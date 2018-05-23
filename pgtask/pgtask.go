@@ -284,7 +284,6 @@ func (c *Client) Queues(ctx context.Context) ([]string, error) {
 }
 
 // Tasks returns a slice of all tasks in the given queue.
-// TODO: Allow only expired, only owned, etc.
 func (c *Client) Tasks(ctx context.Context, queue string, opts ...TasksOpt) ([]*Task, error) {
 	optVals := new(tasksOpts)
 	for _, opt := range opts {
