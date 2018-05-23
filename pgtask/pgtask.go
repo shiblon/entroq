@@ -73,11 +73,11 @@ type Task struct {
 
 // String returns a string representation of this task.
 func (t *Task) String() string {
-	return "Task: " + strings.Join([]string{
-		fmt.Sprintf("[%q %s v%d]", t.queue, t.id, t.version),
-		fmt.Sprintf("[at=%v claimant=%s val=%s]", t.at, t.claimant, string(t.value)),
-		fmt.Sprintf("[c=%v m=%v]", t.created, t.modified),
-	}, " ")
+	return fmt.Sprintf("Task [%q %s v%d]\n\t", t.queue, t.id, t.version) + strings.Join([]string{
+		fmt.Sprintf("at=%q claimant=%s", t.at, t.claimant),
+		fmt.Sprintf("c=%q m=%q", t.created, t.modified),
+		fmt.Sprintf("val=%q", string(t.value)),
+	}, "\n\t") + "\n"
 }
 
 // Queue returns the queue name for this task.
@@ -285,10 +285,23 @@ func (c *Client) Queues(ctx context.Context) ([]string, error) {
 
 // Tasks returns a slice of all tasks in the given queue.
 // TODO: Allow only expired, only owned, etc.
-func (c *Client) Tasks(ctx context.Context, q string) ([]*Task, error) {
-	rows, err := c.db.QueryContext(ctx, "SELECT id, version, queue, at, created, modified, claimant, value FROM tasks WHERE queue = $1", q)
+func (c *Client) Tasks(ctx context.Context, queue string, opts ...TasksOpt) ([]*Task, error) {
+	optVals := new(tasksOpts)
+	for _, opt := range opts {
+		opt(optVals)
+	}
+	values := []interface{}{
+		queue,
+	}
+	q := "SELECT id, version, queue, at, created, modified, claimant, value FROM tasks WHERE queue = $1"
+	if !optVals.allowClaimed {
+		q += " AND (claimant = '00000000-0000-0000-0000-000000000000' OR claimant = $2 OR at < NOW())"
+		values = append(values, c.claimant)
+	}
+
+	rows, err := c.db.QueryContext(ctx, q, values...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get tasks for queue %q: %v", q, err)
+		return nil, fmt.Errorf("failed to get tasks for queue %q: %v", queue, err)
 	}
 	defer rows.Close()
 	var tasks []*Task
@@ -300,9 +313,23 @@ func (c *Client) Tasks(ctx context.Context, q string) ([]*Task, error) {
 		tasks = append(tasks, t)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("task iteration failed for queue %q: %v", q, err)
+		return nil, fmt.Errorf("task iteration failed for queue %q: %v", queue, err)
 	}
 	return tasks, nil
+}
+
+type tasksOpts struct {
+	allowClaimed bool
+}
+
+// TasksOpt is an option that can be passed into Tasks to control what it returns.
+type TasksOpt func(*tasksOpts)
+
+// IncludeClaimed indicates that future tasks claimed by another can be listed.
+func IncludeClaimed() TasksOpt {
+	return func(a *tasksOpts) {
+		a.allowClaimed = true
+	}
 }
 
 // Claim attempts to get the next unclaimed task from the given queue. It
