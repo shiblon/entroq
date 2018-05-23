@@ -24,7 +24,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Error adding task: %v", err)
 	}
-	fmt.Println(inserts)
+	fmt.Println(inserts[0])
 
 	fmt.Println("Claiming a task")
 	task, err := client.Claim(ctx, "group", pgtask.For(10*time.Second))
@@ -34,5 +34,12 @@ func main() {
 	fmt.Println(task)
 
 	fmt.Println("Extending a task's claim time")
-	fmt.Println(client.Commit(ctx, pgtask.Changing(task, pgtask.ArrivalTimeBy(10*time.Second))))
+	_, changes, err := client.Commit(ctx, pgtask.Changing(task, pgtask.ArrivalTimeBy(10*time.Second)))
+	if err != nil {
+		log.Fatalf("Error extending claim time: %v", err)
+	}
+	fmt.Println(changes[0])
+
+	tasks, err := client.Tasks(ctx, "group")
+	fmt.Println(tasks, pgtask.IncludeClaimed())
 }
