@@ -166,7 +166,7 @@ const (
 // NewClient creates a new task client with the given options. Options
 // are created using package-level functions that produce a ClientOption, e.g.,
 //
-//   cli, err := NewClient(
+//   cli, err := NewClient(ctx,
 //   	WithDBName("postgres"),
 //   	WithUsername("myuser"),
 //   	WithPassword("thepassword"),
