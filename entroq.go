@@ -32,17 +32,17 @@ type TaskData struct {
 
 // Task represents a unit of work, with a byte slice value payload.
 type Task struct {
-	Queue string
+	Queue string `json:"queue"`
 
-	ID      uuid.UUID
-	Version int32
+	ID      uuid.UUID `json:"id"`
+	Version int32     `json:"version"`
 
-	At       time.Time
-	Claimant uuid.UUID
-	Value    []byte
+	At       time.Time `json:"at"`
+	Claimant uuid.UUID `json:"claimant"`
+	Value    []byte    `json:"value"`
 
-	Created  time.Time
-	Modified time.Time
+	Created  time.Time `json:"created"`
+	Modified time.Time `json:"modified"`
 }
 
 // String returns a string representation of this task.
@@ -120,8 +120,9 @@ type Backend interface {
 	Close() error
 }
 
-// Open is a function that produces a Backend from a context.
-// Backend implementations will typically provide one of these
+// Open is a function that produces a Backend from a context. Backend
+// implementations will typically provide one of these as the return value of
+// an "Opener" function.
 type Open func(ctx context.Context) (Backend, error)
 
 // Client is a client interface for accessing tasks implemented in PostgreSQL.
