@@ -56,20 +56,24 @@ func (b *backend) initDB(ctx context.Context) error {
 	return nil
 }
 
-// Queues returns a slice of non-empty queue names.
-func (b *backend) Queues(ctx context.Context) ([]string, error) {
-	rows, err := b.db.QueryContext(ctx, "SELECT DISTINCT queue FROM tasks")
+// Queues returns a mapping from queue names to task counts within them.
+func (b *backend) Queues(ctx context.Context) (map[string]int, error) {
+	rows, err := b.db.QueryContext(ctx,
+		"SELECT queue, COUNT(*) AS count FROM tasks GROUP BY queue")
 	if err != nil {
 		return nil, fmt.Errorf("failed to get queue names: %v", err)
 	}
 	defer rows.Close()
-	var queues []string
+	queues := make(map[string]int)
 	for rows.Next() {
-		q := ""
-		if err := rows.Scan(&q); err != nil {
+		var (
+			q     string
+			count int
+		)
+		if err := rows.Scan(&q, &count); err != nil {
 			return nil, fmt.Errorf("queue scan failed: %v", err)
 		}
-		queues = append(queues, q)
+		queues[q] = count
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("queue iteration failed: %v", err)

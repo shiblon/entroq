@@ -45,8 +45,8 @@ func (b *backend) Close() error {
 }
 
 // Queues returns a list of known queues.
-func (b *backend) Queues(ctx context.Context) ([]string, error) {
-	var queues []string
+func (b *backend) Queues(ctx context.Context) (map[string]int, error) {
+	queues := make(map[string]int)
 
 	// In a loop, we get the queue names from the appropriate path,
 	// incrementing to the next sibling "directory" with each step.
@@ -56,8 +56,7 @@ func (b *backend) Queues(ctx context.Context) ([]string, error) {
 		dir := path.Join(qdir, next)
 		resp, err := b.cli.Get(ctx, dir,
 			clientv3.WithFromKey(),
-			clientv3.WithLimit(1),
-			clientv3.WithKeysOnly())
+			clientv3.WithLimit(1))
 		if err != nil {
 			return nil, fmt.Errorf("error retrieving from key %q: %v", dir, err)
 		}
@@ -73,7 +72,12 @@ func (b *backend) Queues(ctx context.Context) ([]string, error) {
 			next = queue + string('/'+1) // skip subdirs
 			continue
 		}
-		queues = append(queues, queue)
+		val := string(resp.Kvs[0].Value)
+		count, err := strconv.Atoi(val)
+		if err != nil {
+			return nil, fmt.Errorf("failed to convert queue count to int: %v", err)
+		}
+		queues[queue] = count
 		next = queue + "\x00"
 	}
 	return queues, nil

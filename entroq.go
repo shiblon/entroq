@@ -91,8 +91,8 @@ func (t *Task) AsDependency() ModifyArg {
 // Backend describes all of the functions that any backend has to implement
 // to be used as the storage for task queues.
 type Backend interface {
-	// Queues returns all known non-empty queue names.
-	Queues(ctx context.Context) ([]string, error)
+	// Queues returns a mapping from all known queues to their task counts.
+	Queues(ctx context.Context) (map[string]int, error)
 
 	// Tasks retrieves all tasks from the given queue. If claimantID is
 	// specified (non-zero), limits those tasks to those that are either
@@ -163,8 +163,8 @@ func WithClaimant(claimant uuid.UUID) ClientOption {
 	}
 }
 
-// Queues returns a slice of all queue names.
-func (c *Client) Queues(ctx context.Context) ([]string, error) {
+// Queues returns a mapping from all queue names to their task counts.
+func (c *Client) Queues(ctx context.Context) (map[string]int, error) {
 	return c.backend.Queues(ctx)
 }
 
