@@ -1,132 +1,41 @@
-// Package pg provides a backend for a entroq.Client.
+// Package pg provides a backend for a entroq.Client using PostgreSQL.
 package pg
 
 import (
 	"context"
 	"database/sql"
 	"fmt"
-	"regexp"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/shiblon/entroq"
-
-	_ "github.com/lib/pq"
 )
 
-const (
-	DefaultPassword = "password" // default postgres password
-	DefaultUsername = "postgres" // default postgres username
-	DefaultDBName   = "entroq"   // default postgres database
-	DefaultSSLMode  = "disable"  // default postgres SSL mode
-)
-
-var escapePattern = regexp.MustCompile(`(['" \\])`)
-
-func escapeOptVal(v string) string {
-	return "'" + escapePattern.ReplaceAllString(v, "\\$1") + "'"
-}
-
-type PG struct {
+type backend struct {
 	db *sql.DB
-
-	dbName   string
-	username string
-	sslMode  string
-	password string
 }
 
-// PGOption is used to pass options to New.
-type PGOption func(pg *PG)
+// New creates a new postgres backend that attaches to the given database.
+func New(ctx context.Context, db *sql.DB) (*backend, error) {
+	b := &backend{db: db}
 
-// WithDBName returns a PGOption that sets the database name for the
-// connection string used to talk to Postgres.
-//
-// Usage:
-//   New(WithDBName("mydb"))
-func WithDBName(n string) PGOption {
-	return func(p *PG) {
-		p.dbName = n
+	if err := b.initDB(ctx); err != nil {
+		return nil, fmt.Errorf("failed to initialize database: %v", err)
 	}
+
+	return b, nil
 }
 
-// WithUsername returns a CLientOption that sets the username for the
-// Postgres connection string.
-//
-// Usage:
-//   New(WithUsername("myusername"))
-func WithUsername(n string) PGOption {
-	return func(p *PG) {
-		p.username = n
-	}
-}
-
-// WithSSLMode sets the ssl mode in the connection string, e.g.,
-//   New(WithSSLMode("disabled"))
-func WithSSLMode(mode string) PGOption {
-	return func(p *PG) {
-		p.sslMode = mode
-	}
-}
-
-// WithPassword sets the database password, e.g.,
-//   New(WithPassword(getPassword()))
-func WithPassword(pwd string) PGOption {
-	return func(p *PG) {
-		p.password = pwd
-	}
-}
-
-// Opener creates a function that returns a new PostgreSQL backend with the given options.
-// Options are created using package-level functions that produce a
-// PGOption, e.g.,
-//
-//   openFunc, err := Open(
-//   	WithDBName("postgres"),
-//   	WithUsername("myuser"),
-//   	WithPassword("thepassword"),
-//   	WithSSLMode("disable"),
-//   )
-//
-// Note that there are defaults for all of these fields, specified as constants.
-// The default claimant value is a new random UUID, created in New.
-func Opener(opts ...PGOption) entroq.Open {
-	pg := &PG{
-		username: DefaultUsername,
-		dbName:   DefaultDBName,
-		sslMode:  DefaultSSLMode,
-		password: DefaultPassword,
-	}
-	for _, opt := range opts {
-		opt(pg)
-	}
-	keyVals := []string{
-		"user=" + escapeOptVal(pg.username),
-		"dbname=" + escapeOptVal(pg.dbName),
-		"sslmode=" + escapeOptVal(pg.sslMode),
-		"password=" + escapeOptVal(pg.password),
-	}
-
-	return func(ctx context.Context) (entroq.Backend, error) {
-		db, err := sql.Open("postgres", strings.Join(keyVals, " "))
-		if err != nil {
-			return nil, fmt.Errorf("failed to open database: %v", err)
-		}
-		pg.db = db
-
-		if err := pg.initDB(ctx); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("failed to initialize database: %v", err)
-		}
-		return pg, nil
-	}
+// Close closes the underlying database connection.
+func (b *backend) Close() error {
+	return b.db.Close()
 }
 
 // initDB sets up the database to have the appropriate tables and necessary
 // extensions to work as a task queue backend.
-func (p *PG) initDB(ctx context.Context) error {
-	_, err := p.db.ExecContext(ctx, `
+func (b *backend) initDB(ctx context.Context) error {
+	_, err := b.db.ExecContext(ctx, `
 		CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 		CREATE TABLE IF NOT EXISTS tasks (
 		  id UUID PRIMARY KEY NOT NULL DEFAULT UUID_GENERATE_V4(),
@@ -148,8 +57,8 @@ func (p *PG) initDB(ctx context.Context) error {
 }
 
 // Queues returns a slice of non-empty queue names.
-func (p *PG) Queues(ctx context.Context) ([]string, error) {
-	rows, err := p.db.QueryContext(ctx, "SELECT DISTINCT queue FROM tasks")
+func (b *backend) Queues(ctx context.Context) ([]string, error) {
+	rows, err := b.db.QueryContext(ctx, "SELECT DISTINCT queue FROM tasks")
 	if err != nil {
 		return nil, fmt.Errorf("failed to get queue names: %v", err)
 	}
@@ -169,7 +78,7 @@ func (p *PG) Queues(ctx context.Context) ([]string, error) {
 }
 
 // Tasks returns a slice of all tasks in the given queue.
-func (p *PG) Tasks(ctx context.Context, queue string, claimant uuid.UUID) ([]*entroq.Task, error) {
+func (b *backend) Tasks(ctx context.Context, queue string, claimant uuid.UUID) ([]*entroq.Task, error) {
 	var zeroID uuid.UUID
 	values := []interface{}{queue}
 	q := "SELECT id, version, queue, at, created, modified, claimant, value FROM tasks WHERE queue = $1"
@@ -179,7 +88,7 @@ func (p *PG) Tasks(ctx context.Context, queue string, claimant uuid.UUID) ([]*en
 		values = append(values, claimant)
 	}
 
-	rows, err := p.db.QueryContext(ctx, q, values...)
+	rows, err := b.db.QueryContext(ctx, q, values...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get tasks for queue %q: %v", queue, err)
 	}
@@ -201,12 +110,12 @@ func (p *PG) Tasks(ctx context.Context, queue string, claimant uuid.UUID) ([]*en
 // TryClaim attempts to claim an "arrived" task from the queue.
 // Returns an error if something goes wrong, a nil task if there is
 // nothing to claim.
-func (p *PG) TryClaim(ctx context.Context, queue string, claimant uuid.UUID, duration time.Duration) (*entroq.Task, error) {
+func (b *backend) TryClaim(ctx context.Context, queue string, claimant uuid.UUID, duration time.Duration) (*entroq.Task, error) {
 	task := new(entroq.Task)
 	if duration == 0 {
 		return nil, fmt.Errorf("no duration set for claim")
 	}
-	err := p.db.QueryRowContext(ctx, `
+	err := b.db.QueryRowContext(ctx, `
 		WITH top AS (
 			SELECT * FROM tasks
 			WHERE
@@ -244,8 +153,8 @@ func (p *PG) TryClaim(ctx context.Context, queue string, claimant uuid.UUID, dur
 
 // Modify attempts to apply an atomic modification to the task
 // store. Either all succeeds or all fails.
-func (p *PG) Modify(ctx context.Context, claimant uuid.UUID, mod *entroq.Modification) (inserted []*entroq.Task, changed []*entroq.Task, err error) {
-	tx, err := p.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+func (b *backend) Modify(ctx context.Context, claimant uuid.UUID, mod *entroq.Modification) (inserted []*entroq.Task, changed []*entroq.Task, err error) {
+	tx, err := b.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to start transaction: %v", err)
 	}
@@ -382,9 +291,4 @@ func depQuery(ctx context.Context, tx *sql.Tx, m *entroq.Modification) (map[uuid
 	}
 
 	return foundDeps, nil
-}
-
-// Close cleans up the database client connection.
-func (p *PG) Close() error {
-	return p.db.Close()
 }
