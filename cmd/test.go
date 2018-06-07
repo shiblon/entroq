@@ -29,7 +29,7 @@ func main() {
 	/*
 		// Postgres Opener
 		opener := func(ctx context.Context) (entroq.Backend, error) {
-			db, err := sql.Open("postgres", "dbname=entroq username=postgres sslmode=disable password=password")
+			db, err := sql.Open("postgres", "dbname=entroq user=postgres sslmode=disable password=password")
 			if err != nil {
 				return nil, fmt.Errorf("error opening database: %v", err)
 			}
