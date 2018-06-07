@@ -45,7 +45,7 @@ type Task struct {
 	Modified time.Time `json:"modified"`
 }
 
-// String returns a string representation of this task.
+// String returns a useful representation of this task.
 func (t *Task) String() string {
 	return fmt.Sprintf("Task [%q %s v%d]\n\t", t.Queue, t.ID, t.Version) + strings.Join([]string{
 		fmt.Sprintf("at=%q claimant=%s", t.At, t.Claimant),
@@ -116,14 +116,10 @@ type Backend interface {
 	// not expired) by another claimant.
 	Modify(ctx context.Context, claimant uuid.UUID, mod *Modification) (inserted []*Task, changed []*Task, err error)
 
-	// Close cleans up the backend connection.
+	// Close closes any underlying connections. The backend is expected to take
+	// ownership of all such connections, so this cleans them up.
 	Close() error
 }
-
-// Open is a function that produces a Backend from a context. Backend
-// implementations will typically provide one of these as the return value of
-// an "Opener" function.
-type Open func(ctx context.Context) (Backend, error)
 
 // Client is a client interface for accessing tasks implemented in PostgreSQL.
 type Client struct {
@@ -131,13 +127,15 @@ type Client struct {
 	claimant uuid.UUID
 }
 
+type BackendOpener func(ctx context.Context) (Backend, error)
+
 // NewClient creates a new task client with the given backend implementation.
 //
 //   cli := NewClient(backend, WithClaimant(myClaimantID))
-func NewClient(ctx context.Context, open Open, opts ...ClientOption) (*Client, error) {
-	backend, err := open(ctx)
+func NewClient(ctx context.Context, opener BackendOpener, opts ...ClientOption) (*Client, error) {
+	backend, err := opener(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("backend open failed: %v", err)
 	}
 	client := &Client{
 		claimant: uuid.New(),
@@ -149,6 +147,11 @@ func NewClient(ctx context.Context, open Open, opts ...ClientOption) (*Client, e
 	return client, nil
 }
 
+// Close closes the underlying backend.
+func (c *Client) Close() error {
+	return c.backend.Close()
+}
+
 // ClientOption is used to pass options to NewClient.
 type ClientOption func(c *Client)
 
@@ -158,11 +161,6 @@ func WithClaimant(claimant uuid.UUID) ClientOption {
 	return func(c *Client) {
 		c.claimant = claimant
 	}
-}
-
-// Close cleans up and closes the underlying connection.
-func (c *Client) Close() error {
-	return c.backend.Close()
 }
 
 // Queues returns a slice of all queue names.
