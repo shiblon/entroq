@@ -21,6 +21,13 @@ message TaskData {
   bytes value = 3;
 }
 
+// TaskChange identifies a task by ID and specifies the new data it should contain.
+// All fields should be filled in. Empty fields result in deleting data from that field.
+message TaskChange {
+  TaskID old_id = 1;
+  TaskData new_data = 2;
+}
+
 // Task is a complete task object, containing IDs, data, and metadata.
 message Task {
   // The name of the queue for this task.
@@ -97,12 +104,12 @@ message ClaimResponse {
 // nothing is committed at all. A failure due to dependencies (in any
 // of changes, deletes, or inserts) will be permanent.
 //
-// All successful changes will cause the requester to be come the claimant.
+// All successful changes will cause the requester to become the claimant.
 message ModifyRequest {
   string claimant_id = 1;
 
   repeated TaskData inserts = 2;
-  repeated Task changes = 3;
+  repeated TaskChange changes = 3;
   repeated TaskID deletes = 4;
   repeated TaskID depends = 5;
 }

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	uuid "github.com/google/uuid"
+	"github.com/google/uuid"
 )
 
 // TaskID contains the identifying parts of a task. If IDs don't match
@@ -97,7 +97,7 @@ type Backend interface {
 	// Tasks retrieves all tasks from the given queue. If claimantID is
 	// specified (non-zero), limits those tasks to those that are either
 	// expired or belong to the given claimant. Otherwise returns them all.
-	Tasks(ctx context.Context, queue string, claimant uuid.UUID) ([]*Task, error)
+	Tasks(ctx context.Context, claimant uuid.UUID, queue string) ([]*Task, error)
 
 	// TryClaim attempts to claim a task from the "top" (or close to it) of the
 	// given queue. When claimed, a task is held for the duration specified
@@ -105,7 +105,7 @@ type Backend interface {
 	// is desired, the task should be immediately modified after it is claimed
 	// to set the AT to a specific time. Returns a nil task and a nil error if
 	// there is nothing to claim.
-	TryClaim(ctx context.Context, queue string, claimant uuid.UUID, duration time.Duration) (*Task, error)
+	TryClaim(ctx context.Context, claimant uuid.UUID, queue string, duration time.Duration) (*Task, error)
 
 	// Modify attempts to atomically modify the task store, and only succeeds
 	// if all dependencies are available and all mutations are either expired
@@ -121,94 +121,70 @@ type Backend interface {
 	Close() error
 }
 
-// Client is a client interface for accessing tasks implemented in PostgreSQL.
-type Client struct {
-	backend  Backend
-	claimant uuid.UUID
+// EntroQ is a client interface for accessing the task queue.
+type EntroQ struct {
+	backend Backend
 }
 
+// BackendOpener is a function that can open a connection to a backend. Creating
+// a client with a specific backend is accomplished by passing one of these functions
+// into New.
 type BackendOpener func(ctx context.Context) (Backend, error)
 
-// NewClient creates a new task client with the given backend implementation.
+// New creates a new task client with the given backend implementation.
 //
-//   cli := NewClient(backend, WithClaimant(myClaimantID))
-func NewClient(ctx context.Context, opener BackendOpener, opts ...ClientOption) (*Client, error) {
+//   cli := New(ctx, backend)
+func New(ctx context.Context, opener BackendOpener) (*EntroQ, error) {
 	backend, err := opener(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("backend open failed: %v", err)
 	}
-	client := &Client{
-		claimant: uuid.New(),
-		backend:  backend,
-	}
-	for _, opt := range opts {
-		opt(client)
-	}
-	return client, nil
-}
-
-// Claimant returns the claimant ID (UUID) for this client.
-func (c *Client) Claimant() uuid.UUID {
-	return c.claimant
+	return &EntroQ{backend: backend}, nil
 }
 
 // Close closes the underlying backend.
-func (c *Client) Close() error {
+func (c *EntroQ) Close() error {
 	return c.backend.Close()
 }
 
-// ClientOption is used to pass options to NewClient.
-type ClientOption func(c *Client)
-
-// WithClaimant sets the claimant ID for this client, e.g.,
-//   NewClient(backend, WithClaimant(uuid.New()))
-func WithClaimant(claimant uuid.UUID) ClientOption {
-	return func(c *Client) {
-		c.claimant = claimant
-	}
-}
-
 // Queues returns a mapping from all queue names to their task counts.
-func (c *Client) Queues(ctx context.Context) (map[string]int, error) {
+func (c *EntroQ) Queues(ctx context.Context) (map[string]int, error) {
 	return c.backend.Queues(ctx)
 }
 
 // Tasks returns a slice of all tasks in the given queue.
-func (c *Client) Tasks(ctx context.Context, queue string, opts ...TasksOpt) ([]*Task, error) {
+func (c *EntroQ) Tasks(ctx context.Context, queue string, opts ...TasksOpt) ([]*Task, error) {
 	optVals := new(tasksOpts)
 	for _, opt := range opts {
 		opt(optVals)
 	}
-	var claimant uuid.UUID
-	if !optVals.allowClaimed {
-		claimant = c.claimant
-	}
-	return c.backend.Tasks(ctx, queue, claimant)
+
+	return c.backend.Tasks(ctx, optVals.claimant, queue)
 }
 
 type tasksOpts struct {
-	allowClaimed bool
+	claimant uuid.UUID
 }
 
 // TasksOpt is an option that can be passed into Tasks to control what it returns.
 type TasksOpt func(*tasksOpts)
 
-// IncludeClaimed indicates that future tasks claimed by another can be listed.
-func IncludeClaimed() TasksOpt {
-	return func(a *tasksOpts) {
-		a.allowClaimed = true
+// LimitClaimant sets the claimant and then only returns self-claimed tasks or expired tasks.
+func LimitClaimant(claimant uuid.UUID) TasksOpt {
+	return func(o *tasksOpts) {
+		o.claimant = claimant
 	}
 }
 
 // Claim attempts to get the next unclaimed task from the given queue. It
 // blocks until one becomes available or until the context is done. When it
-// succeeds, it returns a task with the claimant set to this client, and an
+// succeeds, it returns a task with the claimant set to that given, and an
 // arrival time given by the duration.
-func (c *Client) Claim(ctx context.Context, q string, duration time.Duration) (*Task, error) {
+func (c *EntroQ) Claim(ctx context.Context, claimant uuid.UUID, q string, duration time.Duration) (*Task, error) {
 	const maxWait = time.Minute
 	var curWait = time.Second
 	for {
-		task, err := c.TryClaim(ctx, q, duration)
+		task, err := c.TryClaim(ctx, claimant, q, duration)
 		if err != nil {
 			return nil, err
 		}
@@ -230,8 +206,8 @@ func (c *Client) Claim(ctx context.Context, q string, duration time.Duration) (*
 
 // TryClaimTask attempts one time to claim a task from the given queue. If there are no tasks, it
 // returns a nil error *and* a nil task. This allows the caller to decide whether to retry.
-func (c *Client) TryClaim(ctx context.Context, q string, duration time.Duration) (*Task, error) {
-	return c.backend.TryClaim(ctx, q, c.claimant, duration)
+func (c *EntroQ) TryClaim(ctx context.Context, claimant uuid.UUID, q string, duration time.Duration) (*Task, error) {
+	return c.backend.TryClaim(ctx, claimant, q, duration)
 }
 
 // Modify allows a batch modification operation to be done, gated on the
@@ -241,13 +217,13 @@ func (c *Client) TryClaim(ctx context.Context, q string, duration time.Duration)
 // Returns all inserted task IDs, and an error if it could not proceed. If the error
 // was due to missing dependencies, a *DependencyError is returned, which can be checked for
 // by calling IsDependency(err).
-func (c *Client) Modify(ctx context.Context, modArgs ...ModifyArg) (inserted []*Task, changed []*Task, err error) {
-	mod := newModification(c.claimant)
+func (c *EntroQ) Modify(ctx context.Context, claimant uuid.UUID, modArgs ...ModifyArg) (inserted []*Task, changed []*Task, err error) {
+	mod := newModification(claimant)
 	for _, arg := range modArgs {
 		arg(mod)
 	}
 
-	return c.backend.Modify(ctx, c.claimant, mod)
+	return c.backend.Modify(ctx, claimant, mod)
 }
 
 // ModifyArg is an argument to the Modify function, which does batch modifications to the task store.

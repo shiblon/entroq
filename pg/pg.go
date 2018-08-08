@@ -1,4 +1,4 @@
-// Package pg provides a backend for a entroq.Client using PostgreSQL.
+// Package pg provides an entroq.Backend using PostgreSQL.
 package pg
 
 import (
@@ -11,6 +11,25 @@ import (
 	"github.com/google/uuid"
 	"github.com/shiblon/entroq"
 )
+
+func escp(p string) string {
+	return strings.NewReplacer("=", "\\=", " ", "__").Replace(p)
+}
+
+// Opener creates an opener function to be used to get a backend.
+func Opener(db, user, pwd string, ssl bool) entroq.BackendOpener {
+	sslMode := "disable"
+	if ssl {
+		sslMode = "enable"
+	}
+	return func(ctx context.Context) (entroq.Backend, error) {
+		db, err := sql.Open("postgres", fmt.Sprintf("dbname=%s user=%s password=%s sslmode=%s", escp(db), escp(user), escp(pwd), sslMode))
+		if err != nil {
+			return nil, fmt.Errorf("failed to open postgres DB: %v", err)
+		}
+		return New(ctx, db)
+	}
+}
 
 type backend struct {
 	db *sql.DB
@@ -82,12 +101,11 @@ func (b *backend) Queues(ctx context.Context) (map[string]int, error) {
 }
 
 // Tasks returns a slice of all tasks in the given queue.
-func (b *backend) Tasks(ctx context.Context, queue string, claimant uuid.UUID) ([]*entroq.Task, error) {
-	var zeroID uuid.UUID
+func (b *backend) Tasks(ctx context.Context, claimant uuid.UUID, queue string) ([]*entroq.Task, error) {
 	values := []interface{}{queue}
 	q := "SELECT id, version, queue, at, created, modified, claimant, value FROM tasks WHERE queue = $1"
 
-	if claimant != zeroID {
+	if claimant != uuid.Nil {
 		q += " AND (claimant = '00000000-0000-0000-0000-000000000000' OR claimant = $2 OR at < NOW())"
 		values = append(values, claimant)
 	}
@@ -114,7 +132,7 @@ func (b *backend) Tasks(ctx context.Context, queue string, claimant uuid.UUID) (
 // TryClaim attempts to claim an "arrived" task from the queue.
 // Returns an error if something goes wrong, a nil task if there is
 // nothing to claim.
-func (b *backend) TryClaim(ctx context.Context, queue string, claimant uuid.UUID, duration time.Duration) (*entroq.Task, error) {
+func (b *backend) TryClaim(ctx context.Context, claimant uuid.UUID, queue string, duration time.Duration) (*entroq.Task, error) {
 	task := new(entroq.Task)
 	if duration == 0 {
 		return nil, fmt.Errorf("no duration set for claim")
