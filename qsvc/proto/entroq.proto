@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package entroqproto;
+package proto;
 
 // TaskID contains the ID and version of a task. Together these make a unique
 // identifier for that task.
