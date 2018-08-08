@@ -28,6 +28,17 @@ import (
 	"github.com/shiblon/entroq"
 )
 
+// Opener creates an opener function to be used to get a backend.
+func Opener(urls []string) entroq.BackendOpener {
+	return func(ctx context.Context) (entroq.Backend, error) {
+		cli, err := clientv3.NewFromURLs(urls)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open etcd: %v", err)
+		}
+		return New(cli)
+	}
+}
+
 type backend struct {
 	cli *clientv3.Client
 }
@@ -84,7 +95,7 @@ func (b *backend) Queues(ctx context.Context) (map[string]int, error) {
 }
 
 // Tasks returns a list of tasks in the given queue. If claimant is the zero value, returns all tasks.
-func (b *backend) Tasks(ctx context.Context, queue string, claimant uuid.UUID) ([]*entroq.Task, error) {
+func (b *backend) Tasks(ctx context.Context, claimant uuid.UUID, queue string) ([]*entroq.Task, error) {
 	qdir := path.Join("task/queue", queue, "at")
 
 	endKey := qdir + string('/'+1)
@@ -331,7 +342,7 @@ func (b *backend) Modify(ctx context.Context, claimant uuid.UUID, mod *entroq.Mo
 }
 
 // TryClaim attempts to claim an unclaimed and expired task from the given queue.
-func (b *backend) TryClaim(ctx context.Context, queue string, claimant uuid.UUID, duration time.Duration) (*entroq.Task, error) {
+func (b *backend) TryClaim(ctx context.Context, claimant uuid.UUID, queue string, duration time.Duration) (*entroq.Task, error) {
 	now := time.Now().UTC()
 
 	resp, err := b.cli.Get(ctx, qAtKey(queue, uuid.Nil, time.Time{}),
