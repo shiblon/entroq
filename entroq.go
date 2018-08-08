@@ -147,6 +147,11 @@ func NewClient(ctx context.Context, opener BackendOpener, opts ...ClientOption) 
 	return client, nil
 }
 
+// Claimant returns the claimant ID (UUID) for this client.
+func (c *Client) Claimant() uuid.UUID {
+	return c.claimant
+}
+
 // Close closes the underlying backend.
 func (c *Client) Close() error {
 	return c.backend.Close()

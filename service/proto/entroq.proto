@@ -1,0 +1,156 @@
+syntax = "proto3";
+
+package entroqproto;
+
+// TaskID contains the ID and version of a task. Together these make a unique
+// identifier for that task.
+message TaskID {
+  string id = 1;
+  int32 version = 2;
+}
+
+// TaskData contains only the data portion of a task. Useful for insertion.
+message TaskData {
+  // The name of the queue for this task.
+  string queue = 1;
+
+  // The epoch time in millis when this task becomes available.
+  int64 at_ms = 2;
+
+  // The task's opaque payload.
+  bytes value = 3;
+}
+
+// Task is a complete task object, containing IDs, data, and metadata.
+message Task {
+  // The name of the queue for this task.
+  string queue = 1;
+
+  string id = 2;
+  int32 version = 3;
+
+  // The epoch time in millis when this task becomes available.
+  int64 at_ms = 4;
+
+
+  // The UUID representing the claimant (owner) for this task.
+  string claimant_id = 5;
+
+  // The task's opaque payload.
+  bytes value = 6;
+
+  // Epoch times in millis for creation and update of this task.
+  int64 created_ms = 7;
+  int64 modified_ms = 8;
+}
+
+// QueueStats contains the name of the queue and the number of tasks within it.
+message QueueStats {
+  string name = 1;
+  int32 num_tasks = 2;
+}
+
+// Status is returned for every response.
+//
+// If a response ends in UNKNOWN:
+//    Something unexpected happened. It is usually safe to assume this is fatal.
+//
+// If a response ends in DEPENDENCY:
+//    It is a final error: there is no way to satisfy this request ever again because
+//    of the way that tasks are permanently removed (there will never be another task
+//    with the same ID/Version again) when they are modified.
+//
+// If a response ends in TIMEOUT:
+//    This means either the connection to the backend was dropped somehow, or that
+//    there were no tasks available during the given wait time for the RPC (e.g.,
+//    for a claim attempt).
+enum Status {
+  OK = 0;
+  UNKNOWN = 1;
+  DEPENDENCY = 2;
+  TIMEOUT = 3;
+}
+
+// ClaimRequest is sent to attempt to claim a task from a queue. The claimant ID
+// should be unique to the requesting worker (e.g., if multiple workers are in
+// the same process, they should all have different claimant IDs assigned).
+message ClaimRequest {
+  string claimant_id = 1;
+
+  string queue = 2;
+  int64 duration_ms = 3;
+}
+
+// ClaimResponse is returned when a claim is fulfilled or becomes obviously impossible.
+// A successful claim results in a valid Task message, and status will be OK.
+message ClaimResponse {
+  Status status = 1;
+
+  Task task = 2;
+
+  string error = 3;
+}
+
+// ModifyRequest sends a request to modify a set of tasks with given
+// dependencies. It is performed in a transaction, in which either all
+// suggested modifications succeed and all dependencies are satisfied, or
+// nothing is committed at all. A failure due to dependencies (in any
+// of changes, deletes, or inserts) will be permanent.
+//
+// All successful changes will cause the requester to be come the claimant.
+message ModifyRequest {
+  string claimant_id = 1;
+
+  repeated TaskData inserts = 2;
+  repeated Task changes = 3;
+  repeated TaskID deletes = 4;
+  repeated TaskID depends = 5;
+}
+
+// ModifyResponse returns inserted and updated tasks when successful, or
+// an error representing all failures when not.
+message ModifyResponse {
+  Status status = 1;
+
+  repeated Task inserted = 2;
+  repeated Task changed = 3;
+
+  string error = 4;
+}
+
+// TasksRequest is sent to request a complete listing of tasks for the
+// given queue. If claimant_id is empty, all tasks (not just expired
+// or owned tasks) are returned.
+message TasksRequest {
+  string claimant_id = 1;
+  string queue = 2;
+}
+
+// TasksReqponse contains the tasks requested.
+message TasksResponse {
+  Status status = 1;
+
+  repeated Task tasks = 2;
+
+  string error = 3;
+}
+
+// QueuesRequest is sent to request a listing of all known queues.
+message QueuesRequest {
+}
+
+// QueuesResponse contains the requested list of queue statistics.
+message QueuesResponse {
+  Status status = 1;
+
+  repeated QueueStats queues = 2;
+
+  string error = 3;
+}
+
+service EntroQ {
+  rpc Claim(ClaimRequest) returns (ClaimResponse);
+  rpc Modify(ModifyRequest) returns (ModifyResponse);
+  rpc Tasks(TasksRequest) returns (TasksResponse);
+  rpc Queues(QueuesRequest) returns (QueuesResponse);
+}
