@@ -88,6 +88,23 @@ func (t *Task) AsDependency() ModifyArg {
 	return DependingOn(t.ID, t.Version)
 }
 
+// ID returns a Task ID from this task.
+func (t *Task) IDVersion() *TaskID {
+	return &TaskID{
+		ID:      t.ID,
+		Version: t.Version,
+	}
+}
+
+// Data returns the data for this task.
+func (t *Task) Data() *TaskData {
+	return &TaskData{
+		Queue: t.Queue,
+		At:    t.At,
+		Value: t.Value,
+	}
+}
+
 // Backend describes all of the functions that any backend has to implement
 // to be used as the storage for task queues.
 type Backend interface {
@@ -104,7 +121,8 @@ type Backend interface {
 	// from the time of the claim. If claiming until a specific wall-clock time
 	// is desired, the task should be immediately modified after it is claimed
 	// to set the AT to a specific time. Returns a nil task and a nil error if
-	// there is nothing to claim.
+	// there is nothing to claim. Will fail if (optional) dependent tasks are
+	// not current.
 	TryClaim(ctx context.Context, claimant uuid.UUID, queue string, duration time.Duration) (*Task, error)
 
 	// Modify attempts to atomically modify the task store, and only succeeds
@@ -205,7 +223,7 @@ func (c *EntroQ) Claim(ctx context.Context, claimant uuid.UUID, q string, durati
 }
 
 // TryClaimTask attempts one time to claim a task from the given queue. If there are no tasks, it
-// returns a nil error *and* a nil task. This allows the caller to decide whether to retry.
+// returns a nil error *and* a nil task. This allows the caller to decide whether to retry. It can fail if certain (optional) dependency tasks are not present. This can be used, for example, to ensure that configuration tasks haven't changed.
 func (c *EntroQ) TryClaim(ctx context.Context, claimant uuid.UUID, q string, duration time.Duration) (*Task, error) {
 	return c.backend.TryClaim(ctx, claimant, q, duration)
 }

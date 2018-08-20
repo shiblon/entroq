@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"path"
 	"strconv"
 	"strings"
@@ -357,10 +358,13 @@ func (b *backend) TryClaim(ctx context.Context, claimant uuid.UUID, queue string
 		return nil, nil
 	}
 
-	// Get all of the IDs and keys so that when we find one, we can update its ETA.
+	// Get the top 10 of the IDs and keys so that when we find one, we can update its ETA.
 	qKeyByID := make(map[uuid.UUID]string)
 	var toTry []uuid.UUID
-	for _, kv := range resp.Kvs {
+	for i, kv := range resp.Kvs {
+		if i >= 10 {
+			break
+		}
 		id, err := uuid.ParseBytes(kv.Value)
 		if err != nil {
 			return nil, fmt.Errorf("error parsing At ID: %v", err)
@@ -369,20 +373,22 @@ func (b *backend) TryClaim(ctx context.Context, claimant uuid.UUID, queue string
 		toTry = append(toTry, id)
 	}
 
-	var tryID uuid.UUID
+	// Take any that are ready.
+	rand.Shuffle(len(toTry), func(i, j int) {
+		toTry[i], toTry[j] = toTry[j], toTry[i]
+	})
 
-	var claimedTask *entroq.Task
-	claimFunc := func(stm concurrency.STM) error {
-		// Try to claim the tryID task (and get its corresponding At index).
+	tryClaimID := func(stm concurrency.STM, id uuid.UUID) (*entroq.Task, error) {
+		// Try to claim the given task (and get its corresponding At index).
 		// Fail if we can't do it. We'll retry from the outside.
-		qkey, ok := qKeyByID[tryID]
+		qkey, ok := qKeyByID[id]
 		if !ok {
-			return fmt.Errorf("no queue key %q after finding %q there", qkey, tryID)
+			return nil, fmt.Errorf("no queue key %q after finding %q there", qkey, id)
 		}
-		tstr := stm.Get(dataKey(tryID))
+		tstr := stm.Get(dataKey(id))
 		task := new(entroq.Task)
 		if err := json.Unmarshal([]byte(tstr), task); err != nil {
-			return fmt.Errorf("json unmarshal failed for task %q: %v", tryID, err)
+			return nil, fmt.Errorf("json unmarshal failed for task %q: %v", id, err)
 		}
 		task.At = now.Add(duration)
 		task.Modified = now
@@ -390,15 +396,13 @@ func (b *backend) TryClaim(ctx context.Context, claimant uuid.UUID, queue string
 
 		tbytes, err := json.Marshal(task)
 		if err != nil {
-			return fmt.Errorf("json marshal of claimed task failed: %v", err)
+			return nil, fmt.Errorf("json marshal of claimed task failed: %v", err)
 		}
-		stm.Put(dataKey(tryID), string(tbytes))
+		stm.Put(dataKey(id), string(tbytes))
 		stm.Del(qkey)
 		stm.Put(qAtKey(queue, task.ID, task.At), task.ID.String())
 
-		// Pass info out. We succeeded.
-		claimedTask = task
-		return nil
+		return task, nil
 	}
 
 	// Try all keys in sorted order until we find one claimable or run out.
@@ -407,11 +411,12 @@ func (b *backend) TryClaim(ctx context.Context, claimant uuid.UUID, queue string
 	// because of the inherent race in listing + individual STMs). Retries are
 	// part of the task acquisition. We're just trying to *limit* retries, not
 	// *eliminate* them.
+	var claimedTask *entroq.Task
 	for _, id := range toTry {
-		// Set up the input to the STM function.
-		tryID = id
-
-		stm, err := concurrency.NewSTM(b.cli, claimFunc)
+		stm, err := concurrency.NewSTM(b.cli, func(stm concurrency.STM) (err error) {
+			claimedTask, err = tryClaimID(stm, id)
+			return err
+		})
 		if err != nil {
 			return nil, fmt.Errorf("error in claim stm: %v", err)
 		}
