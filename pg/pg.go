@@ -17,13 +17,13 @@ func escp(p string) string {
 }
 
 // Opener creates an opener function to be used to get a backend.
-func Opener(db, user, pwd string, ssl bool) entroq.BackendOpener {
+func Opener(hostPort, db, user, pwd string, ssl bool) entroq.BackendOpener {
 	sslMode := "disable"
 	if ssl {
-		sslMode = "enable"
+		sslMode = "verify-full"
 	}
 	return func(ctx context.Context) (entroq.Backend, error) {
-		db, err := sql.Open("postgres", fmt.Sprintf("dbname=%s user=%s password=%s sslmode=%s", escp(db), escp(user), escp(pwd), sslMode))
+		db, err := sql.Open("postgres", fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=%s", escp(user), escp(pwd), hostPort, escp(db), sslMode))
 		if err != nil {
 			return nil, fmt.Errorf("failed to open postgres DB: %v", err)
 		}
@@ -138,13 +138,13 @@ func (b *backend) TryClaim(ctx context.Context, claimant uuid.UUID, queue string
 		return nil, fmt.Errorf("no duration set for claim")
 	}
 	err := b.db.QueryRowContext(ctx, `
-		WITH top AS (
+		WITH topN AS (
 			SELECT * FROM tasks
 			WHERE
 				queue = $1 AND
 				at <= NOW()
 			ORDER BY at, version, id ASC
-			LIMIT 1
+			LIMIT 10
 		)
 		UPDATE tasks
 		SET
@@ -152,7 +152,7 @@ func (b *backend) TryClaim(ctx context.Context, claimant uuid.UUID, queue string
 			at = $2,
 			claimant = $3,
 			modified = NOW()
-		WHERE id IN (SELECT id FROM top)
+		WHERE id IN (SELECT id FROM topN ORDER BY random() LIMIT 1)
 		RETURNING id, version, queue, at, created, modified, claimant, value
 	`, queue, time.Now().Add(duration), claimant).Scan(
 		&task.ID,
