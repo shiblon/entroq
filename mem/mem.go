@@ -12,28 +12,38 @@ import (
 	"github.com/shiblon/entroq"
 )
 
-type taskHeap []*entroq.Task
+type hItem struct {
+	idx  int
+	task *entroq.Task
+}
+
+type taskHeap []*hItem
 
 func (h taskHeap) Len() int {
 	return len(h)
 }
 
 func (h taskHeap) Less(i, j int) bool {
-	return h[i].At.Before(h[j].At)
+	return h[i].task.At.Before(h[j].task.At)
 }
 
 func (h taskHeap) Swap(i, j int) {
 	h[i], h[j] = h[j], h[i]
+	h[i].idx = i
+	h[j].idx = j
 }
 
 func (h *taskHeap) Push(x interface{}) {
-	*h = append(*h, x.(*entroq.Task))
+	it := x.(*hItem)
+	it.idx = len(*h)
+	*h = append(*h, it)
 }
 
 func (h *taskHeap) Pop() interface{} {
 	old := *h
 	n := len(old)
 	it := old[n-1]
+	it.idx = -1
 	*h = old[:n-1]
 	return it
 }
@@ -48,8 +58,8 @@ func Opener() entroq.BackendOpener {
 type backend struct {
 	sync.Mutex
 
-	tasksByQueue map[string]taskHeap
-	tasksByID    map[uuid.UUID]*entroq.Task
+	queueItems map[string]taskHeap
+	itemsByID  map[uuid.UUID]*hItem
 }
 
 func lock(mu sync.Locker) sync.Locker {
@@ -68,11 +78,76 @@ func idKey(id uuid.UUID, version int) string {
 // New creates a new, empty in-memory backend.
 func New(ctx context.Context) *backend {
 	b := &backend{
-		tasksByQueue: make(map[string]taskHeap),
-		tasksByID:    make(map[uuid.UUID]*entroq.Task),
+		queueItems: make(map[string]taskHeap),
+		itemsByID:  make(map[uuid.UUID]*hItem),
 	}
 
 	return b
+}
+
+// insertUnsafe must be called from within a locked mutex.
+func (b *backend) insertUnsafe(t *entroq.Task) error {
+	item := &hItem{task: t}
+	if _, ok := b.itemsByID[t.ID]; ok {
+		return fmt.Errorf("duplicate task ID insertion attempt: %v", t.ID)
+	}
+	// If not there, put it there. We could also use append on the long-form
+	// version of the heap (specifying the whole map, etc.) but this is more
+	// straightforward. Just be aware that here be dragons due to the need
+	// to take a pointer to the heap before manipulating it.
+	h, ok := b.queueItems[t.Queue]
+	if !ok {
+		h = make(taskHeap, 0)
+		b.queueItems[t.Queue] = h
+	}
+	heap.Push(&h, &hItem{task: t})
+	b.itemsByID[t.ID] = item
+
+	return nil
+}
+
+// removeUnsafe must be called from within a locked mutex.
+func (b *backend) removeUnsafe(id uuid.UUID) error {
+	item, ok := b.itemsByID[id]
+	if !ok {
+		return fmt.Errorf("item not found for removal: %v", id)
+	}
+	delete(b.itemsByID, id)
+
+	h, ok := b.queueItems[item.task.Queue]
+	if !ok {
+		return fmt.Errorf("queues not in sync; found item to remove queues but not in index: %v", id)
+	}
+	heap.Remove(&h, item.idx)
+	if h.Len() == 0 {
+		delete(b.queueItems, item.task.Queue)
+	}
+
+	return nil
+}
+
+// replaceUnsafe must be called from within a locked mutex.
+func (b *backend) replaceUnsafe(id uuid.UUID, newTask *entroq.Task) error {
+	item, ok := b.itemsByID[id]
+	if !ok {
+		return fmt.Errorf("item not found for task replacement: %v", id)
+	}
+
+	// If the queues are the same, replace and fix order. No other changes.
+	if item.task.Queue == newTask.Queue {
+		item.task = newTask
+		h := b.queueItems[item.task.Queue]
+		heap.Fix(&h, item.idx)
+		return nil
+	}
+
+	// Queues are not the same. We need to remove from the first queue and add
+	// to the second. Note that this might not be *perfectly* efficient because
+	// we unnecessarily modify the ID index twice, but it's correct and easy to
+	// understand, so fixing it would be a premature optimization.
+	b.removeUnsafe(item.task.ID)
+	b.insertUnsafe(newTask)
+	return nil
 }
 
 // Close stops the background goroutines and cleans up the in-memory backend.
@@ -85,8 +160,8 @@ func (b *backend) Queues(ctx context.Context) (map[string]int, error) {
 	defer un(lock(b))
 
 	qs := make(map[string]int)
-	for q, tasks := range b.tasksByQueue {
-		qs[q] = len(tasks)
+	for q, items := range b.queueItems {
+		qs[q] = items.Len()
 	}
 	return qs, nil
 }
@@ -98,7 +173,8 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 	now := time.Now()
 
 	var tasks []*entroq.Task
-	for _, t := range b.tasksByQueue[tq.Queue] {
+	for _, item := range b.queueItems[tq.Queue] {
+		t := item.task
 		if tq.Claimant == uuid.Nil || t.At.Before(now) || tq.Claimant == t.Claimant {
 			tasks = append(tasks, t)
 		}
@@ -110,14 +186,14 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
 	defer un(lock(b))
 
-	tasks := b.tasksByQueue[cq.Queue]
+	items := b.queueItems[cq.Queue]
 
-	if len(tasks) == 0 {
+	if items.Len() == 0 {
 		return nil, nil
 	}
 
 	now := time.Now()
-	top := tasks[0]
+	top := items[0].task
 	if now.Before(top.At) {
 		return nil, nil
 	}
@@ -127,7 +203,7 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 	top.Modified = now
 	top.Claimant = cq.Claimant
 
-	heap.Fix(&tasks, 0)
+	heap.Fix(&items, 0)
 
 	return top, nil
 }
@@ -138,21 +214,21 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 
 	found := make(map[uuid.UUID]*entroq.Task)
 	for _, chg := range mod.Changes {
-		t := b.tasksByID[chg.ID]
-		if t != nil {
-			found[chg.ID] = t
+		item := b.itemsByID[chg.ID]
+		if item != nil {
+			found[chg.ID] = item.task
 		}
 	}
 	for _, del := range mod.Deletes {
-		t := b.tasksByID[del.ID]
-		if t != nil {
-			found[del.ID] = t
+		item := b.itemsByID[del.ID]
+		if item != nil {
+			found[del.ID] = item.task
 		}
 	}
 	for _, dep := range mod.Depends {
-		t := b.tasksByID[dep.ID]
-		if t != nil {
-			found[dep.ID] = t
+		item := b.itemsByID[dep.ID]
+		if item != nil {
+			found[dep.ID] = item.task
 		}
 	}
 
@@ -163,7 +239,6 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 	now := time.Now()
 
 	for _, t := range mod.Inserts {
-		h := b.tasksByQueue[t.Queue]
 		newTask := &entroq.Task{
 			ID:       uuid.New(),
 			Version:  0,
@@ -176,45 +251,18 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 		}
 		copy(newTask.Value, t.Value)
 
+		b.insertUnsafe(newTask)
 		inserted = append(inserted, newTask)
-		heap.Push(&h, newTask)
-		b.tasksByID[newTask.ID] = newTask
 	}
 
 	for _, tid := range mod.Deletes {
-		t := b.tasksByID[tid.ID]
-		delete(b.tasksByID, tid.ID)
-		// TODO: make more efficient.
-		h := b.tasksByQueue[t.Queue]
-		for i, found := range h {
-			if found.ID == t.ID {
-				heap.Remove(&h, i)
-				break
-			}
-		}
+		b.removeUnsafe(tid.ID)
 	}
 
 	for _, chg := range mod.Changes {
 		newTask := chg.Copy()
-		old := b.tasksByID[chg.ID]
-		b.tasksByID[chg.ID] = newTask
-
-		// TODO: make finding the index more efficient.
-		h := b.tasksByQueue[old.Queue]
-		for i, found := range h {
-			if found.ID == chg.ID {
-				if old.Queue == chg.Queue {
-					*old = *newTask
-					heap.Fix(&h, i)
-				} else {
-					heap.Remove(&h, i)
-					newH := b.tasksByQueue[chg.Queue]
-					heap.Push(&newH, newTask)
-				}
-				changed = append(changed, newTask)
-				break
-			}
-		}
+		b.replaceUnsafe(chg.ID, newTask)
+		changed = append(changed, newTask)
 	}
 
 	return inserted, changed, nil
