@@ -9,7 +9,6 @@ import (
 	"log"
 	"net"
 
-	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pg"
 	"github.com/shiblon/entroq/qsvc"
 	"google.golang.org/grpc"
@@ -29,23 +28,19 @@ var (
 
 func main() {
 	flag.Parse()
+	ctx := context.Background()
+
 	lis, err := net.Listen("tcp", fmt.Sprintf("[::]:%d", *port))
 	if err != nil {
 		log.Fatalf("Error listening on port %d: %v", *port, err)
 	}
-	s := grpc.NewServer()
 
-	ctx := context.Background()
-
-	pgOpener := pg.Opener(*dbName, *dbUser, *dbPassword, false)
-	var clients []*entroq.EntroQ
-	for i := 0; i < *backends; i++ {
-		cli, err := entroq.New(ctx, pgOpener)
-		if err != nil {
-			log.Fatalf("Error making a pg task client: %v", err)
-		}
-		clients = append(clients, cli)
+	svc, err := qsvc.New(ctx, pg.Opener(*dbName, *dbUser, *dbPassword, false), *backends)
+	if err != nil {
+		log.Fatalf("Failed to open backend for qsvc: %v", err)
 	}
-	pb.RegisterEntroQServer(s, qsvc.New(clients))
+
+	s := grpc.NewServer()
+	pb.RegisterEntroQServer(s, svc)
 	s.Serve(lis)
 }

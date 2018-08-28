@@ -57,27 +57,6 @@ message QueueStats {
   int32 num_tasks = 2;
 }
 
-// Status is returned for every response.
-//
-// If a response ends in UNKNOWN:
-//    Something unexpected happened. It is usually safe to assume this is fatal.
-//
-// If a response ends in DEPENDENCY:
-//    It is a final error: there is no way to satisfy this request ever again because
-//    of the way that tasks are permanently removed (there will never be another task
-//    with the same ID/Version again) when they are modified.
-//
-// If a response ends in TIMEOUT:
-//    This means either the connection to the backend was dropped somehow, or that
-//    there were no tasks available during the given wait time for the RPC (e.g.,
-//    for a claim attempt).
-enum Status {
-  OK = 0;
-  UNKNOWN = 1;
-  DEPENDENCY = 2;
-  TIMEOUT = 3;
-}
-
 // ClaimRequest is sent to attempt to claim a task from a queue. The claimant ID
 // should be unique to the requesting worker (e.g., if multiple workers are in
 // the same process, they should all have different claimant IDs assigned).
@@ -89,13 +68,8 @@ message ClaimRequest {
 }
 
 // ClaimResponse is returned when a claim is fulfilled or becomes obviously impossible.
-// A successful claim results in a valid Task message, and status will be OK.
 message ClaimResponse {
-  Status status = 1;
-
-  Task task = 2;
-
-  string error = 3;
+  Task task = 1;
 }
 
 // ModifyRequest sends a request to modify a set of tasks with given
@@ -114,15 +88,26 @@ message ModifyRequest {
   repeated TaskID depends = 5;
 }
 
-// ModifyResponse returns inserted and updated tasks when successful, or
-// an error representing all failures when not.
+// ModifyResponse returns inserted and updated tasks when successful.
+// A dependency error (which is permanent) comes through as gRPC's NOT_FOUND code.
 message ModifyResponse {
-  Status status = 1;
+  repeated Task inserted = 1;
+  repeated Task changed = 2;
+}
 
-  repeated Task inserted = 2;
-  repeated Task changed = 3;
+enum DepType {
+  CLAIM = 0;
+  DELETE = 1;
+  CHANGE = 2;
+  DEPEND = 3;
+}
 
-  string error = 4;
+// ModifyDep can be returned with a gRPC NotFound status indicating which
+// dependencies failed. This is done via the gRPC error return, not directly
+// in the response proto.
+message ModifyDep {
+  DepType type = 1;
+  TaskID id = 2;
 }
 
 // TasksRequest is sent to request a complete listing of tasks for the
@@ -135,11 +120,7 @@ message TasksRequest {
 
 // TasksReqponse contains the tasks requested.
 message TasksResponse {
-  Status status = 1;
-
-  repeated Task tasks = 2;
-
-  string error = 3;
+  repeated Task tasks = 1;
 }
 
 // QueuesRequest is sent to request a listing of all known queues.
@@ -148,15 +129,12 @@ message QueuesRequest {
 
 // QueuesResponse contains the requested list of queue statistics.
 message QueuesResponse {
-  Status status = 1;
-
-  repeated QueueStats queues = 2;
-
-  string error = 3;
+  repeated QueueStats queues = 1;
 }
 
+// EntroQ is a service that allows for access to a task queue.
 service EntroQ {
-  rpc Claim(ClaimRequest) returns (ClaimResponse);
+  rpc TryClaim(ClaimRequest) returns (ClaimResponse);
   rpc Modify(ModifyRequest) returns (ModifyResponse);
   rpc Tasks(TasksRequest) returns (TasksResponse);
   rpc Queues(QueuesRequest) returns (QueuesResponse);

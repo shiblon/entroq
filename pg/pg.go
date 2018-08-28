@@ -1,4 +1,5 @@
-// Package pg provides an entroq.Backend using PostgreSQL.
+// Package pg provides an entroq.Backend using PostgreSQL. Use Opener with
+// entroq.New to create a task client that talks to a PostgreSQL backend.
 package pg
 
 import (
