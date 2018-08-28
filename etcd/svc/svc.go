@@ -30,7 +30,7 @@ func main() {
 		log.Fatalf("Error listening on port %d: %v", *port, err)
 	}
 
-	svc, err := qsvc.New(ctx, etcd.Opener(flag.Args()), *backends)
+	svc, err := qsvc.New(ctx, etcd.Opener(flag.Args()), qsvc.WithConnections(*backends))
 	if err != nil {
 		log.Fatalf("Failed to open backend for qsvc: %v", err)
 	}

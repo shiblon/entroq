@@ -49,19 +49,13 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Etcd Opener
-	etcdOpener := etcd.Opener([]string{"localhost:2379", "localhost:2380"})
-
-	// Postgres Opener
-	pgOpener := pg.Opener("localhost", "postgres", "postgres", "password", false)
-
-	etcdClient, err := entroq.New(ctx, etcdOpener)
+	etcdClient, err := entroq.New(ctx, etcd.Opener([]string{"localhost:2379", "localhost:2380"}))
 	if err != nil {
 		log.Fatalf("Failed to create etcdClient: %v", err)
 	}
 	defer etcdClient.Close()
 
-	pgClient, err := entroq.New(ctx, pgOpener)
+	pgClient, err := entroq.New(ctx, pg.Opener("localhost", pg.WithPassword("password")))
 	if err != nil {
 		log.Fatalf("Failed to create pgClient: %v", err)
 	}

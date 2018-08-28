@@ -76,25 +76,21 @@ because you can also move to a highly distributed database like CockroachDB
 using the same wire format. Anything that speaks the Postgres wire format will
 work, provided it implements the following SQL statements:
 
-- `CREATE EXTENSION "uuid-ossp"`
-- `CREATE INDEX`
-- `DISTINCT in selects`
-- `UUID types`
-- `WITH ... UPDATE ... RETURNING statements`
+- `CREATE TABLE IF NOT EXISTS`
+- `CREATE INDEX IF NOT EXISTS`
+- `DISTINCT` in selects
+- `UUID` type
+- `BYTEA` type
+- `TIMESTAMP WITH TIME ZONE` type
+- `WITH ... UPDATE ... RETURNING` statements
 - `BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE`
 - `SELECT ... FOR UPDATE`
 - `INSERT INTO ... RETURNING`
 - `UPDATE ... RETURNING`
-- `uuid_generated_v4` function
 
 Essentially, serializable transactions that also perform row-level locking by
 way of SELECT FOR UPDATE are required, as well as the ability to specify that
 modifying statements also return something with the RETURNING keyword.
-
-The requirement for `CREATE EXTENSION "uuid-ossp"` might need to be flexible,
-as some databases will have this built in (for example, CockroachDB has the
-`gen_random_uuid` function and requires no extensions), and others might not
-allow extensions, but will have other approaches to this.
 
 ### Starting a PostgreSQL instance in Docker
 

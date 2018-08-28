@@ -35,7 +35,12 @@ func main() {
 		log.Fatalf("Error listening on port %d: %v", *port, err)
 	}
 
-	svc, err := qsvc.New(ctx, pg.Opener(fmt.Sprintf("[::]:%d", *port), *dbName, *dbUser, *dbPassword, false), *backends)
+	hostPort := fmt.Sprintf(":%d", *port)
+	svc, err := qsvc.New(ctx, pg.Opener(hostPort,
+		pg.WithDB(*dbName),
+		pg.WithUsername(*dbUser),
+		pg.WithPassword(*dbPassword),
+	), qsvc.WithConnections(*backends))
 	if err != nil {
 		log.Fatalf("Failed to open backend for qsvc: %v", err)
 	}
