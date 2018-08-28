@@ -213,22 +213,9 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 	defer un(lock(b))
 
 	found := make(map[uuid.UUID]*entroq.Task)
-	for _, chg := range mod.Changes {
-		item := b.itemsByID[chg.ID]
-		if item != nil {
-			found[chg.ID] = item.task
-		}
-	}
-	for _, del := range mod.Deletes {
-		item := b.itemsByID[del.ID]
-		if item != nil {
-			found[del.ID] = item.task
-		}
-	}
-	for _, dep := range mod.Depends {
-		item := b.itemsByID[dep.ID]
-		if item != nil {
-			found[dep.ID] = item.task
+	for id := range mod.AllDependencies() {
+		if item, ok := b.itemsByID[id]; ok {
+			found[id] = item.task
 		}
 	}
 
