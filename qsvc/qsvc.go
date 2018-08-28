@@ -1,4 +1,35 @@
-// Package qsvc contains the service implementation for registering with gRPC. It must be given a slice of clients to use as backends.
+// Package qsvc contains the service implementation for registering with gRPC.
+// This provides the service that can be registered with a grpc.Server:
+//
+// 	import (
+// 		"context"
+// 		"log"
+// 		"net"
+//
+// 		"github.com/shiblon/entroq/pg"
+// 		"github.com/shiblon/entroq/qsvc"
+// 		pb "github.com/shiblon/entroq/qsvc/proto"
+//
+// 		"google.golang.org/grpc"
+// 	)
+//
+// 	func main() {
+//		ctx := context.Background()
+//
+// 		listener, err := net.Listen("tcp", "localhost:54321")
+// 		if err != nil {
+// 			log.Fatalf("Failed to listen: %v", err)
+// 		}
+//
+//		svc, err := qsvc.New(ctx, pg.Opener("localhost:5432", "postgres", "postgres", false), 1)
+//		if err != nil {
+//			log.Fatalf("Failed to open service backends: %v", err)
+//		}
+//
+// 		s := grpc.NewServer()
+// 		pb.RegisterEntroQServer(s, svc)
+// 		s.Serve(listener)
+// 	}
 package qsvc
 
 import (
@@ -6,24 +37,52 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/golang/protobuf/proto"
 	"github.com/google/uuid"
 	"github.com/shiblon/entroq"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/shiblon/entroq/qsvc/proto"
 )
 
+const DefaultConnections = 10
+
+// QSvc is an EntroQServer.
 type QSvc struct {
 	pool chan *entroq.EntroQ
 }
 
-func New(clients []*entroq.EntroQ) *QSvc {
-	svc := &QSvc{
-		pool: make(chan *entroq.EntroQ, len(clients)),
+// New creates a new service that exposes gRPC endpoints for task queue access.
+// It load balances across connections (presumably attached to a specific
+// persistent backend) using round robin in order of descending "time not
+// busy". The specified opener is used to select the backend type and pass
+// parameters to it. If connections is less than 1, it is set to
+// DefaultConnections.
+func New(ctx context.Context, opener entroq.BackendOpener, connections int) (svc *QSvc, err error) {
+	if connections < 1 {
+		connections = DefaultConnections
 	}
-	for _, c := range clients {
-		svc.pool <- c
+	svc = &QSvc{
+		pool: make(chan *entroq.EntroQ, connections),
 	}
-	return svc
+	defer func() {
+		if err != nil {
+			// We got an error - close backend connections cleanly if we can.
+			close(svc.pool)
+			for c := range svc.pool {
+				c.Close()
+			}
+		}
+	}()
+	for i := 0; i < connections; i++ {
+		cli, err := entroq.New(ctx, opener)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create backend client: %v", err)
+		}
+		svc.pool <- cli
+	}
+	return svc, nil
 }
 
 func fromMS(ms int64) time.Time {
@@ -34,7 +93,7 @@ func toMS(t time.Time) int64 {
 	return t.Truncate(time.Millisecond).UnixNano() / 1000000
 }
 
-func taskToProto(t *entroq.Task) *pb.Task {
+func protoFromTask(t *entroq.Task) *pb.Task {
 	return &pb.Task{
 		Queue:      t.Queue,
 		Id:         t.ID.String(),
@@ -55,34 +114,40 @@ func (s *QSvc) returnClient(cli *entroq.EntroQ) {
 	s.pool <- cli
 }
 
-func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
+// TryClaim attempts to claim a task, returning immediately. If no tasks are
+// available, it returns a nil response and a nil error.
+func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
 	client := s.getClient()
 	defer s.returnClient(client)
 
 	claimant, err := uuid.Parse(req.ClaimantId)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse claimant ID: %v", err)
+		return nil, status.Errorf(codes.InvalidArgument, "failed to parse claimant ID: %v", err)
 	}
-	task, err := client.Claim(ctx, claimant, req.Queue, time.Duration(req.DurationMs)*time.Millisecond)
+	task, err := client.TryClaim(ctx, claimant, req.Queue, time.Duration(req.DurationMs)*time.Millisecond)
 	if err != nil {
-		return &pb.ClaimResponse{
-			Status: pb.Status_UNKNOWN,
-			Error:  err.Error(),
-		}, fmt.Errorf("failed to claim: %v", err)
+		return nil, status.Errorf(codes.Unknown, "failed to claim: %v", err)
 	}
-	return &pb.ClaimResponse{
-		Status: pb.Status_OK,
-		Task:   taskToProto(task),
-	}, nil
+	if task == nil {
+		return new(pb.ClaimResponse), nil
+	}
+	return &pb.ClaimResponse{Task: protoFromTask(task)}, nil
 }
 
+// Modify attempts to make the specified modification from the given
+// ModifyRequest. If all goes well, it returns a ModifyResponse. If the
+// modification fails due to a dependency error (one of the specified tasks was
+// not present), the gRPC status mechanism is invoked to return a status with
+// the details slice containing *pb.ModifyDep values. These could be used to
+// reconstruct an entroq.DependencyError, or directly to find out which IDs
+// caused the dependency failure. Code UNKNOWN is returned on other errors.
 func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyResponse, error) {
 	client := s.getClient()
 	defer s.returnClient(client)
 
 	claimant, err := uuid.Parse(req.ClaimantId)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse claimant ID: %v", err)
+		return nil, status.Errorf(codes.InvalidArgument, "failed to parse claimant ID: %v", err)
 	}
 	var modArgs []entroq.ModifyArg
 	for _, insert := range req.Inserts {
@@ -94,7 +159,7 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 	for _, change := range req.Changes {
 		id, err := uuid.Parse(change.GetOldId().Id)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse change id: %v", err)
+			return nil, status.Errorf(codes.InvalidArgument, "failed to parse change id: %v", err)
 		}
 		t := &entroq.Task{
 			ID:       id,
@@ -109,33 +174,51 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 	for _, delete := range req.Deletes {
 		id, err := uuid.Parse(delete.Id)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse deletion id: %v", err)
+			return nil, status.Errorf(codes.InvalidArgument, "failed to parse deletion id: %v", err)
 		}
 		modArgs = append(modArgs, entroq.Deleting(id, delete.Version))
 	}
 	for _, depend := range req.Depends {
 		id, err := uuid.Parse(depend.Id)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse dependency id: %v", err)
+			return nil, status.Errorf(codes.InvalidArgument, "failed to parse dependency id: %v", err)
 		}
 		modArgs = append(modArgs, entroq.DependingOn(id, depend.Version))
 	}
 	inserted, changed, err := client.Modify(ctx, claimant, modArgs...)
 	if err != nil {
-		// TODO: only return an error if there's no good information?
-		return &pb.ModifyResponse{
-			Status: pb.Status_UNKNOWN,
-			Error:  err.Error(),
-		}, fmt.Errorf("modification failed: %v", err)
+		if depErr, ok := err.(*entroq.DependencyError); ok {
+			tmap := map[pb.DepType][]*entroq.TaskID{
+				pb.DepType_DEPEND: depErr.Depends,
+				pb.DepType_DELETE: depErr.Deletes,
+				pb.DepType_CHANGE: depErr.Changes,
+				pb.DepType_CLAIM:  depErr.Claims,
+			}
+
+			var details []proto.Message
+			for dtype, dvals := range tmap {
+				for _, tid := range dvals {
+					details = append(details, &pb.ModifyDep{
+						Type: dtype,
+						Id:   &pb.TaskID{Id: tid.String(), Version: tid.Version},
+					})
+				}
+			}
+
+			stat, sErr := status.New(codes.NotFound, "modification dependency error").WithDetails(details...)
+			if sErr != nil {
+				return nil, status.Errorf(codes.NotFound, "dependency failed, and failed to add details. Both errors here: %v --- %v", err, sErr)
+			}
+			return nil, stat.Err()
+		}
+		return nil, status.Errorf(codes.Unknown, "modification failed: %v", err)
 	}
-	resp := &pb.ModifyResponse{
-		Status: pb.Status_OK,
-	}
+	resp := new(pb.ModifyResponse)
 	for _, task := range inserted {
-		resp.Inserted = append(resp.Inserted, taskToProto(task))
+		resp.Inserted = append(resp.Inserted, protoFromTask(task))
 	}
 	for _, task := range changed {
-		resp.Changed = append(resp.Changed, taskToProto(task))
+		resp.Changed = append(resp.Changed, protoFromTask(task))
 	}
 	return resp, nil
 }
@@ -148,23 +231,22 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 	if req.ClaimantId != "" {
 		var err error
 		if claimant, err = uuid.Parse(req.ClaimantId); err != nil {
-			return nil, fmt.Errorf("failed to parse claimant ID: %v", err)
+			return nil, status.Errorf(codes.InvalidArgument, "failed to parse claimant ID: %v", err)
 		}
 	}
 	// Claimant will only really be limited if it is non-Nil.
 	tasks, err := client.Tasks(ctx, req.Queue, entroq.LimitClaimant(claimant))
 	if err != nil {
-		return nil, fmt.Errorf("failed to get tasks: %v", err)
+		return nil, status.Errorf(codes.Unknown, "failed to get tasks: %v", err)
 	}
-	resp := &pb.TasksResponse{
-		Status: pb.Status_OK,
-	}
+	resp := new(pb.TasksResponse)
 	for _, task := range tasks {
-		resp.Tasks = append(resp.Tasks, taskToProto(task))
+		resp.Tasks = append(resp.Tasks, protoFromTask(task))
 	}
 	return resp, nil
 }
 
+// Queues returns a mapping from queue names to queue sizes.
 func (s *QSvc) Queues(ctx context.Context, _ *pb.QueuesRequest) (*pb.QueuesResponse, error) {
 	client := s.getClient()
 	defer s.returnClient(client)
@@ -173,9 +255,7 @@ func (s *QSvc) Queues(ctx context.Context, _ *pb.QueuesRequest) (*pb.QueuesRespo
 	if err != nil {
 		return nil, fmt.Errorf("failed to get queues: %v", err)
 	}
-	resp := &pb.QueuesResponse{
-		Status: pb.Status_OK,
-	}
+	resp := new(pb.QueuesResponse)
 	for name, count := range queueMap {
 		resp.Queues = append(resp.Queues, &pb.QueueStats{
 			Name:     name,
