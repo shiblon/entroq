@@ -95,21 +95,21 @@ func (b *backend) Queues(ctx context.Context) (map[string]int, error) {
 	return queues, nil
 }
 
-// Tasks returns a list of tasks in the given queue. If claimant is the zero value, returns all tasks.
-func (b *backend) Tasks(ctx context.Context, claimant uuid.UUID, queue string) ([]*entroq.Task, error) {
-	qdir := path.Join("task/queue", queue, "at")
+// Tasks returns a list of tasks in the given queue. If tq.Claimant is the zero value, returns all tasks.
+func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Task, error) {
+	qdir := path.Join("task/queue", tq.Queue, "at")
 
 	endKey := qdir + string('/'+1)
-	if claimant == uuid.Nil {
+	if tq.Claimant == uuid.Nil {
 		endKey = path.Join(qdir, time.Now().UTC().Format(tsFormat)+"\x00")
 	}
 
-	idResp, err := b.cli.Get(ctx, path.Join("task/queue", queue, "at/"),
+	idResp, err := b.cli.Get(ctx, path.Join("task/queue", tq.Queue, "at/"),
 		clientv3.WithRange(endKey),
 		clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("error getting task IDs for queue %q: %v", queue, err)
+		return nil, fmt.Errorf("error getting task IDs for queue %q: %v", tq.Queue, err)
 	}
 	var ids []uuid.UUID
 	for _, kv := range idResp.Kvs {
@@ -167,7 +167,7 @@ func queueCount(stm concurrency.STM, key string) (int, error) {
 }
 
 // Modify attempts to make an atomic batch modification to task storage.
-func (b *backend) Modify(ctx context.Context, claimant uuid.UUID, mod *entroq.Modification) (inserted []*entroq.Task, changed []*entroq.Task, err error) {
+func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserted []*entroq.Task, changed []*entroq.Task, err error) {
 	deps, err := mod.AllDependencies()
 	if err != nil {
 		return nil, nil, fmt.Errorf("modify failed: %v", err)
@@ -248,7 +248,7 @@ func (b *backend) Modify(ctx context.Context, claimant uuid.UUID, mod *entroq.Mo
 			task := &entroq.Task{
 				ID:       uuid.New(),
 				Version:  0,
-				Claimant: claimant,
+				Claimant: mod.Claimant,
 
 				Queue: td.Queue,
 				At:    td.At,
@@ -289,7 +289,7 @@ func (b *backend) Modify(ctx context.Context, claimant uuid.UUID, mod *entroq.Mo
 				Created: t.Created,
 
 				Version:  t.Version + 1,
-				Claimant: claimant,
+				Claimant: mod.Claimant,
 				Modified: now,
 			}
 			taskBytes, err := json.Marshal(task)
@@ -343,11 +343,11 @@ func (b *backend) Modify(ctx context.Context, claimant uuid.UUID, mod *entroq.Mo
 }
 
 // TryClaim attempts to claim an unclaimed and expired task from the given queue.
-func (b *backend) TryClaim(ctx context.Context, claimant uuid.UUID, queue string, duration time.Duration) (*entroq.Task, error) {
+func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
 	now := time.Now().UTC()
 
-	resp, err := b.cli.Get(ctx, qAtKey(queue, uuid.Nil, time.Time{}),
-		clientv3.WithRange(qAtKey(queue, uuid.Nil, now)),
+	resp, err := b.cli.Get(ctx, qAtKey(cq.Queue, uuid.Nil, time.Time{}),
+		clientv3.WithRange(qAtKey(cq.Queue, uuid.Nil, now)),
 		clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend),
 	)
 	if err != nil {
@@ -390,9 +390,9 @@ func (b *backend) TryClaim(ctx context.Context, claimant uuid.UUID, queue string
 		if err := json.Unmarshal([]byte(tstr), task); err != nil {
 			return nil, fmt.Errorf("json unmarshal failed for task %q: %v", id, err)
 		}
-		task.At = now.Add(duration)
+		task.At = now.Add(cq.Duration)
 		task.Modified = now
-		task.Claimant = claimant
+		task.Claimant = cq.Claimant
 
 		tbytes, err := json.Marshal(task)
 		if err != nil {
@@ -400,7 +400,7 @@ func (b *backend) TryClaim(ctx context.Context, claimant uuid.UUID, queue string
 		}
 		stm.Put(dataKey(id), string(tbytes))
 		stm.Del(qkey)
-		stm.Put(qAtKey(queue, task.ID, task.At), task.ID.String())
+		stm.Put(qAtKey(cq.Queue, task.ID, task.At), task.ID.String())
 
 		return task, nil
 	}

@@ -102,18 +102,18 @@ func (b *backend) Queues(ctx context.Context) (map[string]int, error) {
 }
 
 // Tasks returns a slice of all tasks in the given queue.
-func (b *backend) Tasks(ctx context.Context, claimant uuid.UUID, queue string) ([]*entroq.Task, error) {
-	values := []interface{}{queue}
+func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Task, error) {
+	values := []interface{}{tq.Queue}
 	q := "SELECT id, version, queue, at, created, modified, claimant, value FROM tasks WHERE queue = $1"
 
-	if claimant != uuid.Nil {
+	if tq.Claimant != uuid.Nil {
 		q += " AND (claimant = '00000000-0000-0000-0000-000000000000' OR claimant = $2 OR at < NOW())"
-		values = append(values, claimant)
+		values = append(values, tq.Claimant)
 	}
 
 	rows, err := b.db.QueryContext(ctx, q, values...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get tasks for queue %q: %v", queue, err)
+		return nil, fmt.Errorf("failed to get tasks for queue %q: %v", tq.Queue, err)
 	}
 	defer rows.Close()
 	var tasks []*entroq.Task
@@ -125,7 +125,7 @@ func (b *backend) Tasks(ctx context.Context, claimant uuid.UUID, queue string) (
 		tasks = append(tasks, t)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("task iteration failed for queue %q: %v", queue, err)
+		return nil, fmt.Errorf("task iteration failed for queue %q: %v", tq.Queue, err)
 	}
 	return tasks, nil
 }
@@ -133,9 +133,9 @@ func (b *backend) Tasks(ctx context.Context, claimant uuid.UUID, queue string) (
 // TryClaim attempts to claim an "arrived" task from the queue.
 // Returns an error if something goes wrong, a nil task if there is
 // nothing to claim.
-func (b *backend) TryClaim(ctx context.Context, claimant uuid.UUID, queue string, duration time.Duration) (*entroq.Task, error) {
+func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
 	task := new(entroq.Task)
-	if duration == 0 {
+	if cq.Duration == 0 {
 		return nil, fmt.Errorf("no duration set for claim")
 	}
 	err := b.db.QueryRowContext(ctx, `
@@ -155,7 +155,7 @@ func (b *backend) TryClaim(ctx context.Context, claimant uuid.UUID, queue string
 			modified = NOW()
 		WHERE id IN (SELECT id FROM topN ORDER BY random() LIMIT 1)
 		RETURNING id, version, queue, at, created, modified, claimant, value
-	`, queue, time.Now().Add(duration), claimant).Scan(
+	`, cq.Queue, time.Now().Add(cq.Duration), cq.Claimant).Scan(
 		&task.ID,
 		&task.Version,
 		&task.Queue,
@@ -174,9 +174,9 @@ func (b *backend) TryClaim(ctx context.Context, claimant uuid.UUID, queue string
 	return task, nil
 }
 
-// Modify attempts to apply an atomic modification to the task
-// store. Either all succeeds or all fails.
-func (b *backend) Modify(ctx context.Context, claimant uuid.UUID, mod *entroq.Modification) (inserted []*entroq.Task, changed []*entroq.Task, err error) {
+// Modify attempts to apply an atomic modification to the task store. Either
+// all succeeds or all fails.
+func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserted []*entroq.Task, changed []*entroq.Task, err error) {
 	tx, err := b.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to start transaction: %v", err)
@@ -203,7 +203,7 @@ func (b *backend) Modify(ctx context.Context, claimant uuid.UUID, mod *entroq.Mo
 
 	for _, td := range mod.Inserts {
 		columns := []string{"queue", "claimant", "value"}
-		values := []interface{}{td.Queue, claimant, td.Value}
+		values := []interface{}{td.Queue, mod.Claimant, td.Value}
 
 		if !td.At.IsZero() {
 			columns = append(columns, "at")

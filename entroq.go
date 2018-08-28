@@ -105,6 +105,40 @@ func (t *Task) Data() *TaskData {
 	}
 }
 
+// Copy copies this tasks data and everything.
+func (t *Task) Copy() *Task {
+	newT := new(Task)
+	*newT = *t
+	newT.Value = make([]byte, len(t.Value))
+	copy(newT.Value, t.Value)
+	return newT
+}
+
+// ClaimQuery contains information necessary to attempt to make a claim on a task in a specific queue.
+type ClaimQuery struct {
+	Queue    string        // The name of the queue to claim from.
+	Claimant uuid.UUID     // The ID of the process trying to make the claim.
+	Duration time.Duration // How long the task should be claimed for if successful.
+}
+
+func newClaimQuery(queue string, claimant uuid.UUID, duration time.Duration) *ClaimQuery {
+	return &ClaimQuery{
+		Queue:    queue,
+		Claimant: claimant,
+		Duration: duration,
+	}
+}
+
+// TasksQuery hholds information for a tasks query.
+type TasksQuery struct {
+	Queue    string
+	Claimant uuid.UUID
+}
+
+func newTasksQuery(queue string, claimant uuid.UUID) *TasksQuery {
+	return &TasksQuery{Queue: queue, Claimant: claimant}
+}
+
 // Backend describes all of the functions that any backend has to implement
 // to be used as the storage for task queues.
 type Backend interface {
@@ -114,16 +148,16 @@ type Backend interface {
 	// Tasks retrieves all tasks from the given queue. If claimantID is
 	// specified (non-zero), limits those tasks to those that are either
 	// expired or belong to the given claimant. Otherwise returns them all.
-	Tasks(ctx context.Context, claimant uuid.UUID, queue string) ([]*Task, error)
+	Tasks(ctx context.Context, tq *TasksQuery) ([]*Task, error)
 
 	// TryClaim attempts to claim a task from the "top" (or close to it) of the
 	// given queue. When claimed, a task is held for the duration specified
 	// from the time of the claim. If claiming until a specific wall-clock time
 	// is desired, the task should be immediately modified after it is claimed
-	// to set the AT to a specific time. Returns a nil task and a nil error if
+	// to set At to a specific time. Returns a nil task and a nil error if
 	// there is nothing to claim. Will fail if (optional) dependent tasks are
 	// not current.
-	TryClaim(ctx context.Context, claimant uuid.UUID, queue string, duration time.Duration) (*Task, error)
+	TryClaim(ctx context.Context, cq *ClaimQuery) (*Task, error)
 
 	// Modify attempts to atomically modify the task store, and only succeeds
 	// if all dependencies are available and all mutations are either expired
@@ -132,7 +166,7 @@ type Backend interface {
 	// function is intended to return a DependencyError if the transaction could
 	// not proceed because dependencies were missing or already claimed (and
 	// not expired) by another claimant.
-	Modify(ctx context.Context, claimant uuid.UUID, mod *Modification) (inserted []*Task, changed []*Task, err error)
+	Modify(ctx context.Context, mod *Modification) (inserted []*Task, changed []*Task, err error)
 
 	// Close closes any underlying connections. The backend is expected to take
 	// ownership of all such connections, so this cleans them up.
@@ -177,7 +211,7 @@ func (c *EntroQ) Tasks(ctx context.Context, queue string, opts ...TasksOpt) ([]*
 		opt(optVals)
 	}
 
-	return c.backend.Tasks(ctx, optVals.claimant, queue)
+	return c.backend.Tasks(ctx, newTasksQuery(queue, optVals.claimant))
 }
 
 type tasksOpts struct {
@@ -225,7 +259,7 @@ func (c *EntroQ) Claim(ctx context.Context, claimant uuid.UUID, q string, durati
 // TryClaimTask attempts one time to claim a task from the given queue. If there are no tasks, it
 // returns a nil error *and* a nil task. This allows the caller to decide whether to retry. It can fail if certain (optional) dependency tasks are not present. This can be used, for example, to ensure that configuration tasks haven't changed.
 func (c *EntroQ) TryClaim(ctx context.Context, claimant uuid.UUID, q string, duration time.Duration) (*Task, error) {
-	return c.backend.TryClaim(ctx, claimant, q, duration)
+	return c.backend.TryClaim(ctx, newClaimQuery(q, claimant, duration))
 }
 
 // Modify allows a batch modification operation to be done, gated on the
@@ -236,12 +270,12 @@ func (c *EntroQ) TryClaim(ctx context.Context, claimant uuid.UUID, q string, dur
 // was due to missing dependencies, a *DependencyError is returned, which can be checked for
 // by calling IsDependency(err).
 func (c *EntroQ) Modify(ctx context.Context, claimant uuid.UUID, modArgs ...ModifyArg) (inserted []*Task, changed []*Task, err error) {
-	mod := newModification(claimant)
+	mod := NewModification(claimant)
 	for _, arg := range modArgs {
 		arg(mod)
 	}
 
-	return c.backend.Modify(ctx, claimant, mod)
+	return c.backend.Modify(ctx, mod)
 }
 
 // ModifyArg is an argument to the Modify function, which does batch modifications to the task store.
@@ -374,8 +408,9 @@ func ValueTo(v []byte) ChangeArg {
 
 // modification contains all of the information for a single batch modification in the task store.
 type Modification struct {
-	claimant uuid.UUID
-	now      time.Time
+	now time.Time
+
+	Claimant uuid.UUID
 
 	Inserts []*TaskData
 	Changes []*Task
@@ -383,8 +418,11 @@ type Modification struct {
 	Depends []*TaskID
 }
 
-func newModification(claimant uuid.UUID) *Modification {
-	return &Modification{claimant: claimant, now: time.Now()}
+func NewModification(claimant uuid.UUID) *Modification {
+	return &Modification{
+		Claimant: claimant,
+		now:      time.Now(),
+	}
 }
 
 // modDependencies returns a dependency map for all modified dependencies
@@ -425,7 +463,7 @@ func (m *Modification) AllDependencies() (map[uuid.UUID]int32, error) {
 
 func (m *Modification) otherwiseClaimed(task *Task) bool {
 	var zeroUUID uuid.UUID
-	return task.At.After(m.now) && task.Claimant != zeroUUID && task.Claimant != m.claimant
+	return task.At.After(m.now) && task.Claimant != zeroUUID && task.Claimant != m.Claimant
 }
 
 func (m *Modification) badChanges(foundDeps map[uuid.UUID]*Task) (missing []*TaskID, claimed []*TaskID) {
