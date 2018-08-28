@@ -17,14 +17,56 @@ func escp(p string) string {
 	return strings.NewReplacer("=", "\\=", " ", "__").Replace(p)
 }
 
-// Opener creates an opener function to be used to get a backend.
-func Opener(hostPort, db, user, pwd string, ssl bool) entroq.BackendOpener {
-	sslMode := "disable"
-	if ssl {
-		sslMode = "verify-full"
+type pgOptions struct {
+	db       string
+	user     string
+	password string
+}
+
+// PGOpt sets an option for the opener.
+type PGOpt func(opts *pgOptions)
+
+// WithUsername changes the username this database will use to connect.
+func WithUsername(name string) PGOpt {
+	return func(opts *pgOptions) {
+		opts.user = name
 	}
+}
+
+// WithPassword sets the connection password.
+func WithPassword(pwd string) PGOpt {
+	return func(opts *pgOptions) {
+		opts.password = pwd
+	}
+}
+
+// WithDB changes the name of the database to connect to.
+func WithDB(db string) PGOpt {
+	return func(opts *pgOptions) {
+		opts.db = db
+	}
+}
+
+// Opener creates an opener function to be used to get a backend.
+func Opener(hostPort string, opts ...PGOpt) entroq.BackendOpener {
+	// Set up some defaults, then apply given options.
+	options := &pgOptions{
+		db:       "postgres",
+		user:     "postgres",
+		password: "postgres",
+	}
+	for _, o := range opts {
+		o(options)
+	}
+
+	// TODO: allow setting of sslmode?
 	return func(ctx context.Context) (entroq.Backend, error) {
-		db, err := sql.Open("postgres", fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=%s", escp(user), escp(pwd), hostPort, escp(db), sslMode))
+		connStr := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable",
+			escp(options.user),
+			escp(options.password),
+			hostPort,
+			escp(options.db))
+		db, err := sql.Open("postgres", connStr)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open postgres DB: %v", err)
 		}
@@ -56,19 +98,18 @@ func (b *backend) Close() error {
 // extensions to work as a task queue backend.
 func (b *backend) initDB(ctx context.Context) error {
 	_, err := b.db.ExecContext(ctx, `
-		CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 		CREATE TABLE IF NOT EXISTS tasks (
-		  id UUID PRIMARY KEY NOT NULL DEFAULT UUID_GENERATE_V4(),
+		  id UUID PRIMARY KEY NOT NULL,
 		  version INTEGER NOT NULL DEFAULT 0,
 		  queue TEXT NOT NULL DEFAULT '',
-		  at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-		  created TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-		  modified TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+		  at TIMESTAMP WITH TIME ZONE NOT NULL,
+		  created TIMESTAMP WITH TIME ZONE,
+		  modified TIMESTAMP WITH TIME ZONE NOT NULL,
 		  claimant UUID,
 		  value BYTEA
 		);
 		CREATE INDEX IF NOT EXISTS byQueue ON tasks (queue);
-		CREATE INDEX IF NOT EXISTS byQueueAT ON tasks (queue, at);
+		CREATE INDEX IF NOT EXISTS byQueueAt ON tasks (queue, at);
 	`)
 	if err != nil {
 		return fmt.Errorf("failed to create (or reuse) tasks table: %v", err)
@@ -107,8 +148,8 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 	q := "SELECT id, version, queue, at, created, modified, claimant, value FROM tasks WHERE queue = $1"
 
 	if tq.Claimant != uuid.Nil {
-		q += " AND (claimant = '00000000-0000-0000-0000-000000000000' OR claimant = $2 OR at < NOW())"
-		values = append(values, tq.Claimant)
+		q += " AND (claimant = $2 OR claimant = $3 OR at < NOW())"
+		values = append(values, uuid.Nil.String(), tq.Claimant)
 	}
 
 	rows, err := b.db.QueryContext(ctx, q, values...)
@@ -138,24 +179,25 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 	if cq.Duration == 0 {
 		return nil, fmt.Errorf("no duration set for claim")
 	}
+	now := time.Now()
 	err := b.db.QueryRowContext(ctx, `
 		WITH topN AS (
 			SELECT * FROM tasks
 			WHERE
 				queue = $1 AND
-				at <= NOW()
+				at <= $2
 			ORDER BY at, version, id ASC
 			LIMIT 10
 		)
 		UPDATE tasks
 		SET
 			version=version+1,
-			at = $2,
-			claimant = $3,
-			modified = NOW()
+			at = $3,
+			claimant = $4,
+			modified = $5
 		WHERE id IN (SELECT id FROM topN ORDER BY random() LIMIT 1)
 		RETURNING id, version, queue, at, created, modified, claimant, value
-	`, cq.Queue, time.Now().Add(cq.Duration), cq.Claimant).Scan(
+	`, cq.Queue, now, now.Add(cq.Duration), cq.Claimant, now).Scan(
 		&task.ID,
 		&task.Version,
 		&task.Queue,
@@ -177,6 +219,7 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 // Modify attempts to apply an atomic modification to the task store. Either
 // all succeeds or all fails.
 func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserted []*entroq.Task, changed []*entroq.Task, err error) {
+	now := time.Now()
 	tx, err := b.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to start transaction: %v", err)
@@ -201,37 +244,6 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 	// Once we get here, we know that all of the dependencies were present.
 	// These should now all succeed.
 
-	for _, td := range mod.Inserts {
-		columns := []string{"queue", "claimant", "value"}
-		values := []interface{}{td.Queue, mod.Claimant, td.Value}
-
-		if !td.At.IsZero() {
-			columns = append(columns, "at")
-			values = append(values, td.At)
-		}
-
-		var placeholders []string
-		for i := range columns {
-			placeholders = append(placeholders, fmt.Sprintf("$%d", i+1))
-		}
-
-		q := "INSERT INTO tasks (" + strings.Join(columns, ", ") + ") VALUES (" + strings.Join(placeholders, ", ") + ") RETURNING id, version, queue, at, claimant, value, created, modified"
-		t := new(entroq.Task)
-		if err := tx.QueryRowContext(ctx, q, values...).Scan(
-			&t.ID,
-			&t.Version,
-			&t.Queue,
-			&t.At,
-			&t.Claimant,
-			&t.Value,
-			&t.Created,
-			&t.Modified,
-		); err != nil {
-			return nil, nil, fmt.Errorf("insert failed in queue %q: %v", td.Queue, err)
-		}
-		inserted = append(inserted, t)
-	}
-
 	for _, tid := range mod.Deletes {
 		q := "DELETE FROM tasks WHERE id = $1 AND version = $2"
 		if _, err := tx.ExecContext(ctx, q, tid.ID, tid.Version); err != nil {
@@ -239,21 +251,35 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 		}
 	}
 
-	for _, t := range mod.Changes {
-		q := `UPDATE tasks SET
-				version = version + 1,
-				modified = NOW(),
-				queue = $1,
-				at = $2,
-				value = $3
-			WHERE id = $4 AND version = $5
-			RETURNING id, version, queue, at, claimant, modified, created, value`
-		nt := new(entroq.Task)
-		row := tx.QueryRowContext(ctx, q, t.Queue, t.At, t.Value, t.ID, t.Version)
-		if err := row.Scan(&nt.ID, &nt.Version, &nt.Queue, &nt.At, &nt.Claimant, &nt.Modified, &nt.Created, &nt.Value); err != nil {
-			return nil, nil, fmt.Errorf("scan failed for newly-changed task %q: %v", t.ID, err)
+	for _, ins := range mod.Inserts {
+		at := ins.At
+		if at.IsZero() {
+			at = now
 		}
-		changed = append(changed, nt)
+
+		t := new(entroq.Task)
+		row := tx.QueryRowContext(ctx, `
+			INSERT INTO tasks (id, version, queue, at, claimant, value, created, modified)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			RETURNING id, version, queue, at, claimant, value, created, modified
+		`, uuid.New(), 0, ins.Queue, at, mod.Claimant, ins.Value, now, now)
+		if err := row.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Claimant, &t.Value, &t.Created, &t.Modified); err != nil {
+			return nil, nil, fmt.Errorf("insert failed in queue %q: %v", ins.Queue, err)
+		}
+		inserted = append(inserted, t)
+	}
+
+	for _, chg := range mod.Changes {
+		t := new(entroq.Task)
+		row := tx.QueryRowContext(ctx, `
+			UPDATE tasks SET version = version + 1, modified = $1, queue = $2, at = $3, value = $4
+			WHERE id = $5 AND version = $6
+			RETURNING id, version, queue, at, claimant, modified, created, value
+		`, now, chg.Queue, chg.At, chg.Value, chg.ID, chg.Version)
+		if err := row.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Claimant, &t.Modified, &t.Created, &t.Value); err != nil {
+			return nil, nil, fmt.Errorf("scan failed for newly-changed task %q: %v", chg.ID, err)
+		}
+		changed = append(changed, t)
 	}
 
 	return inserted, changed, nil

@@ -46,25 +46,47 @@ import (
 	pb "github.com/shiblon/entroq/qsvc/proto"
 )
 
-const DefaultConnections = 10
-
 // QSvc is an EntroQServer.
 type QSvc struct {
 	pool chan *entroq.EntroQ
+}
+
+type svcOptions struct {
+	connections int
+}
+
+// QSvcOpt sets an option for the queue service.
+type QSvcOpt func(opts *svcOptions)
+
+// WithConnections sets the maximum connections (sets to 1 if < 1 or not present).
+func WithConnections(n int) QSvcOpt {
+	return func(opts *svcOptions) {
+		if n < 1 {
+			n = 1
+		}
+		opts.connections = n
+	}
 }
 
 // New creates a new service that exposes gRPC endpoints for task queue access.
 // It load balances across connections (presumably attached to a specific
 // persistent backend) using round robin in order of descending "time not
 // busy". The specified opener is used to select the backend type and pass
-// parameters to it. If connections is less than 1, it is set to
-// DefaultConnections.
-func New(ctx context.Context, opener entroq.BackendOpener, connections int) (svc *QSvc, err error) {
-	if connections < 1 {
-		connections = DefaultConnections
+// parameters to it. If connections is less than 1, it is set to 1. This is an
+// important default because some implementations might *only* ever allow 1
+// connection, and you need to know what you're doing anytime you set this
+// higher (you need to know, for example, whether the backend can handle
+// multiple clients---something like an in-memory backend certainly can't).
+func New(ctx context.Context, opener entroq.BackendOpener, opts ...QSvcOpt) (svc *QSvc, err error) {
+	options := &svcOptions{
+		connections: 1,
 	}
+	for _, o := range opts {
+		o(options)
+	}
+
 	svc = &QSvc{
-		pool: make(chan *entroq.EntroQ, connections),
+		pool: make(chan *entroq.EntroQ, options.connections),
 	}
 	defer func() {
 		if err != nil {
@@ -75,7 +97,7 @@ func New(ctx context.Context, opener entroq.BackendOpener, connections int) (svc
 			}
 		}
 	}()
-	for i := 0; i < connections; i++ {
+	for i := 0; i < options.connections; i++ {
 		cli, err := entroq.New(ctx, opener)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create backend client: %v", err)
