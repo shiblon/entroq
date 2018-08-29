@@ -88,18 +88,13 @@ func New(ctx context.Context, opener entroq.BackendOpener, opts ...QSvcOpt) (svc
 	svc = &QSvc{
 		pool: make(chan *entroq.EntroQ, options.connections),
 	}
-	defer func() {
+	for i := 0; i < options.connections; i++ {
+		cli, err := entroq.New(ctx, opener)
 		if err != nil {
-			// We got an error - close backend connections cleanly if we can.
 			close(svc.pool)
 			for c := range svc.pool {
 				c.Close()
 			}
-		}
-	}()
-	for i := 0; i < options.connections; i++ {
-		cli, err := entroq.New(ctx, opener)
-		if err != nil {
 			return nil, fmt.Errorf("failed to create backend client: %v", err)
 		}
 		svc.pool <- cli

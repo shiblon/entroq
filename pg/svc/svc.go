@@ -21,6 +21,7 @@ import (
 var (
 	port       = flag.Int("port", 37706, "Listening port for EntroQ service")
 	backends   = flag.Int("backends", 10, "Number of backend connections to maintain")
+	dbAddr     = flag.String("dbaddr", "localhost:5432", "Database host address.")
 	dbName     = flag.String("dbname", "postgres", "Database name housing tasks.")
 	dbUser     = flag.String("dbuser", "postgres", "Database user name.")
 	dbPassword = flag.String("dbpwd", "postgres", "Database password.")
@@ -30,19 +31,18 @@ func main() {
 	flag.Parse()
 	ctx := context.Background()
 
-	lis, err := net.Listen("tcp", fmt.Sprintf("[::]:%d", *port))
-	if err != nil {
-		log.Fatalf("Error listening on port %d: %v", *port, err)
-	}
-
-	hostPort := fmt.Sprintf(":%d", *port)
-	svc, err := qsvc.New(ctx, pg.Opener(hostPort,
+	svc, err := qsvc.New(ctx, pg.Opener(*dbAddr,
 		pg.WithDB(*dbName),
 		pg.WithUsername(*dbUser),
 		pg.WithPassword(*dbPassword),
 	), qsvc.WithConnections(*backends))
 	if err != nil {
 		log.Fatalf("Failed to open backend for qsvc: %v", err)
+	}
+
+	lis, err := net.Listen("tcp", fmt.Sprintf("[::]:%d", *port))
+	if err != nil {
+		log.Fatalf("Error listening on port %d: %v", *port, err)
 	}
 
 	s := grpc.NewServer()
