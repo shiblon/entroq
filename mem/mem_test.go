@@ -18,7 +18,7 @@ import (
 	pb "github.com/shiblon/entroq/qsvc/proto"
 )
 
-func TestTryClaim(t *testing.T) {
+func TestSimpleSequence(t *testing.T) {
 	ctx := context.Background()
 
 	conn := mustConn(ctx)
@@ -91,6 +91,37 @@ func TestTryClaim(t *testing.T) {
 	if at0, at1 := modGot.Inserted[0].AtMs, modGot.Inserted[1].AtMs; at1-at0 != 100 {
 		t.Fatalf("Wanted At difference to be %d, got %d: protos\nWant\n%v\nGot\n%v",
 			100, at1-at0, proto.MarshalTextString(modWant), proto.MarshalTextString(modGot))
+	}
+
+	// Get queues.
+	queuesWant := &pb.QueuesResponse{
+		Queues: []*pb.QueueStats{
+			{Name: queue,
+				NumTasks: 2,
+			},
+		},
+	}
+	queuesGot, err := client.Queues(ctx, &pb.QueuesRequest{})
+	if err != nil {
+		t.Fatalf("Getting queues failed: %v", err)
+	}
+	if !proto.Equal(queuesWant, queuesGot) {
+		t.Fatalf("Wanted queues response\n%v\nGot\n%v", proto.MarshalTextString(queuesWant), proto.MarshalTextString(queuesGot))
+	}
+
+	// Get all tasks.
+	tasksGot, err := client.Tasks(ctx, &pb.TasksRequest{Queue: queue})
+	if err != nil {
+		t.Fatalf("Tasks call failed after insertions: %v", err)
+	}
+	if len(tasksGot.Tasks) != 2 {
+		t.Fatalf("Didn't find two tasks when expected: %v", proto.MarshalTextString(tasksGot))
+	}
+	if err := equalTasks(insTask1, tasksGot.Tasks[0], 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := equalTasks(insTask2, tasksGot.Tasks[1], 0); err != nil {
+		t.Fatal(err)
 	}
 
 	// Claim ready task.
