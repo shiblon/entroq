@@ -55,7 +55,7 @@ func main() {
 	}
 	defer etcdClient.Close()
 
-	pgClient, err := entroq.New(ctx, pg.Opener("localhost", pg.WithPassword("password")))
+	pgClient, err := entroq.New(ctx, pg.Opener("localhost:5432", pg.WithPassword("password")))
 	if err != nil {
 		log.Fatalf("Failed to create pgClient: %v", err)
 	}

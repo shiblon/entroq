@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -53,7 +54,7 @@ func Opener(hostPort string, opts ...PGOpt) entroq.BackendOpener {
 	options := &pgOptions{
 		db:       "postgres",
 		user:     "postgres",
-		password: "postgres",
+		password: "password",
 	}
 	for _, o := range opts {
 		o(options)
@@ -70,7 +71,23 @@ func Opener(hostPort string, opts ...PGOpt) entroq.BackendOpener {
 		if err != nil {
 			return nil, fmt.Errorf("failed to open postgres DB: %v", err)
 		}
-		return New(ctx, db)
+		b, err := New(ctx, db)
+		for i := 0; i < 5; i++ {
+			if err == io.EOF {
+				select {
+				case <-time.After(5 * time.Second):
+					b, err = New(ctx, db)
+					continue
+				case <-ctx.Done():
+					return nil, fmt.Errorf("context canceled")
+				}
+			}
+			if err != nil {
+				return nil, fmt.Errorf("new postgres backend: %v", err)
+			}
+			return b, nil
+		}
+		return nil, fmt.Errorf("time out postgres init")
 	}
 }
 
@@ -82,10 +99,13 @@ type backend struct {
 func New(ctx context.Context, db *sql.DB) (*backend, error) {
 	b := &backend{db: db}
 
-	if err := b.initDB(ctx); err != nil {
+	err := b.initDB(ctx)
+	if err == io.EOF {
+		return nil, io.EOF
+	}
+	if err != nil {
 		return nil, fmt.Errorf("failed to initialize database: %v", err)
 	}
-
 	return b, nil
 }
 
@@ -111,10 +131,7 @@ func (b *backend) initDB(ctx context.Context) error {
 		CREATE INDEX IF NOT EXISTS byQueue ON tasks (queue);
 		CREATE INDEX IF NOT EXISTS byQueueAt ON tasks (queue, at);
 	`)
-	if err != nil {
-		return fmt.Errorf("failed to create (or reuse) tasks table: %v", err)
-	}
-	return nil
+	return err
 }
 
 // Queues returns a mapping from queue names to task counts within them.
