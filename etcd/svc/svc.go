@@ -34,6 +34,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to open backend for qsvc: %v", err)
 	}
+	defer svc.Close()
 
 	s := grpc.NewServer()
 	pb.RegisterEntroQServer(s, svc)

@@ -39,6 +39,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to open backend for qsvc: %v", err)
 	}
+	defer svc.Close()
 
 	lis, err := net.Listen("tcp", fmt.Sprintf("[::]:%d", *port))
 	if err != nil {

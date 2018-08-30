@@ -7,10 +7,11 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/proto"
+	"github.com/google/go-cmp/cmp"
 	"github.com/google/uuid"
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/qsvc"
@@ -22,8 +23,8 @@ import (
 
 const bufSize = 1 << 20
 
-// Conner returns a grpc connection.
-type Dialer func(ctx context.Context) (*grpc.ClientConn, error)
+// Dialer returns a net connection.
+type Dialer func() (net.Conn, error)
 
 // StartService starts an in-memory gRPC network service and returns a function for creating client connections to it.
 func StartService(ctx context.Context, opener entroq.BackendOpener) (*grpc.Server, Dialer, error) {
@@ -36,21 +37,15 @@ func StartService(ctx context.Context, opener entroq.BackendOpener) (*grpc.Serve
 	pb.RegisterEntroQServer(s, svc)
 	go s.Serve(lis)
 
-	return s, func(ctx context.Context) (*grpc.ClientConn, error) {
-		return grpc.DialContext(ctx, "bufnet",
-			grpc.WithInsecure(),
-			grpc.WithDialer(func(string, time.Duration) (net.Conn, error) {
-				return lis.Dial()
-			}))
-	}, nil
+	return s, lis.Dial, nil
 }
 
 // SimpleSequence tests some basic functionality of a task manager, over gRPC.
-func SimpleSequence(ctx context.Context, t *testing.T, client pb.EntroQClient) {
+func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ) {
 	t.Helper()
 
 	myID := uuid.New()
-	nowMS := time.Now().UnixNano() / int64(time.Millisecond)
+	now := time.Now()
 
 	sleep := func(d time.Duration) {
 		select {
@@ -63,192 +58,153 @@ func SimpleSequence(ctx context.Context, t *testing.T, client pb.EntroQClient) {
 	const queue = "/test/TryClaim"
 
 	// Claim from empty queue.
-	claimResp, err := client.TryClaim(ctx, &pb.ClaimRequest{
-		ClaimantId: myID.String(),
-		Queue:      queue,
-		DurationMs: 100,
-	})
+	task, err := client.TryClaim(ctx, myID, queue, 100*time.Millisecond)
 	if err != nil {
 		t.Fatalf("Got unexpected error for claiming from an empty queue: %v", err)
 	}
-	if claimResp.Task != nil {
-		t.Fatalf("Got unexpected non-nil claim response from empty queue:\n%v", proto.MarshalTextString(claimResp))
+	if task != nil {
+		t.Fatalf("Got unexpected non-nil claim response from empty queue:\n%s", task)
 	}
 
-	dataFromTask := func(task *pb.Task) *pb.TaskData {
-		td := &pb.TaskData{
-			Queue: task.Queue,
-			AtMs:  task.AtMs,
-			Value: make([]byte, len(task.Value)),
-		}
-		copy(td.Value, task.Value)
-		return td
+	insWant := []*entroq.Task{
+		{
+			Queue:    queue,
+			At:       now,
+			Value:    []byte("hello"),
+			Claimant: myID,
+		},
+		{
+			Queue:    queue,
+			At:       now.Add(100 * time.Millisecond),
+			Value:    []byte("there"),
+			Claimant: myID,
+		},
+	}
+	var insData []*entroq.TaskData
+	for _, task := range insWant {
+		insData = append(insData, task.Data())
 	}
 
-	insTask1 := &pb.Task{
-		Queue:      queue,
-		AtMs:       nowMS,
-		Value:      []byte("hello"),
-		ClaimantId: myID.String(),
-	}
-
-	insTask2 := &pb.Task{
-		Queue:      queue,
-		AtMs:       nowMS + 100,
-		Value:      []byte("there"),
-		ClaimantId: myID.String(),
-	}
-
-	// Insert two tasks.
-	modWant := &pb.ModifyResponse{Inserted: []*pb.Task{insTask1, insTask2}}
-	modGot, err := client.Modify(ctx, &pb.ModifyRequest{
-		ClaimantId: myID.String(),
-		Inserts:    []*pb.TaskData{dataFromTask(insTask1), dataFromTask(insTask2)},
-	})
+	inserted, changed, err := client.Modify(ctx, myID, entroq.Inserting(insData...))
 	if err != nil {
 		t.Fatalf("Got unexpected error inserting two tasks: %v", err)
 	}
-	if err := equalModify(modWant, modGot, 0); err != nil {
-		t.Fatal(err)
+	if changed != nil {
+		t.Fatalf("Got unexpected changes during insertion: %v", err)
+	}
+	if diff := EqualAllTasks(insWant, inserted); diff != "" {
+		t.Fatalf("Modify tasks unexpected result, ignoring ID and time fields (-want +got):\n%v", diff)
 	}
 	// Also check that their arrival times are 100 ms apart as expected:
-	if at0, at1 := modGot.Inserted[0].AtMs, modGot.Inserted[1].AtMs; at1-at0 != 100 {
-		t.Fatalf("Wanted At difference to be %d, got %d: protos\nWant\n%v\nGot\n%v",
-			100, at1-at0, proto.MarshalTextString(modWant), proto.MarshalTextString(modGot))
+	if diff := inserted[1].At.Sub(inserted[0].At); diff != 100*time.Millisecond {
+		t.Fatalf("Wanted At difference to be %v, got %v", 100*time.Millisecond, diff)
 	}
 
 	// Get queues.
-	queuesWant := &pb.QueuesResponse{
-		Queues: []*pb.QueueStats{
-			{Name: queue,
-				NumTasks: 2,
-			},
-		},
-	}
-	queuesGot, err := client.Queues(ctx, &pb.QueuesRequest{})
+	queuesWant := map[string]int{queue: 2}
+	queuesGot, err := client.Queues(ctx)
 	if err != nil {
 		t.Fatalf("Getting queues failed: %v", err)
 	}
-	if !proto.Equal(queuesWant, queuesGot) {
-		t.Fatalf("Wanted queues response\n%v\nGot\n%v", proto.MarshalTextString(queuesWant), proto.MarshalTextString(queuesGot))
+	if diff := cmp.Diff(queuesWant, queuesGot); diff != "" {
+		t.Fatalf("Queues (-want +got):\n%v", diff)
 	}
 
 	// Get all tasks.
-	tasksGot, err := client.Tasks(ctx, &pb.TasksRequest{Queue: queue})
+	tasksGot, err := client.Tasks(ctx, queue)
 	if err != nil {
 		t.Fatalf("Tasks call failed after insertions: %v", err)
 	}
-	if len(tasksGot.Tasks) != 2 {
-		t.Fatalf("Didn't find two tasks when expected: %v", proto.MarshalTextString(tasksGot))
-	}
-	if err := equalTasks(insTask1, tasksGot.Tasks[0], 0); err != nil {
-		t.Fatal(err)
-	}
-	if err := equalTasks(insTask2, tasksGot.Tasks[1], 0); err != nil {
-		t.Fatal(err)
+	if diff := EqualAllTasks(insWant, tasksGot); diff != "" {
+		t.Fatalf("Tasks unexpected return, ignoring ID and time fields (-want +got):\n%v", diff)
 	}
 
 	// Claim ready task.
-	claimResp, err = client.TryClaim(ctx, &pb.ClaimRequest{
-		ClaimantId: myID.String(),
-		Queue:      queue,
-		DurationMs: 10000,
-	})
+	claimCtx, _ := context.WithTimeout(ctx, 10*time.Millisecond)
+	claimed, err := client.Claim(claimCtx, myID, queue, 10*time.Second)
+
 	if err != nil {
 		t.Fatalf("Got unexpected error for claiming from a queue with one ready task: %v", err)
 	}
-	if err := equalTasks(insTask1, claimResp.Task, 1); err != nil {
-		t.Fatalf("Tasks were not as expected when claiming from a queue with one ready task: %v", err)
+	if claimed == nil {
+		t.Fatalf("Unexpected nil result from blocking Claim")
 	}
-	// Also check that the arrival time is well into the future.
-	if got, lowerBound := claimResp.Task.AtMs, nowMS+10000; got < lowerBound {
-		t.Fatalf("Claiming a task, expected arrival time of at least %d, got %d", lowerBound, got)
+	if diff := EqualTasksVersionIncr(insWant[0], claimed, 1); diff != "" {
+		t.Fatalf("Claim tasks differ, ignoring ID and times:\n%v", diff)
 	}
-	if got, upperBound := claimResp.Task.AtMs, nowMS+12500; got > upperBound {
-		t.Fatalf("Expected arrival time at most %d, got %d", upperBound, got)
-	}
-	if claimResp.Task == nil {
-		t.Fatalf("Got unexpected nil claim response from queue with one ready task:\n%v", proto.MarshalTextString(claimResp))
+	if got, lower, upper := claimed.At, now.Add(9*time.Second), now.Add(11*time.Second); got.Before(lower) || got.After(upper) {
+		t.Fatalf("Claimed arrival time not in time bounds [%v, %v]: %v", lower, upper, claimed.At)
 	}
 
-	// Claim not ready task.
-	claimResp, err = client.TryClaim(ctx, &pb.ClaimRequest{
-		ClaimantId: myID.String(),
-		Queue:      queue,
-		DurationMs: 10000,
-	})
+	// TryClaim not ready task.
+	tryclaimed, err := client.TryClaim(ctx, myID, queue, 10*time.Second)
 	if err != nil {
 		t.Fatalf("Got unexpected error for claiming from a queue with no ready tasks: %v", err)
 	}
-	if claimResp.Task != nil {
-		t.Fatalf("Got unexpected non-nil claim response from a queue with no ready tasks:\n%v", proto.MarshalTextString(claimResp))
+	if tryclaimed != nil {
+		t.Fatalf("Got unexpected non-nil claim response from a queue with no ready tasks:\n%s", tryclaimed)
 	}
 
 	// Make sure the next claim will work.
 	sleep(100 * time.Millisecond)
-	claimResp, err = client.TryClaim(ctx, &pb.ClaimRequest{
-		ClaimantId: myID.String(),
-		Queue:      queue,
-		DurationMs: 5000,
-	})
+	tryclaimed, err = client.TryClaim(ctx, myID, queue, 5*time.Second)
 	if err != nil {
-		t.Fatalf("Got unexpected error for claiming from a queue with no ready tasks: %v", err)
+		t.Fatalf("Got unexpected error for claiming from a queue with one ready task: %v", err)
 	}
-	if err := equalTasks(insTask2, claimResp.Task, 1); err != nil {
-		t.Fatalf("Tasks were not as expected when claiming second task from queue: %v", err)
+	if diff := EqualTasksVersionIncr(insWant[1], tryclaimed, 1); diff != "" {
+		t.Fatalf("TryClaim got unexpected task, ignoring ID and time fields (-want +got):\n%v", diff)
 	}
-	if got, lowerBound := claimResp.Task.AtMs, nowMS+5000; got < lowerBound {
-		t.Fatalf("Expected arrival time at least %d, got %d", lowerBound, got)
-	}
-	if got, upperBound := claimResp.Task.AtMs, nowMS+7500; got > upperBound {
-		t.Fatalf("Expected arrival time at most %d, got %d", upperBound, got)
+	if got, lower, upper := tryclaimed.At, time.Now().Add(4*time.Second), time.Now().Add(6*time.Second); got.Before(lower) || got.After(upper) {
+		t.Fatalf("TryClaimed arrival time not in time bounds [%v, %v]: %v", lower, upper, tryclaimed.At)
 	}
 }
 
-func equalProto(want, got proto.Message) error {
-	if !proto.Equal(want, got) {
-		return fmt.Errorf("Wanted:\n%vGot:\n%v", proto.MarshalTextString(want), proto.MarshalTextString(got))
+// EqualAllTasks returns a string diff if any of the tasks in the lists are unequal.
+func EqualAllTasks(want, got []*entroq.Task) string {
+	if len(want) != len(got) {
+		return cmp.Diff(want, got)
 	}
-	return nil
-}
-
-func equalTasks(want, got proto.Message, versionChange int) error {
-	ta, tb := want.(*pb.Task), got.(*pb.Task)
-	if (ta == nil) != (tb == nil) {
-		return fmt.Errorf("Wanted equal tasks, but one is nil and one is not: want\n%v\ngot\n%v", proto.MarshalTextString(want), proto.MarshalTextString(got))
+	if len(want) == 0 {
+		return ""
 	}
-	if ta == nil {
-		return nil
-	}
-	if ta.Queue != tb.Queue ||
-		ta.Version+int32(versionChange) != tb.Version ||
-		ta.ClaimantId != tb.ClaimantId ||
-		!bytes.Equal(ta.Value, tb.Value) {
-		return fmt.Errorf("Wanted (ignoring id, at_ms, created_ms, and modified_ms):\n%vGot:\n%v",
-			proto.MarshalTextString(want), proto.MarshalTextString(got))
-	}
-	return nil
-}
-
-func equalModify(want, got proto.Message, modVersionChange int) error {
-	rWant, rGot := want.(*pb.ModifyResponse), got.(*pb.ModifyResponse)
-	if w, g := len(rWant.Inserted), len(rGot.Inserted); w != g {
-		return fmt.Errorf("Wanted %d inserted, got %d", w, g)
-	}
-	if w, g := len(rWant.Changed), len(rGot.Changed); w != g {
-		return fmt.Errorf("Wanted %d changed, got %d", w, g)
-	}
-	for i, insWant := range rWant.Inserted {
-		insGot := rGot.Inserted[i]
-		if err := equalTasks(insWant, insGot, 0); err != nil {
-			return fmt.Errorf("in insertion:\n%v", err)
+	var diffs []string
+	for i, w := range want {
+		g := got[i]
+		if w.Queue != g.Queue || w.Claimant != g.Claimant || !bytes.Equal(w.Value, g.Value) {
+			diffs = append(diffs, cmp.Diff(w, g))
 		}
 	}
-	for i, chgWant := range rWant.Changed {
-		chgGot := rGot.Changed[i]
-		if err := equalTasks(chgWant, chgGot, modVersionChange); err != nil {
-			return fmt.Errorf("in change:\n%v", err)
+	if len(diffs) != 0 {
+		return strings.Join(diffs, "\n")
+	}
+	return ""
+}
+
+// EqualAllTasksVersionIncr returns a non-empty diff if any of the tasks are
+// unequal, taking a version increment into account for the 'got' tasks.
+func EqualAllTasksVersionIncr(want, got []*entroq.Task, versionBump int) string {
+	if diff := EqualAllTasks(want, got); diff != "" {
+		return diff
+	}
+	var diffs []string
+	for i, w := range want {
+		g := got[i]
+		if w.Version+int32(versionBump) != g.Version {
+			diffs = append(diffs, cmp.Diff(g, w))
 		}
 	}
-	return nil
+	if len(diffs) != 0 {
+		return strings.Join(diffs, "\n")
+	}
+	return ""
+}
+
+// Checks for task equality, ignoring ID, Version, and all time fields.
+func EqualTasks(want, got *entroq.Task) string {
+	return EqualAllTasks([]*entroq.Task{want}, []*entroq.Task{got})
+}
+
+// EqualTasksVersionIncr checks for equality, allowing a version increment.
+func EqualTasksVersionIncr(want, got *entroq.Task, versionBump int) string {
+	return EqualAllTasksVersionIncr([]*entroq.Task{want}, []*entroq.Task{got}, versionBump)
 }

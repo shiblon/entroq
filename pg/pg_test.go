@@ -5,15 +5,19 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
-	pb "github.com/shiblon/entroq/qsvc/proto"
+	"github.com/shiblon/entroq"
+	grpcbackend "github.com/shiblon/entroq/grpc"
 	"github.com/shiblon/entroq/qsvc/test"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc"
 
 	_ "github.com/lib/pq"
 )
@@ -103,9 +107,9 @@ func TestSimpleSequence(t *testing.T) {
 	}
 	defer pgStop()
 
-	hostPort := fmt.Sprintf("localhost:%v", pgPort)
+	pgHostPort := fmt.Sprintf("localhost:%v", pgPort)
 
-	server, dial, err := test.StartService(ctx, Opener(hostPort,
+	server, dial, err := test.StartService(ctx, Opener(pgHostPort,
 		WithDB("postgres"),
 		WithUsername("postgres"),
 		WithPassword("password")))
@@ -114,11 +118,15 @@ func TestSimpleSequence(t *testing.T) {
 	}
 	defer server.Stop()
 
-	conn, err := dial(ctx)
+	client, err := entroq.New(ctx, grpcbackend.Opener("bufnet",
+		grpc.WithDialer(func(string, time.Duration) (net.Conn, error) {
+			return dial()
+		}),
+		grpc.WithInsecure()))
 	if err != nil {
-		t.Fatalf("Could not dial: %v", err)
+		t.Fatalf("Open client: %v", err)
 	}
-	defer conn.Close()
+	defer client.Close()
 
-	test.SimpleSequence(ctx, t, pb.NewEntroQClient(conn))
+	test.SimpleSequence(ctx, t, client)
 }
