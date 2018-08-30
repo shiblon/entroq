@@ -35,6 +35,7 @@ package qsvc
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/golang/protobuf/proto"
@@ -48,7 +49,19 @@ import (
 
 // QSvc is an EntroQServer.
 type QSvc struct {
-	pool chan *entroq.EntroQ
+	sync.Mutex
+
+	pool  chan *entroq.EntroQ
+	inUse map[*entroq.EntroQ]bool
+}
+
+func lock(mu sync.Locker) sync.Locker {
+	mu.Lock()
+	return mu
+}
+
+func un(mu sync.Locker) {
+	mu.Unlock()
 }
 
 type svcOptions struct {
@@ -86,20 +99,40 @@ func New(ctx context.Context, opener entroq.BackendOpener, opts ...QSvcOpt) (svc
 	}
 
 	svc = &QSvc{
-		pool: make(chan *entroq.EntroQ, options.connections),
+		pool:  make(chan *entroq.EntroQ, options.connections),
+		inUse: make(map[*entroq.EntroQ]bool),
 	}
 	for i := 0; i < options.connections; i++ {
 		cli, err := entroq.New(ctx, opener)
 		if err != nil {
-			close(svc.pool)
-			for c := range svc.pool {
-				c.Close()
-			}
-			return nil, fmt.Errorf("failed to create backend client: %v", err)
+			svc.Close()
+			return nil, fmt.Errorf("qsvc backend client: %v", err)
 		}
 		svc.pool <- cli
 	}
 	return svc, nil
+}
+
+// Close closes the backend connections and flushes the connection pool.
+func (s *QSvc) Close() error {
+	defer un(lock(s))
+
+	// Close the connection pool, close all connections in it.
+	close(s.pool)
+	for q := range s.pool {
+		q.Close()
+	}
+	// Ensure that sending blocks instead of panicking.
+	s.pool = nil
+
+	// Also close (even if they're busy) all connections that are in use.
+	// This can cause outstanding operations to error out, and that's fine.
+	// Ideally this won't be called while operations are outstanding, but
+	// it's important that we handle that case.
+	for q := range s.inUse {
+		q.Close()
+	}
+	return nil
 }
 
 func fromMS(ms int64) time.Time {
@@ -123,18 +156,44 @@ func protoFromTask(t *entroq.Task) *pb.Task {
 	}
 }
 
-func (s *QSvc) getClient() *entroq.EntroQ {
-	return <-s.pool
+func (s *QSvc) getClient() (*entroq.EntroQ, error) {
+	defer un(lock(s))
+
+	// Note that because this is a buffered channel, the non-default case
+	// will always succeed except when the channel is nil, which happens
+	// (atomically) when this service is closed.
+	select {
+	case c := <-s.pool:
+		s.inUse[c] = true
+		return c, nil
+	default:
+		return nil, fmt.Errorf("empty pool")
+	}
 }
 
-func (s *QSvc) returnClient(cli *entroq.EntroQ) {
-	s.pool <- cli
+func (s *QSvc) returnClient(c *entroq.EntroQ) error {
+	defer un(lock(s))
+
+	if !s.inUse[c] {
+		return fmt.Errorf("connection gone")
+	}
+	delete(s.inUse, c)
+
+	select {
+	case s.pool <- c:
+		return nil
+	default:
+		return fmt.Errorf("pool closed")
+	}
 }
 
 // TryClaim attempts to claim a task, returning immediately. If no tasks are
 // available, it returns a nil response and a nil error.
 func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
-	client := s.getClient()
+	client, err := s.getClient()
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "no clients for TryClaim: %v", err)
+	}
 	defer s.returnClient(client)
 
 	claimant, err := uuid.Parse(req.ClaimantId)
@@ -159,7 +218,10 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 // reconstruct an entroq.DependencyError, or directly to find out which IDs
 // caused the dependency failure. Code UNKNOWN is returned on other errors.
 func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyResponse, error) {
-	client := s.getClient()
+	client, err := s.getClient()
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "no clients for Modify: %v", err)
+	}
 	defer s.returnClient(client)
 
 	claimant, err := uuid.Parse(req.ClaimantId)
@@ -241,7 +303,10 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 }
 
 func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksResponse, error) {
-	client := s.getClient()
+	client, err := s.getClient()
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "no clients for Tasks: %v", err)
+	}
 	defer s.returnClient(client)
 
 	claimant := uuid.Nil
@@ -265,7 +330,10 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 
 // Queues returns a mapping from queue names to queue sizes.
 func (s *QSvc) Queues(ctx context.Context, _ *pb.QueuesRequest) (*pb.QueuesResponse, error) {
-	client := s.getClient()
+	client, err := s.getClient()
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "no clients for Queues: %v", err)
+	}
 	defer s.returnClient(client)
 
 	queueMap, err := client.Queues(ctx)

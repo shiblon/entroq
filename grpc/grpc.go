@@ -1,4 +1,4 @@
-// Package grpc provides a gRPC backend for EntroQ. This is backend that is
+// Package grpc provides a gRPC backend for EntroQ. This is the backend that is
 // commonly used by clients of an EntroQ task service, set up thus:
 //
 // 	Server:
@@ -7,10 +7,28 @@
 // 	Client:
 // 		entroq library -> grpc backend
 //
-// With things set up this way, the client simply uses the EntroQ library,
+// You can start, for example, a postgres-backed QSvc like this (or just use pg/svc):
+//
+// 	ctx := context.Background()
+// 	svc, err := qsvc.New(ctx, pg.Opener(dbHostPort)) // Other options available, too.
+// 	if err != nil {
+// 		log.Fatalf("Can't open PG backend: %v",e rr)
+// 	}
+// 	defer svc.Close()
+//
+// 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", thisPort))
+// 	if err != nil {
+// 		log.Fatalf("Can't start this service")
+// 	}
+//
+// 	s := grpc.NewServer()
+// 	pb.RegisterEntroQServer(s, svc)
+// 	s.Serve(lis)
+//
+// With the server set up this way, the client simply uses the EntroQ library,
 // hands it the grpc Opener, and they're off:
 //
-// 	client, err := entroq.New(ctx, grpc.Opener("myhost:54321"))
+// 	client, err := entroq.New(ctx, grpc.Opener("myhost:54321", grpc.WithInsecure()))
 //
 // That creates a client library that uses a gRPC connection to do its work.
 // Note that Claim will block on the *client* side doing this instead of
@@ -18,11 +36,6 @@
 // That is actually what we want; rather than hold connections open, we allow
 // the client to poll with exponential backoff. In large-scale systems, this is
 // better behavior.
-//
-// On the server side, the service creates an EntroQ client using some other
-// backend, like the PostgreSQL backend or the etcd backend. Both the service
-// and the client use the same library interface, there just happens to be a
-// gRPC channel in between them.
 package grpc
 
 import (

@@ -281,6 +281,21 @@ func (c *EntroQ) Modify(ctx context.Context, claimant uuid.UUID, modArgs ...Modi
 // ModifyArg is an argument to the Modify function, which does batch modifications to the task store.
 type ModifyArg func(m *Modification)
 
+// Inserting creates an insert modification from TaskData:
+//
+// 	cli.Modify(Inserting(&TaskData{
+// 		Queue: "myqueue",
+// 		At:    time.Now.Add(1 * time.Minute),
+// 		Value: []byte("hi there"),
+// 	}))
+func Inserting(tds ...*TaskData) ModifyArg {
+	return func(m *Modification) {
+		for _, td := range tds {
+			m.Inserts = append(m.Inserts, td)
+		}
+	}
+}
+
 // InsertingInto creates an insert modification. Use like this:
 //
 //   cli.Modify(InsertingInto("my queue name", WithValue([]byte("hi there"))))
