@@ -102,7 +102,6 @@ func TestSimpleSequence(t *testing.T) {
 		t.Fatalf("postgres: %v", err)
 	}
 	defer pgStop()
-	fmt.Println("got to step 1")
 
 	hostPort := fmt.Sprintf("localhost:%v", pgPort)
 
@@ -114,7 +113,6 @@ func TestSimpleSequence(t *testing.T) {
 		t.Fatalf("Could not start service: %v", err)
 	}
 	defer server.Stop()
-	fmt.Println("got to step 2")
 
 	conn, err := dial(ctx)
 	if err != nil {
