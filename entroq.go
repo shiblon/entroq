@@ -489,12 +489,14 @@ func (m *Modification) badChanges(foundDeps map[uuid.UUID]*Task) (missing []*Tas
 				ID:      t.ID,
 				Version: t.Version,
 			})
+			continue
 		}
 		if m.otherwiseClaimed(found) {
 			claimed = append(claimed, &TaskID{
 				ID:      t.ID,
 				Version: t.Version,
 			})
+			continue
 		}
 	}
 	return missing, claimed
@@ -505,9 +507,11 @@ func (m *Modification) badDeletes(foundDeps map[uuid.UUID]*Task) (missing []*Tas
 		found := foundDeps[t.ID]
 		if found == nil {
 			missing = append(missing, t)
+			continue
 		}
 		if m.otherwiseClaimed(found) {
 			claimed = append(claimed, t)
+			continue
 		}
 	}
 	return missing, claimed
