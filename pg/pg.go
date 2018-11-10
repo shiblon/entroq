@@ -135,12 +135,25 @@ func (b *backend) initDB(ctx context.Context) error {
 }
 
 // Queues returns a mapping from queue names to task counts within them.
-func (b *backend) Queues(ctx context.Context) (map[string]int, error) {
-	rows, err := b.db.QueryContext(ctx,
-		"SELECT queue, COUNT(*) AS count FROM tasks GROUP BY queue")
+func (b *backend) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[string]int, error) {
+	q := "SELECT queue, COUNT(*) AS count FROM tasks GROUP BY queue"
+	var values []interface{}
+
+	if qq.MatchPrefix != "" {
+		q += fmt.Sprintf(" WHERE queue LIKE $%d", len(values)+1)
+		values = append(values, qq.MatchPrefix+"%")
+	}
+
+	if qq.Limit > 0 {
+		q += fmt.Sprintf(" LIMIT $%d", len(values)+1)
+		values = append(values, qq.Limit)
+	}
+
+	rows, err := b.db.QueryContext(ctx, q, values...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get queue names: %v", err)
 	}
+
 	defer rows.Close()
 	queues := make(map[string]int)
 	for rows.Next() {
@@ -161,12 +174,17 @@ func (b *backend) Queues(ctx context.Context) (map[string]int, error) {
 
 // Tasks returns a slice of all tasks in the given queue.
 func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Task, error) {
-	values := []interface{}{tq.Queue}
 	q := "SELECT id, version, queue, at, created, modified, claimant, value FROM tasks WHERE queue = $1"
+	values := []interface{}{tq.Queue}
 
 	if tq.Claimant != uuid.Nil {
-		q += " AND (claimant = $2 OR claimant = $3 OR at < NOW())"
+		q += fmt.Sprintf(" AND (claimant = $%d OR claimant = $%d OR at < NOW())", len(values)+1, len(values)+2)
 		values = append(values, uuid.Nil.String(), tq.Claimant)
+	}
+
+	if tq.Limit > 0 {
+		q += fmt.Sprintf(" LIMIT $%d", len(values)+1)
+		values = append(values, tq.Limit)
 	}
 
 	rows, err := b.db.QueryContext(ctx, q, values...)

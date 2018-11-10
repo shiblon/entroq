@@ -129,21 +129,24 @@ func newClaimQuery(queue string, claimant uuid.UUID, duration time.Duration) *Cl
 	}
 }
 
-// TasksQuery hholds information for a tasks query.
+// TasksQuery holds information for a tasks query.
 type TasksQuery struct {
 	Queue    string
 	Claimant uuid.UUID
+	Limit    int
 }
 
-func newTasksQuery(queue string, claimant uuid.UUID) *TasksQuery {
-	return &TasksQuery{Queue: queue, Claimant: claimant}
+// QueuesQuery modifies a queue listing request.
+type QueuesQuery struct {
+	MatchPrefix string
+	Limit       int
 }
 
 // Backend describes all of the functions that any backend has to implement
 // to be used as the storage for task queues.
 type Backend interface {
 	// Queues returns a mapping from all known queues to their task counts.
-	Queues(ctx context.Context) (map[string]int, error)
+	Queues(ctx context.Context, qq *QueuesQuery) (map[string]int, error)
 
 	// Tasks retrieves all tasks from the given queue. If claimantID is
 	// specified (non-zero), limits those tasks to those that are either
@@ -200,8 +203,15 @@ func (c *EntroQ) Close() error {
 }
 
 // Queues returns a mapping from all queue names to their task counts.
-func (c *EntroQ) Queues(ctx context.Context) (map[string]int, error) {
-	return c.backend.Queues(ctx)
+func (c *EntroQ) Queues(ctx context.Context, opts ...QueuesOpt) (map[string]int, error) {
+	optVals := new(queuesOpts)
+	for _, opt := range opts {
+		opt(optVals)
+	}
+	return c.backend.Queues(ctx, &QueuesQuery{
+		MatchPrefix: optVals.matchPrefix,
+		Limit:       optVals.limit,
+	})
 }
 
 // Tasks returns a slice of all tasks in the given queue.
@@ -211,11 +221,16 @@ func (c *EntroQ) Tasks(ctx context.Context, queue string, opts ...TasksOpt) ([]*
 		opt(optVals)
 	}
 
-	return c.backend.Tasks(ctx, newTasksQuery(queue, optVals.claimant))
+	return c.backend.Tasks(ctx, &TasksQuery{
+		Queue:    queue,
+		Claimant: optVals.claimant,
+		Limit:    optVals.limit,
+	})
 }
 
 type tasksOpts struct {
 	claimant uuid.UUID
+	limit    int
 }
 
 // TasksOpt is an option that can be passed into Tasks to control what it returns.
@@ -225,6 +240,35 @@ type TasksOpt func(*tasksOpts)
 func LimitClaimant(claimant uuid.UUID) TasksOpt {
 	return func(o *tasksOpts) {
 		o.claimant = claimant
+	}
+}
+
+// LimitTasks sets the limit on the number of tasks to return. A value <= 0 indicates "no limit".
+func LimitTasks(limit int) TasksOpt {
+	return func(o *tasksOpts) {
+		o.limit = limit
+	}
+}
+
+type queuesOpts struct {
+	matchPrefix string
+	limit       int
+}
+
+// QueuesOpt modifies how queue requests are made.
+type QueuesOpt func(*queuesOpts)
+
+// MatchPrefix sets a prefix match for a queue listing.
+func MatchPrefix(prefix string) QueuesOpt {
+	return func(o *queuesOpts) {
+		o.matchPrefix = prefix
+	}
+}
+
+// LimitQueues sets the limit on the number of queues that are returned.
+func LimitQueues(limit int) QueuesOpt {
+	return func(o *queuesOpts) {
+		o.limit = limit
 	}
 }
 

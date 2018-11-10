@@ -82,8 +82,11 @@ func (b *backend) Close() error {
 }
 
 // Queues produces a mapping from queue names to queue sizes.
-func (b *backend) Queues(ctx context.Context) (map[string]int, error) {
-	resp, err := b.cli.Queues(ctx, new(pb.QueuesRequest))
+func (b *backend) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[string]int, error) {
+	resp, err := b.cli.Queues(ctx, &pb.QueuesRequest{
+		MatchPrefix: qq.MatchPrefix,
+		Limit:       int32(qq.Limit),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get queues over gRPC: %v", err)
 	}
@@ -164,6 +167,7 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 	resp, err := b.cli.Tasks(ctx, &pb.TasksRequest{
 		ClaimantId: tq.Claimant.String(),
 		Queue:      tq.Queue,
+		Limit:      int32(tq.Limit),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get tasks over gRPC: %v", err)

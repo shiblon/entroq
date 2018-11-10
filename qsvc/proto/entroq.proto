@@ -116,6 +116,7 @@ message ModifyDep {
 message TasksRequest {
   string claimant_id = 1;
   string queue = 2;
+  int32 limit = 3;
 }
 
 // TasksReqponse contains the tasks requested.
@@ -125,6 +126,8 @@ message TasksResponse {
 
 // QueuesRequest is sent to request a listing of all known queues.
 message QueuesRequest {
+  string match_prefix = 1;
+  int32 limit = 2;
 }
 
 // QueuesResponse contains the requested list of queue statistics.
