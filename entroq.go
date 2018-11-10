@@ -238,7 +238,7 @@ type QueuesOpt func(*QueuesQuery)
 // MatchPrefix sets a prefix match for a queue listing.
 func MatchPrefix(prefix string) QueuesOpt {
 	return func(q *QueuesQuery) {
-		o.MatchPrefix = prefix
+		q.MatchPrefix = prefix
 	}
 }
 
