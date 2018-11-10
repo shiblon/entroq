@@ -121,14 +121,6 @@ type ClaimQuery struct {
 	Duration time.Duration // How long the task should be claimed for if successful.
 }
 
-func newClaimQuery(queue string, claimant uuid.UUID, duration time.Duration) *ClaimQuery {
-	return &ClaimQuery{
-		Queue:    queue,
-		Claimant: claimant,
-		Duration: duration,
-	}
-}
-
 // TasksQuery holds information for a tasks query.
 type TasksQuery struct {
 	Queue    string
@@ -158,8 +150,8 @@ type Backend interface {
 	// from the time of the claim. If claiming until a specific wall-clock time
 	// is desired, the task should be immediately modified after it is claimed
 	// to set At to a specific time. Returns a nil task and a nil error if
-	// there is nothing to claim. Will fail if (optional) dependent tasks are
-	// not current.
+	// there is nothing to claim. Will fail with a DependencyError is a
+	// specific task ID is requested but not present.
 	TryClaim(ctx context.Context, cq *ClaimQuery) (*Task, error)
 
 	// Modify attempts to atomically modify the task store, and only succeeds
@@ -204,83 +196,71 @@ func (c *EntroQ) Close() error {
 
 // Queues returns a mapping from all queue names to their task counts.
 func (c *EntroQ) Queues(ctx context.Context, opts ...QueuesOpt) (map[string]int, error) {
-	optVals := new(queuesOpts)
+	query := new(QueuesQuery)
 	for _, opt := range opts {
-		opt(optVals)
+		opt(query)
 	}
-	return c.backend.Queues(ctx, &QueuesQuery{
-		MatchPrefix: optVals.matchPrefix,
-		Limit:       optVals.limit,
-	})
+	return c.backend.Queues(ctx, query)
 }
 
 // Tasks returns a slice of all tasks in the given queue.
 func (c *EntroQ) Tasks(ctx context.Context, queue string, opts ...TasksOpt) ([]*Task, error) {
-	optVals := new(tasksOpts)
+	query := &TasksQuery{
+		Queue: queue,
+	}
 	for _, opt := range opts {
-		opt(optVals)
+		opt(query)
 	}
 
-	return c.backend.Tasks(ctx, &TasksQuery{
-		Queue:    queue,
-		Claimant: optVals.claimant,
-		Limit:    optVals.limit,
-	})
-}
-
-type tasksOpts struct {
-	claimant uuid.UUID
-	limit    int
+	return c.backend.Tasks(ctx, query)
 }
 
 // TasksOpt is an option that can be passed into Tasks to control what it returns.
-type TasksOpt func(*tasksOpts)
+type TasksOpt func(*TasksQuery)
 
 // LimitClaimant sets the claimant and then only returns self-claimed tasks or expired tasks.
 func LimitClaimant(claimant uuid.UUID) TasksOpt {
-	return func(o *tasksOpts) {
-		o.claimant = claimant
+	return func(q *TasksQuery) {
+		q.Claimant = claimant
 	}
 }
 
 // LimitTasks sets the limit on the number of tasks to return. A value <= 0 indicates "no limit".
 func LimitTasks(limit int) TasksOpt {
-	return func(o *tasksOpts) {
-		o.limit = limit
+	return func(q *TasksQuery) {
+		q.Limit = limit
 	}
 }
 
-type queuesOpts struct {
-	matchPrefix string
-	limit       int
-}
-
 // QueuesOpt modifies how queue requests are made.
-type QueuesOpt func(*queuesOpts)
+type QueuesOpt func(*QueuesQuery)
 
 // MatchPrefix sets a prefix match for a queue listing.
 func MatchPrefix(prefix string) QueuesOpt {
-	return func(o *queuesOpts) {
-		o.matchPrefix = prefix
+	return func(q *QueuesQuery) {
+		o.MatchPrefix = prefix
 	}
 }
 
 // LimitQueues sets the limit on the number of queues that are returned.
 func LimitQueues(limit int) QueuesOpt {
-	return func(o *queuesOpts) {
-		o.limit = limit
+	return func(q *QueuesQuery) {
+		q.Limit = limit
 	}
 }
+
+// ClaimOpt modifies limits on a task claim.
+type ClaimOpt func(*ClaimQuery)
 
 // Claim attempts to get the next unclaimed task from the given queue. It
 // blocks until one becomes available or until the context is done. When it
 // succeeds, it returns a task with the claimant set to that given, and an
 // arrival time given by the duration.
-func (c *EntroQ) Claim(ctx context.Context, claimant uuid.UUID, q string, duration time.Duration) (*Task, error) {
+func (c *EntroQ) Claim(ctx context.Context, claimant uuid.UUID, q string, duration time.Duration, opts ...ClaimOpt) (*Task, error) {
 	const maxWait = time.Minute
 	var curWait = time.Second
 	for {
-		task, err := c.TryClaim(ctx, claimant, q, duration)
+		task, err := c.TryClaim(ctx, claimant, q, duration, opts...)
 		if err != nil {
 			return nil, err
 		}
@@ -302,8 +282,16 @@ func (c *EntroQ) Claim(ctx context.Context, claimant uuid.UUID, q string, durati
 
 // TryClaimTask attempts one time to claim a task from the given queue. If there are no tasks, it
 // returns a nil error *and* a nil task. This allows the caller to decide whether to retry. It can fail if certain (optional) dependency tasks are not present. This can be used, for example, to ensure that configuration tasks haven't changed.
-func (c *EntroQ) TryClaim(ctx context.Context, claimant uuid.UUID, q string, duration time.Duration) (*Task, error) {
-	return c.backend.TryClaim(ctx, newClaimQuery(q, claimant, duration))
+func (c *EntroQ) TryClaim(ctx context.Context, claimant uuid.UUID, q string, duration time.Duration, opts ...ClaimOpt) (*Task, error) {
+	query := &ClaimQuery{
+		Queue:    q,
+		Claimant: claimant,
+		Duration: duration,
+	}
+	for _, opt := range opts {
+		opt(query)
+	}
+	return c.backend.TryClaim(ctx, query)
 }
 
 // Modify allows a batch modification operation to be done, gated on the
