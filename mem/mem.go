@@ -5,6 +5,7 @@ import (
 	"container/heap"
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -163,12 +164,18 @@ func (b *backend) Close() error {
 }
 
 // Queues returns a map of queue names to sizes.
-func (b *backend) Queues(ctx context.Context) (map[string]int, error) {
+func (b *backend) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[string]int, error) {
 	defer un(lock(b))
 
 	qs := make(map[string]int)
 	for q, items := range b.heaps {
+		if !strings.HasPrefix(q, qq.MatchPrefix) {
+			continue // an empty match prefix always matches, which is the desired default behavior.
+		}
 		qs[q] = items.Len()
+		if qq.Limit > 0 && len(qs) >= qq.Limit {
+			break
+		}
 	}
 	return qs, nil
 }
@@ -184,7 +191,10 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 	if h.Len() == 0 {
 		return nil, nil
 	}
-	for _, item := range h.items {
+	for i, item := range h.items {
+		if tq.Limit > 0 && i >= tq.Limit {
+			break
+		}
 		t := item.task
 		if tq.Claimant == uuid.Nil || now.After(t.At) || tq.Claimant == t.Claimant {
 			tasks = append(tasks, t)
