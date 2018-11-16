@@ -149,6 +149,11 @@ func NewKV(key, value []byte) *KV {
 	return &KV{Key: key, Value: value}
 }
 
+// String converts this key/value pair into a readable string.
+func (kv *KV) String() string {
+	return fmt.Sprintf("%s=%s", string(kv.Key), string(kv.Value))
+}
+
 // MapWorker claims map input tasks, processes them, and produces output tasks.
 type MapWorker struct {
 	client     *entroq.EntroQ
@@ -427,7 +432,6 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 				}
 				allKVs = append(allKVs, kvs)
 				indices = append(indices, 0)
-				modArgs = append(modArgs, task.AsDeletion())
 			}
 
 			var vals []*KV
@@ -457,7 +461,8 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 				return fmt.Errorf("marshal combined merge: %v", err)
 			}
 
-			modArgs = append(modArgs, entroq.InsertingInto(w.OutputQueue, entroq.WithValue(combined)))
+			log.Printf("Reducer %q merged %d tasks, pushing to q %q: %s", w.Name, len(ids), w.InputQueue, string(combined))
+			modArgs = append(modArgs, entroq.InsertingInto(w.InputQueue, entroq.WithValue(combined)))
 			return nil
 		})
 	if err != nil {
@@ -480,6 +485,7 @@ func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error 
 	var outputs []*KV
 	finalTask, err := w.client.DoWithRenew(ctx, task, claimDuration,
 		func(ctx context.Context, id uuid.UUID, data *entroq.TaskData) error {
+			log.Printf("Reduce %q starting reduce task", w.Name)
 			var kvs []*KV
 			if err := json.Unmarshal(data.Value, &kvs); err != nil {
 				return fmt.Errorf("json unmarshal reduce pairs: %v", err)
@@ -489,10 +495,12 @@ func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error 
 				return nil
 			}
 
-			last := new(KV)
 			curr := 0
 
 			for curr < len(kvs) {
+				last := kvs[curr] // starting out - "last" is always first entry
+
+				log.Printf("Reduce %q curr=%d", w.Name, curr)
 				input := &proxyingReduceInput{
 					key:   func() []byte { return last.Key },
 					value: func() []byte { return last.Value },
@@ -501,15 +509,23 @@ func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error 
 						if curr >= len(kvs) {
 							return false
 						}
-						if curr == 0 || bytes.Compare(last.Key, kvs[curr].Key) == 0 {
-							last = kvs[curr]
-							curr++
-							return true
+						// If we aren't just started, and the current key is
+						// not the same as the last, can't continue.
+						if curr > 0 && bytes.Compare(last.Key, kvs[curr].Key) != 0 {
+							return false
 						}
-						return false
+						last = kvs[curr]
+						curr++
+						return true
 					},
 				}
+				currBefore := curr
 				output, err := w.Reduce(ctx, input)
+				if currBefore == curr {
+					// The reducer didn't consume anything - we need to do that instead.
+					for input.Next() {
+					}
+				}
 				if err != nil {
 					return fmt.Errorf("reduce error: %v", err)
 				}
@@ -564,7 +580,7 @@ func (w *ReduceWorker) Run(ctx context.Context) error {
 				return fmt.Errorf("empty check in merge: %v", err)
 			}
 			if empty {
-				log.Printf("Reducer %q nothing to do", w.Name)
+				log.Printf("Reducer %q nothing to merge", w.Name)
 				break // all done - no more map tasks, 1 or fewer merge tasks.
 			}
 
@@ -579,16 +595,18 @@ func (w *ReduceWorker) Run(ctx context.Context) error {
 		}
 		// More than one merge task is in the queue. Shuffle and check again.
 		log.Printf("Reducer %q merging %d tasks", w.Name, len(mergeTasks))
+		for _, t := range mergeTasks {
+			log.Printf("- %v", t.IDVersion())
+		}
 		if err := w.mergeTasks(ctx, mergeTasks); err != nil {
 			return fmt.Errorf("merge: %v", err)
 		}
 	}
 
+	log.Printf("Reducer %q merge finished. Reducing.", w.Name)
+
 	// Then, reduce over the final merged task.
 	task, err := w.client.Claim(ctx, w.ClaimantID, w.InputQueue, claimDuration, entroq.WaitFor(5*time.Second))
-	if entroq.IsCanceled(err) {
-		return fmt.Errorf("no reduce tasks to claim")
-	}
 	if err != nil {
 		return fmt.Errorf("reduce run claim: %v", err)
 	}
