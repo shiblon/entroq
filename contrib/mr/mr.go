@@ -261,24 +261,19 @@ func (w *MapWorker) mapTask(ctx context.Context, task *entroq.Task) error {
 // The task value is expected to be a JSON-serialized KV struct.
 func (w *MapWorker) Run(ctx context.Context) error {
 	for {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("map run canceled")
-		default:
-			empty, err := w.client.QueuesEmpty(ctx, entroq.MatchExact(w.InputQueue))
-			if err != nil {
-				return fmt.Errorf("map test empty: %v", err)
-			}
-			if empty {
-				return nil // all finished.
-			}
-			task, err := w.client.Claim(ctx, w.ClaimantID, w.InputQueue, taskRenewalDuration)
-			if err != nil {
-				return fmt.Errorf("map run claim: %v", err)
-			}
-			if err := w.mapTask(ctx, task); err != nil {
-				return fmt.Errorf("map run: %v", err)
-			}
+		empty, err := w.client.QueuesEmpty(ctx, entroq.MatchExact(w.InputQueue))
+		if err != nil {
+			return fmt.Errorf("map test empty: %v", err)
+		}
+		if empty {
+			return nil // all finished.
+		}
+		task, err := w.client.Claim(ctx, w.ClaimantID, w.InputQueue, taskRenewalDuration)
+		if err != nil {
+			return fmt.Errorf("map run claim: %v", err)
+		}
+		if err := w.mapTask(ctx, task); err != nil {
+			return fmt.Errorf("map run: %v", err)
 		}
 	}
 }
