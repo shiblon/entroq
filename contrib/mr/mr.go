@@ -267,3 +267,25 @@ func (w *MapWorker) Run(ctx context.Context) error {
 		}
 	}
 }
+
+// TODO:
+// master:
+// - read from input stream, getting keys and values
+// - push all tasks to map queue
+// - start mappers (this makes everything below much simpler - shufflers can just check for empty queue)
+// - create shuffle tasks, one per reduce shard, place in shuffle queue
+//
+// shuffle worker:
+// - claim a shuffle shard task from the queue of shard tasks (one per shard, while the mappers are still working, then while there's more than one thing in the queue)
+// - pull data from all tasks in the shard queue, sort it all together. Delete all and add new combined task.
+// - if map queue is empty, delete shard task and move data task into reducer fanout queue.
+//
+// reducer fanout worker:
+// - claim finished shuffle task
+// - split into unique keys
+// - delete shuffle task, add all reduce tasks at once.
+//
+// reduce worker:
+// - claim a reduce task
+// - process all values
+// - delete task and write to output stream
