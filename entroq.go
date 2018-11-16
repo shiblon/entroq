@@ -203,6 +203,15 @@ func (c *EntroQ) Queues(ctx context.Context, opts ...QueuesOpt) (map[string]int,
 	return c.backend.Queues(ctx, query)
 }
 
+// IsEmpty indicates whether the given task queue is empty of tasks.
+func (c *EntroQ) IsEmpty(ctx context.Context, queue string) (bool, error) {
+	ts, err := c.Tasks(ctx, queue, LimitTasks(1))
+	if err != nil {
+		return false, fmt.Errorf("empty check: %v", err)
+	}
+	return len(ts) == 0, nil
+}
+
 // Tasks returns a slice of all tasks in the given queue.
 func (c *EntroQ) Tasks(ctx context.Context, queue string, opts ...TasksOpt) ([]*Task, error) {
 	query := &TasksQuery{
@@ -252,6 +261,15 @@ func LimitQueues(limit int) QueuesOpt {
 // ClaimOpt modifies limits on a task claim.
 type ClaimOpt func(*ClaimQuery)
 
+// Canceled is an error returned when a claim is canceled by its context.
+type Canceled error
+
+// IsCanceled indicates whether the error is a canceled error.
+func IsCanceled(err error) bool {
+	_, ok := err.(Canceled)
+	return ok
+}
+
 // Claim attempts to get the next unclaimed task from the given queue. It
 // blocks until one becomes available or until the context is done. When it
 // succeeds, it returns a task with the claimant set to that given, and an
@@ -275,7 +293,7 @@ func (c *EntroQ) Claim(ctx context.Context, claimant uuid.UUID, q string, durati
 				curWait = maxWait
 			}
 		case <-ctx.Done():
-			return nil, fmt.Errorf("context canceled for claim request in %q", q)
+			return nil, Canceled(fmt.Errorf("context canceled for claim request in %q", q))
 		}
 	}
 }
@@ -292,6 +310,38 @@ func (c *EntroQ) TryClaim(ctx context.Context, claimant uuid.UUID, q string, dur
 		opt(query)
 	}
 	return c.backend.TryClaim(ctx, query)
+}
+
+// RenewFor attempts to renew the given task's lease (update arrival time) for
+// the given duration. Returns the new task.
+func (c *EntroQ) RenewFor(ctx context.Context, task *Task, duration time.Duration) (*Task, error) {
+	changed, err := c.RenewAllFor(ctx, []*Task{task}, duration)
+	if err != nil {
+		return nil, fmt.Errorf("renew task: %v", err)
+	}
+	return changed[0], nil
+}
+
+// RenewAllFor attempts to renew all given tasks' leases (update arrival times)
+// for the given duration. Returns the new tasks.
+func (c *EntroQ) RenewAllFor(ctx context.Context, tasks []*Task, duration time.Duration) ([]*Task, error) {
+	if len(tasks) == 0 {
+		return nil, nil
+	}
+	var modArgs []ModifyArg
+	var taskIDs []string
+	for _, t := range tasks {
+		modArgs = append(modArgs, Changing(t, ArrivalTimeBy(duration)))
+		taskIDs = append(taskIDs, t.IDVersion().String())
+	}
+	_, changed, err := c.Modify(ctx, tasks[0].Claimant, modArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("renewal failed for tasks %q", taskIDs)
+	}
+	if len(changed) != len(tasks) {
+		return nil, fmt.Errorf("renewal expected %d updated tasks, got %d", len(tasks), len(changed))
+	}
+	return changed, nil
 }
 
 // Modify allows a batch modification operation to be done, gated on the
@@ -322,9 +372,7 @@ type ModifyArg func(m *Modification)
 // 	}))
 func Inserting(tds ...*TaskData) ModifyArg {
 	return func(m *Modification) {
-		for _, td := range tds {
-			m.Inserts = append(m.Inserts, td)
-		}
+		m.Inserts = append(m.Inserts, tds...)
 	}
 }
 
@@ -335,18 +383,18 @@ func InsertingInto(q string, insertArgs ...InsertArg) ModifyArg {
 	return func(m *Modification) {
 		data := &TaskData{Queue: q}
 		for _, arg := range insertArgs {
-			arg(m.now, data)
+			arg(m, data)
 		}
 		m.Inserts = append(m.Inserts, data)
 	}
 }
 
 // InsertArg is an argument to task insertion.
-type InsertArg func(now time.Time, d *TaskData)
+type InsertArg func(*Modification, *TaskData)
 
 // WithArrivalTime changes the arrival time to a fixed moment during task insertion.
 func WithArrivalTime(at time.Time) InsertArg {
-	return func(now time.Time, d *TaskData) {
+	return func(_ *Modification, d *TaskData) {
 		d.At = at
 	}
 }
@@ -357,8 +405,8 @@ func WithArrivalTime(at time.Time) InsertArg {
 //     InsertingInto("my queue",
 //       WithTimeIn(2 * time.Minute)))
 func WithArrivalTimeIn(duration time.Duration) InsertArg {
-	return func(now time.Time, d *TaskData) {
-		d.At = now.Add(duration)
+	return func(m *Modification, d *TaskData) {
+		d.At = m.now.Add(duration)
 	}
 }
 
@@ -367,7 +415,7 @@ func WithArrivalTimeIn(duration time.Duration) InsertArg {
 //     InsertingInto("my queue",
 //       WithValue([]byte("hi there"))))
 func WithValue(value []byte) InsertArg {
-	return func(now time.Time, d *TaskData) {
+	return func(_ *Modification, d *TaskData) {
 		d.Value = value
 	}
 }
@@ -409,7 +457,7 @@ func Changing(task *Task, changeArgs ...ChangeArg) ModifyArg {
 	return func(m *Modification) {
 		newTask := *task
 		for _, a := range changeArgs {
-			a(&newTask)
+			a(m, &newTask)
 		}
 		m.Changes = append(m.Changes, &newTask)
 	}
@@ -423,32 +471,32 @@ func Changing(task *Task, changeArgs ...ChangeArg) ModifyArg {
 //     Changing(myTask,
 //       QueueTo("a new queue"),
 //	     ArrivalTimeBy(5 * time.Minute)))
-type ChangeArg func(t *Task)
+type ChangeArg func(m *Modification, t *Task)
 
 // QueueTo creates an option to modify a task's queue in the Changing function.
 func QueueTo(q string) ChangeArg {
-	return func(t *Task) {
+	return func(_ *Modification, t *Task) {
 		t.Queue = q
 	}
 }
 
 // ArrivalTimeTo sets a specific arrival time on a changed task in the Changing function.
 func ArrivalTimeTo(at time.Time) ChangeArg {
-	return func(t *Task) {
+	return func(_ *Modification, t *Task) {
 		t.At = at
 	}
 }
 
 // ArrivalTimeBy sets the arrival time to a time in the future, by the given duration.
 func ArrivalTimeBy(d time.Duration) ChangeArg {
-	return func(t *Task) {
-		t.At = t.At.Add(d)
+	return func(m *Modification, t *Task) {
+		t.At = m.now.Add(d)
 	}
 }
 
 // ValueTo sets the changing task's value to the given byte slice.
 func ValueTo(v []byte) ChangeArg {
-	return func(t *Task) {
+	return func(_ *Modification, t *Task) {
 		t.Value = v
 	}
 }

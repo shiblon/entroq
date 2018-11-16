@@ -2,10 +2,14 @@ package mem
 
 import (
 	"context"
+	"net"
 	"testing"
+	"time"
 
-	pb "github.com/shiblon/entroq/qsvc/proto"
+	"github.com/shiblon/entroq"
+	grpcbackend "github.com/shiblon/entroq/grpc"
 	"github.com/shiblon/entroq/qsvc/test"
+	"google.golang.org/grpc"
 )
 
 func TestSimpleSequence(t *testing.T) {
@@ -17,11 +21,15 @@ func TestSimpleSequence(t *testing.T) {
 	}
 	defer server.Stop()
 
-	conn, err := dial(ctx)
+	client, err := entroq.New(ctx, grpcbackend.Opener("bufnet",
+		grpc.WithDialer(func(string, time.Duration) (net.Conn, error) {
+			return dial()
+		}),
+		grpc.WithInsecure()))
 	if err != nil {
-		t.Fatalf("Could not dial: %v", err)
+		t.Fatalf("Open client: %v", err)
 	}
-	defer conn.Close()
+	defer client.Close()
 
-	test.SimpleSequence(ctx, t, pb.NewEntroQClient(conn))
+	test.SimpleSequence(ctx, t, client)
 }
