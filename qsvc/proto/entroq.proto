@@ -126,8 +126,10 @@ message TasksResponse {
 
 // QueuesRequest is sent to request a listing of all known queues.
 message QueuesRequest {
-  string match_prefix = 1;
-  int32 limit = 2;
+  repeated string match_prefix = 1;
+  repeated string match_exact = 2;
+
+  int32 limit = 3;
 }
 
 // QueuesResponse contains the requested list of queue statistics.

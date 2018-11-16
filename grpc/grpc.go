@@ -85,6 +85,7 @@ func (b *backend) Close() error {
 func (b *backend) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[string]int, error) {
 	resp, err := b.cli.Queues(ctx, &pb.QueuesRequest{
 		MatchPrefix: qq.MatchPrefix,
+		MatchExact:  qq.MatchExact,
 		Limit:       int32(qq.Limit),
 	})
 	if err != nil {

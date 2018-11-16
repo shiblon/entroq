@@ -329,14 +329,17 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 }
 
 // Queues returns a mapping from queue names to queue sizes.
-func (s *QSvc) Queues(ctx context.Context, _ *pb.QueuesRequest) (*pb.QueuesResponse, error) {
+func (s *QSvc) Queues(ctx context.Context, req *pb.QueuesRequest) (*pb.QueuesResponse, error) {
 	client, err := s.getClient()
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "no clients for Queues: %v", err)
 	}
 	defer s.returnClient(client)
 
-	queueMap, err := client.Queues(ctx)
+	queueMap, err := client.Queues(ctx,
+		entroq.MatchPrefix(req.MatchPrefix...),
+		entroq.MatchExact(req.MatchExact...),
+		entroq.LimitQueues(int(req.Limit)))
 	if err != nil {
 		return nil, fmt.Errorf("failed to get queues: %v", err)
 	}

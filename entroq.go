@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/sync/errgroup"
 )
 
 // TaskID contains the identifying parts of a task. If IDs don't match
@@ -130,8 +131,18 @@ type TasksQuery struct {
 
 // QueuesQuery modifies a queue listing request.
 type QueuesQuery struct {
-	MatchPrefix string
-	Limit       int
+	// MatchPrefix specifies allowable prefix matches. If empty, limitations
+	// are not set based on prefix matching. All prefix match conditions are ORed.
+	// If both this and MatchExact are empty or nil, no limitations are set on
+	// queue name: all will be returned.
+	MatchPrefix []string
+
+	// MatchExact specifies allowable exact matches. If empty, limitations are
+	// not set on exact queue names.
+	MatchExact []string
+
+	// Limit specifies an upper bound on the number of queue names returned.
+	Limit int
 }
 
 // Backend describes all of the functions that any backend has to implement
@@ -203,13 +214,22 @@ func (c *EntroQ) Queues(ctx context.Context, opts ...QueuesOpt) (map[string]int,
 	return c.backend.Queues(ctx, query)
 }
 
-// IsEmpty indicates whether the given task queue is empty of tasks.
-func (c *EntroQ) IsEmpty(ctx context.Context, queue string) (bool, error) {
-	ts, err := c.Tasks(ctx, queue, LimitTasks(1))
+// QueueEmpty indicates whether the specified task queues are all empty. If no
+// options are specified, returns an error.
+func (c *EntroQ) QueuesEmpty(ctx context.Context, opts ...QueuesOpt) (bool, error) {
+	if len(opts) == 0 {
+		return false, fmt.Errorf("empty check: no queue options specified")
+	}
+	qs, err := c.Queues(ctx, opts...)
 	if err != nil {
 		return false, fmt.Errorf("empty check: %v", err)
 	}
-	return len(ts) == 0, nil
+	for _, size := range qs {
+		if size > 0 {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // Tasks returns a slice of all tasks in the given queue.
@@ -244,10 +264,17 @@ func LimitTasks(limit int) TasksOpt {
 // QueuesOpt modifies how queue requests are made.
 type QueuesOpt func(*QueuesQuery)
 
-// MatchPrefix sets a prefix match for a queue listing.
-func MatchPrefix(prefix string) QueuesOpt {
+// MatchPrefix adds allowable prefix matches for a queue listing.
+func MatchPrefix(prefixes ...string) QueuesOpt {
 	return func(q *QueuesQuery) {
-		q.MatchPrefix = prefix
+		q.MatchPrefix = append(q.MatchPrefix, prefixes...)
+	}
+}
+
+// MatchExact adds an allowable exact match for a queue listing.
+func MatchExact(matches ...string) QueuesOpt {
+	return func(q *QueuesQuery) {
+		q.MatchExact = append(q.MatchExact, matches...)
 	}
 }
 
@@ -342,6 +369,51 @@ func (c *EntroQ) RenewAllFor(ctx context.Context, tasks []*Task, duration time.D
 		return nil, fmt.Errorf("renewal expected %d updated tasks, got %d", len(tasks), len(changed))
 	}
 	return changed, nil
+}
+
+// WithRenewalFunc is a function that should run while a task it depends on is renewed. Returning from this
+// function triggers an end of the renewal cycle.
+type WithRenewalFunc func(ctx context.Context, id uuid.UUID, data *TaskData) error
+
+// DoWithRenewal runs the provided function while keeping the given task lease renewed.
+func (c *EntroQ) DoWithRenewal(ctx context.Context, task *Task, d time.Duration, f WithRenewalFunc) (*Task, error) {
+	// Save the first task's data and ID, so the renewal function can get at it without synchronization.
+	id := task.ID
+	data := task.Data()
+
+	g, ctx := errgroup.WithContext(ctx)
+
+	doneCh := make(chan bool, 1)
+
+	g.Go(func() error {
+		for {
+			select {
+			case <-doneCh:
+				return nil
+			case <-ctx.Done():
+				return fmt.Errorf("canceled context, stopped renewing")
+			case <-time.After(d / 2):
+				var err error
+				if task, err = c.RenewFor(ctx, task, d); err != nil {
+					return fmt.Errorf("could not extend lease for task: %v", err)
+				}
+			}
+		}
+	})
+
+	g.Go(func() error {
+		defer func() {
+			doneCh <- true
+		}()
+		return f(ctx, id, data)
+	})
+
+	if err := g.Wait(); err != nil {
+		return nil, fmt.Errorf("error running with renewal of task %v: %v", id, err)
+	}
+
+	// The task will have been overwritten with every renewal. Return final task.
+	return task, nil
 }
 
 // Modify allows a batch modification operation to be done, gated on the
