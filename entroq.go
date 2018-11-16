@@ -120,6 +120,8 @@ type ClaimQuery struct {
 	Queue    string        // The name of the queue to claim from.
 	Claimant uuid.UUID     // The ID of the process trying to make the claim.
 	Duration time.Duration // How long the task should be claimed for if successful.
+
+	maxBlock time.Duration // Length of time to wait for a blocking claim.
 }
 
 // TasksQuery holds information for a tasks query.
@@ -288,6 +290,13 @@ func LimitQueues(limit int) QueuesOpt {
 // ClaimOpt modifies limits on a task claim.
 type ClaimOpt func(*ClaimQuery)
 
+// WaitFor sets the maximum wait time for a blocking Claim. Default is whatever the context says.
+func WaitFor(d time.Duration) ClaimOpt {
+	return func(q *ClaimQuery) {
+		q.maxBlock = d
+	}
+}
+
 // Canceled is an error returned when a claim is canceled by its context.
 type Canceled error
 
@@ -302,7 +311,18 @@ func IsCanceled(err error) bool {
 // succeeds, it returns a task with the claimant set to that given, and an
 // arrival time given by the duration.
 func (c *EntroQ) Claim(ctx context.Context, claimant uuid.UUID, q string, duration time.Duration, opts ...ClaimOpt) (*Task, error) {
-	const maxWait = time.Minute
+	const maxCheckInterval = 30 * time.Second
+	query := new(ClaimQuery)
+	for _, opt := range opts {
+		opt(query)
+	}
+
+	if query.maxBlock != 0 {
+		mwc, cancel := context.WithTimeout(ctx, query.maxBlock)
+		defer cancel()
+		ctx = mwc
+	}
+
 	var curWait = time.Second
 	for {
 		task, err := c.TryClaim(ctx, claimant, q, duration, opts...)
@@ -316,8 +336,8 @@ func (c *EntroQ) Claim(ctx context.Context, claimant uuid.UUID, q string, durati
 		select {
 		case <-time.After(curWait):
 			curWait *= 2
-			if curWait > maxWait {
-				curWait = maxWait
+			if curWait > maxCheckInterval {
+				curWait = maxCheckInterval
 			}
 		case <-ctx.Done():
 			return nil, Canceled(fmt.Errorf("context canceled for claim request in %q", q))

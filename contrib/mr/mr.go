@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"log"
 	"path"
 	"sort"
 	"strings"
@@ -21,7 +22,8 @@ import (
 )
 
 const (
-	taskRenewalDuration = time.Minute
+	claimDuration = time.Minute
+	claimWait     = 5 * time.Second
 )
 
 // Fingerprint64 produces a 64-bit unsigned integer from a byte string.
@@ -152,6 +154,7 @@ type MapWorker struct {
 	client     *entroq.EntroQ
 	newEmitter func() MapEmitter
 
+	Name       string
 	ClaimantID uuid.UUID
 
 	InputQueue   string
@@ -170,6 +173,13 @@ func WithMapper(m Mapper) MapWorkerOption {
 			return
 		}
 		mw.Map = m
+	}
+}
+
+// MapAsName sets the name for this worker. Worker names are empty by default.
+func MapAsName(name string) MapWorkerOption {
+	return func(mw *MapWorker) {
+		mw.Name = name
 	}
 }
 
@@ -212,13 +222,14 @@ func NewMapWorker(eq *entroq.EntroQ, inQueue string, newEmitter func() MapEmitte
 // task. That's very doable, but beyond the scope of this exercise.
 func (w *MapWorker) mapTask(ctx context.Context, task *entroq.Task) error {
 	emitter := w.newEmitter()
-	finalTask, err := w.client.DoWithRenew(ctx, task, taskRenewalDuration,
+	finalTask, err := w.client.DoWithRenew(ctx, task, claimDuration,
 		func(ctx context.Context, id uuid.UUID, data *entroq.TaskData) error {
 			kv := new(KV)
 			if err := json.Unmarshal(data.Value, kv); err != nil {
 				return fmt.Errorf("map run json unmarshal: %v", err)
 			}
 
+			log.Printf("Mapper %q task with renew: %v", w.Name, task.IDVersion())
 			if err := w.Map(ctx, kv.Key, kv.Value, emitter.Emit); err != nil {
 				return fmt.Errorf("map task %s failed: %v", id, err)
 			}
@@ -230,6 +241,7 @@ func (w *MapWorker) mapTask(ctx context.Context, task *entroq.Task) error {
 	}
 
 	// Delete map task and create shuffle shard tasks.
+	log.Printf("Mapper %q finished task %v, adding to prefix %q", w.Name, finalTask.IDVersion(), w.OutputPrefix)
 	args, err := emitter.AsModifyArgs(w.OutputPrefix, finalTask.AsDeletion())
 	if err != nil {
 		return fmt.Errorf("map task make insertions: %v", err)
@@ -245,7 +257,10 @@ func (w *MapWorker) mapTask(ctx context.Context, task *entroq.Task) error {
 // first. If this should be run in a goroutine, that is up to the caller.
 // The task value is expected to be a JSON-serialized KV struct.
 func (w *MapWorker) Run(ctx context.Context) error {
+	log.Printf("Mapper %q starting", w.Name)
+	defer log.Printf("Mapper %q finished", w.Name)
 	for {
+		log.Printf("Mapper %q checking for empty map queue", w.Name)
 		empty, err := w.client.QueuesEmpty(ctx, entroq.MatchExact(w.InputQueue))
 		if err != nil {
 			return fmt.Errorf("map test empty: %v", err)
@@ -253,10 +268,15 @@ func (w *MapWorker) Run(ctx context.Context) error {
 		if empty {
 			return nil // all finished.
 		}
-		task, err := w.client.Claim(ctx, w.ClaimantID, w.InputQueue, taskRenewalDuration)
+		log.Printf("Mapper %q queue not empty. Claiming task.", w.Name)
+		task, err := w.client.Claim(ctx, w.ClaimantID, w.InputQueue, claimDuration, entroq.WaitFor(5*time.Second))
+		if entroq.IsCanceled(err) {
+			continue
+		}
 		if err != nil {
 			return fmt.Errorf("map run claim: %v", err)
 		}
+		log.Printf("Mapper %q mapping task %v", w.Name, task.IDVersion())
 		if err := w.mapTask(ctx, task); err != nil {
 			return fmt.Errorf("map run: %v", err)
 		}
@@ -326,6 +346,7 @@ func SliceReducer(ctx context.Context, input ReducerInput) ([]byte, error) {
 type ReduceWorker struct {
 	client *entroq.EntroQ
 
+	Name       string
 	ClaimantID uuid.UUID
 
 	MapEmptyQueue string
@@ -348,6 +369,13 @@ func WithReducer(reduce Reducer) ReduceWorkerOption {
 func ReduceToOutput(q string) ReduceWorkerOption {
 	return func(w *ReduceWorker) {
 		w.OutputQueue = q
+	}
+}
+
+// ReduceAsName sets the name of this reduce worker, defaults to blank.
+func ReduceAsName(name string) ReduceWorkerOption {
+	return func(w *ReduceWorker) {
+		w.Name = name
 	}
 }
 
@@ -386,7 +414,7 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 		return nil
 	}
 	var modArgs []entroq.ModifyArg
-	finalTasks, err := w.client.DoWithRenewAll(ctx, tasks, taskRenewalDuration,
+	finalTasks, err := w.client.DoWithRenewAll(ctx, tasks, claimDuration,
 		func(ctx context.Context, ids []uuid.UUID, dats []*entroq.TaskData) error {
 			// Do a merge sort (linear, already sorted inputs).
 			var allKVs [][]*KV
@@ -450,7 +478,7 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 // writing them out in the order they appear (to maintain sorting).
 func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error {
 	var outputs []*KV
-	finalTask, err := w.client.DoWithRenew(ctx, task, taskRenewalDuration,
+	finalTask, err := w.client.DoWithRenew(ctx, task, claimDuration,
 		func(ctx context.Context, id uuid.UUID, data *entroq.TaskData) error {
 			var kvs []*KV
 			if err := json.Unmarshal(data.Value, &kvs); err != nil {
@@ -521,18 +549,22 @@ func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error 
 // - run reduce over it and place the resulting sorted key/value pairs into the output queue.
 // - quit
 func (w *ReduceWorker) Run(ctx context.Context) error {
+	log.Printf("Reducer %q starting on queue %q", w.Name, w.InputQueue)
+	defer log.Printf("Reducer %q finished", w.Name)
 	// First, merge until there is no more mapping work to do.
 	for {
 		mergeTasks, err := w.client.Tasks(ctx, w.InputQueue)
 		if err != nil {
 			return fmt.Errorf("merge task list: %v", err)
 		}
+		log.Printf("Reducer %q found %d merge tasks", w.Name, len(mergeTasks))
 		if len(mergeTasks) <= 1 {
 			empty, err := w.client.QueuesEmpty(ctx, entroq.MatchExact(w.MapEmptyQueue))
 			if err != nil {
 				return fmt.Errorf("empty check in merge: %v", err)
 			}
 			if empty {
+				log.Printf("Reducer %q nothing to do", w.Name)
 				break // all done - no more map tasks, 1 or fewer merge tasks.
 			}
 
@@ -541,17 +573,22 @@ func (w *ReduceWorker) Run(ctx context.Context) error {
 			case <-ctx.Done():
 				return fmt.Errorf("context canceled while shuffling")
 			case <-time.After(5 * time.Second):
+				log.Printf("Reducer %q trying again", w.Name)
 			}
 			continue
 		}
 		// More than one merge task is in the queue. Shuffle and check again.
+		log.Printf("Reducer %q merging %d tasks", w.Name, len(mergeTasks))
 		if err := w.mergeTasks(ctx, mergeTasks); err != nil {
 			return fmt.Errorf("merge: %v", err)
 		}
 	}
 
 	// Then, reduce over the final merged task.
-	task, err := w.client.Claim(ctx, w.ClaimantID, w.InputQueue, taskRenewalDuration)
+	task, err := w.client.Claim(ctx, w.ClaimantID, w.InputQueue, claimDuration, entroq.WaitFor(5*time.Second))
+	if entroq.IsCanceled(err) {
+		return fmt.Errorf("no reduce tasks to claim")
+	}
 	if err != nil {
 		return fmt.Errorf("reduce run claim: %v", err)
 	}
@@ -652,6 +689,7 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 		qReduceOutput = path.Join(qReduce, "output")
 	)
 
+	log.Printf("Creating tasks for inputs")
 	// First create map tasks for all of the data.
 	for _, kv := range mr.Data {
 		b, err := json.Marshal(kv)
@@ -662,12 +700,16 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 			return "", fmt.Errorf("insert map input: %v", err)
 		}
 	}
+	log.Printf("Created %d tasks", len(mr.Data))
 
 	// When all tasks are present, start map and reduce workers. They'll all exit when finished.
 	g, ctx := errgroup.WithContext(ctx)
+
 	for i := 0; i < mr.NumMappers; i++ {
+		i := i
 		worker := NewMapWorker(mr.client, qMapInput,
 			func() MapEmitter { return NewCollectingMapEmitter(mr.NumReducers) },
+			MapAsName(fmt.Sprint(i)),
 			MapToOutputPrefix(qReduceInput),
 			WithMapper(mr.Map))
 
@@ -677,7 +719,9 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 	}
 
 	for i := 0; i < mr.NumReducers; i++ {
-		worker := NewReduceWorker(mr.client, qMapInput, qReduceInput,
+		i := i
+		worker := NewReduceWorker(mr.client, qMapInput, path.Join(qReduceInput, fmt.Sprint(i)),
+			ReduceAsName(fmt.Sprint(i)),
 			WithReducer(mr.Reduce),
 			ReduceToOutput(qReduceOutput))
 
@@ -686,6 +730,7 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 		})
 	}
 
+	log.Printf("Waiting for mappers and reducers to finish")
 	if err := g.Wait(); err != nil {
 		return "", fmt.Errorf("pipeline error: %v", err)
 	}
