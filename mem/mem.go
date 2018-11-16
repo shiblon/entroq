@@ -163,14 +163,35 @@ func (b *backend) Close() error {
 	return nil
 }
 
+func matchesPrefix(val string, prefixes ...string) bool {
+	for _, p := range prefixes {
+		if strings.HasPrefix(val, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesExact(val string, matches ...string) bool {
+	for _, m := range matches {
+		if val == m {
+			return true
+		}
+	}
+	return false
+}
+
 // Queues returns a map of queue names to sizes.
 func (b *backend) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[string]int, error) {
 	defer un(lock(b))
 
 	qs := make(map[string]int)
 	for q, items := range b.heaps {
-		if !strings.HasPrefix(q, qq.MatchPrefix) {
-			continue // an empty match prefix always matches, which is the desired default behavior.
+		if len(qq.MatchPrefix) != 0 || len(qq.MatchExact) != 0 {
+			if !matchesPrefix(q, qq.MatchPrefix...) && !matchesExact(q, qq.MatchExact...) {
+				// no match
+				continue
+			}
 		}
 		qs[q] = items.Len()
 		if qq.Limit > 0 && len(qs) >= qq.Limit {

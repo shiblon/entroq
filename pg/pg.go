@@ -139,9 +139,21 @@ func (b *backend) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[strin
 	q := "SELECT queue, COUNT(*) AS count FROM tasks GROUP BY queue"
 	var values []interface{}
 
-	if qq.MatchPrefix != "" {
-		q += fmt.Sprintf(" WHERE queue LIKE $%d", len(values)+1)
-		values = append(values, qq.MatchPrefix+"%")
+	if len(qq.MatchPrefix) != 0 || len(qq.MatchExact) != 0 {
+		q += " WHERE "
+	}
+
+	var matchFragments []string
+	for _, m := range qq.MatchPrefix {
+		matchFragments = append(matchFragments, fmt.Sprintf(" queue LIKE $%d", len(values)+1))
+		values = append(values, m+"%")
+	}
+	for _, m := range qq.MatchExact {
+		matchFragments = append(matchFragments, fmt.Sprintf(" queue = $%d", len(values)+1))
+		values = append(values, m)
+	}
+	if len(matchFragments) != 0 {
+		q += strings.Join(matchFragments, " OR ")
 	}
 
 	if qq.Limit > 0 {

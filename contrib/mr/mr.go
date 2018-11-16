@@ -17,7 +17,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shiblon/entroq"
-	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -27,7 +26,7 @@ const (
 
 // MapEmitter is passed to a map input processor so it can emit multiple
 // outputs for a single input by calling it.
-type MapEmitter func(key, value []byte) error
+type MapEmitter func(ctx context.Context, key, value []byte) error
 
 // MapProcessor is a function that accepts a key/value pair and emits zero or
 // more key/value pairs for reducing.
@@ -66,6 +65,30 @@ func WordCountMapper(ctx context.Context, key, value []byte, output MapEmitter) 
 type KV struct {
 	Key   []byte `json:"key"`
 	Value []byte `json:"value"`
+}
+
+// NewKV creates a new key/value struct.
+func NewKV(key, value []byte) *KV {
+	return &KV{Key: key, Value: value}
+}
+
+// MarshalJSON converts this key/value pair into JSON.
+func (kv *KV) MarshalJSON() ([]byte, error) {
+	return json.Marshal(kv)
+}
+
+// UnmarshalJSON attempts to parse JSON into this KV.
+func (kv *KV) UnmarshalJSON(data []byte) error {
+	return json.Unmarshal(data, kv)
+}
+
+// UnmarshalKVJSON attempts to create a new KV from JSON data.
+func UnmarshalKVJSON(data []byte) (*KV, error) {
+	kv := new(KV)
+	if err := kv.UnmarshalJSON(data); err != nil {
+		return nil, err
+	}
+	return kv, nil
 }
 
 // MapWorker claims map input tasks, processes them, and produces output tasks.
@@ -142,98 +165,90 @@ func Fingerprint64(key []byte) uint64 {
 	return h.Sum64()
 }
 
-// ReduceShardForKey produces the reduce shard for a given byte slice and
-// number of shards.
-func ReduceShareForKey(key []byte, n int) int {
+// ShardForKey produces the shard for a given byte slice and number of shards.
+func ShardForKey(key []byte, n int) int {
 	return int(Fingerprint64(key) % uint64(n))
 }
 
+// CollectingMapEmitter collects all of its output into a slice of shards, each
+// member of which contains a slice of kev/value pairs.
+type CollectingMapEmitter struct {
+	NumShards int
+	shards    [][]*KV
+}
+
+// NewCollectingMapEmitter creates a shard map emitter for use by a mapper.
+// When mapping is done, the data is collected into sorted slices of key/value
+// pairs, one per shard.
+func NewCollectingMapEmitter(numShards int) *CollectingMapEmitter {
+	if numShards < 1 {
+		numShards = 1
+	}
+
+	emitter := &CollectingMapEmitter{
+		NumShards: numShards,
+	}
+	for i := 0; i < numShards; i++ {
+		emitter.shards = append(emitter.shards, nil)
+	}
+
+	return emitter
+}
+
+// Emit adds a new key/value pair to the emitter.
+func (e *CollectingMapEmitter) Emit(_ context.Context, key, value []byte) error {
+	shard := ShardForKey(key)
+	e.shards[shard] = append(e.shards[shard], NewKV(key, value))
+}
+
+// AsModifyArgs returns a slice of arguments to be sent to insert new shuffle
+// tasks after emissions are complete. Additional modifications can be passed in
+// to make, e.g., simultaneous task deletion easier to specify.
+func (e *CollectingMapEmitter) AsModifyArgs(qPrefix string, additional ...entroq.ModifyArg) ([][]*KV, error) {
+	var args []entroq.ModifyArg
+	for shard, kvs := range e.shards {
+		if len(kvs) == 0 {
+			continue
+		}
+		sort.Slice(kvs, func(i, j int) bool {
+			return bytes.Compare(kvs[i].Key, kvs[j].Key) < 0
+		})
+		value, err := json.Marshal(kvs)
+		if err != nil {
+			return nil, fmt.Errorf("emit to modify args: %v", err)
+		}
+		queue := path.Join(qPrefix, fmt.Sprint(shard))
+		args = append(args, entroq.InsertingInto(queue, entroq.WithValue(value)))
+	}
+	return append(args, additional...), nil
+}
+
+// mapTask runs a mapper over a given task's input. It does everything in
+// memory, including storage of outputs. Note that, were we to want this to
+// scale, we would need to write output to a number of temporary files, then
+// clean them up if there were an error of any kind (or let them get garbage
+// collected). They would need to not be referenced unless the entire map task
+// were completed, at which point they would be pointed to by the completion
+// task. That's very doable, but beyond the scope of this exercise.
 func (w *MapWorker) mapTask(ctx context.Context, task *entroq.Task) error {
-	// The emit function just collects all outputs into a map from key
-	// shard to values. This in-memory approach wouldn't work in a
-	// large-scale system, but it's fine for getting an idea of how and
-	// whether things work here.
-	//
-	// Note that, were we to want this to scale, we would need to write
-	// output to a number of temporary files, then clean them up if there
-	// were an error of any kind (or let them get garbage collected). They
-	// would need to not be referenced unless the entire map task were
-	// completed, at which point they would be pointed to by the completion
-	// task. That's very doable, but beyond the scope of this exercise.
+	emitter := NewCollectingMapEmitter(w.NumReducers)
 
-	// Stash so that we have it for errors without hitting race conditions.
-	taskID := task.ID
-
-	mapdata := new(KV)
-	if err := json.Unmarshal(task.Value, mapdata); err != nil {
-		return fmt.Errorf("map run json unmarshal: %v", err)
-	}
-
-	// Now that we have the ID stored, we can start trying to renew the task's
-	// lease. We'll do this every 30 seconds.
-	// NOTE: This *changes the task*, so the task has to be protected before
-	// being used. This means that the group context must be canceled, then
-	// the group waited on, before the task can be used again. All we really
-	// need in here is the task's *data*, not the task itself, so that's okay.
-	g, groupCtx := errgroup.WithContext(ctx)
-
-	// Renew the task lease periodically.
-	g.Go(func() error {
-		for {
-			select {
-			case <-groupCtx.Done():
-				return nil // cancelation is the natural outcome
-			case <-time.After(taskRenewalInterval):
-				var err error
-				if task, err = w.client.RenewFor(groupCtx, task, taskRenewalDuration); err != nil {
-					return fmt.Errorf("could not refresh task lease: %v", err)
-				}
-			}
-		}
-	})
-
-	var modifyArgs []entroq.ModifyArg
-
-	// Once this finishes, the lease context will be canceled, causing the
-	// renewal loop to terminate.
-	g.Go(func() error {
-		byShard := make(map[uint64][]*KV)
-		key, value := mapdata.Key, mapdata.Value
-		emit := func(k, v []byte) error {
-			fp := Fingerprint64(k)
-			byShard[fp] = append(byShard[fp], &KV{Key: k, Value: v})
-			return nil
-		}
-		if err := w.Map(groupCtx, key, value, emit); err != nil {
-			return fmt.Errorf("map task %s failed: %v", taskID, err)
-		}
-
-		// Now that we have all of the outputs collected in the map, we can
-		// do a little sorting and shuffling. The tasks set up for shuffling include
-		// a key and a slice of sorted (by key) values, so we get that set up here.
-		// And we create push tasks for all of them while we're at it, after sorting.
-		for shard, kvs := range byShard {
-			sort.Slice(kvs, func(i, j int) bool {
-				return bytes.Compare(kvs[i].Key, kvs[j].Key) < 0
-			})
-			serialized, err := json.Marshal(kvs)
+	finalTask, err := w.client.DoWithRenewal(ctx, task, time.Minute,
+		func(ctx context.Context, id uuid.UUID, data *entroq.TaskData) error {
+			kv, err := UnmarshalKVJSON(data.Value)
 			if err != nil {
-				return fmt.Errorf("map output marshal: %v", err)
+				return fmt.Errorf("map run json unmarshal: %v", err)
 			}
-			modifyArgs = append(modifyArgs,
-				entroq.InsertingInto(path.Join(w.OutputPrefix, fmt.Sprint(shard)),
-					entroq.WithValue(serialized)))
-		}
-		return nil
-	})
 
-	if err := g.Wait(); err != nil {
-		return fmt.Errorf("error mapping task %v: %v", taskID, err)
-	}
+			if err := w.Map(ctx, kv.Key, kv.Value, emitter.Emit); err != nil {
+				return fmt.Errorf("map task %s failed: %v", id, err)
+			}
 
-	// Now that the wait has returned, the task isn't getting renewed. Delete.
-	// Insert all new shuffle shard tasks.
-	modifyArgs = append(modifyArgs, task.AsDeletion())
+			return nil
+		})
+
+	// Delete map task and create shuffle shard tasks.
+	args := emitter.AsModifyArgs(w.OutputPrefix, finalTask.AsDeletion())
 	if _, _, err := w.client.Modify(ctx, task.Claimant, modifyArgs...); err != nil {
 		return fmt.Errorf("map task update failed: %v", err)
 	}
@@ -250,7 +265,7 @@ func (w *MapWorker) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return fmt.Errorf("map run canceled")
 		default:
-			empty, err := w.client.IsEmpty(ctx, w.InputQueue)
+			empty, err := w.client.QueuesEmpty(ctx, entroq.MatchExact(w.InputQueue))
 			if err != nil {
 				return fmt.Errorf("map test empty: %v", err)
 			}
