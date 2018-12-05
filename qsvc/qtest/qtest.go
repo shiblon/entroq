@@ -1,5 +1,5 @@
-// Package test contains standard testing routines for exercising various backends in similar ways.
-package test
+// Package qtest contains standard testing routines for exercising various backends in similar ways.
+package qtest
 
 import (
 	"bytes"
