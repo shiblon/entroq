@@ -8,14 +8,14 @@ import (
 
 	"github.com/shiblon/entroq"
 	grpcbackend "github.com/shiblon/entroq/grpc"
-	"github.com/shiblon/entroq/qsvc/test"
+	"github.com/shiblon/entroq/qsvc/qtest"
 	"google.golang.org/grpc"
 )
 
 func TestSimpleSequence(t *testing.T) {
 	ctx := context.Background()
 
-	server, dial, err := test.StartService(ctx, Opener())
+	server, dial, err := qtest.StartService(ctx, Opener())
 	if err != nil {
 		t.Fatalf("Could not start service: %v", err)
 	}
@@ -31,5 +31,5 @@ func TestSimpleSequence(t *testing.T) {
 	}
 	defer client.Close()
 
-	test.SimpleSequence(ctx, t, client)
+	qtest.SimpleSequence(ctx, t, client)
 }
