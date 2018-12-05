@@ -397,6 +397,7 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.D
 
 	doneCh := make(chan struct{})
 
+	renewed := tasks
 	g.Go(func() error {
 		for {
 			select {
@@ -406,7 +407,7 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.D
 				return fmt.Errorf("canceled context, stopped renewing")
 			case <-time.After(lease / 2):
 				var err error
-				if tasks, err = c.RenewAllFor(ctx, tasks, lease); err != nil {
+				if renewed, err = c.RenewAllFor(ctx, tasks, lease); err != nil {
 					return fmt.Errorf("could not extend lease: %v", err)
 				}
 			}
@@ -423,7 +424,7 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.D
 	}
 
 	// The task will have been overwritten with every renewal. Return final task.
-	return tasks, nil
+	return renewed, nil
 }
 
 // DoWithRenew runs the provided function while keeping the given task lease renewed.
