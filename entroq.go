@@ -392,15 +392,7 @@ func (c *EntroQ) RenewAllFor(ctx context.Context, tasks []*Task, duration time.D
 }
 
 // DoWithRenewAll runs the provided function while keeping all given tasks leases renewed.
-func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, d time.Duration, f func(context.Context, []uuid.UUID, []*TaskData) error) ([]*Task, error) {
-	// Save the initial data and ID, so the renewal function can get at them without synchronization.
-	var ids []uuid.UUID
-	var dats []*TaskData
-	for _, t := range tasks {
-		ids = append(ids, t.ID)
-		dats = append(dats, t.Data())
-	}
-
+func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.Duration, f func(context.Context) error) ([]*Task, error) {
 	g, ctx := errgroup.WithContext(ctx)
 
 	doneCh := make(chan struct{})
@@ -412,10 +404,10 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, d time.Durat
 				return nil
 			case <-ctx.Done():
 				return fmt.Errorf("canceled context, stopped renewing")
-			case <-time.After(d / 2):
+			case <-time.After(lease / 2):
 				var err error
-				if tasks, err = c.RenewAllFor(ctx, tasks, d); err != nil {
-					return fmt.Errorf("could not extend lease for tasks %v: %v", ids, err)
+				if tasks, err = c.RenewAllFor(ctx, tasks, lease); err != nil {
+					return fmt.Errorf("could not extend lease: %v", err)
 				}
 			}
 		}
@@ -423,11 +415,11 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, d time.Durat
 
 	g.Go(func() error {
 		defer close(doneCh)
-		return f(ctx, ids, dats)
+		return f(ctx)
 	})
 
 	if err := g.Wait(); err != nil {
-		return nil, fmt.Errorf("error running with renewal of tasks %v: %v", ids, err)
+		return nil, fmt.Errorf("error running with renewal: %v", err)
 	}
 
 	// The task will have been overwritten with every renewal. Return final task.
@@ -435,10 +427,8 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, d time.Durat
 }
 
 // DoWithRenew runs the provided function while keeping the given task lease renewed.
-func (c *EntroQ) DoWithRenew(ctx context.Context, task *Task, d time.Duration, f func(context.Context, uuid.UUID, *TaskData) error) (*Task, error) {
-	finalTasks, err := c.DoWithRenewAll(ctx, []*Task{task}, d, func(ctx context.Context, ids []uuid.UUID, dats []*TaskData) error {
-		return f(ctx, ids[0], dats[0])
-	})
+func (c *EntroQ) DoWithRenew(ctx context.Context, task *Task, lease time.Duration, f func(context.Context) error) (*Task, error) {
+	finalTasks, err := c.DoWithRenewAll(ctx, []*Task{task}, lease, f)
 	if err != nil {
 		return nil, fmt.Errorf("with renew single task: %v", err)
 	}
