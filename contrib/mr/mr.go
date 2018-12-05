@@ -227,20 +227,19 @@ func NewMapWorker(eq *entroq.EntroQ, inQueue string, newEmitter func() MapEmitte
 // task. That's very doable, but beyond the scope of this exercise.
 func (w *MapWorker) mapTask(ctx context.Context, task *entroq.Task) error {
 	emitter := w.newEmitter()
-	finalTask, err := w.client.DoWithRenew(ctx, task, claimDuration,
-		func(ctx context.Context, id uuid.UUID, data *entroq.TaskData) error {
-			kv := new(KV)
-			if err := json.Unmarshal(data.Value, kv); err != nil {
-				return fmt.Errorf("map run json unmarshal: %v", err)
-			}
+	finalTask, err := w.client.DoWithRenew(ctx, task, claimDuration, func(ctx context.Context) error {
+		kv := new(KV)
+		if err := json.Unmarshal(task.Value, kv); err != nil {
+			return fmt.Errorf("map run json unmarshal: %v", err)
+		}
 
-			log.Printf("Mapper %q task with renew: %v", w.Name, task.IDVersion())
-			if err := w.Map(ctx, kv.Key, kv.Value, emitter.Emit); err != nil {
-				return fmt.Errorf("map task %s failed: %v", id, err)
-			}
+		log.Printf("Mapper %q task with renew: %v", w.Name, task.IDVersion())
+		if err := w.Map(ctx, kv.Key, kv.Value, emitter.Emit); err != nil {
+			return fmt.Errorf("map task %s failed: %v", task.IDVersion(), err)
+		}
 
-			return nil
-		})
+		return nil
+	})
 	if err != nil {
 		return fmt.Errorf("claim task for map: %v", err)
 	}
@@ -419,52 +418,51 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 		return nil
 	}
 	var modArgs []entroq.ModifyArg
-	finalTasks, err := w.client.DoWithRenewAll(ctx, tasks, claimDuration,
-		func(ctx context.Context, ids []uuid.UUID, dats []*entroq.TaskData) error {
-			// Do a merge sort (linear, already sorted inputs).
-			var allKVs [][]*KV
-			var indices []int
+	finalTasks, err := w.client.DoWithRenewAll(ctx, tasks, claimDuration, func(ctx context.Context) error {
+		// Do a merge sort (linear, already sorted inputs).
+		var allKVs [][]*KV
+		var indices []int
 
-			for _, task := range tasks {
-				var kvs []*KV
-				if err := json.Unmarshal(task.Value, &kvs); err != nil {
-					return fmt.Errorf("unmarshal merge data: %v", err)
-				}
-				allKVs = append(allKVs, kvs)
-				indices = append(indices, 0)
+		for _, task := range tasks {
+			var kvs []*KV
+			if err := json.Unmarshal(task.Value, &kvs); err != nil {
+				return fmt.Errorf("unmarshal merge data: %v", err)
 			}
+			allKVs = append(allKVs, kvs)
+			indices = append(indices, 0)
+		}
 
-			var vals []*KV
+		var vals []*KV
 
-			for {
-				best := -1
-				for i, kvs := range allKVs {
-					// Skip any that are exhausted.
-					top := indices[i]
-					if top >= len(kvs) {
-						continue
-					}
-					if best < 0 || bytes.Compare(kvs[top].Key, allKVs[best][indices[best]].Key) < 0 {
-						best = i
-					}
+		for {
+			best := -1
+			for i, kvs := range allKVs {
+				// Skip any that are exhausted.
+				top := indices[i]
+				if top >= len(kvs) {
+					continue
 				}
-				if best < 0 {
-					break
+				if best < 0 || bytes.Compare(kvs[top].Key, allKVs[best][indices[best]].Key) < 0 {
+					best = i
 				}
-				vals = append(vals, allKVs[best][indices[best]])
-				indices[best]++
 			}
-
-			// Now all key/value pairs are merged into a single sorted list. Create a new task and delete the others.
-			combined, err := json.Marshal(vals)
-			if err != nil {
-				return fmt.Errorf("marshal combined merge: %v", err)
+			if best < 0 {
+				break
 			}
+			vals = append(vals, allKVs[best][indices[best]])
+			indices[best]++
+		}
 
-			log.Printf("Reducer %q merged %d tasks, pushing to q %q: %s", w.Name, len(ids), w.InputQueue, string(combined))
-			modArgs = append(modArgs, entroq.InsertingInto(w.InputQueue, entroq.WithValue(combined)))
-			return nil
-		})
+		// Now all key/value pairs are merged into a single sorted list. Create a new task and delete the others.
+		combined, err := json.Marshal(vals)
+		if err != nil {
+			return fmt.Errorf("marshal combined merge: %v", err)
+		}
+
+		log.Printf("Reducer %q merged %d tasks, pushing to q %q: %s", w.Name, len(tasks), w.InputQueue, string(combined))
+		modArgs = append(modArgs, entroq.InsertingInto(w.InputQueue, entroq.WithValue(combined)))
+		return nil
+	})
 	if err != nil {
 		return fmt.Errorf("claim tasks for merge: %v", err)
 	}
@@ -483,56 +481,55 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 // writing them out in the order they appear (to maintain sorting).
 func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error {
 	var outputs []*KV
-	finalTask, err := w.client.DoWithRenew(ctx, task, claimDuration,
-		func(ctx context.Context, id uuid.UUID, data *entroq.TaskData) error {
-			log.Printf("Reduce %q starting reduce task", w.Name)
-			var kvs []*KV
-			if err := json.Unmarshal(data.Value, &kvs); err != nil {
-				return fmt.Errorf("json unmarshal reduce pairs: %v", err)
-			}
+	finalTask, err := w.client.DoWithRenew(ctx, task, claimDuration, func(ctx context.Context) error {
+		log.Printf("Reduce %q starting reduce task", w.Name)
+		var kvs []*KV
+		if err := json.Unmarshal(task.Value, &kvs); err != nil {
+			return fmt.Errorf("json unmarshal reduce pairs: %v", err)
+		}
 
-			if len(kvs) == 0 {
-				return nil
-			}
-
-			curr := 0
-
-			for curr < len(kvs) {
-				last := kvs[curr] // starting out - "last" is always first entry
-
-				log.Printf("Reduce %q curr=%d", w.Name, curr)
-				input := &proxyingReduceInput{
-					key:   func() []byte { return last.Key },
-					value: func() []byte { return last.Value },
-					err:   func() error { return nil },
-					next: func() bool {
-						if curr >= len(kvs) {
-							return false
-						}
-						// If we aren't just started, and the current key is
-						// not the same as the last, can't continue.
-						if curr > 0 && bytes.Compare(last.Key, kvs[curr].Key) != 0 {
-							return false
-						}
-						last = kvs[curr]
-						curr++
-						return true
-					},
-				}
-				currBefore := curr
-				output, err := w.Reduce(ctx, input)
-				if currBefore == curr {
-					// The reducer didn't consume anything - we need to do that instead.
-					for input.Next() {
-					}
-				}
-				if err != nil {
-					return fmt.Errorf("reduce error: %v", err)
-				}
-				outputs = append(outputs, NewKV(last.Key, output))
-			}
+		if len(kvs) == 0 {
 			return nil
-		})
+		}
+
+		curr := 0
+
+		for curr < len(kvs) {
+			last := kvs[curr] // starting out - "last" is always first entry
+
+			log.Printf("Reduce %q curr=%d", w.Name, curr)
+			input := &proxyingReduceInput{
+				key:   func() []byte { return last.Key },
+				value: func() []byte { return last.Value },
+				err:   func() error { return nil },
+				next: func() bool {
+					if curr >= len(kvs) {
+						return false
+					}
+					// If we aren't just started, and the current key is
+					// not the same as the last, can't continue.
+					if curr > 0 && bytes.Compare(last.Key, kvs[curr].Key) != 0 {
+						return false
+					}
+					last = kvs[curr]
+					curr++
+					return true
+				},
+			}
+			currBefore := curr
+			output, err := w.Reduce(ctx, input)
+			if currBefore == curr {
+				// The reducer didn't consume anything - we need to do that instead.
+				for input.Next() {
+				}
+			}
+			if err != nil {
+				return fmt.Errorf("reduce error: %v", err)
+			}
+			outputs = append(outputs, NewKV(last.Key, output))
+		}
+		return nil
+	})
 
 	outputValue, err := json.Marshal(outputs)
 	if err != nil {
