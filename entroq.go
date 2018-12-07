@@ -183,7 +183,18 @@ type Backend interface {
 
 // EntroQ is a client interface for accessing the task queue.
 type EntroQ struct {
-	backend Backend
+	backend  Backend
+	clientID uuid.UUID
+}
+
+// Option is an option that modifies how EntroQ clients are created.
+type Option func(*EntroQ)
+
+// WithClaimantID sets the default claimaint ID for this client.
+func WithClaimantID(id uuid.UUID) Option {
+	return func(eq *EntroQ) {
+		eq.clientID = id
+	}
 }
 
 // BackendOpener is a function that can open a connection to a backend. Creating
@@ -194,17 +205,31 @@ type BackendOpener func(ctx context.Context) (Backend, error)
 // New creates a new task client with the given backend implementation.
 //
 //   cli := New(ctx, backend)
-func New(ctx context.Context, opener BackendOpener) (*EntroQ, error) {
+func New(ctx context.Context, opener BackendOpener, opts ...Option) (*EntroQ, error) {
 	backend, err := opener(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("backend open failed: %v", err)
 	}
-	return &EntroQ{backend: backend}, nil
+	eq := &EntroQ{
+		backend:  backend,
+		clientID: uuid.New(),
+	}
+	for _, o := range opts {
+		o(eq)
+	}
+	return eq, nil
 }
 
 // Close closes the underlying backend.
 func (c *EntroQ) Close() error {
 	return c.backend.Close()
+}
+
+// ID returns the default claimant ID of this client. Used in "bare" calls,
+// like Modify, Claim, etc. To change the ID per call (usually not needed, and
+// can be dangerous), use the "As" calls, e.g., ModifyAs.
+func (c *EntroQ) ID() uuid.UUID {
+	return c.clientID
 }
 
 // Queues returns a mapping from all queue names to their task counts.
@@ -240,25 +265,32 @@ func (c *EntroQ) Tasks(ctx context.Context, queue string, opts ...TasksOpt) ([]*
 		Queue: queue,
 	}
 	for _, opt := range opts {
-		opt(query)
+		opt(c, query)
 	}
 
 	return c.backend.Tasks(ctx, query)
 }
 
 // TasksOpt is an option that can be passed into Tasks to control what it returns.
-type TasksOpt func(*TasksQuery)
+type TasksOpt func(*EntroQ, *TasksQuery)
 
-// LimitClaimant sets the claimant and then only returns self-claimed tasks or expired tasks.
-func LimitClaimant(claimant uuid.UUID) TasksOpt {
-	return func(q *TasksQuery) {
-		q.Claimant = claimant
+// LimitSelf only returns self-claimed tasks or expired tasks.
+func LimitSelf() TasksOpt {
+	return func(c *EntroQ, q *TasksQuery) {
+		q.Claimant = c.clientID
+	}
+}
+
+// LimitClaimant only returns tasks with the given claimant, or expired tasks.
+func LimitClaimant(id uuid.UUID) TasksOpt {
+	return func(_ *EntroQ, q *TasksQuery) {
+		q.Claimant = id
 	}
 }
 
 // LimitTasks sets the limit on the number of tasks to return. A value <= 0 indicates "no limit".
 func LimitTasks(limit int) TasksOpt {
-	return func(q *TasksQuery) {
+	return func(_ *EntroQ, q *TasksQuery) {
 		q.Limit = limit
 	}
 }
@@ -297,6 +329,13 @@ func WaitFor(d time.Duration) ClaimOpt {
 	}
 }
 
+// ClaimAs sets the claimant ID for a claim operation. When not set, uses the internal default for this client.
+func ClaimAs(id uuid.UUID) ClaimOpt {
+	return func(q *ClaimQuery) {
+		q.Claimant = id
+	}
+}
+
 // Canceled is an error returned when a claim is canceled by its context.
 type Canceled error
 
@@ -308,9 +347,9 @@ func IsCanceled(err error) bool {
 
 // Claim attempts to get the next unclaimed task from the given queue. It
 // blocks until one becomes available or until the context is done. When it
-// succeeds, it returns a task with the claimant set to that given, and an
-// arrival time given by the duration.
-func (c *EntroQ) Claim(ctx context.Context, claimant uuid.UUID, q string, duration time.Duration, opts ...ClaimOpt) (*Task, error) {
+// succeeds, it returns a task with the claimant set to the default, or to the
+// value given in options, and an arrival time given by the duration.
+func (c *EntroQ) Claim(ctx context.Context, q string, duration time.Duration, opts ...ClaimOpt) (*Task, error) {
 	const maxCheckInterval = 30 * time.Second
 	query := new(ClaimQuery)
 	for _, opt := range opts {
@@ -325,7 +364,7 @@ func (c *EntroQ) Claim(ctx context.Context, claimant uuid.UUID, q string, durati
 
 	var curWait = time.Second
 	for {
-		task, err := c.TryClaim(ctx, claimant, q, duration, opts...)
+		task, err := c.TryClaim(ctx, q, duration, opts...)
 		if err != nil {
 			return nil, err
 		}
@@ -345,12 +384,15 @@ func (c *EntroQ) Claim(ctx context.Context, claimant uuid.UUID, q string, durati
 	}
 }
 
-// TryClaimTask attempts one time to claim a task from the given queue. If there are no tasks, it
-// returns a nil error *and* a nil task. This allows the caller to decide whether to retry. It can fail if certain (optional) dependency tasks are not present. This can be used, for example, to ensure that configuration tasks haven't changed.
-func (c *EntroQ) TryClaim(ctx context.Context, claimant uuid.UUID, q string, duration time.Duration, opts ...ClaimOpt) (*Task, error) {
+// TryClaimTask attempts one time to claim a task from the given queue. If
+// there are no tasks, it returns a nil error *and* a nil task. This allows the
+// caller to decide whether to retry. It can fail if certain (optional)
+// dependency tasks are not present. This can be used, for example, to ensure
+// that configuration tasks haven't changed.
+func (c *EntroQ) TryClaim(ctx context.Context, q string, duration time.Duration, opts ...ClaimOpt) (*Task, error) {
 	query := &ClaimQuery{
 		Queue:    q,
-		Claimant: claimant,
+		Claimant: c.clientID,
 		Duration: duration,
 	}
 	for _, opt := range opts {
@@ -375,13 +417,18 @@ func (c *EntroQ) RenewAllFor(ctx context.Context, tasks []*Task, duration time.D
 	if len(tasks) == 0 {
 		return nil, nil
 	}
+	// Note that we use the default claimant always in this situation. These
+	// functions are high-level user-friendly things and don't allow some of
+	// the other hocus pocus that might happen in a grpc proxy situation (where
+	// claimant IDs need to come from the request, not the client it uses to
+	// perform its work).
 	var modArgs []ModifyArg
 	var taskIDs []string
 	for _, t := range tasks {
 		modArgs = append(modArgs, Changing(t, ArrivalTimeBy(duration)))
 		taskIDs = append(taskIDs, t.IDVersion().String())
 	}
-	_, changed, err := c.Modify(ctx, tasks[0].Claimant, modArgs...)
+	_, changed, err := c.Modify(ctx, modArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("renewal failed for tasks %q", taskIDs)
 	}
@@ -443,8 +490,8 @@ func (c *EntroQ) DoWithRenew(ctx context.Context, task *Task, lease time.Duratio
 // Returns all inserted task IDs, and an error if it could not proceed. If the error
 // was due to missing dependencies, a *DependencyError is returned, which can be checked for
 // by calling IsDependency(err).
-func (c *EntroQ) Modify(ctx context.Context, claimant uuid.UUID, modArgs ...ModifyArg) (inserted []*Task, changed []*Task, err error) {
-	mod := NewModification(claimant)
+func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (inserted []*Task, changed []*Task, err error) {
+	mod := NewModification(c.clientID)
 	for _, arg := range modArgs {
 		arg(mod)
 	}
@@ -455,13 +502,30 @@ func (c *EntroQ) Modify(ctx context.Context, claimant uuid.UUID, modArgs ...Modi
 // ModifyArg is an argument to the Modify function, which does batch modifications to the task store.
 type ModifyArg func(m *Modification)
 
+// ModifyAs sets the claimant ID for a particular modify call. Usually not
+// needed, can be dangerous unless used with extreme care. The client default
+// is used if this option is not provided.
+func ModifyAs(id uuid.UUID) ModifyArg {
+	return func(m *Modification) {
+		m.Claimant = id
+	}
+}
+
 // Inserting creates an insert modification from TaskData:
 //
-// 	cli.Modify(Inserting(&TaskData{
-// 		Queue: "myqueue",
-// 		At:    time.Now.Add(1 * time.Minute),
-// 		Value: []byte("hi there"),
-// 	}))
+// 	cli.Modify(ctx,
+// 		Inserting(&TaskData{
+// 			Queue: "myqueue",
+// 			At:    time.Now.Add(1 * time.Minute),
+// 			Value: []byte("hi there"),
+// 		}))
+//
+// Or, better still,
+//
+//	cli.Modify(ctx,
+//		InsertingInto("myqueue",
+//		    WithArrivalTimeIn(1 * time.Minute),
+//		    WithValue([]byte("hi there"))))
 func Inserting(tds ...*TaskData) ModifyArg {
 	return func(m *Modification) {
 		m.Inserts = append(m.Inserts, tds...)

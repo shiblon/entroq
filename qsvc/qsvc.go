@@ -200,7 +200,7 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to parse claimant ID: %v", err)
 	}
-	task, err := client.TryClaim(ctx, claimant, req.Queue, time.Duration(req.DurationMs)*time.Millisecond)
+	task, err := client.TryClaim(ctx, req.Queue, time.Duration(req.DurationMs)*time.Millisecond, entroq.ClaimAs(claimant))
 	if err != nil {
 		return nil, status.Errorf(codes.Unknown, "failed to claim: %v", err)
 	}
@@ -228,7 +228,9 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to parse claimant ID: %v", err)
 	}
-	var modArgs []entroq.ModifyArg
+	modArgs := []entroq.ModifyArg{
+		entroq.ModifyAs(claimant),
+	}
 	for _, insert := range req.Inserts {
 		modArgs = append(modArgs,
 			entroq.InsertingInto(insert.Queue,
@@ -264,7 +266,7 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 		}
 		modArgs = append(modArgs, entroq.DependingOn(id, depend.Version))
 	}
-	inserted, changed, err := client.Modify(ctx, claimant, modArgs...)
+	inserted, changed, err := client.Modify(ctx, modArgs...)
 	if err != nil {
 		if depErr, ok := err.(*entroq.DependencyError); ok {
 			tmap := map[pb.DepType][]*entroq.TaskID{
@@ -316,7 +318,7 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 			return nil, status.Errorf(codes.InvalidArgument, "failed to parse claimant ID: %v", err)
 		}
 	}
-	// Claimant will only really be limited if it is non-Nil.
+	// Claimant will only really be limited if it is nonzero.
 	tasks, err := client.Tasks(ctx, req.Queue, entroq.LimitClaimant(claimant))
 	if err != nil {
 		return nil, status.Errorf(codes.Unknown, "failed to get tasks: %v", err)

@@ -16,7 +16,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/shiblon/entroq"
 	"golang.org/x/sync/errgroup"
 )
@@ -159,8 +158,7 @@ type MapWorker struct {
 	client     *entroq.EntroQ
 	newEmitter func() MapEmitter
 
-	Name       string
-	ClaimantID uuid.UUID
+	Name string
 
 	InputQueue   string
 	OutputPrefix string
@@ -207,7 +205,6 @@ func NewMapWorker(eq *entroq.EntroQ, inQueue string, newEmitter func() MapEmitte
 	w := &MapWorker{
 		client:       eq,
 		newEmitter:   newEmitter,
-		ClaimantID:   uuid.New(),
 		InputQueue:   inQueue,
 		OutputPrefix: inQueue,
 		Map:          IdentityMapper,
@@ -227,7 +224,7 @@ func NewMapWorker(eq *entroq.EntroQ, inQueue string, newEmitter func() MapEmitte
 // task. That's very doable, but beyond the scope of this exercise.
 func (w *MapWorker) mapTask(ctx context.Context, task *entroq.Task) error {
 	emitter := w.newEmitter()
-	finalTask, err := w.client.DoWithRenew(ctx, task, claimDuration, func(ctx context.Context) error {
+	task, err := w.client.DoWithRenew(ctx, task, claimDuration, func(ctx context.Context) error {
 		kv := new(KV)
 		if err := json.Unmarshal(task.Value, kv); err != nil {
 			return fmt.Errorf("map run json unmarshal: %v", err)
@@ -245,12 +242,12 @@ func (w *MapWorker) mapTask(ctx context.Context, task *entroq.Task) error {
 	}
 
 	// Delete map task and create shuffle shard tasks.
-	log.Printf("Mapper %q finished task %v, adding to prefix %q", w.Name, finalTask.IDVersion(), w.OutputPrefix)
-	args, err := emitter.AsModifyArgs(w.OutputPrefix, finalTask.AsDeletion())
+	log.Printf("Mapper %q finished task %v, adding to prefix %q", w.Name, task.IDVersion(), w.OutputPrefix)
+	args, err := emitter.AsModifyArgs(w.OutputPrefix, task.AsDeletion())
 	if err != nil {
 		return fmt.Errorf("map task make insertions: %v", err)
 	}
-	if _, _, err := w.client.Modify(ctx, w.ClaimantID, args...); err != nil {
+	if _, _, err := w.client.Modify(ctx, args...); err != nil {
 		return fmt.Errorf("map task update failed: %v", err)
 	}
 	return nil
@@ -273,7 +270,7 @@ func (w *MapWorker) Run(ctx context.Context) error {
 			return nil // all finished.
 		}
 		log.Printf("Mapper %q queue not empty. Claiming task.", w.Name)
-		task, err := w.client.Claim(ctx, w.ClaimantID, w.InputQueue, claimDuration, entroq.WaitFor(5*time.Second))
+		task, err := w.client.Claim(ctx, w.InputQueue, claimDuration, entroq.WaitFor(5*time.Second))
 		if entroq.IsCanceled(err) {
 			continue
 		}
@@ -350,8 +347,7 @@ func SliceReducer(ctx context.Context, input ReducerInput) ([]byte, error) {
 type ReduceWorker struct {
 	client *entroq.EntroQ
 
-	Name       string
-	ClaimantID uuid.UUID
+	Name string
 
 	MapEmptyQueue string
 	InputQueue    string
@@ -388,7 +384,6 @@ func ReduceAsName(name string) ReduceWorkerOption {
 func NewReduceWorker(eq *entroq.EntroQ, mapEmptyQueue, inQueue string, opts ...ReduceWorkerOption) *ReduceWorker {
 	w := &ReduceWorker{
 		client:        eq,
-		ClaimantID:    uuid.New(),
 		InputQueue:    inQueue,
 		MapEmptyQueue: mapEmptyQueue,
 		OutputQueue:   path.Join(inQueue, "out"),
@@ -418,7 +413,7 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 		return nil
 	}
 	var modArgs []entroq.ModifyArg
-	finalTasks, err := w.client.DoWithRenewAll(ctx, tasks, claimDuration, func(ctx context.Context) error {
+	tasks, err := w.client.DoWithRenewAll(ctx, tasks, claimDuration, func(ctx context.Context) error {
 		// Do a merge sort (linear, already sorted inputs).
 		var allKVs [][]*KV
 		var indices []int
@@ -467,10 +462,10 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 		return fmt.Errorf("claim tasks for merge: %v", err)
 	}
 
-	for _, t := range finalTasks {
+	for _, t := range tasks {
 		modArgs = append(modArgs, t.AsDeletion())
 	}
-	if _, _, err := w.client.Modify(ctx, w.ClaimantID, modArgs...); err != nil {
+	if _, _, err := w.client.Modify(ctx, modArgs...); err != nil {
 		return fmt.Errorf("merge output: %v", err)
 	}
 	return nil
@@ -481,7 +476,7 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 // writing them out in the order they appear (to maintain sorting).
 func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error {
 	var outputs []*KV
-	finalTask, err := w.client.DoWithRenew(ctx, task, claimDuration, func(ctx context.Context) error {
+	task, err := w.client.DoWithRenew(ctx, task, claimDuration, func(ctx context.Context) error {
 		log.Printf("Reduce %q starting reduce task", w.Name)
 		var kvs []*KV
 		if err := json.Unmarshal(task.Value, &kvs); err != nil {
@@ -535,7 +530,7 @@ func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error 
 	if err != nil {
 		return fmt.Errorf("failed to serialize reduce outputs: %v", err)
 	}
-	if _, _, err := w.client.Modify(ctx, w.ClaimantID, finalTask.AsDeletion(), entroq.InsertingInto(w.OutputQueue, entroq.WithValue(outputValue))); err != nil {
+	if _, _, err := w.client.Modify(ctx, task.AsDeletion(), entroq.InsertingInto(w.OutputQueue, entroq.WithValue(outputValue))); err != nil {
 		return fmt.Errorf("failed to insert completed reduce shard: %v", err)
 	}
 	return nil
@@ -603,7 +598,7 @@ func (w *ReduceWorker) Run(ctx context.Context) error {
 	log.Printf("Reducer %q merge finished. Reducing.", w.Name)
 
 	// Then, reduce over the final merged task.
-	task, err := w.client.Claim(ctx, w.ClaimantID, w.InputQueue, claimDuration, entroq.WaitFor(5*time.Second))
+	task, err := w.client.Claim(ctx, w.InputQueue, claimDuration, entroq.WaitFor(5*time.Second))
 	if err != nil {
 		return fmt.Errorf("reduce run claim: %v", err)
 	}
@@ -618,8 +613,6 @@ func (w *ReduceWorker) Run(ctx context.Context) error {
 // goroutines, using the provided worker counts.
 type MapReduce struct {
 	client *entroq.EntroQ
-
-	ClaimantID uuid.UUID
 
 	QueuePrefix string
 	NumMappers  int
@@ -680,7 +673,6 @@ func AddInput(kvs ...*KV) MapReduceOption {
 func NewMapReduce(eq *entroq.EntroQ, qPrefix string, opts ...MapReduceOption) *MapReduce {
 	mr := &MapReduce{
 		client:      eq,
-		ClaimantID:  uuid.New(),
 		QueuePrefix: qPrefix,
 		NumMappers:  1,
 		NumReducers: 1,
@@ -711,7 +703,7 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("marshal input: %v", err)
 		}
-		if _, _, err := mr.client.Modify(ctx, mr.ClaimantID, entroq.InsertingInto(qMapInput, entroq.WithValue(b))); err != nil {
+		if _, _, err := mr.client.Modify(ctx, entroq.InsertingInto(qMapInput, entroq.WithValue(b))); err != nil {
 			return "", fmt.Errorf("insert map input: %v", err)
 		}
 	}
