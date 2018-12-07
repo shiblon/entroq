@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/google/uuid"
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/qsvc"
 	"google.golang.org/grpc"
@@ -44,7 +43,6 @@ func StartService(ctx context.Context, opener entroq.BackendOpener) (*grpc.Serve
 func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ) {
 	t.Helper()
 
-	myID := uuid.New()
 	now := time.Now()
 
 	sleep := func(d time.Duration) {
@@ -58,7 +56,7 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ) {
 	const queue = "/test/TryClaim"
 
 	// Claim from empty queue.
-	task, err := client.TryClaim(ctx, myID, queue, 100*time.Millisecond)
+	task, err := client.TryClaim(ctx, queue, 100*time.Millisecond)
 	if err != nil {
 		t.Fatalf("Got unexpected error for claiming from an empty queue: %v", err)
 	}
@@ -71,13 +69,13 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ) {
 			Queue:    queue,
 			At:       now,
 			Value:    []byte("hello"),
-			Claimant: myID,
+			Claimant: client.ID(),
 		},
 		{
 			Queue:    queue,
 			At:       now.Add(100 * time.Millisecond),
 			Value:    []byte("there"),
-			Claimant: myID,
+			Claimant: client.ID(),
 		},
 	}
 	var insData []*entroq.TaskData
@@ -85,7 +83,7 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ) {
 		insData = append(insData, task.Data())
 	}
 
-	inserted, changed, err := client.Modify(ctx, myID, entroq.Inserting(insData...))
+	inserted, changed, err := client.Modify(ctx, entroq.Inserting(insData...))
 	if err != nil {
 		t.Fatalf("Got unexpected error inserting two tasks: %v", err)
 	}
@@ -121,7 +119,7 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ) {
 
 	// Claim ready task.
 	claimCtx, _ := context.WithTimeout(ctx, 10*time.Millisecond)
-	claimed, err := client.Claim(claimCtx, myID, queue, 10*time.Second)
+	claimed, err := client.Claim(claimCtx, queue, 10*time.Second)
 
 	if err != nil {
 		t.Fatalf("Got unexpected error for claiming from a queue with one ready task: %v", err)
@@ -137,7 +135,7 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ) {
 	}
 
 	// TryClaim not ready task.
-	tryclaimed, err := client.TryClaim(ctx, myID, queue, 10*time.Second)
+	tryclaimed, err := client.TryClaim(ctx, queue, 10*time.Second)
 	if err != nil {
 		t.Fatalf("Got unexpected error for claiming from a queue with no ready tasks: %v", err)
 	}
@@ -147,7 +145,7 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ) {
 
 	// Make sure the next claim will work.
 	sleep(100 * time.Millisecond)
-	tryclaimed, err = client.TryClaim(ctx, myID, queue, 5*time.Second)
+	tryclaimed, err = client.TryClaim(ctx, queue, 5*time.Second)
 	if err != nil {
 		t.Fatalf("Got unexpected error for claiming from a queue with one ready task: %v", err)
 	}
