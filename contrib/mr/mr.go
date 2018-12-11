@@ -13,6 +13,7 @@ import (
 	"log"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -230,7 +231,6 @@ func (w *MapWorker) mapTask(ctx context.Context, task *entroq.Task) error {
 			return fmt.Errorf("map run json unmarshal: %v", err)
 		}
 
-		log.Printf("Mapper %q task with renew: %v", w.Name, task.IDVersion())
 		if err := w.Map(ctx, kv.Key, kv.Value, emitter.Emit); err != nil {
 			return fmt.Errorf("map task %s failed: %v", task.IDVersion(), err)
 		}
@@ -242,7 +242,6 @@ func (w *MapWorker) mapTask(ctx context.Context, task *entroq.Task) error {
 	}
 
 	// Delete map task and create shuffle shard tasks.
-	log.Printf("Mapper %q finished task %v, adding to prefix %q", w.Name, task.IDVersion(), w.OutputPrefix)
 	args, err := emitter.AsModifyArgs(w.OutputPrefix, task.AsDeletion())
 	if err != nil {
 		return fmt.Errorf("map task make insertions: %v", err)
@@ -261,7 +260,6 @@ func (w *MapWorker) Run(ctx context.Context) error {
 	log.Printf("Mapper %q starting", w.Name)
 	defer log.Printf("Mapper %q finished", w.Name)
 	for {
-		log.Printf("Mapper %q checking for empty map queue", w.Name)
 		empty, err := w.client.QueuesEmpty(ctx, entroq.MatchExact(w.InputQueue))
 		if err != nil {
 			return fmt.Errorf("map test empty: %v", err)
@@ -269,15 +267,13 @@ func (w *MapWorker) Run(ctx context.Context) error {
 		if empty {
 			return nil // all finished.
 		}
-		log.Printf("Mapper %q queue not empty. Claiming task.", w.Name)
-		task, err := w.client.Claim(ctx, w.InputQueue, claimDuration, entroq.WaitFor(5*time.Second))
+		task, err := w.client.Claim(ctx, w.InputQueue, claimDuration, entroq.ClaimWait(5*time.Second))
 		if entroq.IsCanceled(err) {
 			continue
 		}
 		if err != nil {
 			return fmt.Errorf("map run claim: %v", err)
 		}
-		log.Printf("Mapper %q mapping task %v", w.Name, task.IDVersion())
 		if err := w.mapTask(ctx, task); err != nil {
 			return fmt.Errorf("map run: %v", err)
 		}
@@ -327,6 +323,22 @@ func FirstValueReducer(ctx context.Context, input ReducerInput) ([]byte, error) 
 // sorting keys, for example, where the values are not useful or important.
 func NilReducer(ctx context.Context, input ReducerInput) ([]byte, error) {
 	return nil, nil
+}
+
+// SumReducer produces a sum over (int) values for each key.
+func SumReducer(ctx context.Context, input ReducerInput) ([]byte, error) {
+	sum := 0
+	for input.Next() {
+		count, err := strconv.Atoi(string(input.Value()))
+		if err != nil {
+			return nil, fmt.Errorf("int conversion in SumReducer: %v", err)
+		}
+		sum += count
+	}
+	if err := input.Err(); err != nil {
+		return nil, fmt.Errorf("error getting SumReducer value: %v", err)
+	}
+	return []byte(fmt.Sprint(sum)), nil
 }
 
 // SliceReducer produces a JSON-serialized slice of all values in its input.
@@ -414,47 +426,29 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 	}
 	var modArgs []entroq.ModifyArg
 	tasks, err := w.client.DoWithRenewAll(ctx, tasks, claimDuration, func(ctx context.Context) error {
-		// Do a merge sort (linear, already sorted inputs).
-		var allKVs [][]*KV
-		var indices []int
+		// Append and sort. Note that in real life with real scale, we would
+		// want to do an on-disk merge sort (since individual components would
+		// already be sorted).
+		var kvs []*KV
 
 		for _, task := range tasks {
-			var kvs []*KV
-			if err := json.Unmarshal(task.Value, &kvs); err != nil {
+			var vals []*KV
+			if err := json.Unmarshal(task.Value, &vals); err != nil {
 				return fmt.Errorf("unmarshal merge data: %v", err)
 			}
-			allKVs = append(allKVs, kvs)
-			indices = append(indices, 0)
+			kvs = append(kvs, vals...)
 		}
 
-		var vals []*KV
-
-		for {
-			best := -1
-			for i, kvs := range allKVs {
-				// Skip any that are exhausted.
-				top := indices[i]
-				if top >= len(kvs) {
-					continue
-				}
-				if best < 0 || bytes.Compare(kvs[top].Key, allKVs[best][indices[best]].Key) < 0 {
-					best = i
-				}
-			}
-			if best < 0 {
-				break
-			}
-			vals = append(vals, allKVs[best][indices[best]])
-			indices[best]++
-		}
+		sort.Slice(kvs, func(i, j int) bool {
+			return bytes.Compare(kvs[i].Key, kvs[j].Key) < 0
+		})
 
 		// Now all key/value pairs are merged into a single sorted list. Create a new task and delete the others.
-		combined, err := json.Marshal(vals)
+		combined, err := json.Marshal(kvs)
 		if err != nil {
 			return fmt.Errorf("marshal combined merge: %v", err)
 		}
 
-		log.Printf("Reducer %q merged %d tasks, pushing to q %q: %s", w.Name, len(tasks), w.InputQueue, string(combined))
 		modArgs = append(modArgs, entroq.InsertingInto(w.InputQueue, entroq.WithValue(combined)))
 		return nil
 	})
@@ -492,7 +486,6 @@ func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error 
 		for curr < len(kvs) {
 			last := kvs[curr] // starting out - "last" is always first entry
 
-			log.Printf("Reduce %q curr=%d", w.Name, curr)
 			input := &proxyingReduceInput{
 				key:   func() []byte { return last.Key },
 				value: func() []byte { return last.Value },
@@ -587,18 +580,16 @@ func (w *ReduceWorker) Run(ctx context.Context) error {
 		}
 		// More than one merge task is in the queue. Shuffle and check again.
 		log.Printf("Reducer %q merging %d tasks", w.Name, len(mergeTasks))
-		for _, t := range mergeTasks {
-			log.Printf("- %v", t.IDVersion())
-		}
 		if err := w.mergeTasks(ctx, mergeTasks); err != nil {
 			return fmt.Errorf("merge: %v", err)
 		}
+		log.Printf("Reducer %q merged %d tasks, pushing to %q", w.Name, len(mergeTasks), w.InputQueue)
 	}
 
 	log.Printf("Reducer %q merge finished. Reducing.", w.Name)
 
 	// Then, reduce over the final merged task.
-	task, err := w.client.Claim(ctx, w.InputQueue, claimDuration, entroq.WaitFor(5*time.Second))
+	task, err := w.client.Claim(ctx, w.InputQueue, claimDuration, entroq.ClaimWait(5*time.Second))
 	if err != nil {
 		return fmt.Errorf("reduce run claim: %v", err)
 	}
@@ -726,9 +717,9 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 	}
 
 	for i := 0; i < mr.NumReducers; i++ {
-		i := i
-		worker := NewReduceWorker(mr.client, qMapInput, path.Join(qReduceInput, fmt.Sprint(i)),
-			ReduceAsName(fmt.Sprint(i)),
+		name := fmt.Sprint(i)
+		worker := NewReduceWorker(mr.client, qMapInput, path.Join(qReduceInput, name),
+			ReduceAsName(name),
 			WithReducer(mr.Reduce),
 			ReduceToOutput(qReduceOutput))
 

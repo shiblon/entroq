@@ -121,7 +121,7 @@ type ClaimQuery struct {
 	Claimant uuid.UUID     // The ID of the process trying to make the claim.
 	Duration time.Duration // How long the task should be claimed for if successful.
 
-	maxBlock time.Duration // Length of time to wait for a blocking claim.
+	maxWait time.Duration // Length of time to wait for a blocking claim.
 }
 
 // TasksQuery holds information for a tasks query.
@@ -241,7 +241,7 @@ func (c *EntroQ) Queues(ctx context.Context, opts ...QueuesOpt) (map[string]int,
 	return c.backend.Queues(ctx, query)
 }
 
-// QueueEmpty indicates whether the specified task queues are all empty. If no
+// QueuesEmpty indicates whether the specified task queues are all empty. If no
 // options are specified, returns an error.
 func (c *EntroQ) QueuesEmpty(ctx context.Context, opts ...QueuesOpt) (bool, error) {
 	if len(opts) == 0 {
@@ -322,10 +322,11 @@ func LimitQueues(limit int) QueuesOpt {
 // ClaimOpt modifies limits on a task claim.
 type ClaimOpt func(*ClaimQuery)
 
-// WaitFor sets the maximum wait time for a blocking Claim. Default is whatever the context says.
-func WaitFor(d time.Duration) ClaimOpt {
+// ClaimWait sets the maximum wait time for a blocking Claim. Default is
+// whatever the context says, or indefinite.
+func ClaimWait(d time.Duration) ClaimOpt {
 	return func(q *ClaimQuery) {
-		q.maxBlock = d
+		q.maxWait = d
 	}
 }
 
@@ -350,19 +351,23 @@ func IsCanceled(err error) bool {
 // succeeds, it returns a task with the claimant set to the default, or to the
 // value given in options, and an arrival time given by the duration.
 func (c *EntroQ) Claim(ctx context.Context, q string, duration time.Duration, opts ...ClaimOpt) (*Task, error) {
-	const maxCheckInterval = 30 * time.Second
+	const (
+		maxCheckInterval = 30 * time.Second
+		startInterval    = time.Second
+	)
+
 	query := new(ClaimQuery)
 	for _, opt := range opts {
 		opt(query)
 	}
 
-	if query.maxBlock != 0 {
-		mwc, cancel := context.WithTimeout(ctx, query.maxBlock)
+	if query.maxWait != 0 {
+		var cancel func()
+		ctx, cancel = context.WithTimeout(ctx, query.maxWait)
 		defer cancel()
-		ctx = mwc
 	}
 
-	var curWait = time.Second
+	curWait := startInterval
 	for {
 		task, err := c.TryClaim(ctx, q, duration, opts...)
 		if err != nil {
