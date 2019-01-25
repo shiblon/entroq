@@ -49,7 +49,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	pb "github.com/shiblon/entroq/qsvc/proto"
+	pb "github.com/shiblon/entroq/proto"
 )
 
 // Opener creates an opener function to be used to get a gRPC backend.

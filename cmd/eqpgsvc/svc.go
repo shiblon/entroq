@@ -13,7 +13,7 @@ import (
 	"github.com/shiblon/entroq/qsvc"
 	"google.golang.org/grpc"
 
-	pb "github.com/shiblon/entroq/qsvc/proto"
+	pb "github.com/shiblon/entroq/proto"
 
 	_ "github.com/lib/pq"
 )

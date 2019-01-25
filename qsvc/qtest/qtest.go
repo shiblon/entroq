@@ -17,7 +17,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/test/bufconn"
 
-	pb "github.com/shiblon/entroq/qsvc/proto"
+	pb "github.com/shiblon/entroq/proto"
 )
 
 const bufSize = 1 << 20

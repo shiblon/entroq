@@ -8,7 +8,7 @@
 //
 // 		"github.com/shiblon/entroq/pg"
 // 		"github.com/shiblon/entroq/qsvc"
-// 		pb "github.com/shiblon/entroq/qsvc/proto"
+// 		pb "github.com/shiblon/entroq/proto"
 //
 // 		"google.golang.org/grpc"
 // 	)
@@ -44,7 +44,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	pb "github.com/shiblon/entroq/qsvc/proto"
+	pb "github.com/shiblon/entroq/proto"
 )
 
 // QSvc is an EntroQServer.
