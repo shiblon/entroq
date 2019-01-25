@@ -12,6 +12,7 @@ WORKDIR /build/src/github.com/shiblon/entroq
 
 COPY . .
 
+RUN apk add git
 RUN go get -d -v ./...
 RUN go install -v ./...
 
@@ -21,6 +22,7 @@ FROM alpine
 #RUN adduser -S -D -H -h /go/src/github.com/shiblon/entroq appuser
 #USER appuser
 
+RUN apk add bash
 RUN mkdir -p /go/bin
 
 ENV PATH ${PATH}:/go/bin
