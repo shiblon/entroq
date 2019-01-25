@@ -19,9 +19,6 @@ RUN go install -v ./...
 # Switch to a smaller container without build tools.
 FROM alpine
 
-#RUN adduser -S -D -H -h /go/src/github.com/shiblon/entroq appuser
-#USER appuser
-
 RUN apk add bash
 RUN mkdir -p /go/bin
 
@@ -30,6 +27,9 @@ ENV PATH ${PATH}:/go/bin
 COPY --from=builder /build/bin/* /go/bin/
 COPY cmd/eqsvc.sh /go/bin/
 WORKDIR /go/bin
+
+RUN adduser -S -D -H -h /go/src/github.com/shiblon/entroq appuser
+USER appuser
 
 ENTRYPOINT ["./eqsvc.sh"]
 
