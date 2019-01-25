@@ -1,3 +1,5 @@
+# Inspired by https://www.cloudreach.com/blog/containerize-this-golang-dockerfiles/
+
 # Build inside a Go container.
 FROM golang:alpine as builder
 
