@@ -52,12 +52,19 @@ import (
 	pb "github.com/shiblon/entroq/proto"
 )
 
-// Opener creates an opener function to be used to get a gRPC backend.
-func Opener(hostPort string, dialOpts ...grpc.DialOption) entroq.BackendOpener {
+const DefaultAddr = ":37706"
+
+// Opener creates an opener function to be used to get a gRPC backend. If the
+// address string is empty, it defaults to the DefaultAddr, the default value
+// for the memory-backed gRPC server.
+func Opener(addr string, dialOpts ...grpc.DialOption) entroq.BackendOpener {
+	if addr == "" {
+		addr = DefaultAddr
+	}
 	return func(ctx context.Context) (entroq.Backend, error) {
-		conn, err := grpc.DialContext(ctx, hostPort, dialOpts...)
+		conn, err := grpc.DialContext(ctx, addr, dialOpts...)
 		if err != nil {
-			return nil, fmt.Errorf("failed to dial %q: %v", hostPort, err)
+			return nil, fmt.Errorf("failed to dial %q: %v", addr, err)
 		}
 		return New(conn)
 	}

@@ -2,6 +2,9 @@
 
 A task queue with strong competing-consumer-friendly semantics and transactional updates.
 
+Pronounced "Entro-Q", as in the letter than comes after "Entro-P". We aim to
+take the next step away from parallel systems chaos.
+
 ## Concepts
 
 There are essentially two operations that can be performed on a task store:
