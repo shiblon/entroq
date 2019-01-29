@@ -1,0 +1,82 @@
+---
+variables:
+  IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_NAME
+  IMAGE_REMOTE_TAG: $REMOTE_NAME:$CI_COMMIT_REF_NAME
+  PROTOC_VERSION: 3.5.0
+  GRPC_VERSION: 1.15.0
+  PROTOC_ZIP: protoc-${PROTOC_VERSION}-linux-x86_64.zip
+  GO_PWD: /go/src/gitlab.mediforprogram.com/medifor/medifor-worker
+
+stages:
+- build
+- test
+- release
+
+
+####################################################
+#       Build and Test
+####################################################
+
+proto:
+  image: datamachines/grpc-go:1.11
+  stage: build
+  before_script:
+  # Create a symbolic link under $GOPATH, this is needed for local build
+  # i.e. /go/src/gitlab.mediforprogram.com/medifor/medifor-proto
+  - mkdir -p $GOPATH/src/gitlab.mediforprogram.com/medifor
+  - ln -s $CI_PROJECT_DIR $GOPATH/src/gitlab.mediforprogram.com/medifor/entroq
+  - cd $GOPATH/src/gitlab.mediforprogram.com/medifor/entroq
+  - make clean
+  script:
+  - make build-proto
+  artifacts:
+    paths:
+    - proto/task.pb.go
+
+
+build:
+  image: datamachines/grpc-go:1.11
+  stage: build
+  before_script:
+    # Create a symbolic link under $GOPATH, this is needed for local build
+    # i.e. /go/src/gitlab.mediforprogram.com/medifor/medifor-proto
+    - mkdir -p $GOPATH/src/gitlab.mediforprogram.com/medifor
+    - ln -s $CI_PROJECT_DIR $GOPATH/src/gitlab.mediforprogram.com/medifor/entroq
+    - cd $GOPATH/src/gitlab.mediforprogram.com/medifor/entroq
+    - make clean
+  script:
+    - make build
+
+test:
+  image: datamachines/grpc-go:1.11
+  stage: build
+  before_script:
+    # Create a symbolic link under $GOPATH, this is needed for local build
+    # i.e. /go/src/gitlab.mediforprogram.com/medifor/medifor-proto
+    - mkdir -p $GOPATH/src/gitlab.mediforprogram.com/medifor
+    - ln -s $CI_PROJECT_DIR $GOPATH/src/gitlab.mediforprogram.com/medifor/entroq
+    - cd $GOPATH/src/gitlab.mediforprogram.com/medifor/entroq
+    - make clean
+  script:
+    - make build
+    - make test
+
+####################################################
+#   Docker Build
+####################################################
+
+image:
+  stage: release
+  only:
+    refs:
+    - master
+    - develop
+  before_script:
+  - docker login -u gitlab-ci-token -p $CI_BUILD_TOKEN ${CI_REGISTRY}
+  script:
+  - docker build -t $CI_REGISTRY_IMAGE:latest .
+  - docker tag $CI_REGISTRY_IMAGE:latest $CI_REGISTRY_IMAGE:${CI_COMMIT_REF_NAME}
+  - docker push $CI_REGISTRY_IMAGE:${CI_COMMIT_REF_NAME}
+  - if [ "${CI_COMMIT_REF_NAME}" == "master" ]; then docker push $CI_REGISTRY_IMAGE:latest ; fi
+  - if [ "${CI_COMMIT_REF_NAME}" == "master" ]; then docker tag $CI_REGISTRY_IMAGE:latest $CI_REGISTRY_IMAGE:${CI_COMMIT_SHA}; fi
+  - if [ "${CI_COMMIT_REF_NAME}" == "master" ]; then docker push $CI_REGISTRY_IMAGE:${CI_COMMIT_SHA}; fi
