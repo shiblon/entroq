@@ -6,8 +6,8 @@ FROM datamachines/grpc-go:1.11 as builder
 ENV GOPATH /build
 ENV CGO_ENABLED 0
 
-COPY . $GOPATH/src/gitlab.mediforprogram.com/medifor/entroq
-WORKDIR $GOPATH/src/gitlab.mediforprogram.com/medifor/entroq
+COPY . $GOPATH/src/github.com/shiblon/entroq
+WORKDIR $GOPATH/src/github.com/shiblon/entroq
 
 RUN go get -d -v ./... && \
 	go install -v ./...
@@ -25,7 +25,7 @@ COPY --from=builder /build/bin/* /go/bin/
 COPY cmd/eqsvc.sh /go/bin/
 WORKDIR /go/bin
 
-RUN adduser -S -D -H -h /go/src/gitlab.mediforprogram.com/medifor/entroq appuser
+RUN adduser -S -D -H -h go/src/github.com/shiblon/entroq appuser
 USER appuser
 
 ENTRYPOINT ["./eqsvc.sh"]
