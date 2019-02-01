@@ -40,13 +40,11 @@ type Worker struct {
 	Q   string
 	eqc *EntroQ
 
-	pollInterval  time.Duration
 	renewInterval time.Duration
 	leaseTime     time.Duration
 	taskTimeout   time.Duration
 
 	// Iterator states.
-	ready    <-chan time.Time
 	claimCtx context.Context
 	task     *Task
 	err      error
@@ -57,9 +55,7 @@ func (c *EntroQ) NewWorker(q string, opts ...WorkerOption) *Worker {
 	w := &Worker{
 		Q:             q,
 		eqc:           c,
-		pollInterval:  30 * time.Second,
 		renewInterval: 15 * time.Second,
-		ready:         time.After(0),
 	}
 	for _, opt := range opts {
 		opt(w)
@@ -75,21 +71,18 @@ func (w *Worker) Err() error {
 
 // Next attempts to get ready for a new claim.
 func (w *Worker) Next(ctx context.Context) bool {
-	w.claimCtx = ctx
 	select {
-	case <-w.claimCtx.Done():
-		w.err = w.claimCtx.Err()
+	case <-ctx.Done():
+		w.err = ctx.Err()
 		return false
-	case <-w.ready:
+	default:
 	}
-
-	// Set up the ready channel for the next iteration.
-	w.ready = time.After(w.pollInterval)
 
 	w.task, w.err = w.eqc.Claim(ctx, w.Q, w.leaseTime)
 	if w.err != nil {
 		return false
 	}
+	w.claimCtx = ctx
 	return true
 }
 
@@ -110,13 +103,6 @@ func (w *Worker) Do(f func(context.Context) error) (*Task, error) {
 
 // WorkerOption can be passed to AnalyticWorker to modify the worker
 type WorkerOption func(*Worker)
-
-// WithPollInterval changes the polling interval from the default (30 seconds) to a specified value.
-func WithPollInterval(d time.Duration) WorkerOption {
-	return func(w *Worker) {
-		w.pollInterval = d
-	}
-}
 
 // WithRenewInterval sets the frequency of task renewal. Tasks will be claimed
 // for an amount of time slightly longer than this so that they have a chance
