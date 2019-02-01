@@ -90,6 +90,9 @@ func (w *Worker) Next(ctx context.Context) bool {
 	w.ready = time.After(w.pollInterval)
 
 	w.task, w.err = w.eqc.Claim(w.claimCtx, w.Q, w.leaseTime)
+	if w.err != nil {
+		return false
+	}
 	return true
 }
 
