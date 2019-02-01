@@ -59,7 +59,6 @@ func (c *EntroQ) NewWorker(q string, opts ...WorkerOption) *Worker {
 		eqc:           c,
 		pollInterval:  30 * time.Second,
 		renewInterval: 15 * time.Second,
-		taskTimeout:   1 * time.Minute,
 		ready:         time.After(0),
 	}
 	for _, opt := range opts {
@@ -76,9 +75,7 @@ func (w *Worker) Err() error {
 
 // Next attempts to get ready for a new claim.
 func (w *Worker) Next(ctx context.Context) bool {
-	if w.claimCtx == nil {
-		w.claimCtx = ctx
-	}
+	w.claimCtx = ctx
 	select {
 	case <-w.claimCtx.Done():
 		w.err = w.claimCtx.Err()
@@ -86,10 +83,10 @@ func (w *Worker) Next(ctx context.Context) bool {
 	case <-w.ready:
 	}
 
-	w.claimCtx, _ = context.WithTimeout(ctx, w.taskTimeout)
+	// Set up the ready channel for the next iteration.
 	w.ready = time.After(w.pollInterval)
 
-	w.task, w.err = w.eqc.Claim(w.claimCtx, w.Q, w.leaseTime)
+	w.task, w.err = w.eqc.Claim(ctx, w.Q, w.leaseTime)
 	if w.err != nil {
 		return false
 	}
