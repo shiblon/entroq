@@ -156,18 +156,15 @@ func protoFromTask(t *entroq.Task) *pb.Task {
 	}
 }
 
-func (s *QSvc) getClient() (*entroq.EntroQ, error) {
+func (s *QSvc) getClient(ctx context.Context) (*entroq.EntroQ, error) {
 	defer un(lock(s))
 
-	// Note that because this is a buffered channel, the non-default case
-	// will always succeed except when the channel is nil, which happens
-	// (atomically) when this service is closed.
 	select {
 	case c := <-s.pool:
 		s.inUse[c] = true
 		return c, nil
-	default:
-		return nil, fmt.Errorf("empty pool")
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 
@@ -181,6 +178,7 @@ func (s *QSvc) returnClient(c *entroq.EntroQ) error {
 
 	select {
 	case s.pool <- c:
+		// This will always succeed unless the channel is nil, in which case it's time to be done.
 		return nil
 	default:
 		return fmt.Errorf("pool closed")
@@ -190,7 +188,7 @@ func (s *QSvc) returnClient(c *entroq.EntroQ) error {
 // TryClaim attempts to claim a task, returning immediately. If no tasks are
 // available, it returns a nil response and a nil error.
 func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
-	client, err := s.getClient()
+	client, err := s.getClient(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "no clients for TryClaim: %v", err)
 	}
@@ -218,7 +216,7 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 // reconstruct an entroq.DependencyError, or directly to find out which IDs
 // caused the dependency failure. Code UNKNOWN is returned on other errors.
 func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyResponse, error) {
-	client, err := s.getClient()
+	client, err := s.getClient(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "no clients for Modify: %v", err)
 	}
@@ -305,7 +303,7 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 }
 
 func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksResponse, error) {
-	client, err := s.getClient()
+	client, err := s.getClient(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "no clients for Tasks: %v", err)
 	}
@@ -332,7 +330,7 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 
 // Queues returns a mapping from queue names to queue sizes.
 func (s *QSvc) Queues(ctx context.Context, req *pb.QueuesRequest) (*pb.QueuesResponse, error) {
-	client, err := s.getClient()
+	client, err := s.getClient(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "no clients for Queues: %v", err)
 	}

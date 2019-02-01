@@ -384,7 +384,7 @@ func (c *EntroQ) Claim(ctx context.Context, q string, duration time.Duration, op
 				curWait = maxCheckInterval
 			}
 		case <-ctx.Done():
-			return nil, Canceled(fmt.Errorf("context canceled for claim request in %q", q))
+			return nil, Canceled(fmt.Errorf("context canceled for claim request in %q: %v", q, ctx.Err()))
 		}
 	}
 }
@@ -456,7 +456,7 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.D
 			case <-doneCh:
 				return nil
 			case <-ctx.Done():
-				return fmt.Errorf("canceled context, stopped renewing")
+				return fmt.Errorf("canceled context, stopped renewing: %v", ctx.Err())
 			case <-time.After(lease / 2):
 				var err error
 				if renewed, err = c.RenewAllFor(ctx, tasks, lease); err != nil {
