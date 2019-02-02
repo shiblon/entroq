@@ -1,7 +1,7 @@
 # Inspired by https://www.cloudreach.com/blog/containerize-this-golang-dockerfiles/
 
 # Build inside a Go container.
-FROM datamachines/grpc-go:1.11 as builder
+FROM golang:alpine as builder
 
 ENV GOPATH /build
 ENV CGO_ENABLED 0
@@ -9,8 +9,8 @@ ENV CGO_ENABLED 0
 COPY . $GOPATH/src/github.com/shiblon/entroq
 WORKDIR $GOPATH/src/github.com/shiblon/entroq
 
-RUN go get -d -v ./... && \
-	go install -v ./...
+RUN apk add git
+RUN go get -d -v ./... && go install -v ./...
 
 # Switch to a smaller container without build tools.
 FROM alpine:latest
@@ -20,12 +20,11 @@ RUN mkdir -p /go/bin
 
 ENV PATH ${PATH}:/go/bin
 
-
 COPY --from=builder /build/bin/* /go/bin/
 COPY cmd/eqsvc.sh /go/bin/
 WORKDIR /go/bin
 
-RUN adduser -S -D -H -h go/src/github.com/shiblon/entroq appuser
+RUN adduser -S -D -H -h /go/src/github.com/shiblon/entroq appuser
 USER appuser
 
 ENTRYPOINT ["./eqsvc.sh"]
