@@ -48,6 +48,7 @@ type Worker struct {
 	claimCtx context.Context
 	task     *Task
 	err      error
+	done     chan bool
 }
 
 // NewWorker creates a new worker iterator-like type that makes it easy to claim and operate on tasks in a loop.
@@ -56,6 +57,7 @@ func (c *EntroQ) NewWorker(q string, opts ...WorkerOption) *Worker {
 		Q:             q,
 		eqc:           c,
 		renewInterval: 15 * time.Second,
+		done:          make(chan bool),
 	}
 	for _, opt := range opts {
 		opt(w)
@@ -74,6 +76,9 @@ func (w *Worker) Next(ctx context.Context) bool {
 	select {
 	case <-ctx.Done():
 		w.err = ctx.Err()
+		return false
+	case <-w.done:
+		// Clean shutdown, no special error.
 		return false
 	default:
 	}
@@ -94,6 +99,12 @@ func (w *Worker) Task() *Task {
 // Ctx returns the current task claim's context (valid during a call to Do).
 func (w *Worker) Ctx() context.Context {
 	return w.claimCtx
+}
+
+// Stop cleanly shuts down the worker by discontinuing the next iteration
+// without an error.
+func (w *Worker) Stop() {
+	close(w.done)
 }
 
 // Do calls the given function while renewing the claim according to given options.
