@@ -2,6 +2,7 @@ package entroq
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
@@ -36,6 +37,8 @@ import (
 //     log.Fatalf("Error running worker: %v", err)
 //   }
 type Worker struct {
+	sync.Mutex
+
 	// Q is the queue to claim work from in an endless loop.
 	Q   string
 	eqc *EntroQ
@@ -51,7 +54,8 @@ type Worker struct {
 	done     chan bool
 }
 
-// NewWorker creates a new worker iterator-like type that makes it easy to claim and operate on tasks in a loop.
+// NewWorker creates a new worker iterator-like type that makes it easy to
+// claim and operate on tasks in a loop.
 func (c *EntroQ) NewWorker(q string, opts ...WorkerOption) *Worker {
 	w := &Worker{
 		Q:             q,
@@ -68,6 +72,8 @@ func (c *EntroQ) NewWorker(q string, opts ...WorkerOption) *Worker {
 
 // Err returns the most recent error encountered when doing work for a task.
 func (w *Worker) Err() error {
+	w.Lock()
+	defer w.Unlock()
 	return w.err
 }
 
@@ -75,7 +81,9 @@ func (w *Worker) Err() error {
 func (w *Worker) Next(ctx context.Context) bool {
 	select {
 	case <-ctx.Done():
+		w.Lock()
 		w.err = ctx.Err()
+		w.Unlock()
 		return false
 	case <-w.done:
 		// Clean shutdown, no special error.
@@ -83,21 +91,31 @@ func (w *Worker) Next(ctx context.Context) bool {
 	default:
 	}
 
-	w.task, w.err = w.eqc.Claim(ctx, w.Q, w.leaseTime)
+	task, err := w.eqc.Claim(ctx, w.Q, w.leaseTime)
+
+	w.Lock()
+	defer w.Unlock()
+
+	w.task, w.err = task, err
 	if w.err != nil {
 		return false
 	}
 	w.claimCtx = ctx
+
 	return true
 }
 
 // Task returns the claimed task for this worker.
 func (w *Worker) Task() *Task {
+	w.Lock()
+	defer w.Unlock()
 	return w.task
 }
 
 // Ctx returns the current task claim's context (valid during a call to Do).
 func (w *Worker) Ctx() context.Context {
+	w.Lock()
+	defer w.Unlock()
 	return w.claimCtx
 }
 
