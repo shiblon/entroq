@@ -45,6 +45,7 @@ type Worker struct {
 	renewInterval time.Duration
 	leaseTime     time.Duration
 	taskTimeout   time.Duration
+	done          chan struct{}
 
 	// Iterator states.
 	claimCtx context.Context
@@ -58,12 +59,18 @@ func (c *EntroQ) NewWorker(q string, opts ...WorkerOption) *Worker {
 		Q:             q,
 		eqc:           c,
 		renewInterval: 15 * time.Second,
+		done:          make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(w)
 	}
 	w.leaseTime = 2 * w.renewInterval
 	return w
+}
+
+// Stop causes the loop to terminate on the next call to Next.
+func (w *Worker) Stop() {
+	close(w.done)
 }
 
 // Err returns the most recent error encountered when doing work for a task.
@@ -74,6 +81,8 @@ func (w *Worker) Err() error {
 // Next attempts to get ready for a new claim.
 func (w *Worker) Next(ctx context.Context) bool {
 	select {
+	case <-w.done:
+		return false
 	case <-ctx.Done():
 		w.err = ctx.Err()
 		return false
