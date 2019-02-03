@@ -2,8 +2,9 @@ package entroq
 
 import (
 	"context"
-	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // Worker creates an iterator-like protocol for processing tasks in a queue,
@@ -37,8 +38,6 @@ import (
 //     log.Fatalf("Error running worker: %v", err)
 //   }
 type Worker struct {
-	sync.Mutex
-
 	// Q is the queue to claim work from in an endless loop.
 	Q   string
 	eqc *EntroQ
@@ -51,17 +50,14 @@ type Worker struct {
 	claimCtx context.Context
 	task     *Task
 	err      error
-	done     chan bool
 }
 
-// NewWorker creates a new worker iterator-like type that makes it easy to
-// claim and operate on tasks in a loop.
+// NewWorker creates a new worker iterator-like type that makes it easy to claim and operate on tasks in a loop.
 func (c *EntroQ) NewWorker(q string, opts ...WorkerOption) *Worker {
 	w := &Worker{
 		Q:             q,
 		eqc:           c,
 		renewInterval: 15 * time.Second,
-		done:          make(chan bool),
 	}
 	for _, opt := range opts {
 		opt(w)
@@ -72,8 +68,6 @@ func (c *EntroQ) NewWorker(q string, opts ...WorkerOption) *Worker {
 
 // Err returns the most recent error encountered when doing work for a task.
 func (w *Worker) Err() error {
-	w.Lock()
-	defer w.Unlock()
 	return w.err
 }
 
@@ -81,53 +75,72 @@ func (w *Worker) Err() error {
 func (w *Worker) Next(ctx context.Context) bool {
 	select {
 	case <-ctx.Done():
-		w.Lock()
 		w.err = ctx.Err()
-		w.Unlock()
-		return false
-	case <-w.done:
-		// Clean shutdown, no special error.
 		return false
 	default:
 	}
 
-	task, err := w.eqc.Claim(ctx, w.Q, w.leaseTime)
-
-	w.Lock()
-	defer w.Unlock()
-
-	w.task, w.err = task, err
+	w.task, w.err = w.eqc.Claim(ctx, w.Q, w.leaseTime)
 	if w.err != nil {
 		return false
 	}
 	w.claimCtx = ctx
-
 	return true
 }
 
 // Task returns the claimed task for this worker.
 func (w *Worker) Task() *Task {
-	w.Lock()
-	defer w.Unlock()
 	return w.task
 }
 
 // Ctx returns the current task claim's context (valid during a call to Do).
 func (w *Worker) Ctx() context.Context {
-	w.Lock()
-	defer w.Unlock()
 	return w.claimCtx
-}
-
-// Stop cleanly shuts down the worker by discontinuing the next iteration
-// without an error.
-func (w *Worker) Stop() {
-	close(w.done)
 }
 
 // Do calls the given function while renewing the claim according to given options.
 func (w *Worker) Do(f func(context.Context) error) (*Task, error) {
 	return w.eqc.DoWithRenew(w.claimCtx, w.task, w.leaseTime, f)
+}
+
+// DoModify calls the given function while renewing the claim, and applies
+// requested modifications when finished. If any modifications reference the
+// renewed task, they will be altered to reflect the latest version of that
+// task, but otherwise left intact.
+//
+// Returns the result of the final call to Modify.
+func (w *Worker) DoModify(f func(context.Context) ([]ModifyArg, error)) (inserted []*Task, changed []*Task, err error) {
+	var args []ModifyArg
+	renewedTask, err := w.Do(func(ctx context.Context) (err error) {
+		args, err = f(ctx)
+		return err
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Find any modifications that reference the renewed task's ID (but not
+	// necessarily version, since that might have changed during renewal), and
+	// update to the latest known claimed version. Claimant is ignored when
+	// passing an entire modification into Modify, so we set it to nil, here.
+	modification := NewModification(uuid.Nil, args...)
+	for _, task := range modification.Changes {
+		if task.ID == renewedTask.ID {
+			task.Version = renewedTask.Version
+		}
+	}
+	for _, id := range modification.Depends {
+		if id.ID == renewedTask.ID {
+			id.Version = renewedTask.Version
+		}
+	}
+	for _, id := range modification.Deletes {
+		if id.ID == renewedTask.ID {
+			id.Version = renewedTask.Version
+		}
+	}
+
+	return w.eqc.Modify(w.claimCtx, WithModification(modification))
 }
 
 // WorkerOption can be passed to AnalyticWorker to modify the worker

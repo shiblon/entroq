@@ -496,12 +496,7 @@ func (c *EntroQ) DoWithRenew(ctx context.Context, task *Task, lease time.Duratio
 // was due to missing dependencies, a *DependencyError is returned, which can be checked for
 // by calling IsDependency(err).
 func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (inserted []*Task, changed []*Task, err error) {
-	mod := NewModification(c.clientID)
-	for _, arg := range modArgs {
-		arg(mod)
-	}
-
-	return c.backend.Modify(ctx, mod)
+	return c.backend.Modify(ctx, NewModification(c.clientID, modArgs...))
 }
 
 // ModifyArg is an argument to the Modify function, which does batch modifications to the task store.
@@ -662,6 +657,17 @@ func ValueTo(v []byte) ChangeArg {
 	}
 }
 
+// WithModification returns a ModifyArg that merges the given Modification with whatever it is so far.
+// Ignores Claimant field, and simply appends to all others.
+func WithModification(src *Modification) ModifyArg {
+	return func(dest *Modification) {
+		dest.Inserts = append(dest.Inserts, src.Inserts...)
+		dest.Changes = append(dest.Changes, src.Changes...)
+		dest.Deletes = append(dest.Deletes, src.Deletes...)
+		dest.Depends = append(dest.Depends, src.Depends...)
+	}
+}
+
 // modification contains all of the information for a single batch modification in the task store.
 type Modification struct {
 	now time.Time
@@ -674,11 +680,18 @@ type Modification struct {
 	Depends []*TaskID
 }
 
-func NewModification(claimant uuid.UUID) *Modification {
-	return &Modification{
+// NewModification creates a new modification: insertions, deletions, changes,
+// and dependencies all together. When creating this for the purpose of passing
+// to WithModification, set the claimant to uuid.Nil (it is ignored in that case).
+func NewModification(claimant uuid.UUID, modArgs ...ModifyArg) *Modification {
+	m := &Modification{
 		Claimant: claimant,
 		now:      time.Now(),
 	}
+	for _, arg := range modArgs {
+		arg(m)
+	}
+	return m
 }
 
 // modDependencies returns a dependency map for all modified dependencies
