@@ -6,6 +6,7 @@ package entroq
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -185,6 +186,8 @@ type Backend interface {
 type EntroQ struct {
 	backend  Backend
 	clientID uuid.UUID
+
+	dialAttempts int
 }
 
 // Option is an option that modifies how EntroQ clients are created.
@@ -197,6 +200,16 @@ func WithClaimantID(id uuid.UUID) Option {
 	}
 }
 
+// WithDialAttempts sets the dial attempts to something other than the default.
+func WithDialAttempts(num int) Option {
+	if num < 1 {
+		num = 1
+	}
+	return func(eq *EntroQ) {
+		eq.dialAttempts = num
+	}
+}
+
 // BackendOpener is a function that can open a connection to a backend. Creating
 // a client with a specific backend is accomplished by passing one of these functions
 // into New.
@@ -206,16 +219,30 @@ type BackendOpener func(ctx context.Context) (Backend, error)
 //
 //   cli := New(ctx, backend)
 func New(ctx context.Context, opener BackendOpener, opts ...Option) (*EntroQ, error) {
-	backend, err := opener(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("backend open failed: %v", err)
-	}
 	eq := &EntroQ{
-		backend:  backend,
-		clientID: uuid.New(),
+		clientID:     uuid.New(),
+		dialAttempts: 5,
 	}
 	for _, o := range opts {
 		o(eq)
+	}
+	var err error
+	for i := 0; i < eq.dialAttempts; i++ {
+		log.Printf("Attempt %d of %d to connect to EntroQ backend", i+1, eq.dialAttempts)
+		eq.backend, err = opener(ctx)
+		if err == nil {
+			log.Printf("Connected")
+			break
+		}
+		log.Printf("Failed to connect: %v", err)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
+	}
+	if err != nil {
+		return nil, err
 	}
 	return eq, nil
 }
