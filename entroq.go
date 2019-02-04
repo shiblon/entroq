@@ -232,19 +232,18 @@ func New(ctx context.Context, opener BackendOpener, opts ...Option) (*EntroQ, er
 		eq.backend, err = opener(ctx)
 		if err == nil {
 			log.Printf("Connected")
-			break
+			return eq, nil
 		}
 		log.Printf("Failed to connect: %v", err)
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(5 * time.Second):
+		if i < eq.dialAttempts-1 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(5 * time.Second):
+			}
 		}
 	}
-	if err != nil {
-		return nil, err
-	}
-	return eq, nil
+	return nil, err
 }
 
 // Close closes the underlying backend.
