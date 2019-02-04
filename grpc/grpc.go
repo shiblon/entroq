@@ -50,6 +50,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/shiblon/entroq/proto"
+	hpb "google.golang.org/grpc/health/grpc_health_v1"
 )
 
 const DefaultAddr = ":37706"
@@ -65,6 +66,14 @@ func Opener(addr string, dialOpts ...grpc.DialOption) entroq.BackendOpener {
 		conn, err := grpc.DialContext(ctx, addr, dialOpts...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to dial %q: %v", addr, err)
+		}
+		hclient := hpb.NewHealthClient(conn)
+		resp, err := hclient.Check(ctx, &hpb.HealthCheckRequest{})
+		if err != nil {
+			return nil, fmt.Errorf("health check: %v", err)
+		}
+		if st := resp.GetStatus(); st != hpb.HealthCheckResponse_SERVING {
+			return nil, fmt.Errorf("health serving status: %q", st)
 		}
 		return New(conn)
 	}

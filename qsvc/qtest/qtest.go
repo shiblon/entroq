@@ -15,9 +15,11 @@ import (
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/qsvc"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/test/bufconn"
 
 	pb "github.com/shiblon/entroq/proto"
+	hpb "google.golang.org/grpc/health/grpc_health_v1"
 )
 
 const bufSize = 1 << 20
@@ -33,6 +35,7 @@ func StartService(ctx context.Context, opener entroq.BackendOpener) (*grpc.Serve
 		return nil, nil, fmt.Errorf("start service: %v", err)
 	}
 	s := grpc.NewServer()
+	hpb.RegisterHealthServer(s, health.NewServer())
 	pb.RegisterEntroQServer(s, svc)
 	go s.Serve(lis)
 
