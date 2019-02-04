@@ -12,8 +12,10 @@ import (
 	"github.com/shiblon/entroq/pg"
 	"github.com/shiblon/entroq/qsvc"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
 
 	pb "github.com/shiblon/entroq/proto"
+	hpb "google.golang.org/grpc/health/grpc_health_v1"
 
 	_ "github.com/lib/pq"
 )
@@ -48,5 +50,6 @@ func main() {
 
 	s := grpc.NewServer()
 	pb.RegisterEntroQServer(s, svc)
+	hpb.RegisterHealthServer(s, health.NewServer())
 	s.Serve(lis)
 }
