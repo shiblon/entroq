@@ -26,6 +26,7 @@ var (
 	dbName     = flag.String("dbname", "postgres", "Database name housing tasks.")
 	dbUser     = flag.String("dbuser", "postgres", "Database user name.")
 	dbPassword = flag.String("dbpwd", "postgres", "Database password.")
+	attempts   = flag.String("attempts", 5, "Number of connection attempts before failure (5 seconds in between).")
 )
 
 func main() {
@@ -36,6 +37,7 @@ func main() {
 		pg.WithDB(*dbName),
 		pg.WithUsername(*dbUser),
 		pg.WithPassword(*dbPassword),
+		pg.WithConnectAttempts(*attempts),
 	))
 	if err != nil {
 		log.Fatalf("Failed to open backend for qsvc: %v", err)
