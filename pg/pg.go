@@ -7,7 +7,6 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
-	"log"
 	"strings"
 	"time"
 
@@ -86,16 +85,10 @@ func Opener(hostPort string, opts ...PGOpt) entroq.BackendOpener {
 		if err != nil {
 			return nil, fmt.Errorf("failed to open postgres DB: %v", err)
 		}
-		if err := db.PingContext(ctx); err != nil {
-			return nil, fmt.Errorf("failed to ping postgres DB: %v", err)
-		}
-		var b entroq.Backend
 		for i := 0; i < options.attempts; i++ {
-			b, err = New(ctx, db)
-			if err == nil {
-				return b, nil
+			if err = db.PingContext(ctx); err == nil {
+				return New(ctx, db)
 			}
-			log.Printf("Attempt %d of %d: %v", i+1, options.attempts, err)
 			if i < options.attempts-1 {
 				select {
 				case <-ctx.Done():
