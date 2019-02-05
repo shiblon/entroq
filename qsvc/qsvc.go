@@ -21,7 +21,7 @@
 // 			log.Fatalf("Failed to listen: %v", err)
 // 		}
 //
-//		svc, err := qsvc.New(ctx, pg.Opener("localhost:5432", "postgres", "postgres", false), 1)
+//		svc, err := qsvc.New(ctx, pg.Opener("localhost:5432", "postgres", "postgres", false))
 //		if err != nil {
 //			log.Fatalf("Failed to open service backends: %v", err)
 //		}
