@@ -112,7 +112,8 @@ func TestSimpleSequence(t *testing.T) {
 	server, dial, err := qtest.StartService(ctx, Opener(pgHostPort,
 		WithDB("postgres"),
 		WithUsername("postgres"),
-		WithPassword("password")))
+		WithPassword("password"),
+		WithConnectAttempts(3)))
 	if err != nil {
 		t.Fatalf("Could not start service: %v", err)
 	}
