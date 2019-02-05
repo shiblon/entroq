@@ -26,7 +26,7 @@ var (
 	dbName     = flag.String("dbname", "postgres", "Database name housing tasks.")
 	dbUser     = flag.String("dbuser", "postgres", "Database user name.")
 	dbPassword = flag.String("dbpwd", "postgres", "Database password.")
-	attempts   = flag.String("attempts", 5, "Number of connection attempts before failure (5 seconds in between).")
+	attempts   = flag.Int("attempts", 5, "Number of connection attempts before failure (5 seconds in between).")
 )
 
 func main() {
