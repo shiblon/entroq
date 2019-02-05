@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"log"
 	"strings"
 	"time"
 
@@ -22,6 +23,8 @@ type pgOptions struct {
 	db       string
 	user     string
 	password string
+
+	attempts int
 }
 
 // PGOpt sets an option for the opener.
@@ -48,6 +51,17 @@ func WithDB(db string) PGOpt {
 	}
 }
 
+// WithConnectAttempts sets the number of connection attempts before giving up.
+// The opener waits 5 seconds between each attempt.
+func WithConnectAttempts(num int) PGOpt {
+	if num < 1 {
+		num = 1
+	}
+	return func(opts *pgOptions) {
+		opts.attempts = num
+	}
+}
+
 // Opener creates an opener function to be used to get a backend.
 func Opener(hostPort string, opts ...PGOpt) entroq.BackendOpener {
 	// Set up some defaults, then apply given options.
@@ -55,12 +69,13 @@ func Opener(hostPort string, opts ...PGOpt) entroq.BackendOpener {
 		db:       "postgres",
 		user:     "postgres",
 		password: "password",
+		attempts: 1,
 	}
 	for _, o := range opts {
 		o(options)
 	}
 
-	// TODO: allow setting of sslmode?
+	// TODO: Allow setting of sslmode?
 	return func(ctx context.Context) (entroq.Backend, error) {
 		connStr := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable",
 			escp(options.user),
@@ -71,23 +86,22 @@ func Opener(hostPort string, opts ...PGOpt) entroq.BackendOpener {
 		if err != nil {
 			return nil, fmt.Errorf("failed to open postgres DB: %v", err)
 		}
-		b, err := New(ctx, db)
-		for i := 0; i < 5; i++ {
-			if err == io.EOF {
+		var b entroq.Backend
+		for i := 0; i < options.attempts; i++ {
+			b, err = New(ctx, db)
+			if err == nil {
+				return b, nil
+			}
+			log.Printf("Attempt %d of %d: %v", i+1, options.attempts, err)
+			if i < options.attempts-1 {
 				select {
-				case <-time.After(5 * time.Second):
-					b, err = New(ctx, db)
-					continue
 				case <-ctx.Done():
-					return nil, fmt.Errorf("context canceled")
+					return nil, ctx.Err()
+				case <-time.After(5 * time.Second):
 				}
 			}
-			if err != nil {
-				return nil, fmt.Errorf("new postgres backend: %v", err)
-			}
-			return b, nil
 		}
-		return nil, fmt.Errorf("time out postgres init")
+		return nil, fmt.Errorf("time out postgres init: %v", err)
 	}
 }
 
