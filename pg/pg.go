@@ -86,6 +86,9 @@ func Opener(hostPort string, opts ...PGOpt) entroq.BackendOpener {
 		if err != nil {
 			return nil, fmt.Errorf("failed to open postgres DB: %v", err)
 		}
+		if err := db.PingContext(ctx); err != nil {
+			return nil, fmt.Errorf("failed to ping postgres DB: %v", err)
+		}
 		var b entroq.Backend
 		for i := 0; i < options.attempts; i++ {
 			b, err = New(ctx, db)
