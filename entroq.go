@@ -181,6 +181,16 @@ type Backend interface {
 	Close() error
 }
 
+// WaitingBackend is a backend that can wait in TryClaim.
+type WaitingBackend interface {
+	Backend
+
+	// IsClaimExpired signals that a TryClaim was blocking, and that the error
+	// it got indicates that the wait expired. This means that it can be tried
+	// again immediately without sleeping.
+	IsClaimExpired(err error) bool
+}
+
 // EntroQ is a client interface for accessing the task queue.
 type EntroQ struct {
 	backend  Backend
@@ -369,8 +379,15 @@ func (c *EntroQ) Claim(ctx context.Context, q string, duration time.Duration, op
 
 	curWait := startInterval
 	for {
-		task, err := c.TryClaim(ctx, q, duration, opts...)
+		// Don't wait longer than the check interval, or maxWait, whichever comes first.
+		tryCtx, _ := context.WithTimeout(ctx, maxCheckInterval)
+		task, err := c.TryClaim(tryCtx, q, duration, opts...)
 		if err != nil {
+			// If we are in a waiting backend, and the (blocked) claim merely
+			// expired, we can retry immediately without sleeping.
+			if backend, ok := c.backend.(WaitingBackend); ok && backend.IsClaimExpired(err) {
+				continue
+			}
 			return nil, err
 		}
 		if task != nil {
