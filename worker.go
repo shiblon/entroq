@@ -91,6 +91,8 @@ func (w *Worker) Stop() {
 
 // Err returns the most recent error encountered when doing work for a task.
 func (w *Worker) Err() error {
+	w.Lock()
+	defer w.Unlock()
 	return w.err
 }
 
@@ -109,23 +111,30 @@ func (w *Worker) Next(ctx context.Context) bool {
 	w.claimCtx, w.claimCancel = context.WithCancel(ctx)
 	w.Unlock()
 
-	w.task, w.err = w.eqc.Claim(w.claimCtx, w.Q, w.leaseTime)
-	if w.err != nil {
+	task, err := w.eqc.Claim(w.claimCtx, w.Q, w.leaseTime)
+	if err != nil {
 		if IsCanceled(w.err) {
-			select {
-			case <-w.done:
+			w.Lock()
+			if w.done == nil {
 				w.err = nil
-			default:
 			}
+			w.Unlock()
 		}
 		// If we hit "done" first, then there is no error.
 		return false
 	}
+
+	w.Lock()
+	w.task, w.err = task, err
+	w.Unlock()
+
 	return true
 }
 
 // Task returns the claimed task for this worker.
 func (w *Worker) Task() *Task {
+	w.Lock()
+	defer w.Unlock()
 	return w.task
 }
 
