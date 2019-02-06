@@ -198,7 +198,7 @@ func (s *QSvc) getClient(ctx context.Context) (*entroq.EntroQ, error) {
 	select {
 	case c, ok := <-s.freePool:
 		if !ok {
-			return nil, fmt.Errrorf("no backend connections")
+			return nil, fmt.Errorf("no backend connections")
 		}
 		return c, nil
 	case <-ctx.Done():
