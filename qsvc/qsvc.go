@@ -207,7 +207,8 @@ func (s *QSvc) getClient(ctx context.Context) (*entroq.EntroQ, error) {
 }
 
 func (s *QSvc) returnClient(c *entroq.EntroQ) {
-	// This should always work because it's buffered.
+	// This should always work because it's buffered *and* the pool stays open
+	// so long as there are unclosed connections.
 	select {
 	case s.donePool <- c:
 	default:
