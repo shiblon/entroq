@@ -196,7 +196,10 @@ func protoFromTask(t *entroq.Task) *pb.Task {
 
 func (s *QSvc) getClient(ctx context.Context) (*entroq.EntroQ, error) {
 	select {
-	case c := <-s.freePool:
+	case c, ok := <-s.freePool:
+		if !ok {
+			return nil, fmt.Errrorf("no backend connections")
+		}
 		return c, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
