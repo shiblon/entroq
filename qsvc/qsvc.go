@@ -35,6 +35,7 @@ package qsvc
 import (
 	"context"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -51,8 +52,13 @@ import (
 type QSvc struct {
 	sync.Mutex
 
-	pool  chan *entroq.EntroQ
-	inUse map[*entroq.EntroQ]bool
+	// Pull from here to get clients.
+	freePool <-chan *entroq.EntroQ
+	// Push back here to return clients.
+	donePool chan<- *entroq.EntroQ
+
+	// Signal that we're finished with everything.
+	done chan struct{}
 }
 
 func lock(mu sync.Locker) sync.Locker {
@@ -98,40 +104,72 @@ func New(ctx context.Context, opener entroq.BackendOpener, opts ...QSvcOpt) (svc
 		o(options)
 	}
 
+	// Create read/write channels, then set to read-only, write-only values below.
+	// The goroutine in here that manages these can do both operations on them,
+	// but other methods can't, which protects against mistakes.
+	freePool := make(chan *entroq.EntroQ, options.connections)
+	donePool := make(chan *entroq.EntroQ, options.connections)
+
 	svc = &QSvc{
-		pool:  make(chan *entroq.EntroQ, options.connections),
-		inUse: make(map[*entroq.EntroQ]bool),
+		freePool: freePool,
+		donePool: donePool,
+		done:     make(chan struct{}),
 	}
+
 	for i := 0; i < options.connections; i++ {
 		cli, err := entroq.New(ctx, opener)
 		if err != nil {
-			svc.Close()
+			// Oops - close everything we've opened.
+			for j := 0; j < i; j++ {
+				c := <-freePool
+				c.Close()
+			}
 			return nil, fmt.Errorf("qsvc backend client: %v", err)
 		}
-		svc.pool <- cli
+		freePool <- cli
 	}
+
+	go func() {
+		for {
+			select {
+			case <-svc.done:
+				// Subtle. To avoid having to lock things, we close the free
+				// pool so that no more can be pushed onto it, and then we
+				// consume everything that we can. It's possible that we'll get
+				// scooped by a request, though. That's fine. Stuff will
+				// happen, then the client will be sent back on the "done
+				// pool". We consume all the rest of them and close them, too.
+				// This allows all client connection users to complete gracefully.
+				//
+				// Note that this means we can't select on context and then not
+				// do anything in requests. We have to return clients to the
+				// pool even when the context is canceled.
+				close(freePool)
+				numFree := 0
+				for c := range freePool {
+					numFree++
+					c.Close()
+				}
+				freePool = nil
+				for i := 0; i < options.connections-numFree; i++ {
+					c := <-donePool
+					c.Close()
+				}
+				donePool = nil
+				return
+			case c := <-donePool:
+				// A connection is being returned. Put it back.
+				freePool <- c
+			}
+		}
+	}()
+
 	return svc, nil
 }
 
-// Close closes the backend connections and flushes the connection pool.
+// Close closes the backend connections and flushes the connection free.
 func (s *QSvc) Close() error {
-	defer un(lock(s))
-
-	// Close the connection pool, close all connections in it.
-	close(s.pool)
-	for q := range s.pool {
-		q.Close()
-	}
-	// Ensure that sending blocks instead of panicking.
-	s.pool = nil
-
-	// Also close (even if they're busy) all connections that are in use.
-	// This can cause outstanding operations to error out, and that's fine.
-	// Ideally this won't be called while operations are outstanding, but
-	// it's important that we handle that case.
-	for q := range s.inUse {
-		q.Close()
-	}
+	close(s.done)
 	return nil
 }
 
@@ -157,31 +195,20 @@ func protoFromTask(t *entroq.Task) *pb.Task {
 }
 
 func (s *QSvc) getClient(ctx context.Context) (*entroq.EntroQ, error) {
-	defer un(lock(s))
-
 	select {
-	case c := <-s.pool:
-		s.inUse[c] = true
+	case c := <-s.freePool:
 		return c, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
 }
 
-func (s *QSvc) returnClient(c *entroq.EntroQ) error {
-	defer un(lock(s))
-
-	if !s.inUse[c] {
-		return fmt.Errorf("connection gone")
-	}
-	delete(s.inUse, c)
-
+func (s *QSvc) returnClient(c *entroq.EntroQ) {
+	// This should always work because it's buffered.
 	select {
-	case s.pool <- c:
-		// This will always succeed unless the channel is nil, in which case it's time to be done.
-		return nil
+	case s.donePool <- c:
 	default:
-		return fmt.Errorf("pool closed")
+		log.Fatal("Bug found: failed to return client to buffered done pool")
 	}
 }
 
