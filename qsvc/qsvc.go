@@ -218,6 +218,11 @@ func (s *QSvc) returnClient(c *entroq.EntroQ) {
 
 // TryClaim attempts to claim a task, returning immediately. If no tasks are
 // available, it returns a nil response and a nil error.
+//
+// If req.Wait is present, TryClaim may not return immediately, but may hold
+// onto the connection until either the context expires or a task becomes
+// available to claim. Callers can check for context cancelation codes to know
+// that this has happened, and may opt to immediately re-send the request.
 func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
 	client, err := s.getClient(ctx)
 	if err != nil {
