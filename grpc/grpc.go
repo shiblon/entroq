@@ -266,16 +266,42 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 	return tasks, nil
 }
 
-// TryClaim attempts to claim a task from the queue. Returns a nil task if there is
-// nothing in the queue (not an error).
+// IsClaimExpired indicates whether the error signals an expired claim.
+func (b *backend) IsClaimExpired(err error) bool {
+	// Only signal claim expiration if we were blocking in the first place.
+	if !b.tryClaimWait {
+		return false
+	}
+	switch status.Code(err) {
+	case codes.Aborted, codes.DeadlineExceeded, codes.Canceled:
+		return true
+	}
+
+	switch status.FromContextError(err).Code() {
+	case codes.DeadlineExceeded, codes.Canceled:
+		return true
+	}
+
+	return false
+}
+
+// TryClaim attempts to claim a task from the queue. Normally returns both a
+// nil task and error if nothing is ready.
+//
+// If the WithTryClaimWait option was used to create this backend, TryClaim may
+// block until the context is canceled or the other end shuts down. If the
+// request is terminated before a task becomes available, but is due to context cancelation or an ABORTED status,
+// context is canceled before a task becomes available, the returned error will
+// have grpc status code ABORTED. This condition can be checked thus:
 func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
 	resp, err := b.cli.TryClaim(ctx, &pb.ClaimRequest{
 		ClaimantId: cq.Claimant.String(),
 		Queue:      cq.Queue,
 		DurationMs: int64(cq.Duration / time.Millisecond),
+		Wait:       b.tryClaimWait,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("claim failed over gRPC: %v", err)
+		return nil, err // Do not wrap - gRPC/context status preservation is important.
 	}
 	if resp.Task == nil {
 		return nil, nil
