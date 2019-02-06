@@ -2,6 +2,7 @@ package entroq
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -48,9 +49,12 @@ type Worker struct {
 	done          chan struct{}
 
 	// Iterator states.
-	claimCtx context.Context
-	task     *Task
-	err      error
+	claimCtx    context.Context
+	claimCancel context.CancelFunc
+	task        *Task
+	err         error
+
+	sync.Mutex
 }
 
 // NewWorker creates a new worker iterator-like type that makes it easy to claim and operate on tasks in a loop.
@@ -70,7 +74,19 @@ func (c *EntroQ) NewWorker(q string, opts ...WorkerOption) *Worker {
 
 // Stop causes the loop to terminate on the next call to Next.
 func (w *Worker) Stop() {
+	w.Lock()
+	defer w.Unlock()
+
+	if w.done == nil {
+		return
+	}
+	// Done first, then cancel, so the done situation is easily detected.
 	close(w.done)
+	w.claimCancel()
+
+	w.done = nil
+	w.claimCtx = nil
+	w.claimCancel = nil
 }
 
 // Err returns the most recent error encountered when doing work for a task.
@@ -89,11 +105,22 @@ func (w *Worker) Next(ctx context.Context) bool {
 	default:
 	}
 
-	w.task, w.err = w.eqc.Claim(ctx, w.Q, w.leaseTime)
+	w.Lock()
+	w.claimCtx, w.claimCancel = context.WithCancel(ctx)
+	w.Unlock()
+
+	w.task, w.err = w.eqc.Claim(w.claimCtx, w.Q, w.leaseTime)
 	if w.err != nil {
+		if IsCanceled(w.err) {
+			select {
+			case <-w.done:
+				w.err = nil
+			default:
+			}
+		}
+		// If we hit "done" first, then there is no error.
 		return false
 	}
-	w.claimCtx = ctx
 	return true
 }
 
@@ -102,14 +129,13 @@ func (w *Worker) Task() *Task {
 	return w.task
 }
 
-// Ctx returns the current task claim's context (valid during a call to Do).
-func (w *Worker) Ctx() context.Context {
-	return w.claimCtx
-}
-
 // Do calls the given function while renewing the claim according to given options.
 func (w *Worker) Do(f func(context.Context) error) (*Task, error) {
-	return w.eqc.DoWithRenew(w.claimCtx, w.task, w.leaseTime, f)
+	w.Lock()
+	ctx := w.claimCtx
+	w.Unlock()
+
+	return w.eqc.DoWithRenew(ctx, w.task, w.leaseTime, f)
 }
 
 // DoModify calls the given function while renewing the claim, and applies
