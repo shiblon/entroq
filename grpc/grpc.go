@@ -41,6 +41,7 @@ package grpc
 import (
 	"context"
 	"fmt"
+	"net"
 	"time"
 
 	"github.com/google/uuid"
@@ -53,17 +54,75 @@ import (
 	hpb "google.golang.org/grpc/health/grpc_health_v1"
 )
 
+// DefaultAddr is the default listening address for gRPC services.
 const DefaultAddr = ":37706"
+
+type backendOptions struct {
+	dialOpts       []grpc.DialOption
+	claimSubscribe bool
+}
+
+// Option allows grpc-opener-specific options to be sent in Opener.
+type Option func(*backendOptions)
+
+// WithDialOpts sets grpc dial options. Can be called multiple times.
+// Only valid in call to Opener.
+func WithDialOpts(d ...grpc.DialOption) Option {
+	return func(opts *backendOptions) {
+		opts.dialOpts = append(opts.dialOpts, d...)
+	}
+}
+
+// WithInsecure is a common gRPC dial option, here for convenience.
+func WithInsecure() Option {
+	return WithDialOpts(grpc.WithInsecure())
+}
+
+// WithDialer is a common gRPC dial option, here for convenience.
+func WithDialer(f func(string, time.Duration) (net.Conn, error)) Option {
+	return WithDialOpts(grpc.WithDialer(f))
+}
+
+// WithBlock is a common gRPC dial option, here for convenience.
+func WithBlock() Option {
+	return WithDialOpts(grpc.WithBlock())
+}
+
+// WithNiladicDialer uses a niladic dial function such as that returned by
+// bufconn.Listen. Useful for testing.
+func WithNiladicDialer(f func() (net.Conn, error)) Option {
+	return WithDialOpts(grpc.WithDialer(func(string, time.Duration) (net.Conn, error) {
+		return f()
+	}))
+}
+
+// WithClaimSubscribe instructs the server to hold TryClaim connections open
+// until an event occurs that would return a value. If the request context is
+// canceled before a claimable task arrives, the gRPC status code ABORTED is
+// returned to signal that it can be retried. TryClaim then returns.
+//
+// The Claim method of the entroq client can use that to loop on TryClaim
+// without sleeping in between attempts.
+func WithClaimSubscribe() Option {
+	return func(opts *backendOptions) {
+		opts.claimSubscribe = true
+	}
+}
 
 // Opener creates an opener function to be used to get a gRPC backend. If the
 // address string is empty, it defaults to the DefaultAddr, the default value
 // for the memory-backed gRPC server.
-func Opener(addr string, dialOpts ...grpc.DialOption) entroq.BackendOpener {
+func Opener(addr string, opts ...Option) entroq.BackendOpener {
 	if addr == "" {
 		addr = DefaultAddr
 	}
+	options := new(backendOptions)
+	for _, opt := range opts {
+		opt(options)
+	}
+
 	return func(ctx context.Context) (entroq.Backend, error) {
-		conn, err := grpc.DialContext(ctx, addr, dialOpts...)
+		conn, err := grpc.DialContext(ctx, addr, options.dialOpts...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to dial %q: %v", addr, err)
 		}
@@ -75,20 +134,27 @@ func Opener(addr string, dialOpts ...grpc.DialOption) entroq.BackendOpener {
 		if st := resp.GetStatus(); st != hpb.HealthCheckResponse_SERVING {
 			return nil, fmt.Errorf("health serving status: %q", st)
 		}
-		return New(conn)
+		return New(conn, opts...)
 	}
 }
 
 type backend struct {
 	conn *grpc.ClientConn
 	cli  pb.EntroQClient
+
+	claimSubscribe bool
 }
 
 // New creates a new gRPC backend that attaches to the task service via gRPC.
-func New(conn *grpc.ClientConn) (*backend, error) {
+func New(conn *grpc.ClientConn, opts ...Option) (*backend, error) {
+	options := new(backendOptions)
+	for _, opt := range opts {
+		opt(options)
+	}
 	return &backend{
-		conn: conn,
-		cli:  pb.NewEntroQClient(conn),
+		conn:           conn,
+		cli:            pb.NewEntroQClient(conn),
+		claimSubscribe: options.claimSubscribe,
 	}, nil
 }
 

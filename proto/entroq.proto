@@ -61,13 +61,31 @@ message QueueStats {
 // should be unique to the requesting worker (e.g., if multiple workers are in
 // the same process, they should all have different claimant IDs assigned).
 message ClaimRequest {
+  // The party requesting a task.
   string claimant_id = 1;
 
+  // The queue name to claim a task from.
   string queue = 2;
+
+  // The duration of the claim, if/once successful.
   int64 duration_ms = 3;
+
+  // If set, the server is asked to hold the connection open until a task is
+  // available, or until the context expired, whichever comes first. IF the
+  // context expires, the ABORTED status code is returned, indicating that a
+  // retry can safely occur.
+  bool wait = 4;
 }
 
 // ClaimResponse is returned when a claim is fulfilled or becomes obviously impossible.
+//
+// If "wait" is *not* specified in the request, and no task is available, the
+// task will be empty and the status code sent to the client will be OK.
+//
+// If "wait" is specified and the request times out, the ABORTED status code
+// is sent back to the client, retrievable from the language-specific error or
+// exception. That code signals that the client can retry immediately without
+// sleeping first.
 message ClaimResponse {
   Task task = 1;
 }

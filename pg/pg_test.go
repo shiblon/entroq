@@ -5,19 +5,16 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/shiblon/entroq"
 	grpcbackend "github.com/shiblon/entroq/grpc"
 	"github.com/shiblon/entroq/qsvc/qtest"
 	"golang.org/x/sync/errgroup"
-	"google.golang.org/grpc"
 
 	_ "github.com/lib/pq"
 )
@@ -120,10 +117,8 @@ func TestSimpleSequence(t *testing.T) {
 	defer server.Stop()
 
 	client, err := entroq.New(ctx, grpcbackend.Opener("bufnet",
-		grpc.WithDialer(func(string, time.Duration) (net.Conn, error) {
-			return dial()
-		}),
-		grpc.WithInsecure()))
+		grpcbackend.WithNiladicDialer(dial),
+		grpcbackend.WithInsecure()))
 	if err != nil {
 		t.Fatalf("Open client: %v", err)
 	}
