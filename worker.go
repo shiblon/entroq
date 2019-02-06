@@ -112,22 +112,20 @@ func (w *Worker) Next(ctx context.Context) bool {
 	w.Unlock()
 
 	task, err := w.eqc.Claim(w.claimCtx, w.Q, w.leaseTime)
+
+	w.Lock()
+	defer w.Unlock()
+
+	w.task, w.err = task, err
 	if err != nil {
 		if IsCanceled(w.err) {
-			w.Lock()
 			if w.done == nil {
 				w.err = nil
 			}
-			w.Unlock()
 		}
 		// If we hit "done" first, then there is no error.
 		return false
 	}
-
-	w.Lock()
-	w.task, w.err = task, err
-	w.Unlock()
-
 	return true
 }
 
