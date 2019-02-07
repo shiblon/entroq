@@ -252,7 +252,18 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 // Claim attempts to claim a task and blocks until one is ready or the
 // operation is canceled.
 func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
-	return entroq.PollTryClaim(ctx, cq, b.TryClaim)
+	resp, err := b.cli.Claim(ctx, &pb.ClaimRequest{
+		ClaimantId: cq.Claimant.String(),
+		Queue:      cq.Queue,
+		DurationMs: int64(cq.Duration / time.Millisecond),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if resp.Task == nil {
+		return nil, status.Errorf(codes.Internal, "No task returned from backend Claim")
+	}
+	return fromTaskProto(resp.Task)
 }
 
 // TryClaim attempts to claim a task from the queue. Normally returns both a
