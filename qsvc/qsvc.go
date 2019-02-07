@@ -35,7 +35,6 @@ package qsvc
 import (
 	"context"
 	"fmt"
-	"log"
 	"sync"
 	"time"
 
@@ -53,13 +52,7 @@ import (
 type QSvc struct {
 	sync.Mutex
 
-	// Pull from here to get clients.
-	freePool <-chan *entroq.EntroQ
-	// Push back here to return clients.
-	donePool chan<- *entroq.EntroQ
-
-	// Signal that we're finished with everything.
-	done chan struct{}
+	impl *entroq.EntroQ
 
 	// Keep track of in-memory consumers waiting on a change to a queue that
 	// could unblock them.
@@ -76,107 +69,32 @@ func un(mu sync.Locker) {
 }
 
 type svcOptions struct {
-	connections int
 }
 
 // QSvcOpt sets an option for the queue service.
 type QSvcOpt func(opts *svcOptions)
 
-// WithConnections sets the maximum connections (sets to 1 if < 1 or not present).
-func WithConnections(n int) QSvcOpt {
-	return func(opts *svcOptions) {
-		if n < 1 {
-			n = 1
-		}
-		opts.connections = n
-	}
-}
-
 // New creates a new service that exposes gRPC endpoints for task queue access.
-// It load balances across connections (presumably attached to a specific
-// persistent backend) using round robin in order of descending "time not
-// busy". The specified opener is used to select the backend type and pass
-// parameters to it. If connections is less than 1, it is set to 1. This is an
-// important default because some implementations might *only* ever allow 1
-// connection, and you need to know what you're doing anytime you set this
-// higher (you need to know, for example, whether the backend can handle
-// multiple clients---something like an in-memory backend certainly can't).
 func New(ctx context.Context, opener entroq.BackendOpener, opts ...QSvcOpt) (svc *QSvc, err error) {
-	options := &svcOptions{
-		connections: 1,
-	}
+	options := new(svcOptions)
 	for _, o := range opts {
 		o(options)
 	}
 
-	// Create read/write channels, then set to read-only, write-only values below.
-	// The goroutine in here that manages these can do both operations on them,
-	// but other methods can't, which protects against mistakes.
-	freePool := make(chan *entroq.EntroQ, options.connections)
-	donePool := make(chan *entroq.EntroQ, options.connections)
-
 	svc = &QSvc{
-		freePool: freePool,
-		donePool: donePool,
-		done:     make(chan struct{}),
-		subQ:     subq.New(),
+		subQ: subq.New(),
 	}
 
-	for i := 0; i < options.connections; i++ {
-		cli, err := entroq.New(ctx, opener)
-		if err != nil {
-			// Oops - close everything we've opened.
-			for j := 0; j < i; j++ {
-				c := <-freePool
-				c.Close()
-			}
-			return nil, fmt.Errorf("qsvc backend client: %v", err)
-		}
-		freePool <- cli
+	if svc.impl, err = entroq.New(ctx, opener); err != nil {
+		return nil, fmt.Errorf("qsvc backend client: %v", err)
 	}
-
-	go func() {
-		for {
-			select {
-			case <-svc.done:
-				// Subtle. To avoid having to lock things, we close the free
-				// pool so that no more can be pushed onto it, and then we
-				// consume everything that we can. It's possible that we'll get
-				// scooped by a request, though. That's fine. Stuff will
-				// happen, then the client will be sent back on the "done
-				// pool". We consume all the rest of them and close them, too.
-				// This allows all client connection users to complete gracefully.
-				//
-				// Note that this means we can't select on context and then not
-				// do anything in requests. We have to return clients to the
-				// pool even when the context is canceled.
-				close(freePool)
-				numFree := 0
-				for c := range freePool {
-					numFree++
-					c.Close()
-				}
-				freePool = nil
-				for i := 0; i < options.connections-numFree; i++ {
-					c := <-donePool
-					c.Close()
-				}
-				donePool = nil
-				return
-			case c := <-donePool:
-				// A connection is being returned. Put it back.
-				freePool <- c
-			}
-		}
-	}()
 
 	return svc, nil
 }
 
 // Close closes the backend connections and flushes the connection free.
 func (s *QSvc) Close() error {
-	close(s.done)
-	return nil
+	return s.impl.Close()
 }
 
 func fromMS(ms int64) time.Time {
@@ -200,41 +118,13 @@ func protoFromTask(t *entroq.Task) *pb.Task {
 	}
 }
 
-func (s *QSvc) getClient(ctx context.Context) (*entroq.EntroQ, error) {
-	select {
-	case c, ok := <-s.freePool:
-		if !ok {
-			return nil, fmt.Errorf("no backend connections")
-		}
-		return c, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-}
-
-func (s *QSvc) returnClient(c *entroq.EntroQ) {
-	// This should always work because it's buffered *and* the pool stays open
-	// so long as there are unclosed connections.
-	select {
-	case s.donePool <- c:
-	default:
-		log.Fatal("Bug found: failed to return client to buffered done pool")
-	}
-}
-
 // Claim is the blocking version of TryClaim.
 func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
-	client, err := s.getClient(ctx)
-	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "no clients for TryClaim: %v", err)
-	}
-	defer s.returnClient(client)
-
 	claimant, err := uuid.Parse(req.ClaimantId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to parse claimant ID: %v", err)
 	}
-	task, err := client.Claim(ctx, req.Queue, time.Duration(req.DurationMs)*time.Millisecond, entroq.ClaimAs(claimant))
+	task, err := s.impl.Claim(ctx, req.Queue, time.Duration(req.DurationMs)*time.Millisecond, entroq.ClaimAs(claimant))
 	if err != nil {
 		return nil, status.Errorf(codes.Unknown, "failed to claim: %v", err)
 	}
@@ -247,17 +137,11 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 // TryClaim attempts to claim a task, returning immediately. If no tasks are
 // available, it returns a nil response and a nil error.
 func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
-	client, err := s.getClient(ctx)
-	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "no clients for TryClaim: %v", err)
-	}
-	defer s.returnClient(client)
-
 	claimant, err := uuid.Parse(req.ClaimantId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to parse claimant ID: %v", err)
 	}
-	task, err := client.TryClaim(ctx, req.Queue, time.Duration(req.DurationMs)*time.Millisecond, entroq.ClaimAs(claimant))
+	task, err := s.impl.TryClaim(ctx, req.Queue, time.Duration(req.DurationMs)*time.Millisecond, entroq.ClaimAs(claimant))
 	if err != nil {
 		return nil, status.Errorf(codes.Unknown, "failed to claim: %v", err)
 	}
@@ -275,12 +159,6 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 // reconstruct an entroq.DependencyError, or directly to find out which IDs
 // caused the dependency failure. Code UNKNOWN is returned on other errors.
 func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyResponse, error) {
-	client, err := s.getClient(ctx)
-	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "no clients for Modify: %v", err)
-	}
-	defer s.returnClient(client)
-
 	claimant, err := uuid.Parse(req.ClaimantId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to parse claimant ID: %v", err)
@@ -323,7 +201,7 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 		}
 		modArgs = append(modArgs, entroq.DependingOn(id, depend.Version))
 	}
-	inserted, changed, err := client.Modify(ctx, modArgs...)
+	inserted, changed, err := s.impl.Modify(ctx, modArgs...)
 	if err != nil {
 		if depErr, ok := err.(*entroq.DependencyError); ok {
 			tmap := map[pb.DepType][]*entroq.TaskID{
@@ -378,12 +256,6 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 }
 
 func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksResponse, error) {
-	client, err := s.getClient(ctx)
-	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "no clients for Tasks: %v", err)
-	}
-	defer s.returnClient(client)
-
 	claimant := uuid.Nil
 	if req.ClaimantId != "" {
 		var err error
@@ -392,7 +264,7 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 		}
 	}
 	// Claimant will only really be limited if it is nonzero.
-	tasks, err := client.Tasks(ctx, req.Queue, entroq.LimitClaimant(claimant))
+	tasks, err := s.impl.Tasks(ctx, req.Queue, entroq.LimitClaimant(claimant))
 	if err != nil {
 		return nil, status.Errorf(codes.Unknown, "failed to get tasks: %v", err)
 	}
@@ -405,13 +277,7 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 
 // Queues returns a mapping from queue names to queue sizes.
 func (s *QSvc) Queues(ctx context.Context, req *pb.QueuesRequest) (*pb.QueuesResponse, error) {
-	client, err := s.getClient(ctx)
-	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "no clients for Queues: %v", err)
-	}
-	defer s.returnClient(client)
-
-	queueMap, err := client.Queues(ctx,
+	queueMap, err := s.impl.Queues(ctx,
 		entroq.MatchPrefix(req.MatchPrefix...),
 		entroq.MatchExact(req.MatchExact...),
 		entroq.LimitQueues(int(req.Limit)))
