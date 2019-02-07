@@ -289,10 +289,11 @@ func (b *backend) IsClaimExpired(err error) bool {
 // nil task and error if nothing is ready.
 //
 // If the WithTryClaimWait option was used to create this backend, TryClaim may
-// block until the context is canceled or the other end shuts down. If the
-// request is terminated before a task becomes available, but is due to context cancelation or an ABORTED status,
-// context is canceled before a task becomes available, the returned error will
-// have grpc status code ABORTED. This condition can be checked thus:
+// block until the context is canceled or the other end shuts down. To check
+// for a retryable status, where the retry can occur immediately because it was
+// due to a failed wait, use:
+//
+// 	backend.(entroq.WaitingBackend).IsClaimExpired(err).
 func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
 	resp, err := b.cli.TryClaim(ctx, &pb.ClaimRequest{
 		ClaimantId: cq.Claimant.String(),

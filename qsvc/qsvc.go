@@ -46,6 +46,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/shiblon/entroq/proto"
+	"github.com/shiblon/entroq/subq"
 )
 
 // QSvc is an EntroQServer.
@@ -59,6 +60,10 @@ type QSvc struct {
 
 	// Signal that we're finished with everything.
 	done chan struct{}
+
+	// Keep track of in-memory consumers waiting on a change to a queue that
+	// could unblock them.
+	subQ *subq.SubQ
 }
 
 func lock(mu sync.Locker) sync.Locker {
@@ -114,6 +119,7 @@ func New(ctx context.Context, opener entroq.BackendOpener, opts ...QSvcOpt) (svc
 		freePool: freePool,
 		donePool: donePool,
 		done:     make(chan struct{}),
+		subQ:     subq.New(),
 	}
 
 	for i := 0; i < options.connections; i++ {
@@ -229,12 +235,29 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to parse claimant ID: %v", err)
 	}
-	task, err := client.TryClaim(ctx, req.Queue, time.Duration(req.DurationMs)*time.Millisecond, entroq.ClaimAs(claimant))
+	try := func(ctx context.Context) (*entroq.Task, error) {
+		return client.TryClaim(ctx, req.Queue, time.Duration(req.DurationMs)*time.Millisecond, entroq.ClaimAs(claimant))
+	}
+	task, err := try(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.Unknown, "failed to claim: %v", err)
 	}
 	if task == nil {
-		return new(pb.ClaimResponse), nil
+		if !req.Wait {
+			return new(pb.ClaimResponse), nil
+		}
+		if err := s.subQ.Wait(ctx, req.Queue); err != nil {
+			return nil, status.Errorf(codes.Aborted, "tryclaim wait aborted: %v", err)
+		}
+		// Event signaled - tryclaim might succeed this time.
+		task, err := try(ctx)
+		if err != nil {
+			return nil, status.Errorf(codes.Unknown, "failed to claim: %v", err)
+		}
+		// Nothing to claim.
+		if task == nil {
+			return new(pb.ClaimResponse), nil
+		}
 	}
 	return &pb.ClaimResponse{Task: protoFromTask(task)}, nil
 }
@@ -323,12 +346,28 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 		}
 		return nil, status.Errorf(codes.Unknown, "modification failed: %v", err)
 	}
+	// Signal the queues for these tasks. Queues may be repeated, which will
+	// allow multiple listeners to unblock if there are, for example, multiple
+	// tasks on the same queue that are suddenly available do to actions here.
+	signalQueues := make(map[uuid.UUID]string)
+	now := time.Now()
+
+	// Also assemble the response.
 	resp := new(pb.ModifyResponse)
 	for _, task := range inserted {
+		if task.At.After(now) {
+			signalQueues[task.ID] = task.Queue
+		}
 		resp.Inserted = append(resp.Inserted, protoFromTask(task))
 	}
 	for _, task := range changed {
+		if task.At.After(now) {
+			signalQueues[task.ID] = task.Queue
+		}
 		resp.Changed = append(resp.Changed, protoFromTask(task))
+	}
+	for _, q := range signalQueues {
+		s.subQ.Notify(q)
 	}
 	return resp, nil
 }
