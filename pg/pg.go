@@ -228,6 +228,12 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 	return tasks, nil
 }
 
+// Claim attempts to claim an arrived task from the queue, and blocks if
+// something goes wrong.
+func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
+	return entroq.PollTryClaim(ctx, cq, b.TryClaim)
+}
+
 // TryClaim attempts to claim an "arrived" task from the queue.
 // Returns an error if something goes wrong, a nil task if there is
 // nothing to claim.

@@ -120,8 +120,6 @@ type ClaimQuery struct {
 	Queue    string        // The name of the queue to claim from.
 	Claimant uuid.UUID     // The ID of the process trying to make the claim.
 	Duration time.Duration // How long the task should be claimed for if successful.
-
-	maxWait time.Duration // Length of time to wait for a blocking claim.
 }
 
 // TasksQuery holds information for a tasks query.
@@ -147,6 +145,42 @@ type QueuesQuery struct {
 	Limit int
 }
 
+// BackendClaimFunc is a function that can make claims based on a ClaimQuery.
+// It is a convenience type for backends to use.
+type BackendClaimFunc func(ctx context.Context, eq *ClaimQuery) (*Task, error)
+
+// PollTryClaim runs a loop in which the TryClaim function is called between
+// sleeps with exponential backoff (up to a point). Backend implementations may
+// choose to use this as their Claim implementation.
+func PollTryClaim(ctx context.Context, eq *ClaimQuery, tc BackendClaimFunc) (*Task, error) {
+	const (
+		maxCheckInterval = 30 * time.Second
+		startInterval    = time.Second
+	)
+
+	curWait := startInterval
+	for {
+		// Don't wait longer than the check interval or canceled context.
+		task, err := tc(ctx, eq)
+		if err != nil {
+			return nil, err
+		}
+		if task != nil {
+			return task, nil
+		}
+		// No error, no task - we wait with exponential backoff and try again.
+		select {
+		case <-time.After(curWait):
+			curWait *= 2
+			if curWait > maxCheckInterval {
+				curWait = maxCheckInterval
+			}
+		case <-ctx.Done():
+			return nil, Canceled(fmt.Errorf("context canceled for claim request in %q: %v", eq.Queue, ctx.Err()))
+		}
+	}
+}
+
 // Backend describes all of the functions that any backend has to implement
 // to be used as the storage for task queues.
 type Backend interface {
@@ -166,6 +200,15 @@ type Backend interface {
 	// there is nothing to claim. Will fail with a DependencyError is a
 	// specific task ID is requested but not present.
 	TryClaim(ctx context.Context, cq *ClaimQuery) (*Task, error)
+
+	// Claim is a blocking version of TryClaim, attempting to claim a task
+	// from a queue, and blocking until canceled or a task becomes available.
+	//
+	// Will fail with a DependencyError is a specific task ID is requested but
+	// not present. Never returns both a nil task and a nil error
+	// simultaneously: a failure to claim a task is an error (potentially just
+	// a timeout).
+	Claim(ctx context.Context, cq *ClaimQuery) (*Task, error)
 
 	// Modify attempts to atomically modify the task store, and only succeeds
 	// if all dependencies are available and all mutations are either expired
@@ -332,14 +375,6 @@ func LimitQueues(limit int) QueuesOpt {
 // ClaimOpt modifies limits on a task claim.
 type ClaimOpt func(*ClaimQuery)
 
-// ClaimWait sets the maximum wait time for a blocking Claim. Default is
-// whatever the context says, or indefinite.
-func ClaimWait(d time.Duration) ClaimOpt {
-	return func(q *ClaimQuery) {
-		q.maxWait = d
-	}
-}
-
 // ClaimAs sets the claimant ID for a claim operation. When not set, uses the internal default for this client.
 func ClaimAs(id uuid.UUID) ClaimOpt {
 	return func(q *ClaimQuery) {
@@ -361,49 +396,15 @@ func IsCanceled(err error) bool {
 // succeeds, it returns a task with the claimant set to the default, or to the
 // value given in options, and an arrival time given by the duration.
 func (c *EntroQ) Claim(ctx context.Context, q string, duration time.Duration, opts ...ClaimOpt) (*Task, error) {
-	const (
-		maxCheckInterval = 30 * time.Second
-		startInterval    = time.Second
-	)
-
-	query := new(ClaimQuery)
+	query := &ClaimQuery{
+		Queue:    q,
+		Claimant: c.clientID,
+		Duration: duration,
+	}
 	for _, opt := range opts {
 		opt(query)
 	}
-
-	if query.maxWait != 0 {
-		var cancel func()
-		ctx, cancel = context.WithTimeout(ctx, query.maxWait)
-		defer cancel()
-	}
-
-	curWait := startInterval
-	for {
-		// Don't wait longer than the check interval, or maxWait, whichever comes first.
-		tryCtx, _ := context.WithTimeout(ctx, maxCheckInterval)
-		task, err := c.TryClaim(tryCtx, q, duration, opts...)
-		if err != nil {
-			// If we are in a waiting backend, and the (blocked) claim merely
-			// expired, we can retry immediately without sleeping.
-			if backend, ok := c.backend.(WaitingBackend); ok && backend.IsClaimExpired(err) {
-				continue
-			}
-			return nil, err
-		}
-		if task != nil {
-			return task, nil
-		}
-		// No error, no task - we wait.
-		select {
-		case <-time.After(curWait):
-			curWait *= 2
-			if curWait > maxCheckInterval {
-				curWait = maxCheckInterval
-			}
-		case <-ctx.Done():
-			return nil, Canceled(fmt.Errorf("context canceled for claim request in %q: %v", q, ctx.Err()))
-		}
-	}
+	return c.backend.Claim(ctx, query)
 }
 
 // TryClaimTask attempts one time to claim a task from the given queue. If

@@ -222,6 +222,28 @@ func (s *QSvc) returnClient(c *entroq.EntroQ) {
 	}
 }
 
+// Claim is the blocking version of TryClaim.
+func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
+	client, err := s.getClient(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "no clients for TryClaim: %v", err)
+	}
+	defer s.returnClient(client)
+
+	claimant, err := uuid.Parse(req.ClaimantId)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "failed to parse claimant ID: %v", err)
+	}
+	task, err := client.Claim(ctx, req.Queue, time.Duration(req.DurationMs)*time.Millisecond, entroq.ClaimAs(claimant))
+	if err != nil {
+		return nil, status.Errorf(codes.Unknown, "failed to claim: %v", err)
+	}
+	if task == nil {
+		return new(pb.ClaimResponse), nil
+	}
+	return &pb.ClaimResponse{Task: protoFromTask(task)}, nil
+}
+
 // TryClaim attempts to claim a task, returning immediately. If no tasks are
 // available, it returns a nil response and a nil error.
 func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
@@ -235,29 +257,12 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to parse claimant ID: %v", err)
 	}
-	try := func(ctx context.Context) (*entroq.Task, error) {
-		return client.TryClaim(ctx, req.Queue, time.Duration(req.DurationMs)*time.Millisecond, entroq.ClaimAs(claimant))
-	}
-	task, err := try(ctx)
+	task, err := client.TryClaim(ctx, req.Queue, time.Duration(req.DurationMs)*time.Millisecond, entroq.ClaimAs(claimant))
 	if err != nil {
 		return nil, status.Errorf(codes.Unknown, "failed to claim: %v", err)
 	}
 	if task == nil {
-		if !req.Wait {
-			return new(pb.ClaimResponse), nil
-		}
-		if err := s.subQ.Wait(ctx, req.Queue); err != nil {
-			return nil, status.Errorf(codes.Aborted, "tryclaim wait aborted: %v", err)
-		}
-		// Event signaled - tryclaim might succeed this time.
-		task, err := try(ctx)
-		if err != nil {
-			return nil, status.Errorf(codes.Unknown, "failed to claim: %v", err)
-		}
-		// Nothing to claim.
-		if task == nil {
-			return new(pb.ClaimResponse), nil
-		}
+		return new(pb.ClaimResponse), nil
 	}
 	return &pb.ClaimResponse{Task: protoFromTask(task)}, nil
 }
