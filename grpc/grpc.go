@@ -58,8 +58,7 @@ import (
 const DefaultAddr = ":37706"
 
 type backendOptions struct {
-	dialOpts     []grpc.DialOption
-	tryClaimWait bool
+	dialOpts []grpc.DialOption
 }
 
 // Option allows grpc-opener-specific options to be sent in Opener.
@@ -96,19 +95,6 @@ func WithNiladicDialer(f func() (net.Conn, error)) Option {
 	}))
 }
 
-// WithTryClaimWait instructs the server to hold TryClaim connections open
-// until an event occurs that would return a value. If the request context is
-// canceled before a claimable task arrives, the gRPC status code ABORTED is
-// returned to signal that it can be retried. TryClaim then returns that error.
-//
-// The Claim method of the entroq client can use that information (status code
-// ABORTED) to loop on TryClaim without sleeping in between attempts.
-func WithTryClaimWait() Option {
-	return func(opts *backendOptions) {
-		opts.tryClaimWait = true
-	}
-}
-
 // Opener creates an opener function to be used to get a gRPC backend. If the
 // address string is empty, it defaults to the DefaultAddr, the default value
 // for the memory-backed gRPC server.
@@ -141,8 +127,6 @@ func Opener(addr string, opts ...Option) entroq.BackendOpener {
 type backend struct {
 	conn *grpc.ClientConn
 	cli  pb.EntroQClient
-
-	tryClaimWait bool
 }
 
 // New creates a new gRPC backend that attaches to the task service via gRPC.
@@ -152,9 +136,8 @@ func New(conn *grpc.ClientConn, opts ...Option) (*backend, error) {
 		opt(options)
 	}
 	return &backend{
-		conn:         conn,
-		cli:          pb.NewEntroQClient(conn),
-		tryClaimWait: options.tryClaimWait,
+		conn: conn,
+		cli:  pb.NewEntroQClient(conn),
 	}, nil
 }
 
@@ -266,40 +249,19 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 	return tasks, nil
 }
 
-// IsClaimExpired indicates whether the error signals an expired claim.
-func (b *backend) IsClaimExpired(err error) bool {
-	// Only signal claim expiration if we were blocking in the first place.
-	if !b.tryClaimWait {
-		return false
-	}
-	switch status.Code(err) {
-	case codes.Aborted, codes.DeadlineExceeded, codes.Canceled:
-		return true
-	}
-
-	switch status.FromContextError(err).Code() {
-	case codes.DeadlineExceeded, codes.Canceled:
-		return true
-	}
-
-	return false
+// Claim attempts to claim a task and blocks until one is ready or the
+// operation is canceled.
+func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
+	return entroq.PollTryClaim(ctx, cq, b.TryClaim)
 }
 
 // TryClaim attempts to claim a task from the queue. Normally returns both a
 // nil task and error if nothing is ready.
-//
-// If the WithTryClaimWait option was used to create this backend, TryClaim may
-// block until the context is canceled or the other end shuts down. To check
-// for a retryable status, where the retry can occur immediately because it was
-// due to a failed wait, use:
-//
-// 	backend.(entroq.WaitingBackend).IsClaimExpired(err).
 func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
 	resp, err := b.cli.TryClaim(ctx, &pb.ClaimRequest{
 		ClaimantId: cq.Claimant.String(),
 		Queue:      cq.Queue,
 		DurationMs: int64(cq.Duration / time.Millisecond),
-		Wait:       b.tryClaimWait,
 	})
 	if err != nil {
 		return nil, err // Do not wrap - gRPC/context status preservation is important.

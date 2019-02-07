@@ -267,7 +267,11 @@ func (w *MapWorker) Run(ctx context.Context) error {
 		if empty {
 			return nil // all finished.
 		}
-		task, err := w.client.Claim(ctx, w.InputQueue, claimDuration, entroq.ClaimWait(5*time.Second))
+
+		claimCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+
+		task, err := w.client.Claim(claimCtx, w.InputQueue, claimDuration)
 		if entroq.IsCanceled(err) {
 			continue
 		}
@@ -589,7 +593,10 @@ func (w *ReduceWorker) Run(ctx context.Context) error {
 	log.Printf("Reducer %q merge finished. Reducing.", w.Name)
 
 	// Then, reduce over the final merged task.
-	task, err := w.client.Claim(ctx, w.InputQueue, claimDuration, entroq.ClaimWait(5*time.Second))
+	claimCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	task, err := w.client.Claim(claimCtx, w.InputQueue, claimDuration)
 	if err != nil {
 		return fmt.Errorf("reduce run claim: %v", err)
 	}

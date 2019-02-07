@@ -224,6 +224,12 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 	return tasks, nil
 }
 
+// Claim attempts to claim a task from the queue, blocking until one is
+// available or the operation is canceled.
+func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
+	return entroq.PollTryClaim(ctx, cq, b.TryClaim)
+}
+
 // TryClaim attempts to claim a task from a queue.
 func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
 	defer un(lock(b))

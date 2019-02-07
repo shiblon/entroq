@@ -4,7 +4,9 @@ package subq
 
 import (
 	"context"
+	"log"
 	"sync"
+	"time"
 )
 
 // SubQ is a queue subscription service. It is not public, though; it is based
@@ -17,15 +19,38 @@ type SubQ struct {
 
 type sub struct {
 	sync.Mutex
-	sync.WaitGroup
-	ch chan string
+
+	listeners int
+	ch        chan string
 }
 
 func (s *sub) Ch() chan string {
 	if s == nil {
 		return nil
 	}
+	defer un(lock(s))
 	return s.ch
+}
+
+func (s *sub) Reserve() {
+	defer un(lock(s))
+	s.listeners++
+}
+
+func (s *sub) Release() {
+	defer un(lock(s))
+	if s.listeners == 0 {
+		log.Fatal("Release before Reserve")
+	}
+	s.listeners--
+}
+
+func (s *sub) Reserved() bool {
+	if s == nil {
+		return false
+	}
+	defer un(lock(s))
+	return s.listeners != 0
 }
 
 func lock(l sync.Locker) func() {
@@ -49,10 +74,13 @@ func New() *SubQ {
 // the event.
 func (s *SubQ) Notify(q string) {
 	defer un(lock(s))
+	log.Printf("notify lock %q", q)
 
 	select {
 	case s.qs[q].Ch() <- q:
+		log.Printf("notification sent %q", q)
 	default:
+		log.Printf("notify dropped %q", q)
 	}
 }
 
@@ -64,40 +92,56 @@ func (s *SubQ) Wait(ctx context.Context, q string) error {
 	func() {
 		defer un(lock(s))
 
+		log.Printf("in wait lock for %q: %v", q, s.qs)
+
 		qs := s.qs
 
 		// If there isn't any sync info for this queue, create it and add this
 		// waiter. Otherwise just add the waiter; the sync info is there already.
 		qInfo = qs[q]
 		if qInfo != nil {
-			qInfo.Add(1)
+			qInfo.Reserve()
 			return
 		}
 
+		log.Printf("no sync info for %q", q)
+
 		qInfo = &sub{ch: make(chan string)}
-		qInfo.Add(1)
+		qInfo.Reserve()
 		qs[q] = qInfo
 
-		// In the backgound, wait until there are no more subscribers and
-		// delete the entry for this queue.
-		g := qs[q]
-		go func() {
-			g.Wait()
+		log.Printf("made sync %q: %v", q, s.qs)
 
-			defer un(lock(s))
-			delete(qs, q)
+		// Start up a watchdog that deletes when there are no more listeners.
+		// Only do this when creating a new pInfo entry.
+		go func() {
+			for {
+				s.Lock()
+				if !qs[q].Reserved() {
+					delete(qs, q)
+				}
+				if qs[q] == nil {
+					s.Unlock()
+					return
+				}
+				s.Unlock()
+				time.Sleep(10 * time.Second)
+			}
 		}()
 	}()
-	defer qInfo.Done()
+	defer qInfo.Release()
 
 	// Since we have already added our intent to listen on this channel,
 	// it won't get deleted from the queue map before the select executes
 	// below.
 
+	log.Printf("select %q", q)
 	select {
 	case <-qInfo.Ch():
+		log.Printf("successful wait %q", q)
 		return nil
 	case <-ctx.Done():
+		log.Printf("wait context %q: %v", q, ctx.Err())
 		return ctx.Err()
 	}
 }
