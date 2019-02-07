@@ -64,7 +64,7 @@ func startPostgres(ctx context.Context) (port int, stop func(), err error) {
 	if err := run(ctx, "docker", "run", "-p", "0:5432", "-d", "--name", name, "postgres"); err != nil {
 		return 0, nil, fmt.Errorf("start postgres container: %v", err)
 	}
-	log.Print("Success")
+	log.Print("Container is up")
 
 	stopFunc := func() {
 		log.Printf("Stopping postgres container %q...", name)
@@ -72,7 +72,7 @@ func startPostgres(ctx context.Context) (port int, stop func(), err error) {
 			log.Printf("Error stopping: %v", err)
 			return
 		}
-		log.Printf("Success")
+		log.Printf("Container is down")
 	}
 
 	defer func() {
