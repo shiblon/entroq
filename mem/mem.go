@@ -250,14 +250,16 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 		return nil, nil
 	}
 
+	top = top.Copy()
 	top.Version++
 	top.At = now.Add(cq.Duration)
 	top.Modified = now
 	top.Claimant = cq.Claimant
+	h.items[0].task = top
 
 	heap.Fix(h, 0)
 
-	return top.Copy(), nil
+	return top, nil
 }
 
 // Modify attempts to modify a batch of tasks in the queue system.
