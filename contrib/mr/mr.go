@@ -22,8 +22,8 @@ import (
 )
 
 const (
-	claimDuration = time.Minute
-	claimWait     = 5 * time.Second
+	claimDuration = 5 * time.Second
+	claimWait     = 10 * time.Second
 	shuffleWait   = 5 * time.Second
 )
 
@@ -229,26 +229,26 @@ func (w *MapWorker) mapTask(ctx context.Context, task *entroq.Task) error {
 	task, err := w.client.DoWithRenew(ctx, task, claimDuration, func(ctx context.Context) error {
 		kv := new(KV)
 		if err := json.Unmarshal(task.Value, kv); err != nil {
-			return fmt.Errorf("mr.mapTask json: %v", err)
+			return fmt.Errorf("mr.MapWorker.mapTask json: %v", err)
 		}
 
 		if err := w.Map(ctx, kv.Key, kv.Value, emitter.Emit); err != nil {
-			return fmt.Errorf("mr.mapTask %q: %v", task.IDVersion(), err)
+			return entroq.WrapDependencyError(err, "mr.MapWorker.mapTask %q", task.IDVersion())
 		}
 
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("mr.mapTask claim: %v", err)
+		return entroq.WrapDependencyError(err, "mr.MapWorker.mapTask renew")
 	}
 
 	// Delete map task and create shuffle shard tasks.
 	args, err := emitter.AsModifyArgs(w.OutputPrefix, task.AsDeletion())
 	if err != nil {
-		return fmt.Errorf("mr.mapTask args: %v", err)
+		return fmt.Errorf("mr.MapWorker.mapTask: %v", err)
 	}
 	if _, _, err := w.client.Modify(ctx, args...); err != nil {
-		return err // pass through dependency errors.
+		return entroq.WrapDependencyError(err, "mr.MapWorker.mapTask")
 	}
 	return nil
 }
@@ -263,7 +263,7 @@ func (w *MapWorker) Run(ctx context.Context) error {
 	for {
 		empty, err := w.client.QueuesEmpty(ctx, entroq.MatchExact(w.InputQueue))
 		if err != nil {
-			return fmt.Errorf("map test empty: %v", err)
+			return fmt.Errorf("mr.MapWorker.Run: %v", err)
 		}
 		if empty {
 			return nil // all finished.
@@ -277,7 +277,7 @@ func (w *MapWorker) Run(ctx context.Context) error {
 			continue
 		}
 		if err != nil {
-			return fmt.Errorf("map run claim: %v", err)
+			return fmt.Errorf("mr.MapWorker.Run claim: %v", err)
 		}
 		if err := w.mapTask(ctx, task); err != nil {
 			if entroq.IsDependency(err) {
@@ -462,14 +462,13 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 		return nil
 	})
 	if err != nil {
-		return entroq.WrapDependencyError(err, "mr.ReduceWorker.mergeTasks claim")
+		return entroq.WrapDependencyError(err, "mr.ReduceWorker.mergeTasks renew")
 	}
 
 	for _, t := range tasks {
 		modArgs = append(modArgs, t.AsDeletion())
 	}
 	if _, _, err := w.client.Modify(ctx, modArgs...); err != nil {
-		log.Printf("modify error: %T %v", err, err)
 		return entroq.WrapDependencyError(err, "mr.ReduceWorker.mergeTasks modify")
 	}
 	return nil

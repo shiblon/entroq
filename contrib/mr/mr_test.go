@@ -80,19 +80,21 @@ func TestMapReduce_checkLarge(t *testing.T) {
 	config := &quick.Config{
 		MaxCount: 5,
 		Values: func(values []reflect.Value, rand *rand.Rand) {
-			values[0] = reflect.ValueOf(rand.Intn(5000) + 5000)
-			values[1] = reflect.ValueOf(rand.Intn(100) + 1)
-			values[2] = reflect.ValueOf(rand.Intn(20) + 1)
+			//values[0] = reflect.ValueOf(rand.Intn(5000) + 5000)
+			values[0] = reflect.ValueOf(10)
+			//values[1] = reflect.ValueOf(rand.Intn(100) + 1)
+			values[1] = reflect.ValueOf(10)
+			//values[2] = reflect.ValueOf(rand.Intn(20) + 1)
+			values[2] = reflect.ValueOf(2)
 		},
 	}
 
 	ctx := context.Background()
-	client, err := entroq.New(ctx, mem.Opener())
-	if err != nil {
-		t.Fatalf("Open mem client: %v", err)
-	}
-
 	check := func(ndocs, nm, nr int) bool {
+		client, err := entroq.New(ctx, mem.Opener())
+		if err != nil {
+			t.Fatalf("Open mem client: %v", err)
+		}
 		return mrtest.MRCheck(ctx, client, ndocs, nm, nr)
 	}
 	if err := quick.Check(check, config); err != nil {
