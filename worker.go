@@ -45,10 +45,9 @@ type Worker struct {
 	taskTimeout   time.Duration
 
 	// Iterator states.
-	claimCtx    context.Context
-	claimCancel context.CancelFunc
-	task        *Task
-	err         error
+	claimCtx context.Context
+	task     *Task
+	err      error
 
 	sync.Mutex
 }
@@ -67,10 +66,20 @@ func (c *EntroQ) NewWorker(q string, opts ...WorkerOption) *Worker {
 	return w
 }
 
+func lock(l sync.Locker) func() {
+	l.Lock()
+	return func() {
+		l.Unlock()
+	}
+}
+
+func un(f func()) {
+	f()
+}
+
 // Err returns the most recent error encountered when doing work for a task.
 func (w *Worker) Err() error {
-	w.Lock()
-	defer w.Unlock()
+	defer un(lock(w))
 	return w.err
 }
 
@@ -84,28 +93,19 @@ func (w *Worker) Next(ctx context.Context) bool {
 	}
 
 	w.Lock()
-	w.claimCtx, w.claimCancel = context.WithCancel(ctx)
+	w.claimCtx = ctx
 	w.Unlock()
 
 	task, err := w.eqc.Claim(w.claimCtx, w.Q, w.leaseTime)
 
-	w.Lock()
-	defer w.Unlock()
-
+	defer un(lock(w))
 	w.task, w.err = task, err
-	if err != nil {
-		if IsCanceled(w.err) {
-			w.err = nil
-		}
-		return false
-	}
-	return true
+	return w.err == nil
 }
 
 // Task returns the claimed task for this worker.
 func (w *Worker) Task() *Task {
-	w.Lock()
-	defer w.Unlock()
+	defer un(lock(w))
 	return w.task
 }
 
