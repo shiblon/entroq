@@ -24,6 +24,7 @@ import (
 	homedir "github.com/mitchellh/go-homedir"
 	"github.com/shiblon/entroq/pg"
 	"github.com/shiblon/entroq/qsvc"
+	"github.com/shiblon/entroq/subq"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
@@ -57,6 +58,7 @@ var rootCmd = &cobra.Command{
 			pg.WithUsername(dbUser),
 			pg.WithPassword(dbPass),
 			pg.WithConnectAttempts(attempts),
+			pg.WithNotifyWaiter(subq.New()),
 		))
 		if err != nil {
 			log.Fatalf("Failed to open backend for qsvc: %v", err)
