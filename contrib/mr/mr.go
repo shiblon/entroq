@@ -229,26 +229,26 @@ func (w *MapWorker) mapTask(ctx context.Context, task *entroq.Task) error {
 	task, err := w.client.DoWithRenew(ctx, task, claimDuration, func(ctx context.Context) error {
 		kv := new(KV)
 		if err := json.Unmarshal(task.Value, kv); err != nil {
-			return fmt.Errorf("map run json unmarshal: %v", err)
+			return fmt.Errorf("mr.mapTask json: %v", err)
 		}
 
 		if err := w.Map(ctx, kv.Key, kv.Value, emitter.Emit); err != nil {
-			return fmt.Errorf("map task %s failed: %v", task.IDVersion(), err)
+			return fmt.Errorf("mr.mapTask %q: %v", task.IDVersion(), err)
 		}
 
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("claim task for map: %v", err)
+		return fmt.Errorf("mr.mapTask claim: %v", err)
 	}
 
 	// Delete map task and create shuffle shard tasks.
 	args, err := emitter.AsModifyArgs(w.OutputPrefix, task.AsDeletion())
 	if err != nil {
-		return fmt.Errorf("map task make insertions: %v", err)
+		return fmt.Errorf("mr.mapTask args: %v", err)
 	}
 	if _, _, err := w.client.Modify(ctx, args...); err != nil {
-		return fmt.Errorf("map task update failed: %v", err)
+		return err // pass through dependency errors.
 	}
 	return nil
 }
@@ -280,7 +280,11 @@ func (w *MapWorker) Run(ctx context.Context) error {
 			return fmt.Errorf("map run claim: %v", err)
 		}
 		if err := w.mapTask(ctx, task); err != nil {
-			return fmt.Errorf("map run: %v", err)
+			if entroq.IsDependency(err) {
+				log.Printf("mr.MapWorker.Run continuing: %v", err)
+				continue
+			}
+			return fmt.Errorf("mr.MapWorker.Run: %v", err)
 		}
 	}
 }
@@ -439,7 +443,7 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 		for _, task := range tasks {
 			var vals []*KV
 			if err := json.Unmarshal(task.Value, &vals); err != nil {
-				return fmt.Errorf("unmarshal merge data: %v", err)
+				return fmt.Errorf("mr.ReduceWorker.mergeTasks: %v", err)
 			}
 			kvs = append(kvs, vals...)
 		}
@@ -451,21 +455,22 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 		// Now all key/value pairs are merged into a single sorted list. Create a new task and delete the others.
 		combined, err := json.Marshal(kvs)
 		if err != nil {
-			return fmt.Errorf("marshal combined merge: %v", err)
+			return fmt.Errorf("mr.ReduceWorker.mergeTasks: %v", err)
 		}
 
 		modArgs = append(modArgs, entroq.InsertingInto(w.InputQueue, entroq.WithValue(combined)))
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("claim tasks for merge: %v", err)
+		return entroq.WrapDependencyError(err, "mr.ReduceWorker.mergeTasks claim")
 	}
 
 	for _, t := range tasks {
 		modArgs = append(modArgs, t.AsDeletion())
 	}
 	if _, _, err := w.client.Modify(ctx, modArgs...); err != nil {
-		return fmt.Errorf("merge output: %v", err)
+		log.Printf("modify error: %T %v", err, err)
+		return entroq.WrapDependencyError(err, "mr.ReduceWorker.mergeTasks modify")
 	}
 	return nil
 }
@@ -479,7 +484,7 @@ func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error 
 		log.Printf("Reduce %q starting reduce task", w.Name)
 		var kvs []*KV
 		if err := json.Unmarshal(task.Value, &kvs); err != nil {
-			return fmt.Errorf("json unmarshal reduce pairs: %v", err)
+			return fmt.Errorf("mr.ReduceWorker.reduceTasks: %v", err)
 		}
 
 		if len(kvs) == 0 {
@@ -512,12 +517,12 @@ func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error 
 			currBefore := curr
 			output, err := w.Reduce(ctx, input)
 			if currBefore == curr {
-				// The reducer didn't consume anything - we need to do that instead.
 				for input.Next() {
+					// The reducer didn't consume anything - we need to do that instead.
 				}
 			}
 			if err != nil {
-				return fmt.Errorf("reduce error: %v", err)
+				return entroq.WrapDependencyError(err, "mr.ReduceWorker.reduceTask")
 			}
 			outputs = append(outputs, NewKV(last.Key, output))
 		}
@@ -526,10 +531,10 @@ func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error 
 
 	outputValue, err := json.Marshal(outputs)
 	if err != nil {
-		return fmt.Errorf("failed to serialize reduce outputs: %v", err)
+		return fmt.Errorf("mr.ReduceWorker.reduceTask: %v", err)
 	}
 	if _, _, err := w.client.Modify(ctx, task.AsDeletion(), entroq.InsertingInto(w.OutputQueue, entroq.WithValue(outputValue))); err != nil {
-		return fmt.Errorf("failed to insert completed reduce shard: %v", err)
+		return entroq.WrapDependencyError(err, "mr.ReduceWorker.reduceTask")
 	}
 	return nil
 }
@@ -561,13 +566,13 @@ func (w *ReduceWorker) Run(ctx context.Context) error {
 	for {
 		mergeTasks, err := w.client.Tasks(ctx, w.InputQueue)
 		if err != nil {
-			return fmt.Errorf("merge task list: %v", err)
+			return fmt.Errorf("mr.ReduceWorker.Run tasks: %v", err)
 		}
 		log.Printf("Reducer %q found %d merge tasks", w.Name, len(mergeTasks))
 		if len(mergeTasks) <= 1 {
 			empty, err := w.client.QueuesEmpty(ctx, entroq.MatchExact(w.MapEmptyQueue))
 			if err != nil {
-				return fmt.Errorf("empty check in merge: %v", err)
+				return fmt.Errorf("mr.ReduceWorker.Run: %v", err)
 			}
 			if empty {
 				log.Printf("Reducer %q nothing to merge", w.Name)
@@ -577,7 +582,7 @@ func (w *ReduceWorker) Run(ctx context.Context) error {
 			// Nothing to do - sleep and continue.
 			select {
 			case <-ctx.Done():
-				return fmt.Errorf("context canceled while shuffling")
+				return ctx.Err()
 			case <-time.After(shuffleWait):
 				log.Printf("Reducer %q trying again", w.Name)
 			}
@@ -586,7 +591,11 @@ func (w *ReduceWorker) Run(ctx context.Context) error {
 		// More than one merge task is in the queue. Shuffle and check again.
 		log.Printf("Reducer %q merging %d tasks", w.Name, len(mergeTasks))
 		if err := w.mergeTasks(ctx, mergeTasks); err != nil {
-			return fmt.Errorf("merge: %v", err)
+			if entroq.IsDependency(err) {
+				log.Printf("Trying again in mr.ReduceWorker.Run: %v", err)
+				continue
+			}
+			return fmt.Errorf("mr.ReduceWorker.Run: %v", err)
 		}
 		log.Printf("Reducer %q merged %d tasks, pushing to %q", w.Name, len(mergeTasks), w.InputQueue)
 	}
@@ -599,10 +608,10 @@ func (w *ReduceWorker) Run(ctx context.Context) error {
 
 	task, err := w.client.Claim(claimCtx, w.InputQueue, claimDuration)
 	if err != nil {
-		return fmt.Errorf("reduce run claim: %v", err)
+		return entroq.WrapDependencyError(err, "mr.ReduceWorker.Run")
 	}
 	if err := w.reduceTask(ctx, task); err != nil {
-		return fmt.Errorf("reduce run: %v", err)
+		return entroq.WrapDependencyError(err, "mr.ReduceWorker.Run")
 	}
 	return nil
 }

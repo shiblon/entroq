@@ -213,7 +213,7 @@ func changeProtoFromTask(t *entroq.Task) *pb.TaskChange {
 func fromTaskIDProto(tid *pb.TaskID) (*entroq.TaskID, error) {
 	id, err := uuid.Parse(tid.Id)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse task ID: %v", err)
+		return nil, fmt.Errorf("grpc.fromTaskIDProto parse %q: %v", tid.Id, err)
 	}
 	return &entroq.TaskID{
 		ID:      id,
@@ -312,15 +312,22 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 		switch stat := status.Convert(err); stat.Code() {
 		case codes.NotFound:
 			// Dependency error, should have details.
-			depErr := new(entroq.DependencyError)
+			depErr := entroq.DependencyError{
+				Message: "grpc.Modify",
+			}
 			for _, det := range stat.Details() {
 				detail, ok := det.(*pb.ModifyDep)
 				if !ok {
-					return nil, nil, fmt.Errorf("modification dependency failure, and error reading details: %v", err)
+					return nil, nil, fmt.Errorf("grpc.Modify: %v", err)
 				}
+				if detail.Type == pb.DepType_DETAIL && detail.Msg != "" {
+					depErr.Message += fmt.Sprintf(": %s", detail.Msg)
+					continue
+				}
+
 				tid, err := fromTaskIDProto(detail.Id)
 				if err != nil {
-					return nil, nil, fmt.Errorf("modification dependency failure, and bad ID in details: %v", err)
+					return nil, nil, fmt.Errorf("grpc.Modify: %v", err)
 				}
 				switch detail.Type {
 				case pb.DepType_CLAIM:
@@ -332,26 +339,26 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 				case pb.DepType_DEPEND:
 					depErr.Depends = append(depErr.Depends, tid)
 				default:
-					return nil, nil, fmt.Errorf("modification dependency failure, encountered unknown detail type: %v --- detail %v", err, detail)
+					return nil, nil, fmt.Errorf("grpc.Modify unknown detail %T in %v", detail, err)
 				}
-				return nil, nil, depErr
 			}
+			return nil, nil, depErr
 		default:
-			return nil, nil, fmt.Errorf("modify via grpc failed: %v", err)
+			return nil, nil, fmt.Errorf("grpc.Modify: %v", err)
 		}
 	}
 
-	for _, t := range resp.Inserted {
+	for _, t := range resp.GetInserted() {
 		task, err := fromTaskProto(t)
 		if err != nil {
-			return nil, nil, fmt.Errorf("modification success, but failed to parse inserted values: %v", err)
+			return nil, nil, fmt.Errorf("grpc.Modify: %v", err)
 		}
 		inserted = append(inserted, task)
 	}
-	for _, t := range resp.Changed {
+	for _, t := range resp.GetChanged() {
 		task, err := fromTaskProto(t)
 		if err != nil {
-			return nil, nil, fmt.Errorf("modification success, but failed to parse changed values: %v", err)
+			return nil, nil, fmt.Errorf("grpc.Modify: %v", err)
 		}
 		changed = append(changed, task)
 	}
