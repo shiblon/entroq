@@ -91,6 +91,11 @@ func (w *Worker) Next(ctx context.Context) bool {
 		return false
 	default:
 	}
+
+	w.Lock()
+	w.claimCtx = ctx
+	w.Unlock()
+
 	task, err := w.eqc.Claim(w.claimCtx, w.Q, w.leaseTime)
 
 	defer un(lock(w))
