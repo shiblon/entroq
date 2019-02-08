@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/subq"
 )
@@ -333,11 +334,11 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 
 	foundDeps, err := depQuery(ctx, tx, mod)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get dependencies: %v", err)
+		return nil, nil, entroq.WrapDependencyError(err, "pg.Modify")
 	}
 
 	if err := mod.DependencyError(foundDeps); err != nil {
-		return nil, nil, err
+		return nil, nil, entroq.WrapDependencyError(err, "pg.Modify")
 	}
 
 	// Once we get here, we know that all of the dependencies were present.
@@ -346,7 +347,7 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 	for _, tid := range mod.Deletes {
 		q := "DELETE FROM tasks WHERE id = $1 AND version = $2"
 		if _, err := tx.ExecContext(ctx, q, tid.ID, tid.Version); err != nil {
-			return nil, nil, fmt.Errorf("delete failed for task %q: %v", tid.ID, err)
+			return nil, nil, maybeWrapPGError(err, "pg.Modify delete %q", tid)
 		}
 	}
 
@@ -363,7 +364,7 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 			RETURNING id, version, queue, at, claimant, value, created, modified
 		`, uuid.New(), 0, ins.Queue, at, mod.Claimant, ins.Value, now, now)
 		if err := row.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Claimant, &t.Value, &t.Created, &t.Modified); err != nil {
-			return nil, nil, fmt.Errorf("insert failed in queue %q: %v", ins.Queue, err)
+			return nil, nil, maybeWrapPGError(err, "pg.Modify scan failed in insert %q", err)
 		}
 		inserted = append(inserted, t)
 	}
@@ -376,7 +377,7 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 			RETURNING id, version, queue, at, claimant, modified, created, value
 		`, now, chg.Queue, chg.At, chg.Value, chg.ID, chg.Version)
 		if err := row.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Claimant, &t.Modified, &t.Created, &t.Value); err != nil {
-			return nil, nil, fmt.Errorf("scan failed for newly-changed task %q: %v", chg.ID, err)
+			return nil, nil, maybeWrapPGError(err, "pg.Modify scan failed in update %q", chg.ID)
 		}
 		changed = append(changed, t)
 	}
@@ -420,29 +421,40 @@ func depQuery(ctx context.Context, tx *sql.Tx, m *entroq.Modification) (map[uuid
 	for id, version := range dependencies {
 		placeholders = append(placeholders, fmt.Sprintf("($%d, $%d)", first, first+1))
 		values = append(values, id, version)
-		first++
+		first += 2
 	}
-	instr := strings.Join(placeholders, ", ")
-	rows, err := tx.QueryContext(ctx,
-		"SELECT id, version, queue, at, claimant, value, created, modified FROM tasks WHERE (id, version) IN ("+instr+") FOR UPDATE",
-		values...)
+	query := `SELECT id, version, queue, at, claimant, value, created, modified FROM tasks
+	          WHERE (id, version) IN (` + strings.Join(placeholders, ", ") + `) FOR UPDATE`
+	rows, err := tx.QueryContext(ctx, query, values...)
 	if err != nil {
-		return nil, fmt.Errorf("error in dependencies query: %v", err)
+		return nil, maybeWrapPGError(err, "pg.depQuery")
 	}
 	defer rows.Close()
 	for rows.Next() {
 		t := new(entroq.Task)
 		if err := rows.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Claimant, &t.Value, &t.Created, &t.Modified); err != nil {
-			return nil, fmt.Errorf("row scan failed: %v", err)
+			return nil, maybeWrapPGError(err, "pg.depQuery")
 		}
 		if foundDeps[t.ID] != nil {
-			return nil, fmt.Errorf("duplicate ID %q found in database (more than one version)", t.ID)
+			return nil, fmt.Errorf("pg.depQuery: duplicate ID %q found in database (more than one version)", t.ID)
 		}
 		foundDeps[t.ID] = t
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error scanning dependencies: %v", err)
+		return nil, maybeWrapPGError(err, "pg.depQuery")
 	}
 
 	return foundDeps, nil
+}
+
+// maybeWrapPGError wraps the PG error in the message given, unless it is a
+// transaction serialization error, in which case it passes out a dependency
+// error.
+func maybeWrapPGError(err error, format string, vals ...interface{}) error {
+	if e, ok := err.(*pq.Error); ok && e.Code == "40001" { // serialization eror
+		return entroq.DependencyError{
+			Message: e.Error(),
+		}
+	}
+	return fmt.Errorf(format+": %v", append(vals, err)...)
 }

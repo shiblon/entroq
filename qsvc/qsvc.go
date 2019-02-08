@@ -95,7 +95,10 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 	}
 	task, err := s.impl.Claim(ctx, req.Queue, time.Duration(req.DurationMs)*time.Millisecond, entroq.ClaimAs(claimant))
 	if err != nil {
-		return nil, status.Errorf(codes.Unknown, "failed to claim: %v", err)
+		if entroq.IsTimeout(err) {
+			return nil, status.Errorf(codes.DeadlineExceeded, "qsvc.Claim")
+		}
+		return nil, status.Errorf(codes.Unknown, "qsvc.Claim: %v", err)
 	}
 	if task == nil {
 		return new(pb.ClaimResponse), nil
@@ -186,12 +189,15 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 				pb.DepType_CLAIM:  depErr.Claims,
 			}
 
-			var details []proto.Message
+			details := []proto.Message{&pb.ModifyDep{
+				Type: pb.DepType_DETAIL,
+				Msg:  depErr.Message,
+			}}
 			for dtype, dvals := range tmap {
 				for _, tid := range dvals {
 					details = append(details, &pb.ModifyDep{
 						Type: dtype,
-						Id:   &pb.TaskID{Id: tid.String(), Version: tid.Version},
+						Id:   &pb.TaskID{Id: tid.ID.String(), Version: tid.Version},
 					})
 				}
 			}

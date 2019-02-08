@@ -6,6 +6,7 @@ package entroq
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -905,6 +906,27 @@ func (m *Modification) DependencyError(found map[uuid.UUID]*Task) error {
 	return nil
 }
 
+// WrapDependencyError adds a message to the given error. If it is a dependency
+// error, the returned error will also be a dependency error. Otherwise the
+// first argument is used to append a message to the result of applying the
+// specified format.
+func WrapDependencyError(err error, format string, vals ...interface{}) error {
+	if e, ok := err.(DependencyError); ok {
+		ne := e.Copy()
+		msg := fmt.Sprintf(format, vals...)
+		if msg != "" {
+			if ne.Message != "" {
+				ne.Message = fmt.Sprintf("%s: %s", msg, ne.Message)
+			} else {
+				ne.Message = msg
+			}
+		}
+		return ne
+		log.Printf("Wrap dep result: %+v", ne)
+	}
+	return fmt.Errorf(format+": %v", append(vals, err)...)
+}
+
 // DependencyError is returned when a dependency is missing when modifying the task store.
 type DependencyError struct {
 	Depends []*TaskID
@@ -912,6 +934,24 @@ type DependencyError struct {
 	Changes []*TaskID
 
 	Claims []*TaskID
+
+	Message string
+}
+
+// Copy produces a new deep copy of this error type.
+func (m DependencyError) Copy() DependencyError {
+	e := DependencyError{
+		Depends: make([]*TaskID, len(m.Depends)),
+		Deletes: make([]*TaskID, len(m.Deletes)),
+		Changes: make([]*TaskID, len(m.Changes)),
+		Claims:  make([]*TaskID, len(m.Claims)),
+		Message: m.Message,
+	}
+	copy(e.Depends, m.Depends)
+	copy(e.Deletes, m.Deletes)
+	copy(e.Changes, m.Changes)
+	copy(e.Claims, m.Claims)
+	return e
 }
 
 // HasMissing indicates whether there was anything missing in this error.
@@ -927,7 +967,7 @@ func (m DependencyError) HasClaims() bool {
 // Error produces a helpful error string indicating what was missing.
 func (m DependencyError) Error() string {
 	lines := []string{
-		"DependencyError:",
+		fmt.Sprintf("DependencyError: %v", m.Message),
 	}
 	if len(m.Depends) > 0 {
 		lines = append(lines, "\tmissing depends:")

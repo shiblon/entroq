@@ -110,6 +110,7 @@ enum DepType {
   DELETE = 1;
   CHANGE = 2;
   DEPEND = 3;
+  DETAIL = 4;
 }
 
 // ModifyDep can be returned with a gRPC NotFound status indicating which
@@ -118,6 +119,7 @@ enum DepType {
 message ModifyDep {
   DepType type = 1;
   TaskID id = 2;
+  string msg = 3; // Usually only used with type=DETAIL.
 }
 
 // TasksRequest is sent to request a complete listing of tasks for the
