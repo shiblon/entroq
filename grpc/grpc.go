@@ -58,8 +58,7 @@ import (
 const DefaultAddr = ":37706"
 
 type backendOptions struct {
-	dialOpts       []grpc.DialOption
-	claimSubscribe bool
+	dialOpts []grpc.DialOption
 }
 
 // Option allows grpc-opener-specific options to be sent in Opener.
@@ -96,19 +95,6 @@ func WithNiladicDialer(f func() (net.Conn, error)) Option {
 	}))
 }
 
-// WithClaimSubscribe instructs the server to hold TryClaim connections open
-// until an event occurs that would return a value. If the request context is
-// canceled before a claimable task arrives, the gRPC status code ABORTED is
-// returned to signal that it can be retried. TryClaim then returns.
-//
-// The Claim method of the entroq client can use that to loop on TryClaim
-// without sleeping in between attempts.
-func WithClaimSubscribe() Option {
-	return func(opts *backendOptions) {
-		opts.claimSubscribe = true
-	}
-}
-
 // Opener creates an opener function to be used to get a gRPC backend. If the
 // address string is empty, it defaults to the DefaultAddr, the default value
 // for the memory-backed gRPC server.
@@ -141,8 +127,6 @@ func Opener(addr string, opts ...Option) entroq.BackendOpener {
 type backend struct {
 	conn *grpc.ClientConn
 	cli  pb.EntroQClient
-
-	claimSubscribe bool
 }
 
 // New creates a new gRPC backend that attaches to the task service via gRPC.
@@ -152,9 +136,8 @@ func New(conn *grpc.ClientConn, opts ...Option) (*backend, error) {
 		opt(options)
 	}
 	return &backend{
-		conn:           conn,
-		cli:            pb.NewEntroQClient(conn),
-		claimSubscribe: options.claimSubscribe,
+		conn: conn,
+		cli:  pb.NewEntroQClient(conn),
 	}, nil
 }
 
@@ -266,8 +249,25 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 	return tasks, nil
 }
 
-// TryClaim attempts to claim a task from the queue. Returns a nil task if there is
-// nothing in the queue (not an error).
+// Claim attempts to claim a task and blocks until one is ready or the
+// operation is canceled.
+func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
+	resp, err := b.cli.Claim(ctx, &pb.ClaimRequest{
+		ClaimantId: cq.Claimant.String(),
+		Queue:      cq.Queue,
+		DurationMs: int64(cq.Duration / time.Millisecond),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if resp.Task == nil {
+		return nil, status.Errorf(codes.Internal, "No task returned from backend Claim")
+	}
+	return fromTaskProto(resp.Task)
+}
+
+// TryClaim attempts to claim a task from the queue. Normally returns both a
+// nil task and error if nothing is ready.
 func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
 	resp, err := b.cli.TryClaim(ctx, &pb.ClaimRequest{
 		ClaimantId: cq.Claimant.String(),
@@ -275,7 +275,7 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 		DurationMs: int64(cq.Duration / time.Millisecond),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("claim failed over gRPC: %v", err)
+		return nil, err // Do not wrap - gRPC/context status preservation is important.
 	}
 	if resp.Task == nil {
 		return nil, nil

@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"log"
 	"net"
 	"strings"
 	"testing"
@@ -14,8 +13,11 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/qsvc"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
 	pb "github.com/shiblon/entroq/proto"
@@ -42,6 +44,77 @@ func StartService(ctx context.Context, opener entroq.BackendOpener) (*grpc.Serve
 	return s, lis.Dial, nil
 }
 
+// SimpleWorker tests basic worker functionality while tasks are coming in and
+// being waited on.
+func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ) {
+	t.Helper()
+
+	const queue = "/test/simple_worker"
+
+	w := client.NewWorker(queue)
+
+	var consumed []*entroq.Task
+	ctx, cancel := context.WithCancel(ctx)
+
+	g, ctx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		for w.Next(ctx) {
+			if _, _, err := w.DoModify(func(ctx context.Context) ([]entroq.ModifyArg, error) {
+				consumed = append(consumed, w.Task())
+				return []entroq.ModifyArg{w.Task().AsDeletion()}, nil
+			}); err != nil {
+				return fmt.Errorf("worker loop error: %v", err)
+			}
+		}
+		return w.Err()
+	})
+
+	select {
+	case <-time.After(2 * time.Second):
+	case <-ctx.Done():
+		t.Fatalf("Sleep: %v", ctx.Err())
+	}
+
+	var inserted []*entroq.Task
+	for i := 0; i < 10; i++ {
+		ins, _, err := client.Modify(ctx, entroq.InsertingInto(queue))
+		if err != nil {
+			t.Fatalf("Failed to insert task: %v", err)
+		}
+		inserted = append(inserted, ins...)
+		select {
+		case <-time.After(1 * time.Second):
+		case <-ctx.Done():
+			t.Fatalf("Canceled while inserting: %v", ctx.Err())
+		}
+	}
+
+	for {
+		empty, err := client.QueuesEmpty(ctx, entroq.MatchExact(queue))
+		if err != nil {
+			t.Fatalf("Error checking for empty queue: %v", err)
+		}
+		if empty {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("Context error waiting for queues to empty: %v", err)
+		case <-time.After(2 * time.Second):
+		}
+	}
+
+	cancel()
+	if err := g.Wait(); err != nil && status.Code(err) != codes.Canceled {
+		t.Fatalf("Worker exit error: %v", err)
+	}
+
+	if diff := EqualAllTasksVersionIncr(inserted, consumed, 1); diff != "" {
+		t.Errorf("Tasks inserted not the same as tasks consumed:\n%v", diff)
+	}
+}
+
 // SimpleSequence tests some basic functionality of a task manager, over gRPC.
 func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ) {
 	t.Helper()
@@ -52,11 +125,11 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ) {
 		select {
 		case <-time.After(d):
 		case <-ctx.Done():
-			log.Fatalf("Context canceled")
+			t.Fatalf("Context canceled: %v", ctx.Err())
 		}
 	}
 
-	const queue = "/test/TryClaim"
+	const queue = "/test/simple_sequence"
 
 	// Claim from empty queue.
 	task, err := client.TryClaim(ctx, queue, 100*time.Millisecond)
@@ -200,7 +273,7 @@ func EqualAllTasksVersionIncr(want, got []*entroq.Task, versionBump int) string 
 	return ""
 }
 
-// Checks for task equality, ignoring ID, Version, and all time fields.
+// Checks for task equality, ignoring Version and all time fields.
 func EqualTasks(want, got *entroq.Task) string {
 	return EqualAllTasks([]*entroq.Task{want}, []*entroq.Task{got})
 }

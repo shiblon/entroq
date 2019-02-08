@@ -69,23 +69,15 @@ message ClaimRequest {
 
   // The duration of the claim, if/once successful.
   int64 duration_ms = 3;
-
-  // If set, the server is asked to hold the connection open until a task is
-  // available, or until the context expired, whichever comes first. IF the
-  // context expires, the ABORTED status code is returned, indicating that a
-  // retry can safely occur.
-  bool wait = 4;
 }
 
 // ClaimResponse is returned when a claim is fulfilled or becomes obviously impossible.
 //
-// If "wait" is *not* specified in the request, and no task is available, the
-// task will be empty and the status code sent to the client will be OK.
+// For TryClaim calls, if no task is available, the task will be empty and the
+// status code sent to the client will be OK.
 //
-// If "wait" is specified and the request times out, the ABORTED status code
-// is sent back to the client, retrievable from the language-specific error or
-// exception. That code signals that the client can retry immediately without
-// sleeping first.
+// For Claim calls, the lack of a task is an error, usually a timeout or
+// cancelation.
 message ClaimResponse {
   Task task = 1;
 }
@@ -158,6 +150,7 @@ message QueuesResponse {
 // EntroQ is a service that allows for access to a task queue.
 service EntroQ {
   rpc TryClaim(ClaimRequest) returns (ClaimResponse);
+  rpc Claim(ClaimRequest) returns (ClaimResponse);
   rpc Modify(ModifyRequest) returns (ModifyResponse);
   rpc Tasks(TasksRequest) returns (TasksResponse);
   rpc Queues(QueuesRequest) returns (QueuesResponse);

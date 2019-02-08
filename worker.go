@@ -14,30 +14,27 @@ import (
 // their own worker instance.
 //
 // Example:
-//   w := NewWorker(client, "queue_name")
-//   for w.Next(ctx) {
-//     task, err := w.Do(func(ctx context.Context) error {
-//     	 // The claimed task is held in w.Task(), and its value will not change
-//     	 // while this function runs. The final renewed task is returned from Do.
-//       log.Printf("Task value:\n%s", string(w.Task().Value))
+//	w := NewWorker("queue_name")
+//	for w.Next(ctx) {
+//		if _, _, err := w.DoModify(func(ctx context.Context) ([]ModifyArg, error) {
+//			// The claimed task is held in w.Task(), and its value will not change
+//			// while this function runs. The final renewed task is returned from Do.
+//			log.Printf("Task value:\n%s", string(w.Task().Value))
 //
-//     	 // ...do work on w.Task() that might take a while...
-//     })
-//     if err = nil {
-//       log.Printf("Error for claimed task: %v", err)
-//       continue
-//     }
+//			// ...do work on w.Task() that might take a while...
 //
-//     // Potentially do something with the returned (potentially renewed) task
-//     // value, e.g., delete it because it's finished:
-//     if _, _, err := client.Modify(ctx, task.AsDeletion()); err != nil {
-//       log.Printf("Error deleting final task: %v", err)
-//       continue
-//     }
-//   }
-//   if err := w.Err(); err != nil {
-//     log.Fatalf("Error running worker: %v", err)
-//   }
+//			// Here we specify that the current claimed task be deleted (this is safe,
+//			// versions are updated automatically to renewed values).
+//			return []ModifyArg{
+//				task.AsDeletion(),
+//			}, nil
+//		}); err != nil {
+//			log.Printf("Error for claimed task: %v", err)
+//		}
+//	}
+//	if err := w.Err(); err != nil {
+//		log.Fatalf("Error running worker: %v", err)
+//	}
 type Worker struct {
 	// Q is the queue to claim work from in an endless loop.
 	Q   string
@@ -46,7 +43,6 @@ type Worker struct {
 	renewInterval time.Duration
 	leaseTime     time.Duration
 	taskTimeout   time.Duration
-	done          chan struct{}
 
 	// Iterator states.
 	claimCtx    context.Context
@@ -63,30 +59,12 @@ func (c *EntroQ) NewWorker(q string, opts ...WorkerOption) *Worker {
 		Q:             q,
 		eqc:           c,
 		renewInterval: 15 * time.Second,
-		done:          make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(w)
 	}
 	w.leaseTime = 2 * w.renewInterval
 	return w
-}
-
-// Stop causes the loop to terminate on the next call to Next.
-func (w *Worker) Stop() {
-	w.Lock()
-	defer w.Unlock()
-
-	if w.done == nil {
-		return
-	}
-	// Done first, then cancel, so the done situation is easily detected.
-	close(w.done)
-	w.claimCancel()
-
-	w.done = nil
-	w.claimCtx = nil
-	w.claimCancel = nil
 }
 
 // Err returns the most recent error encountered when doing work for a task.
@@ -99,8 +77,6 @@ func (w *Worker) Err() error {
 // Next attempts to get ready for a new claim.
 func (w *Worker) Next(ctx context.Context) bool {
 	select {
-	case <-w.done:
-		return false
 	case <-ctx.Done():
 		w.err = ctx.Err()
 		return false
@@ -119,11 +95,8 @@ func (w *Worker) Next(ctx context.Context) bool {
 	w.task, w.err = task, err
 	if err != nil {
 		if IsCanceled(w.err) {
-			if w.done == nil {
-				w.err = nil
-			}
+			w.err = nil
 		}
-		// If we hit "done" first, then there is no error.
 		return false
 	}
 	return true
