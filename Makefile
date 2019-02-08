@@ -46,7 +46,7 @@ build: build-proto
 
 .PHONY: test
 test:
-	go test -race -v ./...
+	go test -timeout 20m -race -v ./...
 
 .PHONY: install
 install:

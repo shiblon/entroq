@@ -17,73 +17,14 @@ import (
 	"github.com/shiblon/entroq/mem"
 )
 
-func TestMapReduce_inMemorySmall(t *testing.T) {
-	ctx := context.Background()
-
-	eq, err := entroq.New(ctx, mem.Opener())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer eq.Close()
-
-	mr := NewMapReduce(eq, "/mrtest",
-		WithNumMappers(2),
-		WithNumReducers(1),
-		WithMap(WordCountMapper),
-		WithReduce(NilReducer),
-		AddInput(NewKV(nil, []byte("word1 word2 word3 word4"))),
-		AddInput(NewKV(nil, []byte("word1 word3 word5 word7"))),
-		AddInput(NewKV(nil, []byte("word1 word4 word7 wordA"))),
-		AddInput(NewKV(nil, []byte("word1 word5 word9 wordE"))))
-
-	outQ, err := mr.Run(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	tasks, err := eq.Tasks(ctx, outQ)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	expected := []*KV{
-		NewKV([]byte("word1"), nil),
-		NewKV([]byte("word2"), nil),
-		NewKV([]byte("word3"), nil),
-		NewKV([]byte("word4"), nil),
-		NewKV([]byte("word5"), nil),
-		NewKV([]byte("word7"), nil),
-		NewKV([]byte("word9"), nil),
-		NewKV([]byte("wordA"), nil),
-		NewKV([]byte("wordE"), nil),
-	}
-
-	if len(tasks) != 1 {
-		t.Fatalf("Expected 1 final reduced output task, got %d", len(tasks))
-	}
-
-	task := tasks[0]
-
-	var kvs []*KV
-	if err := json.Unmarshal(task.Value, &kvs); err != nil {
-		t.Fatal(err)
-	}
-
-	for i, kv := range kvs {
-		if kv.String() != expected[i].String() {
-			t.Errorf("Expected %s, got %s", expected[i], kv)
-		}
-	}
-}
-
-// mrCheck is a check function that runs a mapreduce using the specified number of mappers and reducers.
+// MRCheck is a check function that runs a mapreduce using the specified number of mappers and reducers.
 //
 // Creates a bunch of documents, filled with numeric strings (words are all
 // numbers, makes things easy). We start with a known histogram, then we
 // assemble documents by randomly drawing without replacement until the
 // distribution is empty. That way we know our outputs from the beginning,
 // and we get a random starting point.
-func mrCheck(numMappers, numReducers int) bool {
+func MRCheck(numMappers, numReducers int) bool {
 	const (
 		uniqueWords = 200
 		wordsPerDoc = 1000
@@ -199,44 +140,75 @@ func mrCheck(numMappers, numReducers int) bool {
 	return true
 }
 
-func TestMapReduce_checkSmall(t *testing.T) {
-	config := &quick.Config{
-		MaxCount: 10,
-		Values: func(values []reflect.Value, rand *rand.Rand) {
-			values[0] = reflect.ValueOf(rand.Intn(20) + 1)
-			values[1] = reflect.ValueOf(rand.Intn(5) + 1)
-		},
-	}
+func TestMapReduce_inMemorySmall(t *testing.T) {
+	ctx := context.Background()
 
-	if err := quick.Check(mrCheck, config); err != nil {
+	eq, err := entroq.New(ctx, mem.Opener())
+	if err != nil {
 		t.Fatal(err)
 	}
-}
+	defer eq.Close()
 
-func TestMapReduce_checkMedium(t *testing.T) {
-	config := &quick.Config{
-		MaxCount: 8,
-		Values: func(values []reflect.Value, rand *rand.Rand) {
-			values[0] = reflect.ValueOf(rand.Intn(50) + 1)
-			values[1] = reflect.ValueOf(rand.Intn(10) + 1)
-		},
+	mr := NewMapReduce(eq, "/mrtest",
+		WithNumMappers(2),
+		WithNumReducers(1),
+		WithMap(WordCountMapper),
+		WithReduce(NilReducer),
+		AddInput(NewKV(nil, []byte("word1 word2 word3 word4"))),
+		AddInput(NewKV(nil, []byte("word1 word3 word5 word7"))),
+		AddInput(NewKV(nil, []byte("word1 word4 word7 wordA"))),
+		AddInput(NewKV(nil, []byte("word1 word5 word9 wordE"))))
+
+	outQ, err := mr.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	if err := quick.Check(mrCheck, config); err != nil {
+	tasks, err := eq.Tasks(ctx, outQ)
+	if err != nil {
 		t.Fatal(err)
+	}
+
+	expected := []*KV{
+		NewKV([]byte("word1"), nil),
+		NewKV([]byte("word2"), nil),
+		NewKV([]byte("word3"), nil),
+		NewKV([]byte("word4"), nil),
+		NewKV([]byte("word5"), nil),
+		NewKV([]byte("word7"), nil),
+		NewKV([]byte("word9"), nil),
+		NewKV([]byte("wordA"), nil),
+		NewKV([]byte("wordE"), nil),
+	}
+
+	if len(tasks) != 1 {
+		t.Fatalf("Expected 1 final reduced output task, got %d", len(tasks))
+	}
+
+	task := tasks[0]
+
+	var kvs []*KV
+	if err := json.Unmarshal(task.Value, &kvs); err != nil {
+		t.Fatal(err)
+	}
+
+	for i, kv := range kvs {
+		if kv.String() != expected[i].String() {
+			t.Errorf("Expected %s, got %s", expected[i], kv)
+		}
 	}
 }
 
 func TestMapReduce_checkLarge(t *testing.T) {
 	config := &quick.Config{
-		MaxCount: 3,
+		MaxCount: 5,
 		Values: func(values []reflect.Value, rand *rand.Rand) {
-			values[0] = reflect.ValueOf(rand.Intn(200) + 1)
-			values[1] = reflect.ValueOf(rand.Intn(50) + 1)
+			values[0] = reflect.ValueOf(rand.Intn(100) + 1)
+			values[1] = reflect.ValueOf(rand.Intn(20) + 1)
 		},
 	}
 
-	if err := quick.Check(mrCheck, config); err != nil {
+	if err := quick.Check(MRCheck, config); err != nil {
 		t.Fatal(err)
 	}
 }
