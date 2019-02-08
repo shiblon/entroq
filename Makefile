@@ -46,7 +46,7 @@ build: genproto
 
 .PHONY: test
 test:
-	go test -timeout 20m -race -v ./...
+	go test -count 1 -timeout 20m -race -v ./...
 
 .PHONY: install
 install:

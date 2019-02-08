@@ -177,7 +177,8 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 	}
 	inserted, changed, err := s.impl.Modify(ctx, modArgs...)
 	if err != nil {
-		if depErr, ok := err.(*entroq.DependencyError); ok {
+		if entroq.IsDependency(err) {
+			depErr := err.(entroq.DependencyError)
 			tmap := map[pb.DepType][]*entroq.TaskID{
 				pb.DepType_DEPEND: depErr.Depends,
 				pb.DepType_DELETE: depErr.Deletes,

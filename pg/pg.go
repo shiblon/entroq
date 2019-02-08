@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/subq"
 )
 
 func escp(p string) string {
@@ -63,9 +64,13 @@ func WithConnectAttempts(num int) PGOpt {
 	}
 }
 
-// WithNotifyWaiter instructs this backend to use the given NotifyWaiter to
-// attempt to wake up blocking claims instantly when tasks are inserted into a
-// queue they are waiting on.
+// WithNotifyWaiter instructs this backend to use the given NotifyWaiter
+// (instead of its own). This can be useful if there are several interdependent
+// postgres backends in the same process space - they can use the same
+// notification mechanism.
+//
+// Can be set to nil to disable internal claim/modify wait/notify and revert to
+// claim poll/sleep.
 func WithNotifyWaiter(nw entroq.NotifyWaiter) PGOpt {
 	return func(opts *pgOptions) {
 		opts.nw = nw
@@ -80,6 +85,7 @@ func Opener(hostPort string, opts ...PGOpt) entroq.BackendOpener {
 		user:     "postgres",
 		password: "password",
 		attempts: 1,
+		nw:       subq.New(),
 	}
 	for _, o := range opts {
 		o(options)
