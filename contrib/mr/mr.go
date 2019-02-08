@@ -24,6 +24,7 @@ import (
 const (
 	claimDuration = time.Minute
 	claimWait     = 5 * time.Second
+	shuffleWait   = 5 * time.Second
 )
 
 // Fingerprint64 produces a 64-bit unsigned integer from a byte string.
@@ -268,7 +269,7 @@ func (w *MapWorker) Run(ctx context.Context) error {
 			return nil // all finished.
 		}
 
-		claimCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		claimCtx, cancel := context.WithTimeout(ctx, claimWait)
 		defer cancel()
 
 		task, err := w.client.Claim(claimCtx, w.InputQueue, claimDuration)
@@ -577,7 +578,7 @@ func (w *ReduceWorker) Run(ctx context.Context) error {
 			select {
 			case <-ctx.Done():
 				return fmt.Errorf("context canceled while shuffling")
-			case <-time.After(5 * time.Second):
+			case <-time.After(shuffleWait):
 				log.Printf("Reducer %q trying again", w.Name)
 			}
 			continue
@@ -593,7 +594,7 @@ func (w *ReduceWorker) Run(ctx context.Context) error {
 	log.Printf("Reducer %q merge finished. Reducing.", w.Name)
 
 	// Then, reduce over the final merged task.
-	claimCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	claimCtx, cancel := context.WithTimeout(ctx, claimWait)
 	defer cancel()
 
 	task, err := w.client.Claim(claimCtx, w.InputQueue, claimDuration)
