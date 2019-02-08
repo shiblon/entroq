@@ -2,7 +2,6 @@ package entroq
 
 import (
 	"context"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -48,8 +47,6 @@ type Worker struct {
 	claimCtx context.Context
 	task     *Task
 	err      error
-
-	closeOnce sync.Once
 }
 
 // NewWorker creates a new worker iterator-like type that makes it easy to claim and operate on tasks in a loop.
