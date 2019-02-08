@@ -318,7 +318,32 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 
 // Modify attempts to apply an atomic modification to the task store. Either
 // all succeeds or all fails.
-func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserted []*entroq.Task, changed []*entroq.Task, err error) {
+func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserted, changed []*entroq.Task, err error) {
+	for i := 0; i < 5; i++ {
+		inserted, changed, err = b.modify(ctx, mod)
+		// No error - we're done!
+		if err == nil {
+			return inserted, changed, nil
+		}
+		// If it's not a dependency error, no retry.
+		if !entroq.IsDependency(err) {
+			return nil, nil, fmt.Errorf("pg.Modify: %v", err)
+		}
+		// If the cause of the dependency issue is known, we just return it.
+		if !err.(entroq.DependencyError).IsUnknown() {
+			return nil, nil, entroq.WrapDependencyError(err, "pg.Modify")
+		}
+		select {
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+	return nil, nil, entroq.WrapDependencyError(err, "pg.Modify retry limit")
+}
+
+// modify is a private helper to allow for transaction retries when serialization is violated.
+func (b *backend) modify(ctx context.Context, mod *entroq.Modification) (inserted, changed []*entroq.Task, err error) {
 	now := time.Now()
 	tx, err := b.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
@@ -334,11 +359,11 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 
 	foundDeps, err := depQuery(ctx, tx, mod)
 	if err != nil {
-		return nil, nil, entroq.WrapDependencyError(err, "pg.Modify")
+		return nil, nil, entroq.WrapDependencyError(err, "pg.modify")
 	}
 
 	if err := mod.DependencyError(foundDeps); err != nil {
-		return nil, nil, entroq.WrapDependencyError(err, "pg.Modify")
+		return nil, nil, entroq.WrapDependencyError(err, "pg.modify")
 	}
 
 	// Once we get here, we know that all of the dependencies were present.
@@ -347,7 +372,7 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 	for _, tid := range mod.Deletes {
 		q := "DELETE FROM tasks WHERE id = $1 AND version = $2"
 		if _, err := tx.ExecContext(ctx, q, tid.ID, tid.Version); err != nil {
-			return nil, nil, maybeWrapPGError(err, "pg.Modify delete %q", tid)
+			return nil, nil, wrapPGError(err, "pg.modify delete %q", tid)
 		}
 	}
 
@@ -364,7 +389,7 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 			RETURNING id, version, queue, at, claimant, value, created, modified
 		`, uuid.New(), 0, ins.Queue, at, mod.Claimant, ins.Value, now, now)
 		if err := row.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Claimant, &t.Value, &t.Created, &t.Modified); err != nil {
-			return nil, nil, maybeWrapPGError(err, "pg.Modify scan failed in insert %q", err)
+			return nil, nil, wrapPGError(err, "pg.modify scan failed in insert %q", err)
 		}
 		inserted = append(inserted, t)
 	}
@@ -377,7 +402,7 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 			RETURNING id, version, queue, at, claimant, modified, created, value
 		`, now, chg.Queue, chg.At, chg.Value, chg.ID, chg.Version)
 		if err := row.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Claimant, &t.Modified, &t.Created, &t.Value); err != nil {
-			return nil, nil, maybeWrapPGError(err, "pg.Modify scan failed in update %q", chg.ID)
+			return nil, nil, wrapPGError(err, "pg.modify scan failed in update %q", chg.ID)
 		}
 		changed = append(changed, t)
 	}
@@ -427,13 +452,13 @@ func depQuery(ctx context.Context, tx *sql.Tx, m *entroq.Modification) (map[uuid
 	          WHERE (id, version) IN (` + strings.Join(placeholders, ", ") + `) FOR UPDATE`
 	rows, err := tx.QueryContext(ctx, query, values...)
 	if err != nil {
-		return nil, maybeWrapPGError(err, "pg.depQuery")
+		return nil, wrapPGError(err, "pg.depQuery")
 	}
 	defer rows.Close()
 	for rows.Next() {
 		t := new(entroq.Task)
 		if err := rows.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Claimant, &t.Value, &t.Created, &t.Modified); err != nil {
-			return nil, maybeWrapPGError(err, "pg.depQuery")
+			return nil, wrapPGError(err, "pg.depQuery")
 		}
 		if foundDeps[t.ID] != nil {
 			return nil, fmt.Errorf("pg.depQuery: duplicate ID %q found in database (more than one version)", t.ID)
@@ -441,16 +466,16 @@ func depQuery(ctx context.Context, tx *sql.Tx, m *entroq.Modification) (map[uuid
 		foundDeps[t.ID] = t
 	}
 	if err := rows.Err(); err != nil {
-		return nil, maybeWrapPGError(err, "pg.depQuery")
+		return nil, wrapPGError(err, "pg.depQuery")
 	}
 
 	return foundDeps, nil
 }
 
-// maybeWrapPGError wraps the PG error in the message given, unless it is a
+// wrapPGError wraps the PG error in the message given, unless it is a
 // transaction serialization error, in which case it passes out a dependency
 // error.
-func maybeWrapPGError(err error, format string, vals ...interface{}) error {
+func wrapPGError(err error, format string, vals ...interface{}) error {
 	if e, ok := err.(*pq.Error); ok && e.Code == "40001" { // serialization eror
 		return entroq.DependencyError{
 			Message: e.Error(),

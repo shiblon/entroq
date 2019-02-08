@@ -964,6 +964,15 @@ func (m DependencyError) HasClaims() bool {
 	return len(m.Claims) > 0
 }
 
+// IsUnknown indicates whether this is an "empty" dependency error, which indicates
+// that a transaction failed at the storage level, so we don't have
+// fine-grained information about which specific task IDs were involved. This
+// can be used to determine whether a transaction retry is appropriate when a
+// serialization error occurs, for example.
+func (m DependencyError) IsUnknown() bool {
+	return !m.HasMissing() && !m.HasClaims()
+}
+
 // Error produces a helpful error string indicating what was missing.
 func (m DependencyError) Error() string {
 	lines := []string{
