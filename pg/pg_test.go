@@ -95,10 +95,10 @@ func TestMapReduce_checkSmall(t *testing.T) {
 	defer stop()
 
 	config := &quick.Config{
-		MaxCount: 2,
+		MaxCount: 3,
 		Values: func(values []reflect.Value, rand *rand.Rand) {
-			values[0] = reflect.ValueOf(rand.Intn(100) + 100)
-			values[1] = reflect.ValueOf(rand.Intn(20) + 1)
+			values[0] = reflect.ValueOf(rand.Intn(200) + 100)
+			values[1] = reflect.ValueOf(rand.Intn(20) + 10)
 			values[2] = reflect.ValueOf(rand.Intn(4) + 1)
 		},
 	}
