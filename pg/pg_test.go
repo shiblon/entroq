@@ -11,9 +11,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/shiblon/entroq"
 	grpcbackend "github.com/shiblon/entroq/grpc"
 	"github.com/shiblon/entroq/qsvc/qtest"
+	"github.com/shiblon/entroq/subq"
 	"golang.org/x/sync/errgroup"
 
 	_ "github.com/lib/pq"
@@ -59,7 +61,7 @@ func run(ctx context.Context, name string, args ...string) error {
 // startPostgres starts up a postgres docker. Use the stop function to stop it.
 func startPostgres(ctx context.Context) (port int, stop func(), err error) {
 	// Run detached. Check error. Detaches only once Postgres is downloaded and initialized.
-	name := fmt.Sprintf("testpg-%d", os.Getpid())
+	name := fmt.Sprintf("testpg-%s", uuid.New())
 	log.Printf("Starting postgres container %q...", name)
 	if err := run(ctx, "docker", "run", "-p", "0:5432", "-d", "--name", name, "postgres"); err != nil {
 		return 0, nil, fmt.Errorf("start postgres container: %v", err)
@@ -106,11 +108,15 @@ func TestSimpleSequence(t *testing.T) {
 
 	pgHostPort := fmt.Sprintf("localhost:%v", pgPort)
 
+	sq := subq.New()
+
 	server, dial, err := qtest.StartService(ctx, Opener(pgHostPort,
 		WithDB("postgres"),
 		WithUsername("postgres"),
 		WithPassword("password"),
-		WithConnectAttempts(3)))
+		WithConnectAttempts(3),
+		WithNotifyWaiter(sq),
+	))
 	if err != nil {
 		t.Fatalf("Could not start service: %v", err)
 	}
@@ -125,4 +131,40 @@ func TestSimpleSequence(t *testing.T) {
 	defer client.Close()
 
 	qtest.SimpleSequence(ctx, t, client)
+}
+
+func TestSimpleWorker(t *testing.T) {
+	ctx := context.Background()
+
+	pgPort, pgStop, err := startPostgres(ctx)
+	if err != nil {
+		t.Fatalf("postgres: %v", err)
+	}
+	defer pgStop()
+
+	pgHostPort := fmt.Sprintf("localhost:%v", pgPort)
+
+	sq := subq.New()
+
+	server, dial, err := qtest.StartService(ctx, Opener(pgHostPort,
+		WithDB("postgres"),
+		WithUsername("postgres"),
+		WithPassword("password"),
+		WithConnectAttempts(3),
+		WithNotifyWaiter(sq),
+	))
+	if err != nil {
+		t.Fatalf("Could not start service: %v", err)
+	}
+	defer server.Stop()
+
+	client, err := entroq.New(ctx, grpcbackend.Opener("bufnet",
+		grpcbackend.WithNiladicDialer(dial),
+		grpcbackend.WithInsecure()))
+	if err != nil {
+		t.Fatalf("Open client: %v", err)
+	}
+	defer client.Close()
+
+	qtest.SimpleWorker(ctx, t, client)
 }

@@ -35,7 +35,6 @@ package qsvc
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/golang/protobuf/proto"
@@ -45,51 +44,21 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/shiblon/entroq/proto"
-	"github.com/shiblon/entroq/subq"
 )
 
 // QSvc is an EntroQServer.
 type QSvc struct {
-	sync.Mutex
-
 	impl *entroq.EntroQ
-
-	// Keep track of in-memory consumers waiting on a change to a queue that
-	// could unblock them.
-	subQ *subq.SubQ
 }
-
-func lock(mu sync.Locker) sync.Locker {
-	mu.Lock()
-	return mu
-}
-
-func un(mu sync.Locker) {
-	mu.Unlock()
-}
-
-type svcOptions struct {
-}
-
-// QSvcOpt sets an option for the queue service.
-type QSvcOpt func(opts *svcOptions)
 
 // New creates a new service that exposes gRPC endpoints for task queue access.
-func New(ctx context.Context, opener entroq.BackendOpener, opts ...QSvcOpt) (svc *QSvc, err error) {
-	options := new(svcOptions)
-	for _, o := range opts {
-		o(options)
-	}
-
-	svc = &QSvc{
-		subQ: subq.New(),
-	}
-
-	if svc.impl, err = entroq.New(ctx, opener); err != nil {
+func New(ctx context.Context, opener entroq.BackendOpener) (*QSvc, error) {
+	impl, err := entroq.New(ctx, opener)
+	if err != nil {
 		return nil, fmt.Errorf("qsvc backend client: %v", err)
 	}
 
-	return svc, nil
+	return &QSvc{impl: impl}, nil
 }
 
 // Close closes the backend connections and flushes the connection free.
@@ -229,28 +198,13 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 		}
 		return nil, status.Errorf(codes.Unknown, "modification failed: %v", err)
 	}
-	// Signal the queues for these tasks. Queues may be repeated, which will
-	// allow multiple listeners to unblock if there are, for example, multiple
-	// tasks on the same queue that are suddenly available do to actions here.
-	signalQueues := make(map[uuid.UUID]string)
-	now := time.Now()
-
-	// Also assemble the response.
+	// Assemble the response.
 	resp := new(pb.ModifyResponse)
 	for _, task := range inserted {
-		if task.At.After(now) {
-			signalQueues[task.ID] = task.Queue
-		}
 		resp.Inserted = append(resp.Inserted, protoFromTask(task))
 	}
 	for _, task := range changed {
-		if task.At.After(now) {
-			signalQueues[task.ID] = task.Queue
-		}
 		resp.Changed = append(resp.Changed, protoFromTask(task))
-	}
-	for _, q := range signalQueues {
-		s.subQ.Notify(q)
 	}
 	return resp, nil
 }

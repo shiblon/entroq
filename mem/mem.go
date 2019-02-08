@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/subq"
 )
 
 type hItem struct {
@@ -63,6 +64,8 @@ func Opener() entroq.BackendOpener {
 type backend struct {
 	sync.Mutex
 
+	nw entroq.NotifyWaiter
+
 	heaps map[string]*taskHeap
 	byID  map[uuid.UUID]*hItem
 }
@@ -85,6 +88,7 @@ func New(ctx context.Context) *backend {
 	return &backend{
 		heaps: make(map[string]*taskHeap),
 		byID:  make(map[uuid.UUID]*hItem),
+		nw:    subq.New(),
 	}
 }
 
@@ -227,7 +231,7 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 // Claim attempts to claim a task from the queue, blocking until one is
 // available or the operation is canceled.
 func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
-	return entroq.PollTryClaim(ctx, cq, b.TryClaim)
+	return entroq.WaitTryClaim(ctx, cq, b.TryClaim, b.nw)
 }
 
 // TryClaim attempts to claim a task from a queue.
@@ -253,7 +257,7 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 
 	heap.Fix(h, 0)
 
-	return top, nil
+	return top.Copy(), nil
 }
 
 // Modify attempts to modify a batch of tasks in the queue system.
@@ -304,6 +308,8 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 		b.replaceUnsafe(chg.ID, newTask)
 		changed = append(changed, newTask)
 	}
+
+	entroq.NotifyModified(b.nw, inserted, changed)
 
 	return inserted, changed, nil
 }

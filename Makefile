@@ -46,7 +46,7 @@ build: build-proto
 
 .PHONY: test
 test:
-	go test -v ./...
+	go test -race -v ./...
 
 .PHONY: install
 install:
