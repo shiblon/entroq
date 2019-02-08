@@ -46,7 +46,9 @@ build: genproto
 
 .PHONY: test
 test:
-	go test -count 1 -timeout 20m -race -v ./...
+	# Uncomment if you want the test cache ignored.
+	#go test -count 1 -timeout 20m -race -v ./...
+	go test -timeout 20m -race -v ./...
 
 .PHONY: install
 install:

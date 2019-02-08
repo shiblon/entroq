@@ -85,6 +85,7 @@ func MRCheck(ctx context.Context, eq *entroq.EntroQ, numDocs, numMappers, numRed
 		WithNumReducers(numReducers),
 		WithMap(WordCountMapper),
 		WithReduce(SumReducer),
+		WithEarlyReduce(SumReducer),
 		AddInput(docs...))
 
 	outQ, err := mr.Run(ctx)

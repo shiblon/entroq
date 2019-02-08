@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/shiblon/entroq"
@@ -92,9 +93,7 @@ func (e *CollectingMapEmitter) AsModifyArgs(qPrefix string, additional ...entroq
 		if len(kvs) == 0 {
 			continue
 		}
-		sort.Slice(kvs, func(i, j int) bool {
-			return bytes.Compare(kvs[i].Key, kvs[j].Key) < 0
-		})
+		sort.Sort(byKey(kvs))
 		value, err := json.Marshal(kvs)
 		if err != nil {
 			return nil, fmt.Errorf("emit to modify args: %v", err)
@@ -103,6 +102,92 @@ func (e *CollectingMapEmitter) AsModifyArgs(qPrefix string, additional ...entroq
 		args = append(args, entroq.InsertingInto(queue, entroq.WithValue(value)))
 	}
 	return append(args, additional...), nil
+}
+
+// reducingProxyMapEmitter collects its inputs and periodically runs an early
+// reducer over them before sending the reduced results to the target emitter.
+type reducingProxyMapEmitter struct {
+	sync.Mutex
+
+	target MapEmitter
+	reduce Reducer
+
+	collection []*KV
+	emitCtx    context.Context // needed in AsModifyArgs for final Emit call.
+}
+
+// newReducingProxyMapEmitter creates a new emitter that reduces over its
+// inputs and emits them to a target emitter. Used for early reducing in mapper
+// operations.
+func newReducingProxyMapEmitter(target MapEmitter, reduce Reducer) *reducingProxyMapEmitter {
+	return &reducingProxyMapEmitter{
+		target: target,
+		reduce: reduce,
+	}
+}
+
+// reduceAndEmit performs the reduce and emit operation.
+func (e *reducingProxyMapEmitter) reduceAndEmit(ctx context.Context, threshold int) error {
+	var (
+		kvs  []*KV
+		err  error
+		bail bool
+	)
+	func() {
+		e.Lock()
+		defer e.Unlock()
+
+		if len(e.collection) < threshold {
+			bail = true
+			return
+		}
+
+		sort.Sort(byKey(e.collection))
+
+		kvs, err = reduceSortedKVs(ctx, e.reduce, e.collection)
+		if err != nil {
+			err = fmt.Errorf("reducingProxyMapEmitter.reduceUnsafe: %v", err)
+		}
+	}()
+
+	if bail {
+		return nil
+	}
+
+	for _, kv := range kvs {
+		if err := e.target.Emit(ctx, kv.Key, kv.Value); err != nil {
+			return fmt.Errorf("reducingProxyMapEmitter.Emit: %v", err)
+		}
+	}
+
+	e.Lock()
+	defer e.Unlock()
+
+	e.collection = kvs
+	return nil
+}
+
+// Emit collects values for a while, sorts them, reduces them, and sends them
+// to the target emitter.
+func (e *reducingProxyMapEmitter) Emit(ctx context.Context, key, value []byte) error {
+	func() {
+		e.Lock()
+		defer e.Unlock()
+
+		e.emitCtx = ctx
+		e.collection = append(e.collection, NewKV(key, value))
+	}()
+
+	return e.reduceAndEmit(ctx, 100)
+}
+
+// AsModifyArgs creates task insertions. This one simply forwards to the target
+// implementation.
+func (e *reducingProxyMapEmitter) AsModifyArgs(prefix string, additional ...entroq.ModifyArg) ([]entroq.ModifyArg, error) {
+	if err := e.reduceAndEmit(e.emitCtx, 1); err != nil {
+		return nil, fmt.Errorf("reducingProxyMapEmitter.AsModifyArgs: %v", err)
+	}
+	return e.target.AsModifyArgs(prefix, additional...)
 }
 
 // MapProcessor is a function that accepts a key/value pair and emits zero or
@@ -142,6 +227,7 @@ func WordCountMapper(ctx context.Context, key, value []byte, emit MapEmitFunc) e
 // KV contains instructions for a mapper. It is just a key and value.
 type KV struct {
 	Key   []byte `json:"key"`
+	Key2  []byte `json:"key2"` // secondary key for sorting
 	Value []byte `json:"value"`
 }
 
@@ -152,8 +238,25 @@ func NewKV(key, value []byte) *KV {
 
 // String converts this key/value pair into a readable string.
 func (kv *KV) String() string {
-	return fmt.Sprintf("%s=%s", string(kv.Key), string(kv.Value))
+	if len(kv.Key2) > 0 {
+		return fmt.Sprintf("(%s,%s)=%s", string(kv.Key), string(kv.Key2), string(kv.Value))
+	}
+	return fmt.Sprintf("(%s)=%s", string(kv.Key), string(kv.Value))
 }
+
+// byKey helps with sorting KV slices by key. It's used in more than one place,
+// which is why we don't just use sort.Slice.
+type byKey []*KV
+
+func (b byKey) Less(i, j int) bool {
+	cmp := bytes.Compare(b[i].Key, b[j].Key)
+	if cmp == 0 {
+		return bytes.Compare(b[i].Key2, b[j].Key2) < 0
+	}
+	return cmp < 0
+}
+func (b byKey) Swap(i, j int) { b[i], b[j] = b[j], b[i] }
+func (b byKey) Len() int      { return len(b) }
 
 // MapWorker claims map input tasks, processes them, and produces output tasks.
 type MapWorker struct {
@@ -165,6 +268,7 @@ type MapWorker struct {
 	InputQueue   string
 	OutputPrefix string
 	Map          Mapper
+	EarlyReduce  Reducer
 }
 
 // MapWorkerOption is passed to NewMapWorker to change what it does.
@@ -178,6 +282,24 @@ func WithMapper(m Mapper) MapWorkerOption {
 			return
 		}
 		mw.Map = m
+	}
+}
+
+// WithEarlyReducer provides a reducer that can accept map output and
+// produce reduce input, ideally in a "reduced" way. This works if the input
+// value is the same type as the output value, which is not always the case
+//
+// The inputs and outputs are the same as for a Reducer, but *this reducer must
+// be able to operate on its own output*.
+//
+// This would be useful, for example, when summing over words to produce a
+// count of each unique word. The mapper may output "1" for each word, then the
+// intermediate reducer sums up all like words, producing an count. The final
+// reduction and intermediate shuffling then have much less work to do because
+// much of the reducing is happening in the map phase.
+func WithEarlyReducer(r Reducer) MapWorkerOption {
+	return func(mw *MapWorker) {
+		mw.EarlyReduce = r
 	}
 }
 
@@ -226,6 +348,9 @@ func NewMapWorker(eq *entroq.EntroQ, inQueue string, newEmitter func() MapEmitte
 // task. That's very doable, but beyond the scope of this exercise.
 func (w *MapWorker) mapTask(ctx context.Context, task *entroq.Task) error {
 	emitter := w.newEmitter()
+	if w.EarlyReduce != nil {
+		emitter = newReducingProxyMapEmitter(emitter, w.EarlyReduce)
+	}
 	task, err := w.client.DoWithRenew(ctx, task, claimDuration, func(ctx context.Context) error {
 		kv := new(KV)
 		if err := json.Unmarshal(task.Value, kv); err != nil {
@@ -474,6 +599,53 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 	return nil
 }
 
+// reduceSortedKVs takes a slice of key-value pairs, assumed to be sorted, and
+// runs the reduce function with its input iterating over a single key. It does
+// this once per unique key in the slice.
+func reduceSortedKVs(ctx context.Context, reduce Reducer, kvs []*KV) ([]*KV, error) {
+	var outputs []*KV
+	if len(kvs) == 0 {
+		return nil, nil
+	}
+
+	curr := 0
+
+	for curr < len(kvs) {
+		last := kvs[curr] // starting out - "last" is always first entry
+
+		input := &proxyingReduceInput{
+			key:   func() []byte { return last.Key },
+			value: func() []byte { return last.Value },
+			err:   func() error { return nil },
+			next: func() bool {
+				if curr >= len(kvs) {
+					return false
+				}
+				// If we aren't just started, and the current key is
+				// not the same as the last, can't continue.
+				if curr > 0 && bytes.Compare(last.Key, kvs[curr].Key) != 0 {
+					return false
+				}
+				last = kvs[curr]
+				curr++
+				return true
+			},
+		}
+		currBefore := curr
+		output, err := reduce(ctx, input)
+		if currBefore == curr {
+			for input.Next() {
+				// The reducer didn't consume anything - we need to do that instead.
+			}
+		}
+		if err != nil {
+			return nil, err
+		}
+		outputs = append(outputs, NewKV(last.Key, output))
+	}
+	return outputs, nil
+}
+
 // reduceTask takes a task (which is a list of key/value pairs, sorted),
 // and runs a reduce function on each set corresponding to a unique key,
 // writing them out in the order they appear (to maintain sorting).
@@ -486,45 +658,11 @@ func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error 
 			return fmt.Errorf("mr.ReduceWorker.reduceTasks: %v", err)
 		}
 
-		if len(kvs) == 0 {
-			return nil
+		var err error
+		if outputs, err = reduceSortedKVs(ctx, w.Reduce, kvs); err != nil {
+			return entroq.WrapDependencyError(err, "mr.ReduceWorker.reduceTask")
 		}
 
-		curr := 0
-
-		for curr < len(kvs) {
-			last := kvs[curr] // starting out - "last" is always first entry
-
-			input := &proxyingReduceInput{
-				key:   func() []byte { return last.Key },
-				value: func() []byte { return last.Value },
-				err:   func() error { return nil },
-				next: func() bool {
-					if curr >= len(kvs) {
-						return false
-					}
-					// If we aren't just started, and the current key is
-					// not the same as the last, can't continue.
-					if curr > 0 && bytes.Compare(last.Key, kvs[curr].Key) != 0 {
-						return false
-					}
-					last = kvs[curr]
-					curr++
-					return true
-				},
-			}
-			currBefore := curr
-			output, err := w.Reduce(ctx, input)
-			if currBefore == curr {
-				for input.Next() {
-					// The reducer didn't consume anything - we need to do that instead.
-				}
-			}
-			if err != nil {
-				return entroq.WrapDependencyError(err, "mr.ReduceWorker.reduceTask")
-			}
-			outputs = append(outputs, NewKV(last.Key, output))
-		}
 		return nil
 	})
 
@@ -623,8 +761,9 @@ type MapReduce struct {
 	NumMappers  int
 	NumReducers int
 
-	Map    Mapper
-	Reduce Reducer
+	Map         Mapper
+	Reduce      Reducer
+	EarlyReduce Reducer
 
 	Data []*KV
 }
@@ -643,6 +782,13 @@ func WithMap(m Mapper) MapReduceOption {
 func WithReduce(r Reducer) MapReduceOption {
 	return func(mr *MapReduce) {
 		mr.Reduce = r
+	}
+}
+
+// WithEarlyReduce sets the early reducer for map operations.
+func WithEarlyReduce(r Reducer) MapReduceOption {
+	return func(mr *MapReduce) {
+		mr.EarlyReduce = r
 	}
 }
 
@@ -723,7 +869,8 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 			func() MapEmitter { return NewCollectingMapEmitter(mr.NumReducers) },
 			MapAsName(fmt.Sprint(i)),
 			MapToOutputPrefix(qReduceInput),
-			WithMapper(mr.Map))
+			WithMapper(mr.Map),
+			WithEarlyReducer(mr.EarlyReduce))
 
 		g.Go(func() error {
 			return worker.Run(ctx)
