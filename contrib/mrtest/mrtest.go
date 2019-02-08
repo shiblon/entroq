@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/shiblon/entroq"
 	. "github.com/shiblon/entroq/contrib/mr"
 )
@@ -44,7 +45,7 @@ import (
 //	}
 func MRCheck(ctx context.Context, eq *entroq.EntroQ, numDocs, numMappers, numReducers int) bool {
 	const (
-		uniqueWords = 200
+		uniqueWords = 10
 		wordsPerDoc = 1000
 	)
 
@@ -79,7 +80,7 @@ func MRCheck(ctx context.Context, eq *entroq.EntroQ, numDocs, numMappers, numRed
 		return bytes.Compare(expected[i].Key, expected[j].Key) < 0
 	})
 
-	mr := NewMapReduce(eq, "/mrtest",
+	mr := NewMapReduce(eq, "/mrtest/"+uuid.New().String(),
 		WithNumMappers(numMappers),
 		WithNumReducers(numReducers),
 		WithMap(WordCountMapper),
@@ -98,15 +99,17 @@ func MRCheck(ctx context.Context, eq *entroq.EntroQ, numDocs, numMappers, numRed
 		return false
 	}
 
+	good := true
 	if len(tasks) == 0 || len(tasks) > numReducers {
 		log.Printf("Expected between 1 and %d output tasks, got %d", numReducers, len(tasks))
+		good = false
 		for i, t := range tasks {
 			var kvs []*KV
 			if err := json.Unmarshal(t.Value, &kvs); err != nil {
 				log.Printf("Failed to unmarshal task %v on queue %q: %v", t.IDVersion(), t.Queue, err)
 				return false
 			}
-			log.Printf("%d: %v", i, t.IDVersion())
+			log.Printf("%d: %q %v", i, t.Queue, t.IDVersion())
 			kvmap := make(map[string]string)
 			for _, kv := range kvs {
 				kvmap[string(kv.Key)] = string(kv.Value)
@@ -117,7 +120,6 @@ func MRCheck(ctx context.Context, eq *entroq.EntroQ, numDocs, numMappers, numRed
 			}
 			log.Print(string(out))
 		}
-		return false
 	}
 
 	// Check that each task's values are already in key-sorted order.
@@ -142,10 +144,10 @@ func MRCheck(ctx context.Context, eq *entroq.EntroQ, numDocs, numMappers, numRed
 	})
 
 	for i, kv := range allKVs {
-		if want, got := kv.String(), expected[i].String(); want != got {
+		if want, got := expected[i].String(), kv.String(); want != got {
 			log.Printf("Expected %s, got %s", want, got)
-			return false
+			good = false
 		}
 	}
-	return true
+	return good
 }
