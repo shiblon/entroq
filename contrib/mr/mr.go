@@ -23,7 +23,7 @@ import (
 
 const (
 	claimDuration = 5 * time.Second
-	claimWait     = 10 * time.Second
+	claimWait     = 20 * time.Second
 	shuffleWait   = 5 * time.Second
 )
 
@@ -563,18 +563,17 @@ func (w *ReduceWorker) Run(ctx context.Context) error {
 	defer log.Printf("Reducer %q finished", w.Name)
 	// First, merge until there is no more mapping work to do.
 	for {
-		mergeTasks, err := w.client.Tasks(ctx, w.InputQueue)
+		mergeTasks, err := w.client.Tasks(ctx, w.InputQueue, entroq.LimitTasks(200))
 		if err != nil {
 			return fmt.Errorf("mr.ReduceWorker.Run tasks: %v", err)
 		}
-		log.Printf("Reducer %q found %d merge tasks", w.Name, len(mergeTasks))
 		if len(mergeTasks) <= 1 {
 			empty, err := w.client.QueuesEmpty(ctx, entroq.MatchExact(w.MapEmptyQueue))
 			if err != nil {
 				return fmt.Errorf("mr.ReduceWorker.Run: %v", err)
 			}
 			if empty {
-				log.Printf("Reducer %q nothing to merge", w.Name)
+				log.Printf("Reducer %q done merging", w.Name)
 				break // all done - no more map tasks, 1 or fewer merge tasks.
 			}
 
@@ -583,11 +582,10 @@ func (w *ReduceWorker) Run(ctx context.Context) error {
 			case <-ctx.Done():
 				return ctx.Err()
 			case <-time.After(shuffleWait):
-				log.Printf("Reducer %q trying again", w.Name)
 			}
 			continue
 		}
-		// More than one merge task is in the queue. Shuffle and check again.
+		// More than one merge task is in the queue. Merge and check again.
 		log.Printf("Reducer %q merging %d tasks", w.Name, len(mergeTasks))
 		if err := w.mergeTasks(ctx, mergeTasks); err != nil {
 			if entroq.IsDependency(err) {
@@ -601,16 +599,16 @@ func (w *ReduceWorker) Run(ctx context.Context) error {
 
 	log.Printf("Reducer %q merge finished. Reducing.", w.Name)
 
-	// Then, reduce over the final merged task.
-	claimCtx, cancel := context.WithTimeout(ctx, claimWait)
-	defer cancel()
-
-	task, err := w.client.Claim(claimCtx, w.InputQueue, claimDuration)
+	task, err := w.client.TryClaim(ctx, w.InputQueue, claimDuration)
 	if err != nil {
-		return entroq.WrapDependencyError(err, "mr.ReduceWorker.Run")
+		return entroq.WrapDependencyError(err, "mr.ReduceWorker.Run claim")
+	}
+	if task == nil {
+		log.Printf("Reducer %q has nothing to do", w.Name)
+		return nil
 	}
 	if err := w.reduceTask(ctx, task); err != nil {
-		return entroq.WrapDependencyError(err, "mr.ReduceWorker.Run")
+		return entroq.WrapDependencyError(err, "mr.ReduceWorker.Run reduce")
 	}
 	return nil
 }
