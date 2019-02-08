@@ -7,7 +7,6 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
-	"log"
 	"strings"
 	"time"
 
@@ -205,7 +204,6 @@ func (b *backend) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[strin
 
 	q += " GROUP BY queue"
 
-	log.Printf("Getting queues using query %q", q)
 	rows, err := b.db.QueryContext(ctx, q, values...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get queue names: %v", err)

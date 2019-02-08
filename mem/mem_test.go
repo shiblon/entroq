@@ -4,47 +4,41 @@ import (
 	"context"
 	"testing"
 
-	"github.com/shiblon/entroq"
-	grpcbackend "github.com/shiblon/entroq/grpc"
 	"github.com/shiblon/entroq/qsvc/qtest"
 )
 
 func TestSimpleSequence(t *testing.T) {
 	ctx := context.Background()
 
-	server, dial, err := qtest.StartService(ctx, Opener())
+	client, stop, err := qtest.ClientService(ctx, Opener())
 	if err != nil {
-		t.Fatalf("Could not start service: %v", err)
+		t.Fatalf("Get client: %v", err)
 	}
-	defer server.Stop()
+	defer stop()
 
-	client, err := entroq.New(ctx, grpcbackend.Opener("bufnet",
-		grpcbackend.WithNiladicDialer(dial),
-		grpcbackend.WithInsecure()))
-	if err != nil {
-		t.Fatalf("Open client: %v", err)
-	}
-	defer client.Close()
-
-	qtest.SimpleSequence(ctx, t, client)
+	qtest.SimpleSequence(ctx, t, client, "")
 }
 
 func TestSimpleWorker(t *testing.T) {
 	ctx := context.Background()
 
-	server, dial, err := qtest.StartService(ctx, Opener())
+	client, stop, err := qtest.ClientService(ctx, Opener())
 	if err != nil {
-		t.Fatalf("Could not start service: %v", err)
+		t.Fatalf("Get client: %v", err)
 	}
-	defer server.Stop()
+	defer stop()
 
-	client, err := entroq.New(ctx, grpcbackend.Opener("bufnet",
-		grpcbackend.WithNiladicDialer(dial),
-		grpcbackend.WithInsecure()))
+	qtest.SimpleWorker(ctx, t, client, "")
+}
+
+func TestQueueMatch(t *testing.T) {
+	ctx := context.Background()
+
+	client, stop, err := qtest.ClientService(ctx, Opener())
 	if err != nil {
-		t.Fatalf("Open client: %v", err)
+		t.Fatalf("Get client: %v", err)
 	}
-	defer client.Close()
+	defer stop()
 
-	qtest.SimpleWorker(ctx, t, client)
+	qtest.QueueMatch(ctx, t, client, "")
 }
