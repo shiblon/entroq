@@ -2,6 +2,7 @@ package entroq
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -47,6 +48,8 @@ type Worker struct {
 	claimCtx context.Context
 	task     *Task
 	err      error
+
+	sync.Mutex
 }
 
 // NewWorker creates a new worker iterator-like type that makes it easy to claim and operate on tasks in a loop.
@@ -63,8 +66,20 @@ func (c *EntroQ) NewWorker(q string, opts ...WorkerOption) *Worker {
 	return w
 }
 
+func lock(l sync.Locker) func() {
+	l.Lock()
+	return func() {
+		l.Unlock()
+	}
+}
+
+func un(f func()) {
+	f()
+}
+
 // Err returns the most recent error encountered when doing work for a task.
 func (w *Worker) Err() error {
+	defer un(lock(w))
 	return w.err
 }
 
@@ -76,28 +91,26 @@ func (w *Worker) Next(ctx context.Context) bool {
 		return false
 	default:
 	}
+	task, err := w.eqc.Claim(w.claimCtx, w.Q, w.leaseTime)
 
-	w.task, w.err = w.eqc.Claim(ctx, w.Q, w.leaseTime)
-	if w.err != nil {
-		return false
-	}
-	w.claimCtx = ctx
-	return true
+	defer un(lock(w))
+	w.task, w.err = task, err
+	return w.err == nil
 }
 
 // Task returns the claimed task for this worker.
 func (w *Worker) Task() *Task {
+	defer un(lock(w))
 	return w.task
-}
-
-// Ctx returns the current task claim's context (valid during a call to Do).
-func (w *Worker) Ctx() context.Context {
-	return w.claimCtx
 }
 
 // Do calls the given function while renewing the claim according to given options.
 func (w *Worker) Do(f func(context.Context) error) (*Task, error) {
-	return w.eqc.DoWithRenew(w.claimCtx, w.task, w.leaseTime, f)
+	w.Lock()
+	ctx := w.claimCtx
+	w.Unlock()
+
+	return w.eqc.DoWithRenew(ctx, w.task, w.leaseTime, f)
 }
 
 // DoModify calls the given function while renewing the claim, and applies
