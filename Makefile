@@ -41,12 +41,12 @@ proto/entroq.pb.go: proto/entroq.proto
 default: build test
 
 .PHONY: build
-build: build-proto
+build: genproto
 	go build -v ./...
 
 .PHONY: test
 test:
-	go test -v ./...
+	go test -timeout 20m -race -v ./...
 
 .PHONY: install
 install:

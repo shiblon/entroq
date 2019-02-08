@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"log"
 	"strings"
 	"time"
 
@@ -24,6 +25,7 @@ type pgOptions struct {
 	password string
 
 	attempts int
+	nw       entroq.NotifyWaiter
 }
 
 // PGOpt sets an option for the opener.
@@ -61,6 +63,15 @@ func WithConnectAttempts(num int) PGOpt {
 	}
 }
 
+// WithNotifyWaiter instructs this backend to use the given NotifyWaiter to
+// attempt to wake up blocking claims instantly when tasks are inserted into a
+// queue they are waiting on.
+func WithNotifyWaiter(nw entroq.NotifyWaiter) PGOpt {
+	return func(opts *pgOptions) {
+		opts.nw = nw
+	}
+}
+
 // Opener creates an opener function to be used to get a backend.
 func Opener(hostPort string, opts ...PGOpt) entroq.BackendOpener {
 	// Set up some defaults, then apply given options.
@@ -87,7 +98,7 @@ func Opener(hostPort string, opts ...PGOpt) entroq.BackendOpener {
 		}
 		for i := 0; i < options.attempts; i++ {
 			if err = db.PingContext(ctx); err == nil {
-				return New(ctx, db)
+				return New(ctx, db, options.nw)
 			}
 			if i < options.attempts-1 {
 				select {
@@ -103,11 +114,26 @@ func Opener(hostPort string, opts ...PGOpt) entroq.BackendOpener {
 
 type backend struct {
 	db *sql.DB
+	nw entroq.NotifyWaiter
 }
 
 // New creates a new postgres backend that attaches to the given database.
-func New(ctx context.Context, db *sql.DB) (*backend, error) {
-	b := &backend{db: db}
+// If the NotifyWaiter value is provided, Claim will attempt to wait for task
+// events, and Modify will notify on changes and insertions that create
+// "available" tasks. This allows newly-inserted tasks to be picked up more or
+// less immediately if another routine is waiting on the corresponding queue.
+//
+// Note that this is an *optimization*, not a guarantee that tasks will be
+// picked up immediately. It is therefore safe, though not necessarily very
+// helpful, for multiple of these backends to have their own NotifyWaiter
+// objects.
+//
+// If left nil, the default behavior is to poll and sleep.
+func New(ctx context.Context, db *sql.DB, nw entroq.NotifyWaiter) (*backend, error) {
+	b := &backend{
+		db: db,
+		nw: nw,
+	}
 
 	err := b.initDB(ctx)
 	if err == io.EOF {
@@ -146,11 +172,11 @@ func (b *backend) initDB(ctx context.Context) error {
 
 // Queues returns a mapping from queue names to task counts within them.
 func (b *backend) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[string]int, error) {
-	q := "SELECT queue, COUNT(*) AS count FROM tasks GROUP BY queue"
+	q := "SELECT queue, COUNT(*) AS count FROM tasks"
 	var values []interface{}
 
 	if len(qq.MatchPrefix) != 0 || len(qq.MatchExact) != 0 {
-		q += " WHERE "
+		q += " WHERE"
 	}
 
 	var matchFragments []string
@@ -171,6 +197,9 @@ func (b *backend) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[strin
 		values = append(values, qq.Limit)
 	}
 
+	q += " GROUP BY queue"
+
+	log.Printf("Getting queues using query %q", q)
 	rows, err := b.db.QueryContext(ctx, q, values...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get queue names: %v", err)
@@ -226,6 +255,15 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 		return nil, fmt.Errorf("task iteration failed for queue %q: %v", tq.Queue, err)
 	}
 	return tasks, nil
+}
+
+// Claim attempts to claim an arrived task from the queue, and blocks if
+// something goes wrong.
+func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
+	if b.nw != nil {
+		return entroq.WaitTryClaim(ctx, cq, b.TryClaim, b.nw)
+	}
+	return entroq.PollTryClaim(ctx, cq, b.TryClaim)
 }
 
 // TryClaim attempts to claim an "arrived" task from the queue.
@@ -337,6 +375,12 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 			return nil, nil, fmt.Errorf("scan failed for newly-changed task %q: %v", chg.ID, err)
 		}
 		changed = append(changed, t)
+	}
+
+	// Notify any waiters of tasks that were just changed/inserted that are
+	// ready to go.
+	if b.nw != nil {
+		entroq.NotifyModified(b.nw, inserted, changed)
 	}
 
 	return inserted, changed, nil

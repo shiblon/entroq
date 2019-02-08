@@ -11,6 +11,8 @@ import (
 
 	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // TaskID contains the identifying parts of a task. If IDs don't match
@@ -120,8 +122,6 @@ type ClaimQuery struct {
 	Queue    string        // The name of the queue to claim from.
 	Claimant uuid.UUID     // The ID of the process trying to make the claim.
 	Duration time.Duration // How long the task should be claimed for if successful.
-
-	maxWait time.Duration // Length of time to wait for a blocking claim.
 }
 
 // TasksQuery holds information for a tasks query.
@@ -147,6 +147,119 @@ type QueuesQuery struct {
 	Limit int
 }
 
+// BackendClaimFunc is a function that can make claims based on a ClaimQuery.
+// It is a convenience type for backends to use.
+type BackendClaimFunc func(ctx context.Context, eq *ClaimQuery) (*Task, error)
+
+// PollTryClaim runs a loop in which the TryClaim function is called between
+// sleeps with exponential backoff (up to a point). Backend implementations may
+// choose to use this as their Claim implementation.
+func PollTryClaim(ctx context.Context, eq *ClaimQuery, tc BackendClaimFunc) (*Task, error) {
+	const (
+		maxCheckInterval = 30 * time.Second
+		startInterval    = time.Second
+	)
+
+	curWait := startInterval
+	for {
+		// Don't wait longer than the check interval or canceled context.
+		task, err := tc(ctx, eq)
+		if err != nil {
+			return nil, err
+		}
+		if task != nil {
+			return task, nil
+		}
+		// No error, no task - we wait with exponential backoff and try again.
+		select {
+		case <-time.After(curWait):
+			curWait *= 2
+			if curWait > maxCheckInterval {
+				curWait = maxCheckInterval
+			}
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+// Waiter can wait for an event on a given key (e.g., queue name).
+type Waiter interface {
+	// Wait waits for an event on the given key. Competes with other waiters.
+	Wait(ctx context.Context, key string) error
+}
+
+// Notifier can be notified on a given key (e.g., queue name);
+type Notifier interface {
+	// Notify signals an event on the key. Wakes up one waiter, if any, or is
+	// dropped if no waiters are waiting.
+	Notify(key string)
+}
+
+// NotifyWaiter can be notified and waited on for a given key (e.g., queue name).
+// The notification only ever blocks a single waiter.
+type NotifyWaiter interface {
+	Waiter
+	Notifier
+}
+
+// NotifyModified takes inserted and changed tasks and notifies once per unique queue/ID pair.
+func NotifyModified(n Notifier, inserted, changed []*Task) {
+	now := time.Now()
+	qs := make(map[uuid.UUID]string)
+	for _, t := range inserted {
+		if !now.Before(t.At) {
+			qs[t.ID] = t.Queue
+		}
+	}
+	for _, t := range changed {
+		if !now.Before(t.At) {
+			qs[t.ID] = t.Queue
+		}
+	}
+	for _, q := range qs {
+		n.Notify(q)
+	}
+}
+
+// WaitTryClaim runs a loop in which the TryClaim function is called, then if
+// no tasks are available, the given wait function is used to attempt to wait
+// for a task to become available on the queue.
+//
+// The wait function should exit (more or less) immediately if the context is
+// canceled, and should return a nil error if the wait was successful
+// (something became available).
+func WaitTryClaim(ctx context.Context, eq *ClaimQuery, tc BackendClaimFunc, w Waiter) (*Task, error) {
+	for {
+		// Make sure we weren't stopped by the parent context.
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		task, err := tc(ctx, eq)
+		if err != nil {
+			return nil, err
+		}
+		if task != nil {
+			return task, nil
+		}
+		// No error, no task - wait on the queue.
+		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+
+		if err := w.Wait(ctx, eq.Queue); err != nil {
+			// If this is a deadline-exceeded error, we'll continue around again.
+			// It's just the end of our sleep cycle.
+			if err == context.DeadlineExceeded {
+				continue
+			}
+			return nil, err
+		}
+		// No error queue alerted:  go around again, trying to get a task.
+	}
+}
+
 // Backend describes all of the functions that any backend has to implement
 // to be used as the storage for task queues.
 type Backend interface {
@@ -166,6 +279,15 @@ type Backend interface {
 	// there is nothing to claim. Will fail with a DependencyError is a
 	// specific task ID is requested but not present.
 	TryClaim(ctx context.Context, cq *ClaimQuery) (*Task, error)
+
+	// Claim is a blocking version of TryClaim, attempting to claim a task
+	// from a queue, and blocking until canceled or a task becomes available.
+	//
+	// Will fail with a DependencyError is a specific task ID is requested but
+	// not present. Never returns both a nil task and a nil error
+	// simultaneously: a failure to claim a task is an error (potentially just
+	// a timeout).
+	Claim(ctx context.Context, cq *ClaimQuery) (*Task, error)
 
 	// Modify attempts to atomically modify the task store, and only succeeds
 	// if all dependencies are available and all mutations are either expired
@@ -322,14 +444,6 @@ func LimitQueues(limit int) QueuesOpt {
 // ClaimOpt modifies limits on a task claim.
 type ClaimOpt func(*ClaimQuery)
 
-// ClaimWait sets the maximum wait time for a blocking Claim. Default is
-// whatever the context says, or indefinite.
-func ClaimWait(d time.Duration) ClaimOpt {
-	return func(q *ClaimQuery) {
-		q.maxWait = d
-	}
-}
-
 // ClaimAs sets the claimant ID for a claim operation. When not set, uses the internal default for this client.
 func ClaimAs(id uuid.UUID) ClaimOpt {
 	return func(q *ClaimQuery) {
@@ -337,13 +451,30 @@ func ClaimAs(id uuid.UUID) ClaimOpt {
 	}
 }
 
-// Canceled is an error returned when a claim is canceled by its context.
-type Canceled error
-
 // IsCanceled indicates whether the error is a canceled error.
 func IsCanceled(err error) bool {
-	_, ok := err.(Canceled)
-	return ok
+	if status.Code(err) == codes.Canceled {
+		return true
+	}
+
+	if status.FromContextError(err).Code() == codes.Canceled {
+		return true
+	}
+
+	return false
+}
+
+// IsTimeout indicates whether the error is a timeout error.
+func IsTimeout(err error) bool {
+	if status.Code(err) == codes.DeadlineExceeded {
+		return true
+	}
+
+	if status.FromContextError(err).Code() == codes.DeadlineExceeded {
+		return true
+	}
+
+	return false
 }
 
 // Claim attempts to get the next unclaimed task from the given queue. It
@@ -351,42 +482,15 @@ func IsCanceled(err error) bool {
 // succeeds, it returns a task with the claimant set to the default, or to the
 // value given in options, and an arrival time given by the duration.
 func (c *EntroQ) Claim(ctx context.Context, q string, duration time.Duration, opts ...ClaimOpt) (*Task, error) {
-	const (
-		maxCheckInterval = 30 * time.Second
-		startInterval    = time.Second
-	)
-
-	query := new(ClaimQuery)
+	query := &ClaimQuery{
+		Queue:    q,
+		Claimant: c.clientID,
+		Duration: duration,
+	}
 	for _, opt := range opts {
 		opt(query)
 	}
-
-	if query.maxWait != 0 {
-		var cancel func()
-		ctx, cancel = context.WithTimeout(ctx, query.maxWait)
-		defer cancel()
-	}
-
-	curWait := startInterval
-	for {
-		task, err := c.TryClaim(ctx, q, duration, opts...)
-		if err != nil {
-			return nil, err
-		}
-		if task != nil {
-			return task, nil
-		}
-		// No error, no task - we wait.
-		select {
-		case <-time.After(curWait):
-			curWait *= 2
-			if curWait > maxCheckInterval {
-				curWait = maxCheckInterval
-			}
-		case <-ctx.Done():
-			return nil, Canceled(fmt.Errorf("context canceled for claim request in %q: %v", q, ctx.Err()))
-		}
-	}
+	return c.backend.Claim(ctx, query)
 }
 
 // TryClaimTask attempts one time to claim a task from the given queue. If
@@ -781,10 +885,10 @@ func (m *Modification) missingDepends(foundDeps map[uuid.UUID]*Task) []*TaskID {
 	return missing
 }
 
-// Returns a DependencyError if there are problems with the
-// dependencies found in the backend, or nil if everything is
-// fine. Problems include missing or claimed dependencies, both of
-// which will block a modification.
+// DependencyError returns a DependencyError if there are problems with the
+// dependencies found in the backend, or nil if everything is fine. Problems
+// include missing or claimed dependencies, both of which will block a
+// modification.
 func (m *Modification) DependencyError(found map[uuid.UUID]*Task) error {
 	missingChanges, claimedChanges := m.badChanges(found)
 	missingDeletes, claimedDeletes := m.badDeletes(found)
