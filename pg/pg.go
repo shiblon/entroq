@@ -239,8 +239,8 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 	}
 
 	if tq.Limit > 0 {
-		q += fmt.Sprintf(" LIMIT $%d", len(values)+1)
-		values = append(values, tq.Limit)
+		// Safe to directly append, since it's an int.
+		q += fmt.Sprintf(" LIMIT %d", tq.Limit)
 	}
 
 	rows, err := b.db.QueryContext(ctx, q, values...)
