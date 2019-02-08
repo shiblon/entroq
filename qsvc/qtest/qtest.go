@@ -6,12 +6,14 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"path"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/shiblon/entroq"
+	grpcbackend "github.com/shiblon/entroq/grpc"
 	"github.com/shiblon/entroq/qsvc"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
@@ -28,6 +30,36 @@ const bufSize = 1 << 20
 
 // Dialer returns a net connection.
 type Dialer func() (net.Conn, error)
+
+// ClientService starts an in-memory gRPC network service via StartService,
+// then creates an EntroQ client that connects to it. It returns the client and
+// a function that can be deferred for cleanup.
+//
+// The opener is used by the service to connect to storage. The client always
+// uses a grpc opener.
+func ClientService(ctx context.Context, opener entroq.BackendOpener) (client *entroq.EntroQ, stop func(), err error) {
+	s, dial, err := StartService(ctx, opener)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() {
+		if err != nil {
+			s.Stop()
+		}
+	}()
+
+	client, err = entroq.New(ctx, grpcbackend.Opener("bufnet",
+		grpcbackend.WithNiladicDialer(dial),
+		grpcbackend.WithInsecure()))
+	if err != nil {
+		return nil, nil, fmt.Errorf("start client on in-memory service: %v", err)
+	}
+
+	return client, func() {
+		client.Close()
+		s.Stop()
+	}, nil
+}
 
 // StartService starts an in-memory gRPC network service and returns a function for creating client connections to it.
 func StartService(ctx context.Context, opener entroq.BackendOpener) (*grpc.Server, Dialer, error) {
@@ -46,10 +78,10 @@ func StartService(ctx context.Context, opener entroq.BackendOpener) (*grpc.Serve
 
 // SimpleWorker tests basic worker functionality while tasks are coming in and
 // being waited on.
-func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ) {
+func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	t.Helper()
 
-	const queue = "/test/simple_worker"
+	queue := path.Join(qPrefix, "simple_worker")
 
 	w := client.NewWorker(queue)
 
@@ -116,7 +148,7 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ) {
 }
 
 // SimpleSequence tests some basic functionality of a task manager, over gRPC.
-func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ) {
+func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	t.Helper()
 
 	now := time.Now()
@@ -129,7 +161,7 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ) {
 		}
 	}
 
-	const queue = "/test/simple_sequence"
+	queue := path.Join(qPrefix, "simple_sequence")
 
 	// Claim from empty queue.
 	task, err := client.TryClaim(ctx, queue, 100*time.Millisecond)
@@ -230,6 +262,107 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ) {
 	}
 	if got, lower, upper := tryclaimed.At, time.Now().Add(4*time.Second), time.Now().Add(6*time.Second); got.Before(lower) || got.After(upper) {
 		t.Fatalf("TryClaimed arrival time not in time bounds [%v, %v]: %v", lower, upper, tryclaimed.At)
+	}
+}
+
+// QueueMatch tests various queue matching functions against a client.
+func QueueMatch(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	t.Helper()
+
+	queue1 := path.Join(qPrefix, "queue-1")
+	queue2 := path.Join(qPrefix, "queue-2")
+	queue3 := path.Join(qPrefix, "queue-3")
+	quirkyQueue := path.Join(qPrefix, "quirky=queue")
+
+	wantQueues := map[string]int{
+		queue1:      1,
+		queue2:      2,
+		queue3:      3,
+		quirkyQueue: 1,
+	}
+
+	// Add tasks so that queues have a certain number of things in them, as above.
+	var toInsert []entroq.ModifyArg
+	for q, n := range wantQueues {
+		for i := 0; i < n; i++ {
+			toInsert = append(toInsert, entroq.InsertingInto(q))
+		}
+	}
+	inserted, _, err := client.Modify(ctx, toInsert...)
+	if err != nil {
+		t.Fatalf("in QueueMatch - inserting empty tasks: %v", err)
+	}
+
+	// Check that we got everything inserted.
+	if want, got := len(inserted), len(toInsert); want != got {
+		t.Fatalf("in QueueMatch - want %d inserted, got %d", want, got)
+	}
+
+	// Check that we can get exact numbers for all of the above using MatchExact.
+	for q, n := range wantQueues {
+		qs, err := client.Queues(ctx, entroq.MatchExact(q))
+		if err != nil {
+			t.Fatalf("QueueMatch single - getting queue: %v", err)
+		}
+		if len(qs) != 1 {
+			t.Errorf("QueueMatch single - expected 1 entry, got %d", len(qs))
+		}
+		if want, got := n, qs[q]; want != got {
+			t.Errorf("QueueMatch single - expected %d values in queue %q, got %d", want, q, got)
+		}
+	}
+
+	// Check that passing multiple exact matches works properly.
+	multiExactCases := []struct {
+		q1 string
+		q2 string
+	}{
+		{queue1, queue2},
+		{queue1, queue3},
+		{quirkyQueue, queue2},
+		{"bogus", queue3},
+	}
+
+	for _, c := range multiExactCases {
+		qs, err := client.Queues(ctx, entroq.MatchExact(c.q1), entroq.MatchExact(c.q2))
+		if err != nil {
+			t.Fatalf("QueueMatch multi - getting multiple queues: %v", err)
+		}
+		if len(qs) > 2 {
+			t.Errorf("QueueMatch multi - expected no more than 2 entries, got %d", len(qs))
+		}
+		want1, want2 := wantQueues[c.q1], wantQueues[c.q2]
+		if got1, got2 := qs[c.q1], qs[c.q2]; want1 != got1 || want2 != got2 {
+			t.Errorf("QueueMatch multi - wanted %q:%d, %q:%d, got %q:%d, %q:%d", c.q1, want1, c.q2, want2, c.q1, got1, c.q2, got2)
+		}
+	}
+
+	// Check prefix matching.
+	prefixCases := []struct {
+		prefix string
+		qn     int
+		n      int
+	}{
+		{path.Join(qPrefix, "queue-"), 3, 6},
+		{path.Join(qPrefix, "qu"), 4, 7},
+		{path.Join(qPrefix, "qui"), 1, 1},
+	}
+
+	for _, c := range prefixCases {
+		qs, err := client.Queues(ctx, entroq.MatchPrefix(c.prefix))
+		if err != nil {
+			t.Fatalf("QueueMatch prefix - queues error: %v", err)
+		}
+		if want, got := c.qn, len(qs); want != got {
+			t.Errorf("QueueMatch prefix - want %d queues, got %d", want, got)
+		}
+		tot := 0
+		for _, n := range qs {
+			tot += n
+		}
+		if want, got := c.n, tot; want != got {
+			t.Errorf("QueueMatch prefix - want %d total items, got %d", want, got)
+		}
 	}
 }
 

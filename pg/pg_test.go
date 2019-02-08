@@ -13,14 +13,76 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shiblon/entroq"
-	grpcbackend "github.com/shiblon/entroq/grpc"
 	"github.com/shiblon/entroq/qsvc/qtest"
-	"github.com/shiblon/entroq/subq"
 	"golang.org/x/sync/errgroup"
 
 	_ "github.com/lib/pq"
 )
 
+var pgPort int
+
+func TestMain(m *testing.M) {
+	ctx := context.Background()
+
+	var (
+		err    error
+		pgStop func()
+	)
+	if pgPort, pgStop, err = startPostgres(ctx); err != nil {
+		log.Fatalf("Postgres start: %v", err)
+	}
+
+	res := m.Run()
+	pgStop()
+
+	os.Exit(res)
+}
+
+func pgClient(ctx context.Context) (client *entroq.EntroQ, stop func(), err error) {
+	return qtest.ClientService(ctx, Opener(fmt.Sprintf("localhost:%v", pgPort),
+		WithDB("postgres"),
+		WithUsername("postgres"),
+		WithPassword("password"),
+		WithConnectAttempts(3)))
+}
+
+func TestSimpleSequence(t *testing.T) {
+	ctx := context.Background()
+
+	client, stop, err := pgClient(ctx)
+	if err != nil {
+		t.Fatalf("Failed to create pg service and client: %v", err)
+	}
+	defer stop()
+
+	qtest.SimpleSequence(ctx, t, client, "pgtest/"+uuid.New().String())
+}
+
+func TestSimpleWorker(t *testing.T) {
+	ctx := context.Background()
+
+	client, stop, err := pgClient(ctx)
+	if err != nil {
+		t.Fatalf("Failed to create pg service and client: %v", err)
+	}
+	defer stop()
+
+	qtest.SimpleWorker(ctx, t, client, "pgtest/"+uuid.New().String())
+}
+
+func TestQueueMatch(t *testing.T) {
+	ctx := context.Background()
+
+	client, stop, err := pgClient(ctx)
+	if err != nil {
+		t.Fatalf("Failed to create pg service and client: %v", err)
+	}
+	defer stop()
+
+	qtest.QueueMatch(ctx, t, client, "pgtest/"+uuid.New().String())
+}
+
+// run starts a subprocess and connects its standard pipes to the parents'.
 func run(ctx context.Context, name string, args ...string) error {
 	cmd := exec.CommandContext(ctx, name, args...)
 
@@ -95,76 +157,4 @@ func startPostgres(ctx context.Context) (port int, stop func(), err error) {
 	}
 
 	return port, stopFunc, nil
-}
-
-func TestSimpleSequence(t *testing.T) {
-	ctx := context.Background()
-
-	pgPort, pgStop, err := startPostgres(ctx)
-	if err != nil {
-		t.Fatalf("postgres: %v", err)
-	}
-	defer pgStop()
-
-	pgHostPort := fmt.Sprintf("localhost:%v", pgPort)
-
-	sq := subq.New()
-
-	server, dial, err := qtest.StartService(ctx, Opener(pgHostPort,
-		WithDB("postgres"),
-		WithUsername("postgres"),
-		WithPassword("password"),
-		WithConnectAttempts(3),
-		WithNotifyWaiter(sq),
-	))
-	if err != nil {
-		t.Fatalf("Could not start service: %v", err)
-	}
-	defer server.Stop()
-
-	client, err := entroq.New(ctx, grpcbackend.Opener("bufnet",
-		grpcbackend.WithNiladicDialer(dial),
-		grpcbackend.WithInsecure()))
-	if err != nil {
-		t.Fatalf("Open client: %v", err)
-	}
-	defer client.Close()
-
-	qtest.SimpleSequence(ctx, t, client)
-}
-
-func TestSimpleWorker(t *testing.T) {
-	ctx := context.Background()
-
-	pgPort, pgStop, err := startPostgres(ctx)
-	if err != nil {
-		t.Fatalf("postgres: %v", err)
-	}
-	defer pgStop()
-
-	pgHostPort := fmt.Sprintf("localhost:%v", pgPort)
-
-	sq := subq.New()
-
-	server, dial, err := qtest.StartService(ctx, Opener(pgHostPort,
-		WithDB("postgres"),
-		WithUsername("postgres"),
-		WithPassword("password"),
-		WithConnectAttempts(3),
-		WithNotifyWaiter(sq),
-	))
-	if err != nil {
-		t.Fatalf("Could not start service: %v", err)
-	}
-	defer server.Stop()
-
-	client, err := entroq.New(ctx, grpcbackend.Opener("bufnet",
-		grpcbackend.WithNiladicDialer(dial),
-		grpcbackend.WithInsecure()))
-	if err != nil {
-		t.Fatalf("Open client: %v", err)
-	}
-	defer client.Close()
-
-	qtest.SimpleWorker(ctx, t, client)
 }
