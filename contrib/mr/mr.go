@@ -272,7 +272,7 @@ func (w *MapWorker) Run(ctx context.Context) error {
 		defer cancel()
 
 		task, err := w.client.Claim(claimCtx, w.InputQueue, claimDuration)
-		if entroq.IsCanceled(err) {
+		if entroq.IsTimeout(err) {
 			continue
 		}
 		if err != nil {

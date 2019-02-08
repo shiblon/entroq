@@ -74,13 +74,10 @@ func New() *SubQ {
 // the event.
 func (s *SubQ) Notify(q string) {
 	defer un(lock(s))
-	log.Printf("notify lock %q", q)
 
 	select {
 	case s.qs[q].Ch() <- q:
-		log.Printf("notification sent %q", q)
 	default:
-		log.Printf("notify dropped %q", q)
 	}
 }
 
@@ -92,8 +89,6 @@ func (s *SubQ) Wait(ctx context.Context, q string) error {
 	func() {
 		defer un(lock(s))
 
-		log.Printf("in wait lock for %q: %v", q, s.qs)
-
 		qs := s.qs
 
 		// If there isn't any sync info for this queue, create it and add this
@@ -104,13 +99,9 @@ func (s *SubQ) Wait(ctx context.Context, q string) error {
 			return
 		}
 
-		log.Printf("no sync info for %q", q)
-
 		qInfo = &sub{ch: make(chan string)}
 		qInfo.Reserve()
 		qs[q] = qInfo
-
-		log.Printf("made sync %q: %v", q, s.qs)
 
 		// Start up a watchdog that deletes when there are no more listeners.
 		// Only do this when creating a new pInfo entry.
@@ -135,13 +126,10 @@ func (s *SubQ) Wait(ctx context.Context, q string) error {
 	// it won't get deleted from the queue map before the select executes
 	// below.
 
-	log.Printf("select %q", q)
 	select {
 	case <-qInfo.Ch():
-		log.Printf("successful wait %q", q)
 		return nil
 	case <-ctx.Done():
-		log.Printf("wait context %q: %v", q, ctx.Err())
 		return ctx.Err()
 	}
 }
