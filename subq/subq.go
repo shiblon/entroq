@@ -75,9 +75,24 @@ func New() *SubQ {
 func (s *SubQ) Notify(q string) {
 	defer un(lock(s))
 
-	select {
-	case s.qs[q].Ch() <- q:
-	default:
+	// Because the Wait function lets go of the mutex just before selecting on
+	// its channel, there is a case where we can fail to notify even though
+	// it is reserved by a listener. Thus, we keep trying to send if we
+	// hit the default case while the channel is reserved.
+	//
+	// The entire point of keeping track of reservations is to allow exactly
+	// this kind of query, we just have to loop here to avoid that situation.
+	//
+	// Of course, we quit if the send succeeds.
+	for {
+		select {
+		case s.qs[q].Ch() <- q:
+			return
+		default:
+			if !s.qs[q].Reserved() {
+				return
+			}
+		}
 	}
 }
 
