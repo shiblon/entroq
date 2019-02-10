@@ -246,9 +246,7 @@ func WaitTryClaim(ctx context.Context, eq *ClaimQuery, tc BackendClaimFunc, w Wa
 			return task, nil
 		}
 		// No error, no task - wait on the queue.
-		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-
+		ctx, _ := context.WithTimeout(ctx, 30*time.Second)
 		if err := w.Wait(ctx, eq.Queue); err != nil {
 			// If this is a deadline-exceeded error, we'll continue around again.
 			// It's just the end of our sleep cycle.
@@ -257,7 +255,8 @@ func WaitTryClaim(ctx context.Context, eq *ClaimQuery, tc BackendClaimFunc, w Wa
 			}
 			return nil, err
 		}
-		// No error queue alerted:  go around again, trying to get a task.
+		// No error, queue alerted: go around again, trying to get the task
+		// that is ostensibly now present.
 	}
 }
 
