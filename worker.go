@@ -88,20 +88,15 @@ func (w *Worker) Next(ctx context.Context) bool {
 	select {
 	case <-ctx.Done():
 		defer un(lock(w))
-		w.err = ctx.Err()
+		w.claimCtx, w.task, w.err = ctx, nil, ctx.Err()
 		return false
 	default:
 	}
 
-	w.Lock()
-	w.claimCtx = ctx
-	leaseTime := w.leaseTime
-	w.Unlock()
-
-	task, err := w.eqc.Claim(ctx, w.Q, leaseTime)
+	task, err := w.eqc.Claim(ctx, w.Q, w.leaseTime)
 
 	defer un(lock(w))
-	w.task, w.err = task, err
+	w.claimCtx, w.task, w.err = ctx, task, err
 	return w.err == nil
 }
 
@@ -114,10 +109,14 @@ func (w *Worker) Task() *Task {
 // Do calls the given function while renewing the claim according to given options.
 func (w *Worker) Do(f func(context.Context) error) (*Task, error) {
 	w.Lock()
-	ctx, task, leaseTime := w.claimCtx, w.task, w.leaseTime
+	ctx, task, err := w.claimCtx, w.task, w.err
 	w.Unlock()
 
-	return w.eqc.DoWithRenew(ctx, task, leaseTime, f)
+	if err != nil {
+		return nil, err
+	}
+
+	return w.eqc.DoWithRenew(ctx, task, w.leaseTime, f)
 }
 
 // DoModify calls the given function while renewing the claim, and applies
@@ -128,7 +127,8 @@ func (w *Worker) Do(f func(context.Context) error) (*Task, error) {
 // Returns the result of the final call to Modify.
 func (w *Worker) DoModify(f func(context.Context) ([]ModifyArg, error)) (inserted []*Task, changed []*Task, err error) {
 	var args []ModifyArg
-	renewedTask, err := w.Do(func(ctx context.Context) (err error) {
+	renewedTask, err := w.Do(func(ctx context.Context) error {
+		var err error
 		args, err = f(ctx)
 		return err
 	})
