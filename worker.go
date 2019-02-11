@@ -87,6 +87,7 @@ func (w *Worker) Err() error {
 func (w *Worker) Next(ctx context.Context) bool {
 	select {
 	case <-ctx.Done():
+		defer un(lock(w))
 		w.err = ctx.Err()
 		return false
 	default:
@@ -94,9 +95,10 @@ func (w *Worker) Next(ctx context.Context) bool {
 
 	w.Lock()
 	w.claimCtx = ctx
+	leaseTime := w.leaseTime
 	w.Unlock()
 
-	task, err := w.eqc.Claim(w.claimCtx, w.Q, w.leaseTime)
+	task, err := w.eqc.Claim(ctx, w.Q, leaseTime)
 
 	defer un(lock(w))
 	w.task, w.err = task, err
@@ -112,10 +114,10 @@ func (w *Worker) Task() *Task {
 // Do calls the given function while renewing the claim according to given options.
 func (w *Worker) Do(f func(context.Context) error) (*Task, error) {
 	w.Lock()
-	ctx := w.claimCtx
+	ctx, task, leaseTime := w.claimCtx, w.task, w.leaseTime
 	w.Unlock()
 
-	return w.eqc.DoWithRenew(ctx, w.task, w.leaseTime, f)
+	return w.eqc.DoWithRenew(ctx, task, leaseTime, f)
 }
 
 // DoModify calls the given function while renewing the claim, and applies
@@ -155,7 +157,11 @@ func (w *Worker) DoModify(f func(context.Context) ([]ModifyArg, error)) (inserte
 		}
 	}
 
-	return w.eqc.Modify(w.claimCtx, WithModification(modification))
+	w.Lock()
+	ctx := w.claimCtx
+	w.Unlock()
+
+	return w.eqc.Modify(ctx, WithModification(modification))
 }
 
 // WorkerOption can be passed to AnalyticWorker to modify the worker
