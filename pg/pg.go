@@ -319,7 +319,7 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 // Modify attempts to apply an atomic modification to the task store. Either
 // all succeeds or all fails.
 func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserted, changed []*entroq.Task, err error) {
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 7; i++ {
 		inserted, changed, err = b.modify(ctx, mod)
 		// No error - we're done!
 		if err == nil {

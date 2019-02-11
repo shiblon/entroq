@@ -71,29 +71,33 @@ func New() *SubQ {
 
 // Notify sends notifications to at most one waiting goroutines that something
 // is ready on the given queue. If nobody is listening, it immediately drops
-// the event.
+// the event. This function does not block, but notifies in a new goroutine.
 func (s *SubQ) Notify(q string) {
 	defer un(lock(s))
 
-	// Because the Wait function lets go of the mutex just before selecting on
-	// its channel, there is a case where we can fail to notify even though
-	// it is reserved by a listener. Thus, we keep trying to send if we
-	// hit the default case while the channel is reserved.
-	//
-	// The entire point of keeping track of reservations is to allow exactly
-	// this kind of query, we just have to loop here to avoid that situation.
-	//
-	// Of course, we quit if the send succeeds.
-	for {
-		select {
-		case s.qs[q].Ch() <- q:
-			return
-		default:
-			if !s.qs[q].Reserved() {
+	qInfo := s.qs[q]
+
+	// Do this asynchronously - we don't need nor want to wait around for the
+	// cond function to run and the value to be picked up.
+	go func() {
+		// Because the Wait function lets go of the mutex just before selecting on
+		// its channel, there is a case where we can fail to notify even though
+		// it is reserved by a listener. Thus, we keep trying to send if we
+		// hit the default case while the channel is reserved.
+		//
+		// The entire point of keeping track of reservations is to allow exactly
+		// this kind of query, we just have to loop here to avoid that situation.
+		for {
+			select {
+			case qInfo.Ch() <- q:
 				return
+			default:
+				if !qInfo.Reserved() {
+					return
+				}
 			}
 		}
-	}
+	}()
 }
 
 // Wait waits on the given queue until something is notified on it or the
@@ -104,6 +108,10 @@ func (s *SubQ) Notify(q string) {
 // wait is satisfied and the function exits with a nil error. If it returns
 // false, then the function begins to wait for either a notification, a context
 // cancelation, or the expiration of pollWait.
+//
+// Note that cond should execute quickly and not block. It should test the
+// condition as fast as it can and return. Otherwise "Notify" might busy-wait
+// for a while, which is obviously not good.
 //
 // When pollWait expires or a suitable notification arrives, cond is called
 // again, and the above process repeats.
