@@ -256,6 +256,7 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 		ClaimantId: cq.Claimant.String(),
 		Queue:      cq.Queue,
 		DurationMs: int64(cq.Duration / time.Millisecond),
+		PollMs:     int64(cq.PollTime / time.Millisecond),
 	})
 	if err != nil {
 		return nil, err

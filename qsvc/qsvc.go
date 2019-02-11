@@ -93,7 +93,15 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to parse claimant ID: %v", err)
 	}
-	task, err := s.impl.Claim(ctx, req.Queue, time.Duration(req.DurationMs)*time.Millisecond, entroq.ClaimAs(claimant))
+	duration := time.Duration(req.DurationMs) * time.Millisecond
+	pollTime := time.Duration(0)
+	if req.PollMs > 0 {
+		pollTime = time.Duration(req.PollMs) * time.Millisecond
+	}
+
+	task, err := s.impl.Claim(ctx, req.Queue, duration,
+		entroq.ClaimAs(claimant),
+		entroq.ClaimPollTime(pollTime))
 	if err != nil {
 		if entroq.IsTimeout(err) {
 			return nil, status.Errorf(codes.DeadlineExceeded, "qsvc.Claim")
@@ -118,7 +126,9 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to parse claimant ID: %v", err)
 	}
-	task, err := s.impl.TryClaim(ctx, req.Queue, time.Duration(req.DurationMs)*time.Millisecond, entroq.ClaimAs(claimant))
+	duration := time.Duration(req.DurationMs) * time.Millisecond
+	task, err := s.impl.TryClaim(ctx, req.Queue, duration,
+		entroq.ClaimAs(claimant))
 	if err != nil {
 		return nil, status.Errorf(codes.Unknown, "failed to claim: %v", err)
 	}
