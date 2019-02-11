@@ -97,9 +97,44 @@ func (s *SubQ) Notify(q string) {
 }
 
 // Wait waits on the given queue until something is notified on it or the
-// context expires, whichever comes first. You should always call this
-// function assuming it might block forever *even if the queue is notified*.
-func (s *SubQ) Wait(ctx context.Context, q string) error {
+// context expires, whichever comes first. This is the basic behavior when
+// pollWait is 0 and cond is nil.
+//
+// If cond is not nil, it is called immediately. If it returns true, then the
+// wait is satisfied and the function exits with a nil error. If it returns
+// false, then the function begins to wait for either a notification, a context
+// cancelation, or the expiration of pollWait.
+//
+// When pollWait expires or a suitable notification arrives, cond is called
+// again, and the above process repeats.
+//
+// If pollWait is 0, the only way to check cond again is if the channel is
+// notified. Otherwise Wait terminates with an error.
+//
+// This implementation allows you to attempt a polling operation, then wait for
+// notification that the next one is likely to succeed, then check again just
+// in case you got scooped by another process, repeating until something is
+// truly available.
+//
+// Note that cond is called directly from this function, so if it needs a
+// context, it can simply close over the same one passed in here.
+func (s *SubQ) Wait(ctx context.Context, q string, pollWait time.Duration, cond func() bool) error {
+	if cond == nil {
+		// A nil cond function means, basically, "just wait once and tell me what happened".
+		// The first time it's called, it returns false, then true ever after,
+		// giving use the wait behavior we want below. Wrapped in an
+		// immediately-called closure to avoid scope leakage.
+		cond = func() func() bool {
+			var done bool
+			return func() bool {
+				defer func() {
+					done = true
+				}()
+				return done
+			}
+		}()
+	}
+
 	var qInfo *sub
 	func() {
 		defer un(lock(s))
@@ -137,14 +172,24 @@ func (s *SubQ) Wait(ctx context.Context, q string) error {
 	}()
 	defer qInfo.Release()
 
-	// Since we have already added our intent to listen on this channel,
-	// it won't get deleted from the queue map before the select executes
-	// below.
+	for {
+		if cond() {
+			return nil
+		}
 
-	select {
-	case <-qInfo.Ch():
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+		// If not waiting, after is nil, so never satisfied below.
+		var after <-chan time.Time
+		if pollWait > 0 {
+			after = time.After(pollWait)
+		}
+
+		select {
+		case <-after:
+			// Go around again, even though not signaled.
+		case <-qInfo.Ch():
+			// Got a value, go around again to run cond to see if it's still there.
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 }

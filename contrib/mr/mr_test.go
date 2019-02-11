@@ -76,13 +76,13 @@ func TestMapReduce_inMemorySmall(t *testing.T) {
 	}
 }
 
-func TestMapReduce_checkLarge(t *testing.T) {
+func TestMapReduce_check(t *testing.T) {
 	config := &quick.Config{
 		MaxCount: 5,
 		Values: func(values []reflect.Value, rand *rand.Rand) {
-			values[0] = reflect.ValueOf(rand.Intn(5000) + 5000)
-			values[1] = reflect.ValueOf(rand.Intn(100) + 1)
-			values[2] = reflect.ValueOf(rand.Intn(20) + 1)
+			values[0] = reflect.ValueOf(rand.Intn(10) + 10)
+			values[1] = reflect.ValueOf(rand.Intn(10) + 10)
+			values[2] = reflect.ValueOf(rand.Intn(2) + 1)
 		},
 	}
 

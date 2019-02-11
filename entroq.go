@@ -186,8 +186,19 @@ func PollTryClaim(ctx context.Context, eq *ClaimQuery, tc BackendClaimFunc) (*Ta
 
 // Waiter can wait for an event on a given key (e.g., queue name).
 type Waiter interface {
-	// Wait waits for an event on the given key. Competes with other waiters.
-	Wait(ctx context.Context, key string) error
+	// Wait waits for an event on the given key, calling cond after poll
+	// intervals until the key is notified, cond returns true, or the context
+	// is canceled.
+	//
+	// If cond is nil, this function returns when the channel is notified,
+	// the poll interval is exceeded, or the context is canceled. Only the last
+	// event causes a non-nil error.
+	//
+	// If poll is 0, it can never be exceeded.
+	//
+	// A common use is to use poll=0 and cond=nil, causing this to simply wait
+	// for a notification.
+	Wait(ctx context.Context, key string, poll time.Duration, cond func() bool) error
 }
 
 // Notifier can be notified on a given key (e.g., queue name);
@@ -197,11 +208,10 @@ type Notifier interface {
 	Notify(key string)
 }
 
-// NotifyWaiter can be notified and waited on for a given key (e.g., queue name).
-// The notification only ever blocks a single waiter.
+// NotifyWaiter can wait for and notify events.
 type NotifyWaiter interface {
-	Waiter
 	Notifier
+	Waiter
 }
 
 // NotifyModified takes inserted and changed tasks and notifies once per unique queue/ID pair.
@@ -231,34 +241,21 @@ func NotifyModified(n Notifier, inserted, changed []*Task) {
 // canceled, and should return a nil error if the wait was successful
 // (something became available).
 func WaitTryClaim(ctx context.Context, eq *ClaimQuery, tc BackendClaimFunc, w Waiter) (*Task, error) {
-	for {
-		// Make sure we weren't stopped by the parent context.
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-		task, err := tc(ctx, eq)
-		if err != nil {
-			return nil, err
-		}
-		if task != nil {
-			return task, nil
-		}
-		// No error, no task - wait on the queue.
-		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-
-		if err := w.Wait(ctx, eq.Queue); err != nil {
-			// If this is a deadline-exceeded error, we'll continue around again.
-			// It's just the end of our sleep cycle.
-			if err == context.DeadlineExceeded {
-				continue
-			}
-			return nil, err
-		}
-		// No error queue alerted:  go around again, trying to get a task.
+	var (
+		task    *Task
+		condErr error
+	)
+	if err := w.Wait(ctx, eq.Queue, 30*time.Second, func() bool {
+		// If we get either a task or an error, time to stop trying.
+		task, condErr = tc(ctx, eq)
+		return task != nil || condErr != nil
+	}); err != nil {
+		return nil, err
 	}
+	if condErr != nil {
+		return nil, condErr
+	}
+	return task, nil
 }
 
 // Backend describes all of the functions that any backend has to implement

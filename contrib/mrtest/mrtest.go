@@ -49,7 +49,7 @@ func MRCheck(ctx context.Context, eq *entroq.EntroQ, numDocs, numMappers, numRed
 		wordsPerDoc = 1000
 	)
 
-	log.Printf("Checking MR with %d mappers and %d reducers", numMappers, numReducers)
+	log.Printf("Checking MR with docs=%d, mappers=%d, reducers=%d", numDocs, numMappers, numReducers)
 	// Flattened slice of words (keep track in a histogram, too).
 	// Random histogram of "words" (integers).
 	var occurrences []string
