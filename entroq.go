@@ -16,6 +16,8 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+const DefaultClaimPollTime = 30 * time.Second
+
 // TaskID contains the identifying parts of a task. If IDs don't match
 // (identifier and version together), then operations fail on those tasks.
 type TaskID struct {
@@ -123,6 +125,7 @@ type ClaimQuery struct {
 	Queue    string        // The name of the queue to claim from.
 	Claimant uuid.UUID     // The ID of the process trying to make the claim.
 	Duration time.Duration // How long the task should be claimed for if successful.
+	PollTime time.Duration // Length of time between (possibly interruptible) sleep and polling.
 }
 
 // TasksQuery holds information for a tasks query.
@@ -245,7 +248,11 @@ func WaitTryClaim(ctx context.Context, eq *ClaimQuery, tc BackendClaimFunc, w Wa
 		task    *Task
 		condErr error
 	)
-	if err := w.Wait(ctx, eq.Queue, 30*time.Second, func() bool {
+	pollTime := eq.PollTime
+	if pollTime == 0 {
+		pollTime = DefaultClaimPollTime
+	}
+	if err := w.Wait(ctx, eq.Queue, pollTime, func() bool {
 		// If we get either a task or an error, time to stop trying.
 		task, condErr = tc(ctx, eq)
 		return task != nil || condErr != nil
@@ -446,6 +453,13 @@ type ClaimOpt func(*ClaimQuery)
 func ClaimAs(id uuid.UUID) ClaimOpt {
 	return func(q *ClaimQuery) {
 		q.Claimant = id
+	}
+}
+
+// ClaimPollTime sets the polling time for a claim. Set to DefaultClaimPollTime if left at 0.
+func ClaimPollTime(d time.Duration) ClaimOpt {
+	return func(q *ClaimQuery) {
+		q.PollTime = d
 	}
 }
 
