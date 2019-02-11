@@ -863,6 +863,7 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 	// When all tasks are present, start map and reduce workers. They'll all exit when finished.
 	g, ctx := errgroup.WithContext(ctx)
 
+	log.Printf("Starting %d mappers", mr.NumMappers)
 	for i := 0; i < mr.NumMappers; i++ {
 		i := i
 		worker := NewMapWorker(mr.client, qMapInput,
@@ -877,6 +878,7 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 		})
 	}
 
+	log.Printf("Starting %d reducers", mr.NumReducers)
 	for i := 0; i < mr.NumReducers; i++ {
 		name := fmt.Sprint(i)
 		worker := NewReduceWorker(mr.client, qMapInput, path.Join(qReduceInput, name),

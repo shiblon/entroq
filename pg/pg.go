@@ -323,6 +323,11 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 		inserted, changed, err = b.modify(ctx, mod)
 		// No error - we're done!
 		if err == nil {
+			// Notify any waiters of tasks that were just changed/inserted that are
+			// ready to go.
+			if b.nw != nil {
+				entroq.NotifyModified(b.nw, inserted, changed)
+			}
 			return inserted, changed, nil
 		}
 		// If it's not a dependency error, no retry.
@@ -405,12 +410,6 @@ func (b *backend) modify(ctx context.Context, mod *entroq.Modification) (inserte
 			return nil, nil, wrapPGError(err, "pg.modify scan failed in update %q", chg.ID)
 		}
 		changed = append(changed, t)
-	}
-
-	// Notify any waiters of tasks that were just changed/inserted that are
-	// ready to go.
-	if b.nw != nil {
-		entroq.NotifyModified(b.nw, inserted, changed)
 	}
 
 	return inserted, changed, nil
