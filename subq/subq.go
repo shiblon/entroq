@@ -32,15 +32,15 @@ func (s *sub) Ch() chan string {
 	return s.ch
 }
 
-func (s *sub) Reserve() {
+func (s *sub) Add() {
 	defer un(lock(s))
 	s.listeners++
 }
 
-func (s *sub) Release() {
+func (s *sub) Done() {
 	defer un(lock(s))
 	if s.listeners == 0 {
-		log.Fatal("Release before Reserve")
+		log.Fatal("Done before Add")
 	}
 	s.listeners--
 }
@@ -118,10 +118,10 @@ func makeDefaultCondition() func() bool {
 	}
 }
 
-// qInfo returns the requested queue wait channel and reservation mechanism,
+// addListener returns the requested queue wait channel and reservation mechanism,
 // creating one if not present. If it creates one, it also starts up a garbage
 // collection routine for it.
-func (s *SubQ) qInfo(q string) *sub {
+func (s *SubQ) addListener(q string) *sub {
 	defer un(lock(s))
 
 	qs := s.qs
@@ -129,12 +129,12 @@ func (s *SubQ) qInfo(q string) *sub {
 	// If there isn't any sync info for this queue, create it and add this
 	// waiter. Otherwise just add the waiter; the sync info is there already.
 	if qs[q] != nil {
-		qs[q].Reserve()
+		qs[q].Add()
 		return qs[q]
 	}
 
 	qs[q] = &sub{ch: make(chan string)}
-	qs[q].Reserve()
+	qs[q].Add()
 
 	// Start up a watchdog that deletes when there are no more listeners.
 	// Only do this when creating a new pInfo entry.
@@ -194,8 +194,8 @@ func (s *SubQ) Wait(ctx context.Context, q string, pollWait time.Duration, condi
 		return nil
 	}
 
-	qi := s.qInfo(q)
-	defer qi.Release()
+	qi := s.addListener(q)
+	defer qi.Done()
 
 	for !condition() {
 		select {
