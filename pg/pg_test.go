@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"math/rand"
 	"os"
@@ -72,6 +71,7 @@ func TestSimpleWorker(t *testing.T) {
 	}
 	defer stop()
 
+	log.Printf("Simple worker")
 	qtest.SimpleWorker(ctx, t, client, "pgtest/"+uuid.New().String())
 }
 
@@ -98,7 +98,7 @@ func TestMapReduce_checkSmall(t *testing.T) {
 	config := &quick.Config{
 		MaxCount: 3,
 		Values: func(values []reflect.Value, rand *rand.Rand) {
-			values[0] = reflect.ValueOf(rand.Intn(200) + 100)
+			values[0] = reflect.ValueOf(rand.Intn(100) + 100)
 			values[1] = reflect.ValueOf(rand.Intn(30) + 10)
 			values[2] = reflect.ValueOf(rand.Intn(10) + 1)
 		},
@@ -154,28 +154,13 @@ func startPostgres(ctx context.Context) (port int, stop func(), err error) {
 	// Run detached. Check error. Detaches only once Postgres is downloaded and initialized.
 	name := fmt.Sprintf("testpg-%s", uuid.New())
 
-	tmpPrefix := os.TempDir()
-	if strings.HasPrefix(tmpPrefix, "/var") {
-		tmpPrefix = "/tmp"
-	}
-	pgDir, err := ioutil.TempDir(tmpPrefix, name)
-	if err != nil {
-		return 0, nil, fmt.Errorf("startPostgres tmpdir: %v", err)
-	}
-	defer func() {
-		if err != nil {
-			os.RemoveAll(pgDir)
-		}
-	}()
-
 	log.Printf("Starting postgres container %q...", name)
-	if err := run(ctx, "docker", "run", "-p", "0:5432", "-d", "-v", pgDir+":/var/lib/postgresql/data", "--name", name, "postgres"); err != nil {
+	if err := run(ctx, "docker", "run", "-p", "0:5432", "-d", "--name", name, "postgres"); err != nil {
 		return 0, nil, fmt.Errorf("start postgres container: %v", err)
 	}
 	log.Print("Container is up")
 
 	stopFunc := func() {
-		os.RemoveAll(pgDir)
 		log.Printf("Stopping postgres container %q...", name)
 		if err := run(ctx, "docker", "container", "stop", name); err != nil {
 			log.Printf("Error stopping: %v", err)

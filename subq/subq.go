@@ -77,6 +77,11 @@ func (s *SubQ) Notify(q string) {
 
 	qInfo := s.qs[q]
 
+	// Drop if nobody is listening.
+	if !qInfo.Reserved() {
+		return
+	}
+
 	// Do this asynchronously - we don't need nor want to wait around for the
 	// cond function to run and the value to be picked up.
 	go func() {
@@ -91,7 +96,7 @@ func (s *SubQ) Notify(q string) {
 			select {
 			case qInfo.Ch() <- q:
 				return
-			default:
+			case <-time.After(500 * time.Millisecond):
 				if !qInfo.Reserved() {
 					return
 				}
@@ -174,7 +179,7 @@ func (s *SubQ) Wait(ctx context.Context, q string, pollWait time.Duration, cond 
 					return
 				}
 				s.Unlock()
-				time.Sleep(10 * time.Second)
+				time.Sleep(1 * time.Second)
 			}
 		}()
 	}()

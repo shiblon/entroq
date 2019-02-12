@@ -103,7 +103,7 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 	})
 
 	select {
-	case <-time.After(2 * time.Second):
+	case <-time.After(1 * time.Second):
 	case <-ctx.Done():
 		t.Fatalf("Sleep: %v", ctx.Err())
 	}
@@ -116,9 +116,9 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 		}
 		inserted = append(inserted, ins...)
 		select {
-		case <-time.After(1 * time.Second):
 		case <-ctx.Done():
 			t.Fatalf("Canceled while inserting: %v", ctx.Err())
+		default:
 		}
 	}
 
@@ -133,7 +133,7 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 		select {
 		case <-ctx.Done():
 			t.Fatalf("Context error waiting for queues to empty: %v", err)
-		case <-time.After(2 * time.Second):
+		default:
 		}
 	}
 
