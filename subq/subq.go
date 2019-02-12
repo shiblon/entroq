@@ -118,6 +118,17 @@ func makeDefaultCondition() func() bool {
 	}
 }
 
+// tryCollect attempts to collect an unused queue listener, returning true if
+// it was able to do it.
+func (s *SubQ) tryCollect(q string) bool {
+	defer un(lock(s))
+	if !s.qs[q].Reserved() {
+		delete(s.qs, q)
+		return true
+	}
+	return false
+}
+
 // addListener returns the requested queue wait channel and reservation mechanism,
 // creating one if not present. If it creates one, it also starts up a garbage
 // collection routine for it.
@@ -137,18 +148,9 @@ func (s *SubQ) addListener(q string) *sub {
 	qs[q].Add()
 
 	// Start up a watchdog that deletes when there are no more listeners.
-	// Only do this when creating a new pInfo entry.
+	// Only do this when creating a new queue listener entry.
 	go func() {
-		for {
-			s.Lock()
-			if !qs[q].Reserved() {
-				delete(qs, q)
-			}
-			if qs[q] == nil {
-				s.Unlock()
-				return
-			}
-			s.Unlock()
+		for !s.tryCollect(q) {
 			time.Sleep(1 * time.Second)
 		}
 	}()
