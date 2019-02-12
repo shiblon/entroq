@@ -346,29 +346,6 @@ func NewMapWorker(eq *entroq.EntroQ, inQueue string, newEmitter func() MapEmitte
 func (w *MapWorker) Run(ctx context.Context) error {
 	log.Printf("Mapper %q starting", w.Name)
 	defer log.Printf("Mapper %q finished", w.Name)
-	ctx, cancel := context.WithCancel(ctx)
-	g, ctx := errgroup.WithContext(ctx)
-	g.Go(func() error {
-		for {
-			empty, err := w.client.QueuesEmpty(ctx, entroq.MatchExact(w.InputQueue))
-			if err != nil {
-				return fmt.Errorf("mr.MapWorker.Run: %v", err)
-			}
-			if empty {
-				return nil // Nothing to do - quit now.
-			}
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(claimWait):
-			}
-		}
-	})
-
-	go func() {
-		g.Wait()
-		cancel()
-	}()
 
 	wrk := w.client.NewWorker(w.InputQueue)
 
@@ -407,23 +384,18 @@ func (w *MapWorker) Run(ctx context.Context) error {
 				log.Printf("mr.MapWorker.Run.DoModify dependency: %v", err)
 				continue
 			}
+			if entroq.IsCanceled(err) {
+				log.Printf("mr.MapWorker.Run.DoModify canceled: %v", err)
+				break
+			}
 			return fmt.Errorf("mr.MapWorker.Run.DoModify: %v", err)
 		}
-		empty, err := w.client.QueuesEmpty(ctx, entroq.MatchExact(w.InputQueue))
-		if err != nil {
-			return fmt.Errorf("mr.MapWorker.Run: %v", err)
-		}
-		if empty {
-			return nil // all finished.
-		}
 	}
-	if err := g.Wait(); err != nil {
+	if err := wrk.Err(); err != nil && !entroq.IsCanceled(err) {
+		log.Printf("wrk err: %v", err)
 		return err
 	}
-	if err := wrk.Err(); err == context.Canceled {
-		return nil
-	}
-	return wrk.Err()
+	return nil
 }
 
 // ReducerInput provides a streaming interface for getting values during reduction.
@@ -859,21 +831,9 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 		qReduceOutput = path.Join(qReduce, "output")
 	)
 
-	log.Printf("Creating tasks for inputs")
-	// First create map tasks for all of the data.
-	for _, kv := range mr.Data {
-		b, err := json.Marshal(kv)
-		if err != nil {
-			return "", fmt.Errorf("marshal input: %v", err)
-		}
-		if _, _, err := mr.client.Modify(ctx, entroq.InsertingInto(qMapInput, entroq.WithValue(b))); err != nil {
-			return "", fmt.Errorf("insert map input: %v", err)
-		}
-	}
-	log.Printf("Created %d tasks", len(mr.Data))
-
-	// When all tasks are present, start map and reduce workers. They'll all exit when finished.
 	g, ctx := errgroup.WithContext(ctx)
+
+	mapCtx, mapCancel := context.WithCancel(ctx)
 
 	log.Printf("Starting %d mappers", mr.NumMappers)
 	for i := 0; i < mr.NumMappers; i++ {
@@ -886,9 +846,45 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 			WithEarlyReducer(mr.EarlyReduce))
 
 		g.Go(func() error {
-			return worker.Run(ctx)
+			return worker.Run(mapCtx)
 		})
 	}
+
+	log.Printf("Creating %d tasks for inputs", len(mr.Data))
+	// First create map tasks for all of the data.
+	for _, kv := range mr.Data {
+		b, err := json.Marshal(kv)
+		if err != nil {
+			return "", fmt.Errorf("marshal input: %v", err)
+		}
+		if _, _, err := mr.client.Modify(ctx, entroq.InsertingInto(qMapInput, entroq.WithValue(b))); err != nil {
+			return "", fmt.Errorf("insert map input: %v", err)
+		}
+	}
+
+	log.Printf("Created %d tasks", len(mr.Data))
+
+	// When all tasks are present, start map and reduce workers. They'll all exit when finished.
+	// Check for empty mapper queue. If empty, cancel all map workers.
+	log.Printf("Starting empty check")
+	g.Go(func() error {
+		for {
+			empty, err := mr.client.QueuesEmpty(ctx, entroq.MatchExact(qMapInput))
+			log.Printf("empty check: %v %v", empty, err)
+			if err != nil {
+				return fmt.Errorf("mr.MapReduce.Run empty: %v", err)
+			}
+			if empty {
+				mapCancel()
+				return nil // Nothing to do - quit now.
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(claimWait / 2):
+			}
+		}
+	})
 
 	log.Printf("Starting %d reducers", mr.NumReducers)
 	for i := 0; i < mr.NumReducers; i++ {
