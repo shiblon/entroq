@@ -226,7 +226,7 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	}
 
 	// Claim ready task.
-	claimCtx, _ := context.WithTimeout(ctx, 10*time.Millisecond)
+	claimCtx, _ := context.WithTimeout(ctx, 5*time.Second)
 	claimed, err := client.Claim(claimCtx, queue, 10*time.Second)
 
 	if err != nil {
