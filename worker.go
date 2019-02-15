@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/pkg/errors"
 )
 
 // Worker creates an iterator-like protocol for processing tasks in a queue,
@@ -113,7 +114,7 @@ func (w *Worker) Do(f func(context.Context) error) (*Task, error) {
 	w.Unlock()
 
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "worker do")
 	}
 
 	return w.eqc.DoWithRenew(ctx, task, w.leaseTime, f)
@@ -130,10 +131,10 @@ func (w *Worker) DoModify(f func(context.Context) ([]ModifyArg, error)) (inserte
 	renewedTask, err := w.Do(func(ctx context.Context) error {
 		var err error
 		args, err = f(ctx)
-		return err
+		return errors.Wrap(err, "do")
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, errors.Wrap(err, "worker do modify")
 	}
 
 	// Find any modifications that reference the renewed task's ID (but not

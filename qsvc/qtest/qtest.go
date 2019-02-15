@@ -4,7 +4,6 @@ package qtest
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"net"
 	"path"
 	"strings"
@@ -12,14 +11,13 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/pkg/errors"
 	"github.com/shiblon/entroq"
 	grpcbackend "github.com/shiblon/entroq/grpc"
 	"github.com/shiblon/entroq/qsvc"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health"
-	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
 	pb "github.com/shiblon/entroq/proto"
@@ -40,7 +38,7 @@ type Dialer func() (net.Conn, error)
 func ClientService(ctx context.Context, opener entroq.BackendOpener) (client *entroq.EntroQ, stop func(), err error) {
 	s, dial, err := StartService(ctx, opener)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, errors.Wrap(err, "client service")
 	}
 	defer func() {
 		if err != nil {
@@ -52,7 +50,7 @@ func ClientService(ctx context.Context, opener entroq.BackendOpener) (client *en
 		grpcbackend.WithNiladicDialer(dial),
 		grpcbackend.WithInsecure()))
 	if err != nil {
-		return nil, nil, fmt.Errorf("start client on in-memory service: %v", err)
+		return nil, nil, errors.Wrap(err, "start client on in-memory service")
 	}
 
 	return client, func() {
@@ -66,7 +64,7 @@ func StartService(ctx context.Context, opener entroq.BackendOpener) (*grpc.Serve
 	lis := bufconn.Listen(bufSize)
 	svc, err := qsvc.New(ctx, opener)
 	if err != nil {
-		return nil, nil, fmt.Errorf("start service: %v", err)
+		return nil, nil, errors.Wrap(err, "start service")
 	}
 	s := grpc.NewServer()
 	hpb.RegisterHealthServer(s, health.NewServer())
@@ -96,10 +94,10 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 				consumed = append(consumed, w.Task())
 				return []entroq.ModifyArg{w.Task().AsDeletion()}, nil
 			}); err != nil {
-				return fmt.Errorf("worker loop error: %v", err)
+				return errors.Wrap(err, "worker loop error")
 			}
 		}
-		return w.Err()
+		return errors.Wrap(w.Err(), "SimpleWorker")
 	})
 
 	select {
@@ -138,7 +136,7 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 	}
 
 	cancel()
-	if err := g.Wait(); err != nil && status.Code(err) != codes.Canceled {
+	if err := g.Wait(); err != nil && !entroq.IsCanceled(err) {
 		t.Fatalf("Worker exit error: %v", err)
 	}
 
@@ -166,7 +164,7 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	// Claim from empty queue.
 	task, err := client.TryClaim(ctx, queue, 100*time.Millisecond)
 	if err != nil {
-		t.Fatalf("Got unexpected error for claiming from an empty queue: %v", err)
+		t.Fatalf("Got unexpected error claiming from empty queue: %v", err)
 	}
 	if task != nil {
 		t.Fatalf("Got unexpected non-nil claim response from empty queue:\n%s", task)
@@ -193,10 +191,10 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 
 	inserted, changed, err := client.Modify(ctx, entroq.Inserting(insData...))
 	if err != nil {
-		t.Fatalf("Got unexpected error inserting two tasks: %v", err)
+		t.Fatalf("Got unexpected error inserting two tasks: %+v", err)
 	}
 	if changed != nil {
-		t.Fatalf("Got unexpected changes during insertion: %v", err)
+		t.Fatalf("Got unexpected changes during insertion: %+v", err)
 	}
 	if diff := EqualAllTasks(insWant, inserted); diff != "" {
 		t.Fatalf("Modify tasks unexpected result, ignoring ID and time fields (-want +got):\n%v", diff)
@@ -222,15 +220,15 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 		t.Fatalf("Tasks call failed after insertions: %v", err)
 	}
 	if diff := EqualAllTasks(insWant, tasksGot); diff != "" {
-		t.Fatalf("Tasks unexpected return, ignoring ID and time fields (-want +got):\n%v", diff)
+		t.Fatalf("Tasks unexpected return, ignoring ID and time fields (-want +got):\n%+v", diff)
 	}
 
 	// Claim ready task.
-	claimCtx, _ := context.WithTimeout(ctx, 10*time.Millisecond)
+	claimCtx, _ := context.WithTimeout(ctx, 5*time.Second)
 	claimed, err := client.Claim(claimCtx, queue, 10*time.Second)
 
 	if err != nil {
-		t.Fatalf("Got unexpected error for claiming from a queue with one ready task: %v", err)
+		t.Fatalf("Got unexpected error for claiming from a queue with one ready task: %+v", err)
 	}
 	if claimed == nil {
 		t.Fatalf("Unexpected nil result from blocking Claim")

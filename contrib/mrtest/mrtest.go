@@ -80,7 +80,9 @@ func MRCheck(ctx context.Context, eq *entroq.EntroQ, numDocs, numMappers, numRed
 		return bytes.Compare(expected[i].Key, expected[j].Key) < 0
 	})
 
-	mr := NewMapReduce(eq, "/mrtest/"+uuid.New().String(),
+	queuePrefix := "/mrtest/" + uuid.New().String()
+
+	mr := NewMapReduce(eq, queuePrefix,
 		WithNumMappers(numMappers),
 		WithNumReducers(numReducers),
 		WithMap(WordCountMapper),
@@ -148,6 +150,15 @@ func MRCheck(ctx context.Context, eq *entroq.EntroQ, numDocs, numMappers, numRed
 		if want, got := expected[i].String(), kv.String(); want != got {
 			log.Printf("Expected %s, got %s", want, got)
 			good = false
+		}
+	}
+	if !good {
+		queues, err := eq.Queues(ctx, entroq.MatchPrefix(queuePrefix))
+		for q, n := range queues {
+			log.Printf("queue %q = %d", q, n)
+		}
+		if err != nil {
+			log.Printf("queues error: %v", err)
 		}
 	}
 	return good

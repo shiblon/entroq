@@ -12,12 +12,13 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/lib/pq"
+	"github.com/pkg/errors"
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/subq"
 )
 
 func escp(p string) string {
-	return strings.NewReplacer("=", "\\=", " ", "__").Replace(p)
+	return strings.NewReplacer("=", "\\=", " ", "\\ ").Replace(p)
 }
 
 type pgOptions struct {
@@ -100,7 +101,7 @@ func Opener(hostPort string, opts ...PGOpt) entroq.BackendOpener {
 			escp(options.db))
 		db, err := sql.Open("postgres", connStr)
 		if err != nil {
-			return nil, fmt.Errorf("failed to open postgres DB: %v", err)
+			return nil, errors.Wrap(err, "failed to open postgres DB")
 		}
 		for i := 0; i < options.attempts; i++ {
 			if err = db.PingContext(ctx); err == nil {
@@ -109,12 +110,12 @@ func Opener(hostPort string, opts ...PGOpt) entroq.BackendOpener {
 			if i < options.attempts-1 {
 				select {
 				case <-ctx.Done():
-					return nil, ctx.Err()
+					return nil, errors.Wrap(ctx.Err(), "pg opener")
 				case <-time.After(5 * time.Second):
 				}
 			}
 		}
-		return nil, fmt.Errorf("time out postgres init: %v", err)
+		return nil, errors.Wrap(err, "time out postgres init")
 	}
 }
 
@@ -146,14 +147,14 @@ func New(ctx context.Context, db *sql.DB, nw entroq.NotifyWaiter) (*backend, err
 		return nil, io.EOF
 	}
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize database: %v", err)
+		return nil, errors.Wrap(err, "failed to initialize database")
 	}
 	return b, nil
 }
 
 // Close closes the underlying database connection.
 func (b *backend) Close() error {
-	return b.db.Close()
+	return errors.Wrap(b.db.Close(), "pg backend close")
 }
 
 // initDB sets up the database to have the appropriate tables and necessary
@@ -173,7 +174,7 @@ func (b *backend) initDB(ctx context.Context) error {
 		CREATE INDEX IF NOT EXISTS byQueue ON tasks (queue);
 		CREATE INDEX IF NOT EXISTS byQueueAt ON tasks (queue, at);
 	`)
-	return err
+	return errors.Wrap(err, "initDB")
 }
 
 // Queues returns a mapping from queue names to task counts within them.
@@ -207,7 +208,7 @@ func (b *backend) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[strin
 
 	rows, err := b.db.QueryContext(ctx, q, values...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get queue names: %v", err)
+		return nil, errors.Wrap(err, "queue names")
 	}
 
 	defer rows.Close()
@@ -218,12 +219,12 @@ func (b *backend) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[strin
 			count int
 		)
 		if err := rows.Scan(&q, &count); err != nil {
-			return nil, fmt.Errorf("queue scan failed: %v", err)
+			return nil, errors.Wrap(err, "row scan")
 		}
 		queues[q] = count
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("queue iteration failed: %v", err)
+		return nil, errors.Wrap(err, "queue iteration")
 	}
 	return queues, nil
 }
@@ -245,19 +246,19 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 
 	rows, err := b.db.QueryContext(ctx, q, values...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get tasks for queue %q: %v", tq.Queue, err)
+		return nil, errors.Wrapf(err, "queue tasks %q", tq.Queue)
 	}
 	defer rows.Close()
 	var tasks []*entroq.Task
 	for rows.Next() {
 		t := &entroq.Task{}
 		if err := rows.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Created, &t.Modified, &t.Claimant, &t.Value); err != nil {
-			return nil, fmt.Errorf("task scan failed: %v", err)
+			return nil, errors.Wrap(err, "task scan")
 		}
 		tasks = append(tasks, t)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("task iteration failed for queue %q: %v", tq.Queue, err)
+		return nil, errors.Wrapf(err, "queue task iteration %q", tq.Queue)
 	}
 	return tasks, nil
 }
@@ -277,7 +278,7 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
 	task := new(entroq.Task)
 	if cq.Duration == 0 {
-		return nil, fmt.Errorf("no duration set for claim")
+		return nil, errors.Errorf("no duration set for claim %q", cq.Queue)
 	}
 	now := time.Now()
 	err := b.db.QueryRowContext(ctx, `
@@ -308,12 +309,20 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 		&task.Value,
 	)
 	if err != nil {
-		if err != sql.ErrNoRows {
-			return nil, err
+		if err == sql.ErrNoRows {
+			return nil, nil
 		}
-		return nil, nil
+		return nil, errors.Wrap(err, "pg try claim")
 	}
 	return task, nil
+}
+
+func isSerialization(err error) bool {
+	if err == nil {
+		return false
+	}
+	e, ok := errors.Cause(err).(*pq.Error)
+	return ok && e.Code == "40001"
 }
 
 // Modify attempts to apply an atomic modification to the task store. Either
@@ -330,21 +339,21 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 			}
 			return inserted, changed, nil
 		}
-		// If it's not a dependency error, no retry.
-		if !entroq.IsDependency(err) {
-			return nil, nil, fmt.Errorf("pg.Modify: %v", err)
+		if _, ok := entroq.AsDependency(err); ok {
+			// We know what's wrong, no reason to retry.
+			return nil, nil, errors.Wrap(err, "pg modify dependency")
 		}
-		// If the cause of the dependency issue is known, we just return it.
-		if !err.(entroq.DependencyError).IsUnknown() {
-			return nil, nil, entroq.WrapDependencyError(err, "pg.Modify")
+		if !isSerialization(err) {
+			// We didn't get a retriable serialization error, return.
+			return nil, nil, errors.Wrap(err, "pg modify unknown")
 		}
-		select {
-		case <-ctx.Done():
-			return nil, nil, ctx.Err()
-		case <-time.After(time.Second):
-		}
+		// Serialization error - go around again.
+		time.Sleep(time.Second)
 	}
-	return nil, nil, entroq.WrapDependencyError(err, "pg.Modify retry limit")
+	// Serialization errors that can't be retried are passed as empty
+	// dependency errors. We don't know what the conflict was, but it was like
+	// a dependency problem.
+	return nil, nil, entroq.DependencyErrorf("retry limit: %v", err)
 }
 
 // modify is a private helper to allow for transaction retries when serialization is violated.
@@ -352,7 +361,7 @@ func (b *backend) modify(ctx context.Context, mod *entroq.Modification) (inserte
 	now := time.Now()
 	tx, err := b.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to start transaction: %v", err)
+		return nil, nil, errors.Wrap(err, "failed to start transaction")
 	}
 	defer func() {
 		if err != nil {
@@ -364,11 +373,11 @@ func (b *backend) modify(ctx context.Context, mod *entroq.Modification) (inserte
 
 	foundDeps, err := depQuery(ctx, tx, mod)
 	if err != nil {
-		return nil, nil, entroq.WrapDependencyError(err, "pg.modify")
+		return nil, nil, errors.Wrap(err, "get deps")
 	}
 
 	if err := mod.DependencyError(foundDeps); err != nil {
-		return nil, nil, entroq.WrapDependencyError(err, "pg.modify")
+		return nil, nil, errors.Wrap(err, "dependency issue found")
 	}
 
 	// Once we get here, we know that all of the dependencies were present.
@@ -377,7 +386,7 @@ func (b *backend) modify(ctx context.Context, mod *entroq.Modification) (inserte
 	for _, tid := range mod.Deletes {
 		q := "DELETE FROM tasks WHERE id = $1 AND version = $2"
 		if _, err := tx.ExecContext(ctx, q, tid.ID, tid.Version); err != nil {
-			return nil, nil, wrapPGError(err, "pg.modify delete %q", tid)
+			return nil, nil, errors.Wrapf(err, "pg modify delete %s", tid)
 		}
 	}
 
@@ -394,7 +403,7 @@ func (b *backend) modify(ctx context.Context, mod *entroq.Modification) (inserte
 			RETURNING id, version, queue, at, claimant, value, created, modified
 		`, uuid.New(), 0, ins.Queue, at, mod.Claimant, ins.Value, now, now)
 		if err := row.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Claimant, &t.Value, &t.Created, &t.Modified); err != nil {
-			return nil, nil, wrapPGError(err, "pg.modify scan failed in insert %q", err)
+			return nil, nil, errors.Wrap(err, "pg modify insert scan")
 		}
 		inserted = append(inserted, t)
 	}
@@ -407,7 +416,7 @@ func (b *backend) modify(ctx context.Context, mod *entroq.Modification) (inserte
 			RETURNING id, version, queue, at, claimant, modified, created, value
 		`, now, chg.Queue, chg.At, chg.Value, chg.ID, chg.Version)
 		if err := row.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Claimant, &t.Modified, &t.Created, &t.Value); err != nil {
-			return nil, nil, wrapPGError(err, "pg.modify scan failed in update %q", chg.ID)
+			return nil, nil, errors.Wrapf(err, "pg modify update scan %s", chg.ID)
 		}
 		changed = append(changed, t)
 	}
@@ -426,7 +435,7 @@ func depQuery(ctx context.Context, tx *sql.Tx, m *entroq.Modification) (map[uuid
 	// all deletes, and update all changes.
 	dependencies, err := m.AllDependencies()
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "pg dep query")
 	}
 
 	foundDeps := make(map[uuid.UUID]*entroq.Task)
@@ -451,34 +460,22 @@ func depQuery(ctx context.Context, tx *sql.Tx, m *entroq.Modification) (map[uuid
 	          WHERE (id, version) IN (` + strings.Join(placeholders, ", ") + `) FOR UPDATE`
 	rows, err := tx.QueryContext(ctx, query, values...)
 	if err != nil {
-		return nil, wrapPGError(err, "pg.depQuery")
+		return nil, errors.Wrap(err, "pg dep query")
 	}
 	defer rows.Close()
 	for rows.Next() {
 		t := new(entroq.Task)
 		if err := rows.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Claimant, &t.Value, &t.Created, &t.Modified); err != nil {
-			return nil, wrapPGError(err, "pg.depQuery")
+			return nil, errors.Wrap(err, "pg dep scan")
 		}
 		if foundDeps[t.ID] != nil {
-			return nil, fmt.Errorf("pg.depQuery: duplicate ID %q found in database (more than one version)", t.ID)
+			return nil, errors.Errorf("pg duplicate ID %q found", t.ID)
 		}
 		foundDeps[t.ID] = t
 	}
 	if err := rows.Err(); err != nil {
-		return nil, wrapPGError(err, "pg.depQuery")
+		return nil, errors.Wrap(err, "pg dep iteration")
 	}
 
 	return foundDeps, nil
-}
-
-// wrapPGError wraps the PG error in the message given, unless it is a
-// transaction serialization error, in which case it passes out a dependency
-// error.
-func wrapPGError(err error, format string, vals ...interface{}) error {
-	if e, ok := err.(*pq.Error); ok && e.Code == "40001" { // serialization eror
-		return entroq.DependencyError{
-			Message: e.Error(),
-		}
-	}
-	return fmt.Errorf(format+": %v", append(vals, err)...)
 }
