@@ -340,59 +340,73 @@ func NewMapWorker(eq *entroq.EntroQ, inQueue string, newEmitter func() MapEmitte
 	return w
 }
 
+// mapTask runs a mapper over a given task's input. It does everything in
+// memory, including storage of outputs. Note that, were we to want this to
+// scale, we would need to write output to a number of temporary files, then
+// clean them up if there were an error of any kind (or let them get garbage
+// collected). They would need to not be referenced unless the entire map task
+// were completed, at which point they would be pointed to by the completion
+// task. That's very doable, but beyond the scope of this exercise.
+func (w *MapWorker) mapTask(ctx context.Context, task *entroq.Task) error {
+	emitter := w.newEmitter()
+	if w.EarlyReduce != nil {
+		emitter = newReducingProxyMapEmitter(emitter, w.EarlyReduce)
+	}
+	task, err := w.client.DoWithRenew(ctx, task, claimDuration, func(ctx context.Context) error {
+		kv := new(KV)
+		if err := json.Unmarshal(task.Value, kv); err != nil {
+			return errors.Wrap(err, "mapworker task from json")
+		}
+
+		if err := w.Map(ctx, kv.Key, kv.Value, emitter.Emit); err != nil {
+			return errors.Wrapf(err, "mapworker task %q", task.IDVersion())
+		}
+
+		return nil
+	})
+	if err != nil {
+		return errors.Wrap(err, "mapworker renew")
+	}
+
+	// Delete map task and create shuffle shard tasks.
+	args, err := emitter.AsModifyArgs(w.OutputPrefix, task.AsDeletion())
+	if err != nil {
+		return errors.Wrap(err, "mapworker get args")
+	}
+	if _, _, err := w.client.Modify(ctx, args...); err != nil {
+		return errors.Wrap(err, "mapworker ack")
+	}
+	return nil
+}
+
 // Run runs the map worker. It blocks, running until the map queue is
 // empty, it encounters an error, or its context is canceled, whichever comes
 // first. If this should be run in a goroutine, that is up to the caller.
 // The task value is expected to be a JSON-serialized KV struct.
+//
+// Runs until the context is canceled or an unrecoverable error is encountered.
 func (w *MapWorker) Run(ctx context.Context) error {
 	log.Printf("Mapper %q starting", w.Name)
 	defer log.Printf("Mapper %q finished", w.Name)
+	for {
+		claimCtx, cancel := context.WithTimeout(ctx, claimWait)
+		defer cancel()
 
-	wrk := w.client.NewWorker(w.InputQueue)
-
-	// Runs a mapper over a given task's input. It does everything in
-	// memory, including storage of outputs. Note that, were we to want this to
-	// scale, we would need to write output to a number of temporary files, then
-	// clean them up if there were an error of any kind (or let them get garbage
-	// collected). They would need to not be referenced unless the entire map task
-	// were completed, at which point they would be pointed to by the completion
-	// task. That's very doable, but beyond the scope of this exercise.
-	for wrk.Next(ctx) {
-		if _, _, err := wrk.DoModify(func(ctx context.Context) ([]entroq.ModifyArg, error) {
-			task := wrk.Task()
-
-			emitter := w.newEmitter()
-			if w.EarlyReduce != nil {
-				emitter = newReducingProxyMapEmitter(emitter, w.EarlyReduce)
-			}
-
-			kv := new(KV)
-			if err := json.Unmarshal(task.Value, kv); err != nil {
-				return nil, errors.Wrap(err, "map json")
-			}
-
-			if err := w.Map(ctx, kv.Key, kv.Value, emitter.Emit); err != nil {
-				return nil, errors.Wrapf(err, "map %q", task.IDVersion())
-			}
-
-			return emitter.AsModifyArgs(w.OutputPrefix, task.AsDeletion())
-		}); err != nil {
-			if entroq.IsTimeout(err) {
-				log.Printf("map timeout: %v", err)
-				continue
-			}
+		task, err := w.client.Claim(claimCtx, w.InputQueue, claimDuration)
+		if entroq.IsTimeout(err) {
+			continue
+		}
+		if err != nil {
+			return errors.Wrap(err, "map worker claim")
+		}
+		if err := w.mapTask(ctx, task); err != nil {
 			if _, ok := entroq.AsDependency(err); ok {
-				log.Printf("map dependency: %v", err)
+				log.Printf("map worker continuing: %v", err)
 				continue
 			}
-			if entroq.IsCanceled(err) {
-				log.Printf("map canceled: %v", err)
-				break
-			}
-			return errors.Wrap(err, "map")
+			return errors.Wrap(err, "map worker task error")
 		}
 	}
-	return errors.Wrap(wrk.Err(), "map worker")
 }
 
 // ReducerInput provides a streaming interface for getting values during reduction.
@@ -634,8 +648,6 @@ func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error 
 	var outputs []*KV
 	task, err := w.client.DoWithRenew(ctx, task, claimDuration, func(ctx context.Context) error {
 		log.Printf("Reduce %q starting reduce task", w.Name)
-		defer log.Printf("Reduce %q finished", w.Name)
-
 		var kvs []*KV
 		if err := json.Unmarshal(task.Value, &kvs); err != nil {
 			return errors.Wrap(err, "reduce from json")
@@ -649,7 +661,6 @@ func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error 
 		return nil
 	})
 
-	log.Printf("Reducer %q output: %v", w.Name, outputs)
 	outputValue, err := json.Marshal(outputs)
 	if err != nil {
 		return errors.Wrap(err, "reduce to json")
@@ -831,30 +842,7 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 		qReduceOutput = path.Join(qReduce, "output")
 	)
 
-	g, ctx := errgroup.WithContext(ctx)
-
-	mapCtx, mapCancel := context.WithCancel(ctx)
-
-	log.Printf("Starting %d mappers", mr.NumMappers)
-	for i := 0; i < mr.NumMappers; i++ {
-		i := i
-		worker := NewMapWorker(mr.client, qMapInput,
-			func() MapEmitter { return NewCollectingMapEmitter(mr.NumReducers) },
-			MapAsName(fmt.Sprint(i)),
-			MapToOutputPrefix(qReduceInput),
-			WithMapper(mr.Map),
-			WithEarlyReducer(mr.EarlyReduce))
-
-		g.Go(func() error {
-			if err := worker.Run(mapCtx); !entroq.IsCanceled(err) {
-				return errors.Wrap(err, "map worker")
-			}
-			log.Printf("Map worker %q clean shutdown", worker.Name)
-			return nil
-		})
-	}
-
-	log.Printf("Creating %d tasks for inputs", len(mr.Data))
+	log.Printf("Creating tasks for inputs")
 	// First create map tasks for all of the data.
 	for _, kv := range mr.Data {
 		b, err := json.Marshal(kv)
@@ -865,26 +853,46 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 			return "", errors.Wrap(err, "insert map input")
 		}
 	}
-
 	log.Printf("Created %d tasks", len(mr.Data))
 
 	// When all tasks are present, start map and reduce workers. They'll all exit when finished.
-	// Check for empty mapper queue. If empty, cancel all map workers.
+	g, ctx := errgroup.WithContext(ctx)
+	mapCtx, mapCancel := context.WithCancel(ctx)
+
+	for i := 0; i < mr.NumMappers; i++ {
+		i := i
+		ctx := mapCtx
+		worker := NewMapWorker(mr.client, qMapInput,
+			func() MapEmitter { return NewCollectingMapEmitter(mr.NumReducers) },
+			MapAsName(fmt.Sprint(i)),
+			MapToOutputPrefix(qReduceInput),
+			WithMapper(mr.Map),
+			WithEarlyReducer(mr.EarlyReduce))
+
+		g.Go(func() error {
+			if err := worker.Run(ctx); !entroq.IsCanceled(err) {
+				return errors.Wrap(err, "map worker")
+			}
+			log.Printf("Map worker %q clean shutdown", worker.Name)
+			return nil
+		})
+	}
+
 	log.Printf("Starting empty check")
 	g.Go(func() error {
 		for {
 			empty, err := mr.client.QueuesEmpty(ctx, entroq.MatchExact(qMapInput))
 			if err != nil {
-				return errors.Wrap(err, "empty check")
+				return errors.Wrap(err, "map worker empty queue check")
 			}
 			if empty {
 				mapCancel()
-				return nil // Nothing to do - quit now.
+				return nil // all finished.
 			}
 			select {
 			case <-ctx.Done():
-				return errors.Wrap(ctx.Err(), "empty check done")
-			case <-time.After(claimWait / 2):
+				return errors.Wrap(ctx.Err(), "empty checker")
+			case <-time.After(5 * time.Second):
 			}
 		}
 	})
