@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 	"testing/quick"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
@@ -124,7 +125,7 @@ func TestMapReduce_checkSmall(t *testing.T) {
 	config := &quick.Config{
 		MaxCount: 3,
 		Values: func(values []reflect.Value, rand *rand.Rand) {
-			values[0] = reflect.ValueOf(rand.Intn(100) + 100)
+			values[0] = reflect.ValueOf(rand.Intn(500) + 100)
 			values[1] = reflect.ValueOf(rand.Intn(30) + 10)
 			values[2] = reflect.ValueOf(rand.Intn(10) + 1)
 		},
@@ -168,7 +169,6 @@ func run(ctx context.Context, name string, args ...string) error {
 			return errors.Wrap(err, "stderr copy")
 		}
 		return nil
-
 	})
 
 	g.Go(cmd.Wait)
@@ -182,9 +182,10 @@ func startPostgres(ctx context.Context) (port int, stop func(), err error) {
 	name := fmt.Sprintf("testpg-%s", uuid.New())
 
 	log.Printf("Starting postgres container %q...", name)
-	if err := run(ctx, "docker", "run", "-p", "0:5432", "-d", "--name", name, "postgres"); err != nil {
+	if err := run(ctx, "docker", "run", "-p", "0:5432", "--rm", "-d", "--name", name, "postgres"); err != nil {
 		return 0, nil, errors.Wrap(err, "start postgres container")
 	}
+	time.Sleep(2 * time.Second) // give it some time to get pipes attached
 	log.Print("Container is up")
 
 	stopFunc := func() {

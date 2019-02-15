@@ -618,7 +618,7 @@ func (c *EntroQ) DoWithRenew(ctx context.Context, task *Task, lease time.Duratio
 //
 // Returns all inserted task IDs, and an error if it could not proceed. If the error
 // was due to missing dependencies, a *DependencyError is returned, which can be checked for
-// by calling IsDependency(err).
+// by calling AsDependency(err).
 func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (inserted []*Task, changed []*Task, err error) {
 	return c.backend.Modify(ctx, NewModification(c.clientID, modArgs...))
 }
