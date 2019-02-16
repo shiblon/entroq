@@ -81,23 +81,17 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 
 	queue := path.Join(qPrefix, "simple_worker")
 
-	w := client.NewWorker(queue)
-
 	var consumed []*entroq.Task
 	ctx, cancel := context.WithCancel(ctx)
 
 	g, ctx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
-		for w.Next(ctx) {
-			if _, _, err := w.DoModify(func(ctx context.Context) ([]entroq.ModifyArg, error) {
-				consumed = append(consumed, w.Task())
-				return []entroq.ModifyArg{w.Task().AsDeletion()}, nil
-			}); err != nil {
-				return errors.Wrap(err, "worker loop error")
-			}
-		}
-		return errors.Wrap(w.Err(), "SimpleWorker")
+		w := client.NewWorker(queue)
+		return w.Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
+			consumed = append(consumed, task)
+			return []entroq.ModifyArg{task.AsDeletion()}, nil
+		})
 	})
 
 	select {
