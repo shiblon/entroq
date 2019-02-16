@@ -6,15 +6,17 @@ package entroq
 import (
 	"context"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+const DefaultClaimPollTime = 30 * time.Second
 
 // TaskID contains the identifying parts of a task. If IDs don't match
 // (identifier and version together), then operations fail on those tasks.
@@ -123,6 +125,7 @@ type ClaimQuery struct {
 	Queue    string        // The name of the queue to claim from.
 	Claimant uuid.UUID     // The ID of the process trying to make the claim.
 	Duration time.Duration // How long the task should be claimed for if successful.
+	PollTime time.Duration // Length of time between (possibly interruptible) sleep and polling.
 }
 
 // TasksQuery holds information for a tasks query.
@@ -166,7 +169,7 @@ func PollTryClaim(ctx context.Context, eq *ClaimQuery, tc BackendClaimFunc) (*Ta
 		// Don't wait longer than the check interval or canceled context.
 		task, err := tc(ctx, eq)
 		if err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "poll try claim")
 		}
 		if task != nil {
 			return task, nil
@@ -179,15 +182,26 @@ func PollTryClaim(ctx context.Context, eq *ClaimQuery, tc BackendClaimFunc) (*Ta
 				curWait = maxCheckInterval
 			}
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, errors.Wrap(ctx.Err(), "poll try claim")
 		}
 	}
 }
 
 // Waiter can wait for an event on a given key (e.g., queue name).
 type Waiter interface {
-	// Wait waits for an event on the given key. Competes with other waiters.
-	Wait(ctx context.Context, key string) error
+	// Wait waits for an event on the given key, calling cond after poll
+	// intervals until the key is notified, cond returns true, or the context
+	// is canceled.
+	//
+	// If cond is nil, this function returns when the channel is notified,
+	// the poll interval is exceeded, or the context is canceled. Only the last
+	// event causes a non-nil error.
+	//
+	// If poll is 0, it can never be exceeded.
+	//
+	// A common use is to use poll=0 and cond=nil, causing this to simply wait
+	// for a notification.
+	Wait(ctx context.Context, key string, poll time.Duration, cond func() bool) error
 }
 
 // Notifier can be notified on a given key (e.g., queue name);
@@ -197,11 +211,10 @@ type Notifier interface {
 	Notify(key string)
 }
 
-// NotifyWaiter can be notified and waited on for a given key (e.g., queue name).
-// The notification only ever blocks a single waiter.
+// NotifyWaiter can wait for and notify events.
 type NotifyWaiter interface {
-	Waiter
 	Notifier
+	Waiter
 }
 
 // NotifyModified takes inserted and changed tasks and notifies once per unique queue/ID pair.
@@ -231,33 +244,25 @@ func NotifyModified(n Notifier, inserted, changed []*Task) {
 // canceled, and should return a nil error if the wait was successful
 // (something became available).
 func WaitTryClaim(ctx context.Context, eq *ClaimQuery, tc BackendClaimFunc, w Waiter) (*Task, error) {
-	for {
-		// Make sure we weren't stopped by the parent context.
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-		task, err := tc(ctx, eq)
-		if err != nil {
-			return nil, err
-		}
-		if task != nil {
-			return task, nil
-		}
-		// No error, no task - wait on the queue.
-		ctx, _ := context.WithTimeout(ctx, 30*time.Second)
-		if err := w.Wait(ctx, eq.Queue); err != nil {
-			// If this is a deadline-exceeded error, we'll continue around again.
-			// It's just the end of our sleep cycle.
-			if err == context.DeadlineExceeded {
-				continue
-			}
-			return nil, err
-		}
-		// No error, queue alerted: go around again, trying to get the task
-		// that is ostensibly now present.
+	var (
+		task    *Task
+		condErr error
+	)
+	pollTime := eq.PollTime
+	if pollTime == 0 {
+		pollTime = DefaultClaimPollTime
 	}
+	if err := w.Wait(ctx, eq.Queue, pollTime, func() bool {
+		// If we get either a task or an error, time to stop trying.
+		task, condErr = tc(ctx, eq)
+		return task != nil || condErr != nil
+	}); err != nil {
+		return nil, errors.Wrap(err, "wait try claim")
+	}
+	if condErr != nil {
+		return nil, errors.Wrap(condErr, "wait try claim condition")
+	}
+	return task, nil
 }
 
 // Backend describes all of the functions that any backend has to implement
@@ -330,7 +335,7 @@ type BackendOpener func(ctx context.Context) (Backend, error)
 func New(ctx context.Context, opener BackendOpener, opts ...Option) (*EntroQ, error) {
 	backend, err := opener(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("backend connection: %v", err)
+		return nil, errors.Wrap(err, "backend connection")
 	}
 	eq := &EntroQ{
 		clientID: uuid.New(),
@@ -367,11 +372,11 @@ func (c *EntroQ) Queues(ctx context.Context, opts ...QueuesOpt) (map[string]int,
 // options are specified, returns an error.
 func (c *EntroQ) QueuesEmpty(ctx context.Context, opts ...QueuesOpt) (bool, error) {
 	if len(opts) == 0 {
-		return false, fmt.Errorf("empty check: no queue options specified")
+		return false, errors.New("empty check: no queue options specified")
 	}
 	qs, err := c.Queues(ctx, opts...)
 	if err != nil {
-		return false, fmt.Errorf("empty check: %v", err)
+		return false, errors.Wrap(err, "empty check")
 	}
 	for _, size := range qs {
 		if size > 0 {
@@ -451,13 +456,24 @@ func ClaimAs(id uuid.UUID) ClaimOpt {
 	}
 }
 
+// ClaimPollTime sets the polling time for a claim. Set to DefaultClaimPollTime if left at 0.
+func ClaimPollTime(d time.Duration) ClaimOpt {
+	return func(q *ClaimQuery) {
+		q.PollTime = d
+	}
+}
+
 // IsCanceled indicates whether the error is a canceled error.
 func IsCanceled(err error) bool {
-	if status.Code(err) == codes.Canceled {
+	if err == nil {
+		return false
+	}
+	err = errors.Cause(err)
+	if err == context.Canceled {
 		return true
 	}
 
-	if status.FromContextError(err).Code() == codes.Canceled {
+	if status.Code(err) == codes.Canceled {
 		return true
 	}
 
@@ -466,11 +482,15 @@ func IsCanceled(err error) bool {
 
 // IsTimeout indicates whether the error is a timeout error.
 func IsTimeout(err error) bool {
-	if status.Code(err) == codes.DeadlineExceeded {
+	if err == nil {
+		return false
+	}
+	err = errors.Cause(err)
+	if err == context.DeadlineExceeded {
 		return true
 	}
 
-	if status.FromContextError(err).Code() == codes.DeadlineExceeded {
+	if status.Code(err) == codes.DeadlineExceeded {
 		return true
 	}
 
@@ -515,7 +535,7 @@ func (c *EntroQ) TryClaim(ctx context.Context, q string, duration time.Duration,
 func (c *EntroQ) RenewFor(ctx context.Context, task *Task, duration time.Duration) (*Task, error) {
 	changed, err := c.RenewAllFor(ctx, []*Task{task}, duration)
 	if err != nil {
-		return nil, fmt.Errorf("renew task: %v", err)
+		return nil, errors.Wrap(err, "renew task")
 	}
 	return changed[0], nil
 }
@@ -539,10 +559,10 @@ func (c *EntroQ) RenewAllFor(ctx context.Context, tasks []*Task, duration time.D
 	}
 	_, changed, err := c.Modify(ctx, modArgs...)
 	if err != nil {
-		return nil, fmt.Errorf("renewal failed for tasks %q", taskIDs)
+		return nil, errors.Wrapf(err, "renewal failed for tasks %q", taskIDs)
 	}
 	if len(changed) != len(tasks) {
-		return nil, fmt.Errorf("renewal expected %d updated tasks, got %d", len(tasks), len(changed))
+		return nil, errors.Errorf("renewal expected %d updated tasks, got %d", len(tasks), len(changed))
 	}
 	return changed, nil
 }
@@ -560,11 +580,11 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.D
 			case <-doneCh:
 				return nil
 			case <-ctx.Done():
-				return fmt.Errorf("canceled context, stopped renewing: %v", ctx.Err())
+				return errors.Wrap(ctx.Err(), "renew all stopped")
 			case <-time.After(lease / 2):
 				var err error
 				if renewed, err = c.RenewAllFor(ctx, tasks, lease); err != nil {
-					return fmt.Errorf("could not extend lease: %v", err)
+					return errors.Wrap(err, "could not extend lease")
 				}
 			}
 		}
@@ -576,7 +596,7 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.D
 	})
 
 	if err := g.Wait(); err != nil {
-		return nil, fmt.Errorf("error running with renewal: %v", err)
+		return nil, errors.Wrap(err, "error running with renewal")
 	}
 
 	// The task will have been overwritten with every renewal. Return final task.
@@ -587,7 +607,7 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.D
 func (c *EntroQ) DoWithRenew(ctx context.Context, task *Task, lease time.Duration, f func(context.Context) error) (*Task, error) {
 	finalTasks, err := c.DoWithRenewAll(ctx, []*Task{task}, lease, f)
 	if err != nil {
-		return nil, fmt.Errorf("with renew single task: %v", err)
+		return nil, errors.Wrap(err, "with renew single task")
 	}
 	return finalTasks[0], nil
 }
@@ -598,7 +618,7 @@ func (c *EntroQ) DoWithRenew(ctx context.Context, task *Task, lease time.Duratio
 //
 // Returns all inserted task IDs, and an error if it could not proceed. If the error
 // was due to missing dependencies, a *DependencyError is returned, which can be checked for
-// by calling IsDependency(err).
+// by calling AsDependency(err).
 func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (inserted []*Task, changed []*Task, err error) {
 	return c.backend.Modify(ctx, NewModification(c.clientID, modArgs...))
 }
@@ -804,13 +824,13 @@ func (m *Modification) modDependencies() (map[uuid.UUID]int32, error) {
 	deps := make(map[uuid.UUID]int32)
 	for _, t := range m.Changes {
 		if _, ok := deps[t.ID]; ok {
-			return nil, fmt.Errorf("duplicates found in dependencies")
+			return nil, errors.New("duplicates found in dependencies")
 		}
 		deps[t.ID] = t.Version
 	}
 	for _, t := range m.Deletes {
 		if _, ok := deps[t.ID]; ok {
-			return nil, fmt.Errorf("duplicates found in dependencies")
+			return nil, errors.New("duplicates found in dependencies")
 		}
 		deps[t.ID] = t.Version
 	}
@@ -823,11 +843,11 @@ func (m *Modification) modDependencies() (map[uuid.UUID]int32, error) {
 func (m *Modification) AllDependencies() (map[uuid.UUID]int32, error) {
 	deps, err := m.modDependencies()
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "get dependencies")
 	}
 	for _, t := range m.Depends {
 		if _, ok := deps[t.ID]; ok {
-			return nil, fmt.Errorf("duplicates found in dependencies")
+			return nil, errors.New("duplicates found in dependencies")
 		}
 		deps[t.ID] = t.Version
 	}
@@ -905,27 +925,6 @@ func (m *Modification) DependencyError(found map[uuid.UUID]*Task) error {
 	return nil
 }
 
-// WrapDependencyError adds a message to the given error. If it is a dependency
-// error, the returned error will also be a dependency error. Otherwise the
-// first argument is used to append a message to the result of applying the
-// specified format.
-func WrapDependencyError(err error, format string, vals ...interface{}) error {
-	if e, ok := err.(DependencyError); ok {
-		ne := e.Copy()
-		msg := fmt.Sprintf(format, vals...)
-		if msg != "" {
-			if ne.Message != "" {
-				ne.Message = fmt.Sprintf("%s: %s", msg, ne.Message)
-			} else {
-				ne.Message = msg
-			}
-		}
-		return ne
-		log.Printf("Wrap dep result: %+v", ne)
-	}
-	return fmt.Errorf(format+": %v", append(vals, err)...)
-}
-
 // DependencyError is returned when a dependency is missing when modifying the task store.
 type DependencyError struct {
 	Depends []*TaskID
@@ -935,6 +934,11 @@ type DependencyError struct {
 	Claims []*TaskID
 
 	Message string
+}
+
+// DependencyErrorf creates a new dependency error with the given message.
+func DependencyErrorf(msg string, vals ...interface{}) DependencyError {
+	return DependencyError{Message: fmt.Sprintf(msg, vals...)}
 }
 
 // Copy produces a new deep copy of this error type.
@@ -961,15 +965,6 @@ func (m DependencyError) HasMissing() bool {
 // HasClaims indicates whether any of the tasks were claimed by another claimant and unexpired.
 func (m DependencyError) HasClaims() bool {
 	return len(m.Claims) > 0
-}
-
-// IsUnknown indicates whether this is an "empty" dependency error, which indicates
-// that a transaction failed at the storage level, so we don't have
-// fine-grained information about which specific task IDs were involved. This
-// can be used to determine whether a transaction retry is appropriate when a
-// serialization error occurs, for example.
-func (m DependencyError) IsUnknown() bool {
-	return !m.HasMissing() && !m.HasClaims()
 }
 
 // Error produces a helpful error string indicating what was missing.
@@ -1004,8 +999,9 @@ func (m DependencyError) Error() string {
 	return strings.Join(lines, "\n")
 }
 
-// IsDependency indicates whether the given error is a dependency error.
-func IsDependency(err error) bool {
-	_, ok := err.(DependencyError)
-	return ok
+// AsDependency indicates whether the given error is a dependency error.
+func AsDependency(err error) (DependencyError, bool) {
+	// Force two-lvalue context.
+	d, ok := errors.Cause(err).(DependencyError)
+	return d, ok
 }
