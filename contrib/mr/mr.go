@@ -340,45 +340,6 @@ func NewMapWorker(eq *entroq.EntroQ, inQueue string, newEmitter func() MapEmitte
 	return w
 }
 
-// mapTask runs a mapper over a given task's input. It does everything in
-// memory, including storage of outputs. Note that, were we to want this to
-// scale, we would need to write output to a number of temporary files, then
-// clean them up if there were an error of any kind (or let them get garbage
-// collected). They would need to not be referenced unless the entire map task
-// were completed, at which point they would be pointed to by the completion
-// task. That's very doable, but beyond the scope of this exercise.
-func (w *MapWorker) mapTask(ctx context.Context, task *entroq.Task) error {
-	emitter := w.newEmitter()
-	if w.EarlyReduce != nil {
-		emitter = newReducingProxyMapEmitter(emitter, w.EarlyReduce)
-	}
-	task, err := w.client.DoWithRenew(ctx, task, claimDuration, func(ctx context.Context) error {
-		kv := new(KV)
-		if err := json.Unmarshal(task.Value, kv); err != nil {
-			return errors.Wrap(err, "mapworker task from json")
-		}
-
-		if err := w.Map(ctx, kv.Key, kv.Value, emitter.Emit); err != nil {
-			return errors.Wrapf(err, "mapworker task %q", task.IDVersion())
-		}
-
-		return nil
-	})
-	if err != nil {
-		return errors.Wrap(err, "mapworker renew")
-	}
-
-	// Delete map task and create shuffle shard tasks.
-	args, err := emitter.AsModifyArgs(w.OutputPrefix, task.AsDeletion())
-	if err != nil {
-		return errors.Wrap(err, "mapworker get args")
-	}
-	if _, _, err := w.client.Modify(ctx, args...); err != nil {
-		return errors.Wrap(err, "mapworker ack")
-	}
-	return nil
-}
-
 // Run runs the map worker. It blocks, running until the map queue is
 // empty, it encounters an error, or its context is canceled, whichever comes
 // first. If this should be run in a goroutine, that is up to the caller.
