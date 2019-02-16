@@ -69,6 +69,9 @@ message ClaimRequest {
 
   // The duration of the claim, if/once successful.
   int64 duration_ms = 3;
+
+  // How long to sleep for a claim (not try claim) between polls. The sleep may be interruptible depending on the backend implementation.
+  int64 poll_ms = 4;
 }
 
 // ClaimResponse is returned when a claim is fulfilled or becomes obviously impossible.
