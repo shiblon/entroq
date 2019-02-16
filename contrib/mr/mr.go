@@ -386,27 +386,22 @@ func (w *MapWorker) mapTask(ctx context.Context, task *entroq.Task) error {
 //
 // Runs until the context is canceled or an unrecoverable error is encountered.
 func (w *MapWorker) Run(ctx context.Context) error {
-	log.Printf("Mapper %q starting", w.Name)
-	defer log.Printf("Mapper %q finished", w.Name)
-	for {
-		claimCtx, cancel := context.WithTimeout(ctx, claimWait)
-		defer cancel()
+	eqw := w.client.NewWorker(w.InputQueue)
+	return eqw.Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
+		emitter := w.newEmitter()
+		if w.EarlyReduce != nil {
+			emitter = newReducingProxyMapEmitter(emitter, w.EarlyReduce)
+		}
+		kv := new(KV)
+		if err := json.Unmarshal(task.Value, kv); err != nil {
+			return nil, errors.Wrap(err, "map run json")
+		}
+		if err := w.Map(ctx, kv.Key, kv.Value, emitter.Emit); err != nil {
+			return nil, errors.Wrap(err, "map run map")
+		}
 
-		task, err := w.client.Claim(claimCtx, w.InputQueue, claimDuration)
-		if entroq.IsTimeout(err) {
-			continue
-		}
-		if err != nil {
-			return errors.Wrap(err, "map worker claim")
-		}
-		if err := w.mapTask(ctx, task); err != nil {
-			if _, ok := entroq.AsDependency(err); ok {
-				log.Printf("map worker continuing: %v", err)
-				continue
-			}
-			return errors.Wrap(err, "map worker task error")
-		}
-	}
+		return emitter.AsModifyArgs(w.OutputPrefix, task.AsDeletion())
+	})
 }
 
 // ReducerInput provides a streaming interface for getting values during reduction.
