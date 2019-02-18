@@ -1,5 +1,5 @@
 // Package qtest contains standard testing routines for exercising various backends in similar ways.
-package qtest
+package qtest // import "entrogo.com/entroq/qsvc/qtest"
 
 import (
 	"bytes"
@@ -10,17 +10,17 @@ import (
 	"testing"
 	"time"
 
+	"entrogo.com/entroq"
+	grpcbackend "entrogo.com/entroq/grpc"
+	"entrogo.com/entroq/qsvc"
 	"github.com/google/go-cmp/cmp"
 	"github.com/pkg/errors"
-	"github.com/shiblon/entroq"
-	grpcbackend "github.com/shiblon/entroq/grpc"
-	"github.com/shiblon/entroq/qsvc"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/test/bufconn"
 
-	pb "github.com/shiblon/entroq/proto"
+	pb "entrogo.com/entroq/proto"
 	hpb "google.golang.org/grpc/health/grpc_health_v1"
 )
 

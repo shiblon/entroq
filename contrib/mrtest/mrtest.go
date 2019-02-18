@@ -1,6 +1,6 @@
 // Package mrtest is a test package tightly tied to the mr package, separated
 // out to avoid import cycles when other tests want to use it.
-package mrtest
+package mrtest // import "entrogo.com/entroq/contrib/mrtest"
 
 import (
 	"bytes"
@@ -12,9 +12,9 @@ import (
 	"sort"
 	"strings"
 
+	"entrogo.com/entroq"
+	. "entrogo.com/entroq/contrib/mr"
 	"github.com/google/uuid"
-	"github.com/shiblon/entroq"
-	. "github.com/shiblon/entroq/contrib/mr"
 )
 
 // MRCheck is a check function that runs a mapreduce using the specified number of mappers and reducers.

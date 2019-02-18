@@ -15,11 +15,11 @@ import (
 	"testing/quick"
 	"time"
 
+	"entrogo.com/entroq"
+	"entrogo.com/entroq/contrib/mrtest"
+	"entrogo.com/entroq/qsvc/qtest"
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
-	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/contrib/mrtest"
-	"github.com/shiblon/entroq/qsvc/qtest"
 	"golang.org/x/sync/errgroup"
 
 	_ "github.com/lib/pq"

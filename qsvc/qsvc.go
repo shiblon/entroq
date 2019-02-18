@@ -6,9 +6,9 @@
 // 		"log"
 // 		"net"
 //
-// 		"github.com/shiblon/entroq/pg"
-// 		"github.com/shiblon/entroq/qsvc"
-// 		pb "github.com/shiblon/entroq/proto"
+// 		"entrogo.com/entroq/pg"
+// 		"entrogo.com/entroq/qsvc"
+// 		pb "entrogo.com/entroq/proto"
 //
 // 		"google.golang.org/grpc"
 // 	)
@@ -30,20 +30,20 @@
 // 		pb.RegisterEntroQServer(s, svc)
 // 		s.Serve(listener)
 // 	}
-package qsvc
+package qsvc // import "entrogo.com/entroq/qsvc"
 
 import (
 	"context"
 	"time"
 
+	"entrogo.com/entroq"
 	"github.com/golang/protobuf/proto"
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
-	"github.com/shiblon/entroq"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	pb "github.com/shiblon/entroq/proto"
+	pb "entrogo.com/entroq/proto"
 )
 
 // QSvc is an EntroQServer.
