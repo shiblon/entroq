@@ -6,8 +6,8 @@ FROM golang:alpine as builder
 ENV GOPATH /build
 ENV CGO_ENABLED 0
 
-COPY . $GOPATH/src/github.com/shiblon/entroq
-WORKDIR $GOPATH/src/github.com/shiblon/entroq
+COPY . $GOPATH/src/entrogo.com/entroq
+WORKDIR $GOPATH/src/entrogo.com/entroq
 
 RUN apk add git
 RUN go get -d -v ./... && go install -v ./...
@@ -24,7 +24,7 @@ COPY --from=builder /build/bin/* /go/bin/
 COPY cmd/eqsvc.sh /go/bin/
 WORKDIR /go/bin
 
-RUN adduser -S -D -H -h /go/src/github.com/shiblon/entroq appuser
+RUN adduser -S -D -H -h /go/src/entrogo.com/entroq appuser
 USER appuser
 
 ENTRYPOINT ["./eqsvc.sh"]

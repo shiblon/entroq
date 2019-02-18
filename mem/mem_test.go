@@ -7,9 +7,9 @@ import (
 	"testing"
 	"testing/quick"
 
-	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/contrib/mrtest"
-	"github.com/shiblon/entroq/qsvc/qtest"
+	"entrogo.com/entroq"
+	"entrogo.com/entroq/contrib/mrtest"
+	"entrogo.com/entroq/qsvc/qtest"
 )
 
 func TestSimpleSequence(t *testing.T) {
