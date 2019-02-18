@@ -1,7 +1,6 @@
 syntax = "proto3";
 
 package proto;
-option go_package = "entrogo.com/entroq/proto";
 
 // TaskID contains the ID and version of a task. Together these make a unique
 // identifier for that task.
