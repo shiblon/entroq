@@ -1,5 +1,5 @@
 // Package mem is an in-memory implementation of an EntroQ backend.
-package mem
+package mem // import "entrogo.com/entroq/mem"
 
 import (
 	"container/heap"
@@ -9,10 +9,10 @@ import (
 	"sync"
 	"time"
 
+	"entrogo.com/entroq"
+	"entrogo.com/entroq/subq"
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
-	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/subq"
 )
 
 type hItem struct {
