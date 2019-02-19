@@ -1,12 +1,14 @@
 // Package subq abstracts the idea of subscribing to a particular queue so that
 // changes can be immediately notified.
-package subq
+package subq // import "entrogo.com/entroq/subq"
 
 import (
 	"context"
 	"log"
 	"sync"
 	"time"
+
+	"github.com/pkg/errors"
 )
 
 // SubQ is a queue subscription service. It is not public, though; it is based
@@ -206,7 +208,7 @@ func (s *SubQ) Wait(ctx context.Context, q string, pollWait time.Duration, condi
 		case <-qi.Ch():
 			// Got a value, go around again to run condition to see if it's still there.
 		case <-ctx.Done():
-			return ctx.Err()
+			return errors.Wrap(ctx.Err(), "subq wait")
 		}
 	}
 	return nil

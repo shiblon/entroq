@@ -11,10 +11,10 @@ import (
 	"testing"
 	"testing/quick"
 
-	"github.com/shiblon/entroq"
-	. "github.com/shiblon/entroq/contrib/mr"
-	"github.com/shiblon/entroq/contrib/mrtest"
-	"github.com/shiblon/entroq/mem"
+	"entrogo.com/entroq"
+	. "entrogo.com/entroq/contrib/mr"
+	"entrogo.com/entroq/contrib/mrtest"
+	"entrogo.com/entroq/mem"
 )
 
 func TestMapReduce_inMemorySmall(t *testing.T) {

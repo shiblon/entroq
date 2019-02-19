@@ -6,9 +6,9 @@
 // 		"log"
 // 		"net"
 //
-// 		"github.com/shiblon/entroq/pg"
-// 		"github.com/shiblon/entroq/qsvc"
-// 		pb "github.com/shiblon/entroq/proto"
+// 		"entrogo.com/entroq/pg"
+// 		"entrogo.com/entroq/qsvc"
+// 		pb "entrogo.com/entroq/proto"
 //
 // 		"google.golang.org/grpc"
 // 	)
@@ -30,20 +30,20 @@
 // 		pb.RegisterEntroQServer(s, svc)
 // 		s.Serve(listener)
 // 	}
-package qsvc
+package qsvc // import "entrogo.com/entroq/qsvc"
 
 import (
 	"context"
-	"fmt"
 	"time"
 
+	"entrogo.com/entroq"
 	"github.com/golang/protobuf/proto"
 	"github.com/google/uuid"
-	"github.com/shiblon/entroq"
+	"github.com/pkg/errors"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	pb "github.com/shiblon/entroq/proto"
+	pb "entrogo.com/entroq/proto"
 )
 
 // QSvc is an EntroQServer.
@@ -55,7 +55,7 @@ type QSvc struct {
 func New(ctx context.Context, opener entroq.BackendOpener) (*QSvc, error) {
 	impl, err := entroq.New(ctx, opener)
 	if err != nil {
-		return nil, fmt.Errorf("qsvc backend client: %v", err)
+		return nil, errors.Wrap(err, "qsvc backend client")
 	}
 
 	return &QSvc{impl: impl}, nil
@@ -63,7 +63,7 @@ func New(ctx context.Context, opener entroq.BackendOpener) (*QSvc, error) {
 
 // Close closes the backend connections and flushes the connection free.
 func (s *QSvc) Close() error {
-	return s.impl.Close()
+	return errors.Wrap(s.impl.Close(), "qsvc close")
 }
 
 func fromMS(ms int64) time.Time {
@@ -87,11 +87,29 @@ func protoFromTask(t *entroq.Task) *pb.Task {
 	}
 }
 
+func wrapErrorf(err error, format string, vals ...interface{}) error {
+	if err == nil {
+		return nil
+	}
+	err = errors.Wrapf(err, format, vals...)
+	if entroq.IsTimeout(err) {
+		return status.New(codes.DeadlineExceeded, err.Error()).Err()
+	}
+	if entroq.IsCanceled(err) {
+		return status.New(codes.Canceled, err.Error()).Err()
+	}
+	return err
+}
+
+func codeErrorf(code codes.Code, err error, format string, vals ...interface{}) error {
+	return status.New(code, errors.Wrapf(err, format, vals...).Error()).Err()
+}
+
 // Claim is the blocking version of TryClaim.
 func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
 	claimant, err := uuid.Parse(req.ClaimantId)
 	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "failed to parse claimant ID: %v", err)
+		return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse claimant ID")
 	}
 	duration := time.Duration(req.DurationMs) * time.Millisecond
 	pollTime := time.Duration(0)
@@ -103,10 +121,7 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 		entroq.ClaimAs(claimant),
 		entroq.ClaimPollTime(pollTime))
 	if err != nil {
-		if entroq.IsTimeout(err) {
-			return nil, status.Errorf(codes.DeadlineExceeded, "qsvc.Claim")
-		}
-		return nil, status.Errorf(codes.Unknown, "qsvc.Claim: %v", err)
+		return nil, wrapErrorf(err, "qsvc claim")
 	}
 	if task == nil {
 		return new(pb.ClaimResponse), nil
@@ -124,13 +139,12 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
 	claimant, err := uuid.Parse(req.ClaimantId)
 	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "failed to parse claimant ID: %v", err)
+		return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse claimant ID")
 	}
 	duration := time.Duration(req.DurationMs) * time.Millisecond
-	task, err := s.impl.TryClaim(ctx, req.Queue, duration,
-		entroq.ClaimAs(claimant))
+	task, err := s.impl.TryClaim(ctx, req.Queue, duration, entroq.ClaimAs(claimant))
 	if err != nil {
-		return nil, status.Errorf(codes.Unknown, "failed to claim: %v", err)
+		return nil, wrapErrorf(err, "try claim")
 	}
 	if task == nil {
 		return new(pb.ClaimResponse), nil
@@ -148,7 +162,7 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyResponse, error) {
 	claimant, err := uuid.Parse(req.ClaimantId)
 	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "failed to parse claimant ID: %v", err)
+		return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse claimant ID")
 	}
 	modArgs := []entroq.ModifyArg{
 		entroq.ModifyAs(claimant),
@@ -162,7 +176,7 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 	for _, change := range req.Changes {
 		id, err := uuid.Parse(change.GetOldId().Id)
 		if err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "failed to parse change id: %v", err)
+			return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse change id")
 		}
 		t := &entroq.Task{
 			ID:       id,
@@ -177,21 +191,20 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 	for _, delete := range req.Deletes {
 		id, err := uuid.Parse(delete.Id)
 		if err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "failed to parse deletion id: %v", err)
+			return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse deletion id")
 		}
 		modArgs = append(modArgs, entroq.Deleting(id, delete.Version))
 	}
 	for _, depend := range req.Depends {
 		id, err := uuid.Parse(depend.Id)
 		if err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "failed to parse dependency id: %v", err)
+			return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse dependency id")
 		}
 		modArgs = append(modArgs, entroq.DependingOn(id, depend.Version))
 	}
 	inserted, changed, err := s.impl.Modify(ctx, modArgs...)
 	if err != nil {
-		if entroq.IsDependency(err) {
-			depErr := err.(entroq.DependencyError)
+		if depErr, ok := entroq.AsDependency(err); ok {
 			tmap := map[pb.DepType][]*entroq.TaskID{
 				pb.DepType_DEPEND: depErr.Depends,
 				pb.DepType_DELETE: depErr.Deletes,
@@ -214,11 +227,11 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 
 			stat, sErr := status.New(codes.NotFound, "modification dependency error").WithDetails(details...)
 			if sErr != nil {
-				return nil, status.Errorf(codes.NotFound, "dependency failed, and failed to add details. Both errors here: %v --- %v", err, sErr)
+				return nil, codeErrorf(codes.NotFound, sErr, "dependency failed, and failed to add details %v", err)
 			}
 			return nil, stat.Err()
 		}
-		return nil, status.Errorf(codes.Unknown, "modification failed: %v", err)
+		return nil, wrapErrorf(err, "modification failed")
 	}
 	// Assemble the response.
 	resp := new(pb.ModifyResponse)
@@ -236,13 +249,13 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 	if req.ClaimantId != "" {
 		var err error
 		if claimant, err = uuid.Parse(req.ClaimantId); err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "failed to parse claimant ID: %v", err)
+			return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse claimant ID")
 		}
 	}
 	// Claimant will only really be limited if it is nonzero.
 	tasks, err := s.impl.Tasks(ctx, req.Queue, entroq.LimitClaimant(claimant))
 	if err != nil {
-		return nil, status.Errorf(codes.Unknown, "failed to get tasks: %v", err)
+		return nil, wrapErrorf(err, "failed to get tasks")
 	}
 	resp := new(pb.TasksResponse)
 	for _, task := range tasks {
@@ -258,7 +271,7 @@ func (s *QSvc) Queues(ctx context.Context, req *pb.QueuesRequest) (*pb.QueuesRes
 		entroq.MatchExact(req.MatchExact...),
 		entroq.LimitQueues(int(req.Limit)))
 	if err != nil {
-		return nil, fmt.Errorf("failed to get queues: %v", err)
+		return nil, wrapErrorf(err, "failed to get queues")
 	}
 	resp := new(pb.QueuesResponse)
 	for name, count := range queueMap {

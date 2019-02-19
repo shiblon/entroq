@@ -1,5 +1,5 @@
 // Package mem is an in-memory implementation of an EntroQ backend.
-package mem
+package mem // import "entrogo.com/entroq/mem"
 
 import (
 	"container/heap"
@@ -9,9 +9,10 @@ import (
 	"sync"
 	"time"
 
+	"entrogo.com/entroq"
+	"entrogo.com/entroq/subq"
 	"github.com/google/uuid"
-	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/subq"
+	"github.com/pkg/errors"
 )
 
 type hItem struct {
@@ -95,7 +96,7 @@ func New(ctx context.Context) *backend {
 // insertUnsafe must be called from within a locked mutex.
 func (b *backend) insertUnsafe(t *entroq.Task) error {
 	if _, ok := b.byID[t.ID]; ok {
-		return fmt.Errorf("duplicate task ID insertion attempt: %v", t.ID)
+		return errors.Errorf("duplicate task ID insertion attempt: %v", t.ID)
 	}
 	// If not there, put it there. We could also use append on the long-form
 	// version of the heap (specifying the whole map, etc.) but this is more
@@ -117,13 +118,13 @@ func (b *backend) insertUnsafe(t *entroq.Task) error {
 func (b *backend) removeUnsafe(id uuid.UUID) error {
 	item, ok := b.byID[id]
 	if !ok {
-		return fmt.Errorf("item not found for removal: %v", id)
+		return errors.Errorf("item not found for removal: %v", id)
 	}
 	delete(b.byID, id)
 
 	h, ok := b.heaps[item.task.Queue]
 	if !ok {
-		return fmt.Errorf("queues not in sync; found item to remove queues but not in index: %v", id)
+		return errors.Errorf("queues not in sync; found item to remove queues but not in index: %v", id)
 	}
 	heap.Remove(h, item.idx)
 	if h.Len() == 0 {
@@ -137,7 +138,7 @@ func (b *backend) removeUnsafe(id uuid.UUID) error {
 func (b *backend) replaceUnsafe(id uuid.UUID, newTask *entroq.Task) error {
 	item, ok := b.byID[id]
 	if !ok {
-		return fmt.Errorf("item not found for task replacement: %v", id)
+		return errors.Errorf("item not found for task replacement: %v", id)
 	}
 
 	// If the queues are the same, replace and fix order. No other changes.
@@ -153,10 +154,10 @@ func (b *backend) replaceUnsafe(id uuid.UUID, newTask *entroq.Task) error {
 	// we unnecessarily modify the ID index twice, but it's correct and easy to
 	// understand, so fixing it would be a premature optimization.
 	if err := b.removeUnsafe(item.task.ID); err != nil {
-		return fmt.Errorf("update queue removal: %v", err)
+		return errors.Wrap(err, "update queue removal")
 	}
 	if err := b.insertUnsafe(newTask); err != nil {
-		return fmt.Errorf("update queue insertion: %v", err)
+		return errors.Wrap(err, "update queue insertion")
 	}
 
 	return nil
@@ -269,7 +270,7 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 	found := make(map[uuid.UUID]*entroq.Task)
 	deps, err := mod.AllDependencies()
 	if err != nil {
-		return nil, nil, fmt.Errorf("dependency problem: %v", err)
+		return nil, nil, errors.Wrap(err, "dependency problem")
 	}
 
 	for id := range deps {
@@ -279,7 +280,7 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 	}
 
 	if err := mod.DependencyError(found); err != nil {
-		return nil, nil, err
+		return nil, nil, errors.Wrap(err, "Modify")
 	}
 
 	now := time.Now()

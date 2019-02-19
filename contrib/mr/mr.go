@@ -2,7 +2,7 @@
 // inside the task manager (no outside files). This limits what it is good for,
 // but makes for a lovely stress test, and shows off some useful task manager
 // interaction patterns.
-package mr
+package mr // import "entrogo.com/entroq/contrib/mr"
 
 import (
 	"bytes"
@@ -18,7 +18,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/shiblon/entroq"
+	"entrogo.com/entroq"
+	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -96,7 +97,7 @@ func (e *CollectingMapEmitter) AsModifyArgs(qPrefix string, additional ...entroq
 		sort.Sort(byKey(kvs))
 		value, err := json.Marshal(kvs)
 		if err != nil {
-			return nil, fmt.Errorf("emit to modify args: %v", err)
+			return nil, errors.Wrap(err, "emit to modify args")
 		}
 		queue := path.Join(qPrefix, fmt.Sprint(shard))
 		args = append(args, entroq.InsertingInto(queue, entroq.WithValue(value)))
@@ -146,7 +147,7 @@ func (e *reducingProxyMapEmitter) reduceAndEmit(ctx context.Context, threshold i
 
 		kvs, err = reduceSortedKVs(ctx, e.reduce, e.collection)
 		if err != nil {
-			err = fmt.Errorf("reducingProxyMapEmitter.reduceUnsafe: %v", err)
+			err = errors.Wrap(err, "reduce and emit error")
 		}
 	}()
 
@@ -156,7 +157,7 @@ func (e *reducingProxyMapEmitter) reduceAndEmit(ctx context.Context, threshold i
 
 	for _, kv := range kvs {
 		if err := e.target.Emit(ctx, kv.Key, kv.Value); err != nil {
-			return fmt.Errorf("reducingProxyMapEmitter.Emit: %v", err)
+			return errors.Wrap(err, "proxy emit")
 		}
 	}
 
@@ -178,14 +179,14 @@ func (e *reducingProxyMapEmitter) Emit(ctx context.Context, key, value []byte) e
 		e.collection = append(e.collection, NewKV(key, value))
 	}()
 
-	return e.reduceAndEmit(ctx, 100)
+	return errors.Wrap(e.reduceAndEmit(ctx, 100), "reducing proxy emit")
 }
 
 // AsModifyArgs creates task insertions. This one simply forwards to the target
 // implementation.
 func (e *reducingProxyMapEmitter) AsModifyArgs(prefix string, additional ...entroq.ModifyArg) ([]entroq.ModifyArg, error) {
 	if err := e.reduceAndEmit(e.emitCtx, 1); err != nil {
-		return nil, fmt.Errorf("reducingProxyMapEmitter.AsModifyArgs: %v", err)
+		return nil, errors.Wrap(err, "proxy modify args")
 	}
 	return e.target.AsModifyArgs(prefix, additional...)
 }
@@ -212,12 +213,12 @@ func WordCountMapper(ctx context.Context, key, value []byte, emit MapEmitFunc) e
 		if (numEmitted+1)%1000 == 0 {
 			select {
 			case <-ctx.Done():
-				return fmt.Errorf("canceled map operation")
+				return errors.Wrap(ctx.Err(), "canceled map operation")
 			default:
 			}
 		}
 		if err := emit(ctx, []byte(word), []byte(fmt.Sprint(count))); err != nil {
-			return fmt.Errorf("word count output error: %v", err)
+			return errors.Wrap(err, "word count output error")
 		}
 		numEmitted++
 	}
@@ -343,59 +344,25 @@ func NewMapWorker(eq *entroq.EntroQ, inQueue string, newEmitter func() MapEmitte
 // empty, it encounters an error, or its context is canceled, whichever comes
 // first. If this should be run in a goroutine, that is up to the caller.
 // The task value is expected to be a JSON-serialized KV struct.
+//
+// Runs until the context is canceled or an unrecoverable error is encountered.
 func (w *MapWorker) Run(ctx context.Context) error {
-	log.Printf("Mapper %q starting", w.Name)
-	defer log.Printf("Mapper %q finished", w.Name)
-
-	wrk := w.client.NewWorker(w.InputQueue)
-
-	// Runs a mapper over a given task's input. It does everything in
-	// memory, including storage of outputs. Note that, were we to want this to
-	// scale, we would need to write output to a number of temporary files, then
-	// clean them up if there were an error of any kind (or let them get garbage
-	// collected). They would need to not be referenced unless the entire map task
-	// were completed, at which point they would be pointed to by the completion
-	// task. That's very doable, but beyond the scope of this exercise.
-	for wrk.Next(ctx) {
-		if _, _, err := wrk.DoModify(func(ctx context.Context) ([]entroq.ModifyArg, error) {
-			task := wrk.Task()
-
-			emitter := w.newEmitter()
-			if w.EarlyReduce != nil {
-				emitter = newReducingProxyMapEmitter(emitter, w.EarlyReduce)
-			}
-
-			kv := new(KV)
-			if err := json.Unmarshal(task.Value, kv); err != nil {
-				return nil, fmt.Errorf("mr.MapWorker.mapTask json: %v", err)
-			}
-
-			if err := w.Map(ctx, kv.Key, kv.Value, emitter.Emit); err != nil {
-				return nil, entroq.WrapDependencyError(err, "mr.MapWorker.mapTask %q", task.IDVersion())
-			}
-
-			return emitter.AsModifyArgs(w.OutputPrefix, task.AsDeletion())
-		}); err != nil {
-			if entroq.IsTimeout(err) {
-				log.Printf("mr.MapWorker.Run.DoModify timeout: %v", err)
-				continue
-			}
-			if entroq.IsDependency(err) {
-				log.Printf("mr.MapWorker.Run.DoModify dependency: %v", err)
-				continue
-			}
-			if entroq.IsCanceled(err) {
-				log.Printf("mr.MapWorker.Run.DoModify canceled: %v", err)
-				break
-			}
-			return fmt.Errorf("mr.MapWorker.Run.DoModify: %v", err)
+	eqw := w.client.NewWorker(w.InputQueue)
+	return eqw.Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
+		emitter := w.newEmitter()
+		if w.EarlyReduce != nil {
+			emitter = newReducingProxyMapEmitter(emitter, w.EarlyReduce)
 		}
-	}
-	if err := wrk.Err(); err != nil && !entroq.IsCanceled(err) {
-		log.Printf("wrk err: %v", err)
-		return err
-	}
-	return nil
+		kv := new(KV)
+		if err := json.Unmarshal(task.Value, kv); err != nil {
+			return nil, errors.Wrap(err, "map run json")
+		}
+		if err := w.Map(ctx, kv.Key, kv.Value, emitter.Emit); err != nil {
+			return nil, errors.Wrap(err, "map run map")
+		}
+
+		return emitter.AsModifyArgs(w.OutputPrefix, task.AsDeletion())
+	})
 }
 
 // ReducerInput provides a streaming interface for getting values during reduction.
@@ -417,7 +384,7 @@ type ReducerInput interface {
 	// 		process(input.Value())
 	// 	}
 	// 	if err := input.Err(); err != nil {
-	// 		return fmt.Errorf("error getting input: %v", err)
+	// 		return errors.Wrap(err, "error getting input")
 	// 	}
 	Next() bool
 }
@@ -429,10 +396,10 @@ type Reducer func(ctx context.Context, input ReducerInput) ([]byte, error)
 // FirstValueReducer outputs its first value and quits.
 func FirstValueReducer(ctx context.Context, input ReducerInput) ([]byte, error) {
 	if !input.Next() {
-		return nil, fmt.Errorf("no inputs to reducer")
+		return nil, errors.New("no inputs to reducer")
 	}
 	if err := input.Err(); err != nil {
-		return nil, fmt.Errorf("reduce error: %v", err)
+		return nil, errors.Wrap(err, "reduce")
 	}
 	return input.Value(), nil
 }
@@ -449,12 +416,12 @@ func SumReducer(ctx context.Context, input ReducerInput) ([]byte, error) {
 	for input.Next() {
 		count, err := strconv.Atoi(string(input.Value()))
 		if err != nil {
-			return nil, fmt.Errorf("int conversion in SumReducer: %v", err)
+			return nil, errors.Wrap(err, "int conversion in SumReducer")
 		}
 		sum += count
 	}
 	if err := input.Err(); err != nil {
-		return nil, fmt.Errorf("error getting SumReducer value: %v", err)
+		return nil, errors.Wrap(err, "get SumReducer value")
 	}
 	return []byte(fmt.Sprint(sum)), nil
 }
@@ -466,7 +433,7 @@ func SliceReducer(ctx context.Context, input ReducerInput) ([]byte, error) {
 		vals = append(vals, input.Value())
 	}
 	if err := input.Err(); err != nil {
-		return nil, fmt.Errorf("error getting reduce value: %v", err)
+		return nil, errors.Wrap(err, "get reduce value")
 	}
 	return json.Marshal(vals)
 }
@@ -552,7 +519,7 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 		for _, task := range tasks {
 			var vals []*KV
 			if err := json.Unmarshal(task.Value, &vals); err != nil {
-				return fmt.Errorf("mr.ReduceWorker.mergeTasks: %v", err)
+				return errors.Wrap(err, "merge from json")
 			}
 			kvs = append(kvs, vals...)
 		}
@@ -564,21 +531,21 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 		// Now all key/value pairs are merged into a single sorted list. Create a new task and delete the others.
 		combined, err := json.Marshal(kvs)
 		if err != nil {
-			return fmt.Errorf("mr.ReduceWorker.mergeTasks: %v", err)
+			return errors.Wrap(err, "merge to json")
 		}
 
 		modArgs = append(modArgs, entroq.InsertingInto(w.InputQueue, entroq.WithValue(combined)))
 		return nil
 	})
 	if err != nil {
-		return entroq.WrapDependencyError(err, "mr.ReduceWorker.mergeTasks renew")
+		return errors.Wrap(err, "merge while claimed")
 	}
 
 	for _, t := range tasks {
 		modArgs = append(modArgs, t.AsDeletion())
 	}
 	if _, _, err := w.client.Modify(ctx, modArgs...); err != nil {
-		return entroq.WrapDependencyError(err, "mr.ReduceWorker.mergeTasks modify")
+		return errors.Wrap(err, "merge output")
 	}
 	return nil
 }
@@ -623,7 +590,7 @@ func reduceSortedKVs(ctx context.Context, reduce Reducer, kvs []*KV) ([]*KV, err
 			}
 		}
 		if err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "reduce sorted kvs")
 		}
 		outputs = append(outputs, NewKV(last.Key, output))
 	}
@@ -639,12 +606,12 @@ func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error 
 		log.Printf("Reduce %q starting reduce task", w.Name)
 		var kvs []*KV
 		if err := json.Unmarshal(task.Value, &kvs); err != nil {
-			return fmt.Errorf("mr.ReduceWorker.reduceTasks: %v", err)
+			return errors.Wrap(err, "reduce from json")
 		}
 
 		var err error
 		if outputs, err = reduceSortedKVs(ctx, w.Reduce, kvs); err != nil {
-			return entroq.WrapDependencyError(err, "mr.ReduceWorker.reduceTask")
+			return errors.Wrap(err, "reduce sorted")
 		}
 
 		return nil
@@ -652,10 +619,10 @@ func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error 
 
 	outputValue, err := json.Marshal(outputs)
 	if err != nil {
-		return fmt.Errorf("mr.ReduceWorker.reduceTask: %v", err)
+		return errors.Wrap(err, "reduce to json")
 	}
 	if _, _, err := w.client.Modify(ctx, task.AsDeletion(), entroq.InsertingInto(w.OutputQueue, entroq.WithValue(outputValue))); err != nil {
-		return entroq.WrapDependencyError(err, "mr.ReduceWorker.reduceTask")
+		return errors.Wrap(err, "reduce output")
 	}
 	return nil
 }
@@ -687,12 +654,12 @@ func (w *ReduceWorker) Run(ctx context.Context) error {
 	for {
 		mergeTasks, err := w.client.Tasks(ctx, w.InputQueue, entroq.LimitTasks(200))
 		if err != nil {
-			return fmt.Errorf("mr.ReduceWorker.Run tasks: %v", err)
+			return errors.Wrap(err, "reduce get tasks")
 		}
 		if len(mergeTasks) <= 1 {
 			empty, err := w.client.QueuesEmpty(ctx, entroq.MatchExact(w.MapEmptyQueue))
 			if err != nil {
-				return fmt.Errorf("mr.ReduceWorker.Run: %v", err)
+				return errors.Wrap(err, "reduce empty check")
 			}
 			if empty {
 				log.Printf("Reducer %q done merging", w.Name)
@@ -702,7 +669,7 @@ func (w *ReduceWorker) Run(ctx context.Context) error {
 			// Nothing to do - sleep and continue.
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return errors.Wrap(ctx.Err(), "reduce worker done")
 			case <-time.After(shuffleWait):
 			}
 			continue
@@ -710,11 +677,11 @@ func (w *ReduceWorker) Run(ctx context.Context) error {
 		// More than one merge task is in the queue. Merge and check again.
 		log.Printf("Reducer %q merging %d tasks", w.Name, len(mergeTasks))
 		if err := w.mergeTasks(ctx, mergeTasks); err != nil {
-			if entroq.IsDependency(err) {
-				log.Printf("Trying again in mr.ReduceWorker.Run: %v", err)
-				continue
+			if _, ok := entroq.AsDependency(err); !ok {
+				return errors.Wrapf(err, "merge %d tasks", len(mergeTasks))
 			}
-			return fmt.Errorf("mr.ReduceWorker.Run: %v", err)
+			log.Printf("Trying again in mr.ReduceWorker.Run: %v", err)
+			continue
 		}
 		log.Printf("Reducer %q merged %d tasks, pushing to %q", w.Name, len(mergeTasks), w.InputQueue)
 	}
@@ -723,14 +690,14 @@ func (w *ReduceWorker) Run(ctx context.Context) error {
 
 	task, err := w.client.TryClaim(ctx, w.InputQueue, claimDuration)
 	if err != nil {
-		return entroq.WrapDependencyError(err, "mr.ReduceWorker.Run claim")
+		return errors.Wrap(err, "reduce claim")
 	}
 	if task == nil {
 		log.Printf("Reducer %q has nothing to do", w.Name)
 		return nil
 	}
 	if err := w.reduceTask(ctx, task); err != nil {
-		return entroq.WrapDependencyError(err, "mr.ReduceWorker.Run reduce")
+		return errors.Wrap(err, "reduce")
 	}
 	return nil
 }
@@ -831,13 +798,26 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 		qReduceOutput = path.Join(qReduce, "output")
 	)
 
-	g, ctx := errgroup.WithContext(ctx)
+	log.Printf("Creating tasks for inputs")
+	// First create map tasks for all of the data.
+	for _, kv := range mr.Data {
+		b, err := json.Marshal(kv)
+		if err != nil {
+			return "", errors.Wrap(err, "marshal input")
+		}
+		if _, _, err := mr.client.Modify(ctx, entroq.InsertingInto(qMapInput, entroq.WithValue(b))); err != nil {
+			return "", errors.Wrap(err, "insert map input")
+		}
+	}
+	log.Printf("Created %d tasks", len(mr.Data))
 
+	// When all tasks are present, start map and reduce workers. They'll all exit when finished.
+	g, ctx := errgroup.WithContext(ctx)
 	mapCtx, mapCancel := context.WithCancel(ctx)
 
-	log.Printf("Starting %d mappers", mr.NumMappers)
 	for i := 0; i < mr.NumMappers; i++ {
 		i := i
+		ctx := mapCtx
 		worker := NewMapWorker(mr.client, qMapInput,
 			func() MapEmitter { return NewCollectingMapEmitter(mr.NumReducers) },
 			MapAsName(fmt.Sprint(i)),
@@ -846,42 +826,29 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 			WithEarlyReducer(mr.EarlyReduce))
 
 		g.Go(func() error {
-			return worker.Run(mapCtx)
+			if err := worker.Run(ctx); !entroq.IsCanceled(err) {
+				return errors.Wrap(err, "map worker")
+			}
+			log.Printf("Map worker %q clean shutdown", worker.Name)
+			return nil
 		})
 	}
 
-	log.Printf("Creating %d tasks for inputs", len(mr.Data))
-	// First create map tasks for all of the data.
-	for _, kv := range mr.Data {
-		b, err := json.Marshal(kv)
-		if err != nil {
-			return "", fmt.Errorf("marshal input: %v", err)
-		}
-		if _, _, err := mr.client.Modify(ctx, entroq.InsertingInto(qMapInput, entroq.WithValue(b))); err != nil {
-			return "", fmt.Errorf("insert map input: %v", err)
-		}
-	}
-
-	log.Printf("Created %d tasks", len(mr.Data))
-
-	// When all tasks are present, start map and reduce workers. They'll all exit when finished.
-	// Check for empty mapper queue. If empty, cancel all map workers.
 	log.Printf("Starting empty check")
 	g.Go(func() error {
 		for {
 			empty, err := mr.client.QueuesEmpty(ctx, entroq.MatchExact(qMapInput))
-			log.Printf("empty check: %v %v", empty, err)
 			if err != nil {
-				return fmt.Errorf("mr.MapReduce.Run empty: %v", err)
+				return errors.Wrap(err, "map worker empty queue check")
 			}
 			if empty {
 				mapCancel()
-				return nil // Nothing to do - quit now.
+				return nil // all finished.
 			}
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(claimWait / 2):
+				return errors.Wrap(ctx.Err(), "empty checker")
+			case <-time.After(5 * time.Second):
 			}
 		}
 	})
@@ -895,13 +862,13 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 			ReduceToOutput(qReduceOutput))
 
 		g.Go(func() error {
-			return worker.Run(ctx)
+			return errors.Wrap(worker.Run(ctx), "reduce worker")
 		})
 	}
 
 	log.Printf("Waiting for mappers and reducers to finish")
 	if err := g.Wait(); err != nil {
-		return "", fmt.Errorf("pipeline error: %v", err)
+		return "", errors.Wrap(err, "pipeline error")
 	}
 
 	return qReduceOutput, nil
