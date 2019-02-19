@@ -36,7 +36,7 @@
 // That is actually what we want; rather than hold connections open, we allow
 // the client to poll with exponential backoff. In large-scale systems, this is
 // better behavior.
-package grpc
+package grpc // import "entrogo.com/entroq/grpc"
 
 import (
 	"context"
@@ -44,13 +44,14 @@ import (
 	"net"
 	"time"
 
+	"entrogo.com/entroq"
 	"github.com/google/uuid"
-	"github.com/shiblon/entroq"
+	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	pb "github.com/shiblon/entroq/proto"
+	pb "entrogo.com/entroq/proto"
 	hpb "google.golang.org/grpc/health/grpc_health_v1"
 )
 
@@ -110,15 +111,15 @@ func Opener(addr string, opts ...Option) entroq.BackendOpener {
 	return func(ctx context.Context) (entroq.Backend, error) {
 		conn, err := grpc.DialContext(ctx, addr, options.dialOpts...)
 		if err != nil {
-			return nil, fmt.Errorf("failed to dial %q: %v", addr, err)
+			return nil, errors.Wrapf(err, "dial %q", addr)
 		}
 		hclient := hpb.NewHealthClient(conn)
 		resp, err := hclient.Check(ctx, &hpb.HealthCheckRequest{})
 		if err != nil {
-			return nil, fmt.Errorf("health check: %v", err)
+			return nil, errors.Wrap(err, "health check")
 		}
 		if st := resp.GetStatus(); st != hpb.HealthCheckResponse_SERVING {
-			return nil, fmt.Errorf("health serving status: %q", st)
+			return nil, errors.Errorf("health serving status: %q", st)
 		}
 		return New(conn, opts...)
 	}
@@ -143,7 +144,7 @@ func New(conn *grpc.ClientConn, opts ...Option) (*backend, error) {
 
 // Close closes the underlying connection to the gRPC task service.
 func (b *backend) Close() error {
-	return b.conn.Close()
+	return errors.Wrap(b.conn.Close(), "pg backend close")
 }
 
 // Queues produces a mapping from queue names to queue sizes.
@@ -154,7 +155,7 @@ func (b *backend) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[strin
 		Limit:       int32(qq.Limit),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to get queues over gRPC: %v", err)
+		return nil, errors.Wrap(err, "failed to get queues over gRPC")
 	}
 	qs := make(map[string]int)
 	for _, q := range resp.Queues {
@@ -174,12 +175,12 @@ func toMS(t time.Time) int64 {
 func fromTaskProto(t *pb.Task) (*entroq.Task, error) {
 	cid, err := uuid.Parse(t.ClaimantId)
 	if err != nil {
-		return nil, fmt.Errorf("claimant UUID parse failure: %v", err)
+		return nil, errors.Wrap(err, "claimant UUID parse failure")
 	}
 
 	id, err := uuid.Parse(t.Id)
 	if err != nil {
-		return nil, fmt.Errorf("task UUID parse failure: %v", err)
+		return nil, errors.Wrap(err, "task UUID parse failure")
 	}
 
 	return &entroq.Task{
@@ -213,7 +214,7 @@ func changeProtoFromTask(t *entroq.Task) *pb.TaskChange {
 func fromTaskIDProto(tid *pb.TaskID) (*entroq.TaskID, error) {
 	id, err := uuid.Parse(tid.Id)
 	if err != nil {
-		return nil, fmt.Errorf("grpc.fromTaskIDProto parse %q: %v", tid.Id, err)
+		return nil, errors.Wrapf(err, "parse %q", tid.Id)
 	}
 	return &entroq.TaskID{
 		ID:      id,
@@ -236,13 +237,13 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 		Limit:      int32(tq.Limit),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to get tasks over gRPC: %v", err)
+		return nil, errors.Wrap(err, "failed to get tasks over gRPC")
 	}
 	var tasks []*entroq.Task
 	for _, t := range resp.Tasks {
 		task, err := fromTaskProto(t)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse task response: %v", err)
+			return nil, errors.Wrap(err, "failed to parse task response")
 		}
 		tasks = append(tasks, task)
 	}
@@ -259,10 +260,10 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 		PollMs:     int64(cq.PollTime / time.Millisecond),
 	})
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "grpc claim")
 	}
 	if resp.Task == nil {
-		return nil, status.Errorf(codes.Internal, "No task returned from backend Claim")
+		return nil, errors.New("no task returned from backend Claim")
 	}
 	return fromTaskProto(resp.Task)
 }
@@ -276,7 +277,7 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 		DurationMs: int64(cq.Duration / time.Millisecond),
 	})
 	if err != nil {
-		return nil, err // Do not wrap - gRPC/context status preservation is important.
+		return nil, errors.Wrap(err, "grpc try claim")
 	}
 	if resp.Task == nil {
 		return nil, nil
@@ -310,25 +311,27 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 
 	resp, err := b.cli.Modify(ctx, req)
 	if err != nil {
-		switch stat := status.Convert(err); stat.Code() {
+		switch stat := status.Convert(errors.Cause(err)); stat.Code() {
 		case codes.NotFound:
 			// Dependency error, should have details.
 			depErr := entroq.DependencyError{
-				Message: "grpc.Modify",
+				Message: err.Error(),
 			}
 			for _, det := range stat.Details() {
 				detail, ok := det.(*pb.ModifyDep)
 				if !ok {
-					return nil, nil, fmt.Errorf("grpc.Modify: %v", err)
+					return nil, nil, errors.Errorf("grpc modify unexpected detail type %T: %+v", det, det)
 				}
-				if detail.Type == pb.DepType_DETAIL && detail.Msg != "" {
-					depErr.Message += fmt.Sprintf(": %s", detail.Msg)
+				if detail.Type == pb.DepType_DETAIL {
+					if detail.Msg != "" {
+						depErr.Message += fmt.Sprintf(": %s", detail.Msg)
+					}
 					continue
 				}
 
 				tid, err := fromTaskIDProto(detail.Id)
 				if err != nil {
-					return nil, nil, fmt.Errorf("grpc.Modify: %v", err)
+					return nil, nil, errors.Wrap(err, "grpc modify from proto")
 				}
 				switch detail.Type {
 				case pb.DepType_CLAIM:
@@ -340,26 +343,26 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 				case pb.DepType_DEPEND:
 					depErr.Depends = append(depErr.Depends, tid)
 				default:
-					return nil, nil, fmt.Errorf("grpc.Modify unknown detail %T in %v", detail, err)
+					return nil, nil, errors.Errorf("grpc modify unknown type %v in detail %v", detail.Type, detail)
 				}
 			}
-			return nil, nil, depErr
+			return nil, nil, errors.Wrap(depErr, "grpc modify dependency")
 		default:
-			return nil, nil, fmt.Errorf("grpc.Modify: %v", err)
+			return nil, nil, errors.Wrap(err, "grpc modify")
 		}
 	}
 
 	for _, t := range resp.GetInserted() {
 		task, err := fromTaskProto(t)
 		if err != nil {
-			return nil, nil, fmt.Errorf("grpc.Modify: %v", err)
+			return nil, nil, errors.Wrap(err, "grpc modify task proto")
 		}
 		inserted = append(inserted, task)
 	}
 	for _, t := range resp.GetChanged() {
 		task, err := fromTaskProto(t)
 		if err != nil {
-			return nil, nil, fmt.Errorf("grpc.Modify: %v", err)
+			return nil, nil, errors.Wrap(err, "grpc modify changed")
 		}
 		changed = append(changed, task)
 	}

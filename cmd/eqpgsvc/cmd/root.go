@@ -21,15 +21,15 @@ import (
 	"net"
 	"os"
 
+	"entrogo.com/entroq/pg"
+	"entrogo.com/entroq/qsvc"
 	homedir "github.com/mitchellh/go-homedir"
-	"github.com/shiblon/entroq/pg"
-	"github.com/shiblon/entroq/qsvc"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 
-	pb "github.com/shiblon/entroq/proto"
+	pb "entrogo.com/entroq/proto"
 	hpb "google.golang.org/grpc/health/grpc_health_v1"
 
 	_ "github.com/lib/pq"
