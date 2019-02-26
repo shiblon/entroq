@@ -20,6 +20,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 
 	"entrogo.com/entroq/pg"
 	"entrogo.com/entroq/qsvc"
@@ -116,8 +117,8 @@ func initConfig() {
 			os.Exit(1)
 		}
 
-		viper.AddConfigPath(home)
-		viper.SetConfigName(".config/eqpgsvc")
+		viper.AddConfigPath(filepath.Join(home, ".config"))
+		viper.SetConfigName("eqpgsvc.yml")
 	}
 
 	viper.AutomaticEnv() // read in environment variables that match

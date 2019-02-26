@@ -24,6 +24,18 @@ func TestSimpleSequence(t *testing.T) {
 	qtest.SimpleSequence(ctx, t, client, "")
 }
 
+func TestInsertWithID(t *testing.T) {
+	ctx := context.Background()
+
+	client, stop, err := qtest.ClientService(ctx, Opener())
+	if err != nil {
+		t.Fatalf("Get client: %v", err)
+	}
+	defer stop()
+
+	qtest.InsertWithID(ctx, t, client, "")
+}
+
 func TestSimpleWorker(t *testing.T) {
 	ctx := context.Background()
 

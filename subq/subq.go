@@ -108,9 +108,9 @@ func (s *SubQ) Notify(q string) {
 	}()
 }
 
-// makeDefaultCondition creates a condition function that returns false once, then true.
-// This will cause the Wait function to wait exactly one time through its
-// polling loop.
+// makeDefaultCondition creates a condition function that returns false once,
+// then true. This will cause the Wait function to wait exactly one time for a
+// notification, then exit.
 func makeDefaultCondition() func() bool {
 	var done bool
 	return func() bool {

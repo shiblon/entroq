@@ -168,10 +168,20 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 		entroq.ModifyAs(claimant),
 	}
 	for _, insert := range req.Inserts {
+		var (
+			id  uuid.UUID
+			err error
+		)
+		if insert.Id != "" {
+			if id, err = uuid.Parse(insert.Id); err != nil {
+				return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse explicit insertion ID")
+			}
+		}
 		modArgs = append(modArgs,
 			entroq.InsertingInto(insert.Queue,
 				entroq.WithArrivalTime(fromMS(insert.AtMs)),
-				entroq.WithValue(insert.Value)))
+				entroq.WithValue(insert.Value),
+				entroq.WithID(id)))
 	}
 	for _, change := range req.Changes {
 		id, err := uuid.Parse(change.GetOldId().Id)
