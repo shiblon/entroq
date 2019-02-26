@@ -48,6 +48,18 @@ type TaskData struct {
 	Queue string
 	At    time.Time
 	Value []byte
+
+	// ID is an optional task ID to be used for task insertion.
+	// Default (uuid.Nil) causes the backend to assign one, and that is
+	// sufficient for many cases. If you desire to make a database entry that
+	// *references* a task, however, in that case it can make sense to specify
+	// an explicit task ID for insertion. This allows a common workflow cycle
+	//
+	// 	consume task -> db update -> insert tasks
+	//
+	// to be done safely, where the database update needs to refer to
+	// to-be-inserted tasks.
+	ID uuid.UUID
 }
 
 // Task represents a unit of work, with a byte slice value payload.
@@ -122,6 +134,7 @@ func (t *Task) Data() *TaskData {
 		Queue: t.Queue,
 		At:    t.At,
 		Value: t.Value,
+		ID:    t.ID,
 	}
 }
 
@@ -711,6 +724,52 @@ func WithArrivalTimeIn(duration time.Duration) InsertArg {
 func WithValue(value []byte) InsertArg {
 	return func(_ *Modification, d *TaskData) {
 		d.Value = value
+	}
+}
+
+// WithID sets the task's ID for insertion. This is not normally needed, as the backend
+// will assign a new, unique ID for this task if none is specified. There are cases
+// where assigning an explicit insertion ID (always being careful that it is
+// unique) can be useful, however.
+//
+// For example, a not uncommon need is for a worker to do the following:
+//
+// 	- Claim a task,
+// 	- Make database entries corresponding to downstream work,
+// 	- Insert tasks for the downstream work and delete claimed task.
+//
+// If the database entries need to reference the tasks that have not yet been
+// inserted (e.g., if they need to be used to get at the status of a task), it
+// is not safe to simply update the database after insertion, as this introduces
+// a race condition. If, for example, the following strategy is employed, then
+// the task IDs may never make it into the database:
+//
+// 	- Claim a task,
+// 	- Make database entries
+// 	- Insert tasks and delete claimed task
+// 	- Update database with new task IDs
+//
+// In this event, it is entirely possible to successfully process the incoming
+// task and create the outgoing tasks, then lose network connectivity and fail
+// to add those IDs to the databse. Now it is no longer possible to update the
+// database appropriately: the task information is simply lost.
+//
+// Instead, it is safe to do the following:
+//
+// 	- Claim a task
+// 	- Make database entries, including with to-be-created task IDs
+// 	- Insert tasks with those IDs and delete claimed task.
+//
+// This avoids the potential data loss condition entirely.
+//
+// There are other workarounds for this situation, like using a two-step
+// creation process and taking advantage of the ability to move tasks between
+// queues without disturbing their ID (only their version), but this is not
+// uncommon enough to warrant requiring the extra worker logic just to get a
+// task ID into the database.
+func WithID(id uuid.UUID) InsertArg {
+	return func(_ *Modification, d *TaskData) {
+		d.ID = id
 	}
 }
 
