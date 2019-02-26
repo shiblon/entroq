@@ -191,14 +191,6 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 
 	now := time.Now()
 
-	sleep := func(d time.Duration) {
-		select {
-		case <-time.After(d):
-		case <-ctx.Done():
-			t.Fatalf("Context canceled: %v", ctx.Err())
-		}
-	}
-
 	queue := path.Join(qPrefix, "simple_sequence")
 
 	// Claim from empty queue.
@@ -210,6 +202,8 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 		t.Fatalf("Got unexpected non-nil claim response from empty queue:\n%s", task)
 	}
 
+	const futureTaskDuration = 5 * time.Second
+
 	insWant := []*entroq.Task{
 		{
 			Queue:    queue,
@@ -219,7 +213,7 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 		},
 		{
 			Queue:    queue,
-			At:       now.Add(100 * time.Millisecond),
+			At:       now.Add(futureTaskDuration),
 			Value:    []byte("there"),
 			Claimant: client.ID(),
 		},
@@ -240,13 +234,13 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 		t.Fatalf("Modify tasks unexpected result, ignoring ID and time fields (-want +got):\n%v", diff)
 	}
 	// Also check that their arrival times are 100 ms apart as expected:
-	if diff := inserted[1].At.Sub(inserted[0].At); diff != 100*time.Millisecond {
-		t.Fatalf("Wanted At difference to be %v, got %v", 100*time.Millisecond, diff)
+	if diff := inserted[1].At.Sub(inserted[0].At); diff != futureTaskDuration {
+		t.Fatalf("Wanted At difference to be %v, got %v", futureTaskDuration, diff)
 	}
 
 	// Get queues.
 	queuesWant := map[string]int{queue: 2}
-	queuesGot, err := client.Queues(ctx)
+	queuesGot, err := client.Queues(ctx, entroq.MatchPrefix(qPrefix))
 	if err != nil {
 		t.Fatalf("Getting queues failed: %v", err)
 	}
@@ -290,16 +284,17 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	}
 
 	// Make sure the next claim will work.
-	sleep(100 * time.Millisecond)
-	tryclaimed, err = client.TryClaim(ctx, queue, 5*time.Second)
+	claimCtx, cancel := context.WithTimeout(ctx, 2*futureTaskDuration)
+	defer cancel()
+	claimed, err = client.Claim(claimCtx, queue, 5*time.Second, entroq.ClaimPollTime(time.Second))
 	if err != nil {
 		t.Fatalf("Got unexpected error for claiming from a queue with one ready task: %v", err)
 	}
-	if diff := EqualTasksVersionIncr(insWant[1], tryclaimed, 1); diff != "" {
-		t.Fatalf("TryClaim got unexpected task, ignoring ID and time fields (-want +got):\n%v", diff)
+	if diff := EqualTasksVersionIncr(insWant[1], claimed, 1); diff != "" {
+		t.Fatalf("Claim got unexpected task, ignoring ID and time fields (-want +got):\n%v", diff)
 	}
-	if got, lower, upper := tryclaimed.At, time.Now().Add(4*time.Second), time.Now().Add(6*time.Second); got.Before(lower) || got.After(upper) {
-		t.Fatalf("TryClaimed arrival time not in time bounds [%v, %v]: %v", lower, upper, tryclaimed.At)
+	if got, lower, upper := claimed.At, time.Now().Add(4*time.Second), time.Now().Add(6*time.Second); got.Before(lower) || got.After(upper) {
+		t.Fatalf("Claimed arrival time not in time bounds [%v, %v]: %v", lower, upper, claimed.At)
 	}
 }
 
@@ -415,7 +410,7 @@ func EqualAllTasks(want, got []*entroq.Task) string {
 	var diffs []string
 	for i, w := range want {
 		g := got[i]
-		if w.Queue != g.Queue || w.Claimant != g.Claimant || !bytes.Equal(w.Value, g.Value) {
+		if (w == nil) != (g == nil) || w.Queue != g.Queue || w.Claimant != g.Claimant || !bytes.Equal(w.Value, g.Value) {
 			diffs = append(diffs, cmp.Diff(w, g))
 		}
 	}

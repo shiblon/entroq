@@ -111,7 +111,7 @@ func (w *Worker) Run(ctx context.Context, f func(ctx context.Context, task *Task
 
 		if _, _, err := w.eqc.Modify(ctx, WithModification(modification)); err != nil {
 			if _, ok := AsDependency(err); ok {
-				log.Printf("Worker continuing after ack dependency: %v", err)
+				log.Print("Worker ack failed, throwing away: %v", err)
 				continue
 			}
 			if IsTimeout(err) {

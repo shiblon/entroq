@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 
 	"entrogo.com/entroq/mem"
 	"entrogo.com/entroq/qsvc"
@@ -83,8 +84,8 @@ func initConfig() {
 		}
 
 		// Search config in home directory with name ".config/eqmemsvc" (without extension).
-		viper.AddConfigPath(home)
-		viper.SetConfigName(".config/eqmemsvc")
+		viper.AddConfigPath(filepath.Join(home, ".config"))
+		viper.SetConfigName("eqmemsvc.yml")
 	}
 
 	viper.AutomaticEnv() // read in environment variables that match
