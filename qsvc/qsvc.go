@@ -34,7 +34,6 @@ package qsvc // import "entrogo.com/entroq/qsvc"
 
 import (
 	"context"
-	"log"
 	"time"
 
 	"entrogo.com/entroq"
@@ -168,7 +167,6 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 	modArgs := []entroq.ModifyArg{
 		entroq.ModifyAs(claimant),
 	}
-	log.Printf("mod arg inserts:")
 	for _, insert := range req.Inserts {
 		var (
 			id  uuid.UUID

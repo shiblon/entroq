@@ -396,12 +396,17 @@ func (b *backend) modify(ctx context.Context, mod *entroq.Modification) (inserte
 			at = now
 		}
 
+		id := ins.ID
+		if id == uuid.Nil {
+			id = uuid.New()
+		}
+
 		t := new(entroq.Task)
 		row := tx.QueryRowContext(ctx, `
 			INSERT INTO tasks (id, version, queue, at, claimant, value, created, modified)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 			RETURNING id, version, queue, at, claimant, value, created, modified
-		`, uuid.New(), 0, ins.Queue, at, mod.Claimant, ins.Value, now, now)
+		`, id, 0, ins.Queue, at, mod.Claimant, ins.Value, now, now)
 		if err := row.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Claimant, &t.Value, &t.Created, &t.Modified); err != nil {
 			return nil, nil, errors.Wrap(err, "pg modify insert scan")
 		}
