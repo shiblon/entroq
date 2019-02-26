@@ -5,6 +5,7 @@ import (
 	"container/heap"
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -93,10 +94,27 @@ func New(ctx context.Context) *backend {
 	}
 }
 
-// insertUnsafe must be called from within a locked mutex.
-func (b *backend) insertUnsafe(t *entroq.Task) error {
-	if _, ok := b.byID[t.ID]; ok {
-		return errors.Errorf("duplicate task ID insertion attempt: %v", t.ID)
+// existsIDUnsafe must be called from within a locked mutex, returns whether the given ID exists.
+func (b *backend) existsIDUnsafe(id uuid.UUID) bool {
+	_, ok := b.byID[id]
+	return ok
+}
+
+// existsIDVersionUnsafe must be called from within a locked mutex, returns
+// whether the given ID and version exists.
+func (b *backend) existsIDVersionUnsafe(id *entroq.TaskID) bool {
+	if item, ok := b.byID[id.ID]; ok && item.task.Version == id.Version {
+		return true
+	}
+	return false
+}
+
+// insertUnsafe must be called from within a locked mutex. Panics when
+// duplicate insertion is attempted, so tests for duplicate IDs need to be done
+// in the caller.
+func (b *backend) insertUnsafe(t *entroq.Task) {
+	if b.existsIDUnsafe(t.ID) {
+		log.Panicf("Duplicate insertion ID attempted: %v", t.ID)
 	}
 	// If not there, put it there. We could also use append on the long-form
 	// version of the heap (specifying the whole map, etc.) but this is more
@@ -110,57 +128,53 @@ func (b *backend) insertUnsafe(t *entroq.Task) error {
 	item := &hItem{task: t}
 	heap.Push(h, item)
 	b.byID[t.ID] = item
-
-	return nil
 }
 
-// removeUnsafe must be called from within a locked mutex.
-func (b *backend) removeUnsafe(id uuid.UUID) error {
-	item, ok := b.byID[id]
-	if !ok {
-		return errors.Errorf("item not found for removal: %v", id)
+// removeUnsafe must be called from within a locked mutex. Assumes that the
+// item exists - existence must be checked from the caller. Panics if queues
+// get out of sync (should never happen, so there's no recovering if it does).
+func (b *backend) removeUnsafe(id *entroq.TaskID) {
+	if !b.existsIDVersionUnsafe(id) {
+		log.Panicf("Item not found for removal: %v", id)
 	}
-	delete(b.byID, id)
-
+	item := b.byID[id.ID]
+	if item.task.Version != id.Version {
+		log.Panicf("Item removal version mismatch: wanted %q, got %q", id, item.task.IDVersion())
+	}
 	h, ok := b.heaps[item.task.Queue]
 	if !ok {
-		return errors.Errorf("queues not in sync; found item to remove queues but not in index: %v", id)
+		log.Panicf("Queues not in sync; found item to remove in queues but not index: %v", id)
 	}
+
+	delete(b.byID, id.ID)
 	heap.Remove(h, item.idx)
 	if h.Len() == 0 {
 		delete(b.heaps, item.task.Queue)
 	}
-
-	return nil
 }
 
-// replaceUnsafe must be called from within a locked mutex.
-func (b *backend) replaceUnsafe(id uuid.UUID, newTask *entroq.Task) error {
-	item, ok := b.byID[id]
-	if !ok {
-		return errors.Errorf("item not found for task replacement: %v", id)
+// replaceUnsafe must be called from within a locked mutex. If the existing
+// task isn't there, panics.
+func (b *backend) replaceUnsafe(id *entroq.TaskID, newTask *entroq.Task) {
+	if !b.existsIDVersionUnsafe(id) {
+		log.Panicf("Item not found for task replacement: %v", id)
 	}
+	item := b.byID[id.ID]
 
 	// If the queues are the same, replace and fix order. No other changes.
 	if item.task.Queue == newTask.Queue {
 		item.task = newTask
 		h := b.heaps[item.task.Queue]
 		heap.Fix(h, item.idx)
-		return nil
+		return
 	}
 
 	// Queues are not the same. We need to remove from the first queue and add
 	// to the second. Note that this might not be *perfectly* efficient because
 	// we unnecessarily modify the ID index twice, but it's correct and easy to
 	// understand, so fixing it would be a premature optimization.
-	if err := b.removeUnsafe(item.task.ID); err != nil {
-		return errors.Wrap(err, "update queue removal")
-	}
-	if err := b.insertUnsafe(newTask); err != nil {
-		return errors.Wrap(err, "update queue insertion")
-	}
-
-	return nil
+	b.removeUnsafe(item.task.IDVersion())
+	b.insertUnsafe(newTask)
 }
 
 // Close stops the background goroutines and cleans up the in-memory backend.
@@ -286,8 +300,12 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 	now := time.Now()
 
 	for _, t := range mod.Inserts {
+		id := t.ID
+		if id == uuid.Nil {
+			id = uuid.New()
+		}
 		newTask := &entroq.Task{
-			ID:       uuid.New(),
+			ID:       id,
 			Version:  0,
 			Queue:    t.Queue,
 			Claimant: mod.Claimant,
@@ -297,19 +315,37 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 			Value:    make([]byte, len(t.Value)),
 		}
 		copy(newTask.Value, t.Value)
-
-		b.insertUnsafe(newTask)
+		if b.existsIDUnsafe(newTask.ID) {
+			return nil, nil, errors.Errorf("Cannot insert task ID %q: already exists", newTask.ID)
+		}
 		inserted = append(inserted, newTask)
 	}
 
 	for _, tid := range mod.Deletes {
-		b.removeUnsafe(tid.ID)
+		if !b.existsIDVersionUnsafe(tid) {
+			return nil, nil, errors.Errorf("task %q not found for deletion", tid)
+		}
 	}
 
 	for _, chg := range mod.Changes {
 		newTask := chg.Copy()
-		b.replaceUnsafe(chg.ID, newTask)
+		if !b.existsIDVersionUnsafe(chg.IDVersion()) {
+			return nil, nil, errors.Errorf("task %q not found for update", chg.IDVersion())
+		}
+		// Don't update version here - we do it at the last moment when actually doing the update below.
 		changed = append(changed, newTask)
+	}
+
+	for _, t := range inserted {
+		b.insertUnsafe(t)
+	}
+	for _, tid := range mod.Deletes {
+		b.removeUnsafe(tid)
+	}
+	for _, t := range changed {
+		id := t.IDVersion()
+		t.Version++
+		b.replaceUnsafe(id, t)
 	}
 
 	entroq.NotifyModified(b.nw, inserted, changed)
