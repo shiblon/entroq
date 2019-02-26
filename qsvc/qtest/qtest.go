@@ -14,6 +14,7 @@ import (
 	grpcbackend "entrogo.com/entroq/grpc"
 	"entrogo.com/entroq/qsvc"
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/uuid"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
@@ -136,6 +137,51 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 
 	if diff := EqualAllTasksVersionIncr(inserted, consumed, 1); diff != "" {
 		t.Errorf("Tasks inserted not the same as tasks consumed:\n%v", diff)
+	}
+}
+
+// InsertWithID tests the ability to insert tasks with a specified ID,
+// including errors when an existing ID is used for insertion.
+func InsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	t.Helper()
+	queue := path.Join(qPrefix, "insert_with_id")
+
+	knownID := uuid.New()
+
+	// Insert a task with an explicity ID.
+	inserted, changed, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithID(knownID)))
+	if err != nil {
+		t.Fatalf("Unable to insert task with known ID %q: %v", knownID, err)
+	}
+
+	// Check that insertion with explicit IDs works.
+	if len(changed) != 0 {
+		t.Fatalf("Expected 0 changed tasks, got %d", len(changed))
+	}
+	if len(inserted) != 1 {
+		t.Fatalf("Expected 1 inserted task, got %d", len(inserted))
+	}
+
+	insertedTask := inserted[0]
+	if insertedTask.ID != knownID {
+		t.Fatalf("Expected inserted task to have ID %q, got %q", knownID, insertedTask.ID)
+	}
+
+	// Try to claim the just-inserted task.
+	claimed, err := client.TryClaim(ctx, queue, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("Unexpected error claiming task with ID %q: %v", knownID, err)
+	}
+	if claimed == nil {
+		t.Fatalf("Expected task from queue %q, but received none", queue)
+	}
+	if claimed.ID != knownID {
+		t.Fatalf("Task claim expected ID %q, got %q", knownID, claimed.ID)
+	}
+
+	// Try to insert another with the same ID, observe an error.
+	if _, _, err = client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithID(knownID))); err == nil {
+		t.Fatalf("Expected error inserting duplicate ID %q, got no error", knownID)
 	}
 }
 

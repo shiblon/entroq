@@ -19,6 +19,14 @@ message TaskData {
 
   // The task's opaque payload.
   bytes value = 3;
+
+  // An optional ID (UUID) for an inserted task to use.
+  // Default is for the backend to assign one, and that is sufficient for many
+  // cases. If you desire to make a database entry that *references* a task,
+  // however, in that case it can make sense to specify an explicit task ID for
+  // insertion (allowing "consume -> db update -> modify" worker cycles to
+  // safely update a database entry that references to-be-inserted tasks).
+  string id = 4;
 }
 
 // TaskChange identifies a task by ID and specifies the new data it should contain.

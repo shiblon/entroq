@@ -196,10 +196,15 @@ func fromTaskProto(t *pb.Task) (*entroq.Task, error) {
 }
 
 func protoFromTaskData(td *entroq.TaskData) *pb.TaskData {
+	id := ""
+	if td.ID != uuid.Nil {
+		id = td.ID.String()
+	}
 	return &pb.TaskData{
 		Queue: td.Queue,
 		AtMs:  toMS(td.At),
 		Value: td.Value,
+		Id:    id,
 	}
 }
 
