@@ -52,6 +52,18 @@ func pgClient(ctx context.Context) (client *entroq.EntroQ, stop func(), err erro
 		WithConnectAttempts(10)))
 }
 
+func TestTasksWithID(t *testing.T) {
+	ctx := context.Background()
+
+	client, stop, err := pgClient(ctx)
+	if err != nil {
+		t.Fatalf("Get client: %v", err)
+	}
+	defer stop()
+
+	qtest.TasksWithID(ctx, t, client, "pgtest/"+uuid.New().String())
+}
+
 func TestInsertWithID(t *testing.T) {
 	ctx := context.Background()
 

@@ -236,10 +236,15 @@ func protoFromTaskID(tid *entroq.TaskID) *pb.TaskID {
 
 // Tasks produces a list of tasks in a given queue, possibly limited by claimant.
 func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Task, error) {
+	var ids []string
+	for _, tid := range tq.IDs {
+		ids = append(ids, tid.String())
+	}
 	resp, err := b.cli.Tasks(ctx, &pb.TasksRequest{
 		ClaimantId: tq.Claimant.String(),
 		Queue:      tq.Queue,
 		Limit:      int32(tq.Limit),
+		TaskId:     ids,
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get tasks over gRPC")
