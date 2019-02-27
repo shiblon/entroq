@@ -239,6 +239,16 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 		values = append(values, uuid.Nil.String(), tq.Claimant)
 	}
 
+	// Add IDs if a set of limiting IDs has been requested.
+	if len(tq.IDs) > 0 {
+		var specifiers []string
+		for _, id := range tq.IDs {
+			specifiers = append(specifiers, fmt.Sprintf("$%d", len(values)+1))
+			values = append(values, id.String())
+		}
+		q += " AND id IN (" + strings.Join(specifiers, ", ") + ")"
+	}
+
 	if tq.Limit > 0 {
 		// Safe to directly append, since it's an int.
 		q += fmt.Sprintf(" LIMIT %d", tq.Limit)

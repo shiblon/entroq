@@ -160,6 +160,7 @@ type TasksQuery struct {
 	Queue    string
 	Claimant uuid.UUID
 	Limit    int
+	IDs      []uuid.UUID
 }
 
 // QueuesQuery modifies a queue listing request.
@@ -446,6 +447,15 @@ func LimitClaimant(id uuid.UUID) TasksOpt {
 func LimitTasks(limit int) TasksOpt {
 	return func(_ *EntroQ, q *TasksQuery) {
 		q.Limit = limit
+	}
+}
+
+// WithTaskID adds a task ID to the set of IDs that can be returned in a task
+// query. The default is "all that match other specs" if no IDs are specified.
+// Note that versions are not part of the ID.
+func WithTaskID(ids ...uuid.UUID) TasksOpt {
+	return func(_ *EntroQ, q *TasksQuery) {
+		q.IDs = append(q.IDs, ids...)
 	}
 }
 
