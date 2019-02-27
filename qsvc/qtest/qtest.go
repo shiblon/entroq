@@ -140,6 +140,67 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 	}
 }
 
+// TasksWithID exercises the task query mechanism that allows specific task IDs to be looked up.
+func TasksWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	t.Helper()
+	queue := path.Join(qPrefix, "tasks_with_id")
+
+	ids := []uuid.UUID{
+		uuid.New(),
+		uuid.New(),
+		uuid.New(),
+		uuid.New(),
+	}
+
+	var args []entroq.ModifyArg
+	for _, id := range ids {
+		args = append(args, entroq.InsertingInto(queue, entroq.WithID(id)))
+	}
+	inserted, _, err := client.Modify(ctx, args...)
+	if err != nil {
+		t.Fatalf("Insertion failed: %v", err)
+	}
+	if want, got := len(ids), len(inserted); want != got {
+		t.Fatalf("Expected %d tasks inserted, got %d", want, got)
+	}
+	for i, task := range inserted {
+		if want, got := ids[i], task.ID; want != got {
+			t.Fatalf("Inserted task should have ID %q, but has %q", want, got)
+		}
+	}
+
+	// Once inserted, we should be able to query for zero (all), one, or more of them.
+
+	// Check that no ID spec produces the right number of them.
+	tasks, err := client.Tasks(ctx, queue)
+	if err != nil {
+		t.Fatalf("Error getting tasks from queue %q: %v", queue, err)
+	}
+	if want, got := len(ids), len(tasks); want != got {
+		t.Fatalf("Expected %d tasks in 'all' query, got %d", want, got)
+	}
+	for i, task := range tasks {
+		if want, got := ids[i], task.ID; want != got {
+			t.Fatalf("Wanted queried task %d to have ID %q, got %q", i, want, got)
+		}
+	}
+
+	// Check that specifing a couple of the IDs works.
+	idSubSet := []uuid.UUID{ids[1], ids[3]}
+	tasks, err = client.Tasks(ctx, queue, entroq.WithTaskID(idSubSet...))
+	if err != nil {
+		t.Fatalf("Error getting tasks from queue %q: %v", queue, err)
+	}
+	if want, got := len(idSubSet), len(tasks); want != got {
+		t.Fatalf("Expected %d tasks in 'all' query, got %d", want, got)
+	}
+	for i, task := range tasks {
+		if want, got := idSubSet[i], task.ID; want != got {
+			t.Fatalf("Wanted queried task %d to have ID %q, got %q", i, want, got)
+		}
+	}
+}
+
 // InsertWithID tests the ability to insert tasks with a specified ID,
 // including errors when an existing ID is used for insertion.
 func InsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
