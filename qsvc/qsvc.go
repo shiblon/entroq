@@ -263,7 +263,16 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 		}
 	}
 	// Claimant will only really be limited if it is nonzero.
-	tasks, err := s.impl.Tasks(ctx, req.Queue, entroq.LimitClaimant(claimant))
+	// Tasks will only be limited if non-empty.
+	var ids []uuid.UUID
+	for _, sID := range req.TaskId {
+		id, err := uuid.Parse(sID)
+		if err != nil {
+			return nil, codeErrorf(codes.InvalidArgument, err, "invalid task ID: %q", sID)
+		}
+		ids = append(ids, id)
+	}
+	tasks, err := s.impl.Tasks(ctx, req.Queue, entroq.LimitClaimant(claimant), entroq.WithTaskID(ids...))
 	if err != nil {
 		return nil, wrapErrorf(err, "failed to get tasks")
 	}

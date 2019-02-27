@@ -140,6 +140,11 @@ message TasksRequest {
   string claimant_id = 1;
   string queue = 2;
   int32 limit = 3;
+
+  // If IDs are specified here, then any task which matches any of these IDs,
+  // and simultaneously fits other specifications, will be returned.
+  // If empty, all tasks that fit other specifications will be returned.
+  repeated string task_id = 4;
 }
 
 // TasksReqponse contains the tasks requested.

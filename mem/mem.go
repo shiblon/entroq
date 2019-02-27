@@ -231,11 +231,26 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 	if h.Len() == 0 {
 		return nil, nil
 	}
+
+	goodIDs := make(map[uuid.UUID]bool)
+	for _, id := range tq.IDs {
+		goodIDs[id] = true
+	}
+	idAllowed := func(id uuid.UUID) bool {
+		if len(tq.IDs) == 0 {
+			return true
+		}
+		return goodIDs[id]
+	}
+
 	for i, item := range h.items {
 		if tq.Limit > 0 && i >= tq.Limit {
 			break
 		}
 		t := item.task
+		if !idAllowed(t.ID) {
+			continue
+		}
 		if tq.Claimant == uuid.Nil || now.After(t.At) || tq.Claimant == t.Claimant {
 			tasks = append(tasks, t)
 		}
