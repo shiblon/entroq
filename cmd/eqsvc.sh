@@ -13,6 +13,10 @@ case "$1" in
     shift
     exec eqmemsvc "$@"
     ;;
+  eqc | '')
+    shift
+    exec eqc "$@"
+    ;;
   -*)
     exec eqmemsvc "$@"
     ;;
