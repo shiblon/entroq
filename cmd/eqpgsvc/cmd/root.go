@@ -94,7 +94,7 @@ func init() {
 	pflags.StringVar(&dbName, "dbname", "postgres", "Database housing tasks.")
 	pflags.StringVar(&dbUser, "dbuser", "postgres", "Database user name.")
 	pflags.StringVar(&dbPass, "dbpwd", "postgres", "Database password.")
-	pflags.IntVar(&attempts, "attempts", 5, "Connection attempts, separated by 5-second pauses, before dying due to lack of backend connection.")
+	pflags.IntVar(&attempts, "attempts", 10, "Connection attempts, separated by 5-second pauses, before dying due to lack of backend connection.")
 
 	viper.BindPFlag("port", pflags.Lookup("port"))
 	viper.BindPFlag("dbaddr", pflags.Lookup("dbaddr"))
