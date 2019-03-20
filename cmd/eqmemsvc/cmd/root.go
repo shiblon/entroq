@@ -12,6 +12,7 @@ import (
 	"entrogo.com/entroq/mem"
 	"entrogo.com/entroq/qsvc"
 	homedir "github.com/mitchellh/go-homedir"
+	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
@@ -31,24 +32,25 @@ var (
 var rootCmd = &cobra.Command{
 	Use:   "eqmemsvc",
 	Short: "A memory-backed EntroQ service. Ephemeral - don't trust to keep your data.",
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := context.Background()
 
 		lis, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 		if err != nil {
-			log.Fatalf("Error listening on port %d: %v", port, err)
+			return errors.Wrapf(err, "error listening on port %d", port)
 		}
 
 		svc, err := qsvc.New(ctx, mem.Opener())
 		if err != nil {
-			log.Fatalf("Failed to open backend for qsvc: %v", err)
+			return errors.Wrap(err, "failed to open mem backend for qsvc")
 		}
 		defer svc.Close()
 
 		s := grpc.NewServer()
 		pb.RegisterEntroQServer(s, svc)
 		hpb.RegisterHealthServer(s, health.NewServer())
-		log.Fatal(s.Serve(lis))
+		log.Printf("Starting EntroQ server %d -> mem", port)
+		return s.Serve(lis)
 	},
 }
 
