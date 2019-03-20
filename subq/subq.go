@@ -204,8 +204,10 @@ func (s *SubQ) Wait(ctx context.Context, q string, pollWait time.Duration, condi
 	for !condition() {
 		select {
 		case <-wait():
+			log.Printf("SubQ loop release valve")
 			// Go around again, even though not signaled.
 		case <-qi.Ch():
+			log.Printf("SubQ notified")
 			// Got a value, go around again to run condition to see if it's still there.
 		case <-ctx.Done():
 			return errors.Wrap(ctx.Err(), "subq wait")

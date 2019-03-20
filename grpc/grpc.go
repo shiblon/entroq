@@ -127,7 +127,6 @@ func Opener(addr string, opts ...Option) entroq.BackendOpener {
 
 type backend struct {
 	conn *grpc.ClientConn
-	cli  pb.EntroQClient
 }
 
 // New creates a new gRPC backend that attaches to the task service via gRPC.
@@ -136,10 +135,7 @@ func New(conn *grpc.ClientConn, opts ...Option) (*backend, error) {
 	for _, opt := range opts {
 		opt(options)
 	}
-	return &backend{
-		conn: conn,
-		cli:  pb.NewEntroQClient(conn),
-	}, nil
+	return &backend{conn}, nil
 }
 
 // Close closes the underlying connection to the gRPC task service.
@@ -149,7 +145,7 @@ func (b *backend) Close() error {
 
 // Queues produces a mapping from queue names to queue sizes.
 func (b *backend) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[string]int, error) {
-	resp, err := b.cli.Queues(ctx, &pb.QueuesRequest{
+	resp, err := pb.NewEntroQClient(b.conn).Queues(ctx, &pb.QueuesRequest{
 		MatchPrefix: qq.MatchPrefix,
 		MatchExact:  qq.MatchExact,
 		Limit:       int32(qq.Limit),
@@ -240,7 +236,7 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 	for _, tid := range tq.IDs {
 		ids = append(ids, tid.String())
 	}
-	resp, err := b.cli.Tasks(ctx, &pb.TasksRequest{
+	resp, err := pb.NewEntroQClient(b.conn).Tasks(ctx, &pb.TasksRequest{
 		ClaimantId: tq.Claimant.String(),
 		Queue:      tq.Queue,
 		Limit:      int32(tq.Limit),
@@ -263,7 +259,7 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 // Claim attempts to claim a task and blocks until one is ready or the
 // operation is canceled.
 func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
-	resp, err := b.cli.Claim(ctx, &pb.ClaimRequest{
+	resp, err := pb.NewEntroQClient(b.conn).Claim(ctx, &pb.ClaimRequest{
 		ClaimantId: cq.Claimant.String(),
 		Queue:      cq.Queue,
 		DurationMs: int64(cq.Duration / time.Millisecond),
@@ -281,7 +277,7 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 // TryClaim attempts to claim a task from the queue. Normally returns both a
 // nil task and error if nothing is ready.
 func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
-	resp, err := b.cli.TryClaim(ctx, &pb.ClaimRequest{
+	resp, err := pb.NewEntroQClient(b.conn).TryClaim(ctx, &pb.ClaimRequest{
 		ClaimantId: cq.Claimant.String(),
 		Queue:      cq.Queue,
 		DurationMs: int64(cq.Duration / time.Millisecond),
@@ -319,7 +315,7 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 		})
 	}
 
-	resp, err := b.cli.Modify(ctx, req)
+	resp, err := pb.NewEntroQClient(b.conn).Modify(ctx, req)
 	if err != nil {
 		switch stat := status.Convert(errors.Cause(err)); stat.Code() {
 		case codes.NotFound:
