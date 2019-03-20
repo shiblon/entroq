@@ -20,6 +20,7 @@ package entroq // import "entrogo.com/entroq"
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -594,6 +595,7 @@ func (c *EntroQ) RenewAllFor(ctx context.Context, tasks []*Task, duration time.D
 		modArgs = append(modArgs, Changing(t, ArrivalTimeBy(duration)))
 		taskIDs = append(taskIDs, t.IDVersion().String())
 	}
+	log.Printf("Renewing tasks %v", taskIDs)
 	_, changed, err := c.Modify(ctx, modArgs...)
 	if err != nil {
 		return nil, errors.Wrapf(err, "renewal failed for tasks %q", taskIDs)
