@@ -25,6 +25,7 @@ import (
 	"entrogo.com/entroq/pg"
 	"entrogo.com/entroq/qsvc"
 	homedir "github.com/mitchellh/go-homedir"
+	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
@@ -50,7 +51,7 @@ var (
 var rootCmd = &cobra.Command{
 	Use:   "eqpgsvc",
 	Short: "A postgres-backed EntroQ service.",
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := context.Background()
 
 		svc, err := qsvc.New(ctx, pg.Opener(dbAddr,
@@ -60,19 +61,20 @@ var rootCmd = &cobra.Command{
 			pg.WithConnectAttempts(attempts),
 		))
 		if err != nil {
-			log.Fatalf("Failed to open backend for qsvc: %v", err)
+			return errors.Wrap(err, "failed to open pg backend")
 		}
 		defer svc.Close()
 
 		lis, err := net.Listen("tcp", fmt.Sprintf("[::]:%d", port))
 		if err != nil {
-			log.Fatalf("Error listening on port %d: %v", port, err)
+			return errors.Wrapf(err, "error listening on port %d", port)
 		}
 
 		s := grpc.NewServer()
 		pb.RegisterEntroQServer(s, svc)
 		hpb.RegisterHealthServer(s, health.NewServer())
-		log.Fatal(s.Serve(lis))
+		log.Printf("Starting EntroQ server %d -> %v db=%v u=%v", port, dbAddr, dbName, dbUser)
+		return s.Serve(lis)
 	},
 }
 
