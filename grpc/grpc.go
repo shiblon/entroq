@@ -41,6 +41,7 @@ package grpc // import "entrogo.com/entroq/grpc"
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"time"
 
@@ -55,8 +56,14 @@ import (
 	hpb "google.golang.org/grpc/health/grpc_health_v1"
 )
 
-// DefaultAddr is the default listening address for gRPC services.
-const DefaultAddr = ":37706"
+const (
+	// DefaultAddr is the default listening address for gRPC services.
+	DefaultAddr = ":37706"
+
+	// ClaimRetryInterval is how long a grpc client holds a claim request open
+	// before dropping it and trying again.
+	ClaimRetryInterval = 30 * time.Second
+)
 
 type backendOptions struct {
 	dialOpts []grpc.DialOption
@@ -259,19 +266,36 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 // Claim attempts to claim a task and blocks until one is ready or the
 // operation is canceled.
 func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
-	resp, err := pb.NewEntroQClient(b.conn).Claim(ctx, &pb.ClaimRequest{
-		ClaimantId: cq.Claimant.String(),
-		Queue:      cq.Queue,
-		DurationMs: int64(cq.Duration / time.Millisecond),
-		PollMs:     int64(cq.PollTime / time.Millisecond),
-	})
-	if err != nil {
-		return nil, errors.Wrap(err, "grpc claim")
+	for {
+		// Check whether the parent context was canceled.
+		select {
+		case <-ctx.Done():
+			return nil, errors.Wrap(ctx.Err(), "grpc claim")
+		default:
+		}
+		ctx, _ := context.WithTimeout(ctx, ClaimRetryInterval)
+		resp, err := pb.NewEntroQClient(b.conn).Claim(ctx, &pb.ClaimRequest{
+			ClaimantId: cq.Claimant.String(),
+			Queue:      cq.Queue,
+			DurationMs: int64(cq.Duration / time.Millisecond),
+			PollMs:     int64(cq.PollTime / time.Millisecond),
+		})
+		if err != nil {
+			if entroq.IsTimeout(err) {
+				log.Printf("Claim over gRPC time-out: retrying connection")
+				// If we just timed out on our little request context, then
+				// we can go around again.
+				// It's possible that the *parent* context timed out, which
+				// is why we check that at the beginning of the loop, as well.
+				continue
+			}
+			return nil, errors.Wrap(err, "grpc claim")
+		}
+		if resp.Task == nil {
+			return nil, errors.New("no task returned from backend Claim")
+		}
+		return fromTaskProto(resp.Task)
 	}
-	if resp.Task == nil {
-		return nil, errors.New("no task returned from backend Claim")
-	}
-	return fromTaskProto(resp.Task)
 }
 
 // TryClaim attempts to claim a task from the queue. Normally returns both a
