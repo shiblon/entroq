@@ -62,7 +62,7 @@ const (
 
 	// ClaimRetryInterval is how long a grpc client holds a claim request open
 	// before dropping it and trying again.
-	ClaimRetryInterval = 30 * time.Second
+	ClaimRetryInterval = 2 * time.Minute
 )
 
 type backendOptions struct {
