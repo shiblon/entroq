@@ -56,19 +56,16 @@ func (w *Worker) Run(ctx context.Context, f func(ctx context.Context, task *Task
 	defer log.Printf("Finishing EntroQ worker on client %v: err=%v", w.eqc.ID(), err)
 	log.Printf("Starting EntroQ worker on client %v", w.eqc.ID())
 	for {
-		log.Printf("Top of worker loop on client %v", w.eqc.ID())
 		select {
 		case <-ctx.Done():
 			return errors.Wrap(ctx.Err(), "worker quit")
 		default:
 		}
 
-		log.Printf("Claiming a task from %q for client %v", w.Q, w.eqc.ID())
 		task, err := w.eqc.Claim(ctx, w.Q, w.lease)
 		if err != nil {
 			return errors.Wrap(err, "worker claim")
 		}
-		log.Printf("Claimed task for client %v: %v", w.eqc.ID(), task.IDVersion())
 
 		var args []ModifyArg
 		renewed, err := w.eqc.DoWithRenew(ctx, task, w.lease, func(ctx context.Context) error {
@@ -123,7 +120,6 @@ func (w *Worker) Run(ctx context.Context, f func(ctx context.Context, task *Task
 			}
 		}
 
-		log.Printf("Modifying in worker for client %v", w.eqc.ID())
 		if _, _, err := w.eqc.Modify(ctx, WithModification(modification)); err != nil {
 			if _, ok := AsDependency(err); ok {
 				log.Printf("Worker ack failed, throwing away: %v", err)

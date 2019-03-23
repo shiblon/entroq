@@ -169,7 +169,8 @@ func (b *backend) initDB(ctx context.Context) error {
 		  created TIMESTAMP WITH TIME ZONE,
 		  modified TIMESTAMP WITH TIME ZONE NOT NULL,
 		  claimant UUID,
-		  value BYTEA
+		  value BYTEA,
+		  claims INTEGER NOT NULL DEFAULT 0
 		);
 		CREATE INDEX IF NOT EXISTS byQueue ON tasks (queue);
 		CREATE INDEX IF NOT EXISTS byQueueAt ON tasks (queue, at);
@@ -302,12 +303,13 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 		)
 		UPDATE tasks
 		SET
-			version=version+1,
+			version = version + 1,
+			claims = claims + 1,
 			at = $3,
 			claimant = $4,
 			modified = $5
 		WHERE id IN (SELECT id FROM topN ORDER BY random() LIMIT 1)
-		RETURNING id, version, queue, at, created, modified, claimant, value
+		RETURNING id, version, queue, at, created, modified, claimant, value, claims
 	`, cq.Queue, now, now.Add(cq.Duration), cq.Claimant, now).Scan(
 		&task.ID,
 		&task.Version,
@@ -317,6 +319,7 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 		&task.Modified,
 		&task.Claimant,
 		&task.Value,
+		&task.Claims,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {

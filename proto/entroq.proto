@@ -57,6 +57,9 @@ message Task {
   // Epoch times in millis for creation and update of this task.
   int64 created_ms = 7;
   int64 modified_ms = 8;
+
+  // The number of times this has been successfully claimed.
+  int32 claims = 9;
 }
 
 // QueueStats contains the name of the queue and the number of tasks within it.

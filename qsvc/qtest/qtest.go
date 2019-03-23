@@ -115,6 +115,9 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 	g.Go(func() error {
 		w := client.NewWorker(queue)
 		return w.Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
+			if task.Claims != 1 {
+				return nil, errors.Errorf("worker claim expected claims to be 1, got %d", task.Claims)
+			}
 			consumed = append(consumed, task)
 			return []entroq.ModifyArg{task.AsDeletion()}, nil
 		})
@@ -359,6 +362,9 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	if got, lower, upper := claimed.At, now.Add(9*time.Second), now.Add(11*time.Second); got.Before(lower) || got.After(upper) {
 		t.Fatalf("Claimed arrival time not in time bounds [%v, %v]: %v", lower, upper, claimed.At)
 	}
+	if claimed.Claims != 1 {
+		t.Fatalf("Expected claim to increment task claims to %d, got %d", 1, claimed.Claims)
+	}
 
 	// TryClaim not ready task.
 	tryclaimed, err := client.TryClaim(ctx, queue, 10*time.Second)
@@ -381,6 +387,9 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	}
 	if got, lower, upper := claimed.At, time.Now().Add(4*time.Second), time.Now().Add(6*time.Second); got.Before(lower) || got.After(upper) {
 		t.Fatalf("Claimed arrival time not in time bounds [%v, %v]: %v", lower, upper, claimed.At)
+	}
+	if claimed.Claims != 1 {
+		t.Fatalf("Expected claim to increment task claims to %d, got %d", 1, claimed.Claims)
 	}
 }
 

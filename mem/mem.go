@@ -282,6 +282,7 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 
 	top = top.Copy()
 	top.Version++
+	top.Claims++
 	top.At = now.Add(cq.Duration)
 	top.Modified = now
 	top.Claimant = cq.Claimant
@@ -324,6 +325,7 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 			Version:  0,
 			Queue:    t.Queue,
 			Claimant: mod.Claimant,
+			Claims:   0,
 			At:       t.At,
 			Created:  now,
 			Modified: now,
