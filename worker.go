@@ -97,18 +97,27 @@ func (w *Worker) Run(ctx context.Context, f func(ctx context.Context, task *Task
 		modification := NewModification(uuid.Nil, args...)
 		for _, task := range modification.Changes {
 			if task.ID == renewed.ID && task.Version != renewed.Version {
+				if task.Version > renewed.Version {
+					return errors.Errorf("task updated inside worker body, expected version <= %v, got %v", renewed.Version, task.Version)
+				}
 				log.Printf("Rewriting change version %v => %v", task.Version, renewed.Version)
 				task.Version = renewed.Version
 			}
 		}
 		for _, id := range modification.Depends {
 			if id.ID == renewed.ID && task.Version != renewed.Version {
+				if task.Version > renewed.Version {
+					return errors.Errorf("task updated inside worker body, expected version <= %v, got %v", renewed.Version, task.Version)
+				}
 				log.Printf("Rewriting depend version %v => %v", task.Version, renewed.Version)
 				id.Version = renewed.Version
 			}
 		}
 		for _, id := range modification.Deletes {
 			if id.ID == renewed.ID && task.Version != renewed.Version {
+				if task.Version > renewed.Version {
+					return errors.Errorf("task updated inside worker body, expected version <= %v, got %v", renewed.Version, task.Version)
+				}
 				log.Printf("Rewriting delete version %v => %v", task.Version, renewed.Version)
 				id.Version = renewed.Version
 			}
