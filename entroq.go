@@ -64,6 +64,9 @@ type TaskData struct {
 }
 
 // Task represents a unit of work, with a byte slice value payload.
+// Note that Claims is the number of times a task has successfully been claimed.
+// This is different than the version number, which increments for
+// every modification, not just claims.
 type Task struct {
 	Queue string `json:"queue"`
 
@@ -72,6 +75,7 @@ type Task struct {
 
 	At       time.Time `json:"at"`
 	Claimant uuid.UUID `json:"claimant"`
+	Claims   int32     `json:"claims"`
 	Value    []byte    `json:"value"`
 
 	Created  time.Time `json:"created"`

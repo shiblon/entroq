@@ -82,6 +82,7 @@ func protoFromTask(t *entroq.Task) *pb.Task {
 		Version:    t.Version,
 		AtMs:       toMS(t.At),
 		ClaimantId: t.Claimant.String(),
+		Claims:     t.Claims,
 		Value:      t.Value,
 		CreatedMs:  toMS(t.Created),
 		ModifiedMs: toMS(t.Modified),

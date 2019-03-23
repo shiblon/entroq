@@ -192,6 +192,7 @@ func fromTaskProto(t *pb.Task) (*entroq.Task, error) {
 		Version:  t.Version,
 		At:       fromMS(t.AtMs),
 		Claimant: cid,
+		Claims:   t.Claims,
 		Value:    t.Value,
 		Created:  fromMS(t.CreatedMs),
 		Modified: fromMS(t.ModifiedMs),
