@@ -75,6 +75,31 @@ func StartService(ctx context.Context, opener entroq.BackendOpener) (*grpc.Serve
 	return s, lis.Dial, nil
 }
 
+// SimpleChange tests that changing things in the task leave most of it intact, and can handle things like queue moves.
+func SimpleChange(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	t.Helper()
+
+	inQueue := path.Join(qPrefix, "simple_change", "in")
+	outQueue := path.Join(qPrefix, "simple_change", "out")
+
+	inserted, _, err := client.Modify(ctx, entroq.InsertingInto(inQueue))
+	if err != nil {
+		t.Fatalf("Error inserting: %v", err)
+	}
+	_, changed, err := client.Modify(ctx, inserted[0].AsChange(entroq.QueueTo(outQueue)))
+	if err != nil {
+		t.Fatalf("Error changing: %v", err)
+	}
+	if changed[0].Queue != outQueue {
+		t.Fatalf("Change queue: want %q, got %v", outQueue, changed[0].Queue)
+	}
+	changed[0].Queue = inQueue
+
+	if diff := EqualTasksVersionIncr(inserted[0], changed[0], 1); diff != "" {
+		t.Fatalf("Tasks not equal (except version bump):\n%v", diff)
+	}
+}
+
 // SimpleWorker tests basic worker functionality while tasks are coming in and
 // being waited on.
 func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {

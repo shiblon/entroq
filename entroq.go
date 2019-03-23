@@ -139,7 +139,7 @@ func (t *Task) Data() *TaskData {
 	}
 }
 
-// Copy copies this tasks data and everything.
+// Copy copies this task's data and everything.
 func (t *Task) Copy() *Task {
 	newT := new(Task)
 	*newT = *t
