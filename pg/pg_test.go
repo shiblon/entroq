@@ -88,6 +88,19 @@ func TestSimpleSequence(t *testing.T) {
 	qtest.SimpleSequence(ctx, t, client, "pgtest/"+uuid.New().String())
 }
 
+func TestSimpleChange(t *testing.T) {
+	ctx := context.Background()
+
+	client, stop, err := pgClient(ctx)
+	if err != nil {
+		t.Fatalf("Failed to create pg service and client: %v", err)
+	}
+	defer stop()
+
+	log.Printf("Simple change")
+	qtest.SimpleChange(ctx, t, client, "pgtest/"+uuid.New().String())
+}
+
 func TestSimpleWorker(t *testing.T) {
 	ctx := context.Background()
 

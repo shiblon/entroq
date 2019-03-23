@@ -48,6 +48,18 @@ func TestInsertWithID(t *testing.T) {
 	qtest.InsertWithID(ctx, t, client, "")
 }
 
+func TestSimpleChange(t *testing.T) {
+	ctx := context.Background()
+
+	client, stop, err := qtest.ClientService(ctx, Opener())
+	if err != nil {
+		t.Fatalf("Get client: %v", err)
+	}
+	defer stop()
+
+	qtest.SimpleChange(ctx, t, client, "")
+}
+
 func TestSimpleWorker(t *testing.T) {
 	ctx := context.Background()
 
