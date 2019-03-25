@@ -222,6 +222,7 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 	if err != nil {
 		if depErr, ok := entroq.AsDependency(err); ok {
 			tmap := map[pb.DepType][]*entroq.TaskID{
+				pb.DepType_INSERT: depErr.Inserts,
 				pb.DepType_DEPEND: depErr.Depends,
 				pb.DepType_DELETE: depErr.Deletes,
 				pb.DepType_CHANGE: depErr.Changes,

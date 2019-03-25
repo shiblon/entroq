@@ -468,14 +468,12 @@ func depQuery(ctx context.Context, tx *sql.Tx, m *entroq.Modification) (map[uuid
 	// to know that the dependencies are there while we work).
 	var placeholders []string
 	var values []interface{}
-	first := 1
-	for id, version := range dependencies {
-		placeholders = append(placeholders, fmt.Sprintf("($%d, $%d)", first, first+1))
-		values = append(values, id, version)
-		first += 2
+	for id := range dependencies {
+		placeholders = append(placeholders, fmt.Sprintf("$%d", len(values)+1))
+		values = append(values, id)
 	}
 	query := `SELECT id, version, queue, at, claimant, value, created, modified FROM tasks
-	          WHERE (id, version) IN (` + strings.Join(placeholders, ", ") + `) FOR UPDATE`
+	          WHERE id IN (` + strings.Join(placeholders, ", ") + `) FOR UPDATE`
 	rows, err := tx.QueryContext(ctx, query, values...)
 	if err != nil {
 		return nil, errors.Wrap(err, "pg dep query")

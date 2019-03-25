@@ -310,7 +310,7 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 	}
 
 	if err := mod.DependencyError(found); err != nil {
-		return nil, nil, errors.Wrap(err, "Modify")
+		return nil, nil, errors.Wrap(err, "modify")
 	}
 
 	now := time.Now()
@@ -333,7 +333,7 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 		}
 		copy(newTask.Value, t.Value)
 		if b.existsIDUnsafe(newTask.ID) {
-			return nil, nil, errors.Errorf("Cannot insert task ID %q: already exists", newTask.ID)
+			return nil, nil, errors.Errorf("cannot insert task ID %q: already exists", newTask.ID)
 		}
 		inserted = append(inserted, newTask)
 	}

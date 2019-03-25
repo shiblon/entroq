@@ -268,9 +268,16 @@ func InsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 		t.Fatalf("Task claim expected ID %q, got %q", knownID, claimed.ID)
 	}
 
-	// Try to insert another with the same ID, observe an error.
-	if _, _, err = client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithID(knownID))); err == nil {
-		t.Fatalf("Expected error inserting duplicate ID %q, got no error", knownID)
+	_, _, err = client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithID(knownID)))
+	if err == nil {
+		t.Fatalf("Expected error inserting with existing ID %v, but got no error", knownID)
+	}
+	depErr, ok := entroq.AsDependency(err)
+	if !ok {
+		t.Fatalf("Expected dependency error, got %v", err)
+	}
+	if want, got := 1, len(depErr.Inserts); want != got {
+		t.Fatalf("Expected %d insertion errors in dependency error, got %v", want, got)
 	}
 }
 

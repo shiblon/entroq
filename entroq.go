@@ -926,9 +926,15 @@ func (m *Modification) modDependencies() (map[uuid.UUID]int32, error) {
 	return deps, nil
 }
 
-// AllDependencies returns a dependency map from ID to version, and returns an
-// error if there are duplicates. Changes, Deletions, and Dependencies should
-// be disjoint sets.
+// AllDependencies returns a dependency map from ID to version for tasks that
+// must exist and match version numbers. It returns an error if there are
+// duplicates. Changes, Deletions, Dependencies and Insertions with IDs must be
+// disjoint sets.
+//
+// When using this to query backend storage for the presence of tasks, note
+// that it is safe to ignore the version if you use the DependencyError method
+// to determine whether a transaction can proceed. That checks versions
+// appropriate for all different types of modification.
 func (m *Modification) AllDependencies() (map[uuid.UUID]int32, error) {
 	deps, err := m.modDependencies()
 	if err != nil {
@@ -940,6 +946,16 @@ func (m *Modification) AllDependencies() (map[uuid.UUID]int32, error) {
 		}
 		deps[t.ID] = t.Version
 	}
+	for _, t := range m.Inserts {
+		// Add to dependencies (they need to *not* exist) if an ID is set.
+		if t.ID == uuid.Nil {
+			continue
+		}
+		if _, ok := deps[t.ID]; ok {
+			return nil, errors.New("duplicates found in dependencies")
+		}
+		deps[t.ID] = -1
+	}
 	return deps, nil
 }
 
@@ -948,10 +964,20 @@ func (m *Modification) otherwiseClaimed(task *Task) bool {
 	return task.At.After(m.now) && task.Claimant != zeroUUID && task.Claimant != m.Claimant
 }
 
+func (m *Modification) badInserts(foundDeps map[uuid.UUID]*Task) []*TaskID {
+	var present []*TaskID
+	for _, t := range m.Inserts {
+		if found := foundDeps[t.ID]; found != nil {
+			present = append(present, found.IDVersion())
+		}
+	}
+	return present
+}
+
 func (m *Modification) badChanges(foundDeps map[uuid.UUID]*Task) (missing []*TaskID, claimed []*TaskID) {
 	for _, t := range m.Changes {
 		found := foundDeps[t.ID]
-		if found == nil {
+		if found == nil || found.Version != t.Version {
 			missing = append(missing, &TaskID{
 				ID:      t.ID,
 				Version: t.Version,
@@ -972,7 +998,7 @@ func (m *Modification) badChanges(foundDeps map[uuid.UUID]*Task) (missing []*Tas
 func (m *Modification) badDeletes(foundDeps map[uuid.UUID]*Task) (missing []*TaskID, claimed []*TaskID) {
 	for _, t := range m.Deletes {
 		found := foundDeps[t.ID]
-		if found == nil {
+		if found == nil || found.Version != t.Version {
 			missing = append(missing, t)
 			continue
 		}
@@ -987,7 +1013,7 @@ func (m *Modification) badDeletes(foundDeps map[uuid.UUID]*Task) (missing []*Tas
 func (m *Modification) missingDepends(foundDeps map[uuid.UUID]*Task) []*TaskID {
 	var missing []*TaskID
 	for _, t := range m.Depends {
-		if _, ok := foundDeps[t.ID]; !ok {
+		if found, ok := foundDeps[t.ID]; !ok || found.Version != t.Version {
 			missing = append(missing, t)
 		}
 	}
@@ -999,12 +1025,14 @@ func (m *Modification) missingDepends(foundDeps map[uuid.UUID]*Task) []*TaskID {
 // include missing or claimed dependencies, both of which will block a
 // modification.
 func (m *Modification) DependencyError(found map[uuid.UUID]*Task) error {
+	presentInserts := m.badInserts(found)
 	missingChanges, claimedChanges := m.badChanges(found)
 	missingDeletes, claimedDeletes := m.badDeletes(found)
 	missingDepends := m.missingDepends(found)
 
-	if len(missingChanges) > 0 || len(claimedChanges) > 0 || len(missingDeletes) > 0 || len(claimedDeletes) > 0 || len(missingDepends) > 0 {
+	if len(presentInserts) > 0 || len(missingChanges) > 0 || len(claimedChanges) > 0 || len(missingDeletes) > 0 || len(claimedDeletes) > 0 || len(missingDepends) > 0 {
 		return DependencyError{
+			Inserts: presentInserts,
 			Changes: missingChanges,
 			Deletes: missingDeletes,
 			Depends: m.missingDepends(found),
@@ -1016,6 +1044,7 @@ func (m *Modification) DependencyError(found map[uuid.UUID]*Task) error {
 
 // DependencyError is returned when a dependency is missing when modifying the task store.
 type DependencyError struct {
+	Inserts []*TaskID
 	Depends []*TaskID
 	Deletes []*TaskID
 	Changes []*TaskID
@@ -1033,12 +1062,14 @@ func DependencyErrorf(msg string, vals ...interface{}) DependencyError {
 // Copy produces a new deep copy of this error type.
 func (m DependencyError) Copy() DependencyError {
 	e := DependencyError{
+		Inserts: make([]*TaskID, len(m.Inserts)),
 		Depends: make([]*TaskID, len(m.Depends)),
 		Deletes: make([]*TaskID, len(m.Deletes)),
 		Changes: make([]*TaskID, len(m.Changes)),
 		Claims:  make([]*TaskID, len(m.Claims)),
 		Message: m.Message,
 	}
+	copy(e.Inserts, m.Inserts)
 	copy(e.Depends, m.Depends)
 	copy(e.Deletes, m.Deletes)
 	copy(e.Changes, m.Changes)
@@ -1056,10 +1087,21 @@ func (m DependencyError) HasClaims() bool {
 	return len(m.Claims) > 0
 }
 
+// HasCollisions indicates whether any of the inserted tasks collided with existing IDs.
+func (m DependencyError) HasCollisions() bool {
+	return len(m.Inserts) > 0
+}
+
 // Error produces a helpful error string indicating what was missing.
 func (m DependencyError) Error() string {
 	lines := []string{
 		fmt.Sprintf("DependencyError: %v", m.Message),
+	}
+	if len(m.Inserts) > 0 {
+		lines = append(lines, "\tcolliding inserts:")
+		for _, tid := range m.Inserts {
+			lines = append(lines, fmt.Sprintf("\t\t%s", tid))
+		}
 	}
 	if len(m.Depends) > 0 {
 		lines = append(lines, "\tmissing depends:")

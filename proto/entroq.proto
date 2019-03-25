@@ -125,6 +125,7 @@ enum DepType {
   CHANGE = 2;
   DEPEND = 3;
   DETAIL = 4;
+  INSERT = 5;
 }
 
 // ModifyDep can be returned with a gRPC NotFound status indicating which

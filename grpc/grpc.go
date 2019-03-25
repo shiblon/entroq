@@ -373,6 +373,8 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 					depErr.Changes = append(depErr.Changes, tid)
 				case pb.DepType_DEPEND:
 					depErr.Depends = append(depErr.Depends, tid)
+				case pb.DepType_INSERT:
+					depErr.Inserts = append(depErr.Inserts, tid)
 				default:
 					return nil, nil, errors.Errorf("grpc modify unknown type %v in detail %v", detail.Type, detail)
 				}

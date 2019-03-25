@@ -69,7 +69,7 @@ func TestInsertWithID(t *testing.T) {
 
 	client, stop, err := pgClient(ctx)
 	if err != nil {
-		t.Fatalf("Get client: %v", err)
+		t.Fatalf("Failed to create pg service and client: %v", err)
 	}
 	defer stop()
 
