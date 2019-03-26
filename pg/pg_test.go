@@ -114,6 +114,19 @@ func TestSimpleWorker(t *testing.T) {
 	qtest.SimpleWorker(ctx, t, client, "pgtest/"+uuid.New().String())
 }
 
+func TestWorkerRenewal(t *testing.T) {
+	ctx := context.Background()
+
+	client, stop, err := pgClient(ctx)
+	if err != nil {
+		t.Fatalf("Failed to create pg service and client: %v", err)
+	}
+	defer stop()
+
+	log.Printf("Worker renewal")
+	qtest.WorkerRenewal(ctx, t, client, "pgtest/"+uuid.New().String())
+}
+
 func TestQueueMatch(t *testing.T) {
 	ctx := context.Background()
 
