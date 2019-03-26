@@ -626,7 +626,7 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.D
 				return errors.Wrap(ctx.Err(), "renew all stopped")
 			case <-time.After(lease / 2):
 				var err error
-				if renewed, err = c.RenewAllFor(ctx, tasks, lease); err != nil {
+				if renewed, err = c.RenewAllFor(ctx, renewed, lease); err != nil {
 					return errors.Wrap(err, "could not extend lease")
 				}
 			}
