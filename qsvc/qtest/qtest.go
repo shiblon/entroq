@@ -168,6 +168,43 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 	}
 }
 
+// WorkerRenewal tests that task claims are renewed periodically for longer-running work tasks.
+func WorkerRenewal(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	t.Helper()
+
+	queue := path.Join(qPrefix, "worker_renewal")
+
+	_, _, err := client.Modify(ctx, entroq.InsertingInto(queue))
+	if err != nil {
+		t.Fatalf("Error inserting: %v", err)
+	}
+
+	// Newly-inserted task will have version 0.
+
+	task, err := client.Claim(ctx, queue, 6*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to claim task: %v", err)
+	}
+
+	// Task now has version 1.
+
+	renewed, err := client.DoWithRenew(ctx, task, 6*time.Second, func(ctx context.Context) error {
+		select {
+		case <-ctx.Done():
+			return errors.Wrap(ctx.Err(), "worker do with renew")
+		case <-time.After(10 * time.Second): // long enough for 3 renewals.
+			return nil
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Error renewing and waiting: %v", err)
+	}
+	if want, got := task.Version+3, renewed.Version; want != got {
+		t.Fatalf("Expected renewed task to be at version %d, got %d", want, got)
+	}
+}
+
 // TasksWithID exercises the task query mechanism that allows specific task IDs to be looked up.
 func TasksWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	t.Helper()
