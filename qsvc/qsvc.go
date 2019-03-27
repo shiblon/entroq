@@ -34,7 +34,6 @@ package qsvc // import "entrogo.com/entroq/qsvc"
 
 import (
 	"context"
-	"log"
 	"time"
 
 	"entrogo.com/entroq"
@@ -119,7 +118,6 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 		pollTime = time.Duration(req.PollMs) * time.Millisecond
 	}
 
-	log.Printf("QSvc claim %q for claimant %v", req.Queue, claimant)
 	task, err := s.impl.Claim(ctx, req.Queue, duration,
 		entroq.ClaimAs(claimant),
 		entroq.ClaimPollTime(pollTime))
@@ -145,7 +143,6 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 		return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse claimant ID")
 	}
 	duration := time.Duration(req.DurationMs) * time.Millisecond
-	log.Printf("QSvc try claim %q for claimant %v", req.Queue, claimant)
 	task, err := s.impl.TryClaim(ctx, req.Queue, duration, entroq.ClaimAs(claimant))
 	if err != nil {
 		return nil, wrapErrorf(err, "try claim")
@@ -168,7 +165,6 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 	if err != nil {
 		return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse claimant ID")
 	}
-	defer log.Printf("QSvc modify complete for claimant %v", claimant)
 	modArgs := []entroq.ModifyArg{
 		entroq.ModifyAs(claimant),
 	}
@@ -217,7 +213,6 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 		}
 		modArgs = append(modArgs, entroq.DependingOn(id, depend.Version))
 	}
-	log.Printf("QSvc modify for claimant %v", claimant)
 	inserted, changed, err := s.impl.Modify(ctx, modArgs...)
 	if err != nil {
 		if depErr, ok := entroq.AsDependency(err); ok {
@@ -269,7 +264,6 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 			return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse claimant ID")
 		}
 	}
-	defer log.Printf("QSvc get tasks complete in %q for claimant %v", req.Queue, claimant)
 	// Claimant will only really be limited if it is nonzero.
 	// Tasks will only be limited if non-empty.
 	var ids []uuid.UUID
@@ -280,7 +274,6 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 		}
 		ids = append(ids, id)
 	}
-	log.Printf("QSvc get tasks in %q for claimant %v", req.Queue, claimant)
 	tasks, err := s.impl.Tasks(ctx, req.Queue, entroq.LimitClaimant(claimant), entroq.WithTaskID(ids...))
 	if err != nil {
 		return nil, wrapErrorf(err, "failed to get tasks")
@@ -294,8 +287,6 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 
 // Queues returns a mapping from queue names to queue sizes.
 func (s *QSvc) Queues(ctx context.Context, req *pb.QueuesRequest) (*pb.QueuesResponse, error) {
-	log.Printf("QSvc get queues")
-	defer log.Printf("QSvc get queues complete")
 	queueMap, err := s.impl.Queues(ctx,
 		entroq.MatchPrefix(req.MatchPrefix...),
 		entroq.MatchExact(req.MatchExact...),

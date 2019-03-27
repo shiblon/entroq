@@ -299,7 +299,8 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 				queue = $1 AND
 				at <= $2
 			ORDER BY at, version, id ASC
-			LIMIT 10
+			LIMIT 3
+			FOR UPDATE
 		)
 		UPDATE tasks
 		SET
