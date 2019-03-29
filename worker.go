@@ -76,16 +76,17 @@ func (w *Worker) Run(ctx context.Context, f func(ctx context.Context, task *Task
 			return nil
 		})
 		if err != nil {
+			log.Printf("Worker error: %v", err)
 			if _, ok := AsDependency(err); ok {
-				log.Printf("Worker continuing after dependency: %v", err)
+				log.Print("Worker continuing after dependency")
 				continue
 			}
 			if IsTimeout(err) {
-				log.Printf("Worker continuing after timeout: %v", err)
+				log.Print("Worker continuing after timeout")
 				continue
 			}
 			if IsCanceled(err) {
-				log.Printf("Worker shutting down cleanly: %v", err)
+				log.Print("Worker shutting down cleanly")
 				return nil
 			}
 			return errors.Wrap(err, "worker error")
