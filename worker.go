@@ -53,7 +53,9 @@ func (c *EntroQ) NewWorker(q string, opts ...WorkerOption) *Worker {
 // it exits, and version numbers for claim renewals will be automatically
 // updated.
 func (w *Worker) Run(ctx context.Context, f func(ctx context.Context, task *Task) ([]ModifyArg, error)) (err error) {
-	defer log.Printf("Finishing EntroQ worker on client %v: err=%v", w.eqc.ID(), err)
+	defer func() {
+		log.Printf("Finishing EntroQ worker on client %v: err=%v", w.eqc.ID(), err)
+	}()
 	log.Printf("Starting EntroQ worker on client %v", w.eqc.ID())
 	for {
 		select {
