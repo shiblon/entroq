@@ -548,6 +548,7 @@ func (c *EntroQ) Claim(ctx context.Context, q string, duration time.Duration, op
 		Queue:    q,
 		Claimant: c.clientID,
 		Duration: duration,
+		PollTime: DefaultClaimPollTime,
 	}
 	for _, opt := range opts {
 		opt(query)
