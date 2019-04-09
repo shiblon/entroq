@@ -294,26 +294,31 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 		return nil, errors.Errorf("no duration set for claim %q", cq.Queue)
 	}
 	now := time.Now()
-	err := b.db.QueryRowContext(ctx, `
-		WITH topN AS (
-			SELECT * FROM tasks
-			WHERE
-				queue = $1 AND
-				at <= $2
-			ORDER BY at, version, id ASC
-			LIMIT 20
-			FOR UPDATE
-		)
+
+	// Use of SKIP LOCKED:
+	// - https://dba.stackexchange.com/questions/69471/postgres-update-limit-1
+	// - https://blog.2ndquadrant.com/what-is-select-skip-locked-for-in-postgresql-9-5/
+	if err := b.db.QueryRowContext(ctx, `
 		UPDATE tasks
 		SET
 			version = version + 1,
 			claims = claims + 1,
-			at = $3,
-			claimant = $4,
-			modified = $5
-		WHERE id IN (SELECT id FROM topN ORDER BY RANDOM() LIMIT 1)
+			at = $1,
+			claimant = $2,
+			modified = $3
+		WHERE
+			(id, version) IN (
+				SELECT id, version
+				FROM tasks
+				WHERE
+					queue = $4 AND
+					at < $5
+				ORDER BY RANDOM()
+				FOR UPDATE SKIP LOCKED
+				LIMIT 1
+			)
 		RETURNING id, version, queue, at, created, modified, claimant, value, claims
-	`, cq.Queue, now, now.Add(cq.Duration), cq.Claimant, now).Scan(
+	`, now.Add(cq.Duration), cq.Claimant, now, cq.Queue, now).Scan(
 		&task.ID,
 		&task.Version,
 		&task.Queue,
@@ -323,13 +328,13 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 		&task.Claimant,
 		&task.Value,
 		&task.Claims,
-	)
-	if err != nil {
+	); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
-		return nil, errors.Wrap(err, "pg try claim")
+		return nil, errors.Wrap(err, "claim update")
 	}
+
 	return task, nil
 }
 
@@ -375,7 +380,7 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 // modify is a private helper to allow for transaction retries when serialization is violated.
 func (b *backend) modify(ctx context.Context, mod *entroq.Modification) (inserted, changed []*entroq.Task, err error) {
 	now := time.Now()
-	tx, err := b.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	tx, err := b.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "failed to start transaction")
 	}

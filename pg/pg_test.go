@@ -188,6 +188,30 @@ func TestMapReduce_checkSmall(t *testing.T) {
 	}
 }
 
+func TestMapReduce_checkLarge(t *testing.T) {
+	ctx := context.Background()
+	client, stop, err := pgClient(ctx)
+	if err != nil {
+		t.Fatalf("Open pg client: %v", err)
+	}
+	defer stop()
+
+	config := &quick.Config{
+		MaxCount: 3,
+		Values: func(values []reflect.Value, rand *rand.Rand) {
+			values[0] = reflect.ValueOf(rand.Intn(3000) + 100)
+			values[1] = reflect.ValueOf(rand.Intn(100) + 10)
+			values[2] = reflect.ValueOf(rand.Intn(20) + 1)
+		},
+	}
+	check := func(ndocs, nm, nr int) bool {
+		return mrtest.MRCheck(ctx, client, ndocs, nm, nr)
+	}
+	if err := quick.Check(check, config); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // run starts a subprocess and connects its standard pipes to the parents'.
 func run(ctx context.Context, name string, args ...string) error {
 	cmd := exec.CommandContext(ctx, name, args...)
