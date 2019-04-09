@@ -188,7 +188,7 @@ func TestMapReduce_checkSmall(t *testing.T) {
 	}
 }
 
-func TestMapReduce_checkLarge(t *testing.T) {
+func TestMapReduce_checkMedium(t *testing.T) {
 	ctx := context.Background()
 	client, stop, err := pgClient(ctx)
 	if err != nil {
@@ -199,8 +199,8 @@ func TestMapReduce_checkLarge(t *testing.T) {
 	config := &quick.Config{
 		MaxCount: 3,
 		Values: func(values []reflect.Value, rand *rand.Rand) {
-			values[0] = reflect.ValueOf(rand.Intn(3000) + 100)
-			values[1] = reflect.ValueOf(rand.Intn(100) + 10)
+			values[0] = reflect.ValueOf(rand.Intn(1000) + 100)
+			values[1] = reflect.ValueOf(rand.Intn(50) + 10)
 			values[2] = reflect.ValueOf(rand.Intn(20) + 1)
 		},
 	}
