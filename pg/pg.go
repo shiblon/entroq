@@ -299,7 +299,7 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 				queue = $1 AND
 				at <= $2
 			ORDER BY at, version, id ASC
-			LIMIT 3
+			LIMIT 20
 			FOR UPDATE
 		)
 		UPDATE tasks
@@ -309,7 +309,7 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 			at = $3,
 			claimant = $4,
 			modified = $5
-		WHERE id IN (SELECT id FROM topN ORDER BY random() LIMIT 1)
+		WHERE id IN (SELECT id FROM topN ORDER BY RANDOM() LIMIT 1)
 		RETURNING id, version, queue, at, created, modified, claimant, value, claims
 	`, cq.Queue, now, now.Add(cq.Duration), cq.Claimant, now).Scan(
 		&task.ID,
