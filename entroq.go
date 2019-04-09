@@ -61,6 +61,20 @@ type TaskData struct {
 	// to be done safely, where the database update needs to refer to
 	// to-be-inserted tasks.
 	ID uuid.UUID
+
+	// skipCollidingID indicates that a collision on insertion is not fatal,
+	// and the insertion can be removed if that happens, and then the
+	// modification can be retried.
+	skipCollidingID bool
+}
+
+// String returns a string representation of the task data, excluding the value.
+func (t *TaskData) String() string {
+	s := fmt.Sprintf("%q::%v", t.Queue, t.At)
+	if t.ID != uuid.Nil {
+		s += "::" + t.ID.String()
+	}
+	return s
 }
 
 // Task represents a unit of work, with a byte slice value payload.
@@ -664,6 +678,51 @@ func (c *EntroQ) DoWithRenew(ctx context.Context, task *Task, lease time.Duratio
 // was due to missing dependencies, a *DependencyError is returned, which can be checked for
 // by calling AsDependency(err).
 func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (inserted []*Task, changed []*Task, err error) {
+	mod := NewModification(c.clientID, modArgs...)
+	for {
+		ins, chg, err := c.backend.Modify(ctx, mod)
+		if err == nil {
+			return ins, chg, nil
+		}
+		depErr, ok := AsDependency(err)
+		// If not a dependency error, pass it on out.
+		if !ok {
+			return nil, nil, errors.Wrap(err, "modify")
+		}
+		// If anything is missing or there's a claim problem, bail.
+		if depErr.HasMissing() || depErr.HasClaims() {
+			return nil, nil, errors.Wrap(err, "modify non-ins deps")
+		}
+		// No collisions? Not sure what's going on.
+		if !depErr.HasCollisions() {
+			return nil, nil, errors.Wrap(err, "non-collision errors")
+		}
+
+		// If we get this far, the only errors we have are insertion collisions.
+		// If any of them cannot be skipped, we bail out.
+		// Otherwise we remove them and try again.
+
+		// Now check all collisions. If we can remove all of them safely, do so
+		// and try again.
+		collidingIDs := make(map[uuid.UUID]bool)
+		for _, ins := range depErr.Inserts {
+			collidingIDs[ins.ID] = true
+		}
+		var newInserts []*TaskData
+		for _, td := range mod.Inserts {
+			if collidingIDs[td.ID] {
+				if td.skipCollidingID {
+					// Skippable, so skip.
+					continue
+				}
+				// Can't skip this one. Bail.
+				return nil, nil, errors.Wrap(err, "unskippable collision")
+			}
+			newInserts = append(newInserts, td)
+		}
+		log.Printf("Trying modification again due to skippable colliding inserts. %v -> %v", mod.Inserts, newInserts)
+		mod.Inserts = newInserts
+	}
 	return c.backend.Modify(ctx, NewModification(c.clientID, modArgs...))
 }
 
@@ -787,6 +846,17 @@ func WithValue(value []byte) InsertArg {
 func WithID(id uuid.UUID) InsertArg {
 	return func(_ *Modification, d *TaskData) {
 		d.ID = id
+	}
+}
+
+// WithSkipColliding sets the insert argument to allow itself to be removed if
+// the only error encountered is an ID collision. This can help when it is
+// desired to insert multiple tasks, but a previous subset was already inserted
+// with similar IDs. Sometimes you want to specify a superset to "catch what we
+// missed".
+func WithSkipColliding(s bool) InsertArg {
+	return func(_ *Modification, d *TaskData) {
+		d.skipCollidingID = s
 	}
 }
 
