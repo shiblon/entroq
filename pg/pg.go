@@ -288,46 +288,16 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 // TryClaim attempts to claim an "arrived" task from the queue.
 // Returns an error if something goes wrong, a nil task if there is
 // nothing to claim.
-func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (claimed *entroq.Task, err error) {
+func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
 	task := new(entroq.Task)
 	if cq.Duration == 0 {
 		return nil, errors.Errorf("no duration set for claim %q", cq.Queue)
 	}
 	now := time.Now()
 
-	tx, err := b.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
-	if err != nil {
-		return nil, errors.Wrap(err, "claim transaction")
-	}
-	defer func() {
-		if err != nil {
-			tx.Rollback()
-		} else {
-			tx.Commit()
-		}
-	}()
-
-	var (
-		id      uuid.UUID
-		version int32
-	)
-
-	if err := b.db.QueryRowContext(ctx, `
-		SELECT id, version
-		FROM tasks
-		WHERE
-			queue = $1 AND
-			at <= $2
-		ORDER BY RANDOM()
-		LIMIT 1
-		FOR UPDATE
-	`, cq.Queue, now).Scan(&id, &version); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, errors.Wrap(err, "get random available")
-	}
-
+	// Use of SKIP LOCKED:
+	// - https://dba.stackexchange.com/questions/69471/postgres-update-limit-1
+	// - https://blog.2ndquadrant.com/what-is-select-skip-locked-for-in-postgresql-9-5/
 	if err := b.db.QueryRowContext(ctx, `
 		UPDATE tasks
 		SET
@@ -337,10 +307,18 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (claimed 
 			claimant = $2,
 			modified = $3
 		WHERE
-			id = $4 AND
-			version = $5
+			(id, version) IN (
+				SELECT id, version
+				FROM tasks
+				WHERE
+					queue = $4 AND
+					at < $5
+				ORDER BY RANDOM()
+				FOR UPDATE SKIP LOCKED
+				LIMIT 1
+			)
 		RETURNING id, version, queue, at, created, modified, claimant, value, claims
-	`, now.Add(cq.Duration), cq.Claimant, now, id, version).Scan(
+	`, now.Add(cq.Duration), cq.Claimant, now, cq.Queue, now).Scan(
 		&task.ID,
 		&task.Version,
 		&task.Queue,
