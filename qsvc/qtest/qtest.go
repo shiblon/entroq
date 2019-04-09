@@ -274,7 +274,7 @@ func InsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 
 	knownID := uuid.New()
 
-	// Insert a task with an explicity ID.
+	// Insert task with an explicit ID.
 	inserted, changed, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithID(knownID)))
 	if err != nil {
 		t.Fatalf("Unable to insert task with known ID %q: %v", knownID, err)
@@ -305,6 +305,7 @@ func InsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 		t.Fatalf("Task claim expected ID %q, got %q", knownID, claimed.ID)
 	}
 
+	// Try to insert with a known ID that's already there.
 	_, _, err = client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithID(knownID)))
 	if err == nil {
 		t.Fatalf("Expected error inserting with existing ID %v, but got no error", knownID)
@@ -315,6 +316,40 @@ func InsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 	}
 	if want, got := 1, len(depErr.Inserts); want != got {
 		t.Fatalf("Expected %d insertion errors in dependency error, got %v", want, got)
+	}
+
+	// Try to insert again, but allow it to be skipped.
+	_, _, err = client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithID(knownID), entroq.WithSkipColliding(true)))
+	if err != nil {
+		t.Fatalf("Expected no error inserting with existing skippable ID %v: %v", knownID, err)
+	}
+
+	// Insert another task.
+	inserted, _, err = client.Modify(ctx, entroq.InsertingInto(queue))
+	if err != nil {
+		t.Fatalf("Expected no insertion error, got: %v", err)
+	}
+
+	// Try to insert the known ID and delete the new ID at the same time. This
+	// should work when it's set to skip colliding.
+	if _, _, err = client.Modify(ctx,
+		entroq.InsertingInto(queue,
+			entroq.WithID(knownID),
+			entroq.WithSkipColliding(true)),
+		inserted[0].AsDeletion()); err != nil {
+		t.Fatalf("Expected no error inserting skippable and deleting, got: %v", err)
+	}
+
+	// Check that we have only one task in the queue, and that it's the expected one.
+	tasks, err := client.Tasks(ctx, queue)
+	if err != nil {
+		t.Fatalf("Error getting tasks: %v", err)
+	}
+	if want, got := 1, len(tasks); want != got {
+		t.Fatalf("Expected len(tasks) = %d, got %v", want, got)
+	}
+	if want, got := knownID, tasks[0].ID; want != got {
+		t.Fatalf("Expected ID %v found, got %v", want, got)
 	}
 }
 
