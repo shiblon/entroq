@@ -172,6 +172,8 @@ func (b *backend) initDB(ctx context.Context) error {
 		  value BYTEA,
 		  claims INTEGER NOT NULL DEFAULT 0
 		);
+		CREATE INDEX IF NOT EXISTS byID ON tasks (id);
+		CREATE INDEX IF NOT EXISTS byVersion ON tasks (version);
 		CREATE INDEX IF NOT EXISTS byQueue ON tasks (queue);
 		CREATE INDEX IF NOT EXISTS byQueueAt ON tasks (queue, at);
 	`)
