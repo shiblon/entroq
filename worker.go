@@ -54,44 +54,44 @@ func (c *EntroQ) NewWorker(q string, opts ...WorkerOption) *Worker {
 // updated.
 func (w *Worker) Run(ctx context.Context, f func(ctx context.Context, task *Task) ([]ModifyArg, error)) (err error) {
 	defer func() {
-		log.Printf("Finishing EntroQ worker on client %v: err=%v", w.eqc.ID(), err)
+		log.Printf("Finishing EntroQ worker %q on client %v: err=%v", w.Q, w.eqc.ID(), err)
 	}()
-	log.Printf("Starting EntroQ worker on client %v", w.eqc.ID())
+	log.Printf("Starting EntroQ worker %q on client %v", w.Q, w.eqc.ID())
 	for {
 		select {
 		case <-ctx.Done():
-			return errors.Wrap(ctx.Err(), "worker quit")
+			return errors.Wrapf(ctx.Err(), "worker quit (%q)", w.Q)
 		default:
 		}
 
 		task, err := w.eqc.Claim(ctx, w.Q, w.lease)
 		if err != nil {
-			return errors.Wrap(err, "worker claim")
+			return errors.Wrapf(err, "worker claim (%q)", w.Q)
 		}
 
 		var args []ModifyArg
 		renewed, err := w.eqc.DoWithRenew(ctx, task, w.lease, func(ctx context.Context) error {
 			var err error
 			if args, err = f(ctx, task); err != nil {
-				return errors.Wrap(err, "worker run with renew")
+				return errors.Wrapf(err, "worker run with renew (%q)", w.Q)
 			}
 			return nil
 		})
 		if err != nil {
-			log.Printf("Worker error: %v", err)
+			log.Printf("Worker error (%q): %v", w.Q, err)
 			if _, ok := AsDependency(err); ok {
-				log.Print("Worker continuing after dependency")
+				log.Printf("Worker continuing after dependency (%q)", w.Q)
 				continue
 			}
 			if IsTimeout(err) {
-				log.Print("Worker continuing after timeout")
+				log.Printf("Worker continuing after timeout (%q)", w.Q)
 				continue
 			}
 			if IsCanceled(err) {
-				log.Print("Worker shutting down cleanly")
+				log.Printf("Worker shutting down cleanly (%q)", w.Q)
 				return nil
 			}
-			return errors.Wrap(err, "worker error")
+			return errors.Wrapf(err, "worker error (%q)", w.Q)
 		}
 
 		modification := NewModification(uuid.Nil, args...)
@@ -125,18 +125,18 @@ func (w *Worker) Run(ctx context.Context, f func(ctx context.Context, task *Task
 
 		if _, _, err := w.eqc.Modify(ctx, WithModification(modification)); err != nil {
 			if _, ok := AsDependency(err); ok {
-				log.Printf("Worker ack failed, throwing away: %v", err)
+				log.Printf("Worker ack failed (%q), throwing away: %v", w.Q, err)
 				continue
 			}
 			if IsTimeout(err) {
-				log.Printf("Worker continuing after ack timeout: %v", err)
+				log.Printf("Worker continuing (%q) after ack timeout: %v", w.Q, err)
 				continue
 			}
 			if IsCanceled(err) {
-				log.Printf("Worker exiting cleanly instead of acking: %v", err)
+				log.Printf("Worker exiting cleanly (%q) instead of acking: %v", w.Q, err)
 				return nil
 			}
-			return errors.Wrap(err, "worker ack")
+			return errors.Wrapf(err, "worker ack (%q)", w.Q)
 		}
 	}
 }
