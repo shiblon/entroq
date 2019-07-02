@@ -16,15 +16,17 @@ package cmd
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 )
 
 var (
 	flagTsQueue string
+	flagTsJSON  bool
 )
 
 func init() {
@@ -32,24 +34,46 @@ func init() {
 
 	tsCmd.Flags().StringVarP(&flagTsQueue, "queue", "q", "", "Queue to read tasks from. Required.")
 	tsCmd.MarkFlagRequired("queue")
+	tsCmd.Flags().BoolVarP(&flagTsJSON, "json", "j", false, "Value is JSON, display as such.")
 }
 
 // tsCmd represents the ts command
 var tsCmd = &cobra.Command{
 	Use:   "ts",
 	Short: "Get tasks from a queue in the EntroQ",
-	RunE: func(cmd *cobra.Command, args []string) error {
+	Run: func(cmd *cobra.Command, args []string) {
 		ts, err := eq.Tasks(context.Background(), flagTsQueue)
 		if err != nil {
-			return errors.Wrap(err, "get tasks")
+			log.Fatalf("Error getting tasks: %v", err)
 		}
 
 		b, err := json.MarshalIndent(ts, "", "\t")
 		if err != nil {
-			return errors.Wrap(err, "tasks json")
+			log.Fatalf("Error getting task JSON: %v", err)
+		}
+
+		if flagTsJSON {
+			var tasks []map[string]interface{}
+			if err := json.Unmarshal(b, &tasks); err != nil {
+				log.Fatalf("Error converting JSON into maps: %v", err)
+			}
+			for _, t := range tasks {
+				var m map[string]interface{}
+				v, err := base64.StdEncoding.DecodeString(t["value"].(string))
+				if err != nil {
+					log.Fatalf("Error decoding json base64 byte string: %v", err)
+				}
+				if err := json.Unmarshal([]byte(v), &m); err != nil {
+					log.Fatalf("Error getting map from value JSON: %v", err)
+				}
+				t["value"] = m
+			}
+			b, err = json.MarshalIndent(tasks, "", "\t")
+			if err != nil {
+				log.Fatalf("Error getting task JSON: %v", err)
+			}
 		}
 
 		fmt.Println(string(b))
-		return nil
 	},
 }
