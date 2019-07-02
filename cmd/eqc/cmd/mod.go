@@ -16,8 +16,6 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"log"
 
 	"entrogo.com/entroq"
@@ -35,7 +33,7 @@ var (
 func init() {
 	rootCmd.AddCommand(modCmd)
 
-	modCmd.Flags().StringVarP(&flagModID, "task", "t", "", "Task ID to modify. Note that this will modify *any* version of this task ID without regard for what else is happening. Use with care. Required")
+	modCmd.Flags().StringVarP(&flagModID, "task", "t", "", "Task ID to modify. Note that this will modify *any* version of this task ID without regard for what else is happening. Use with care.")
 	modCmd.MarkFlagRequired("task")
 
 	modCmd.Flags().StringVarP(&flagModQueue, "queue", "q", "", "Queue containing the task to modify. Required.")
@@ -72,15 +70,8 @@ var modCmd = &cobra.Command{
 			log.Fatalf("Too many tasks returned: %v", tasks)
 		}
 
-		_, mod, err := eq.Modify(context.Background(), entroq.Changing(tasks[0], chgArgs...))
-		if err != nil {
+		if _, _, err := eq.Modify(context.Background(), tasks[0].AsChange(chgArgs...)); err != nil {
 			log.Fatalf("Could not modify task %q: %v", id, err)
 		}
-
-		b, err := json.MarshalIndent(mod, "", "\t")
-		if err != nil {
-			log.Fatalf("JSON marshal: %v", err)
-		}
-		fmt.Println(string(b))
 	},
 }
