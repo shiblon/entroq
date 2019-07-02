@@ -15,7 +15,7 @@ import (
 // own worker instance.
 //
 // Example:
-//	w := NewWorker("queue_name")
+//	w := eqClient.NewWorker("queue_name")
 //	err := w.Run(ctx, func(ctx context.Context, task *Task) ([]ModifyArg, error) {
 //		// Do stuff with the task.
 //		// It's safe to mark it for deletion, too. It is renewed in the background.
