@@ -234,7 +234,7 @@ func (b *backend) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[strin
 
 // Tasks returns a slice of all tasks in the given queue.
 func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Task, error) {
-	q := "SELECT id, version, queue, at, created, modified, claimant, value FROM tasks WHERE queue = $1"
+	q := "SELECT id, version, queue, at, created, modified, claimant, value, claims FROM tasks WHERE queue = $1"
 	values := []interface{}{tq.Queue}
 
 	if tq.Claimant != uuid.Nil {
@@ -265,7 +265,7 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 	var tasks []*entroq.Task
 	for rows.Next() {
 		t := &entroq.Task{}
-		if err := rows.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Created, &t.Modified, &t.Claimant, &t.Value); err != nil {
+		if err := rows.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Created, &t.Modified, &t.Claimant, &t.Value, &t.Claims); err != nil {
 			return nil, errors.Wrap(err, "task scan")
 		}
 		tasks = append(tasks, t)
