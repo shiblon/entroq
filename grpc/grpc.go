@@ -41,7 +41,6 @@ package grpc // import "entrogo.com/entroq/grpc"
 import (
 	"context"
 	"fmt"
-	"log"
 	"net"
 	"time"
 
@@ -283,7 +282,6 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 		})
 		if err != nil {
 			if entroq.IsTimeout(err) {
-				log.Printf("Claim over gRPC time-out: retrying connection")
 				// If we just timed out on our little request context, then
 				// we can go around again.
 				// It's possible that the *parent* context timed out, which
