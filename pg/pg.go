@@ -243,13 +243,13 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 	}
 
 	// Add IDs if a set of limiting IDs has been requested.
-	if len(tq.IDs) > 0 {
-		var specifiers []string
-		for _, id := range tq.IDs {
-			specifiers = append(specifiers, fmt.Sprintf("$%d", len(values)+1))
-			values = append(values, id.String())
-		}
-		q += " AND id IN (" + strings.Join(specifiers, ", ") + ")"
+	strIDs := make([]string, 0, len(tq.IDs))
+	for _, id := range tq.IDs {
+		strIDs = append(strIDs, id.String())
+	}
+	if len(strIDs) != 0 {
+		q += fmt.Sprintf(" AND id = any($%d)", len(values)+1)
+		values = append(values, pq.StringArray(strIDs))
 	}
 
 	if tq.Limit > 0 {
@@ -474,15 +474,14 @@ func depQuery(ctx context.Context, tx *sql.Tx, m *entroq.Modification) (map[uuid
 	// touch them all while inserting, deleting, and changing, and so we can
 	// guarantee that dependencies don't disappear while we're at it (we need
 	// to know that the dependencies are there while we work).
-	var placeholders []string
-	var values []interface{}
+	strIDs := make([]string, 0, len(dependencies))
 	for id := range dependencies {
-		placeholders = append(placeholders, fmt.Sprintf("$%d", len(values)+1))
-		values = append(values, id)
+		strIDs = append(strIDs, id.String())
 	}
-	query := `SELECT id, version, queue, at, claimant, value, created, modified FROM tasks
-	          WHERE id IN (` + strings.Join(placeholders, ", ") + `) FOR UPDATE`
-	rows, err := tx.QueryContext(ctx, query, values...)
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, version, queue, at, claimant, value, created, modified FROM tasks
+		WHERE id = any($1) FOR UPDATE
+	`, pq.Array(strIDs))
 	if err != nil {
 		return nil, errors.Wrap(err, "pg dep query")
 	}
