@@ -2,7 +2,10 @@ package entroq
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log"
+	"path"
 	"time"
 
 	"github.com/google/uuid"
@@ -26,17 +29,57 @@ import (
 //	// it timed out).
 type Worker struct {
 	// Q is the queue to claim work from in an endless loop.
-	Q   string
+	Q string
+
+	// ErrQ is the queue where "moved" tasks go, when an error is recoverable
+	// but task information should be saved elsewhere.
+	ErrQ string
+
 	eqc *EntroQ
 
 	renew time.Duration
 	lease time.Duration
 }
 
+// MoveTaskError causes a task to be completely serialized, wrapped in a
+// larger JSON object with error information, and moved to a specified queue.
+// This can be useful when non-fatal task-specific errors happen in a worker
+// and we want to stash them somewhere instead of just causing the worker to
+// crash, but allows us to handle that as an early error return.
+type MoveTaskError struct {
+	Err error
+}
+
+// NewMoveTaskError creates a new MoveTaskError from the given error.
+func NewMoveTaskError(err error) *MoveTaskError {
+	return &MoveTaskError{err}
+}
+
+// Error produces an error string.
+func (e *MoveTaskError) Error() string {
+	return fmt.Sprintf("task-specific, movable: %v", e.Err)
+}
+
+// AsMoveTaskError returns the underlying error and true iff the underlying
+// error indicates a worker task should be moved to the error queue instead o
+// causing the worker to exit.
+func AsMoveTaskError(err error) (*MoveTaskError, bool) {
+	cause := errors.Cause(err)
+	mte, ok := cause.(*MoveTaskError)
+	return mte, ok
+}
+
+// ErrorTaskValue holds a task that is moved to an error queue, with an error message attached.
+type ErrorTaskValue struct {
+	Task *Task  `json:"task"`
+	Err  string `json:"err"`
+}
+
 // NewWorker creates a new worker iterator-like type that makes it easy to claim and operate on tasks in a loop.
 func (c *EntroQ) NewWorker(q string, opts ...WorkerOption) *Worker {
 	w := &Worker{
 		Q:     q,
+		ErrQ:  path.Join(q, "err"),
 		eqc:   c,
 		lease: 30 * time.Second,
 	}
@@ -77,8 +120,9 @@ func (w *Worker) Run(ctx context.Context, f func(ctx context.Context, task *Task
 			}
 			return nil
 		})
+
 		if err != nil {
-			log.Printf("Worker error (%q): %v", w.Q, err)
+			log.Printf("Worker error (%q): %T %v", w.Q, err, err)
 			if _, ok := AsDependency(err); ok {
 				log.Printf("Worker continuing after dependency (%q)", w.Q)
 				continue
@@ -91,6 +135,18 @@ func (w *Worker) Run(ctx context.Context, f func(ctx context.Context, task *Task
 				log.Printf("Worker shutting down cleanly (%q)", w.Q)
 				return nil
 			}
+			if _, ok := AsMoveTaskError(err); ok {
+				log.Printf("Worker moving error task to %q instead of exiting: %v", w.ErrQ, err)
+				newVal, marshalErr := json.Marshal(&ErrorTaskValue{Task: task, Err: err.Error()})
+				if marshalErr != nil {
+					return errors.Wrapf(marshalErr, "trying to marshal movable task with own error: %q", err)
+				}
+				if _, _, insErr := w.eqc.Modify(ctx, task.AsDeletion(), InsertingInto(w.ErrQ, WithValue(newVal))); err != nil {
+					return errors.Wrapf(insErr, "trying to insert movable task with own error: %q", err)
+				}
+				return nil
+			}
+
 			return errors.Wrapf(err, "worker error (%q)", w.Q)
 		}
 
@@ -150,5 +206,14 @@ type WorkerOption func(*Worker)
 func WithLease(d time.Duration) WorkerOption {
 	return func(w *Worker) {
 		w.lease = d
+	}
+}
+
+// WithErrorQueue sets the error queue for a "moved" task (as opposed
+// to one that errors out causing a crash). The default is to append "/err" to
+// the inbox value.
+func WithErrorQueue(q string) WorkerOption {
+	return func(w *Worker) {
+		w.ErrQ = q
 	}
 }
