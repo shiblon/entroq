@@ -120,9 +120,8 @@ func (w *Worker) Run(ctx context.Context, f func(ctx context.Context, task *Task
 			}
 			return nil
 		})
-
 		if err != nil {
-			log.Printf("Worker error (%q): %T %v", w.Q, err, err)
+			log.Printf("Worker error (%q): %v", w.Q, err)
 			if _, ok := AsDependency(err); ok {
 				log.Printf("Worker continuing after dependency (%q)", w.Q)
 				continue
@@ -146,7 +145,6 @@ func (w *Worker) Run(ctx context.Context, f func(ctx context.Context, task *Task
 				}
 				return nil
 			}
-
 			return errors.Wrapf(err, "worker error (%q)", w.Q)
 		}
 
