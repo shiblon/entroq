@@ -33,4 +33,4 @@ ENTRYPOINT ["./eqsvc.sh"]
 # Other options include "pg" with its associated flags.
 # If flags are left off, or the command is left off, the default in-memory
 # service is started.
-CMD ["mem", "-port", "37706"]
+CMD ["mem", "--port=37706"]
