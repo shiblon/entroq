@@ -72,6 +72,18 @@ func TestSimpleWorker(t *testing.T) {
 	qtest.SimpleWorker(ctx, t, client, "")
 }
 
+func TestWorkerMoveOnError(t *testing.T) {
+	ctx := context.Background()
+
+	client, stop, err := qtest.ClientService(ctx, Opener())
+	if err != nil {
+		t.Fatalf("Get client: %v", err)
+	}
+	defer stop()
+
+	qtest.WorkerMoveOnError(ctx, t, client, "")
+}
+
 func TestWorkerRenewal(t *testing.T) {
 	ctx := context.Background()
 
