@@ -4,6 +4,8 @@ package qtest // import "entrogo.com/entroq/qsvc/qtest"
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"log"
 	"net"
 	"path"
 	"strings"
@@ -165,6 +167,128 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 
 	if diff := EqualAllTasksVersionIncr(inserted, consumed, 1); diff != "" {
 		t.Errorf("Tasks inserted not the same as tasks consumed:\n%v", diff)
+	}
+}
+
+// WorkerMoveOnError tests that workers that have JustMoveTaskError results
+// move the task into an error queue with the expected wrapper and don't just
+// crash.
+func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	t.Helper()
+
+	queue := path.Join(qPrefix, "move_on_error")
+
+	type tc struct {
+		name  string
+		input *entroq.Task
+		moved bool
+	}
+
+	cases := []tc{
+		{
+			name: "die",
+			input: &entroq.Task{
+				Queue: queue,
+				ID:    uuid.New(),
+				Value: []byte("die"),
+			},
+			moved: false,
+		},
+		{
+			name: "move",
+			input: &entroq.Task{
+				Queue: queue,
+				ID:    uuid.New(),
+				Value: []byte("move"),
+			},
+			moved: true,
+		},
+	}
+
+	waitForEmptyInbox := func(ctx context.Context) error {
+		for i := 0; i < 5; i++ {
+			empty, err := client.QueuesEmpty(ctx, entroq.MatchExact(queue))
+			if err != nil {
+				return errors.Wrap(err, "get empty status")
+			}
+			if empty {
+				return nil
+			}
+			select {
+			case <-ctx.Done():
+				return errors.Wrap(ctx.Err(), "wait for empty inbox")
+			case <-time.After(time.Second):
+			}
+		}
+		return nil
+	}
+
+	runWorkerOneCase := func(ctx context.Context, c tc) {
+		t.Helper()
+
+		w := client.NewWorker(queue)
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		g, gctx := errgroup.WithContext(ctx)
+		g.Go(func() error {
+			err := w.Run(gctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
+				switch string(task.Value) {
+				case "die":
+					return nil, errors.New("task asked to die")
+				case "move":
+					return nil, entroq.NewMoveTaskError(errors.New("task asked to move"))
+				default:
+					return []entroq.ModifyArg{task.AsDeletion()}, nil
+				}
+			})
+			log.Printf("Worker exited: %v", err)
+			return err
+		})
+
+		if _, _, err := client.Modify(ctx, entroq.InsertingInto(w.Q,
+			entroq.WithID(c.input.ID),
+			entroq.WithValue(c.input.Value),
+		)); err != nil {
+			t.Fatalf("Test %q insert task work: %v", c.name, err)
+		}
+		if err := waitForEmptyInbox(ctx); err != nil {
+			log.Printf("Test %q wait: %v", c.name, err)
+		}
+		errTasks, err := client.Tasks(ctx, w.ErrQ)
+		if err != nil {
+			t.Fatalf("Test %q find in error queue: %v", c.name, err)
+		}
+		var foundTask *entroq.Task
+		for _, task := range errTasks {
+			et := new(entroq.ErrorTaskValue)
+			if err := json.Unmarshal(task.Value, et); err != nil {
+				t.Fatalf("Test %q failed to unmarshal error task value %q: %v", c.name, string(task.Value), err)
+			}
+			if et.Task.ID == c.input.ID {
+				foundTask = et.Task
+				break
+			}
+		}
+		if c.moved && foundTask == nil {
+			t.Errorf("Test %q expected task to be moved, but is not found in %q", c.name, w.ErrQ)
+		} else if !c.moved && foundTask != nil {
+			t.Errorf("Test %q expected task to be deleted, but showed up in %q", c.name, w.ErrQ)
+		}
+
+		cancel()
+
+		err = g.Wait()
+		if c.moved && err != nil && !entroq.IsCanceled(err) {
+			t.Errorf("Test %q expected no error on move, got %v", c.name, err)
+		} else if !c.moved && entroq.IsCanceled(err) {
+			t.Errorf("Test %q expected error from worker, got none", c.name)
+		}
+	}
+
+	// Feed test cases one at a time to the worker, wait for empty, then
+	// depending on desired outcomes, check error queue for expected value.
+	for _, test := range cases {
+		runWorkerOneCase(ctx, test)
 	}
 }
 
