@@ -65,7 +65,7 @@ class EntroQ:
 
         return resp.tasks
 
-    def tryclaim(self, queue, duration_ms=30000):
+    def try_claim(self, queue, duration_ms=30000):
         """Try to claim a task from the given queue, for the given duration.
 
         Args:
