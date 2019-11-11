@@ -23,7 +23,7 @@ class EntroQ:
         self.stub = entroq_pb2_grpc.EntroQStub(self.channel)
         self.health_stub = health_pb2_grpc.HealthStub(self.channel)
 
-    def quues(self, prefixmatches=(), exactmatches=(), limit=0):
+    def queues(self, prefixmatches=(), exactmatches=(), limit=0):
         """Return information about each queue that meets any of the given match criteria.
 
         If both prefixmatches and exactmatches is empty, then every queue
