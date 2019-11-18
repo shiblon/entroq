@@ -17,7 +17,7 @@ class EntroQ:
             eqaddr: Hostport of the address of an EntroQ gRPC service.
         """
         self.addr = eqaddr
-        self.claimant_id = uuid.uuid4()
+        self.claimant_id = str(uuid.uuid4())
         # TODO: allow secure channels.
         self.channel = grpc.insecure_channel(self.addr)
         self.stub = entroq_pb2_grpc.EntroQStub(self.channel)
