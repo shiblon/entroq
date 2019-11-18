@@ -6,8 +6,8 @@ from grpc_health.v1 import health_pb2_grpc
 from google.protobuf import json_format
 import uuid
 
-import entroq_pb2
-import entroq_pb2_grpc
+from . import entroq_pb2
+from . import entroq_pb2_grpc
 
 class EntroQ:
     def __init__(self, eqaddr):

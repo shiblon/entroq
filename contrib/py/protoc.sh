@@ -13,3 +13,5 @@ pip install 'grpcio-tools==1.15.0'
 pip install 'protobuf==3.6.1'
 
 python -m grpc_tools.protoc -I"${protodir}" --python_out=./entroq/ --grpc_python_out=./entroq/ "${protodir}"/*.proto
+# Fix up the stupid non-relative import that grpc output makes.
+sed -i '' -e 's/import entroq_pb2 as/from . import entroq_pb2 as/' ./entroq/entroq_pb2_grpc.py
