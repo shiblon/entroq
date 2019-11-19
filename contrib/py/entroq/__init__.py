@@ -1,10 +1,13 @@
 # Package entroq provides a client library for working with EntroQ.
 
+import base64
+import json
+import uuid
+
+from google.protobuf import json_format
 import grpc
 from grpc_health.v1 import health_pb2
 from grpc_health.v1 import health_pb2_grpc
-from google.protobuf import json_format
-import uuid
 
 from . import entroq_pb2
 from . import entroq_pb2_grpc
@@ -23,6 +26,17 @@ class EntroQ:
         self.channel = grpc.insecure_channel(self.addr)
         self.stub = entroq_pb2_grpc.EntroQStub(self.channel)
         self.health_stub = health_pb2_grpc.HealthStub(self.channel)
+
+    @staticmethod
+    def to_dict(task, value_type=''):
+        if value_type and value_type.lower() == 'json':
+            jt = json_format.MessageToDict(task)
+            val = jt.get('value')
+            if val:
+                jt['value'] = json.loads(base64.b64decode(val).decode('utf-8'))
+            return jt
+
+        return json_format.MessageToDict(task)
 
     def queues(self, prefixmatches=(), exactmatches=(), limit=0):
         """Return information about each queue that meets any of the given match criteria.
