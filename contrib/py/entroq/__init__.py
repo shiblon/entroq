@@ -9,6 +9,7 @@ import uuid
 from . import entroq_pb2
 from . import entroq_pb2_grpc
 
+
 class EntroQ:
     def __init__(self, eqaddr):
         """Create an EntroQ client (over gRPC).
@@ -45,7 +46,7 @@ class EntroQ:
 
         return resp.queues
 
-    def tasks(self, queue, claimant_id=None, task_id=None, limit=0):
+    def tasks(self, queue, claimant_id='', task_ids=(), limit=0):
         """Return tasks that match the given fields. Typically used to itemize a queue.
 
         Args:
@@ -61,7 +62,7 @@ class EntroQ:
             queue=queue,
             claimant_id=claimant_id,
             limit=limit,
-            task_id=task_id))
+            task_id=task_ids))
 
         return resp.tasks
 

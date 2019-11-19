@@ -40,7 +40,7 @@ func init() {
 	rmCmd.Flags().StringVarP(&flagRmID, "task", "t", "", "Task ID to remove. Note that this will remove whatever version of the task ID it finds. Use with care. Required.")
 	rmCmd.MarkFlagRequired("task")
 
-	rmCmd.Flags().IntVarP(&flagRmRetries, "retries", "r", 5, "Retries (in case the task is claimed)")
+	rmCmd.Flags().IntVarP(&flagRmRetries, "retries", "r", 10, "Retries (in case the task is claimed)")
 
 	rmCmd.Flags().StringVarP(&flagRmQueue, "queue", "q", "", "Queue containing the task to remove. Required.")
 	rmCmd.MarkFlagRequired("queue")
