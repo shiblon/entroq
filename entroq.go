@@ -952,7 +952,7 @@ func WithModification(src *Modification) ModifyArg {
 	}
 }
 
-// modification contains all of the information for a single batch modification in the task store.
+// Modification contains all of the information for a single batch modification in the task store.
 type Modification struct {
 	now time.Time
 
