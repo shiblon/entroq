@@ -87,7 +87,7 @@ class EntroQ:
     def task_by_id(self, queue, task_id):
         tasks = self.tasks(queue, task_ids=[task_id], limit=1)
         if not tasks:
-            raise ValueError(f"Task {task_id} not found")
+            raise ValueError("Task {task_id} not found".format(task_id=task_id))
         return tasks[0]
 
     def try_claim(self, queue, duration_ms=30000):
