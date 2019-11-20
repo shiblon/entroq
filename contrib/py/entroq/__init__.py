@@ -57,8 +57,12 @@ class EntroQ:
             match_prefix=prefixmatches,
             match_exact=exactmatches,
             limit=limit))
+        return {q.name: q.num_tasks for q in resp.queues}
 
-        return resp.queues
+    def queue_empty(self, queue):
+        """Indicate whether the given queue is empty."""
+        qs = self.queues(exactmatches=[queue])
+        return not qs.get(queue, 0)
 
     def tasks(self, queue, claimant_id='', task_ids=(), limit=0):
         """Return tasks that match the given fields. Typically used to itemize a queue.
@@ -136,3 +140,21 @@ class EntroQ:
             changes=changes,
             deletes=deletes,
             depends=depends))
+
+    def pop_all(self, queue):
+        """Attempt to completely clear a queue.
+
+        Claims from the queue, deleting everything it claims, until the queue is empty.
+
+        Note that this must be called in a loop.
+
+        Args:
+            queue: The queue name to clear.
+
+        Yields:
+            Each task that has been removed (entroq_pb2.Task).
+        """
+        while not self.queue_empty(queue):
+            task = self.claim(queue)
+            self.modify(deletes=[entroq_pb2.TaskID(id=task.id, version=task.version)])
+            yield task
