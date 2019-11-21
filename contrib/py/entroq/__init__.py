@@ -14,6 +14,8 @@ from . import entroq_pb2_grpc
 
 
 class EntroQ:
+    """Client class for EntroQ over gRPC."""
+
     def __init__(self, eqaddr):
         """Create an EntroQ client (over gRPC).
 
@@ -164,3 +166,8 @@ class EntroQ:
             task = self.claim(queue)
             self.modify(deletes=[entroq_pb2.TaskID(id=task.id, version=task.version)])
             yield task
+
+
+class EQWorker:
+    """Worker for claiming tasks from a given queue and running a given method."""
+    pass
