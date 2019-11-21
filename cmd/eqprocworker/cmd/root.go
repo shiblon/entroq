@@ -56,24 +56,35 @@ type SubprocessOutput struct {
 var rootCmd = &cobra.Command{
 	Use:   "eqprocworker [options]",
 	Short: "EntroQ Worker CLI that reads a subprocess task and runs the specified command",
-	Long: `The eqprocworker command runs an EntroQ worker that accepts a
-	subprocess definition and tries to run it. Use with care only in trusted
-	environments, as this can open up privileged execution depending on the user
-	running this worker and the users allowed to insert tasks.
+	Long: `The eqprocworker processes EntroQ tasks and runs subprocess commands.
+
+	It starts an EntroQ worker that accepts a subprocess definition and tries
+	to run it. Use with care only in trusted environments, as this can open up
+	privileged execution depending on the user running this worker and the
+	users allowed to insert tasks.
 
 	The task should have the following format, in valid JSON:
 		{
 			"outbox": "<name of done queue>",
+			"errbox": "<name of error queue>",
 			"cmd": ["path/to/cmd", "arg1", "arg2", "arg3"],
 			"dir": "<working dir, defaults to parent of cmd>",
 			"env": ["name=value", "name2=value2"]
 		}
 
-	If the outbox is not specified, it will be set to the input queue with
-	"/done" appended to the end.
+	If the outbox is not specified, it will be set to
 
-	A finished task will repeat the data from the input task (flags, etc.), and will additionally
-	include the exit code (0 for success, as is typical):
+	  <inbox>/done
+
+	If the errbox is not specified, it is the same as the outbox.
+
+	A task, if something is wrong with it, may also end up in one of the following:
+
+	  <inbox>/failed-parse
+	  <errbox>/failed-start
+
+	A finished task will repeat the data from the input task (flags, etc.), and
+	will additionally include the exit code (0 for success, as is typical):
 
 		{
 			"cmd": ["path/to/cmd", "arg1", "arg2", "arg3"]
