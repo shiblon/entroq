@@ -15,7 +15,34 @@ from . import entroq_pb2
 from . import entroq_pb2_grpc
 
 
-RpcError = grpc.RpcError
+def is_cancelled(exc):
+    return exc.cancelled()
+
+
+def is_dependency(exc):
+    return exc.code() == grpc.StatusCode.NOT_FOUND
+
+
+def as_dependency(exc, as_json=False):
+    if not is_dependency(exc): return None
+    # Should have dependency metadata.
+    meta = exc.trailing_metadata()
+    if not meta:
+        return None
+    status = rpc_status.from_call(exc)
+    details = []
+    for d in status.details:
+        if not d.type_url.endswith('/proto.ModifyDep'):
+            return None
+        dep = entroq_pb2.ModifyDep()
+        dep.ParseFromString(d.value)
+        if dep.type == entroq_pb2.DETAIL and not dep.msg:
+            continue
+        if as_json:
+            details.append(json_format.MessageToDict(dep))
+        else:
+            details.append(dep)
+    return details
 
 
 class DependencyError(Exception):
@@ -199,36 +226,6 @@ class EntroQ:
             task = self.claim(queue)
             self.modify(deletes=[entroq_pb2.TaskID(id=task.id, version=task.version)])
             yield task
-
-
-def is_dependency(exc):
-    return exc.code() == grpc.StatusCode.NOT_FOUND
-
-
-def as_dependency(exc, as_json=False):
-    if not is_dependency(exc): return None
-    # Should have dependency metadata.
-    meta = exc.trailing_metadata()
-    if not meta:
-        return None
-    status = rpc_status.from_call(exc)
-    details = []
-    for d in status.details:
-        if not d.type_url.endswith('/proto.ModifyDep'):
-            return None
-        dep = entroq_pb2.ModifyDep()
-        dep.ParseFromString(d.value)
-        if dep.type == entroq_pb2.DETAIL and not dep.msg:
-            continue
-        if as_json:
-            details.append(json_format.MessageToDict(dep))
-        else:
-            details.append(dep)
-    return details
-
-
-def is_cancelled(exc):
-    return exc.cancelled()
 
 
 class EQWorker:
