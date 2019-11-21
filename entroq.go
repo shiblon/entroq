@@ -570,7 +570,7 @@ func (c *EntroQ) Claim(ctx context.Context, q string, duration time.Duration, op
 	return c.backend.Claim(ctx, query)
 }
 
-// TryClaimTask attempts one time to claim a task from the given queue. If
+// TryClaim attempts one time to claim a task from the given queue. If
 // there are no tasks, it returns a nil error *and* a nil task. This allows the
 // caller to decide whether to retry. It can fail if certain (optional)
 // dependency tasks are not present. This can be used, for example, to ensure
