@@ -202,10 +202,12 @@ class EntroQ:
             deletes: a list of entroq_pb2.TaskID indicating which tasks to delete.
             depends: a list of entroq_pb2.TaskID that must exist for success.
 
+        Raises:
+            grpc.RpcError or, when we can get dependency information, DependencyError.
+
         Returns:
             entroq_pb2.ModifyResponse indicating what was inserted and what was changed.
         """
-        # TODO: document exceptions - they are meaningful.
         try:
             return self.stub.Modify(entroq_pb2.ModifyRequest(
                 claimant_id=self.claimant_id,
