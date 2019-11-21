@@ -29,7 +29,7 @@ setup(name=pkg_name,
           'grpcio-status==1.25.0',
           'grpcio-tools==1.25.0',
           'grpcio_health_checking==1.25.0',
-          'protobuf==3.6.1',
+          'protobuf==3.10.0',
       ],
       data_files=list(iter_protos(pkg_name)),
       py_modules=[

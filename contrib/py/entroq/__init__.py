@@ -3,6 +3,8 @@
 
 import base64
 import json
+import threading
+import time
 import uuid
 
 from google.protobuf import json_format
@@ -63,7 +65,7 @@ class DependencyError(Exception):
     def as_dict(self):
         return {
             'code': self._exc.code(),
-            'message', self._exc.details(),
+            'message': self._exc.details(),
             'details': [json_format.MessageToDict(d) for d in self._deps],
         }
 
@@ -85,6 +87,11 @@ class EntroQ:
         self.channel = grpc.insecure_channel(self.addr)
         self.stub = entroq_pb2_grpc.EntroQStub(self.channel)
         self.health_stub = health_pb2_grpc.HealthStub(self.channel)
+
+        # Call the server, see what time it thinks it is, calculate rough skew.
+        now = int(time.time() * 1000)
+        self.time_skew = self.time() - now
+        print("time skew", self.time_skew)
 
     @staticmethod
     def to_dict(task, value_type=''):
@@ -209,6 +216,57 @@ class EntroQ:
         except grpc.RpcError as e:
             raise DependencyError.from_exc(e)
 
+    def time(self):
+        res = self.stub.Time(entroq_pb2.TimeRequest())
+        return res.time_ms
+
+    def now(self):
+        """Return now from the rough perspective of the server, in milliseconds."""
+        return int(time.time * 1000) + self.time_skew
+
+    def renew_for(self, task, duration=30):
+        """Renew a task for a given number of seconds."""
+        return self.modfy(changes=[
+            pb.TaskChange(old_id=pb.TaskID(id=task.id, version=task.version),
+                          new_data=pb.TaskData(queue=task.queue,
+                                               at_ms=self.now() + 1000 * duration,
+                                               value=task.value)),
+        ]).changed[0]
+
+    def do_with_renew(self, task, do_func, duration=30):
+        """Calls do_func while renewing the given task.
+
+        Args:
+            task: The entroq_pb2.Task to attempt to renew.
+            do_func: A function accepting a task and returning anything, to be
+                called with this task while it is renewed in the background.
+            duration: Claim duration in seconds.
+
+
+        Returns:
+            The (renewed task, do_func result).
+        """
+        renew_interval = duration // 2
+        exit = threading.Event()
+
+        lock = threading.Lock()
+
+        def renewer():
+            exit.wait(duration / 1000)
+            while not exit.is_set():
+                _t = self.renew_for(task, duration=duration)
+                with lock:
+                    renewed = _t
+                exit.wait(duration / 1000)
+
+        try:
+            threading.Thread(target=renewer).start()
+            result = do_func(task)
+            with lock:
+                return renewed, result
+        finally:
+            exit.set()
+
     def pop_all(self, queue):
         """Attempt to completely clear a queue.
 
@@ -230,4 +288,55 @@ class EntroQ:
 
 class EQWorker:
     """Worker for claiming tasks from a given queue and running a given method."""
-    pass
+    def __init__(self, eq):
+        """Create a worker using the given EntroQ client.
+
+        Args:
+            eq: An EntroQ instance.
+        """
+        self.eq = eq
+
+    def work(self, queue, do_func, claim_duration=30):
+        """Pull tasks from given queue, calling do_func, while renewing claims.
+
+        This function never returns. If you want to run it in the background,
+        start up a thrad with this as the target.
+
+        Args:
+            queue: The name of the queue to pull from.
+            do_func: The function to call. Accepts a single task argument and
+                returns a pb.ModifyRequest (no need to specify claimant ID).
+            claim_duration: Seconds for which this claim should be renewed
+                every renewal cycle.
+        """
+        def fixup(renewed, tlist):
+            for val in tlist:
+                if val.id == renewed.id and val.version != renewed.version:
+                    if val.version > renewed.version:
+                        raise ValueError("Task updated inside worker body, version too high")
+                    val.version = renewed.version
+
+        while True:
+            task = self.eq.claim(queue, duration_ms=1000 * claim_duration)
+            try:
+                renewed, mod_req = self.do_with_renew(task, do_func, duration=claim_duration)
+            except DependencyError as e:
+                logging.warn("Worker continuing after dependency: %s", e)
+                continue
+
+            if not mod_req:
+                logging.info("No modification requested, continuing")
+                continue
+
+            if not (mod_req.inserts or mod_req.changes or mod_req.deletes):
+                logging.info("No mutating modifications requested, continuing")
+                continue
+
+            fixup(renewed, mod_req.changes)
+            fixup(renewed, mod_req.depends)
+            fixup(renewed, mod_req.deletes)
+
+            self.eq.modify(changes=mod_req.changes,
+                           inserts=mod_req.inserts,
+                           depends=mod_req.depends,
+                           changes=mod_req.changes)

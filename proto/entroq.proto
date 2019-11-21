@@ -169,6 +169,16 @@ message QueuesResponse {
   repeated QueueStats queues = 1;
 }
 
+// TimeRequest asks the server for what it thinks is the current time.
+message TimeRequest {
+}
+
+// TimeResponse contains the server's idea of the current time in milliseconds
+// since the epoch.
+message TimeResponse {
+  int64 time_ms = 1;
+}
+
 // EntroQ is a service that allows for access to a task queue.
 service EntroQ {
   rpc TryClaim(ClaimRequest) returns (ClaimResponse);
@@ -176,4 +186,5 @@ service EntroQ {
   rpc Modify(ModifyRequest) returns (ModifyResponse);
   rpc Tasks(TasksRequest) returns (TasksResponse);
   rpc Queues(QueuesRequest) returns (QueuesResponse);
+  rpc Time(TimeRequest) returns (TimeResponse);
 }
