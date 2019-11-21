@@ -16,7 +16,9 @@ package cmd
 
 import (
 	"context"
-	"fmt"
+	"encoding/base64"
+	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,8 +32,9 @@ import (
 )
 
 var (
-	cfgFile string
-	svcAddr string
+	cfgFile   string
+	svcAddr   string
+	jsonValue bool
 
 	eq *entroq.EntroQ
 )
@@ -65,7 +68,7 @@ queue listings, individual task information, etc.`,
 // This is called by main.main(). It only needs to happen once to the rootCmd.
 func Execute() {
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Println(err)
+		log.Print(err)
 		os.Exit(1)
 	}
 }
@@ -79,6 +82,38 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.config/eqc.yaml)")
 
 	rootCmd.PersistentFlags().StringVar(&svcAddr, "svcaddr", ":37706", "address of service, uses port 37706 if none is specified")
+	rootCmd.PersistentFlags().BoolVarP(&jsonValue, "json", "j", false, "Display task values as JSON.")
+}
+
+func mustTaskString(t *entroq.Task) string {
+	b, err := json.Marshal(t)
+	if err != nil {
+		log.Fatalf("Failed to marshal to JSON: %v", err)
+	}
+
+	if !jsonValue {
+		return string(b)
+	}
+
+	// Unmarshal into a map so we can insert the value where we want it (as we want it).
+	var tm, vm map[string]interface{}
+	if err := json.Unmarshal(b, &tm); err != nil {
+		log.Fatalf("Error creating map from JSON: %v", err)
+	}
+	v, err := base64.StdEncoding.DecodeString(tm["value"].(string))
+	if err != nil {
+		log.Fatalf("Failed to b64 deserialize byte value: %v", err)
+	}
+	if err := json.Unmarshal([]byte(v), &vm); err != nil {
+		log.Fatalf("Failed to unmarshal JSON value: %v", err)
+	}
+	tm["value"] = vm
+
+	b, err = json.Marshal(tm)
+	if err != nil {
+		log.Fatalf("Error marshaling unnested task: %v", err)
+	}
+	return string(b)
 }
 
 // initConfig reads in config file and ENV variables if set.
@@ -90,7 +125,7 @@ func initConfig() {
 		// Find home directory.
 		home, err := homedir.Dir()
 		if err != nil {
-			fmt.Println(err)
+			log.Print(err)
 			os.Exit(1)
 		}
 
@@ -107,6 +142,6 @@ func initConfig() {
 
 	// If a config file is found, read it in.
 	if err := viper.ReadInConfig(); err == nil {
-		fmt.Println("Using config file:", viper.ConfigFileUsed())
+		log.Print("Using config file:", viper.ConfigFileUsed())
 	}
 }
