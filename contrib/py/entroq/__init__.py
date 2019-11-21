@@ -91,7 +91,6 @@ class EntroQ:
         # Call the server, see what time it thinks it is, calculate rough skew.
         now = int(time.time() * 1000)
         self.time_skew = self.time() - now
-        print("time skew", self.time_skew)
 
     @staticmethod
     def to_dict(task, value_type=''):
@@ -252,6 +251,7 @@ class EntroQ:
         exit = threading.Event()
 
         lock = threading.Lock()
+        renewed = task
 
         def renewer():
             exit.wait(duration / 1000)
@@ -321,7 +321,7 @@ class EQWorker:
         while True:
             task = self.eq.claim(queue, duration_ms=1000 * claim_duration)
             try:
-                renewed, mod_req = self.do_with_renew(task, do_func, duration=claim_duration)
+                renewed, mod_req = self.eq.do_with_renew(task, do_func, duration=claim_duration)
             except DependencyError as e:
                 logging.warn("Worker continuing after dependency: %s", e)
                 continue
@@ -341,4 +341,4 @@ class EQWorker:
             self.eq.modify(changes=mod_req.changes,
                            inserts=mod_req.inserts,
                            depends=mod_req.depends,
-                           changes=mod_req.changes)
+                           deletes=mod_req.deletes)
