@@ -24,16 +24,19 @@ class DependencyError(Exception):
         deps = as_dependency(exc)
         if not deps:
             return exc
-        return cls(deps)
+        return cls(deps, exc=exc)
 
-    def __init__(self, deps):
+    def __init__(self, deps, exc=None):
         self._deps = deps
+        self._exc = exc
 
     def as_json(self):
         return json.dumps(self.as_dict())
 
     def as_dict(self):
         return {
+            'code': self._exc.code(),
+            'message', self._exc.details(),
             'details': [json_format.MessageToDict(d) for d in self._deps],
         }
 
