@@ -1,4 +1,5 @@
-# Package entroq provides a client library for working with EntroQ.
+"""Package entroq provides a client library for working with EntroQ.
+"""
 
 import base64
 import json
@@ -6,6 +7,7 @@ import uuid
 
 from google.protobuf import json_format
 import grpc
+from grpc_status import rpc_status
 from grpc_health.v1 import health_pb2
 from grpc_health.v1 import health_pb2_grpc
 
@@ -13,10 +15,35 @@ from . import entroq_pb2
 from . import entroq_pb2_grpc
 
 
+RpcError = grpc.RpcError
+
+
+class DependencyError(Exception):
+    @classmethod
+    def from_exc(cls, exc):
+        deps = as_dependency(exc)
+        if not deps:
+            return exc
+        return cls(deps)
+
+    def __init__(self, deps):
+        self._deps = deps
+
+    def as_json(self):
+        return json.dumps(self.as_dict())
+
+    def as_dict(self):
+        return {
+            'details': [json_format.MessageToDict(d) for d in self._deps],
+        }
+
+    __str__ = as_json
+
+
 class EntroQ:
     """Client class for EntroQ over gRPC."""
 
-    def __init__(self, eqaddr):
+    def __init__(self, eqaddr='localhost:37706'):
         """Create an EntroQ client (over gRPC).
 
         Args:
@@ -142,12 +169,15 @@ class EntroQ:
             entroq_pb2.ModifyResponse indicating what was inserted and what was changed.
         """
         # TODO: document exceptions - they are meaningful.
-        return self.stub.Modify(entroq_pb2.ModifyRequest(
-            claimant_id=self.claimant_id,
-            inserts=inserts,
-            changes=changes,
-            deletes=deletes,
-            depends=depends))
+        try:
+            return self.stub.Modify(entroq_pb2.ModifyRequest(
+                claimant_id=self.claimant_id,
+                inserts=inserts,
+                changes=changes,
+                deletes=deletes,
+                depends=depends))
+        except grpc.RpcError as e:
+            raise DependencyError.from_exc(e)
 
     def pop_all(self, queue):
         """Attempt to completely clear a queue.
@@ -166,6 +196,36 @@ class EntroQ:
             task = self.claim(queue)
             self.modify(deletes=[entroq_pb2.TaskID(id=task.id, version=task.version)])
             yield task
+
+
+def is_dependency(exc):
+    return exc.code() == grpc.StatusCode.NOT_FOUND
+
+
+def as_dependency(exc, as_json=False):
+    if not is_dependency(exc): return None
+    # Should have dependency metadata.
+    meta = exc.trailing_metadata()
+    if not meta:
+        return None
+    status = rpc_status.from_call(exc)
+    details = []
+    for d in status.details:
+        if not d.type_url.endswith('/proto.ModifyDep'):
+            return None
+        dep = entroq_pb2.ModifyDep()
+        dep.ParseFromString(d.value)
+        if dep.type == entroq_pb2.DETAIL and not dep.msg:
+            continue
+        if as_json:
+            details.append(json_format.MessageToDict(dep))
+        else:
+            details.append(dep)
+    return details
+
+
+def is_cancelled(exc):
+    return exc.cancelled()
 
 
 class EQWorker:
