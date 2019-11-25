@@ -7,10 +7,10 @@ tmp=$(mktemp -d)
 python3 -m venv "$tmp"
 source "$tmp/bin/activate"
 pip install --upgrade pip
-pip install 'grpcio==1.15.0'
-pip install 'grpcio-health-checking==1.15.0'
-pip install 'grpcio-tools==1.15.0'
-pip install 'protobuf==3.6.1'
+pip install 'grpcio==1.25.0'
+pip install 'grpcio-health-checking==1.25.0'
+pip install 'grpcio-tools==1.25.0'
+pip install 'protobuf==3.10.0'
 
 python -m grpc_tools.protoc -I"${protodir}" --python_out=./entroq/ --grpc_python_out=./entroq/ "${protodir}"/*.proto
 # Fix up the stupid non-relative import that grpc output makes.
