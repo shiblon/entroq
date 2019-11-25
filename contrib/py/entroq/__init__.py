@@ -25,7 +25,7 @@ def is_dependency(exc):
     return exc.code() == grpc.StatusCode.NOT_FOUND
 
 
-def as_dependency(exc, as_json=False):
+def dependency_error_details(exc, as_json=False):
     if not is_dependency(exc): return None
     # Should have dependency metadata.
     meta = exc.trailing_metadata()
@@ -47,27 +47,63 @@ def as_dependency(exc, as_json=False):
     return details
 
 
+def id_str(task_id):
+    return '{}:{}'.format(task_id.id, task_id.version)
+
+
 class DependencyError(Exception):
     @classmethod
     def from_exc(cls, exc):
-        deps = as_dependency(exc)
+        deps = dependency_error_details(exc)
         if not deps:
             return exc
-        return cls(deps, exc=exc)
+        self.exc = exc
+        return cls.from_deps(deps)
 
-    def __init__(self, deps, exc=None):
-        self._deps = deps
-        self._exc = exc
+    @classmethod
+    def from_deps(cls, deps):
+        self.claims = []
+        self.deletes = []
+        self.changes = []
+        self.depends = []
+        self.inserts = []
+        self.msg = ''
+
+        for d in deps:
+            if d.type == entroq_pb2.CLAIM:
+                self.claims.append(id_str(d.id))
+            elif d.type == entroq_pb2.DELETE:
+                self.deletes.append(id_str(d.id))
+            elif d.type == entroq_pb2.CHANGE:
+                self.changes.append(id_str(d.id))
+            elif d.type == entroq_pb2.DEPEND:
+                self.depends.append(id_str(d.id))
+            elif d.type == entroq_pb2.DETAIL:
+                self.msg = d.msg
+            elif d.type == entroq_pb2.INSERT:
+                self.inserts.append(id_str(d.id))
+
+    def __init__(self):
+        raise NotImplementedError('call a specific classmethod constructor')
 
     def as_json(self):
         return json.dumps(self.as_dict())
 
     def as_dict(self):
-        return {
-            'code': self._exc.code(),
-            'message': self._exc.details(),
-            'details': [json_format.MessageToDict(d) for d in self._deps],
-        }
+        result = {}
+        if self.claims:
+            result['claims'] = self.claims
+        if self.deletes:
+            result['deletes'] = self.deletes
+        if self.changes:
+            result['changes'] = self.changes
+        if self.depends:
+            result['depends'] = self.depends
+        if self.msg:
+            result['msg'] = self.msg
+        if self.inserts:
+            result['inserts'] = self.inserts
+        return result
 
     __str__ = as_json
 
