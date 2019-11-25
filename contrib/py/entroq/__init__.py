@@ -51,24 +51,34 @@ def id_str(task_id):
     return '{}:{}'.format(task_id.id, task_id.version)
 
 
+def as_change(task):
+    return entroq_pb2.TaskChange(
+        old_id=as_id(task),
+        new_data=entroq_pb2.TaskData(
+            queue=task.queue,
+            at_ms=task.at_ms,
+            value=task.value
+        )
+    )
+
+
+def as_id(task):
+    return entroq_pb2.TaskID(id=task.id, version=task.version)
+
+
 class DependencyError(Exception):
     @classmethod
     def from_exc(cls, exc):
         deps = dependency_error_details(exc)
         if not deps:
             return exc
+        self = cls.from_deps(deps)
         self.exc = exc
-        return cls.from_deps(deps)
+        return self
 
     @classmethod
     def from_deps(cls, deps):
-        self.claims = []
-        self.deletes = []
-        self.changes = []
-        self.depends = []
-        self.inserts = []
-        self.msg = ''
-
+        self = cls()
         for d in deps:
             if d.type == entroq_pb2.CLAIM:
                 self.claims.append(id_str(d.id))
@@ -82,9 +92,15 @@ class DependencyError(Exception):
                 self.msg = d.msg
             elif d.type == entroq_pb2.INSERT:
                 self.inserts.append(id_str(d.id))
+        return self
 
     def __init__(self):
-        raise NotImplementedError('call a specific classmethod constructor')
+        self.claims = []
+        self.deletes = []
+        self.changes = []
+        self.depends = []
+        self.inserts = []
+        self.msg = ''
 
     def as_json(self):
         return json.dumps(self.as_dict())
@@ -241,15 +257,16 @@ class EntroQ:
             grpc.RpcError or, when we can get dependency information, DependencyError.
 
         Returns:
-            entroq_pb2.ModifyResponse indicating what was inserted and what was changed.
+            (inserted_tasks, changed_tasks) - lists of entroq_pb2.Task.
         """
         try:
-            return self.stub.Modify(entroq_pb2.ModifyRequest(
+            resp = self.stub.Modify(entroq_pb2.ModifyRequest(
                 claimant_id=self.claimant_id,
                 inserts=inserts,
                 changes=changes,
                 deletes=deletes,
                 depends=depends))
+            return resp.inserted, resp.changed
         except grpc.RpcError as e:
             raise DependencyError.from_exc(e)
 
@@ -259,16 +276,19 @@ class EntroQ:
 
     def now(self):
         """Return now from the rough perspective of the server, in milliseconds."""
-        return int(time.time * 1000) + self.time_skew
+        return int(time.time() * 1000) + self.time_skew
 
     def renew_for(self, task, duration=30):
         """Renew a task for a given number of seconds."""
-        return self.modfy(changes=[
-            pb.TaskChange(old_id=pb.TaskID(id=task.id, version=task.version),
-                          new_data=pb.TaskData(queue=task.queue,
-                                               at_ms=self.now() + 1000 * duration,
-                                               value=task.value)),
-        ]).changed[0]
+        _, chg = self.modify(changes=[
+            entroq_pb2.TaskChange(
+                old_id=entroq_pb2.TaskID(id=task.id,
+                                         version=task.version),
+                new_data=entroq_pb2.TaskData(queue=task.queue,
+                                             at_ms=self.now() + 1000 * duration,
+                                             value=task.value)),
+        ])
+        return chg[0]
 
     def do_with_renew(self, task, do_func, duration=30):
         """Calls do_func while renewing the given task.
@@ -343,7 +363,8 @@ class EQWorker:
         Args:
             queue: The name of the queue to pull from.
             do_func: The function to call. Accepts a single task argument and
-                returns a pb.ModifyRequest (no need to specify claimant ID).
+                returns an entroq_pb2.ModifyRequest (no need to specify
+                claimant ID).
             claim_duration: Seconds for which this claim should be renewed
                 every renewal cycle.
         """
