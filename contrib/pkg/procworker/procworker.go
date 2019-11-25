@@ -14,7 +14,6 @@ import (
 	"os/exec"
 
 	"entrogo.com/entroq"
-	"github.com/pkg/errors"
 )
 
 // SubprocessInput contains information about the subprocess to run. Task
@@ -24,6 +23,11 @@ type SubprocessInput struct {
 	Dir    string   `json:"dir"`
 	Env    []string `json:"env"`
 	Outbox string   `json:"outbox"`
+	Errbox string   `json:"errbox"`
+
+	// Err is the most recent error, in case this is moved to a failure queue
+	// before a process can start.
+	Err string `json:"err"`
 }
 
 // JSON creates JSON from the input.
@@ -35,13 +39,22 @@ func (p *SubprocessInput) JSON() []byte {
 	return out
 }
 
+// AsOutput creates an output structure from the input, for filling in results.
+func (p *SubprocessInput) AsOutput() *SubprocessOutput {
+	return &SubprocessOutput{
+		Cmd: p.Cmd,
+		Env: p.Env,
+		Dir: p.Dir,
+	}
+}
+
 // SubprocessOutput contains results from the subprocess that was run. Task
 // values pushed to the outbox will contain this as a JSON-encoded string.
 type SubprocessOutput struct {
 	Cmd    []string `json:"cmd"`
 	Dir    string   `json:"dir"`
 	Env    []string `json:"env"`
-	Error  string   `json:"statusMessage"`
+	Err    string   `json:"err"`
 	Stdout string   `json:"stdout"`
 	Stderr string   `json:"stderr"`
 }
@@ -63,16 +76,28 @@ func (p *SubprocessOutput) JSON() []byte {
 func Run(ctx context.Context, t *entroq.Task) ([]entroq.ModifyArg, error) {
 	input := new(SubprocessInput)
 	if err := json.Unmarshal(t.Value, input); err != nil {
-		return nil, errors.Wrap(err, "unmarshal value in worker")
-	}
-
-	if len(input.Cmd) == 0 {
-		return nil, errors.New("No command specified in input task")
+		log.Printf("Error unmarshaling value: %v", err)
+		return []entroq.ModifyArg{
+			t.AsChange(entroq.QueueTo(t.Queue + "/failed-parse")),
+		}, nil
 	}
 
 	outbox := input.Outbox
 	if outbox == "" {
 		outbox = t.Queue + "/done"
+	}
+
+	errbox := input.Errbox
+	if errbox == "" {
+		errbox = t.Queue + "/error"
+	}
+
+	if len(input.Cmd) == 0 {
+		log.Print("Empty command")
+		return []entroq.ModifyArg{
+			t.AsDeletion(),
+			entroq.InsertingInto(outbox, entroq.WithValue(input.AsOutput().JSON())),
+		}, nil
 	}
 
 	cmd := exec.CommandContext(ctx, input.Cmd[0], input.Cmd[1:]...)
@@ -87,18 +112,21 @@ func Run(ctx context.Context, t *entroq.Task) ([]entroq.ModifyArg, error) {
 	cmd.Stdout = outbuf
 	cmd.Stderr = errbuf
 
-	output := &SubprocessOutput{
-		Cmd: input.Cmd,
-		Env: input.Env,
-		Dir: input.Dir,
-	}
+	output := input.AsOutput()
+
+	destQueue := outbox
 
 	if err := cmd.Run(); err != nil {
+		destQueue = errbox
+		output.Err = err.Error()
 		_, ok := err.(*exec.ExitError)
 		if !ok {
-			return nil, errors.Wrap(err, "non-exit error on process run")
+			log.Printf("Non-exit error: %v", err)
+			return []entroq.ModifyArg{
+				t.AsDeletion(),
+				entroq.InsertingInto(errbox+"/failed-start", entroq.WithValue(output.JSON())),
+			}, nil
 		}
-		output.Error = err.Error()
 	}
 
 	output.Stdout = outbuf.String()
@@ -106,6 +134,6 @@ func Run(ctx context.Context, t *entroq.Task) ([]entroq.ModifyArg, error) {
 
 	return []entroq.ModifyArg{
 		t.AsDeletion(),
-		entroq.InsertingInto(outbox, entroq.WithValue(output.JSON())),
+		entroq.InsertingInto(destQueue, entroq.WithValue(output.JSON())),
 	}, nil
 }

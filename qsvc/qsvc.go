@@ -303,3 +303,10 @@ func (s *QSvc) Queues(ctx context.Context, req *pb.QueuesRequest) (*pb.QueuesRes
 	}
 	return resp, nil
 }
+
+// Time returns the current time in milliseconds since the Epoch.
+func (s *QSvc) Time(ctx context.Context, req *pb.TimeRequest) (*pb.TimeResponse, error) {
+	return &pb.TimeResponse{
+		TimeMs: int64(time.Nanosecond) * time.Now().UnixNano() / int64(time.Millisecond),
+	}, nil
+}
