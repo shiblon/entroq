@@ -39,6 +39,11 @@ class EntroQStub(object):
         request_serializer=entroq__pb2.QueuesRequest.SerializeToString,
         response_deserializer=entroq__pb2.QueuesResponse.FromString,
         )
+    self.Time = channel.unary_unary(
+        '/proto.EntroQ/Time',
+        request_serializer=entroq__pb2.TimeRequest.SerializeToString,
+        response_deserializer=entroq__pb2.TimeResponse.FromString,
+        )
 
 
 class EntroQServicer(object):
@@ -80,6 +85,13 @@ class EntroQServicer(object):
     context.set_details('Method not implemented!')
     raise NotImplementedError('Method not implemented!')
 
+  def Time(self, request, context):
+    # missing associated documentation comment in .proto file
+    pass
+    context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+    context.set_details('Method not implemented!')
+    raise NotImplementedError('Method not implemented!')
+
 
 def add_EntroQServicer_to_server(servicer, server):
   rpc_method_handlers = {
@@ -107,6 +119,11 @@ def add_EntroQServicer_to_server(servicer, server):
           servicer.Queues,
           request_deserializer=entroq__pb2.QueuesRequest.FromString,
           response_serializer=entroq__pb2.QueuesResponse.SerializeToString,
+      ),
+      'Time': grpc.unary_unary_rpc_method_handler(
+          servicer.Time,
+          request_deserializer=entroq__pb2.TimeRequest.FromString,
+          response_serializer=entroq__pb2.TimeResponse.SerializeToString,
       ),
   }
   generic_handler = grpc.method_handlers_generic_handler(
