@@ -291,7 +291,7 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
 	task := new(entroq.Task)
 	if cq.Duration == 0 {
-		return nil, errors.Errorf("no duration set for claim %q", cq.Queue)
+		return nil, errors.Errorf("no duration set for claim %q", cq.Queues)
 	}
 	now := time.Now()
 
@@ -311,14 +311,14 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 				SELECT id, version
 				FROM tasks
 				WHERE
-					queue = $4 AND
+					queue = any($4) AND
 					at < $5
 				ORDER BY RANDOM()
 				FOR UPDATE SKIP LOCKED
 				LIMIT 1
 			)
 		RETURNING id, version, queue, at, created, modified, claimant, value, claims
-	`, now.Add(cq.Duration), cq.Claimant, now, cq.Queue, now).Scan(
+	`, now.Add(cq.Duration), cq.Claimant, now, pq.StringArray(cq.Queues), now).Scan(
 		&task.ID,
 		&task.Version,
 		&task.Queue,
@@ -501,4 +501,11 @@ func depQuery(ctx context.Context, tx *sql.Tx, m *entroq.Modification) (map[uuid
 	}
 
 	return foundDeps, nil
+}
+
+// Time returns the time used in all calculations in this process.
+//
+// TODO: it might make sense to change all uses of time to use the database.
+func (b *backend) Time(ctx context.Context) (time.Time, error) {
+	return entroq.ProcessTime(), nil
 }

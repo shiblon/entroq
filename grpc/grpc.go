@@ -276,7 +276,7 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 		ctx, _ := context.WithTimeout(ctx, ClaimRetryInterval)
 		resp, err := pb.NewEntroQClient(b.conn).Claim(ctx, &pb.ClaimRequest{
 			ClaimantId: cq.Claimant.String(),
-			Queue:      cq.Queue,
+			Queues:     cq.Queues,
 			DurationMs: int64(cq.Duration / time.Millisecond),
 			PollMs:     int64(cq.PollTime / time.Millisecond),
 		})
@@ -302,7 +302,7 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
 	resp, err := pb.NewEntroQClient(b.conn).TryClaim(ctx, &pb.ClaimRequest{
 		ClaimantId: cq.Claimant.String(),
-		Queue:      cq.Queue,
+		Queues:     cq.Queues,
 		DurationMs: int64(cq.Duration / time.Millisecond),
 	})
 	if err != nil {
@@ -399,4 +399,13 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 	}
 
 	return inserted, changed, nil
+}
+
+// Time returns the time as reported by the server.
+func (b *backend) Time(ctx context.Context) (time.Time, error) {
+	resp, err := pb.NewEntroQClient(b.conn).Time(ctx, new(pb.TimeRequest))
+	if err != nil {
+		return time.Time{}, errors.Wrap(err, "grpc time")
+	}
+	return fromMS(resp.TimeMs).UTC(), nil
 }

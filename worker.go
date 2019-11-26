@@ -5,12 +5,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"path"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
 )
+
+// Work contains information about a single work queue, including destination
+// on move errors.
+type Work struct {
+	Q    string // Queue to listen on.
+	ErrQ string // Optional error queue for moves.
+}
 
 // Worker creates an iterator-like protocol for processing tasks in a queue,
 // one at a time, in a loop. Each worker should only be accessed from a single
@@ -28,12 +34,8 @@ import (
 //	// Handle the error, which is nil if the context was canceled (but not if
 //	// it timed out).
 type Worker struct {
-	// Q is the queue to claim work from in an endless loop.
-	Q string
-
-	// ErrQ is the queue where "moved" tasks go, when an error is recoverable
-	// but task information should be saved elsewhere.
-	ErrQ string
+	// Work is the set of queues to claim work from in an endless loop.
+	Work []*Work
 
 	eqc *EntroQ
 
@@ -69,25 +71,37 @@ func AsMoveTaskError(err error) (*MoveTaskError, bool) {
 	return mte, ok
 }
 
-// ErrorTaskValue holds a task that is moved to an error queue, with an error message attached.
+// ErrorTaskValue holds a task that is moved to an error queue, with an error
+// message attached.
 type ErrorTaskValue struct {
 	Task *Task  `json:"task"`
 	Err  string `json:"err"`
 }
 
-// NewWorker creates a new worker iterator-like type that makes it easy to claim and operate on tasks in a loop.
-func (c *EntroQ) NewWorker(q string, opts ...WorkerOption) *Worker {
+// NewWorker creates a new worker that makes it easy to claim and operate on
+// tasks in an endless loop.
+func (c *EntroQ) NewWorker(opts ...WorkerOption) (*Worker, error) {
 	w := &Worker{
-		Q:     q,
-		ErrQ:  path.Join(q, "err"),
 		eqc:   c,
-		lease: 30 * time.Second,
+		lease: DefaultClaimDuration,
 	}
 	for _, opt := range opts {
 		opt(w)
 	}
+	if len(w.Work) == 0 {
+		return nil, errors.New("nothing to do, no work queue given")
+	}
 	w.renew = w.lease / 2
-	return w
+	return w, nil
+}
+
+func (w *Worker) ErrQ(inQ string) string {
+	for _, work := range w.Work {
+		if work.Q == inQ && work.ErrQ != "" {
+			return work.ErrQ
+		}
+	}
+	return inQ + "/err"
 }
 
 // Run attempts to run the given function once per each claimed task, in a
@@ -96,56 +110,64 @@ func (c *EntroQ) NewWorker(q string, opts ...WorkerOption) *Worker {
 // it exits, and version numbers for claim renewals will be automatically
 // updated.
 func (w *Worker) Run(ctx context.Context, f func(ctx context.Context, task *Task) ([]ModifyArg, error)) (err error) {
+	var qs []string
+	for _, work := range w.Work {
+		qs = append(qs, work.Q)
+	}
+
 	defer func() {
-		log.Printf("Finishing EntroQ worker %q on client %v: err=%v", w.Q, w.eqc.ID(), err)
+		log.Printf("Finishing EntroQ worker %q on client %v: err=%v", qs, w.eqc.ID(), err)
 	}()
-	log.Printf("Starting EntroQ worker %q on client %v", w.Q, w.eqc.ID())
+	log.Printf("Starting EntroQ worker %q on client %v", qs, w.eqc.ID())
+
 	for {
 		select {
 		case <-ctx.Done():
-			return errors.Wrapf(ctx.Err(), "worker quit (%q)", w.Q)
+			return errors.Wrapf(ctx.Err(), "worker quit (%q)", qs)
 		default:
 		}
 
-		task, err := w.eqc.Claim(ctx, w.Q, w.lease)
+		task, err := w.eqc.Claim(ctx, From(qs...), ClaimFor(w.lease))
 		if err != nil {
-			return errors.Wrapf(err, "worker claim (%q)", w.Q)
+			return errors.Wrapf(err, "worker claim (%q)", qs)
 		}
+
+		errQ := w.ErrQ(task.Queue)
 
 		var args []ModifyArg
 		renewed, err := w.eqc.DoWithRenew(ctx, task, w.lease, func(ctx context.Context) error {
 			var err error
 			if args, err = f(ctx, task); err != nil {
-				return errors.Wrapf(err, "worker run with renew (%q)", w.Q)
+				return errors.Wrapf(err, "worker run with renew (%q)", qs)
 			}
 			return nil
 		})
 		if err != nil {
-			log.Printf("Worker error (%q): %v", w.Q, err)
+			log.Printf("Worker error (%q): %v", qs, err)
 			if _, ok := AsDependency(err); ok {
-				log.Printf("Worker continuing after dependency (%q)", w.Q)
+				log.Printf("Worker continuing after dependency (%q)", qs)
 				continue
 			}
 			if IsTimeout(err) {
-				log.Printf("Worker continuing after timeout (%q)", w.Q)
+				log.Printf("Worker continuing after timeout (%q)", qs)
 				continue
 			}
 			if IsCanceled(err) {
-				log.Printf("Worker shutting down cleanly (%q)", w.Q)
+				log.Printf("Worker shutting down cleanly (%q)", qs)
 				return nil
 			}
 			if _, ok := AsMoveTaskError(err); ok {
-				log.Printf("Worker moving error task to %q instead of exiting: %v", w.ErrQ, err)
+				log.Printf("Worker moving error task to %q instead of exiting: %v", errQ, err)
 				newVal, marshalErr := json.Marshal(&ErrorTaskValue{Task: task, Err: err.Error()})
 				if marshalErr != nil {
 					return errors.Wrapf(marshalErr, "trying to marshal movable task with own error: %q", err)
 				}
-				if _, _, insErr := w.eqc.Modify(ctx, task.AsDeletion(), InsertingInto(w.ErrQ, WithValue(newVal))); err != nil {
+				if _, _, insErr := w.eqc.Modify(ctx, task.AsDeletion(), InsertingInto(errQ, WithValue(newVal))); err != nil {
 					return errors.Wrapf(insErr, "trying to insert movable task with own error: %q", err)
 				}
 				return nil
 			}
-			return errors.Wrapf(err, "worker error (%q)", w.Q)
+			return errors.Wrapf(err, "worker error (%q)", qs)
 		}
 
 		modification := NewModification(uuid.Nil, args...)
@@ -179,18 +201,18 @@ func (w *Worker) Run(ctx context.Context, f func(ctx context.Context, task *Task
 
 		if _, _, err := w.eqc.Modify(ctx, WithModification(modification)); err != nil {
 			if _, ok := AsDependency(err); ok {
-				log.Printf("Worker ack failed (%q), throwing away: %v", w.Q, err)
+				log.Printf("Worker ack failed (%q), throwing away: %v", qs, err)
 				continue
 			}
 			if IsTimeout(err) {
-				log.Printf("Worker continuing (%q) after ack timeout: %v", w.Q, err)
+				log.Printf("Worker continuing (%q) after ack timeout: %v", qs, err)
 				continue
 			}
 			if IsCanceled(err) {
-				log.Printf("Worker exiting cleanly (%q) instead of acking: %v", w.Q, err)
+				log.Printf("Worker exiting cleanly (%q) instead of acking: %v", qs, err)
 				return nil
 			}
-			return errors.Wrapf(err, "worker ack (%q)", w.Q)
+			return errors.Wrapf(err, "worker ack (%q)", qs)
 		}
 	}
 }
@@ -198,7 +220,23 @@ func (w *Worker) Run(ctx context.Context, f func(ctx context.Context, task *Task
 // WorkerOption can be passed to AnalyticWorker to modify the worker
 type WorkerOption func(*Worker)
 
-// WithRenewInterval sets the frequency of task renewal. Tasks will be claimed
+// WorkOn sets a queue to be worked on. It allows an optional error queue to be
+// specified for tasks to "move" to when a special move error is given. The
+// default error queue is the input q + "/err".
+func WorkOn(q string, opts ...WorkOption) WorkerOption {
+	return func(w *Worker) {
+		work := &Work{
+			Q:    q,
+			ErrQ: q + "/err",
+		}
+		for _, opt := range opts {
+			opt(work)
+		}
+		w.Work = append(w.Work, work)
+	}
+}
+
+// WithLease sets the frequency of task renewal. Tasks will be claimed
 // for an amount of time slightly longer than this so that they have a chance
 // of being renewed before expiring.
 func WithLease(d time.Duration) WorkerOption {
@@ -207,11 +245,14 @@ func WithLease(d time.Duration) WorkerOption {
 	}
 }
 
+// WorkOption can be passed to the WorkQueue option to modify how a work queue
+// is processed.
+type WorkOption func(*Work)
+
 // WithErrorQueue sets the error queue for a "moved" task (as opposed
-// to one that errors out causing a crash). The default is to append "/err" to
-// the inbox value.
-func WithErrorQueue(q string) WorkerOption {
-	return func(w *Worker) {
+// to one that errors out causing a crash).
+func WithErrorQueue(q string) WorkOption {
+	return func(w *Work) {
 		w.ErrQ = q
 	}
 }

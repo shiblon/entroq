@@ -211,7 +211,7 @@ class EntroQ:
         """Try to claim a task from the given queue, for the given duration.
 
         Args:
-            queue: Name of queue to claim a task from.
+            queue: Name of queue to claim a task from. Or a list of queue names.
             duration_ms: Milliseconds that the claim should initially be good for.
 
         Returns:
@@ -219,7 +219,7 @@ class EntroQ:
         """
         resp = self.stub.TryClaim(entroq_pb2.ClaimRequest(
             claimant_id=self.claimant_id,
-            queue=queue,
+            queues=queue if isinstance(queue, (list, tuple)) else [queue],
             duration_ms=duration_ms))
 
         return resp.task
@@ -238,7 +238,7 @@ class EntroQ:
         # TODO: time out after retry interval, reconnect and try again.
         resp = self.stub.Claim(entroq_pb2.ClaimRequest(
             claimant_id=self.claimant_id,
-            queue=queue,
+            queues=queue if isinstance(queue, (list, tuple)) else [queue],
             duration_ms=duration_ms,
             poll_ms=poll_ms))
 

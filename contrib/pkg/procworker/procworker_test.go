@@ -88,7 +88,12 @@ func TestRun(t *testing.T) {
 	g, ctx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
-		return eq.NewWorker(inbox).Run(ctx, Run)
+		w, err := eq.NewWorker(entroq.WorkOn(inbox))
+		if err != nil {
+			return err
+		}
+
+		return w.Run(ctx, Run)
 	})
 
 	// Insert tasks one at a time, check that we get the expected output in the expected place.
@@ -105,7 +110,7 @@ func TestRun(t *testing.T) {
 			outbox = implicitOutbox
 		}
 
-		task, err := eq.Claim(ctx, outbox, 10*time.Second)
+		task, err := eq.Claim(ctx, entroq.From(outbox), entroq.ClaimFor(10*time.Second))
 		if err != nil {
 			t.Fatalf("Claim from outbox %q: %v", outbox, err)
 		}

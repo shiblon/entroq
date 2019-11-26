@@ -75,8 +75,8 @@ message ClaimRequest {
   // The party requesting a task.
   string claimant_id = 1;
 
-  // The queue name to claim a task from.
-  string queue = 2;
+  // The queue names to claim a task from.
+  repeated string queues = 2;
 
   // The duration of the claim, if/once successful.
   int64 duration_ms = 3;
