@@ -118,7 +118,9 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 		pollTime = time.Duration(req.PollMs) * time.Millisecond
 	}
 
-	task, err := s.impl.Claim(ctx, req.Queue, duration,
+	task, err := s.impl.Claim(ctx,
+		entroq.From(req.Queues...),
+		entroq.ClaimFor(duration),
 		entroq.ClaimAs(claimant),
 		entroq.ClaimPollTime(pollTime))
 	if err != nil {
@@ -143,7 +145,10 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 		return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse claimant ID")
 	}
 	duration := time.Duration(req.DurationMs) * time.Millisecond
-	task, err := s.impl.TryClaim(ctx, req.Queue, duration, entroq.ClaimAs(claimant))
+	task, err := s.impl.TryClaim(ctx,
+		entroq.From(req.Queues...),
+		entroq.ClaimFor(duration),
+		entroq.ClaimAs(claimant))
 	if err != nil {
 		return nil, wrapErrorf(err, "try claim")
 	}
@@ -306,7 +311,5 @@ func (s *QSvc) Queues(ctx context.Context, req *pb.QueuesRequest) (*pb.QueuesRes
 
 // Time returns the current time in milliseconds since the Epoch.
 func (s *QSvc) Time(ctx context.Context, req *pb.TimeRequest) (*pb.TimeResponse, error) {
-	return &pb.TimeResponse{
-		TimeMs: int64(time.Nanosecond) * time.Now().UnixNano() / int64(time.Millisecond),
-	}, nil
+	return &pb.TimeResponse{TimeMs: toMS(time.Now().UTC())}, nil
 }

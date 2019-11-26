@@ -55,11 +55,11 @@ var claimCmd = &cobra.Command{
 		duration := time.Duration(flagDurationSecs) * time.Second
 
 		if flagClaimTry {
-			if task, err = eq.TryClaim(ctx, flagClaimQueue, duration); err != nil {
+			if task, err = eq.TryClaim(ctx, entroq.From(flagClaimQueue), entroq.ClaimFor(duration)); err != nil {
 				return err
 			}
 		} else {
-			if task, err = eq.Claim(ctx, flagClaimQueue, duration); err != nil {
+			if task, err = eq.Claim(ctx, entroq.From(flagClaimQueue), entroq.ClaimFor(duration)); err != nil {
 				return err
 			}
 		}

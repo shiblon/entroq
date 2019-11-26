@@ -5,6 +5,7 @@ package subq // import "entrogo.com/entroq/subq"
 import (
 	"context"
 	"log"
+	"reflect"
 	"sync"
 	"time"
 
@@ -159,7 +160,7 @@ func (s *SubQ) addListener(q string) *sub {
 	return qs[q]
 }
 
-// Wait waits on the given queue until something is notified on it or the
+// Wait waits on the given queues until something is notified on one or the
 // context expires, whichever comes first. This is the basic behavior when
 // pollWait is 0 and condition is nil.
 //
@@ -185,7 +186,7 @@ func (s *SubQ) addListener(q string) *sub {
 //
 // Note that condition is called directly from this function, so if it needs a
 // context, it can simply close over the same one passed in here.
-func (s *SubQ) Wait(ctx context.Context, q string, pollWait time.Duration, condition func() bool) error {
+func (s *SubQ) Wait(ctx context.Context, qs []string, pollWait time.Duration, condition func() bool) error {
 	if condition == nil {
 		condition = makeDefaultCondition()
 	}
@@ -198,18 +199,66 @@ func (s *SubQ) Wait(ctx context.Context, q string, pollWait time.Duration, condi
 		return nil
 	}
 
-	qi := s.addListener(q)
-	defer qi.Done()
+	var listeners []*sub
+	for _, q := range qs {
+		qi := s.addListener(q)
+		defer qi.Done()
+		listeners = append(listeners, qi)
+	}
 
 	for !condition() {
-		select {
-		case <-wait():
-			// Go around again, even though not signaled.
-		case <-qi.Ch():
-			// Got a value, go around again to run condition to see if it's still there.
-		case <-ctx.Done():
-			return errors.Wrap(ctx.Err(), "subq wait")
+		// Faster version of select statement when there's exactly one listener.
+		if len(listeners) == 1 {
+			select {
+			case <-wait():
+				// Go around again, even though not signaled.
+			case <-listeners[0].Ch():
+				// Got a value, go around again to run condition to see if it's still there.
+			case <-ctx.Done():
+				return errors.Wrap(ctx.Err(), "subq wait")
+			}
+			continue
 		}
+
+		// More than one listener: create select cases dynamically. Note that
+		// we can't just create one goroutine per channel and funnel them into
+		// a single place because that would potentially starve other waiters
+		// (we would have consumed a notification not meant for us if we pick
+		// one and cancel the others). Thus, we use reflection here to generate
+		// a dynamic select.
+		//
+		// The cases are created each time through the loop because we have to
+		// call functions to get at the channels safely each time (and in some
+		// cases we have to get brand new channels).
+		cases := []reflect.SelectCase{
+			// This must be first.
+			{
+				Dir:  reflect.SelectRecv,
+				Chan: reflect.ValueOf(ctx.Done()),
+			},
+			{
+				Dir:  reflect.SelectRecv,
+				Chan: reflect.ValueOf(wait()),
+			},
+		}
+		for _, listener := range listeners {
+			cases = append(cases, reflect.SelectCase{
+				Dir:  reflect.SelectRecv,
+				Chan: reflect.ValueOf(listener.Ch()),
+			})
+		}
+		// Dyanmic select. If it's position 0, we know our context was canceled.
+		// Otherwise, we go around again because it's either a time-based
+		// release valve, or we got a notification and need to check the
+		// condition again.
+		chosen, _, _ := reflect.Select(cases)
+		if chosen == 0 {
+			// Context was canceled. Get it out and wrap its error.
+			return errors.Wrap(ctx.Err(), "subq wait multi")
+		}
+		// Otherwise, we just go around again. Either the time case
+		// fired, in which case it's a release valve, or a notification
+		// occurred, in which case we know trying again is likely to work.
 	}
 	return nil
 }
