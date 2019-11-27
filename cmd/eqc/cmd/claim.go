@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -25,7 +26,7 @@ import (
 )
 
 var (
-	flagClaimQueue   string
+	flagClaimQueues  []string
 	flagClaimTry     bool
 	flagDurationSecs int
 )
@@ -33,7 +34,7 @@ var (
 func init() {
 	rootCmd.AddCommand(claimCmd)
 
-	claimCmd.Flags().StringVarP(&flagClaimQueue, "queue", "q", "", "Queue to claim from. Required.")
+	claimCmd.Flags().StringArrayVarP(&flagClaimQueues, "queue", "q", nil, "Queue to claim from. Required, can be repeated to claim from one of several queues.")
 	claimCmd.MarkFlagRequired("queue")
 
 	claimCmd.Flags().BoolVar(&flagClaimTry, "try", false, "Use non-blocking try-claim.")
@@ -43,8 +44,12 @@ func init() {
 // claimCmd represents the claim command
 var claimCmd = &cobra.Command{
 	Use:   "claim",
-	Short: "Claim a task from a queue.",
+	Short: "Claim a task from a queue (or queues).",
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if len(flagClaimQueues) == 0 {
+			return errors.New("No claim queues specified")
+		}
+
 		ctx := context.Background()
 
 		var (
@@ -55,11 +60,11 @@ var claimCmd = &cobra.Command{
 		duration := time.Duration(flagDurationSecs) * time.Second
 
 		if flagClaimTry {
-			if task, err = eq.TryClaim(ctx, entroq.From(flagClaimQueue), entroq.ClaimFor(duration)); err != nil {
+			if task, err = eq.TryClaim(ctx, entroq.From(flagClaimQueues...), entroq.ClaimFor(duration)); err != nil {
 				return err
 			}
 		} else {
-			if task, err = eq.Claim(ctx, entroq.From(flagClaimQueue), entroq.ClaimFor(duration)); err != nil {
+			if task, err = eq.Claim(ctx, entroq.From(flagClaimQueues...), entroq.ClaimFor(duration)); err != nil {
 				return err
 			}
 		}

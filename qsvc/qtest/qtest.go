@@ -115,11 +115,7 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 	g, ctx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
-		w, err := client.NewWorker(entroq.WorkOn(queue))
-		if err != nil {
-			return err
-		}
-		return w.Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
+		return client.NewWorker(queue).Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
 			if task.Claims != 1 {
 				return nil, errors.Errorf("worker claim expected claims to be 1, got %d", task.Claims)
 			}
@@ -229,10 +225,8 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 	runWorkerOneCase := func(ctx context.Context, c tc) {
 		t.Helper()
 
-		w, err := client.NewWorker(entroq.WorkOn(queue))
-		if err != nil {
-			t.Fatalf("Run worker one case: %v", err)
-		}
+		w := client.NewWorker(queue)
+
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 		g, gctx := errgroup.WithContext(ctx)
@@ -260,7 +254,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		if err := waitForEmptyInbox(ctx); err != nil {
 			log.Printf("Test %q wait: %v", c.name, err)
 		}
-		errTasks, err := client.Tasks(ctx, w.ErrQ(queue))
+		errTasks, err := client.Tasks(ctx, w.ErrQMap(queue))
 		if err != nil {
 			t.Fatalf("Test %q find in error queue: %v", c.name, err)
 		}
@@ -276,9 +270,9 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 			}
 		}
 		if c.moved && foundTask == nil {
-			t.Errorf("Test %q expected task to be moved, but is not found in %q", c.name, w.ErrQ(queue))
+			t.Errorf("Test %q expected task to be moved, but is not found in %q", c.name, w.ErrQMap(queue))
 		} else if !c.moved && foundTask != nil {
-			t.Errorf("Test %q expected task to be deleted, but showed up in %q", c.name, w.ErrQ(queue))
+			t.Errorf("Test %q expected task to be deleted, but showed up in %q", c.name, w.ErrQMap(queue))
 		}
 
 		cancel()

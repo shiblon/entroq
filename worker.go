@@ -11,12 +11,10 @@ import (
 	"github.com/pkg/errors"
 )
 
-// Work contains information about a single work queue, including destination
-// on move errors.
-type Work struct {
-	Q    string // Queue to listen on.
-	ErrQ string // Optional error queue for moves.
-}
+// ErrQMap is a function that maps from an inbox name to its "move on error"
+// error box name. If no mapping is found, a suitable default should be
+// returned.
+type ErrQMap func(inbox string) string
 
 // Worker creates an iterator-like protocol for processing tasks in a queue,
 // one at a time, in a loop. Each worker should only be accessed from a single
@@ -34,8 +32,12 @@ type Work struct {
 //	// Handle the error, which is nil if the context was canceled (but not if
 //	// it timed out).
 type Worker struct {
-	// Work is the set of queues to claim work from in an endless loop.
-	Work []*Work
+	// Qs contains the queues to work on.
+	Qs []string
+
+	// ErrQMap maps an inbox to the queue tasks are moved to if a MoveTaskError
+	// is returned from a worker's run function.
+	ErrQMap ErrQMap
 
 	eqc *EntroQ
 
@@ -80,80 +82,82 @@ type ErrorTaskValue struct {
 
 // NewWorker creates a new worker that makes it easy to claim and operate on
 // tasks in an endless loop.
-func (c *EntroQ) NewWorker(opts ...WorkerOption) (*Worker, error) {
-	w := &Worker{
+func (c *EntroQ) NewWorker(qs ...string) *Worker {
+	return &Worker{
+		Qs:      qs,
+		ErrQMap: DefaultErrQMap,
+
 		eqc:   c,
 		lease: DefaultClaimDuration,
+		renew: DefaultClaimDuration / 2,
 	}
+}
+
+func (w *Worker) WithOpts(opts ...WorkerOption) *Worker {
 	for _, opt := range opts {
 		opt(w)
 	}
-	if len(w.Work) == 0 {
-		return nil, errors.New("nothing to do, no work queue given")
-	}
 	w.renew = w.lease / 2
-	return w, nil
+	return w
 }
 
-func (w *Worker) ErrQ(inQ string) string {
-	for _, work := range w.Work {
-		if work.Q == inQ && work.ErrQ != "" {
-			return work.ErrQ
-		}
-	}
-	return inQ + "/err"
-}
+// Work is a function that is called by Run. It does work for one task, then
+// returns any necessary modifications.
+//
+// If this function returns a MoveTaskError, the original task is moved into
+// a queue specified by calling ErrQMap on the original queue name.
+// This is useful for keeping track of failed tasks by moving them out of the
+// way instead of deleting them or allowing them to be picked up again.
+type Work func(ctx context.Context, task *Task) ([]ModifyArg, error)
 
 // Run attempts to run the given function once per each claimed task, in a
 // loop, until the context is canceled or an unrecoverable error is
 // encountered. The function can return modifications that should be done after
 // it exits, and version numbers for claim renewals will be automatically
 // updated.
-func (w *Worker) Run(ctx context.Context, f func(ctx context.Context, task *Task) ([]ModifyArg, error)) (err error) {
-	var qs []string
-	for _, work := range w.Work {
-		qs = append(qs, work.Q)
+func (w *Worker) Run(ctx context.Context, f Work) (err error) {
+	if len(w.Qs) == 0 {
+		return errors.New("No queues specified to work on")
 	}
-
 	defer func() {
-		log.Printf("Finishing EntroQ worker %q on client %v: err=%v", qs, w.eqc.ID(), err)
+		log.Printf("Finishing EntroQ worker %q on client %v: err=%v", w.Qs, w.eqc.ID(), err)
 	}()
-	log.Printf("Starting EntroQ worker %q on client %v", qs, w.eqc.ID())
+	log.Printf("Starting EntroQ worker %q on client %v", w.Qs, w.eqc.ID())
 
 	for {
 		select {
 		case <-ctx.Done():
-			return errors.Wrapf(ctx.Err(), "worker quit (%q)", qs)
+			return errors.Wrapf(ctx.Err(), "worker quit (%q)", w.Qs)
 		default:
 		}
 
-		task, err := w.eqc.Claim(ctx, From(qs...), ClaimFor(w.lease))
+		task, err := w.eqc.Claim(ctx, From(w.Qs...), ClaimFor(w.lease))
 		if err != nil {
-			return errors.Wrapf(err, "worker claim (%q)", qs)
+			return errors.Wrapf(err, "worker claim (%q)", w.Qs)
 		}
 
-		errQ := w.ErrQ(task.Queue)
+		errQ := w.ErrQMap(task.Queue)
 
 		var args []ModifyArg
 		renewed, err := w.eqc.DoWithRenew(ctx, task, w.lease, func(ctx context.Context) error {
 			var err error
 			if args, err = f(ctx, task); err != nil {
-				return errors.Wrapf(err, "worker run with renew (%q)", qs)
+				return errors.Wrapf(err, "worker run with renew (%q)", w.Qs)
 			}
 			return nil
 		})
 		if err != nil {
-			log.Printf("Worker error (%q): %v", qs, err)
+			log.Printf("Worker error (%q): %v", w.Qs, err)
 			if _, ok := AsDependency(err); ok {
-				log.Printf("Worker continuing after dependency (%q)", qs)
+				log.Printf("Worker continuing after dependency (%q)", w.Qs)
 				continue
 			}
 			if IsTimeout(err) {
-				log.Printf("Worker continuing after timeout (%q)", qs)
+				log.Printf("Worker continuing after timeout (%q)", w.Qs)
 				continue
 			}
 			if IsCanceled(err) {
-				log.Printf("Worker shutting down cleanly (%q)", qs)
+				log.Printf("Worker shutting down cleanly (%q)", w.Qs)
 				return nil
 			}
 			if _, ok := AsMoveTaskError(err); ok {
@@ -167,7 +171,7 @@ func (w *Worker) Run(ctx context.Context, f func(ctx context.Context, task *Task
 				}
 				return nil
 			}
-			return errors.Wrapf(err, "worker error (%q)", qs)
+			return errors.Wrapf(err, "worker error (%q)", w.Qs)
 		}
 
 		modification := NewModification(uuid.Nil, args...)
@@ -201,40 +205,24 @@ func (w *Worker) Run(ctx context.Context, f func(ctx context.Context, task *Task
 
 		if _, _, err := w.eqc.Modify(ctx, WithModification(modification)); err != nil {
 			if _, ok := AsDependency(err); ok {
-				log.Printf("Worker ack failed (%q), throwing away: %v", qs, err)
+				log.Printf("Worker ack failed (%q), throwing away: %v", w.Qs, err)
 				continue
 			}
 			if IsTimeout(err) {
-				log.Printf("Worker continuing (%q) after ack timeout: %v", qs, err)
+				log.Printf("Worker continuing (%q) after ack timeout: %v", w.Qs, err)
 				continue
 			}
 			if IsCanceled(err) {
-				log.Printf("Worker exiting cleanly (%q) instead of acking: %v", qs, err)
+				log.Printf("Worker exiting cleanly (%q) instead of acking: %v", w.Qs, err)
 				return nil
 			}
-			return errors.Wrapf(err, "worker ack (%q)", qs)
+			return errors.Wrapf(err, "worker ack (%q)", w.Qs)
 		}
 	}
 }
 
 // WorkerOption can be passed to AnalyticWorker to modify the worker
 type WorkerOption func(*Worker)
-
-// WorkOn sets a queue to be worked on. It allows an optional error queue to be
-// specified for tasks to "move" to when a special move error is given. The
-// default error queue is the input q + "/err".
-func WorkOn(q string, opts ...WorkOption) WorkerOption {
-	return func(w *Worker) {
-		work := &Work{
-			Q:    q,
-			ErrQ: q + "/err",
-		}
-		for _, opt := range opts {
-			opt(work)
-		}
-		w.Work = append(w.Work, work)
-	}
-}
 
 // WithLease sets the frequency of task renewal. Tasks will be claimed
 // for an amount of time slightly longer than this so that they have a chance
@@ -245,14 +233,16 @@ func WithLease(d time.Duration) WorkerOption {
 	}
 }
 
-// WorkOption can be passed to the WorkQueue option to modify how a work queue
-// is processed.
-type WorkOption func(*Work)
-
-// WithErrorQueue sets the error queue for a "moved" task (as opposed
-// to one that errors out causing a crash).
-func WithErrorQueue(q string) WorkOption {
-	return func(w *Work) {
-		w.ErrQ = q
+// WithErrQMap sets a function that maps from inbox queue names to error queue names.
+// Defaults to DefaultErrQMap.
+func WithErrQMap(f ErrQMap) WorkerOption {
+	return func(w *Worker) {
+		w.ErrQMap = f
 	}
+}
+
+// DefaultErrQMap appends "/err" to the inbox, and is the default behavior if
+// no overriding error queue mapping options are provided.
+func DefaultErrQMap(inbox string) string {
+	return inbox + "/err"
 }
