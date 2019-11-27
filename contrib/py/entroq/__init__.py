@@ -361,7 +361,7 @@ class EQWorker:
         start up a thrad with this as the target.
 
         Args:
-            queue: The name of the queue to pull from.
+            queue: The name of the queue to pull from, or a list of queues.
             do_func: The function to call. Accepts a single task argument and
                 returns an entroq_pb2.ModifyRequest (no need to specify
                 claimant ID).

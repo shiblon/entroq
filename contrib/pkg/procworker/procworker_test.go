@@ -88,12 +88,7 @@ func TestRun(t *testing.T) {
 	g, ctx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
-		w, err := eq.NewWorker(entroq.WorkOn(inbox))
-		if err != nil {
-			return err
-		}
-
-		return w.Run(ctx, Run)
+		return eq.NewWorker(inbox).Run(ctx, Run)
 	})
 
 	// Insert tasks one at a time, check that we get the expected output in the expected place.
