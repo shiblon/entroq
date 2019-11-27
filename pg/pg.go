@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"net/url"
 	"strings"
 	"time"
 
@@ -21,6 +22,18 @@ func escp(p string) string {
 	return strings.NewReplacer("=", "\\=", " ", "\\ ").Replace(p)
 }
 
+// SSLMode is used to request a particular PostgreSQL SSL mode.
+type SSLMode string
+
+const (
+	SSLDisable    SSLMode = "disable"     // Always non-SSL.
+	SSLAllow      SSLMode = "allow"       // Try non-SSL first, fall back to SSL.
+	SSLPrefer     SSLMode = "prefer"      // Try SSL first, fall back to non-SSL.
+	SSLRequire    SSLMode = "require"     // Only try SSL.
+	SSLVerifyCA   SSLMode = "verify-ca"   // Only SSL, check server against CA.
+	SSLVerifyFull SSLMode = "verify-full" // Only SSL, check CA and host name.
+)
+
 type pgOptions struct {
 	db       string
 	user     string
@@ -28,6 +41,12 @@ type pgOptions struct {
 
 	attempts int
 	nw       entroq.NotifyWaiter
+
+	sslMode SSLMode
+
+	sslClientKeyFile  string
+	sslClientCertFile string
+	sslServerCAFile   string
 }
 
 // PGOpt sets an option for the opener.
@@ -51,6 +70,31 @@ func WithPassword(pwd string) PGOpt {
 func WithDB(db string) PGOpt {
 	return func(opts *pgOptions) {
 		opts.db = db
+	}
+}
+
+// WithSSL provides SSL-specific options to the database connection.
+func WithSSL(mode SSLMode, sslOpts ...PGOpt) PGOpt {
+	return func(opts *pgOptions) {
+		opts.sslMode = mode
+		for _, o := range sslOpts {
+			o(opts)
+		}
+	}
+}
+
+// WithSSLClientFiles specfies the client cert and key files for the connection.
+func WithSSLClientFiles(certFile, keyFile string) PGOpt {
+	return func(opts *pgOptions) {
+		opts.sslClientCertFile = certFile
+		opts.sslClientKeyFile = keyFile
+	}
+}
+
+// WithSSLServerCAFile specifies the CA file for verifying the server.
+func WithSSLServerCAFile(caFile string) PGOpt {
+	return func(opts *pgOptions) {
+		opts.sslServerCAFile = caFile
 	}
 }
 
@@ -87,18 +131,34 @@ func Opener(hostPort string, opts ...PGOpt) entroq.BackendOpener {
 		password: "password",
 		attempts: 1,
 		nw:       subq.New(),
+
+		sslMode: SSLDisable,
 	}
 	for _, o := range opts {
 		o(options)
 	}
 
-	// TODO: Allow setting of sslmode?
 	return func(ctx context.Context) (entroq.Backend, error) {
-		connStr := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable",
+		connStr := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=%s",
 			escp(options.user),
 			escp(options.password),
 			hostPort,
-			escp(options.db))
+			escp(options.db),
+			options.sslMode,
+		)
+
+		if options.sslClientKeyFile != "" {
+			connStr += "&sslkey=" + url.QueryEscape(options.sslClientKeyFile)
+		}
+
+		if options.sslClientCertFile != "" {
+			connStr += "&sslcert=" + url.QueryEscape(options.sslClientCertFile)
+		}
+
+		if options.sslServerCAFile != "" {
+			connStr += "&sslrootcert=" + url.QueryEscape(options.sslServerCAFile)
+		}
+
 		db, err := sql.Open("postgres", connStr)
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to open postgres DB")
@@ -504,8 +564,11 @@ func depQuery(ctx context.Context, tx *sql.Tx, m *entroq.Modification) (map[uuid
 }
 
 // Time returns the time used in all calculations in this process.
-//
-// TODO: it might make sense to change all uses of time to use the database.
 func (b *backend) Time(ctx context.Context) (time.Time, error) {
-	return entroq.ProcessTime(), nil
+	row := b.db.QueryRowContext(ctx, "SELECT now()")
+	var t time.Time
+	if err := row.Scan(&t); err != nil {
+		return time.Time{}, errors.Wrap(err, "postgres time")
+	}
+	return t, nil
 }
