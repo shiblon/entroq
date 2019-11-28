@@ -355,6 +355,10 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 	}
 	now := time.Now()
 
+	// TODO: Multi-queue fairness is not quite what we would expect it to be.
+	// Figure out how to make PostgreSQL query evenly against all available queues.
+	// Note that shuffling queue name order does pretty much nothing.
+
 	// Use of SKIP LOCKED:
 	// - https://dba.stackexchange.com/questions/69471/postgres-update-limit-1
 	// - https://blog.2ndquadrant.com/what-is-select-skip-locked-for-in-postgresql-9-5/
