@@ -31,7 +31,6 @@ func init() {
 	rootCmd.AddCommand(timeCmd)
 
 	timeCmd.Flags().BoolVarP(&flagTimeMillis, "millis", "m", false, "Return time as milliseconds since the Epoch, UTC")
-
 	timeCmd.Flags().BoolVarP(&flagTimeLocal, "local", "l", false, "Show local time")
 }
 

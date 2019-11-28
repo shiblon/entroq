@@ -144,19 +144,8 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 		}
 	}
 
-	for {
-		empty, err := client.QueuesEmpty(ctx, entroq.MatchExact(queue))
-		if err != nil {
-			t.Fatalf("Error checking for empty queue: %v", err)
-		}
-		if empty {
-			break
-		}
-		select {
-		case <-ctx.Done():
-			t.Fatalf("Context error waiting for queues to empty: %v", err)
-		default:
-		}
+	if err := client.WaitQueuesEmpty(ctx, entroq.MatchExact(queue)); err != nil {
+		t.Fatalf("Error waiting for empty: %v", err)
 	}
 
 	cancel()
@@ -166,6 +155,104 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 
 	if diff := EqualAllTasksVersionIncr(inserted, consumed, 1); diff != "" {
 		t.Errorf("Tasks inserted not the same as tasks consumed:\n%v", diff)
+	}
+}
+
+func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	t.Helper()
+
+	bigQueue := path.Join(qPrefix, "multi_worker_big")
+	medQueue := path.Join(qPrefix, "multi_worker_medium")
+	smallQueue := path.Join(qPrefix, "multi_worker_small")
+
+	const (
+		bigSize   = 100
+		medSize   = 60
+		smallSize = 20
+	)
+
+	// Populate all of the queues, most in the big one, least in the small one.
+	for i := 0; i < bigSize; i++ {
+		args := []entroq.ModifyArg{
+			entroq.InsertingInto(bigQueue, entroq.WithValue([]byte("big value"))),
+		}
+		if i < medSize {
+			args = append(args, entroq.ModifyArg(
+				entroq.InsertingInto(medQueue, entroq.WithValue([]byte("med value"))),
+			))
+		}
+		if i < smallSize {
+			args = append(args, entroq.ModifyArg(
+				entroq.InsertingInto(smallQueue, entroq.WithValue([]byte("smallvalue"))),
+			))
+		}
+		if _, _, err := client.Modify(ctx, args...); err != nil {
+			t.Fatalf("Insert queues failed: %v", err)
+		}
+	}
+
+	// Keep track of what was consumed when.
+	var consumed []*entroq.Task
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	g, ctx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		w := client.NewWorker(bigQueue, medQueue, smallQueue)
+		return w.Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
+			if task.Claims != 1 {
+				return nil, errors.Errorf("worker claim expected to be 1, was %d", task.Claims)
+			}
+			consumed = append(consumed, task)
+			return []entroq.ModifyArg{task.AsDeletion()}, nil
+		})
+	})
+
+	waitCtx, _ := context.WithTimeout(ctx, 20*time.Second)
+	if err := client.WaitQueuesEmpty(waitCtx, entroq.MatchExact(bigQueue, medQueue, smallQueue)); err != nil {
+		t.Fatalf("Error waiting for empty queues: %v", err)
+	}
+
+	cancel() // stop the worker
+	if err := g.Wait(); err != nil && !entroq.IsCanceled(err) {
+		t.Fatalf("Error in worker")
+	}
+
+	// Now check that we consumed the right tasks from the right queues..
+	queuesFound := make(map[string]int)
+	medMaxIdx := 0
+	smallMaxIdx := 0
+	for i, t := range consumed {
+		queuesFound[t.Queue]++
+		switch t.Queue {
+		case medQueue:
+			medMaxIdx = i
+		case smallQueue:
+			smallMaxIdx = i
+		}
+	}
+
+	// Estimates of how soon these should have been consumed.
+	smallExpectedMax := smallSize * 3
+	medExpectedMax := (medSize-smallSize)*2 + smallExpectedMax
+
+	if smallMaxIdx > smallExpectedMax+10 {
+		t.Errorf("Expected small queue to be consumed sooner than it was: %d", smallMaxIdx)
+	}
+	if medMaxIdx > medExpectedMax+10 {
+		t.Errorf("Expected med queue to be consumed sooner than it was: %v", medMaxIdx)
+	}
+
+	if found := queuesFound[bigQueue]; found != bigSize {
+		t.Errorf("Expected to consume %d from big queue, consumed %d", bigSize, found)
+	}
+	if found := queuesFound[medQueue]; found != medSize {
+		t.Errorf("Expected to consume %d from med queue, consumed %d", medSize, found)
+	}
+	if found := queuesFound[smallQueue]; found != smallSize {
+		t.Errorf("Expected to consume %d from small queue, consumed %d", smallSize, found)
 	}
 }
 
@@ -204,24 +291,6 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		},
 	}
 
-	waitForEmptyInbox := func(ctx context.Context) error {
-		for i := 0; i < 5; i++ {
-			empty, err := client.QueuesEmpty(ctx, entroq.MatchExact(queue))
-			if err != nil {
-				return errors.Wrap(err, "get empty status")
-			}
-			if empty {
-				return nil
-			}
-			select {
-			case <-ctx.Done():
-				return errors.Wrap(ctx.Err(), "wait for empty inbox")
-			case <-time.After(time.Second):
-			}
-		}
-		return nil
-	}
-
 	runWorkerOneCase := func(ctx context.Context, c tc) {
 		t.Helper()
 
@@ -251,7 +320,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		)); err != nil {
 			t.Fatalf("Test %q insert task work: %v", c.name, err)
 		}
-		if err := waitForEmptyInbox(ctx); err != nil {
+		if err := client.WaitQueuesEmpty(ctx, entroq.MatchExact(queue)); err != nil {
 			log.Printf("Test %q wait: %v", c.name, err)
 		}
 		errTasks, err := client.Tasks(ctx, w.ErrQMap(queue))
