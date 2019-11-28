@@ -442,7 +442,6 @@ func (c *EntroQ) QueuesEmpty(ctx context.Context, opts ...QueuesOpt) (bool, erro
 // WaitQueuesEmpty does a poll-and-wait strategy to block until the queue query returns empty.
 func (c *EntroQ) WaitQueuesEmpty(ctx context.Context, opts ...QueuesOpt) error {
 	for {
-		fmt.Println("Wait empty")
 		empty, err := c.QueuesEmpty(ctx, opts...)
 		if err != nil {
 			return errors.Wrap(err, "wait empty")

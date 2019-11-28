@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net"
 	"path"
@@ -144,8 +145,19 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 		}
 	}
 
-	if err := client.WaitQueuesEmpty(ctx, entroq.MatchExact(queue)); err != nil {
-		t.Fatalf("Error waiting for empty: %v", err)
+	for {
+		empty, err := client.QueuesEmpty(ctx, entroq.MatchExact(queue))
+		if err != nil {
+			t.Fatalf("Error checking for empty queue: %v", err)
+		}
+		if empty {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("Context error waiting for queues to empty: %v", err)
+		default:
+		}
 	}
 
 	cancel()
@@ -202,6 +214,7 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	g.Go(func() error {
 		w := client.NewWorker(bigQueue, medQueue, smallQueue)
 		return w.Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
+			fmt.Printf("Got task (%d): %v\n", len(consumed)+1, task.Queue)
 			if task.Claims != 1 {
 				return nil, errors.Errorf("worker claim expected to be 1, was %d", task.Claims)
 			}
@@ -320,7 +333,8 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		)); err != nil {
 			t.Fatalf("Test %q insert task work: %v", c.name, err)
 		}
-		if err := client.WaitQueuesEmpty(ctx, entroq.MatchExact(queue)); err != nil {
+		waitCtx, _ := context.WithTimeout(ctx, 5*time.Second)
+		if err := client.WaitQueuesEmpty(waitCtx, entroq.MatchExact(queue)); err != nil && !entroq.IsCanceled(err) {
 			log.Printf("Test %q wait: %v", c.name, err)
 		}
 		errTasks, err := client.Tasks(ctx, w.ErrQMap(queue))
