@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/url"
 	"strings"
 	"time"
@@ -345,19 +346,40 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 	return entroq.PollTryClaim(ctx, cq, b.TryClaim)
 }
 
-// TryClaim attempts to claim an "arrived" task from the queue.
-// Returns an error if something goes wrong, a nil task if there is
-// nothing to claim.
+// TryClaim attempts to claim an "arrived" task from any of the specified
+// queues, attempting to do so fairly across queues. Returns an error if
+// something goes wrong, a nil task if there is nothing to claim.
 func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
+	// Note that we loop here instead of just using `= any(queues)` in the
+	// WHERE clause because that cannot guarantee inter-queue fairness. And,
+	// DISTINCT ON doesn't work in FOR UPDATE, etc.
+	//
+	// This is just as good, though, because we poll them all fairly quickly, and it does
+	// not reduce correctness.
+	qs := append(make([]string, 0, len(cq.Queues)), cq.Queues...)
+	rand.Shuffle(len(qs), func(i, j int) { qs[i], qs[j] = qs[j], qs[i] })
+
+	for _, q := range qs {
+		t, err := b.tryClaimOne(ctx, q, cq)
+		if err != nil {
+			return nil, errors.Wrap(err, "try claim")
+		}
+		if t != nil {
+			return t, nil
+		}
+	}
+	return nil, nil
+}
+
+// tryClaimOne attempts to claim an "arrived" task from the specified queue.
+// Returns an error if something goes wrong, a nil task if there is nothing to
+// claim.
+func (b *backend) tryClaimOne(ctx context.Context, q string, cq *entroq.ClaimQuery) (*entroq.Task, error) {
 	task := new(entroq.Task)
 	if cq.Duration == 0 {
 		return nil, errors.Errorf("no duration set for claim %q", cq.Queues)
 	}
 	now := time.Now()
-
-	// TODO: Multi-queue fairness is not quite what we would expect it to be.
-	// Figure out how to make PostgreSQL query evenly against all available queues.
-	// Note that shuffling queue name order does pretty much nothing.
 
 	// Use of SKIP LOCKED:
 	// - https://dba.stackexchange.com/questions/69471/postgres-update-limit-1
@@ -375,14 +397,14 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 				SELECT id, version
 				FROM tasks
 				WHERE
-					queue = any($4) AND
+					queue = $4 AND
 					at < $5
-				ORDER BY RANDOM()
+				ORDER BY random()
 				FOR UPDATE SKIP LOCKED
 				LIMIT 1
 			)
 		RETURNING id, version, queue, at, created, modified, claimant, value, claims
-	`, now.Add(cq.Duration), cq.Claimant, now, pq.StringArray(cq.Queues), now).Scan(
+	`, now.Add(cq.Duration), cq.Claimant, now, q, now).Scan(
 		&task.ID,
 		&task.Version,
 		&task.Queue,

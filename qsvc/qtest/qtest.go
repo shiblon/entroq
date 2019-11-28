@@ -178,9 +178,11 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	smallQueue := path.Join(qPrefix, "multi_worker_small")
 
 	const (
-		bigSize   = 100
+		bigSize   = 300
 		medSize   = 60
 		smallSize = 20
+
+		numWorkers = 5
 	)
 
 	// Populate all of the queues, most in the big one, least in the small one.
@@ -203,25 +205,44 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 		}
 	}
 
-	// Keep track of what was consumed when.
-	var consumed []*entroq.Task
-
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// Keep track of what was consumed when.
+	var consumed []*entroq.Task
+	consumedCh := make(chan *entroq.Task)
+
 	g, ctx := errgroup.WithContext(ctx)
 
-	g.Go(func() error {
-		w := client.NewWorker(bigQueue, medQueue, smallQueue)
-		return w.Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
-			fmt.Printf("Got task (%d): %v\n", len(consumed)+1, task.Queue)
-			if task.Claims != 1 {
-				return nil, errors.Errorf("worker claim expected to be 1, was %d", task.Claims)
+	for i := 0; i < numWorkers; i++ {
+		i := i
+		g.Go(func() error {
+			w := client.NewWorker(bigQueue, medQueue, smallQueue)
+			err := w.Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
+				fmt.Printf("Got task (%d@%d): %v\n", len(consumed)+1, i, task.Queue)
+				if task.Claims != 1 {
+					return nil, errors.Errorf("worker claim expected to be 1, was %d", task.Claims)
+				}
+				consumedCh <- task
+				return []entroq.ModifyArg{task.AsDeletion()}, nil
+			})
+			if entroq.IsCanceled(err) {
+				return nil
 			}
-			consumed = append(consumed, task)
-			return []entroq.ModifyArg{task.AsDeletion()}, nil
+			return err
 		})
-	})
+	}
+
+	go func() {
+		for task := range consumedCh {
+			consumed = append(consumed, task)
+		}
+	}()
+
+	go func() {
+		g.Wait()
+		close(consumedCh)
+	}()
 
 	waitCtx, _ := context.WithTimeout(ctx, 1*time.Minute)
 	if err := client.WaitQueuesEmpty(waitCtx, entroq.MatchExact(bigQueue, medQueue, smallQueue)); err != nil {
@@ -235,8 +256,16 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 
 	// Now check that we consumed the right tasks from the right queues..
 	queuesFound := make(map[string]int)
-	for _, t := range consumed {
+	lastSmall := 0
+	lastMed := 0
+	for i, t := range consumed {
 		queuesFound[t.Queue]++
+		switch t.Queue {
+		case medQueue:
+			lastMed = i
+		case smallQueue:
+			lastSmall = i
+		}
 	}
 
 	if found := queuesFound[bigQueue]; found != bigSize {
@@ -247,6 +276,19 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	}
 	if found := queuesFound[smallQueue]; found != smallSize {
 		t.Errorf("Expected to consume %d from small queue, consumed %d", smallSize, found)
+	}
+
+	const (
+		lastExpectedSmall = smallSize*3 + 15
+		lastExpectedMed   = (medSize-smallSize)*2 + lastExpectedSmall + 15
+	)
+
+	if lastSmall > lastExpectedSmall {
+		t.Errorf("Expected small to be done by %d, but finished at %d", lastExpectedSmall, lastSmall)
+	}
+
+	if lastMed > lastExpectedMed {
+		t.Errorf("Expected small to be done by %d, but finished at %d", lastExpectedMed, lastMed)
 	}
 }
 
