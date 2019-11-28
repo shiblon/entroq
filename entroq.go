@@ -439,6 +439,25 @@ func (c *EntroQ) QueuesEmpty(ctx context.Context, opts ...QueuesOpt) (bool, erro
 	return true, nil
 }
 
+// WaitQueuesEmpty does a poll-and-wait strategy to block until the queue query returns empty.
+func (c *EntroQ) WaitQueuesEmpty(ctx context.Context, opts ...QueuesOpt) error {
+	for {
+		fmt.Println("Wait empty")
+		empty, err := c.QueuesEmpty(ctx, opts...)
+		if err != nil {
+			return errors.Wrap(err, "wait empty")
+		}
+		if empty {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return errors.Wrap(ctx.Err(), "wait empty")
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
 // Tasks returns a slice of all tasks in the given queue.
 func (c *EntroQ) Tasks(ctx context.Context, queue string, opts ...TasksOpt) ([]*Task, error) {
 	query := &TasksQuery{
