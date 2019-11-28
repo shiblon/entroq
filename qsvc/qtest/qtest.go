@@ -223,7 +223,7 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 		})
 	})
 
-	waitCtx, _ := context.WithTimeout(ctx, 20*time.Second)
+	waitCtx, _ := context.WithTimeout(ctx, 1*time.Minute)
 	if err := client.WaitQueuesEmpty(waitCtx, entroq.MatchExact(bigQueue, medQueue, smallQueue)); err != nil {
 		t.Fatalf("Error waiting for empty queues: %v", err)
 	}
@@ -235,27 +235,8 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 
 	// Now check that we consumed the right tasks from the right queues..
 	queuesFound := make(map[string]int)
-	medMaxIdx := 0
-	smallMaxIdx := 0
-	for i, t := range consumed {
+	for _, t := range consumed {
 		queuesFound[t.Queue]++
-		switch t.Queue {
-		case medQueue:
-			medMaxIdx = i
-		case smallQueue:
-			smallMaxIdx = i
-		}
-	}
-
-	// Estimates of how soon these should have been consumed.
-	smallExpectedMax := smallSize * 3
-	medExpectedMax := (medSize-smallSize)*2 + smallExpectedMax
-
-	if smallMaxIdx > smallExpectedMax+10 {
-		t.Errorf("Expected small queue to be consumed sooner than it was: %d", smallMaxIdx)
-	}
-	if medMaxIdx > medExpectedMax+10 {
-		t.Errorf("Expected med queue to be consumed sooner than it was: %v", medMaxIdx)
 	}
 
 	if found := queuesFound[bigQueue]; found != bigSize {
