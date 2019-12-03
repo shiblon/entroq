@@ -496,6 +496,66 @@ func TasksWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	}
 }
 
+// TasksWithIDOnly tests that tasks listed by ID only (no queue) can return from multiple queues.
+func TasksWithIDOnly(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	t.Helper()
+	q1 := path.Join(qPrefix, "id_only_1")
+	q2 := path.Join(qPrefix, "id_only_2")
+
+	var modArgs []entroq.ModifyArg
+	for i := 0; i < 5; i++ {
+		q := q1
+		if i%2 == 0 {
+			q = q2
+		}
+		val := []byte(fmt.Sprintf("val %d", i))
+		modArgs = append(modArgs, entroq.InsertingInto(q, entroq.WithValue(val)))
+	}
+
+	ins, _, err := client.Modify(ctx, modArgs...)
+	if err != nil {
+		t.Fatalf("Initial insert failed: %v", err)
+	}
+
+	var ids1, ids2 []uuid.UUID
+	var tasks1, tasks2 []*entroq.Task
+	for i, t := range ins {
+		if i < 3 {
+			tasks1 = append(tasks1, t)
+			ids1 = append(ids1, t.ID)
+		} else {
+			tasks2 = append(tasks2, t)
+			ids2 = append(ids2, t.ID)
+		}
+	}
+
+	results1, err := client.Tasks(ctx, "", entroq.WithTaskID(ids1...))
+	if err != nil {
+		t.Errorf("First group of task IDs had an error: %v", err)
+	}
+	for i, task := range results1 {
+		if want, got := ids1[i], task.ID; want != got {
+			t.Errorf("Expected task %d from group 1 to have ID %v, got %v", i, want, got)
+		}
+		if want, got := string(tasks1[i].Value), string(task.Value); want != got {
+			t.Errorf("Expected task %d from group 1 to have bytes %s, got %s", i, want, got)
+		}
+	}
+
+	results2, err := client.Tasks(ctx, "", entroq.WithTaskID(ids2...))
+	if err != nil {
+		t.Errorf("First group of task IDs had an error: %v", err)
+	}
+	for i, task := range results2 {
+		if want, got := ids2[i], task.ID; want != got {
+			t.Errorf("Expected task %d from group 2 to have ID %v, got %v", i, want, got)
+		}
+		if want, got := string(tasks2[i].Value), string(task.Value); want != got {
+			t.Errorf("Expected task %d from group 2 to have bytes %s, got %s", i, want, got)
+		}
+	}
+}
+
 // InsertWithID tests the ability to insert tasks with a specified ID,
 // including errors when an existing ID is used for insertion.
 func InsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
