@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -68,6 +69,21 @@ func (p *SubprocessOutput) JSON() []byte {
 	return out
 }
 
+// TeeWriter writes to two writers what is written to it.
+type TeeWriter struct {
+	w1 io.Writer
+	w2 io.Writer
+}
+
+// Write forwards the data written to it to the two writers within.
+func (w TeeWriter) Write(data []byte) (int, error) {
+	n, err := w.w2.Write(data)
+	if err != nil {
+		return n, err
+	}
+	return w.w1.Write(data)
+}
+
 // Run is a function that can be passed to a worker's Run method. The worker
 // will call this for each task it wishes to process. It pulls subprocess call
 // information from its input task, including which outbox to write results to.
@@ -109,8 +125,8 @@ func Run(ctx context.Context, t *entroq.Task) ([]entroq.ModifyArg, error) {
 	outbuf := new(bytes.Buffer)
 	errbuf := new(bytes.Buffer)
 
-	cmd.Stdout = outbuf
-	cmd.Stderr = errbuf
+	cmd.Stdout = TeeWriter{os.Stdout, outbuf}
+	cmd.Stderr = TeeWriter{os.Stderr, errbuf}
 
 	output := input.AsOutput()
 
