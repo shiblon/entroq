@@ -217,9 +217,11 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	for i := 0; i < numWorkers; i++ {
 		i := i
 		g.Go(func() error {
+			ti := 0
 			w := client.NewWorker(bigQueue, medQueue, smallQueue)
 			err := w.Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
-				fmt.Printf("Got task (%d@%d): %v\n", len(consumed)+1, i, task.Queue)
+				ti++
+				fmt.Printf("Got task (%d@%d): %v\n", ti, i, task.Queue)
 				if task.Claims != 1 {
 					return nil, errors.Errorf("worker claim expected to be 1, was %d", task.Claims)
 				}
@@ -233,40 +235,54 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 		})
 	}
 
-	go func() {
-		for task := range consumedCh {
-			consumed = append(consumed, task)
+	g.Go(func() error {
+		waitCtx, _ := context.WithTimeout(ctx, 1*time.Minute)
+		if err := client.WaitQueuesEmpty(waitCtx, entroq.MatchExact(bigQueue, medQueue, smallQueue)); err != nil {
+			return errors.Wrap(err, "waiting for empty queues")
 		}
-	}()
+		// All done. Stop the workers.
+		cancel()
+		return nil
+	})
 
 	go func() {
 		g.Wait()
 		close(consumedCh)
 	}()
 
-	waitCtx, _ := context.WithTimeout(ctx, 1*time.Minute)
-	if err := client.WaitQueuesEmpty(waitCtx, entroq.MatchExact(bigQueue, medQueue, smallQueue)); err != nil {
-		t.Fatalf("Error waiting for empty queues: %v", err)
+	for task := range consumedCh {
+		consumed = append(consumed, task)
 	}
 
-	cancel() // stop the worker
 	if err := g.Wait(); err != nil && !entroq.IsCanceled(err) {
 		t.Fatalf("Error in worker")
 	}
 
 	// Now check that we consumed the right tasks from the right queues..
 	queuesFound := make(map[string]int)
-	lastSmall := 0
-	lastMed := 0
+	var smallIndices []int
+	var medIndices []int
+
 	for i, t := range consumed {
 		queuesFound[t.Queue]++
 		switch t.Queue {
 		case medQueue:
-			lastMed = i
+			medIndices = append(medIndices, i)
 		case smallQueue:
-			lastSmall = i
+			smallIndices = append(smallIndices, i)
 		}
 	}
+
+	// assume sorted
+	sortedMedian := func(indices []int) float64 {
+		if len(indices)%2 == 1 {
+			return float64(indices[len(indices)/2])
+		}
+		return float64(indices[len(indices)/2-1]+indices[len(indices)/2]) / 2
+	}
+
+	smallMedian := sortedMedian(smallIndices)
+	medMedian := sortedMedian(medIndices)
 
 	if found := queuesFound[bigQueue]; found != bigSize {
 		t.Errorf("Expected to consume %d from big queue, consumed %d", bigSize, found)
@@ -279,16 +295,16 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	}
 
 	const (
-		lastExpectedSmall = smallSize*3 + 15
-		lastExpectedMed   = (medSize-smallSize)*2 + lastExpectedSmall + 15
+		maxExpectedSmallMedian = float64(smallSize*3/2 + 15)
+		maxExpectedMedMedian   = float64((medSize-smallSize)*2+smallSize*3)/2 + 15
 	)
 
-	if lastSmall > lastExpectedSmall {
-		t.Errorf("Expected small to be done by %d, but finished at %d", lastExpectedSmall, lastSmall)
+	if smallMedian > maxExpectedSmallMedian {
+		t.Errorf("Expected small median to max out at around %f, but was %f", maxExpectedSmallMedian, smallMedian)
 	}
 
-	if lastMed > lastExpectedMed {
-		t.Errorf("Expected small to be done by %d, but finished at %d", lastExpectedMed, lastMed)
+	if medMedian > maxExpectedMedMedian {
+		t.Errorf("Expected med median to max out at around %f, but was %f", maxExpectedMedMedian, medMedian)
 	}
 }
 
@@ -492,6 +508,66 @@ func TasksWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	for i, task := range tasks {
 		if want, got := idSubSet[i], task.ID; want != got {
 			t.Fatalf("Wanted queried task %d to have ID %q, got %q", i, want, got)
+		}
+	}
+}
+
+// TasksWithIDOnly tests that tasks listed by ID only (no queue) can return from multiple queues.
+func TasksWithIDOnly(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	t.Helper()
+	q1 := path.Join(qPrefix, "id_only_1")
+	q2 := path.Join(qPrefix, "id_only_2")
+
+	var modArgs []entroq.ModifyArg
+	for i := 0; i < 5; i++ {
+		q := q1
+		if i%2 == 0 {
+			q = q2
+		}
+		val := []byte(fmt.Sprintf("val %d", i))
+		modArgs = append(modArgs, entroq.InsertingInto(q, entroq.WithValue(val)))
+	}
+
+	ins, _, err := client.Modify(ctx, modArgs...)
+	if err != nil {
+		t.Fatalf("Initial insert failed: %v", err)
+	}
+
+	var ids1, ids2 []uuid.UUID
+	var tasks1, tasks2 []*entroq.Task
+	for i, t := range ins {
+		if i < 3 {
+			tasks1 = append(tasks1, t)
+			ids1 = append(ids1, t.ID)
+		} else {
+			tasks2 = append(tasks2, t)
+			ids2 = append(ids2, t.ID)
+		}
+	}
+
+	results1, err := client.Tasks(ctx, "", entroq.WithTaskID(ids1...))
+	if err != nil {
+		t.Errorf("First group of task IDs had an error: %v", err)
+	}
+	for i, task := range results1 {
+		if want, got := ids1[i], task.ID; want != got {
+			t.Errorf("Expected task %d from group 1 to have ID %v, got %v", i, want, got)
+		}
+		if want, got := string(tasks1[i].Value), string(task.Value); want != got {
+			t.Errorf("Expected task %d from group 1 to have bytes %s, got %s", i, want, got)
+		}
+	}
+
+	results2, err := client.Tasks(ctx, "", entroq.WithTaskID(ids2...))
+	if err != nil {
+		t.Errorf("First group of task IDs had an error: %v", err)
+	}
+	for i, task := range results2 {
+		if want, got := ids2[i], task.ID; want != got {
+			t.Errorf("Expected task %d from group 2 to have ID %v, got %v", i, want, got)
+		}
+		if want, got := string(tasks2[i].Value), string(task.Value); want != got {
+			t.Errorf("Expected task %d from group 2 to have bytes %s, got %s", i, want, got)
 		}
 	}
 }
