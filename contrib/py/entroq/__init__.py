@@ -1,11 +1,15 @@
-# Package entroq provides a client library for working with EntroQ.
+"""Package entroq provides a client library for working with EntroQ.
+"""
 
 import base64
 import json
+import threading
+import time
 import uuid
 
 from google.protobuf import json_format
 import grpc
+from grpc_status import rpc_status
 from grpc_health.v1 import health_pb2
 from grpc_health.v1 import health_pb2_grpc
 
@@ -13,8 +17,117 @@ from . import entroq_pb2
 from . import entroq_pb2_grpc
 
 
+def is_cancelled(exc):
+    return exc.cancelled()
+
+
+def is_dependency(exc):
+    return exc.code() == grpc.StatusCode.NOT_FOUND
+
+
+def dependency_error_details(exc, as_json=False):
+    if not is_dependency(exc): return None
+    # Should have dependency metadata.
+    meta = exc.trailing_metadata()
+    if not meta:
+        return None
+    status = rpc_status.from_call(exc)
+    details = []
+    for d in status.details:
+        if not d.type_url.endswith('/proto.ModifyDep'):
+            return None
+        dep = entroq_pb2.ModifyDep()
+        dep.ParseFromString(d.value)
+        if dep.type == entroq_pb2.DETAIL and not dep.msg:
+            continue
+        if as_json:
+            details.append(json_format.MessageToDict(dep))
+        else:
+            details.append(dep)
+    return details
+
+
+def id_str(task_id):
+    return '{}:{}'.format(task_id.id, task_id.version)
+
+
+def as_change(task):
+    return entroq_pb2.TaskChange(
+        old_id=as_id(task),
+        new_data=entroq_pb2.TaskData(
+            queue=task.queue,
+            at_ms=task.at_ms,
+            value=task.value
+        )
+    )
+
+
+def as_id(task):
+    return entroq_pb2.TaskID(id=task.id, version=task.version)
+
+
+class DependencyError(Exception):
+    @classmethod
+    def from_exc(cls, exc):
+        deps = dependency_error_details(exc)
+        if not deps:
+            return exc
+        self = cls.from_deps(deps)
+        self.exc = exc
+        return self
+
+    @classmethod
+    def from_deps(cls, deps):
+        self = cls()
+        for d in deps:
+            if d.type == entroq_pb2.CLAIM:
+                self.claims.append(id_str(d.id))
+            elif d.type == entroq_pb2.DELETE:
+                self.deletes.append(id_str(d.id))
+            elif d.type == entroq_pb2.CHANGE:
+                self.changes.append(id_str(d.id))
+            elif d.type == entroq_pb2.DEPEND:
+                self.depends.append(id_str(d.id))
+            elif d.type == entroq_pb2.DETAIL:
+                self.msg = d.msg
+            elif d.type == entroq_pb2.INSERT:
+                self.inserts.append(id_str(d.id))
+        return self
+
+    def __init__(self):
+        self.claims = []
+        self.deletes = []
+        self.changes = []
+        self.depends = []
+        self.inserts = []
+        self.msg = ''
+
+    def as_json(self):
+        return json.dumps(self.as_dict())
+
+    def as_dict(self):
+        result = {}
+        if self.claims:
+            result['claims'] = self.claims
+        if self.deletes:
+            result['deletes'] = self.deletes
+        if self.changes:
+            result['changes'] = self.changes
+        if self.depends:
+            result['depends'] = self.depends
+        if self.msg:
+            result['msg'] = self.msg
+        if self.inserts:
+            result['inserts'] = self.inserts
+        return result
+
+    __str__ = as_json
+
+
 class EntroQ:
-    def __init__(self, eqaddr):
+    """Client class for EntroQ over gRPC."""
+
+    def __init__(self, eqaddr='localhost:37706'):
         """Create an EntroQ client (over gRPC).
 
         Args:
@@ -26,6 +139,10 @@ class EntroQ:
         self.channel = grpc.insecure_channel(self.addr)
         self.stub = entroq_pb2_grpc.EntroQStub(self.channel)
         self.health_stub = health_pb2_grpc.HealthStub(self.channel)
+
+        # Call the server, see what time it thinks it is, calculate rough skew.
+        now = int(time.time() * 1000)
+        self.time_skew = self.time() - now
 
     @staticmethod
     def to_dict(task, value_type=''):
@@ -136,16 +253,77 @@ class EntroQ:
             deletes: a list of entroq_pb2.TaskID indicating which tasks to delete.
             depends: a list of entroq_pb2.TaskID that must exist for success.
 
+        Raises:
+            grpc.RpcError or, when we can get dependency information, DependencyError.
+
         Returns:
-            entroq_pb2.ModifyResponse indicating what was inserted and what was changed.
+            (inserted_tasks, changed_tasks) - lists of entroq_pb2.Task.
         """
-        # TODO: document exceptions - they are meaningful.
-        return self.stub.Modify(entroq_pb2.ModifyRequest(
-            claimant_id=self.claimant_id,
-            inserts=inserts,
-            changes=changes,
-            deletes=deletes,
-            depends=depends))
+        try:
+            resp = self.stub.Modify(entroq_pb2.ModifyRequest(
+                claimant_id=self.claimant_id,
+                inserts=inserts,
+                changes=changes,
+                deletes=deletes,
+                depends=depends))
+            return resp.inserted, resp.changed
+        except grpc.RpcError as e:
+            raise DependencyError.from_exc(e)
+
+    def time(self):
+        res = self.stub.Time(entroq_pb2.TimeRequest())
+        return res.time_ms
+
+    def now(self):
+        """Return now from the rough perspective of the server, in milliseconds."""
+        return int(time.time() * 1000) + self.time_skew
+
+    def renew_for(self, task, duration=30):
+        """Renew a task for a given number of seconds."""
+        _, chg = self.modify(changes=[
+            entroq_pb2.TaskChange(
+                old_id=entroq_pb2.TaskID(id=task.id,
+                                         version=task.version),
+                new_data=entroq_pb2.TaskData(queue=task.queue,
+                                             at_ms=self.now() + 1000 * duration,
+                                             value=task.value)),
+        ])
+        return chg[0]
+
+    def do_with_renew(self, task, do_func, duration=30):
+        """Calls do_func while renewing the given task.
+
+        Args:
+            task: The entroq_pb2.Task to attempt to renew.
+            do_func: A function accepting a task and returning anything, to be
+                called with this task while it is renewed in the background.
+            duration: Claim duration in seconds.
+
+
+        Returns:
+            The (renewed task, do_func result).
+        """
+        renew_interval = duration // 2
+        exit = threading.Event()
+
+        lock = threading.Lock()
+        renewed = task
+
+        def renewer():
+            exit.wait(duration / 1000)
+            while not exit.is_set():
+                _t = self.renew_for(task, duration=duration)
+                with lock:
+                    renewed = _t
+                exit.wait(duration / 1000)
+
+        try:
+            threading.Thread(target=renewer).start()
+            result = do_func(task)
+            with lock:
+                return renewed, result
+        finally:
+            exit.set()
 
     def pop_all(self, queue):
         """Attempt to completely clear a queue.
@@ -164,3 +342,60 @@ class EntroQ:
             task = self.claim(queue)
             self.modify(deletes=[entroq_pb2.TaskID(id=task.id, version=task.version)])
             yield task
+
+
+class EQWorker:
+    """Worker for claiming tasks from a given queue and running a given method."""
+    def __init__(self, eq):
+        """Create a worker using the given EntroQ client.
+
+        Args:
+            eq: An EntroQ instance.
+        """
+        self.eq = eq
+
+    def work(self, queue, do_func, claim_duration=30):
+        """Pull tasks from given queue, calling do_func, while renewing claims.
+
+        This function never returns. If you want to run it in the background,
+        start up a thrad with this as the target.
+
+        Args:
+            queue: The name of the queue to pull from.
+            do_func: The function to call. Accepts a single task argument and
+                returns an entroq_pb2.ModifyRequest (no need to specify
+                claimant ID).
+            claim_duration: Seconds for which this claim should be renewed
+                every renewal cycle.
+        """
+        def fixup(renewed, tlist):
+            for val in tlist:
+                if val.id == renewed.id and val.version != renewed.version:
+                    if val.version > renewed.version:
+                        raise ValueError("Task updated inside worker body, version too high")
+                    val.version = renewed.version
+
+        while True:
+            task = self.eq.claim(queue, duration_ms=1000 * claim_duration)
+            try:
+                renewed, mod_req = self.eq.do_with_renew(task, do_func, duration=claim_duration)
+            except DependencyError as e:
+                logging.warn("Worker continuing after dependency: %s", e)
+                continue
+
+            if not mod_req:
+                logging.info("No modification requested, continuing")
+                continue
+
+            if not (mod_req.inserts or mod_req.changes or mod_req.deletes):
+                logging.info("No mutating modifications requested, continuing")
+                continue
+
+            fixup(renewed, mod_req.changes)
+            fixup(renewed, mod_req.depends)
+            fixup(renewed, mod_req.deletes)
+
+            self.eq.modify(changes=mod_req.changes,
+                           inserts=mod_req.inserts,
+                           depends=mod_req.depends,
+                           deletes=mod_req.deletes)
