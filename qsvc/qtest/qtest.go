@@ -217,9 +217,11 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	for i := 0; i < numWorkers; i++ {
 		i := i
 		g.Go(func() error {
+			ti := 0
 			w := client.NewWorker(bigQueue, medQueue, smallQueue)
 			err := w.Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
-				fmt.Printf("Got task (%d@%d): %v\n", len(consumed)+1, i, task.Queue)
+				ti++
+				fmt.Printf("Got task (%d@%d): %v\n", ti, i, task.Queue)
 				if task.Claims != 1 {
 					return nil, errors.Errorf("worker claim expected to be 1, was %d", task.Claims)
 				}
@@ -233,40 +235,54 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 		})
 	}
 
-	go func() {
-		for task := range consumedCh {
-			consumed = append(consumed, task)
+	g.Go(func() error {
+		waitCtx, _ := context.WithTimeout(ctx, 1*time.Minute)
+		if err := client.WaitQueuesEmpty(waitCtx, entroq.MatchExact(bigQueue, medQueue, smallQueue)); err != nil {
+			return errors.Wrap(err, "waiting for empty queues")
 		}
-	}()
+		// All done. Stop the workers.
+		cancel()
+		return nil
+	})
 
 	go func() {
 		g.Wait()
 		close(consumedCh)
 	}()
 
-	waitCtx, _ := context.WithTimeout(ctx, 1*time.Minute)
-	if err := client.WaitQueuesEmpty(waitCtx, entroq.MatchExact(bigQueue, medQueue, smallQueue)); err != nil {
-		t.Fatalf("Error waiting for empty queues: %v", err)
+	for task := range consumedCh {
+		consumed = append(consumed, task)
 	}
 
-	cancel() // stop the worker
 	if err := g.Wait(); err != nil && !entroq.IsCanceled(err) {
 		t.Fatalf("Error in worker")
 	}
 
 	// Now check that we consumed the right tasks from the right queues..
 	queuesFound := make(map[string]int)
-	lastSmall := 0
-	lastMed := 0
+	var smallIndices []int
+	var medIndices []int
+
 	for i, t := range consumed {
 		queuesFound[t.Queue]++
 		switch t.Queue {
 		case medQueue:
-			lastMed = i
+			medIndices = append(medIndices, i)
 		case smallQueue:
-			lastSmall = i
+			smallIndices = append(smallIndices, i)
 		}
 	}
+
+	// assume sorted
+	sortedMedian := func(indices []int) float64 {
+		if len(indices)%2 == 1 {
+			return float64(indices[len(indices)/2])
+		}
+		return float64(indices[len(indices)/2-1]+indices[len(indices)/2]) / 2
+	}
+
+	smallMedian := sortedMedian(smallIndices)
+	medMedian := sortedMedian(medIndices)
 
 	if found := queuesFound[bigQueue]; found != bigSize {
 		t.Errorf("Expected to consume %d from big queue, consumed %d", bigSize, found)
@@ -279,16 +295,16 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	}
 
 	const (
-		lastExpectedSmall = smallSize*3 + 15
-		lastExpectedMed   = (medSize-smallSize)*2 + lastExpectedSmall + 15
+		maxExpectedSmallMedian = float64(smallSize*3/2 + 15)
+		maxExpectedMedMedian   = float64((medSize-smallSize)*2+smallSize*3)/2 + 15
 	)
 
-	if lastSmall > lastExpectedSmall {
-		t.Errorf("Expected small to be done by %d, but finished at %d", lastExpectedSmall, lastSmall)
+	if smallMedian > maxExpectedSmallMedian {
+		t.Errorf("Expected small median to max out at around %f, but was %f", maxExpectedSmallMedian, smallMedian)
 	}
 
-	if lastMed > lastExpectedMed {
-		t.Errorf("Expected small to be done by %d, but finished at %d", lastExpectedMed, lastMed)
+	if medMedian > maxExpectedMedMedian {
+		t.Errorf("Expected med median to max out at around %f, but was %f", maxExpectedMedMedian, medMedian)
 	}
 }
 
