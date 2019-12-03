@@ -31,7 +31,10 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-const DefaultClaimPollTime = 30 * time.Second
+const (
+	DefaultClaimPollTime = 30 * time.Second
+	DefaultClaimDuration = 30 * time.Second
+)
 
 // TaskID contains the identifying parts of a task. If IDs don't match
 // (identifier and version together), then operations fail on those tasks.
@@ -168,7 +171,7 @@ func (t *Task) Copy() *Task {
 
 // ClaimQuery contains information necessary to attempt to make a claim on a task in a specific queue.
 type ClaimQuery struct {
-	Queue    string        // The name of the queue to claim from.
+	Queues   []string      // Queues to attempt to claim from. Only one wins.
 	Claimant uuid.UUID     // The ID of the process trying to make the claim.
 	Duration time.Duration // How long the task should be claimed for if successful.
 	PollTime time.Duration // Length of time between (possibly interruptible) sleep and polling.
@@ -236,9 +239,9 @@ func PollTryClaim(ctx context.Context, eq *ClaimQuery, tc BackendClaimFunc) (*Ta
 
 // Waiter can wait for an event on a given key (e.g., queue name).
 type Waiter interface {
-	// Wait waits for an event on the given key, calling cond after poll
-	// intervals until the key is notified, cond returns true, or the context
-	// is canceled.
+	// Wait waits for an event on the given set of keys, calling cond after
+	// poll intervals until one of them is notified, cond returns true, or the
+	// context is canceled.
 	//
 	// If cond is nil, this function returns when the channel is notified,
 	// the poll interval is exceeded, or the context is canceled. Only the last
@@ -248,7 +251,7 @@ type Waiter interface {
 	//
 	// A common use is to use poll=0 and cond=nil, causing this to simply wait
 	// for a notification.
-	Wait(ctx context.Context, key string, poll time.Duration, cond func() bool) error
+	Wait(ctx context.Context, keys []string, poll time.Duration, cond func() bool) error
 }
 
 // Notifier can be notified on a given key (e.g., queue name);
@@ -299,7 +302,7 @@ func WaitTryClaim(ctx context.Context, eq *ClaimQuery, tc BackendClaimFunc, w Wa
 	if pollTime == 0 {
 		pollTime = DefaultClaimPollTime
 	}
-	if err := w.Wait(ctx, eq.Queue, pollTime, func() bool {
+	if err := w.Wait(ctx, eq.Queues, pollTime, func() bool {
 		// If we get either a task or an error, time to stop trying.
 		task, condErr = tc(ctx, eq)
 		return task != nil || condErr != nil
@@ -349,6 +352,9 @@ type Backend interface {
 	// not proceed because dependencies were missing or already claimed (and
 	// not expired) by another claimant.
 	Modify(ctx context.Context, mod *Modification) (inserted []*Task, changed []*Task, err error)
+
+	// Time returns the time as the backend understands it, in UTC.
+	Time(ctx context.Context) (time.Time, error)
 
 	// Close closes any underlying connections. The backend is expected to take
 	// ownership of all such connections, so this cleans them up.
@@ -431,6 +437,24 @@ func (c *EntroQ) QueuesEmpty(ctx context.Context, opts ...QueuesOpt) (bool, erro
 		}
 	}
 	return true, nil
+}
+
+// WaitQueuesEmpty does a poll-and-wait strategy to block until the queue query returns empty.
+func (c *EntroQ) WaitQueuesEmpty(ctx context.Context, opts ...QueuesOpt) error {
+	for {
+		empty, err := c.QueuesEmpty(ctx, opts...)
+		if err != nil {
+			return errors.Wrap(err, "wait empty")
+		}
+		if empty {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return errors.Wrap(ctx.Err(), "wait empty")
+		case <-time.After(2 * time.Second):
+		}
+	}
 }
 
 // Tasks returns a slice of all tasks in the given queue.
@@ -519,6 +543,31 @@ func ClaimPollTime(d time.Duration) ClaimOpt {
 	}
 }
 
+// ClaimFor sets the duration of a successful claim (the amount of time from now when it expires).
+func ClaimFor(duration time.Duration) ClaimOpt {
+	return func(q *ClaimQuery) {
+		q.Duration = duration
+	}
+}
+
+// From sets the queue(s) for a claim.
+func From(qs ...string) ClaimOpt {
+	return func(cq *ClaimQuery) {
+		// Add and remove duplicates.
+		qmap := make(map[string]bool)
+		for _, q := range qs {
+			qmap[q] = true
+		}
+		for _, q := range cq.Queues {
+			qmap[q] = true
+		}
+		cq.Queues = make([]string, 0, len(qmap))
+		for q := range qmap {
+			cq.Queues = append(cq.Queues, q)
+		}
+	}
+}
+
 // IsCanceled indicates whether the error is a canceled error.
 func IsCanceled(err error) bool {
 	if err == nil {
@@ -553,36 +602,41 @@ func IsTimeout(err error) bool {
 	return false
 }
 
-// Claim attempts to get the next unclaimed task from the given queue. It
-// blocks until one becomes available or until the context is done. When it
-// succeeds, it returns a task with the claimant set to the default, or to the
-// value given in options, and an arrival time given by the duration.
-func (c *EntroQ) Claim(ctx context.Context, q string, duration time.Duration, opts ...ClaimOpt) (*Task, error) {
+// claimQueryFromOpts processes ClaimOpt values and produces a claim query.
+func claimQueryFromOpts(claimant uuid.UUID, opts ...ClaimOpt) *ClaimQuery {
 	query := &ClaimQuery{
-		Queue:    q,
-		Claimant: c.clientID,
-		Duration: duration,
+		Claimant: claimant,
+		Duration: DefaultClaimDuration,
 		PollTime: DefaultClaimPollTime,
 	}
 	for _, opt := range opts {
 		opt(query)
 	}
+	return query
+}
+
+// Claim attempts to get the next unclaimed task from the given queues. It
+// blocks until one becomes available or until the context is done. When it
+// succeeds, it returns a task with the claimant set to the default, or to the
+// value given in options, and an arrival time computed from the duration. The
+// default duration if none is given is DefaultClaimDuration.
+func (c *EntroQ) Claim(ctx context.Context, opts ...ClaimOpt) (*Task, error) {
+	query := claimQueryFromOpts(c.clientID, opts...)
+	if len(query.Queues) == 0 {
+		return nil, errors.New("no queues specified for claim")
+	}
 	return c.backend.Claim(ctx, query)
 }
 
-// TryClaim attempts one time to claim a task from the given queue. If
+// TryClaim attempts one time to claim a task from the given queues. If
 // there are no tasks, it returns a nil error *and* a nil task. This allows the
 // caller to decide whether to retry. It can fail if certain (optional)
 // dependency tasks are not present. This can be used, for example, to ensure
 // that configuration tasks haven't changed.
-func (c *EntroQ) TryClaim(ctx context.Context, q string, duration time.Duration, opts ...ClaimOpt) (*Task, error) {
-	query := &ClaimQuery{
-		Queue:    q,
-		Claimant: c.clientID,
-		Duration: duration,
-	}
-	for _, opt := range opts {
-		opt(query)
+func (c *EntroQ) TryClaim(ctx context.Context, opts ...ClaimOpt) (*Task, error) {
+	query := claimQueryFromOpts(c.clientID, opts...)
+	if len(query.Queues) == 0 {
+		return nil, errors.New("no queues specified for try claim")
 	}
 	return c.backend.TryClaim(ctx, query)
 }
@@ -1206,4 +1260,15 @@ func AsDependency(err error) (DependencyError, bool) {
 	// Force two-lvalue context.
 	d, ok := errors.Cause(err).(DependencyError)
 	return d, ok
+}
+
+// Time gets the time as the backend understands it, in UTC. Default is just
+// time.Now().UTC().
+func (c *EntroQ) Time(ctx context.Context) (time.Time, error) {
+	return ProcessTime(), nil
+}
+
+// ProcessTime returns the time the calling process thinks it is, in UTC.
+func ProcessTime() time.Time {
+	return time.Now().UTC()
 }
