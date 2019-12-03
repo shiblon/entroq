@@ -28,9 +28,6 @@ import (
 
 var (
 	flagRmID      string
-	flagRmQueue   string
-	flagRmQueueTo string
-	flagRmVal     string
 	flagRmRetries int
 )
 
@@ -41,9 +38,6 @@ func init() {
 	rmCmd.MarkFlagRequired("task")
 
 	rmCmd.Flags().IntVarP(&flagRmRetries, "retries", "r", 10, "Retries (in case the task is claimed)")
-
-	rmCmd.Flags().StringVarP(&flagRmQueue, "queue", "q", "", "Queue containing the task to remove. Required.")
-	rmCmd.MarkFlagRequired("queue")
 }
 
 // rmCmd represents the rm command
@@ -59,7 +53,7 @@ var rmCmd = &cobra.Command{
 		var delErr error
 		for i := 0; i < flagRmRetries; i++ {
 			log.Printf("Attempt %d/%d to remove %v", i+1, flagRmRetries, id)
-			tasks, err := eq.Tasks(ctx, flagRmQueue, entroq.WithTaskID(id))
+			tasks, err := eq.Tasks(ctx, "", entroq.WithTaskID(id))
 			if err != nil {
 				log.Fatalf("Error getting task ID %v", id)
 			}

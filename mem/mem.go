@@ -33,6 +33,13 @@ func (h *taskHeap) Len() int {
 	return len(h.items)
 }
 
+func (h *taskHeap) Items() []*hItem {
+	if h == nil {
+		return nil
+	}
+	return h.items
+}
+
 func (h *taskHeap) Less(i, j int) bool {
 	return h.items[i].task.At.Before(h.items[j].task.At)
 }
@@ -227,31 +234,39 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 
 	now := time.Now()
 
-	var tasks []*entroq.Task
-	h := b.heaps[tq.Queue]
-	if h.Len() == 0 {
+	var items []*hItem
+
+	if len(tq.IDs) != 0 {
+		// Work by the (likely smaller) ID list, instead of by everything in the queue.
+		for _, id := range tq.IDs {
+			item, ok := b.byID[id]
+			if !ok {
+				continue
+			}
+			if tq.Queue != "" && tq.Queue != item.task.Queue {
+				continue
+			}
+			items = append(items, item)
+		}
+	} else if tq.Queue != "" {
+		// Queue specified with no ID filter, get everything.
+		items = b.heaps[tq.Queue].Items()
+	}
+
+	// Nothing passed, exit early
+	if len(items) == 0 {
 		return nil, nil
 	}
 
-	goodIDs := make(map[uuid.UUID]bool)
-	for _, id := range tq.IDs {
-		goodIDs[id] = true
-	}
-	idAllowed := func(id uuid.UUID) bool {
-		if len(tq.IDs) == 0 {
-			return true
-		}
-		return goodIDs[id]
-	}
+	var tasks []*entroq.Task
 
-	for i, item := range h.items {
-		if tq.Limit > 0 && i >= tq.Limit {
+	// By this point, we have already filtered on the ID list if there is one.
+	// Just apply claimant and limit filters now.
+	for _, item := range items {
+		if tq.Limit > 0 && len(tasks) >= tq.Limit {
 			break
 		}
 		t := item.task
-		if !idAllowed(t.ID) {
-			continue
-		}
 		if tq.Claimant == uuid.Nil || now.After(t.At) || tq.Claimant == t.Claimant {
 			tasks = append(tasks, t)
 		}
