@@ -7,6 +7,8 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"math/rand"
+	"net/url"
 	"strings"
 	"time"
 
@@ -21,6 +23,18 @@ func escp(p string) string {
 	return strings.NewReplacer("=", "\\=", " ", "\\ ").Replace(p)
 }
 
+// SSLMode is used to request a particular PostgreSQL SSL mode.
+type SSLMode string
+
+const (
+	SSLDisable    SSLMode = "disable"     // Always non-SSL.
+	SSLAllow      SSLMode = "allow"       // Try non-SSL first, fall back to SSL.
+	SSLPrefer     SSLMode = "prefer"      // Try SSL first, fall back to non-SSL.
+	SSLRequire    SSLMode = "require"     // Only try SSL.
+	SSLVerifyCA   SSLMode = "verify-ca"   // Only SSL, check server against CA.
+	SSLVerifyFull SSLMode = "verify-full" // Only SSL, check CA and host name.
+)
+
 type pgOptions struct {
 	db       string
 	user     string
@@ -28,6 +42,12 @@ type pgOptions struct {
 
 	attempts int
 	nw       entroq.NotifyWaiter
+
+	sslMode SSLMode
+
+	sslClientKeyFile  string
+	sslClientCertFile string
+	sslServerCAFile   string
 }
 
 // PGOpt sets an option for the opener.
@@ -51,6 +71,31 @@ func WithPassword(pwd string) PGOpt {
 func WithDB(db string) PGOpt {
 	return func(opts *pgOptions) {
 		opts.db = db
+	}
+}
+
+// WithSSL provides SSL-specific options to the database connection.
+func WithSSL(mode SSLMode, sslOpts ...PGOpt) PGOpt {
+	return func(opts *pgOptions) {
+		opts.sslMode = mode
+		for _, o := range sslOpts {
+			o(opts)
+		}
+	}
+}
+
+// WithSSLClientFiles specfies the client cert and key files for the connection.
+func WithSSLClientFiles(certFile, keyFile string) PGOpt {
+	return func(opts *pgOptions) {
+		opts.sslClientCertFile = certFile
+		opts.sslClientKeyFile = keyFile
+	}
+}
+
+// WithSSLServerCAFile specifies the CA file for verifying the server.
+func WithSSLServerCAFile(caFile string) PGOpt {
+	return func(opts *pgOptions) {
+		opts.sslServerCAFile = caFile
 	}
 }
 
@@ -87,18 +132,34 @@ func Opener(hostPort string, opts ...PGOpt) entroq.BackendOpener {
 		password: "password",
 		attempts: 1,
 		nw:       subq.New(),
+
+		sslMode: SSLDisable,
 	}
 	for _, o := range opts {
 		o(options)
 	}
 
-	// TODO: Allow setting of sslmode?
 	return func(ctx context.Context) (entroq.Backend, error) {
-		connStr := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable",
+		connStr := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=%s",
 			escp(options.user),
 			escp(options.password),
 			hostPort,
-			escp(options.db))
+			escp(options.db),
+			options.sslMode,
+		)
+
+		if options.sslClientKeyFile != "" {
+			connStr += "&sslkey=" + url.QueryEscape(options.sslClientKeyFile)
+		}
+
+		if options.sslClientCertFile != "" {
+			connStr += "&sslcert=" + url.QueryEscape(options.sslClientCertFile)
+		}
+
+		if options.sslServerCAFile != "" {
+			connStr += "&sslrootcert=" + url.QueryEscape(options.sslServerCAFile)
+		}
+
 		db, err := sql.Open("postgres", connStr)
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to open postgres DB")
@@ -285,13 +346,38 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 	return entroq.PollTryClaim(ctx, cq, b.TryClaim)
 }
 
-// TryClaim attempts to claim an "arrived" task from the queue.
-// Returns an error if something goes wrong, a nil task if there is
-// nothing to claim.
+// TryClaim attempts to claim an "arrived" task from any of the specified
+// queues, attempting to do so fairly across queues. Returns an error if
+// something goes wrong, a nil task if there is nothing to claim.
 func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
+	// Note that we loop here instead of just using `= any(queues)` in the
+	// WHERE clause because that cannot guarantee inter-queue fairness. And,
+	// DISTINCT ON doesn't work in FOR UPDATE, etc.
+	//
+	// This is just as good, though, because we poll them all fairly quickly, and it does
+	// not reduce correctness.
+	qs := append(make([]string, 0, len(cq.Queues)), cq.Queues...)
+	rand.Shuffle(len(qs), func(i, j int) { qs[i], qs[j] = qs[j], qs[i] })
+
+	for _, q := range qs {
+		t, err := b.tryClaimOne(ctx, q, cq)
+		if err != nil {
+			return nil, errors.Wrap(err, "try claim")
+		}
+		if t != nil {
+			return t, nil
+		}
+	}
+	return nil, nil
+}
+
+// tryClaimOne attempts to claim an "arrived" task from the specified queue.
+// Returns an error if something goes wrong, a nil task if there is nothing to
+// claim.
+func (b *backend) tryClaimOne(ctx context.Context, q string, cq *entroq.ClaimQuery) (*entroq.Task, error) {
 	task := new(entroq.Task)
 	if cq.Duration == 0 {
-		return nil, errors.Errorf("no duration set for claim %q", cq.Queue)
+		return nil, errors.Errorf("no duration set for claim %q", cq.Queues)
 	}
 	now := time.Now()
 
@@ -313,12 +399,12 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 				WHERE
 					queue = $4 AND
 					at < $5
-				ORDER BY RANDOM()
+				ORDER BY random()
 				FOR UPDATE SKIP LOCKED
 				LIMIT 1
 			)
 		RETURNING id, version, queue, at, created, modified, claimant, value, claims
-	`, now.Add(cq.Duration), cq.Claimant, now, cq.Queue, now).Scan(
+	`, now.Add(cq.Duration), cq.Claimant, now, q, now).Scan(
 		&task.ID,
 		&task.Version,
 		&task.Queue,
@@ -501,4 +587,14 @@ func depQuery(ctx context.Context, tx *sql.Tx, m *entroq.Modification) (map[uuid
 	}
 
 	return foundDeps, nil
+}
+
+// Time returns the time used in all calculations in this process.
+func (b *backend) Time(ctx context.Context) (time.Time, error) {
+	row := b.db.QueryRowContext(ctx, "SELECT now()")
+	var t time.Time
+	if err := row.Scan(&t); err != nil {
+		return time.Time{}, errors.Wrap(err, "postgres time")
+	}
+	return t, nil
 }

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net"
 	"path"
@@ -115,8 +116,7 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 	g, ctx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
-		w := client.NewWorker(queue)
-		return w.Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
+		return client.NewWorker(queue).Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
 			if task.Claims != 1 {
 				return nil, errors.Errorf("worker claim expected claims to be 1, got %d", task.Claims)
 			}
@@ -170,6 +170,128 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 	}
 }
 
+func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	t.Helper()
+
+	bigQueue := path.Join(qPrefix, "multi_worker_big")
+	medQueue := path.Join(qPrefix, "multi_worker_medium")
+	smallQueue := path.Join(qPrefix, "multi_worker_small")
+
+	const (
+		bigSize   = 300
+		medSize   = 60
+		smallSize = 20
+
+		numWorkers = 5
+	)
+
+	// Populate all of the queues, most in the big one, least in the small one.
+	for i := 0; i < bigSize; i++ {
+		args := []entroq.ModifyArg{
+			entroq.InsertingInto(bigQueue, entroq.WithValue([]byte("big value"))),
+		}
+		if i < medSize {
+			args = append(args, entroq.ModifyArg(
+				entroq.InsertingInto(medQueue, entroq.WithValue([]byte("med value"))),
+			))
+		}
+		if i < smallSize {
+			args = append(args, entroq.ModifyArg(
+				entroq.InsertingInto(smallQueue, entroq.WithValue([]byte("smallvalue"))),
+			))
+		}
+		if _, _, err := client.Modify(ctx, args...); err != nil {
+			t.Fatalf("Insert queues failed: %v", err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Keep track of what was consumed when.
+	var consumed []*entroq.Task
+	consumedCh := make(chan *entroq.Task)
+
+	g, ctx := errgroup.WithContext(ctx)
+
+	for i := 0; i < numWorkers; i++ {
+		i := i
+		g.Go(func() error {
+			w := client.NewWorker(bigQueue, medQueue, smallQueue)
+			err := w.Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
+				fmt.Printf("Got task (%d@%d): %v\n", len(consumed)+1, i, task.Queue)
+				if task.Claims != 1 {
+					return nil, errors.Errorf("worker claim expected to be 1, was %d", task.Claims)
+				}
+				consumedCh <- task
+				return []entroq.ModifyArg{task.AsDeletion()}, nil
+			})
+			if entroq.IsCanceled(err) {
+				return nil
+			}
+			return err
+		})
+	}
+
+	go func() {
+		for task := range consumedCh {
+			consumed = append(consumed, task)
+		}
+	}()
+
+	go func() {
+		g.Wait()
+		close(consumedCh)
+	}()
+
+	waitCtx, _ := context.WithTimeout(ctx, 1*time.Minute)
+	if err := client.WaitQueuesEmpty(waitCtx, entroq.MatchExact(bigQueue, medQueue, smallQueue)); err != nil {
+		t.Fatalf("Error waiting for empty queues: %v", err)
+	}
+
+	cancel() // stop the worker
+	if err := g.Wait(); err != nil && !entroq.IsCanceled(err) {
+		t.Fatalf("Error in worker")
+	}
+
+	// Now check that we consumed the right tasks from the right queues..
+	queuesFound := make(map[string]int)
+	lastSmall := 0
+	lastMed := 0
+	for i, t := range consumed {
+		queuesFound[t.Queue]++
+		switch t.Queue {
+		case medQueue:
+			lastMed = i
+		case smallQueue:
+			lastSmall = i
+		}
+	}
+
+	if found := queuesFound[bigQueue]; found != bigSize {
+		t.Errorf("Expected to consume %d from big queue, consumed %d", bigSize, found)
+	}
+	if found := queuesFound[medQueue]; found != medSize {
+		t.Errorf("Expected to consume %d from med queue, consumed %d", medSize, found)
+	}
+	if found := queuesFound[smallQueue]; found != smallSize {
+		t.Errorf("Expected to consume %d from small queue, consumed %d", smallSize, found)
+	}
+
+	const (
+		lastExpectedSmall = smallSize*3 + 15
+		lastExpectedMed   = (medSize-smallSize)*2 + lastExpectedSmall + 15
+	)
+
+	if lastSmall > lastExpectedSmall {
+		t.Errorf("Expected small to be done by %d, but finished at %d", lastExpectedSmall, lastSmall)
+	}
+
+	if lastMed > lastExpectedMed {
+		t.Errorf("Expected small to be done by %d, but finished at %d", lastExpectedMed, lastMed)
+	}
+}
+
 // WorkerMoveOnError tests that workers that have JustMoveTaskError results
 // move the task into an error queue with the expected wrapper and don't just
 // crash.
@@ -205,28 +327,11 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		},
 	}
 
-	waitForEmptyInbox := func(ctx context.Context) error {
-		for i := 0; i < 5; i++ {
-			empty, err := client.QueuesEmpty(ctx, entroq.MatchExact(queue))
-			if err != nil {
-				return errors.Wrap(err, "get empty status")
-			}
-			if empty {
-				return nil
-			}
-			select {
-			case <-ctx.Done():
-				return errors.Wrap(ctx.Err(), "wait for empty inbox")
-			case <-time.After(time.Second):
-			}
-		}
-		return nil
-	}
-
 	runWorkerOneCase := func(ctx context.Context, c tc) {
 		t.Helper()
 
 		w := client.NewWorker(queue)
+
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 		g, gctx := errgroup.WithContext(ctx)
@@ -245,16 +350,17 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 			return err
 		})
 
-		if _, _, err := client.Modify(ctx, entroq.InsertingInto(w.Q,
+		if _, _, err := client.Modify(ctx, entroq.InsertingInto(queue,
 			entroq.WithID(c.input.ID),
 			entroq.WithValue(c.input.Value),
 		)); err != nil {
 			t.Fatalf("Test %q insert task work: %v", c.name, err)
 		}
-		if err := waitForEmptyInbox(ctx); err != nil {
+		waitCtx, _ := context.WithTimeout(ctx, 5*time.Second)
+		if err := client.WaitQueuesEmpty(waitCtx, entroq.MatchExact(queue)); err != nil && !entroq.IsCanceled(err) {
 			log.Printf("Test %q wait: %v", c.name, err)
 		}
-		errTasks, err := client.Tasks(ctx, w.ErrQ)
+		errTasks, err := client.Tasks(ctx, w.ErrQMap(queue))
 		if err != nil {
 			t.Fatalf("Test %q find in error queue: %v", c.name, err)
 		}
@@ -270,9 +376,9 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 			}
 		}
 		if c.moved && foundTask == nil {
-			t.Errorf("Test %q expected task to be moved, but is not found in %q", c.name, w.ErrQ)
+			t.Errorf("Test %q expected task to be moved, but is not found in %q", c.name, w.ErrQMap(queue))
 		} else if !c.moved && foundTask != nil {
-			t.Errorf("Test %q expected task to be deleted, but showed up in %q", c.name, w.ErrQ)
+			t.Errorf("Test %q expected task to be deleted, but showed up in %q", c.name, w.ErrQMap(queue))
 		}
 
 		cancel()
@@ -305,7 +411,7 @@ func WorkerRenewal(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPr
 
 	// Newly-inserted task will have version 0.
 
-	task, err := client.Claim(ctx, queue, 6*time.Second)
+	task, err := client.Claim(ctx, entroq.From(queue), entroq.ClaimFor(6*time.Second))
 	if err != nil {
 		t.Fatalf("Failed to claim task: %v", err)
 	}
@@ -418,7 +524,7 @@ func InsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 	}
 
 	// Try to claim the just-inserted task.
-	claimed, err := client.TryClaim(ctx, queue, 100*time.Millisecond)
+	claimed, err := client.TryClaim(ctx, entroq.From(queue), entroq.ClaimFor(100*time.Millisecond))
 	if err != nil {
 		t.Fatalf("Unexpected error claiming task with ID %q: %v", knownID, err)
 	}
@@ -486,7 +592,7 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	queue := path.Join(qPrefix, "simple_sequence")
 
 	// Claim from empty queue.
-	task, err := client.TryClaim(ctx, queue, 100*time.Millisecond)
+	task, err := client.TryClaim(ctx, entroq.From(queue), entroq.ClaimFor(100*time.Millisecond))
 	if err != nil {
 		t.Fatalf("Got unexpected error claiming from empty queue: %v", err)
 	}
@@ -551,7 +657,7 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 
 	// Claim ready task.
 	claimCtx, _ := context.WithTimeout(ctx, 5*time.Second)
-	claimed, err := client.Claim(claimCtx, queue, 10*time.Second)
+	claimed, err := client.Claim(claimCtx, entroq.From(queue), entroq.ClaimFor(10*time.Second))
 
 	if err != nil {
 		t.Fatalf("Got unexpected error for claiming from a queue with one ready task: %+v", err)
@@ -570,7 +676,7 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	}
 
 	// TryClaim not ready task.
-	tryclaimed, err := client.TryClaim(ctx, queue, 10*time.Second)
+	tryclaimed, err := client.TryClaim(ctx, entroq.From(queue), entroq.ClaimFor(10*time.Second))
 	if err != nil {
 		t.Fatalf("Got unexpected error for claiming from a queue with no ready tasks: %v", err)
 	}
@@ -581,7 +687,10 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	// Make sure the next claim will work.
 	claimCtx, cancel := context.WithTimeout(ctx, 2*futureTaskDuration)
 	defer cancel()
-	claimed, err = client.Claim(claimCtx, queue, 5*time.Second, entroq.ClaimPollTime(time.Second))
+	claimed, err = client.Claim(claimCtx,
+		entroq.From(queue),
+		entroq.ClaimFor(5*time.Second),
+		entroq.ClaimPollTime(time.Second))
 	if err != nil {
 		t.Fatalf("Got unexpected error for claiming from a queue with one ready task: %v", err)
 	}

@@ -105,7 +105,7 @@ func TestRun(t *testing.T) {
 			outbox = implicitOutbox
 		}
 
-		task, err := eq.Claim(ctx, outbox, 10*time.Second)
+		task, err := eq.Claim(ctx, entroq.From(outbox), entroq.ClaimFor(10*time.Second))
 		if err != nil {
 			t.Fatalf("Claim from outbox %q: %v", outbox, err)
 		}

@@ -347,8 +347,7 @@ func NewMapWorker(eq *entroq.EntroQ, inQueue string, newEmitter func() MapEmitte
 //
 // Runs until the context is canceled or an unrecoverable error is encountered.
 func (w *MapWorker) Run(ctx context.Context) error {
-	eqw := w.client.NewWorker(w.InputQueue)
-	return eqw.Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
+	return w.client.NewWorker(w.InputQueue).Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
 		emitter := w.newEmitter()
 		if w.EarlyReduce != nil {
 			emitter = newReducingProxyMapEmitter(emitter, w.EarlyReduce)
@@ -688,7 +687,7 @@ func (w *ReduceWorker) Run(ctx context.Context) error {
 
 	log.Printf("Reducer %q merge finished. Reducing.", w.Name)
 
-	task, err := w.client.TryClaim(ctx, w.InputQueue, claimDuration)
+	task, err := w.client.TryClaim(ctx, entroq.From(w.InputQueue), entroq.ClaimFor(claimDuration))
 	if err != nil {
 		return errors.Wrap(err, "reduce claim")
 	}

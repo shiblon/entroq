@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/rand"
 	"strings"
 	"sync"
 	"time"
@@ -264,33 +265,44 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 	return entroq.WaitTryClaim(ctx, cq, b.TryClaim, b.nw)
 }
 
-// TryClaim attempts to claim a task from a queue.
+// TryClaim attempts to claim against multiple queues. Only one will win.
 func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
 	defer un(lock(b))
 
-	h := b.heaps[cq.Queue]
-
-	if h.Len() == 0 {
-		return nil, nil
+	var heaps []*taskHeap
+	// Get all of the heaps and shuffle them.
+	for _, q := range cq.Queues {
+		heaps = append(heaps, b.heaps[q])
 	}
+	rand.Shuffle(len(heaps), func(i, j int) { heaps[i], heaps[j] = heaps[j], heaps[i] })
 
-	now := time.Now()
-	top := h.items[0].task
-	if top.At.After(now) {
-		return nil, nil
+	// Try to find a claimable task in any of them.
+	for _, h := range heaps {
+		if h.Len() == 0 {
+			continue
+		}
+
+		now := time.Now()
+		top := h.items[0].task
+		if top.At.After(now) {
+			continue
+		}
+
+		// Found one.
+		top = top.Copy()
+		top.Version++
+		top.Claims++
+		top.At = now.Add(cq.Duration)
+		top.Modified = now
+		top.Claimant = cq.Claimant
+		h.items[0].task = top
+
+		heap.Fix(h, 0)
+
+		return top, nil
 	}
-
-	top = top.Copy()
-	top.Version++
-	top.Claims++
-	top.At = now.Add(cq.Duration)
-	top.Modified = now
-	top.Claimant = cq.Claimant
-	h.items[0].task = top
-
-	heap.Fix(h, 0)
-
-	return top, nil
+	// None found in any queue.
+	return nil, nil
 }
 
 // Modify attempts to modify a batch of tasks in the queue system.
@@ -368,4 +380,8 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 	entroq.NotifyModified(b.nw, inserted, changed)
 
 	return inserted, changed, nil
+}
+
+func (b *backend) Time(_ context.Context) (time.Time, error) {
+	return entroq.ProcessTime(), nil
 }
