@@ -25,7 +25,6 @@ import (
 
 var (
 	flagModID      string
-	flagModQueue   string
 	flagModQueueTo string
 	flagModVal     string
 )
@@ -35,9 +34,6 @@ func init() {
 
 	modCmd.Flags().StringVarP(&flagModID, "task", "t", "", "Task ID to modify. Note that this will modify *any* version of this task ID without regard for what else is happening. Use with care.")
 	modCmd.MarkFlagRequired("task")
-
-	modCmd.Flags().StringVarP(&flagModQueue, "queue", "q", "", "Queue containing the task to modify. Required.")
-	modCmd.MarkFlagRequired("queue")
 	modCmd.Flags().StringVarP(&flagModQueueTo, "queue_to", "Q", "", "New queue for task, if a change is desired.")
 	modCmd.Flags().StringVarP(&flagModVal, "val", "v", "", "Value to set in task.")
 }
@@ -59,7 +55,7 @@ var modCmd = &cobra.Command{
 		if err != nil {
 			log.Fatalf("Error parsing task ID: %v", err)
 		}
-		tasks, err := eq.Tasks(context.Background(), flagModQueue, entroq.WithTaskID(id))
+		tasks, err := eq.Tasks(context.Background(), "", entroq.WithTaskID(id))
 		if err != nil {
 			log.Fatalf("Error getting task ID %q", id)
 		}

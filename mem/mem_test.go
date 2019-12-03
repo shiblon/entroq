@@ -36,6 +36,18 @@ func TestTasksWithID(t *testing.T) {
 	qtest.TasksWithID(ctx, t, client, "")
 }
 
+func TestTasksWithIDOnly(t *testing.T) {
+	ctx := context.Background()
+
+	client, stop, err := qtest.ClientService(ctx, Opener())
+	if err != nil {
+		t.Fatalf("Get client: %v", err)
+	}
+	defer stop()
+
+	qtest.TasksWithIDOnly(ctx, t, client, "")
+}
+
 func TestInsertWithID(t *testing.T) {
 	ctx := context.Background()
 

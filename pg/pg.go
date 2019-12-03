@@ -295,8 +295,13 @@ func (b *backend) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[strin
 
 // Tasks returns a slice of all tasks in the given queue.
 func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Task, error) {
-	q := "SELECT id, version, queue, at, created, modified, claimant, value, claims FROM tasks WHERE queue = $1"
-	values := []interface{}{tq.Queue}
+	q := "SELECT id, version, queue, at, created, modified, claimant, value, claims FROM tasks WHERE true"
+	var values []interface{}
+
+	if tq.Queue != "" {
+		q += fmt.Sprintf(" AND queue = $%d", len(values)+1)
+		values = append(values, tq.Queue)
+	}
 
 	if tq.Claimant != uuid.Nil {
 		q += fmt.Sprintf(" AND (claimant = $%d OR claimant = $%d OR at < NOW())", len(values)+1, len(values)+2)
