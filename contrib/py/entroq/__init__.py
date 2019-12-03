@@ -181,13 +181,13 @@ class EntroQ:
         qs = self.queues(exactmatches=[queue])
         return not qs.get(queue, 0)
 
-    def tasks(self, queue, claimant_id='', task_ids=(), limit=0):
+    def tasks(self, queue='', claimant_id='', task_ids=(), limit=0):
         """Return tasks that match the given fields. Typically used to itemize a queue.
 
         Args:
-            queue: required queue name.
+            queue: queue name, if filtering on queue name, otherwise task_ids must be given.
             claimant_id: optional - if specified, limit to tasks claimed by this claimant.
-            task_id: optioanl - if specified, limit to a particular task ID.
+            task_ids: optioanl - if specified, limit to a particular iterable of task IDs.
             limit: limit to this many results, all if 0.
 
         Returns:
@@ -201,8 +201,8 @@ class EntroQ:
 
         return resp.tasks
 
-    def task_by_id(self, queue, task_id):
-        tasks = self.tasks(queue, task_ids=[task_id], limit=1)
+    def task_by_id(self, task_id, queue=''):
+        tasks = self.tasks(queue=queue, task_ids=[task_id], limit=1)
         if not tasks:
             raise ValueError("Task {task_id} not found".format(task_id=task_id))
         return tasks[0]
