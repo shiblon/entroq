@@ -7,11 +7,12 @@ import threading
 import time
 import uuid
 
-from google.protobuf import json_format
 import grpc
-from grpc_status import rpc_status
+
+from google.protobuf import json_format
 from grpc_health.v1 import health_pb2
 from grpc_health.v1 import health_pb2_grpc
+from grpc_status import rpc_status
 
 from . import entroq_pb2
 from . import entroq_pb2_grpc
