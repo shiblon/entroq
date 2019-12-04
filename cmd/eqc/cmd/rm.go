@@ -29,6 +29,7 @@ import (
 var (
 	flagRmID      string
 	flagRmRetries int
+	flagRmForce   bool
 )
 
 func init() {
@@ -37,6 +38,7 @@ func init() {
 	rmCmd.Flags().StringVarP(&flagRmID, "task", "t", "", "Task ID to remove. Note that this will remove whatever version of the task ID it finds. Use with care. Required.")
 	rmCmd.MarkFlagRequired("task")
 
+	rmCmd.Flags().BoolVarP(&flagRmForce, "force", "f", false, "CAREFUL: forces deletion. Spoofs claimant to delete even if task is claimed.")
 	rmCmd.Flags().IntVarP(&flagRmRetries, "retries", "r", 10, "Retries (in case the task is claimed)")
 }
 
@@ -64,7 +66,14 @@ var rmCmd = &cobra.Command{
 				log.Fatalf("Too many tasks returned: %v", tasks)
 			}
 
-			_, mod, err := eq.Modify(ctx, tasks[0].AsDeletion())
+			task := tasks[0]
+
+			modArgs := []entroq.ModifyArg{task.AsDeletion()}
+			if flagRmForce {
+				modArgs = append(modArgs, entroq.ModifyAs(task.Claimant))
+			}
+
+			_, mod, err := eq.Modify(ctx, modArgs...)
 			if err != nil {
 				log.Printf("Try %d/%d - could not remove task %v: %v", i+1, flagRmRetries, id, err)
 				delErr = err

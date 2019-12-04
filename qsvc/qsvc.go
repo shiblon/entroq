@@ -279,7 +279,7 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 		}
 		ids = append(ids, id)
 	}
-	tasks, err := s.impl.Tasks(ctx, req.Queue, entroq.LimitClaimant(claimant), entroq.WithTaskID(ids...))
+	tasks, err := s.impl.Tasks(ctx, req.Queue, entroq.LimitClaimant(claimant), entroq.WithTaskID(ids...), entroq.LimitTasks(int(req.Limit)))
 	if err != nil {
 		return nil, wrapErrorf(err, "failed to get tasks")
 	}

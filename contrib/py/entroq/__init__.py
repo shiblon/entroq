@@ -7,11 +7,12 @@ import threading
 import time
 import uuid
 
-from google.protobuf import json_format
 import grpc
-from grpc_status import rpc_status
+
+from google.protobuf import json_format
 from grpc_health.v1 import health_pb2
 from grpc_health.v1 import health_pb2_grpc
+from grpc_status import rpc_status
 
 from . import entroq_pb2
 from . import entroq_pb2_grpc
@@ -244,7 +245,7 @@ class EntroQ:
 
         return resp.task
 
-    def modify(self, inserts=(), changes=(), deletes=(), depends=()):
+    def modify(self, inserts=(), changes=(), deletes=(), depends=(), unsafe_claimant_id=None):
         """Attempt a modification of potentially multiple tasks and queues.
 
         Args:
@@ -252,6 +253,7 @@ class EntroQ:
             changes: a list of entroq_pb2.TaskChange indicating alterations to tasks.
             deletes: a list of entroq_pb2.TaskID indicating which tasks to delete.
             depends: a list of entroq_pb2.TaskID that must exist for success.
+            unsafe_claimant_id: sets the claimant ID to the given value. Use with extreme care. Default is safe.
 
         Raises:
             grpc.RpcError or, when we can get dependency information, DependencyError.
@@ -261,7 +263,7 @@ class EntroQ:
         """
         try:
             resp = self.stub.Modify(entroq_pb2.ModifyRequest(
-                claimant_id=self.claimant_id,
+                claimant_id=unsafe_claimant_id or self.claimant_id,
                 inserts=inserts,
                 changes=changes,
                 deletes=deletes,
@@ -269,6 +271,16 @@ class EntroQ:
             return resp.inserted, resp.changed
         except grpc.RpcError as e:
             raise DependencyError.from_exc(e)
+
+    def delete(self, task_id, unsafe_claimant_id=None):
+        """Attempt to delete the given task_id.
+
+        Args:
+            task_id: entroq_pb2.TaskID of the task to be deleted.
+            unsafe_claimant_id: Specify to override claimant ID (e.g., to force
+                deletion of a claimed task). Use with caution.
+        """
+        self.modify(deletes=[task_id], unsafe_claimant_id=unsafe_claimant_id)
 
     def time(self):
         res = self.stub.Time(entroq_pb2.TimeRequest())
@@ -325,7 +337,7 @@ class EntroQ:
         finally:
             exit.set()
 
-    def pop_all(self, queue):
+    def pop_all(self, queue, force=False):
         """Attempt to completely clear a queue.
 
         Claims from the queue, deleting everything it claims, until the queue is empty.
@@ -334,10 +346,18 @@ class EntroQ:
 
         Args:
             queue: The queue name to clear.
+            force: If specified, will spoof the claimant for every task instead of claiming first.
 
         Yields:
             Each task that has been removed (entroq_pb2.Task).
         """
+        if force:
+            for task in self.tasks(queue=queue):
+                self.delete(unsafe_claimant_id=task.claimant_id,
+                            task_id=entroq_pb2.TaskID(id=task.id, version=task.version))
+                yield task
+            return
+
         while not self.queue_empty(queue):
             task = self.claim(queue)
             self.modify(deletes=[entroq_pb2.TaskID(id=task.id, version=task.version)])

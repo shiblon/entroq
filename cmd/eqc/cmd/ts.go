@@ -19,18 +19,23 @@ import (
 	"fmt"
 	"log"
 
+	"entrogo.com/entroq"
+	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 )
 
 var (
 	flagTsQueue string
+	flagTsIDs   []string
+	flagTsLimit int
 )
 
 func init() {
 	rootCmd.AddCommand(tsCmd)
 
-	tsCmd.Flags().StringVarP(&flagTsQueue, "queue", "q", "", "Queue to read tasks from. Required.")
-	tsCmd.MarkFlagRequired("queue")
+	tsCmd.Flags().StringVarP(&flagTsQueue, "queue", "q", "", "Queue to read tasks from. Can be blank if IDs are given.")
+	tsCmd.Flags().StringArrayVarP(&flagTsIDs, "task", "t", nil, "Task IDs to read from. Optional.")
+	tsCmd.Flags().IntVarP(&flagTsLimit, "limit", "n", 0, "Limit of tasks, unlimited if 0.")
 }
 
 // tsCmd represents the ts command
@@ -38,7 +43,19 @@ var tsCmd = &cobra.Command{
 	Use:   "ts",
 	Short: "Get tasks from a queue in the EntroQ",
 	Run: func(cmd *cobra.Command, args []string) {
-		ts, err := eq.Tasks(context.Background(), flagTsQueue)
+		if len(flagTsIDs) == 0 && flagTsQueue == "" {
+			log.Print("No queue or task IDs specified.")
+			return
+		}
+		var ids []uuid.UUID
+		for _, tid := range flagTsIDs {
+			uid, err := uuid.Parse(tid)
+			if err != nil {
+				log.Fatalf("Failed to parse ID %q: %v", tid, err)
+			}
+			ids = append(ids, uid)
+		}
+		ts, err := eq.Tasks(context.Background(), flagTsQueue, entroq.WithTaskID(ids...), entroq.LimitTasks(flagTsLimit))
 		if err != nil {
 			log.Fatalf("Error getting tasks: %v", err)
 		}
