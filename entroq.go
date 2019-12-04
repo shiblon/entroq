@@ -205,10 +205,10 @@ type QueuesQuery struct {
 // Note that available + claimed may not add up to size. This is because a task
 // can be unavailable (AT in the future) without being claimed by anyone.
 type QueueStat struct {
-	Name      string // The queue name.
-	Size      int    // The total number of tasks.
-	Claimed   int    // The number of currently claimed tasks.
-	Available int    // The number of available tasks.
+	Name      string `json:"name"`      // The queue name.
+	Size      int    `json:"size"`      // The total number of tasks.
+	Claimed   int    `json:"claimed"`   // The number of currently claimed tasks.
+	Available int    `json:"available"` // The number of available tasks.
 }
 
 // QueuesFromStats can be used for converting the new QueueStats to the old
