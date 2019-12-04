@@ -35,9 +35,9 @@ func init() {
 
 	qsCmd.Flags().StringArrayVarP(&flagQsPrefix, "prefix", "p", nil, "Prefix match, if any. May be specified more than once.")
 
-	qsCmd.Flags().StringArrayVarP(&flagQsExact, "exact", "e", nil, "Exact match, if any. May be specified more than once.")
+	qsCmd.Flags().StringArrayVarP(&flagQsExact, "queue", "q", nil, "Exact match, if any. May be specified more than once.")
 
-	qsCmd.Flags().IntVarP(&flagQsLimit, "limit", "l", 0, "Limit number of queues returned.")
+	qsCmd.Flags().IntVarP(&flagQsLimit, "limit", "n", 0, "Limit number of queues returned.")
 }
 
 // qsCmd represents the qs command
