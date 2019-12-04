@@ -43,8 +43,14 @@ type TaskID struct {
 	Version int32
 }
 
+// String produces the id:version string representation.
 func (t TaskID) String() string {
 	return fmt.Sprintf("%s:v%d", t.ID, t.Version)
+}
+
+// AsDeletion produces an appropriate ModifyArg to delete the task with this ID.
+func (t TaskID) AsDeletion() ModifyArg {
+	return Deleting(t.ID, t.Version)
 }
 
 // TaskData contains just the data, not the identifier or metadata. Used for insertions.

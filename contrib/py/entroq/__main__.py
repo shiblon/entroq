@@ -3,6 +3,7 @@ from . import entroq_pb2 as pb
 
 import click
 import datetime
+from datetime import timezone
 import grpc
 import json
 
@@ -16,6 +17,7 @@ class _ClickContext: pass
 @click.option('--json', '-j', is_flag=True, default=False, help='Values are JSON, unpack as such for display')
 @click.pass_context
 def main(ctx, svcaddr, json):
+    # TODO: actually use the json flag.
     ctx.ensure_object(_ClickContext)
     ctx.obj.addr = svcaddr
 
@@ -82,13 +84,17 @@ def claim(ctx, queue, try_, duration):
 @main.command()
 @click.pass_context
 @click.option('--millis', '-m', is_flag=True, help="Return time in milliseconds since the Epoch UTC")
+@click.option('--local', '-l', is_flag=True, help='Show local time (when not using milliseconds)')
 def time(ctx, millis, local):
     cli = EntroQ(ctx.obj.addr)
-    time_ms = cli.Time()
+    time_ms = cli.time()
     if millis:
         print(time_ms)
         return
-    dt = datetime.datetime.fromtimestamp(time_ms / 1000.0)
+    tz = None
+    if not local:
+        tz = timezone.utc
+    dt = datetime.datetime.fromtimestamp(time_ms / 1000.0, tz=tz)
     print(dt)
 
 
@@ -99,7 +105,26 @@ def time(ctx, millis, local):
 @click.option('--limit', '-n', default=0, help='Limit returned tasks')
 def ts(ctx, queue, task, limit):
     cli = EntroQ(ctx.obj.addr)
-    for task in cli.tasks(queue=queue, task_ids=task, limit=limit)
+    for task in cli.tasks(queue=queue, task_ids=task, limit=limit):
+        print(json_format.MessageToJson(task))
+
+
+@main.command()
+@click.pass_context
+@click.option('--task', '-t', required=True, help='Task ID to modify - modifies whatever version it finds. Use with care.')
+@click.option('--queue_to', '-Q', default='', help='Change queue to this value.')
+@click.option('--val', '-v', default='', help='Change to this value.')
+@click.option('--force', '-f', is_flag=True, help='UNSAFE: force modification even if this task is claimed.')
+def mod(ctx, task, queue_to, val, force):
+    cli = EntroQ(ctx.obj.addr)
+    t = cli.task_by_id(task)
+    old_id = pb.TaskID(id=t.id, version=t.version)
+    new_data = pb.TaskData(queue=queue_to or t.queue,
+                           value=val or t.value)
+    _, chg = cli.modify(changes=[pb.TaskChange(old_id=old_id, new_data=new_data)],
+                        unsafe_claimant_id=t.claimant_id if force else None)
+    for t in chg:
+        print(json_format.MessageToJson(t))
 
 
 main(obj=_ClickContext())

@@ -96,7 +96,8 @@ func mustTaskString(t *entroq.Task) string {
 	}
 
 	// Unmarshal into a map so we can insert the value where we want it (as we want it).
-	var tm, vm map[string]interface{}
+	var tm map[string]interface{}
+	var vm interface{}
 	if err := json.Unmarshal(b, &tm); err != nil {
 		log.Fatalf("Error creating map from JSON: %v", err)
 	}
