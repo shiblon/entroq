@@ -56,7 +56,7 @@ var qsCmd = &cobra.Command{
 			opts = append(opts, entroq.LimitQueues(lim))
 		}
 
-		qs, err := eq.Queues(context.Background(), opts...)
+		qs, err := eq.QueueStats(context.Background(), opts...)
 		if err != nil {
 			return errors.Wrap(err, "get queues")
 		}
