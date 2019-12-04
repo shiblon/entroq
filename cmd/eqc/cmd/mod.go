@@ -27,6 +27,7 @@ var (
 	flagModID      string
 	flagModQueueTo string
 	flagModVal     string
+	flagModForce   bool
 )
 
 func init() {
@@ -36,6 +37,7 @@ func init() {
 	modCmd.MarkFlagRequired("task")
 	modCmd.Flags().StringVarP(&flagModQueueTo, "queue_to", "Q", "", "New queue for task, if a change is desired.")
 	modCmd.Flags().StringVarP(&flagModVal, "val", "v", "", "Value to set in task.")
+	modCmd.Flags().BoolVarP(&flagModForce, "force", "f", false, "Force by spoofing the claimant if already claimed.")
 }
 
 // modCmd represents the mod command
@@ -43,14 +45,6 @@ var modCmd = &cobra.Command{
 	Use:   "mod",
 	Short: "Modify a task by queue and ID.",
 	Run: func(cmd *cobra.Command, args []string) {
-		var chgArgs []entroq.ChangeArg
-		if flagModVal != "" {
-			chgArgs = append(chgArgs, entroq.ValueTo([]byte(flagModVal)))
-		}
-		if flagModQueueTo != "" {
-			chgArgs = append(chgArgs, entroq.QueueTo(flagModQueueTo))
-		}
-
 		id, err := uuid.Parse(flagModID)
 		if err != nil {
 			log.Fatalf("Error parsing task ID: %v", err)
@@ -66,7 +60,21 @@ var modCmd = &cobra.Command{
 			log.Fatalf("Too many tasks returned: %v", tasks)
 		}
 
-		if _, _, err := eq.Modify(context.Background(), tasks[0].AsChange(chgArgs...)); err != nil {
+		task := tasks[0]
+
+		var chgArgs []entroq.ChangeArg
+		if flagModVal != "" {
+			chgArgs = append(chgArgs, entroq.ValueTo([]byte(flagModVal)))
+		}
+		if flagModQueueTo != "" {
+			chgArgs = append(chgArgs, entroq.QueueTo(flagModQueueTo))
+		}
+
+		modArgs := []entroq.ModifyArg{task.AsChange(chgArgs...)}
+		if flagModForce {
+			modArgs = append(modArgs, entroq.ModifyAs(task.Claimant))
+		}
+		if _, _, err := eq.Modify(context.Background(), modArgs...); err != nil {
 			log.Fatalf("Could not modify task %q: %v", id, err)
 		}
 	},
