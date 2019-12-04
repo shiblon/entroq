@@ -170,16 +170,16 @@ class EntroQ:
         Returns:
             [entroq_pb2.QueueStats]
         """
-        resp = self.stub.Queues(entroq_pb2.QueuesRequest(
+        resp = self.stub.QueueStats(entroq_pb2.QueuesRequest(
             match_prefix=prefixmatches,
             match_exact=exactmatches,
             limit=limit))
-        return {q.name: q.num_tasks for q in resp.queues}
+        return resp.queues
 
     def queue_empty(self, queue):
         """Indicate whether the given queue is empty."""
         qs = self.queues(exactmatches=[queue])
-        return not qs.get(queue, 0)
+        return qs.get(queue, {}).get('size', 0) == 0
 
     def tasks(self, queue='', claimant_id='', task_ids=(), limit=0):
         """Return tasks that match the given fields. Typically used to itemize a queue.
