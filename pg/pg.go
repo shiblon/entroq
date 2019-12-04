@@ -241,9 +241,19 @@ func (b *backend) initDB(ctx context.Context) error {
 	return errors.Wrap(err, "initDB")
 }
 
-// Queues returns a mapping from queue names to task counts within them.
+// Queues returns the queues and their sizes.
 func (b *backend) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[string]int, error) {
-	q := "SELECT queue, COUNT(*) AS count FROM tasks"
+	return entroq.QueuesFromStats(b.QueueStats(ctx, qq))
+}
+
+// QueueStats returns a mapping from queue names to their statistics.
+func (b *backend) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[string]*entroq.QueueStat, error) {
+	q := `SELECT
+			queue,
+			COUNT(*) AS count,
+			COUNT(*) FILTER(WHERE at > NOW() AND claimant != '00000000-0000-0000-0000-000000000000') AS claimed,
+			COUNT(*) FILTER(WHERE at <= NOW()) as available
+		FROM tasks`
 	var values []interface{}
 
 	if len(qq.MatchPrefix) != 0 || len(qq.MatchExact) != 0 {
@@ -276,16 +286,23 @@ func (b *backend) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[strin
 	}
 
 	defer rows.Close()
-	queues := make(map[string]int)
+	queues := make(map[string]*entroq.QueueStat)
 	for rows.Next() {
 		var (
-			q     string
-			count int
+			q         string
+			count     int
+			claimed   int
+			available int
 		)
-		if err := rows.Scan(&q, &count); err != nil {
+		if err := rows.Scan(&q, &count, &claimed, &available); err != nil {
 			return nil, errors.Wrap(err, "row scan")
 		}
-		queues[q] = count
+		queues[q] = &entroq.QueueStat{
+			Name:      q,
+			Size:      count,
+			Claimed:   claimed,
+			Available: available,
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, errors.Wrap(err, "queue iteration")

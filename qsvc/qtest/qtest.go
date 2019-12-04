@@ -882,6 +882,53 @@ func QueueMatch(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefi
 	}
 }
 
+// QueueStats checks that queue stats basically work.
+func QueueStats(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	t.Helper()
+
+	nothingClaimedQueue := path.Join(qPrefix, "queue-1")
+	partiallyClaimedQueue := path.Join(qPrefix, "queue-2")
+
+	if _, _, err := client.Modify(ctx,
+		entroq.InsertingInto(nothingClaimedQueue),
+		entroq.InsertingInto(nothingClaimedQueue),
+		entroq.InsertingInto(partiallyClaimedQueue),
+		entroq.InsertingInto(partiallyClaimedQueue),
+		entroq.InsertingInto(partiallyClaimedQueue),
+	); err != nil {
+		t.Fatalf("Insert into queues: %v", err)
+	}
+
+	// Now claim something.
+	if _, err := client.Claim(ctx, entroq.From(partiallyClaimedQueue)); err != nil {
+		t.Fatalf("Couldn't claim: %v", err)
+	}
+
+	got, err := client.QueueStats(ctx, entroq.MatchPrefix(qPrefix))
+	if err != nil {
+		t.Fatalf("Queue stats error: %v", err)
+	}
+
+	want := map[string]*entroq.QueueStat{
+		nothingClaimedQueue: &entroq.QueueStat{
+			Name:      nothingClaimedQueue,
+			Size:      2,
+			Claimed:   0,
+			Available: 2,
+		},
+		partiallyClaimedQueue: &entroq.QueueStat{
+			Name:      partiallyClaimedQueue,
+			Size:      3,
+			Claimed:   1,
+			Available: 2,
+		},
+	}
+
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Fatalf("QueueStats (-want +got):\n%v", diff)
+	}
+}
+
 // EqualAllTasks returns a string diff if any of the tasks in the lists are unequal.
 func EqualAllTasks(want, got []*entroq.Task) string {
 	if len(want) != len(got) {

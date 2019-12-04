@@ -132,6 +132,18 @@ func TestQueueMatch(t *testing.T) {
 	qtest.QueueMatch(ctx, t, client, "")
 }
 
+func TestQueueStats(t *testing.T) {
+	ctx := context.Background()
+
+	client, stop, err := qtest.ClientService(ctx, Opener())
+	if err != nil {
+		t.Fatalf("Get client: %v", err)
+	}
+	defer stop()
+
+	qtest.QueueStats(ctx, t, client, "")
+}
+
 func TestMapReduce_checkSmall(t *testing.T) {
 	config := &quick.Config{
 		MaxCount: 2,

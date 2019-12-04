@@ -228,11 +228,58 @@ func (b *backend) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[strin
 	return qs, nil
 }
 
+// QueueStats returns a map of queue names to queue statistics.
+func (b *backend) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[string]*entroq.QueueStat, error) {
+	defer un(lock(b))
+
+	now, err := b.Time(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "tasks current time")
+	}
+
+	qs := make(map[string]*entroq.QueueStat)
+	for q, heap := range b.heaps {
+		if qq.Limit > 0 && len(qs) >= qq.Limit {
+			break
+		}
+
+		if len(qq.MatchPrefix) != 0 || len(qq.MatchExact) != 0 {
+			if !matchesPrefix(q, qq.MatchPrefix...) && !matchesExact(q, qq.MatchExact...) {
+				// no match
+				continue
+			}
+		}
+		// Find out how many tasks are claimed. This means they both have a
+		// claimant and their arrival time is in the future.
+		claimed := 0
+		available := 0
+		for _, item := range heap.Items() {
+			if item.task.At.After(now) {
+				if item.task.Claimant != uuid.Nil {
+					claimed++
+				}
+			} else {
+				available++
+			}
+		}
+		qs[q] = &entroq.QueueStat{
+			Name:      q,
+			Size:      heap.Len(),
+			Claimed:   claimed,
+			Available: available,
+		}
+	}
+	return qs, nil
+}
+
 // Tasks gets a listing of tasks in a given queue for a given (possibly empty, for all tasks) claimant.
 func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Task, error) {
 	defer un(lock(b))
 
-	now := time.Now()
+	now, err := b.Time(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "tasks current time")
+	}
 
 	var items []*hItem
 
@@ -297,7 +344,10 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 			continue
 		}
 
-		now := time.Now()
+		now, err := b.Time(ctx)
+		if err != nil {
+			return nil, errors.Wrap(err, "try claim current time")
+		}
 		top := h.items[0].task
 		if top.At.After(now) {
 			continue
