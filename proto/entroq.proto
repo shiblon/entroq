@@ -66,6 +66,8 @@ message Task {
 message QueueStats {
   string name = 1;
   int32 num_tasks = 2;
+  int32 num_claimed = 3;
+  int32 num_available = 4;
 }
 
 // ClaimRequest is sent to attempt to claim a task from a queue. The claimant ID
@@ -186,5 +188,6 @@ service EntroQ {
   rpc Modify(ModifyRequest) returns (ModifyResponse);
   rpc Tasks(TasksRequest) returns (TasksResponse);
   rpc Queues(QueuesRequest) returns (QueuesResponse);
+  rpc QueueStats(QueuesRequest) returns (QueuesResponse);
   rpc Time(TimeRequest) returns (TimeResponse);
 }
