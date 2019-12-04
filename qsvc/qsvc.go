@@ -309,6 +309,27 @@ func (s *QSvc) Queues(ctx context.Context, req *pb.QueuesRequest) (*pb.QueuesRes
 	return resp, nil
 }
 
+// QueueStats returns a mapping from queue names to queue stats.
+func (s *QSvc) QueueStats(ctx context.Context, req *pb.QueuesRequest) (*pb.QueuesResponse, error) {
+	queueMap, err := s.impl.QueueStats(ctx,
+		entroq.MatchPrefix(req.MatchPrefix...),
+		entroq.MatchExact(req.MatchExact...),
+		entroq.LimitQueues(int(req.Limit)))
+	if err != nil {
+		return nil, wrapErrorf(err, "failed to get queues")
+	}
+	resp := new(pb.QueuesResponse)
+	for _, stat := range queueMap {
+		resp.Queues = append(resp.Queues, &pb.QueueStats{
+			Name:         stat.Name,
+			NumTasks:     int32(stat.Size),
+			NumClaimed:   int32(stat.Claimed),
+			NumAvailable: int32(stat.Available),
+		})
+	}
+	return resp, nil
+}
+
 // Time returns the current time in milliseconds since the Epoch.
 func (s *QSvc) Time(ctx context.Context, req *pb.TimeRequest) (*pb.TimeResponse, error) {
 	return &pb.TimeResponse{TimeMs: toMS(time.Now().UTC())}, nil
