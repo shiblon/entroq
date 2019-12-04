@@ -310,7 +310,6 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 	// By this point, we have already filtered on the ID list if there is one.
 	// Just apply claimant and limit filters now.
 	for _, item := range items {
-		fmt.Printf("Tasks in memory, limited to %d\n", tq.Limit)
 		if tq.Limit > 0 && len(tasks) >= tq.Limit {
 			break
 		}

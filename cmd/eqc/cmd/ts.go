@@ -55,7 +55,6 @@ var tsCmd = &cobra.Command{
 			}
 			ids = append(ids, uid)
 		}
-		fmt.Println(flagTsLimit)
 		ts, err := eq.Tasks(context.Background(), flagTsQueue, entroq.WithTaskID(ids...), entroq.LimitTasks(flagTsLimit))
 		if err != nil {
 			log.Fatalf("Error getting tasks: %v", err)
