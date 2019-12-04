@@ -201,6 +201,31 @@ type QueuesQuery struct {
 	Limit int
 }
 
+// QueueStat holds high-level information about a queue.
+// Note that available + claimed may not add up to size. This is because a task
+// can be unavailable (AT in the future) without being claimed by anyone.
+type QueueStat struct {
+	Name      string // The queue name.
+	Size      int    // The total number of tasks.
+	Claimed   int    // The number of currently claimed tasks.
+	Available int    // The number of available tasks.
+}
+
+// QueuesFromStats can be used for converting the new QueueStats to the old
+// Queues output, making it easier on backend implementers to just define one
+// function (similar to how WaitTryClaim or PollTryClaim can make implementing
+// Claim in terms of TryClaim easier).
+func QueuesFromStats(stats map[string]*QueueStat, err error) (map[string]int, error) {
+	if err != nil {
+		return nil, err
+	}
+	qs := make(map[string]int)
+	for k, v := range stats {
+		qs[k] = v.Size
+	}
+	return qs, nil
+}
+
 // BackendClaimFunc is a function that can make claims based on a ClaimQuery.
 // It is a convenience type for backends to use.
 type BackendClaimFunc func(ctx context.Context, eq *ClaimQuery) (*Task, error)
@@ -321,6 +346,10 @@ type Backend interface {
 	// Queues returns a mapping from all known queues to their task counts.
 	Queues(ctx context.Context, qq *QueuesQuery) (map[string]int, error)
 
+	// QueueStats returns statistics for the specified queues query. Richer
+	// than just calling Queues, as it can return more than just the size.
+	QueueStats(ctx context.Context, qq *QueuesQuery) (map[string]*QueueStat, error)
+
 	// Tasks retrieves all tasks from the given queue. If claimantID is
 	// specified (non-zero), limits those tasks to those that are either
 	// expired or belong to the given claimant. Otherwise returns them all.
@@ -419,6 +448,15 @@ func (c *EntroQ) Queues(ctx context.Context, opts ...QueuesOpt) (map[string]int,
 		opt(query)
 	}
 	return c.backend.Queues(ctx, query)
+}
+
+// QueueStats returns a mapping from queue names to task stats.
+func (c *EntroQ) QueueStats(ctx context.Context, opts ...QueuesOpt) (map[string]*QueueStat, error) {
+	query := new(QueuesQuery)
+	for _, opt := range opts {
+		opt(query)
+	}
+	return c.backend.QueueStats(ctx, query)
 }
 
 // QueuesEmpty indicates whether the specified task queues are all empty. If no

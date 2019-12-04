@@ -166,6 +166,28 @@ func (b *backend) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[strin
 	return qs, nil
 }
 
+// QueueStats maps queue names to stats for those queues.
+func (b *backend) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[string]*entroq.QueueStat, error) {
+	resp, err := pb.NewEntroQClient(b.conn).QueueStats(ctx, &pb.QueuesRequest{
+		MatchPrefix: qq.MatchPrefix,
+		MatchExact:  qq.MatchExact,
+		Limit:       int32(qq.Limit),
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get queue stats over gRPC")
+	}
+	qs := make(map[string]*entroq.QueueStat)
+	for _, q := range resp.Queues {
+		qs[q.Name] = &entroq.QueueStat{
+			Name:      q.Name,
+			Size:      int(q.NumTasks),
+			Claimed:   int(q.NumClaimed),
+			Available: int(q.NumAvailable),
+		}
+	}
+	return qs, nil
+}
+
 func fromMS(ms int64) time.Time {
 	return time.Unix(0, ms*int64(time.Millisecond))
 }
