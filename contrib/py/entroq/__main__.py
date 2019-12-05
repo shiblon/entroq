@@ -12,14 +12,24 @@ from google.protobuf import json_format
 class _ClickContext: pass
 
 
+def _task_str_raw(task):
+    return EntroQ.to_dict(task)
+
+
+def _task_str_json(task):
+    return EntroQ.to_dict(task, value_type='json')
+
+
 @click.group()
 @click.option('--svcaddr', default='localhost:37706', show_default=True, help='EntroQ service address')
 @click.option('--json', '-j', is_flag=True, default=False, help='Values are JSON, unpack as such for display')
 @click.pass_context
 def main(ctx, svcaddr, json):
-    # TODO: actually use the json flag.
     ctx.ensure_object(_ClickContext)
     ctx.obj.addr = svcaddr
+    ctx.obj.task_to_str = _task_str_raw
+    if json:
+        ctx.obj.task_to_str = _task_str_json
 
 
 @main.command()
@@ -30,7 +40,7 @@ def ins(ctx, queue, val):
     cli = EntroQ(ctx.obj.addr)
     ins, _ = cli.modify(inserts=[pb.TaskData(queue=queue, value=val.encode('utf-8'))])
     for t in ins:
-        print(json_format.MessageToJson(t))
+        print(ctx.obj.task_to_str(t))
 
 
 @main.command()
@@ -66,7 +76,7 @@ def rm(ctx, task, force, retries):
 def clear(ctx, queue, force):
     cli = EntroQ(ctx.obj.addr)
     for t in cli.pop_all(queue, force=force):
-        print(json_format.MessageToJson(t))
+        print(ctx.obj.task_to_str(t))
 
 
 @main.command()
@@ -78,7 +88,7 @@ def claim(ctx, queue, try_, duration):
     cli = EntroQ(ctx.obj.addr)
     claim_func = cli.try_claim if try_ else cli.claim
     t = claim_func(queue, duration=duration)
-    print(json_format.MessageToJson(t))
+    print(ctx.obj.task_to_str(t))
 
 
 @main.command()
@@ -106,7 +116,7 @@ def time(ctx, millis, local):
 def ts(ctx, queue, task, limit):
     cli = EntroQ(ctx.obj.addr)
     for task in cli.tasks(queue=queue, task_ids=task, limit=limit):
-        print(json_format.MessageToJson(task))
+        print(ctx.obj.task_to_str(task))
 
 
 @main.command()
@@ -124,7 +134,7 @@ def mod(ctx, task, queue_to, val, force):
     _, chg = cli.modify(changes=[pb.TaskChange(old_id=old_id, new_data=new_data)],
                         unsafe_claimant_id=t.claimant_id if force else None)
     for t in chg:
-        print(json_format.MessageToJson(t))
+        print(ctx.obj.task_to_str(t))
 
 
 main(obj=_ClickContext())
