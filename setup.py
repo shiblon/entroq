@@ -36,5 +36,6 @@ setup(name=pkg_name,
       py_modules=[
           'entroq.entroq_pb2',
           'entroq.entroq_pb2_grpc',
-          'entroq',
+          'entroq.__main__',
+          'entroq.__init__',
       ])
