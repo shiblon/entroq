@@ -137,4 +137,5 @@ def mod(ctx, task, queue_to, val, force):
         print(ctx.obj.task_to_str(t))
 
 
-main(obj=_ClickContext())
+if __name__ == '__main__':
+    main(obj=_ClickContext())
