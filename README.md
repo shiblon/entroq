@@ -329,11 +329,11 @@ Alternatively, you can write code that uses the `gRPC` backend and talks to
 
 The qsvc directory contains the gRPC service implementation that is found in
 the Docker container `shiblon/entroq`. This service exposes the endpoints found
-in `qsvc/proto`. Working services using various backends are found in the
-backend directories, e.g.,
+in `proto`. Working services using various backends are found in the
+cmd directories, e.g.,
 
-- `pg/svc`
-- `mem/svc`
+- `cmd/eqmemsvc`
+- `cmd/eqpgsvc`
 
 You can build any of these and start them on desired ports and with desired
 backend connections based on flag settings.
@@ -342,8 +342,12 @@ There is no *service* backend for `grpc`, though one could conceivably make
 sense as a sort of proxy. But in that case you should really just use a grpc
 proxy.
 
-When using one of these services, this is your main server. Clients should use
-the `grpc` backend to connect to it.
+When using one of these services, this is your main server and should be
+treated as a singleton. Clients should use the `grpc` backend to connect to it.
+
+Does making the server a singleton affect performance? Yes, of course, you can't
+scale a singleton, but in practice if you are hitting a work queue that hard you
+likely have a granularity problem in your design.
 
 ## Python Implementation
 
