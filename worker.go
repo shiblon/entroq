@@ -82,15 +82,20 @@ type ErrorTaskValue struct {
 
 // NewWorker creates a new worker that makes it easy to claim and operate on
 // tasks in an endless loop.
-func (c *EntroQ) NewWorker(qs ...string) *Worker {
+func NewWorker(eq *EntroQ, qs ...string) *Worker {
 	return &Worker{
 		Qs:      qs,
 		ErrQMap: DefaultErrQMap,
 
-		eqc:   c,
+		eqc:   eq,
 		lease: DefaultClaimDuration,
 		renew: DefaultClaimDuration / 2,
 	}
+}
+
+// NewWorker is a convenience method on an EntroQ client to create a worker.
+func (c *EntroQ) NewWorker(qs ...string) *Worker {
+	return NewWorker(c, qs...)
 }
 
 func (w *Worker) WithOpts(opts ...WorkerOption) *Worker {
