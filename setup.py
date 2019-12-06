@@ -16,7 +16,7 @@ setup(name=pkg_name,
       package_dir={
           '': 'contrib/py',
       },
-      version='0.3.6',
+      version='0.3.7',
       description='EntroQ Python Client Library',
       author='Chris Monson',
       author_email='shiblon@gmail.com',
