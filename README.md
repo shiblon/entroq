@@ -34,7 +34,7 @@ You can then run `eqc` to talk to an EntroQ service (such as one started in the
 
 There is also a Python-based command line, installable via pip:
 
-    pip install git+https://github.com/shiblon/entroq
+    python3 -m pip install git+https://github.com/shiblon/entroq
     python3 -m entroq --help
 
 ## Concepts
@@ -452,7 +452,7 @@ replace uses of Celery in Python.
 The Python implementation is made to be pip-installable directly from github:
 
 ```
-$ pip install git+https://github.com/shiblon/entroq
+$ python3 -m pip install git+https://github.com/shiblon/entroq
 ```
 
 This creates the `entroq` module and supporting protocol buffers beneath it.
