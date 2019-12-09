@@ -184,7 +184,10 @@ class EntroQ:
     def queue_empty(self, queue):
         """Indicate whether the given queue is empty."""
         qs = self.queues(exactmatches=[queue])
-        return qs.get(queue, {}).get('size', 0) == 0
+        for qstat in qs:
+            if qstat.name == queue:
+                return qstat.num_tasks == 0
+        return True
 
     def tasks(self, queue='', claimant_id='', task_ids=(), limit=0):
         """Return tasks that match the given fields. Typically used to itemize a queue.
