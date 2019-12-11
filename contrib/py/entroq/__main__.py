@@ -113,9 +113,10 @@ def time(ctx, millis, local):
 @click.option('--queue', '-q', default='', help='Queue to list')
 @click.option('--task', '-t', multiple=True, help='Task ID to list')
 @click.option('--limit', '-n', default=0, help='Limit returned tasks')
+@click.option('--omit_values', '-V', is_flag=True, help='Omit values in returned tasks')
 def ts(ctx, queue, task, limit):
     cli = EntroQ(ctx.obj.addr)
-    for task in cli.tasks(queue=queue, task_ids=task, limit=limit):
+    for task in cli.tasks(queue=queue, task_ids=task, limit=limit, omit_values=omit_values):
         print(ctx.obj.task_to_str(task))
 
 
