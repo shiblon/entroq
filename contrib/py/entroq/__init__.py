@@ -189,7 +189,7 @@ class EntroQ:
                 return qstat.num_tasks == 0
         return True
 
-    def tasks(self, queue='', claimant_id='', task_ids=(), limit=0):
+    def tasks(self, queue='', claimant_id='', task_ids=(), limit=0, omit_values=False):
         """Return tasks that match the given fields. Typically used to itemize a queue.
 
         Args:
@@ -197,17 +197,18 @@ class EntroQ:
             claimant_id: optional - if specified, limit to tasks claimed by this claimant.
             task_ids: optioanl - if specified, limit to a particular iterable of task IDs.
             limit: limit to this many results, all if 0.
+            omit_values: only return metadata.
 
         Returns:
             [entroq_pb2.Task] for all matching tasks.
         """
-        resp = self.stub.Tasks(entroq_pb2.TasksRequest(
+        return list(self.stub.StreamTasks(entroq_pb2.TasksRequest(
             queue=queue,
             claimant_id=claimant_id,
             limit=limit,
-            task_id=task_ids))
-
-        return resp.tasks
+            task_id=task_ids,
+            omit_values=omit_values))
+        )
 
     def task_by_id(self, task_id, queue=''):
         tasks = self.tasks(queue=queue, task_ids=[task_id], limit=1)
