@@ -67,14 +67,6 @@ def as_id(task):
     return entroq_pb2.TaskID(id=task.id, version=task.version)
 
 
-def as_json_dict(task, unwrap_value=False):
-    pass
-
-
-def as_id(task):
-    return entroq_pb2.TaskID(id=task.id, version=task.version)
-
-
 class DependencyError(Exception):
     @classmethod
     def from_exc(cls, exc):
