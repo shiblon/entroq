@@ -63,6 +63,10 @@ def as_change(task):
     )
 
 
+def as_id(task):
+    return entroq_pb2.TaskID(id=task.id, version=task.version)
+
+
 def as_json_dict(task, unwrap_value=False):
     pass
 
