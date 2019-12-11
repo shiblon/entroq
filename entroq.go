@@ -175,6 +175,14 @@ func (t *Task) Copy() *Task {
 	return newT
 }
 
+// CopyOmitValue copies this task but leaves the value blank.
+func (t *Task) CopyOmitValue() *Task {
+	newT := new(Task)
+	*newT = *t
+	newT.Value = nil
+	return newT
+}
+
 // ClaimQuery contains information necessary to attempt to make a claim on a task in a specific queue.
 type ClaimQuery struct {
 	Queues   []string      // Queues to attempt to claim from. Only one wins.
@@ -189,6 +197,12 @@ type TasksQuery struct {
 	Claimant uuid.UUID
 	Limit    int
 	IDs      []uuid.UUID
+
+	// OmitValues specifies that only metadata should be returned.
+	// Backends are not required to honor this flag, though any
+	// service receiving it in a request should ensure that values
+	// are not passed over the wire.
+	OmitValues bool
 }
 
 // QueuesQuery modifies a queue listing request.
@@ -534,6 +548,13 @@ func LimitClaimant(id uuid.UUID) TasksOpt {
 func LimitTasks(limit int) TasksOpt {
 	return func(_ *EntroQ, q *TasksQuery) {
 		q.Limit = limit
+	}
+}
+
+// OmitValues tells a tasks query to only return metadata, not values.
+func OmitValues() TasksOpt {
+	return func(_ *EntroQ, q *TasksQuery) {
+		q.OmitValues = true
 	}
 }
 

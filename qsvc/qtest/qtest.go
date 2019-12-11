@@ -295,8 +295,8 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	}
 
 	const (
-		maxExpectedSmallMedian = float64(smallSize*3/2 + 15)
-		maxExpectedMedMedian   = float64((medSize-smallSize)*2+smallSize*3)/2 + 15
+		maxExpectedSmallMedian = float64(smallSize*3/2 + smallSize)
+		maxExpectedMedMedian   = float64((medSize-smallSize)*2+smallSize*3)/2 + medSize
 	)
 
 	if smallMedian > maxExpectedSmallMedian {
@@ -448,6 +448,37 @@ func WorkerRenewal(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPr
 	}
 	if want, got := task.Version+3, renewed.Version; want != got {
 		t.Fatalf("Expected renewed task to be at version %d, got %d", want, got)
+	}
+}
+
+// TasksOmitValue exercises the task query where values are not desired.
+func TasksOmitValue(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	t.Helper()
+	queue := path.Join(qPrefix, "tasks_omit_value")
+
+	inserted, _, err := client.Modify(ctx,
+		entroq.InsertingInto(queue, entroq.WithValue([]byte("t1"))),
+		entroq.InsertingInto(queue, entroq.WithValue([]byte("t2"))),
+		entroq.InsertingInto(queue, entroq.WithValue([]byte("t3"))),
+	)
+	if err != nil {
+		t.Fatalf("Failed to insert tasks: %v", err)
+	}
+
+	tasks, err := client.Tasks(ctx, queue, entroq.OmitValues())
+	if err != nil {
+		t.Fatalf("Failed to get tasks without values: %v", err)
+	}
+	if diff := EqualAllTasksOmitValues(inserted, tasks); diff != "" {
+		t.Errorf("Task listing without values had unexpected results (-want +got):\n%v", diff)
+	}
+
+	tasksWithVals, err := client.Tasks(ctx, queue)
+	if err != nil {
+		t.Fatalf("Failed to get tasks with values: %v", err)
+	}
+	if diff := EqualAllTasks(inserted, tasksWithVals); diff != "" {
+		t.Fatalf("Task listing with values had unexpected results (-want +got):\n%v", diff)
 	}
 }
 
@@ -948,6 +979,18 @@ func EqualAllTasks(want, got []*entroq.Task) string {
 		return strings.Join(diffs, "\n")
 	}
 	return ""
+}
+
+// EqualAllTasksOmitValues returns a string diff if any tasks in the list are unequal, not counting values.
+func EqualAllTasksOmitValues(want, got []*entroq.Task) string {
+	var wantNoVal, gotNoVal []*entroq.Task
+	for _, t := range want {
+		wantNoVal = append(wantNoVal, t.CopyOmitValue())
+	}
+	for _, t := range got {
+		gotNoVal = append(gotNoVal, t.CopyOmitValue())
+	}
+	return EqualAllTasks(wantNoVal, gotNoVal)
 }
 
 // EqualAllTasksVersionIncr returns a non-empty diff if any of the tasks are

@@ -270,6 +270,7 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 		Queue:      tq.Queue,
 		Limit:      int32(tq.Limit),
 		TaskId:     ids,
+		OmitValues: tq.OmitValues,
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get tasks over gRPC")
