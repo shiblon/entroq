@@ -351,6 +351,12 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 		if err := rows.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Created, &t.Modified, &t.Claimant, &t.Value, &t.Claims); err != nil {
 			return nil, errors.Wrap(err, "task scan")
 		}
+		// NOTE: we can make this more efficient by not even asking for the
+		// value, but it complicates the code a lot and may not be worth the
+		// maintainability hit.
+		if tq.OmitValues {
+			t.Value = nil
+		}
 		tasks = append(tasks, t)
 	}
 	if err := rows.Err(); err != nil {

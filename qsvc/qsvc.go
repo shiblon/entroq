@@ -279,7 +279,15 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 		}
 		ids = append(ids, id)
 	}
-	tasks, err := s.impl.Tasks(ctx, req.Queue, entroq.LimitClaimant(claimant), entroq.WithTaskID(ids...), entroq.LimitTasks(int(req.Limit)))
+	opts := []entroq.TasksOpt{
+		entroq.LimitClaimant(claimant),
+		entroq.WithTaskID(ids...),
+		entroq.LimitTasks(int(req.Limit)),
+	}
+	if req.OmitValues {
+		opts = append(opts, entroq.OmitValues())
+	}
+	tasks, err := s.impl.Tasks(ctx, req.Queue, opts...)
 	if err != nil {
 		return nil, wrapErrorf(err, "failed to get tasks")
 	}
@@ -288,6 +296,20 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 		resp.Tasks = append(resp.Tasks, protoFromTask(task))
 	}
 	return resp, nil
+}
+
+func (s *QSvc) StreamTasks(req *pb.TasksRequest, stream pb.EntroQ_StreamTasksServer) error {
+	resp, err := s.Tasks(stream.Context(), req)
+	if err != nil {
+		return wrapErrorf(err, "get tasks to stream")
+	}
+
+	for _, task := range resp.Tasks {
+		if err := stream.Send(task); err != nil {
+			return wrapErrorf(err, "send stream tasks")
+		}
+	}
+	return nil
 }
 
 // Queues returns a mapping from queue names to queue sizes.

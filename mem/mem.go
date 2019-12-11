@@ -315,7 +315,11 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 		}
 		t := item.task
 		if tq.Claimant == uuid.Nil || now.After(t.At) || tq.Claimant == t.Claimant {
-			tasks = append(tasks, t)
+			if tq.OmitValues {
+				tasks = append(tasks, t.CopyOmitValue())
+			} else {
+				tasks = append(tasks, t.Copy())
+			}
 		}
 	}
 	return tasks, nil

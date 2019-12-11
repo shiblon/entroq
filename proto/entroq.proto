@@ -142,6 +142,7 @@ message ModifyDep {
 // TasksRequest is sent to request a complete listing of tasks for the
 // given queue. If claimant_id is empty, all tasks (not just expired
 // or owned tasks) are returned.
+// Next Tag: 6
 message TasksRequest {
   string claimant_id = 1;
   string queue = 2;
@@ -151,6 +152,9 @@ message TasksRequest {
   // and simultaneously fits other specifications, will be returned.
   // If empty, all tasks that fit other specifications will be returned.
   repeated string task_id = 4;
+
+  // If omit_values is true, then only metadata will be returned, no actual values.
+  bool omit_values = 5;
 }
 
 // TasksReqponse contains the tasks requested.
@@ -190,4 +194,6 @@ service EntroQ {
   rpc Queues(QueuesRequest) returns (QueuesResponse);
   rpc QueueStats(QueuesRequest) returns (QueuesResponse);
   rpc Time(TimeRequest) returns (TimeResponse);
+
+  rpc StreamTasks(TasksRequest) returns (stream Task);
 }
