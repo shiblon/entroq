@@ -117,9 +117,9 @@ func Run(ctx context.Context, t *entroq.Task) ([]entroq.ModifyArg, error) {
 
 	if len(input.Cmd) == 0 {
 		log.Print("Empty command")
+		input.Err = "Empty command"
 		return []entroq.ModifyArg{
-			t.AsDeletion(),
-			entroq.InsertingInto(outbox, entroq.WithValue(input.AsOutput().JSON())),
+			t.AsChange(entroq.QueueTo(t.Queue+"/empty"), entroq.ValueTo(input.JSON())),
 		}, nil
 	}
 
