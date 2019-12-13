@@ -36,22 +36,6 @@ var (
 	inbox   string
 )
 
-type SubprocessInput struct {
-	Cmd    []string `json:"cmd"`
-	Dir    string   `json:"dir"`
-	Env    []string `json:"env"`
-	Outbox string   `json:"outbox"`
-}
-
-type SubprocessOutput struct {
-	Cmd    []string `json:"cmd"`
-	Dir    string   `json:"dir"`
-	Env    []string `json:"env"`
-	Error  string   `json:"statusMessage"`
-	Stdout string   `json:"stdout"`
-	Stderr string   `json:"stderr"`
-}
-
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
 	Use:   "eqprocworker [options]",
