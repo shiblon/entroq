@@ -3,6 +3,13 @@
 //
 // Basically, it runs what you ask it to run, and pushes results where you
 // want them.
+//
+// Because of this, YOU SHOULD NEVER USE THIS. Really. Just don't. It's super
+// dangerous - anyone that has access to push tasks into your queue can make
+// you run arbitrary things as your process user. That's horrible and bad and
+// scary, even in a controlled environment.
+//
+// Containers do not make this better, at least not better enough.
 package procworker
 
 import (
