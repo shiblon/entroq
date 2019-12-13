@@ -25,9 +25,10 @@ import (
 )
 
 var (
-	flagTsQueue string
-	flagTsIDs   []string
-	flagTsLimit int
+	flagTsQueue      string
+	flagTsIDs        []string
+	flagTsLimit      int
+	flagTsOmitValues bool
 )
 
 func init() {
@@ -36,6 +37,7 @@ func init() {
 	tsCmd.Flags().StringVarP(&flagTsQueue, "queue", "q", "", "Queue to read tasks from. Can be blank if IDs are given.")
 	tsCmd.Flags().StringArrayVarP(&flagTsIDs, "task", "t", nil, "Task IDs to read from. Optional.")
 	tsCmd.Flags().IntVarP(&flagTsLimit, "limit", "n", 0, "Limit of tasks, unlimited if 0.")
+	tsCmd.Flags().BoolVarP(&flagTsOmitValues, "omit_values", "V", false, "Omit values in task output")
 }
 
 // tsCmd represents the ts command
@@ -55,7 +57,14 @@ var tsCmd = &cobra.Command{
 			}
 			ids = append(ids, uid)
 		}
-		ts, err := eq.Tasks(context.Background(), flagTsQueue, entroq.WithTaskID(ids...), entroq.LimitTasks(flagTsLimit))
+		opts := []entroq.TasksOpt{
+			entroq.WithTaskID(ids...),
+			entroq.LimitTasks(flagTsLimit),
+		}
+		if flagTsOmitValues {
+			opts = append(opts, entroq.OmitValues())
+		}
+		ts, err := eq.Tasks(context.Background(), flagTsQueue, opts...)
 		if err != nil {
 			log.Fatalf("Error getting tasks: %v", err)
 		}
