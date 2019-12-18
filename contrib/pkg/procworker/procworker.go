@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"entrogo.com/entroq"
@@ -69,7 +70,7 @@ func (p *SubprocessInput) AsOutput() *SubprocessOutput {
 		Errdir: p.Errdir,
 	}
 
-	ts := time.Now().UTC().Format("20060102-150405")
+	ts := strings.Replace(time.Now().UTC().Format("20060102-150405.000"), ".", "", -1)
 
 	if p.Outdir != "" {
 		out.Outfile = filepath.Join(p.Outdir, fmt.Sprintf("%s.STDOUT", ts))
