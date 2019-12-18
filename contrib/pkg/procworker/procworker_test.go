@@ -3,8 +3,11 @@ package procworker
 import (
 	"context"
 	"encoding/json"
+	"io/ioutil"
 	"log"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -52,6 +55,12 @@ func TestRun(t *testing.T) {
 	const inbox = "/subproctest/inbox"
 	const implicitOutbox = inbox + "/done"
 
+	outdir, err := ioutil.TempDir("", "procworker-test-")
+	if err != nil {
+		t.Fatalf("Could not create temp dir: %v", err)
+	}
+	defer os.RemoveAll(outdir)
+
 	cases := []struct {
 		in     *SubprocessInput
 		expect *SubprocessOutput
@@ -67,6 +76,22 @@ func TestRun(t *testing.T) {
 				Env:    []string{"VAR=my value"},
 				Stdout: "output here, var=my value\n",
 				Stderr: "error here\n",
+			},
+		},
+		{
+			in: &SubprocessInput{
+				Cmd:    []string{"/bin/bash", "-c", `echo "output here, var=${VAR}"; echo 1>&2 'error here'`},
+				Env:    []string{"VAR=my value"},
+				Outdir: outdir,
+				Errdir: outdir,
+			},
+			expect: &SubprocessOutput{
+				Cmd:     []string{"/bin/bash", "-c", `echo "output here, var=${VAR}"; echo 1>&2 'error here'`},
+				Env:     []string{"VAR=my value"},
+				Outfile: "output here, var=my value\n", // use contents here even though that's wrong in practice.
+				Errfile: "error here\n",
+				Stdout:  "",
+				Stderr:  "",
 			},
 		},
 		{
@@ -113,6 +138,56 @@ func TestRun(t *testing.T) {
 		output := new(SubprocessOutput)
 		if err := json.Unmarshal(task.Value, output); err != nil {
 			t.Fatalf("Unmarshal output task: %v", err)
+		}
+
+		if test.in.Outdir != "" {
+			if output.Outfile == "" {
+				t.Fatalf("Expected output file in directory %q, but none given", test.in.Outdir)
+			}
+			if !filepath.HasPrefix(output.Outfile, test.in.Outdir) {
+				t.Fatalf("Expected output file to be in dir %q, but got %q", test.in.Outdir, output.Outfile)
+			}
+			if !strings.HasSuffix(output.Outfile, ".STDOUT") {
+				t.Errorf("Expected output file to have STDOUT extension, but got this: %q", output.Outfile)
+			}
+			val, err := ioutil.ReadFile(output.Outfile)
+			if err != nil {
+				t.Fatalf("Error opening output file: %v", err)
+			}
+			if want, got := test.expect.Outfile, string(val); want != got {
+				t.Fatalf("Expected output file to contain %q, got %q", want, got)
+			}
+			// Set things up so that the diff passes, now that we've checked all of the important things.
+			test.expect.Outfile = output.Outfile
+		} else {
+			if output.Outfile != "" {
+				t.Fatalf("Expected no output file, but found %q", output.Outfile)
+			}
+		}
+
+		if test.in.Errdir != "" {
+			if output.Errfile == "" {
+				t.Fatalf("Expected error file in directory %q, but none given", test.in.Errdir)
+			}
+			if !filepath.HasPrefix(output.Errfile, test.in.Errdir) {
+				t.Fatalf("Expected error file to be in dir %q, but got %q", test.in.Errdir, output.Errfile)
+			}
+			if !strings.HasSuffix(output.Errfile, ".STDERR") {
+				t.Errorf("Expected error file to have STDERR extension, but got this: %q", output.Errfile)
+			}
+			val, err := ioutil.ReadFile(output.Errfile)
+			if err != nil {
+				t.Fatalf("Error opening output file: %v", err)
+			}
+			if want, got := test.expect.Errfile, string(val); want != got {
+				t.Fatalf("Expected error file to contain %q, got %q", want, got)
+			}
+			// Set things up so that the diff passes, now that we've checked all of the important things.
+			test.expect.Errfile = output.Errfile
+		} else {
+			if output.Errfile != "" {
+				t.Fatalf("Expected no error file, but found %q", output.Errfile)
+			}
 		}
 
 		if diff := cmp.Diff(test.expect, output); diff != "" {
