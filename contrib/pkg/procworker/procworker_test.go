@@ -90,6 +90,8 @@ func TestRun(t *testing.T) {
 				Env:     []string{"VAR=my value"},
 				Outfile: "output here, var=my value\n", // use contents here even though that's wrong in practice.
 				Errfile: "error here\n",
+				Outdir:  outdir,
+				Errdir:  outdir,
 				Stdout:  "",
 				Stderr:  "",
 			},
