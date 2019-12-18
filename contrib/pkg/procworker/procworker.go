@@ -62,9 +62,11 @@ func (p *SubprocessInput) JSON() []byte {
 // AsOutput creates an output structure from the input, for filling in results.
 func (p *SubprocessInput) AsOutput() *SubprocessOutput {
 	out := &SubprocessOutput{
-		Cmd: p.Cmd,
-		Env: p.Env,
-		Dir: p.Dir,
+		Cmd:    p.Cmd,
+		Env:    p.Env,
+		Dir:    p.Dir,
+		Outdir: p.Outdir,
+		Errdir: p.Errdir,
 	}
 
 	ts := time.Now().UTC().Format("20060102-150405")
@@ -87,6 +89,8 @@ type SubprocessOutput struct {
 	Dir    string   `json:"dir"`
 	Env    []string `json:"env"`
 	Err    string   `json:"err"`
+	Outdir string   `json:"outdir"`
+	Errdir string   `json:"errdir"`
 	Stdout string   `json:"stdout"`
 	Stderr string   `json:"stderr"`
 
@@ -153,9 +157,9 @@ func Run(ctx context.Context, t *entroq.Task) ([]entroq.ModifyArg, error) {
 
 	if len(input.Cmd) == 0 {
 		log.Print("Empty command")
-		input.Err = "Empty command"
 		return []entroq.ModifyArg{
-			t.AsChange(entroq.QueueTo(t.Queue+"/empty"), entroq.ValueTo(input.JSON())),
+			t.AsDeletion(),
+			entroq.InsertingInto(outbox, entroq.WithValue(input.AsOutput().JSON())),
 		}, nil
 	}
 
