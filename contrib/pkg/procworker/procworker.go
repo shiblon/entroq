@@ -184,9 +184,12 @@ func Run(ctx context.Context, t *entroq.Task) ([]entroq.ModifyArg, error) {
 		outbuf = new(bytes.Buffer)
 		outWriters = append(outWriters, outbuf)
 	} else {
+		if err := os.MkdirAll(filepath.Dir(output.Outfile), 0775); err != nil {
+			return nil, errors.Wrapf(err, "creating stdout dir %q", output.Outfile)
+		}
 		outFile, err := os.Create(output.Outfile)
 		if err != nil {
-			return nil, errors.Wrapf(err, "Error creating stdout file %q", output.Outfile)
+			return nil, errors.Wrapf(err, "creating stdout file %q", output.Outfile)
 		}
 		defer outFile.Close()
 		outWriters = append(outWriters, outFile)
@@ -196,9 +199,12 @@ func Run(ctx context.Context, t *entroq.Task) ([]entroq.ModifyArg, error) {
 		errbuf = new(bytes.Buffer)
 		errWriters = append(errWriters, errbuf)
 	} else {
+		if err := os.MkdirAll(filepath.Dir(output.Errfile), 0775); err != nil {
+			return nil, errors.Wrapf(err, "creating stdout dir %q", output.Errfile)
+		}
 		errFile, err := os.Create(output.Errfile)
 		if err != nil {
-			return nil, errors.Wrapf(err, "Error creating stderr file %q", output.Errfile)
+			return nil, errors.Wrapf(err, "creating stderr file %q", output.Errfile)
 		}
 		defer errFile.Close()
 		errWriters = append(errWriters, errFile)
