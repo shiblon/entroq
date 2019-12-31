@@ -51,7 +51,7 @@ snapshots of queue state.
 
 Both `Claim` and `Modify` change the version number of every task they affect.
 Any time any task is mutated, its version increments. Thus, if one process
-manages to mutate at task, any other process that was working on it will find
+manages to mutate a task, any other process that was working on it will find
 that it is not available, and will fail. This is the key concept behind the
 "commit once" semantics of EntroQ.
 
