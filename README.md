@@ -120,7 +120,7 @@ finished. It also allows the network time to return the task to the claimant.
 Note: best practice is to keep the initial claim time relatively low, then rely
 on the claimant to update the arrival time periodically. This allows for
 situations like network partitions to be recovered from relatively quickly:
-a new worker will mor quickly pick up a task that missed a 30-second renewal
+a new worker will more quickly pick up a task that missed a 30-second renewal
 window than one that was reserved for 15 minutes with a claimant that died
 early in its lease.
 
