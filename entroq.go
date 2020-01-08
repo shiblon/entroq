@@ -53,6 +53,11 @@ func (t TaskID) AsDeletion() ModifyArg {
 	return Deleting(t.ID, t.Version)
 }
 
+// AsDependency produces an appropriate ModifyArg to depend on this task ID.
+func (t TaskID) AsDependency() ModifyArg {
+	return DependingOn(t.ID, t.Version)
+}
+
 // TaskData contains just the data, not the identifier or metadata. Used for insertions.
 type TaskData struct {
 	Queue string

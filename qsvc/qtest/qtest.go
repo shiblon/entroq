@@ -308,6 +308,64 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	}
 }
 
+// WorkerDependencyHandler tests that workers with specified dependency
+// handlers get called on dependency errors, and that upgrades to fatal errors
+// happen appropriately.
+func WorkerDependencyHandler(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	t.Helper()
+
+	queue := path.Join(qPrefix, "dep-handler-queue")
+
+	timesHandled := make(chan int, 1)
+	timesHandled <- 0
+
+	upgradeError := errors.New("upgraded")
+
+	leaseTime := 3 * time.Second
+
+	onDep := func(err entroq.DependencyError) error {
+		h := <-timesHandled
+		defer func() {
+			timesHandled <- h + 1
+			// Also give the task time to expire before the loop tries again,
+			// otherwise it waits for a long time (no notification for tasks
+			// becoming available).
+			time.Sleep(leaseTime)
+		}()
+		switch h {
+		case 0:
+			return nil // first time through, we ignore it, don't upgrade it.
+		case 1:
+			return upgradeError // second time through upgrade it.
+		default:
+			t.Fatalf("Called dependency handler too many times: %v", timesHandled)
+			return nil
+		}
+	}
+
+	if _, _, err := client.Modify(ctx, entroq.InsertingInto(queue)); err != nil {
+		t.Fatalf("Failed to insert task: %v", err)
+	}
+
+	w := client.NewWorker(queue).WithOpts(entroq.WithDependencyHandler(onDep), entroq.WithLease(leaseTime))
+
+	ctx, cancel := context.WithTimeout(ctx, 3*leaseTime)
+	defer cancel()
+
+	err := w.Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
+		// Return a modification that will fail because it depends on a non-existent task ID.
+		return []entroq.ModifyArg{task.AsDeletion(), entroq.DependingOn(uuid.New(), 0)}, nil
+	})
+
+	if errors.Cause(err) != upgradeError {
+		t.Fatalf("Expected upgrade error, got %v", err)
+	}
+
+	if h := <-timesHandled; h != 2 {
+		t.Fatalf("Expected to have a safe error, then a fatal error, only ran %v times", h)
+	}
+}
+
 // WorkerMoveOnError tests that workers that have JustMoveTaskError results
 // move the task into an error queue with the expected wrapper and don't just
 // crash.
