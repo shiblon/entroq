@@ -3,19 +3,33 @@
 //
 // Basically, it runs what you ask it to run, and pushes results where you
 // want them.
+//
+// Because of this, YOU SHOULD NEVER USE THIS. Really. Just don't. It's super
+// dangerous - anyone that has access to push tasks into your queue can make
+// you run arbitrary things as your process user. That's horrible and bad and
+// scary, even in a controlled environment.
+//
+// Containers do not make this better, at least not better enough.
 package procworker
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
 
 	"entrogo.com/entroq"
+	"github.com/pkg/errors"
 )
+
+const MaxStdOutSize = 1024 * 1024
 
 // SubprocessInput contains information about the subprocess to run. Task
 // values should be JSON-encoded versions of this structure.
@@ -25,6 +39,12 @@ type SubprocessInput struct {
 	Env    []string `json:"env"`
 	Outbox string   `json:"outbox"`
 	Errbox string   `json:"errbox"`
+
+	// Directory names for stdout and stderr. If empty, outputs as string into
+	// Stdout and Stderr fields. If specified, creates a random file
+	// name.stdout/stderr file.
+	Outdir string `json:"outdir"`
+	Errdir string `json:"errdir"`
 
 	// Err is the most recent error, in case this is moved to a failure queue
 	// before a process can start.
@@ -42,11 +62,25 @@ func (p *SubprocessInput) JSON() []byte {
 
 // AsOutput creates an output structure from the input, for filling in results.
 func (p *SubprocessInput) AsOutput() *SubprocessOutput {
-	return &SubprocessOutput{
-		Cmd: p.Cmd,
-		Env: p.Env,
-		Dir: p.Dir,
+	out := &SubprocessOutput{
+		Cmd:    p.Cmd,
+		Env:    p.Env,
+		Dir:    p.Dir,
+		Outdir: p.Outdir,
+		Errdir: p.Errdir,
 	}
+
+	ts := strings.Replace(time.Now().UTC().Format("20060102-150405.000"), ".", "", -1)
+
+	if p.Outdir != "" {
+		out.Outfile = filepath.Join(p.Outdir, fmt.Sprintf("%s.STDOUT", ts))
+	}
+
+	if p.Errdir != "" {
+		out.Errfile = filepath.Join(p.Errdir, fmt.Sprintf("%s.STDERR", ts))
+	}
+
+	return out
 }
 
 // SubprocessOutput contains results from the subprocess that was run. Task
@@ -56,8 +90,16 @@ type SubprocessOutput struct {
 	Dir    string   `json:"dir"`
 	Env    []string `json:"env"`
 	Err    string   `json:"err"`
+	Outdir string   `json:"outdir"`
+	Errdir string   `json:"errdir"`
 	Stdout string   `json:"stdout"`
 	Stderr string   `json:"stderr"`
+
+	// If Outfile and Errfile were specified in the input, this contains
+	// the final full pathnames of those files.
+	Outfile string `json:"outfile"`
+	Errfile string `json:"errfile"`
+	// TODO: use the input and fill these outputs.
 }
 
 // JSON creates JSON from the input.
@@ -71,17 +113,23 @@ func (p *SubprocessOutput) JSON() []byte {
 
 // TeeWriter writes to two writers what is written to it.
 type TeeWriter struct {
-	w1 io.Writer
-	w2 io.Writer
+	writers []io.Writer
+}
+
+// NewTeeWriter crates a new TeeWriter with the given writers to fan input out to.
+func NewTeeWriter(writers ...io.Writer) *TeeWriter {
+	return &TeeWriter{writers: writers}
 }
 
 // Write forwards the data written to it to the two writers within.
-func (w TeeWriter) Write(data []byte) (int, error) {
-	n, err := w.w2.Write(data)
-	if err != nil {
-		return n, err
+func (w *TeeWriter) Write(data []byte) (int, error) {
+	for _, writer := range w.writers {
+		n, err := writer.Write(data)
+		if err != nil {
+			return n, err
+		}
 	}
-	return w.w1.Write(data)
+	return len(data), nil
 }
 
 // Run is a function that can be passed to a worker's Run method. The worker
@@ -122,13 +170,48 @@ func Run(ctx context.Context, t *entroq.Task) ([]entroq.ModifyArg, error) {
 	}
 	cmd.Dir = input.Dir
 
-	outbuf := new(bytes.Buffer)
-	errbuf := new(bytes.Buffer)
-
-	cmd.Stdout = TeeWriter{os.Stdout, outbuf}
-	cmd.Stderr = TeeWriter{os.Stderr, errbuf}
-
 	output := input.AsOutput()
+	outWriters := []io.Writer{os.Stdout}
+	errWriters := []io.Writer{os.Stderr}
+
+	// Create output buffers if needed, otherwise open files.
+	var (
+		outbuf *bytes.Buffer
+		errbuf *bytes.Buffer
+	)
+
+	if output.Outfile == "" {
+		outbuf = new(bytes.Buffer)
+		outWriters = append(outWriters, outbuf)
+	} else {
+		if err := os.MkdirAll(filepath.Dir(output.Outfile), 0775); err != nil {
+			return nil, errors.Wrapf(err, "creating stdout dir %q", output.Outfile)
+		}
+		outFile, err := os.Create(output.Outfile)
+		if err != nil {
+			return nil, errors.Wrapf(err, "creating stdout file %q", output.Outfile)
+		}
+		defer outFile.Close()
+		outWriters = append(outWriters, outFile)
+	}
+
+	if output.Errfile == "" {
+		errbuf = new(bytes.Buffer)
+		errWriters = append(errWriters, errbuf)
+	} else {
+		if err := os.MkdirAll(filepath.Dir(output.Errfile), 0775); err != nil {
+			return nil, errors.Wrapf(err, "creating stdout dir %q", output.Errfile)
+		}
+		errFile, err := os.Create(output.Errfile)
+		if err != nil {
+			return nil, errors.Wrapf(err, "creating stderr file %q", output.Errfile)
+		}
+		defer errFile.Close()
+		errWriters = append(errWriters, errFile)
+	}
+
+	cmd.Stdout = NewTeeWriter(outWriters...)
+	cmd.Stderr = NewTeeWriter(errWriters...)
 
 	destQueue := outbox
 
@@ -145,8 +228,18 @@ func Run(ctx context.Context, t *entroq.Task) ([]entroq.ModifyArg, error) {
 		}
 	}
 
-	output.Stdout = outbuf.String()
-	output.Stderr = errbuf.String()
+	if outbuf != nil {
+		output.Stdout = outbuf.String()
+		if len(output.Stdout) > MaxStdOutSize {
+			output.Stdout = "<truncated...>\n" + output.Stdout[len(output.Stdout)-MaxStdOutSize:]
+		}
+	}
+	if errbuf != nil {
+		output.Stderr = errbuf.String()
+		if len(output.Stderr) > MaxStdOutSize {
+			output.Stderr = "<truncated...>\n" + output.Stderr[len(output.Stderr)-MaxStdOutSize:]
+		}
+	}
 
 	return []entroq.ModifyArg{
 		t.AsDeletion(),
