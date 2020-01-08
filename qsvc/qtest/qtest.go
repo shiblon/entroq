@@ -1039,16 +1039,14 @@ func EqualAllTasks(want, got []*entroq.Task) string {
 	return ""
 }
 
-// EqualAllTasksOmitValues returns a string diff if any tasks in the list are unequal, not counting values.
+// EqualAllTasksOmitValues returns a string diff if any tasks in the list are
+// unequal, not counting values in want (leaving got alone).
 func EqualAllTasksOmitValues(want, got []*entroq.Task) string {
-	var wantNoVal, gotNoVal []*entroq.Task
+	var wantNoVal []*entroq.Task
 	for _, t := range want {
 		wantNoVal = append(wantNoVal, t.CopyOmitValue())
 	}
-	for _, t := range got {
-		gotNoVal = append(gotNoVal, t.CopyOmitValue())
-	}
-	return EqualAllTasks(wantNoVal, gotNoVal)
+	return EqualAllTasks(wantNoVal, got)
 }
 
 // EqualAllTasksVersionIncr returns a non-empty diff if any of the tasks are
