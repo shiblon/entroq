@@ -16,6 +16,11 @@ import (
 // returned.
 type ErrQMap func(inbox string) string
 
+// DependencyHandler is called (if set) when a worker run finishes with a
+// dependency error. If it returns a non-nil error, that converts into a fatal
+// error.
+type DependencyHandler func(err DependencyError) error
+
 // Worker creates an iterator-like protocol for processing tasks in a queue,
 // one at a time, in a loop. Each worker should only be accessed from a single
 // goroutine. If multiple goroutines are desired, they should each use their
@@ -39,9 +44,12 @@ type Worker struct {
 	// is returned from a worker's run function.
 	ErrQMap ErrQMap
 
+	// OnDepErr can hold a function to be called when a dependency error is
+	// encountered. if it returns a non-nil error, it will become fatal.
+	OnDepErr DependencyHandler
+
 	eqc *EntroQ
 
-	renew time.Duration
 	lease time.Duration
 }
 
@@ -89,7 +97,6 @@ func NewWorker(eq *EntroQ, qs ...string) *Worker {
 
 		eqc:   eq,
 		lease: DefaultClaimDuration,
-		renew: DefaultClaimDuration / 2,
 	}
 }
 
@@ -102,7 +109,6 @@ func (w *Worker) WithOpts(opts ...WorkerOption) *Worker {
 	for _, opt := range opts {
 		opt(w)
 	}
-	w.renew = w.lease / 2
 	return w
 }
 
@@ -127,7 +133,7 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 	defer func() {
 		log.Printf("Finishing EntroQ worker %q on client %v: err=%v", w.Qs, w.eqc.ID(), err)
 	}()
-	log.Printf("Starting EntroQ worker %q on client %v", w.Qs, w.eqc.ID())
+	log.Printf("Starting EntroQ worker %q on client %v, leasing for %v at a time", w.Qs, w.eqc.ID(), w.lease)
 
 	for {
 		select {
@@ -209,7 +215,13 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 		}
 
 		if _, _, err := w.eqc.Modify(ctx, WithModification(modification)); err != nil {
-			if _, ok := AsDependency(err); ok {
+			if depErr, ok := AsDependency(err); ok {
+				if w.OnDepErr != nil {
+					if err := w.OnDepErr(depErr); err != nil {
+						log.Printf("Dependency error upgraded to fatal: %v", err)
+						return errors.Wrap(err, "worker depdency error upgraded to fatal")
+					}
+				}
 				log.Printf("Worker ack failed (%q), throwing away: %v", w.Qs, err)
 				continue
 			}
@@ -243,6 +255,24 @@ func WithLease(d time.Duration) WorkerOption {
 func WithErrQMap(f ErrQMap) WorkerOption {
 	return func(w *Worker) {
 		w.ErrQMap = f
+	}
+}
+
+// WithDependencyHandler sets a function to be called when a worker
+// encounters a dependency error. If this function returns a non-nil error, the
+// worker will exit.
+//
+// Note that workers always exit on non-dependency errors, but usually treat
+// dependency errors as things that can be retried. Specifying a handler for
+// dependency errors allows different behavior as needed.
+//
+// One possible use case for a dependency error handler is to reload a
+// configuration task for the next round: if the task is depended on, but has
+// been changed, the task can be retried, but configuration should also be
+// reloaded, which could be done in a handler.
+func WithDependencyHandler(f DependencyHandler) WorkerOption {
+	return func(w *Worker) {
+		w.OnDepErr = f
 	}
 }
 

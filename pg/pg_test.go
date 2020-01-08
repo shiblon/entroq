@@ -151,6 +151,19 @@ func TestMultiWorker(t *testing.T) {
 	qtest.MultiWorker(ctx, t, client, "pgtest/"+uuid.New().String())
 }
 
+func TestWorkerDependencyHandler(t *testing.T) {
+	ctx := context.Background()
+
+	client, stop, err := pgClient(ctx)
+	if err != nil {
+		t.Fatalf("Failed to create pg service and client: %v", err)
+	}
+	defer stop()
+
+	log.Printf("Worker dependency handler")
+	qtest.WorkerDependencyHandler(ctx, t, client, "pgtest/"+uuid.New().String())
+}
+
 func TestWorkerMoveOnError(t *testing.T) {
 	ctx := context.Background()
 

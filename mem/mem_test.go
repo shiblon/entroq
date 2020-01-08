@@ -108,6 +108,18 @@ func TestMultiWorker(t *testing.T) {
 	qtest.MultiWorker(ctx, t, client, "")
 }
 
+func TestWorkerDependencyHandler(t *testing.T) {
+	ctx := context.Background()
+
+	client, stop, err := qtest.ClientService(ctx, Opener())
+	if err != nil {
+		t.Fatalf("Get client: %v", err)
+	}
+	defer stop()
+
+	qtest.WorkerDependencyHandler(ctx, t, client, "")
+}
+
 func TestWorkerMoveOnError(t *testing.T) {
 	ctx := context.Background()
 
