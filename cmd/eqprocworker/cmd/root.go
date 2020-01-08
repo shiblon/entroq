@@ -62,6 +62,11 @@ var rootCmd = &cobra.Command{
 
 	If the errbox is not specified, it is the same as the outbox.
 
+	You can also specify "outdir" and "errdir". If these are specified, stdout
+	and/or stderr will be written to files in those directories instead of
+	inlined in the response task. The "outfile" and "errfile" parameters will
+	point to those files.
+
 	A task, if something is wrong with it, may also end up in one of the following:
 
 	  <inbox>/failed-parse
