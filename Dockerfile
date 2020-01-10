@@ -24,7 +24,7 @@ COPY --from=builder /build/bin/* /go/bin/
 COPY cmd/eqsvc.sh /go/bin/
 WORKDIR /go/bin
 
-RUN adduser -S -D -H -h /go/src/entrogo.com/entroq appuser
+RUN adduser -S -D -H -h /go/src/entrogo.com/entroq -u 100 appuser
 USER appuser
 
 ENTRYPOINT ["./eqsvc.sh"]
