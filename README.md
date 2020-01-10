@@ -2,10 +2,10 @@
 
 A task queue with strong competing-consumer semantics and transactional updates.
 
-Pronounced "Entro-Q", as in the letter than comes after "Entro-P". We aim to
-take the next step away from parallel systems chaos. It is also the descendent
-of `github.com/shiblon/taskstore`, an earlier and less robust attempt at the
-same idea.
+Pronounced "Entro-Q" ("Entro-Queue"), as in the letter than comes after
+"Entro-P". We aim to take the next step away from parallel systems chaos. It is
+also the descendent of `github.com/shiblon/taskstore`, an earlier and less
+robust attempt at the same idea.
 
 It is designed to be as simple and modular as possible, doing one thing well.
 It is not a pubsub system, a database, or a generic RPC mechanism. It is only a
