@@ -252,7 +252,8 @@ func (b *backend) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[s
 			queue,
 			COUNT(*) AS count,
 			COUNT(*) FILTER(WHERE at > NOW() AND claimant != '00000000-0000-0000-0000-000000000000') AS claimed,
-			COUNT(*) FILTER(WHERE at <= NOW()) as available
+			COUNT(*) FILTER(WHERE at <= NOW()) as available,
+			MAX(claims) AS max_claims
 		FROM tasks`
 	var values []interface{}
 
@@ -293,8 +294,9 @@ func (b *backend) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[s
 			count     int
 			claimed   int
 			available int
+			maxClaims int
 		)
-		if err := rows.Scan(&q, &count, &claimed, &available); err != nil {
+		if err := rows.Scan(&q, &count, &claimed, &available, &maxClaims); err != nil {
 			return nil, errors.Wrap(err, "row scan")
 		}
 		queues[q] = &entroq.QueueStat{
@@ -302,6 +304,7 @@ func (b *backend) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[s
 			Size:      count,
 			Claimed:   claimed,
 			Available: available,
+			MaxClaims: maxClaims,
 		}
 	}
 	if err := rows.Err(); err != nil {

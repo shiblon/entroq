@@ -1004,12 +1004,14 @@ func QueueStats(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefi
 			Size:      2,
 			Claimed:   0,
 			Available: 2,
+			MaxClaims: 0,
 		},
 		partiallyClaimedQueue: &entroq.QueueStat{
 			Name:      partiallyClaimedQueue,
 			Size:      3,
 			Claimed:   1,
 			Available: 2,
+			MaxClaims: 1,
 		},
 	}
 

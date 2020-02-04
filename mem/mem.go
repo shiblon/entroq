@@ -253,6 +253,7 @@ func (b *backend) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[s
 		// claimant and their arrival time is in the future.
 		claimed := 0
 		available := 0
+		maxClaims := 0
 		for _, item := range heap.Items() {
 			if item.task.At.After(now) {
 				if item.task.Claimant != uuid.Nil {
@@ -261,12 +262,16 @@ func (b *backend) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[s
 			} else {
 				available++
 			}
+			if int(item.task.Claims) > maxClaims {
+				maxClaims = int(item.task.Claims)
+			}
 		}
 		qs[q] = &entroq.QueueStat{
 			Name:      q,
 			Size:      heap.Len(),
 			Claimed:   claimed,
 			Available: available,
+			MaxClaims: maxClaims,
 		}
 	}
 	return qs, nil
