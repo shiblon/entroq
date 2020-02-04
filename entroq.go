@@ -234,6 +234,8 @@ type QueueStat struct {
 	Size      int    `json:"size"`      // The total number of tasks.
 	Claimed   int    `json:"claimed"`   // The number of currently claimed tasks.
 	Available int    `json:"available"` // The number of available tasks.
+
+	MaxClaims int `json:"maxClaims"` // The maximum number of claims for a task in the queue.
 }
 
 // QueuesFromStats can be used for converting the new QueueStats to the old

@@ -68,6 +68,10 @@ message QueueStats {
   int32 num_tasks = 2;
   int32 num_claimed = 3;
   int32 num_available = 4;
+
+  // Maximum claims value for any task in the queue
+  // (can help detect tasks that are causing crashes, etc.)
+  int32 max_claims = 5;
 }
 
 // ClaimRequest is sent to attempt to claim a task from a queue. The claimant ID
