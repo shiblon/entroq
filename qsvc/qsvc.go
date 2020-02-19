@@ -34,6 +34,8 @@ package qsvc // import "entrogo.com/entroq/qsvc"
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"time"
 
 	"entrogo.com/entroq"
@@ -356,4 +358,41 @@ func (s *QSvc) QueueStats(ctx context.Context, req *pb.QueuesRequest) (*pb.Queue
 // Time returns the current time in milliseconds since the Epoch.
 func (s *QSvc) Time(ctx context.Context, req *pb.TimeRequest) (*pb.TimeResponse, error) {
 	return &pb.TimeResponse{TimeMs: toMS(time.Now().UTC())}, nil
+}
+
+func (s *QSvc) NewHTTPHandler(prefix string) http.Handler {
+	wrapErr := func(w http.ResponseWriter, code int, err error) {
+		w.StatusCode = code
+		fmt.Fprint(err.Error())
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc(prefix+"/v1/claim", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			wrapErr(w, http.StatusBadRequest, fmt.Errorf("not a POST request"))
+			return
+		}
+
+		req := new(pb.ClaimRequest)
+		if err := jsonpb.Unmarshal(r.Body, req); err != nil {
+			wrapErr(w, http.StatusBadRequest, fmt.Errorf("unmarshal proto: %v", err))
+			return
+		}
+		resp, err := s.Claim(r.Context(), req)
+		if err != nil {
+			wrapErr(w, http.StatusInternalServerError, fmt.Errorf("claim: %v", err))
+			return
+		}
+		// TODO: handle dependency errors differently. Send back JSON for those, too.
+
+		respBytes, err := jsonpb.Marshal(resp)
+		if err != nil {
+			wrapErr(w, http.StatusInternalServerError, fmt.Errorf("marshal: %v", err))
+			return
+		}
+
+		w.StatusCode = http.StatusOK
+		w.Header().Add("Content-Type", "application/json")
+		w.Header().Add("Content-Length", fmt.Sprintf("%d", len(respBytes)))
+		w.Write(respBytes)
+	})
 }
