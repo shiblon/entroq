@@ -29,8 +29,11 @@ USER appuser
 
 ENTRYPOINT ["./eqsvc.sh"]
 
+EXPOSE 37706
+EXPOSE 37708
+
 # Defalts to starting up an in-memory queue service on the default port.
 # Other options include "pg" with its associated flags.
 # If flags are left off, or the command is left off, the default in-memory
 # service is started.
-CMD ["mem", "--port=37706"]
+CMD ["mem", "--port=37706", "--http_port=37708"]
