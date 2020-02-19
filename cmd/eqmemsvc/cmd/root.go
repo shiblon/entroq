@@ -24,8 +24,9 @@ import (
 
 // Flags.
 var (
-	cfgFile string
-	port    int
+	cfgFile  string
+	port     int
+	httpPort int
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -45,6 +46,11 @@ var rootCmd = &cobra.Command{
 			return errors.Wrap(err, "failed to open mem backend for qsvc")
 		}
 		defer svc.Close()
+
+		if httpPort >= 0 {
+			log.Printf("Starting EntroQ HTTP service %d -> mem", httpPort)
+			go qsvc.HTTPListenAndServe(fmt.Sprintf(":%d", httpPort), svc, "/api/v1")
+		}
 
 		s := grpc.NewServer()
 		pb.RegisterEntroQServer(s, svc)
@@ -68,8 +74,10 @@ func init() {
 	pflags := rootCmd.PersistentFlags()
 	pflags.StringVar(&cfgFile, "config", "", "config file (default is $HOME/.config/eqmemsvc)")
 	pflags.IntVar(&port, "port", 37706, "Port to listen on.")
+	pflags.IntVar(&httpPort, "http_port", -1, "HTTP port to listen on. Default is not to listen on http.")
 
 	viper.BindPFlag("port", pflags.Lookup("port"))
+	viper.BindPFlag("http_port", pflags.Lookup("http_port"))
 }
 
 // initConfig reads in config file and ENV variables if set.

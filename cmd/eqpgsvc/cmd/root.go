@@ -40,6 +40,7 @@ import (
 var (
 	cfgFile  string
 	port     int
+	httpPort int
 	dbAddr   string
 	dbName   string
 	dbUser   string
@@ -64,6 +65,11 @@ var rootCmd = &cobra.Command{
 			return errors.Wrap(err, "failed to open pg backend")
 		}
 		defer svc.Close()
+
+		if httpPort >= 0 {
+			log.Printf("Starting EntroQ HTTP service %d -> mem", httpPort)
+			go qsvc.HTTPListenAndServe(fmt.Sprintf(":%d", httpPort), svc, "/api/v1")
+		}
 
 		lis, err := net.Listen("tcp", fmt.Sprintf("[::]:%d", port))
 		if err != nil {
@@ -92,6 +98,7 @@ func init() {
 	pflags := rootCmd.PersistentFlags()
 	pflags.StringVar(&cfgFile, "config", "", "config file (default is $HOME/.config/eqpgsvc)")
 	pflags.IntVar(&port, "port", 37706, "Service port number.")
+	pflags.IntVar(&httpPort, "http_port", -1, "HTTP port to listen on. Default is not to listen on http.")
 	pflags.StringVar(&dbAddr, "dbaddr", ":5432", "Address of PostgreSQL server.")
 	pflags.StringVar(&dbName, "dbname", "postgres", "Database housing tasks.")
 	pflags.StringVar(&dbUser, "dbuser", "postgres", "Database user name.")
@@ -99,6 +106,7 @@ func init() {
 	pflags.IntVar(&attempts, "attempts", 10, "Connection attempts, separated by 5-second pauses, before dying due to lack of backend connection.")
 
 	viper.BindPFlag("port", pflags.Lookup("port"))
+	viper.BindPFlag("http_port", pflags.Lookup("http_port"))
 	viper.BindPFlag("dbaddr", pflags.Lookup("dbaddr"))
 	viper.BindPFlag("dbname", pflags.Lookup("dbname"))
 	viper.BindPFlag("dbuser", pflags.Lookup("dbuser"))
