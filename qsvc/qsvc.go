@@ -35,10 +35,13 @@ package qsvc // import "entrogo.com/entroq/qsvc"
 import (
 	"context"
 	"fmt"
+	"io/ioutil"
+	"log"
 	"net/http"
 	"time"
 
 	"entrogo.com/entroq"
+	"github.com/golang/protobuf/jsonpb"
 	"github.com/golang/protobuf/proto"
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
@@ -231,10 +234,14 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 				pb.DepType_CLAIM:  depErr.Claims,
 			}
 
-			details := []proto.Message{&pb.ModifyDep{
-				Type: pb.DepType_DETAIL,
-				Msg:  depErr.Message,
-			}}
+			var details []proto.Message
+			if depErr.Message != "" {
+				details = append(details, &pb.ModifyDep{
+					Type: pb.DepType_DETAIL,
+					Msg:  depErr.Message,
+				})
+			}
+
 			for dtype, dvals := range tmap {
 				for _, tid := range dvals {
 					details = append(details, &pb.ModifyDep{
@@ -360,39 +367,126 @@ func (s *QSvc) Time(ctx context.Context, req *pb.TimeRequest) (*pb.TimeResponse,
 	return &pb.TimeResponse{TimeMs: toMS(time.Now().UTC())}, nil
 }
 
-func (s *QSvc) NewHTTPHandler(prefix string) http.Handler {
-	wrapErr := func(w http.ResponseWriter, code int, err error) {
-		w.StatusCode = code
-		fmt.Fprint(err.Error())
-	}
-	mux := http.NewServeMux()
-	mux.HandleFunc(prefix+"/v1/claim", func(w http.ResponseWriter, r *http.Request) {
+func httpWrapError(w http.ResponseWriter, code int, err error) {
+	w.WriteHeader(code)
+	fmt.Fprint(w, err.Error())
+}
+
+func grpcHTTPHandler(req proto.Message, f func(context.Context, proto.Message) (proto.Message, error)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+
 		if r.Method != http.MethodPost {
-			wrapErr(w, http.StatusBadRequest, fmt.Errorf("not a POST request"))
+			httpWrapError(w, http.StatusMethodNotAllowed, fmt.Errorf("not a POST request"))
 			return
 		}
 
-		req := new(pb.ClaimRequest)
-		if err := jsonpb.Unmarshal(r.Body, req); err != nil {
-			wrapErr(w, http.StatusBadRequest, fmt.Errorf("unmarshal proto: %v", err))
-			return
-		}
-		resp, err := s.Claim(r.Context(), req)
+		bodyBytes, err := ioutil.ReadAll(r.Body)
 		if err != nil {
-			wrapErr(w, http.StatusInternalServerError, fmt.Errorf("claim: %v", err))
+			httpWrapError(w, http.StatusBadRequest, fmt.Errorf("get body: %v", err))
 			return
 		}
-		// TODO: handle dependency errors differently. Send back JSON for those, too.
+		if err := jsonpb.UnmarshalString(string(bodyBytes), req); err != nil {
+			httpWrapError(w, http.StatusBadRequest, fmt.Errorf("unmarshal request body: %v\n\t%v", err, string(bodyBytes)))
+			return
+		}
 
-		respBytes, err := jsonpb.Marshal(resp)
+		resp, err := f(ctx, req)
 		if err != nil {
-			wrapErr(w, http.StatusInternalServerError, fmt.Errorf("marshal: %v", err))
-			return
+			switch stat := status.Convert(errors.Cause(err)); stat.Code() {
+			case codes.NotFound:
+				// Dependency error - get jsonify details.
+				details := new(pb.ModifyDeps)
+				for _, det := range stat.Details() {
+					detail, ok := det.(*pb.ModifyDep)
+					if !ok {
+						httpWrapError(w, http.StatusInternalServerError, fmt.Errorf("http handler unpack details"))
+						return
+					}
+					details.Deps = append(details.Deps, detail)
+				}
+				errStr, err := new(jsonpb.Marshaler).MarshalToString(details)
+				if err != nil {
+					httpWrapError(w, http.StatusInternalServerError, fmt.Errorf("http handler marshal: %v", err))
+					return
+				}
+				errBytes := []byte(errStr)
+				w.Header().Add("Content-Type", "application/json")
+				w.Header().Add("Content-Length", fmt.Sprint(len(errBytes)))
+				w.WriteHeader(http.StatusFailedDependency)
+				w.Write(errBytes)
+				return
+			case codes.InvalidArgument:
+				httpWrapError(w, http.StatusBadRequest, fmt.Errorf("http handler: %v", err))
+				return
+			case codes.Canceled, codes.DeadlineExceeded:
+				httpWrapError(w, http.StatusRequestTimeout, fmt.Errorf("http handler: %v", err))
+				return
+			default:
+				httpWrapError(w, http.StatusInternalServerError, fmt.Errorf("http handler: %v", err))
+				return
+			}
 		}
 
-		w.StatusCode = http.StatusOK
+		respStr, err := new(jsonpb.Marshaler).MarshalToString(resp)
+		if err != nil {
+			httpWrapError(w, http.StatusInternalServerError, fmt.Errorf("marshal: %v", err))
+			return
+		}
+		respBytes := []byte(respStr)
+
 		w.Header().Add("Content-Type", "application/json")
-		w.Header().Add("Content-Length", fmt.Sprintf("%d", len(respBytes)))
+		w.Header().Add("Content-Length", fmt.Sprint(len(respBytes)))
+		w.WriteHeader(http.StatusOK)
 		w.Write(respBytes)
-	})
+	}
+}
+
+// GRPCStub represents something callable with appropriate end points (server or client).
+type GRPCStub interface {
+	Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error)
+	TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error)
+	Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksResponse, error)
+	QueueStats(ctx context.Context, req *pb.QueuesRequest) (*pb.QueuesResponse, error)
+	Time(ctx context.Context, req *pb.TimeRequest) (*pb.TimeResponse, error)
+	Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyResponse, error)
+}
+
+// HTTPHandler returns an EntroQ http handler that defers to a gRPC
+// implementation such as *QSvc or *EntroQClient (with suitable wrapping to
+// allow or ignore variadic opts).
+func HTTPServeMux(stub GRPCStub, prefix string) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc(prefix+"/claim", grpcHTTPHandler(new(pb.ClaimRequest), func(ctx context.Context, req proto.Message) (proto.Message, error) {
+		msg, err := stub.Claim(ctx, req.(*pb.ClaimRequest))
+		return msg, err
+	}))
+	mux.HandleFunc(prefix+"/tryclaim", grpcHTTPHandler(new(pb.ClaimRequest), func(ctx context.Context, req proto.Message) (proto.Message, error) {
+		msg, err := stub.TryClaim(ctx, req.(*pb.ClaimRequest))
+		return msg, err
+	}))
+	mux.HandleFunc(prefix+"/tasks", grpcHTTPHandler(new(pb.TasksRequest), func(ctx context.Context, req proto.Message) (proto.Message, error) {
+		msg, err := stub.Tasks(ctx, req.(*pb.TasksRequest))
+		return msg, err
+	}))
+	mux.HandleFunc(prefix+"/queuestats", grpcHTTPHandler(new(pb.QueuesRequest), func(ctx context.Context, req proto.Message) (proto.Message, error) {
+		msg, err := stub.QueueStats(ctx, req.(*pb.QueuesRequest))
+		return msg, err
+	}))
+	mux.HandleFunc(prefix+"/time", grpcHTTPHandler(new(pb.TimeRequest), func(ctx context.Context, req proto.Message) (proto.Message, error) {
+		msg, err := stub.Time(ctx, req.(*pb.TimeRequest))
+		return msg, err
+	}))
+	mux.HandleFunc(prefix+"/modify", grpcHTTPHandler(new(pb.ModifyRequest), func(ctx context.Context, req proto.Message) (proto.Message, error) {
+		msg, err := stub.Modify(ctx, req.(*pb.ModifyRequest))
+		return msg, err
+	}))
+
+	return mux
+}
+
+// HTTPListenAndServe creates a serve mux from the stub, rooted at the given URL prefix.
+func HTTPListenAndServe(addr string, stub GRPCStub, prefix string) {
+	mux := HTTPServeMux(stub, prefix)
+	log.Fatal(http.ListenAndServe(addr, mux))
 }

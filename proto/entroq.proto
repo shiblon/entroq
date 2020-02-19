@@ -143,6 +143,11 @@ message ModifyDep {
   string msg = 3; // Usually only used with type=DETAIL.
 }
 
+// ModifyDeps contains a list of ModifyDep.
+message ModifyDeps {
+  repeated ModifyDep deps = 1;
+}
+
 // TasksRequest is sent to request a complete listing of tasks for the
 // given queue. If claimant_id is empty, all tasks (not just expired
 // or owned tasks) are returned.
