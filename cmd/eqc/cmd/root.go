@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"log"
@@ -24,17 +25,20 @@ import (
 	"strings"
 
 	"entrogo.com/entroq"
-	"entrogo.com/entroq/grpc"
+	eqgrpc "entrogo.com/entroq/grpc"
 	homedir "github.com/mitchellh/go-homedir"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 )
 
 var (
 	cfgFile   string
 	svcAddr   string
 	jsonValue bool
+	secure    bool
 
 	eq *entroq.EntroQ
 )
@@ -49,8 +53,20 @@ queue listings, individual task information, etc.`,
 		if cmd.Name() == "help" || cmd.IsAdditionalHelpTopicCommand() {
 			return nil
 		}
+		var opts []eqgrpc.Option
+		if secure {
+			pool, err := x509.SystemCertPool()
+			if err != nil {
+				return errors.Wrap(err, "cert pool")
+			}
+			creds := credentials.NewClientTLSFromCert(pool, "")
+			opts = append(opts, eqgrpc.WithDialOpts(grpc.WithTransportCredentials(creds)))
+		} else {
+			opts = append(opts, eqgrpc.WithInsecure())
+		}
+
 		var err error
-		eq, err = entroq.New(context.Background(), grpc.Opener(svcAddr, grpc.WithInsecure()))
+		eq, err = entroq.New(context.Background(), eqgrpc.Opener(svcAddr, opts...))
 		if err != nil {
 			return errors.Wrap(err, "entroq client open")
 		}
@@ -81,8 +97,9 @@ func init() {
 	// will be global for your application.
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.config/eqc.yaml)")
 
-	rootCmd.PersistentFlags().StringVar(&svcAddr, "svcaddr", ":37706", "address of service, uses port 37706 if none is specified")
+	rootCmd.PersistentFlags().StringVarP(&svcAddr, "svcaddr", "s", ":37706", "address of service, uses port 37706 if none is specified")
 	rootCmd.PersistentFlags().BoolVarP(&jsonValue, "json", "j", false, "Display task values as JSON.")
+	rootCmd.PersistentFlags().BoolVarP(&secure, "secure", "S", false, "Use secure connection.")
 }
 
 func mustTaskString(t *entroq.Task) string {
