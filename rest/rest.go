@@ -1,11 +1,11 @@
-// Package grpc provides a gRPC backend for EntroQ. This is the backend that is
-// commonly used by clients of an EntroQ task service, set up thus:
+// Package rest provides a basic RESTful JSON backend for EntroQ.
+// This can be used with the http mode of the EntroQ task service, set up thus:
 //
 // 	Server:
-// 		qsvc -> entroq library -> some backend (e.g., pg)
+// 		qsvc (rest port) -> entroq library -> some backend (e.g., pg)
 //
 // 	Client:
-// 		entroq library -> grpc backend
+// 		entroq library -> rest backend
 //
 // You can start, for example, a postgres-backed QSvc like this:
 //
@@ -16,166 +16,168 @@
 // 	}
 // 	defer svc.Close()
 //
-// 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", thisPort))
-// 	if err != nil {
-// 		log.Fatalf("Can't start this service")
-// 	}
-//
-// 	s := grpc.NewServer()
-// 	pb.RegisterEntroQServer(s, svc)
-// 	s.Serve(lis)
+// 	qsvc.HTTPListenAndServe(":37707", svc, "/api/v1")
 //
 // With the server set up this way, the client simply uses the EntroQ library,
 // hands it the grpc Opener, and they're off:
 //
-// 	client, err := entroq.New(ctx, grpc.Opener("myhost:54321", grpc.WithInsecure()))
+// 	client, err := entroq.New(ctx, rest.Opener("myhost:37707"))
 //
-// That creates a client library that uses a gRPC connection to do its work.
-// Note that Claim will block on the *client* side doing this instead of
-// holding the *server* connection hostage while a claim fails to go through.
-// That is actually what we want; rather than hold connections open, we allow
-// the client to poll with exponential backoff. In large-scale systems, this is
-// better behavior.
-package grpc // import "entrogo.com/entroq/grpc"
+// That creates a client library that uses an HTTP/1.1 connection to do its work.
+package rest // import "entrogo.com/entroq/rest"
 
 import (
 	"context"
 	"fmt"
-	"net"
+	"io/ioutil"
+	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"entrogo.com/entroq"
+	"github.com/golang/protobuf/jsonpb"
+	"github.com/golang/protobuf/proto"
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	pb "entrogo.com/entroq/proto"
-	hpb "google.golang.org/grpc/health/grpc_health_v1"
 )
 
 const (
-	// DefaultAddr is the default listening address for gRPC services.
-	DefaultAddr = ":37706"
+	DefaultAPIURL = "http://[::]:37707/api/v1"
 
-	// ClaimRetryInterval is how long a grpc client holds a claim request open
+	// ClaimRetryInterval is how long a rest client holds a claim request open
 	// before dropping it and trying again.
 	ClaimRetryInterval = 2 * time.Minute
 )
 
-type backendOptions struct {
-	dialOpts []grpc.DialOption
-}
-
-// Option allows grpc-opener-specific options to be sent in Opener.
-type Option func(*backendOptions)
-
-// WithDialOpts sets grpc dial options. Can be called multiple times.
-// Only valid in call to Opener.
-func WithDialOpts(d ...grpc.DialOption) Option {
-	return func(opts *backendOptions) {
-		opts.dialOpts = append(opts.dialOpts, d...)
-	}
-}
-
-// WithInsecure is a common gRPC dial option, here for convenience.
-func WithInsecure() Option {
-	return WithDialOpts(grpc.WithInsecure())
-}
-
-// WithDialer is a common gRPC dial option, here for convenience.
-func WithDialer(f func(string, time.Duration) (net.Conn, error)) Option {
-	return WithDialOpts(grpc.WithDialer(f))
-}
-
-// WithBlock is a common gRPC dial option, here for convenience.
-func WithBlock() Option {
-	return WithDialOpts(grpc.WithBlock())
-}
-
-// WithNiladicDialer uses a niladic dial function such as that returned by
-// bufconn.Listen. Useful for testing.
-func WithNiladicDialer(f func() (net.Conn, error)) Option {
-	return WithDialOpts(grpc.WithDialer(func(string, time.Duration) (net.Conn, error) {
-		return f()
-	}))
-}
-
-// Opener creates an opener function to be used to get a gRPC backend. If the
-// address string is empty, it defaults to the DefaultAddr, the default value
-// for the memory-backed gRPC server.
-func Opener(addr string, opts ...Option) entroq.BackendOpener {
-	if addr == "" {
-		addr = DefaultAddr
-	}
-	options := new(backendOptions)
-	for _, opt := range opts {
-		opt(options)
-	}
-
+// Opener creates an opener function to be used to talk to an HTTP REST JSON backend.
+func Opener(apiURL string) entroq.BackendOpener {
 	return func(ctx context.Context) (entroq.Backend, error) {
-		conn, err := grpc.DialContext(ctx, addr, options.dialOpts...)
-		if err != nil {
-			return nil, errors.Wrapf(err, "dial %q", addr)
-		}
-		hclient := hpb.NewHealthClient(conn)
-		resp, err := hclient.Check(ctx, &hpb.HealthCheckRequest{})
-		if err != nil {
-			return nil, errors.Wrap(err, "health check")
-		}
-		if st := resp.GetStatus(); st != hpb.HealthCheckResponse_SERVING {
-			return nil, errors.Errorf("health serving status: %q", st)
-		}
-		return New(conn, opts...)
+		return New(opts...)
 	}
 }
 
 type backend struct {
-	conn *grpc.ClientConn
+	apiURL string
 }
 
 // New creates a new gRPC backend that attaches to the task service via gRPC.
-func New(conn *grpc.ClientConn, opts ...Option) (*backend, error) {
-	options := new(backendOptions)
-	for _, opt := range opts {
-		opt(options)
+// If empty, the API URL is assumed to be DefaultAPIURL.
+func New(apiURL string) (*backend, error) {
+	if apiURL == "" {
+		apiURL = DefaultAPIURL
 	}
-	return &backend{conn}, nil
+	return &backend{
+		apiURL: strings.TrimRight(apiURL, "/"),
+	}, nil
 }
 
-// Close closes the underlying connection to the gRPC task service.
+// Close cleans up the REST client.
 func (b *backend) Close() error {
-	return errors.Wrap(b.conn.Close(), "pg backend close")
+	return nil
+}
+
+func (b *backend) urlFor(endpoint string) string {
+	return b.apiURL + "/" + strings.TrimLeft(endpoint, "/")
+}
+
+func (b *backend) postProto(ctx context.Context, endpoint string, req proto.Message, emptyResp proto.Message) error {
+	reqJSON, err := new(jsonpb.Marshaler).MarshalToString(req)
+	if err != nil {
+		return errors.Wrapf(err, "rest post %v marshal", endpoint)
+	}
+
+	// Use of context requires a slightly more complex make-request-then-do strategy.
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", b.urlFor(endpoint), strings.NewReader(reqJSON))
+	if err != nil {
+		return errors.Wrapf(err, "rest post new req", endpoint)
+	}
+	httpReq.Header.Set("Content-Tyep", "application/json")
+
+	httpResp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		if err.(*url.Error).Timeout() {
+			// Convert to something we recognize as a timeout more easily.
+			return errors.Wrapf(context.DeadlineExceeded, "rest req timeout: %v", err)
+		}
+		return errors.Wrapf(err, "rest post %v", endpoint)
+	}
+	defer httpResp.Body.Close()
+
+	switch httpResp.StatusCode {
+	case http.StatusOK
+		if err := jsonpb.Unmarshal(httpResp.Body, emptyResp); err != nil {
+			return errors.Wrapf(err, "rest post %v", endpoint)
+		}
+		return nil
+	case http.StatusFailedDependency:
+		deps := new(pb.ModifyDeps)
+		if err := jsonpb.Unmarshal(httpResp.Body, deps); err != nil {
+			return errors.Wrapf(err, "rest post %v", endpoint)
+		}
+
+		depErr := entroq.DependencyError{}
+		for _, detail := range deps.Deps {
+			if detail.Type == pb.DepType_DETAIL {
+				if detail.Msg != "" {
+					depErr.Message += fmt.Sprintf(": %s", detail.Msg)
+				}
+				continue
+			}
+
+			// TODO: refactor - this is also in grpc (a few surrounding things are, as well).
+			tid, err := fromTaskIDProto(detail.Id)
+			if err != nil {
+				return errors.Wrap(err, "rest dep detail from proto")
+			}
+			switch detail.Type {
+				case pb.DepType_CLAIM:
+					depErr.Claims = append(depErr.Claims, tid)
+				case pb.DepType_DELETE:
+					depErr.Deletes = append(depErr.Deletes, tid)
+				case pb.DepType_CHANGE:
+					depErr.Changes = append(depErr.Changes, tid)
+				case pb.DepType_DEPEND:
+					depErr.Depends = append(depErr.Depends, tid)
+				case pb.DepType_INSERT:
+					depErr.Inserts = append(depErr.Inserts, tid)
+				default:
+					return errors.Errorf("rest unknown dep type %v in detail %v", detail.Type, detail)
+			}
+		}
+		return errors.Wrap(depErr, "rest modify dependency")
+	case http.StatusRequestTimeout:
+		return errors.Wrapf(context.DeadlineExceeded, "rest req timeout %q", httpResp.Status)
+	default:
+		body, err := ioutil.ReadAll(httpResp.Body)
+		if err != nil {
+			return errors.Error("rest response %q, can't read body: %v", httpResp.Status, err)
+		}
+		return errors.Errorf("rest response %q: %v", httpResp.Status, body)
+	}
 }
 
 // Queues produces a mapping from queue names to queue sizes.
 func (b *backend) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[string]int, error) {
-	resp, err := pb.NewEntroQClient(b.conn).Queues(ctx, &pb.QueuesRequest{
-		MatchPrefix: qq.MatchPrefix,
-		MatchExact:  qq.MatchExact,
-		Limit:       int32(qq.Limit),
-	})
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get queues over gRPC")
-	}
-	qs := make(map[string]int)
-	for _, q := range resp.Queues {
-		qs[q.Name] = int(q.NumTasks)
-	}
-	return qs, nil
+	return entroq.QueuesFromStats(b.QueueStats(ctx, qq))
 }
 
 // QueueStats maps queue names to stats for those queues.
 func (b *backend) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[string]*entroq.QueueStat, error) {
-	resp, err := pb.NewEntroQClient(b.conn).QueueStats(ctx, &pb.QueuesRequest{
+	resp := new(pb.QueuesResponse)
+	if err := b.postProto(ctx, "queustats", &pb.QueuesRequest{
 		MatchPrefix: qq.MatchPrefix,
 		MatchExact:  qq.MatchExact,
 		Limit:       int32(qq.Limit),
-	})
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get queue stats over gRPC")
+	}, resp); err != nil {
+		return nil, errors.Wrap(err, "queuestats")
 	}
+
+	// TODO: refactor - this is in both grpc and rest, now.
 	qs := make(map[string]*entroq.QueueStat)
 	for _, q := range resp.Queues {
 		qs[q.Name] = &entroq.QueueStat{
@@ -266,16 +268,19 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 	for _, tid := range tq.IDs {
 		ids = append(ids, tid.String())
 	}
-	resp, err := pb.NewEntroQClient(b.conn).Tasks(ctx, &pb.TasksRequest{
+
+	resp := new(pb.TasksResponse)
+	if err := b.postProto(ctx, "tasks", &pb.TasksRequest{
 		ClaimantId: tq.Claimant.String(),
 		Queue:      tq.Queue,
 		Limit:      int32(tq.Limit),
 		TaskId:     ids,
 		OmitValues: tq.OmitValues,
-	})
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get tasks over gRPC")
+	}, resp); err != nil {
+		return nil, errors.Wrap(err, "tasks")
 	}
+
+	// TODO: refactor - both in grpc and here now.
 	var tasks []*entroq.Task
 	for _, t := range resp.Tasks {
 		task, err := fromTaskProto(t)
@@ -290,6 +295,7 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 // Claim attempts to claim a task and blocks until one is ready or the
 // operation is canceled.
 func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
+	// TODO: refactor - grpc has a lot of similar logic.
 	for {
 		// Check whether the parent context was canceled.
 		select {
@@ -298,13 +304,13 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 		default:
 		}
 		ctx, _ := context.WithTimeout(ctx, ClaimRetryInterval)
-		resp, err := pb.NewEntroQClient(b.conn).Claim(ctx, &pb.ClaimRequest{
+		resp := new(pb.ClaimResponse)
+		if err := b.postProto(ctx, "claim", &pb.ClaimRequest{
 			ClaimantId: cq.Claimant.String(),
 			Queues:     cq.Queues,
 			DurationMs: int64(cq.Duration / time.Millisecond),
 			PollMs:     int64(cq.PollTime / time.Millisecond),
-		})
-		if err != nil {
+		}, resp); err != nil {
 			if entroq.IsTimeout(err) {
 				// If we just timed out on our little request context, then
 				// we can go around again.
@@ -312,7 +318,7 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 				// is why we check that at the beginning of the loop, as well.
 				continue
 			}
-			return nil, errors.Wrap(err, "grpc claim")
+			return nil, errors.Wrap(err, "rest claim")
 		}
 		if resp.Task == nil {
 			return nil, errors.New("no task returned from backend Claim")
@@ -324,13 +330,13 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 // TryClaim attempts to claim a task from the queue. Normally returns both a
 // nil task and error if nothing is ready.
 func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
-	resp, err := pb.NewEntroQClient(b.conn).TryClaim(ctx, &pb.ClaimRequest{
+	resp := new(pb.ClaimResponse)
+	if err := b.postProto(ctx, "tryclaim", &pb.ClaimRequest{
 		ClaimantId: cq.Claimant.String(),
 		Queues:     cq.Queues,
 		DurationMs: int64(cq.Duration / time.Millisecond),
-	})
-	if err != nil {
-		return nil, errors.Wrap(err, "grpc try claim")
+	}, resp); err != nil {
+		return nil, errors.Wrap(err, "rest try claim")
 	}
 	if resp.Task == nil {
 		return nil, nil
@@ -362,49 +368,11 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 		})
 	}
 
-	resp, err := pb.NewEntroQClient(b.conn).Modify(ctx, req)
-	if err != nil {
-		switch stat := status.Convert(errors.Cause(err)); stat.Code() {
-		case codes.NotFound:
-			// Dependency error, should have details.
-			depErr := entroq.DependencyError{
-				Message: err.Error(),
-			}
-			for _, det := range stat.Details() {
-				detail, ok := det.(*pb.ModifyDep)
-				if !ok {
-					return nil, nil, errors.Errorf("grpc modify unexpected detail type %T: %+v", det, det)
-				}
-				if detail.Type == pb.DepType_DETAIL {
-					if detail.Msg != "" {
-						depErr.Message += fmt.Sprintf(": %s", detail.Msg)
-					}
-					continue
-				}
-
-				tid, err := fromTaskIDProto(detail.Id)
-				if err != nil {
-					return nil, nil, errors.Wrap(err, "grpc modify from proto")
-				}
-				switch detail.Type {
-				case pb.DepType_CLAIM:
-					depErr.Claims = append(depErr.Claims, tid)
-				case pb.DepType_DELETE:
-					depErr.Deletes = append(depErr.Deletes, tid)
-				case pb.DepType_CHANGE:
-					depErr.Changes = append(depErr.Changes, tid)
-				case pb.DepType_DEPEND:
-					depErr.Depends = append(depErr.Depends, tid)
-				case pb.DepType_INSERT:
-					depErr.Inserts = append(depErr.Inserts, tid)
-				default:
-					return nil, nil, errors.Errorf("grpc modify unknown type %v in detail %v", detail.Type, detail)
-				}
-			}
-			return nil, nil, errors.Wrap(depErr, "grpc modify dependency")
-		default:
-			return nil, nil, errors.Wrap(err, "grpc modify")
-		}
+	resp := new(pb.ModifyResponse)
+	if err := b.postProto(ctx, req, resp); err != nil {
+		// If we got a dependency error, that is already taken care of, so we can safely
+		// pass all errors directly back.
+		return nil, nil, errors.Wrap(err, "rest modify")
 	}
 
 	for _, t := range resp.GetInserted() {
@@ -427,9 +395,9 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 
 // Time returns the time as reported by the server.
 func (b *backend) Time(ctx context.Context) (time.Time, error) {
-	resp, err := pb.NewEntroQClient(b.conn).Time(ctx, new(pb.TimeRequest))
-	if err != nil {
-		return time.Time{}, errors.Wrap(err, "grpc time")
+	resp := new(pb.TimeResponse)
+	if err := b.postProto(ctx, new(pb.TimeRequest), resp); err != nil {
+		return time.Time{}, errors.Wrap(err, "rest time")
 	}
 	return fromMS(resp.TimeMs).UTC(), nil
 }
