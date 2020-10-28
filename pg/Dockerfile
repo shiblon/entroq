@@ -24,10 +24,10 @@ RUN mkdir -p /tmp/src \
  && make \
  && make install
 
-RUN parallel --embed | head -n -6 > eqpluspg.sh \
- && echo 'parallel --halt now,done=1 ::: "docker-entrypoint.sh postgres" "eqsvc.sh pg --port=37706"' >> eqpluspg.sh \
- && chmod +x eqpluspg.sh \
- && mv eqpluspg.sh /build/bin/
+RUN parallel --embed | head -n -6 > eq_and_pg.sh \
+ && echo 'parallel --halt now,done=1 ::: "docker-entrypoint.sh postgres" "eqsvc.sh pg --port=37706"' >> eq_and_pg.sh \
+ && chmod +x eq_and_pg.sh \
+ && mv eq_and_pg.sh /build/bin/
 
 
 
@@ -49,5 +49,4 @@ EXPOSE 37706
 VOLUME /var/lib/postgresql/data
 
 
-# TODO: fix entrypoint to call postgres, tini, etc.
-CMD ["eqpluspg.sh"]
+CMD ["eq_and_pg.sh"]
