@@ -1,0 +1,15 @@
+#!/bin/bash
+
+img_name=${IMAGE_NAME%%:*}
+img_tag=${IMAGE_NAME#*:}
+
+if [[ "img_tag" =~ ^pg-v?([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+  major_minor_img="${img_name}:${img_tag%.*}"
+  major_img="${img_name}:${major_minor%.*}"
+
+  docker tag "$IMAGE_NAME" "$major_minor_img"
+  docker tag "$IMAGE_NAME" "$major_img"
+
+  docker push "$major_minor_img"
+  docker push "$major_img"
+fi
