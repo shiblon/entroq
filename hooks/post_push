@@ -1,0 +1,12 @@
+#!/bin/bash
+
+if [[ "$DOCKER_TAG" =~ ^v?([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+  major_minor_img="${DOCKER_REPO}:${DOCKER_TAG%.*}"
+  major_img="${DOCKER_REPO}:${DOCKER_TAG%%.*}"
+
+  docker tag "$IMAGE_NAME" "$major_minor_img"
+  docker tag "$IMAGE_NAME" "$major_img"
+
+  docker push "$major_minor_img"
+  docker push "$major_img"
+fi
