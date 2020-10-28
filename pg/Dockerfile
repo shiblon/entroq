@@ -24,6 +24,15 @@ RUN mkdir -p /tmp/src \
  && make \
  && make install
 
+# Create a GNU parallel script that can run both postgres and eqsvc
+# simultaneously, configured to stop everything if either one goes down
+# (--halt).
+#
+# The docker-entrypoint.sh script comes from the postgres base image.
+# The eqsvc.sh script comes from our builder base image.
+#
+# Note that we cut out the last 6 lines of the embedded parallel script: these
+# are noisy example invocations, so we don't need them.
 RUN parallel --embed | head -n -6 > eq_and_pg.sh \
  && echo 'parallel --halt now,done=1 ::: "docker-entrypoint.sh postgres" "eqsvc.sh pg --port=37706"' >> eq_and_pg.sh \
  && chmod +x eq_and_pg.sh \
