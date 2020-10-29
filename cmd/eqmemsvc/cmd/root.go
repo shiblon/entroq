@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 
@@ -13,6 +14,7 @@ import (
 	"entrogo.com/entroq/qsvc"
 	homedir "github.com/mitchellh/go-homedir"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
@@ -24,8 +26,9 @@ import (
 
 // Flags.
 var (
-	cfgFile string
-	port    int
+	cfgFile  string
+	port     int
+	httpPort int
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -45,6 +48,11 @@ var rootCmd = &cobra.Command{
 			return errors.Wrap(err, "failed to open mem backend for qsvc")
 		}
 		defer svc.Close()
+
+		go func() {
+			http.Handle("/metrics", promhttp.Handler())
+			log.Fatalf("http and metric server: %v", http.ListenAndServe(fmt.Sprintf(":%d", httpPort), nil))
+		}()
 
 		s := grpc.NewServer()
 		pb.RegisterEntroQServer(s, svc)
@@ -68,8 +76,10 @@ func init() {
 	pflags := rootCmd.PersistentFlags()
 	pflags.StringVar(&cfgFile, "config", "", "config file (default is $HOME/.config/eqmemsvc)")
 	pflags.IntVar(&port, "port", 37706, "Port to listen on.")
+	pflags.IntVar(&httpPort, "http_port", 8080, "Port to listen to HTTP requests on, including for /metrics.")
 
 	viper.BindPFlag("port", pflags.Lookup("port"))
+	viper.BindPFlag("http_port", pflags.Lookup("http_port"))
 }
 
 // initConfig reads in config file and ENV variables if set.

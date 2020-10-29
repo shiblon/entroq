@@ -438,9 +438,10 @@ func WithClaimantID(id uuid.UUID) Option {
 // into New.
 type BackendOpener func(ctx context.Context) (Backend, error)
 
-// New creates a new task client with the given backend implementation.
+// New creates a new task client with the given backend implementation, for example, to
+// use an in-memory implementation:
 //
-//   cli := New(ctx, backend)
+//   cli, err := New(ctx, mem.Opener())
 func New(ctx context.Context, opener BackendOpener, opts ...Option) (*EntroQ, error) {
 	backend, err := opener(ctx)
 	if err != nil {
