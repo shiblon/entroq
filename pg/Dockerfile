@@ -54,7 +54,15 @@ ENV PATH ${PATH}:/go/bin
 COPY cmd/eqsvc.sh /go/bin/
 WORKDIR /go/bin
 
+# gRPC endpoint
 EXPOSE 37706
+
+# Prometheus endpoint
+EXPOSE 9100
+
+# PostgreSQL endpoint
+EXPOSE 5432
+
 VOLUME /var/lib/postgresql/data
 
 

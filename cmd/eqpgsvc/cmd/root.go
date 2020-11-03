@@ -101,7 +101,7 @@ func init() {
 	pflags := rootCmd.PersistentFlags()
 	pflags.StringVar(&cfgFile, "config", "", "config file (default is $HOME/.config/eqpgsvc)")
 	pflags.IntVar(&port, "port", 37706, "Service port number.")
-	pflags.IntVar(&httpPort, "http_port", 8080, "Port to listen to HTTP requests on, including for /metrics.")
+	pflags.IntVar(&httpPort, "http_port", 9100, "Port to listen to HTTP requests on, including for /metrics.")
 	pflags.StringVar(&dbAddr, "dbaddr", ":5432", "Address of PostgreSQL server.")
 	pflags.StringVar(&dbName, "dbname", "postgres", "Database housing tasks.")
 	pflags.StringVar(&dbUser, "dbuser", "postgres", "Database user name.")
