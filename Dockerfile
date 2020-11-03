@@ -27,7 +27,11 @@ WORKDIR /go/bin
 RUN adduser -S -D -H -h /go/src/entrogo.com/entroq -u 100 appuser
 USER appuser
 
+# gRPC endpoint
 EXPOSE 37706
+
+# Prometheus endpoint
+EXPOSE 9100
 
 ENTRYPOINT ["./eqsvc.sh"]
 
@@ -35,4 +39,4 @@ ENTRYPOINT ["./eqsvc.sh"]
 # Other options include "pg" with its associated flags.
 # If flags are left off, or the command is left off, the default in-memory
 # service is started.
-CMD ["mem", "--port=37706"]
+CMD ["mem"]
