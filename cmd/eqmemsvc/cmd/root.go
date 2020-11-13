@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 
@@ -13,6 +14,7 @@ import (
 	"entrogo.com/entroq/qsvc"
 	homedir "github.com/mitchellh/go-homedir"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
@@ -47,10 +49,11 @@ var rootCmd = &cobra.Command{
 		}
 		defer svc.Close()
 
-		if httpPort >= 0 {
-			log.Printf("Starting EntroQ HTTP service %d -> mem", httpPort)
-			go qsvc.HTTPListenAndServe(fmt.Sprintf(":%d", httpPort), svc, "/api/v1")
-		}
+		go func() {
+			qsvc.AddHTTPHandlers(http.DefaultServeMux, svc)
+			http.Handle("/metrics", promhttp.Handler())
+			log.Fatalf("http and metric server: %v", http.ListenAndServe(fmt.Sprintf(":%d", httpPort), nil))
+		}()
 
 		s := grpc.NewServer()
 		pb.RegisterEntroQServer(s, svc)
@@ -74,7 +77,7 @@ func init() {
 	pflags := rootCmd.PersistentFlags()
 	pflags.StringVar(&cfgFile, "config", "", "config file (default is $HOME/.config/eqmemsvc)")
 	pflags.IntVar(&port, "port", 37706, "Port to listen on.")
-	pflags.IntVar(&httpPort, "http_port", -1, "HTTP port to listen on. Default is not to listen on http.")
+	pflags.IntVar(&httpPort, "http_port", 8080, "Port to listen to HTTP requests on, including for /metrics.")
 
 	viper.BindPFlag("port", pflags.Lookup("port"))
 	viper.BindPFlag("http_port", pflags.Lookup("http_port"))

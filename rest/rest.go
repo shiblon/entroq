@@ -40,8 +40,6 @@ import (
 	"github.com/golang/protobuf/proto"
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
 	pb "entrogo.com/entroq/proto"
 )
@@ -57,7 +55,7 @@ const (
 // Opener creates an opener function to be used to talk to an HTTP REST JSON backend.
 func Opener(apiURL string) entroq.BackendOpener {
 	return func(ctx context.Context) (entroq.Backend, error) {
-		return New(opts...)
+		return New(apiURL)
 	}
 }
 
@@ -109,7 +107,7 @@ func (b *backend) postProto(ctx context.Context, endpoint string, req proto.Mess
 	defer httpResp.Body.Close()
 
 	switch httpResp.StatusCode {
-	case http.StatusOK
+	case http.StatusOK:
 		if err := jsonpb.Unmarshal(httpResp.Body, emptyResp); err != nil {
 			return errors.Wrapf(err, "rest post %v", endpoint)
 		}
@@ -135,18 +133,18 @@ func (b *backend) postProto(ctx context.Context, endpoint string, req proto.Mess
 				return errors.Wrap(err, "rest dep detail from proto")
 			}
 			switch detail.Type {
-				case pb.DepType_CLAIM:
-					depErr.Claims = append(depErr.Claims, tid)
-				case pb.DepType_DELETE:
-					depErr.Deletes = append(depErr.Deletes, tid)
-				case pb.DepType_CHANGE:
-					depErr.Changes = append(depErr.Changes, tid)
-				case pb.DepType_DEPEND:
-					depErr.Depends = append(depErr.Depends, tid)
-				case pb.DepType_INSERT:
-					depErr.Inserts = append(depErr.Inserts, tid)
-				default:
-					return errors.Errorf("rest unknown dep type %v in detail %v", detail.Type, detail)
+			case pb.DepType_CLAIM:
+				depErr.Claims = append(depErr.Claims, tid)
+			case pb.DepType_DELETE:
+				depErr.Deletes = append(depErr.Deletes, tid)
+			case pb.DepType_CHANGE:
+				depErr.Changes = append(depErr.Changes, tid)
+			case pb.DepType_DEPEND:
+				depErr.Depends = append(depErr.Depends, tid)
+			case pb.DepType_INSERT:
+				depErr.Inserts = append(depErr.Inserts, tid)
+			default:
+				return errors.Errorf("rest unknown dep type %v in detail %v", detail.Type, detail)
 			}
 		}
 		return errors.Wrap(depErr, "rest modify dependency")
@@ -155,7 +153,7 @@ func (b *backend) postProto(ctx context.Context, endpoint string, req proto.Mess
 	default:
 		body, err := ioutil.ReadAll(httpResp.Body)
 		if err != nil {
-			return errors.Error("rest response %q, can't read body: %v", httpResp.Status, err)
+			return errors.Errorf("rest response %q, can't read body: %v", httpResp.Status, err)
 		}
 		return errors.Errorf("rest response %q: %v", httpResp.Status, body)
 	}
@@ -369,7 +367,7 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 	}
 
 	resp := new(pb.ModifyResponse)
-	if err := b.postProto(ctx, req, resp); err != nil {
+	if err := b.postProto(ctx, "modify", req, resp); err != nil {
 		// If we got a dependency error, that is already taken care of, so we can safely
 		// pass all errors directly back.
 		return nil, nil, errors.Wrap(err, "rest modify")
@@ -396,7 +394,7 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 // Time returns the time as reported by the server.
 func (b *backend) Time(ctx context.Context) (time.Time, error) {
 	resp := new(pb.TimeResponse)
-	if err := b.postProto(ctx, new(pb.TimeRequest), resp); err != nil {
+	if err := b.postProto(ctx, "time", new(pb.TimeRequest), resp); err != nil {
 		return time.Time{}, errors.Wrap(err, "rest time")
 	}
 	return fromMS(resp.TimeMs).UTC(), nil

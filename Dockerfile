@@ -27,6 +27,8 @@ WORKDIR /go/bin
 RUN adduser -S -D -H -h /go/src/entrogo.com/entroq -u 100 appuser
 USER appuser
 
+EXPOSE 37706
+
 ENTRYPOINT ["./eqsvc.sh"]
 
 EXPOSE 37706

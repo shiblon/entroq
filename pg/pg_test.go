@@ -307,7 +307,7 @@ func startPostgres(ctx context.Context) (port int, stop func(), err error) {
 	name := fmt.Sprintf("testpg-%s", uuid.New())
 
 	log.Printf("Starting postgres container %q...", name)
-	if err := run(ctx, "docker", "run", "-p", "0:5432", "--rm", "-d", "--name", name, "postgres"); err != nil {
+	if err := run(ctx, "docker", "run", "-p", "0:5432", "--rm", "-d", "-e", "POSTGRES_PASSWORD=postgres", "--name", name, "postgres:11"); err != nil {
 		return 0, nil, errors.Wrap(err, "start postgres container")
 	}
 	time.Sleep(2 * time.Second) // give it some time to get pipes attached

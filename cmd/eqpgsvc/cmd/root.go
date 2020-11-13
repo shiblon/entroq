@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 
@@ -26,6 +27,7 @@ import (
 	"entrogo.com/entroq/qsvc"
 	homedir "github.com/mitchellh/go-homedir"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
@@ -41,6 +43,7 @@ var (
 	cfgFile  string
 	port     int
 	httpPort int
+
 	dbAddr   string
 	dbName   string
 	dbUser   string
@@ -66,10 +69,11 @@ var rootCmd = &cobra.Command{
 		}
 		defer svc.Close()
 
-		if httpPort >= 0 {
-			log.Printf("Starting EntroQ HTTP service %d -> mem", httpPort)
-			go qsvc.HTTPListenAndServe(fmt.Sprintf(":%d", httpPort), svc, "/api/v1")
-		}
+		go func() {
+			qsvc.AddHTTPHandlers(http.DefaultServeMux, svc)
+			http.Handle("/metrics", promhttp.Handler())
+			log.Fatalf("http and metric server: %v", http.ListenAndServe(fmt.Sprintf(":%d", httpPort), nil))
+		}()
 
 		lis, err := net.Listen("tcp", fmt.Sprintf("[::]:%d", port))
 		if err != nil {
@@ -98,7 +102,7 @@ func init() {
 	pflags := rootCmd.PersistentFlags()
 	pflags.StringVar(&cfgFile, "config", "", "config file (default is $HOME/.config/eqpgsvc)")
 	pflags.IntVar(&port, "port", 37706, "Service port number.")
-	pflags.IntVar(&httpPort, "http_port", -1, "HTTP port to listen on. Default is not to listen on http.")
+	pflags.IntVar(&httpPort, "http_port", 9090, "Port to listen to HTTP requests on, including for /metrics.")
 	pflags.StringVar(&dbAddr, "dbaddr", ":5432", "Address of PostgreSQL server.")
 	pflags.StringVar(&dbName, "dbname", "postgres", "Database housing tasks.")
 	pflags.StringVar(&dbUser, "dbuser", "postgres", "Database user name.")

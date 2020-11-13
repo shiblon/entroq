@@ -45,15 +45,42 @@ import (
 	"github.com/golang/protobuf/proto"
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	pb "entrogo.com/entroq/proto"
 )
 
+const (
+	// MetricNS is the prometheus namespace for all metrics for this module.
+	MetricNS = "entroq"
+
+	// MetricInterval sets the collection interval for metrics.
+	MetricInterval = 1 * time.Minute
+
+	// API Path
+	APIPath = "/api/v1"
+)
+
+var (
+	metricQueueSize = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: MetricNS,
+			Subsystem: "queue",
+			Name:      "size",
+			Help:      "Number of tasks in named queue.",
+		},
+		[]string{"name", "type"},
+	)
+)
+
 // QSvc is an EntroQServer.
 type QSvc struct {
 	impl *entroq.EntroQ
+
+	metricCancel context.CancelFunc
 }
 
 // New creates a new service that exposes gRPC endpoints for task queue access.
@@ -63,12 +90,57 @@ func New(ctx context.Context, opener entroq.BackendOpener) (*QSvc, error) {
 		return nil, errors.Wrap(err, "qsvc backend client")
 	}
 
-	return &QSvc{impl: impl}, nil
+	// Note that you should *never* use a background context like this unless
+	// it is guaranteed to be exclusively used for a background process. That
+	// is the (rare) case here.
+	mctx, mcancel := context.WithCancel(context.Background())
+
+	svc := &QSvc{
+		impl:         impl,
+		metricCancel: mcancel,
+	}
+
+	go func() {
+		for {
+			if err := svc.RefreshMetrics(mctx); err != nil {
+				log.Printf("Error refreshing metrics: %v", err)
+			}
+			select {
+			case <-mctx.Done():
+				return
+			case <-time.After(MetricInterval):
+			}
+		}
+	}()
+
+	return svc, nil
 }
 
 // Close closes the backend connections and flushes the connection free.
 func (s *QSvc) Close() error {
+	s.metricCancel() // Don't bother waiting for it
 	return errors.Wrap(s.impl.Close(), "qsvc close")
+}
+
+// RefreshMetrics collects stats and exports them as prometheus metrics.
+// Intended to be called periodically in the background. Beware of calling too
+// frequently, as this may deny service to users.
+func (s *QSvc) RefreshMetrics(ctx context.Context) error {
+	stats, err := s.impl.QueueStats(ctx)
+	if err != nil {
+		return errors.Wrap(err, "collectMetricStats")
+	}
+
+	// Clear it out, then repopulate.
+	metricQueueSize.Reset()
+	for name, stat := range stats {
+		metricQueueSize.WithLabelValues(name, "total").Set(float64(stat.Size))
+		metricQueueSize.WithLabelValues(name, "claimed").Set(float64(stat.Claimed))
+		metricQueueSize.WithLabelValues(name, "available").Set(float64(stat.Available))
+		metricQueueSize.WithLabelValues(name, "maxClaims").Set(float64(stat.MaxClaims))
+	}
+
+	return nil
 }
 
 func fromMS(ms int64) time.Time {
@@ -452,41 +524,37 @@ type GRPCStub interface {
 	Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyResponse, error)
 }
 
-// HTTPHandler returns an EntroQ http handler that defers to a gRPC
-// implementation such as *QSvc or *EntroQClient (with suitable wrapping to
-// allow or ignore variadic opts).
-func HTTPServeMux(stub GRPCStub, prefix string) *http.ServeMux {
-	mux := http.NewServeMux()
-	mux.HandleFunc(prefix+"/claim", grpcHTTPHandler(new(pb.ClaimRequest), func(ctx context.Context, req proto.Message) (proto.Message, error) {
+// AddHTTPHandlers adds handlers to a provided mux, using the given grpc stub for the implementation.
+func AddHTTPHandlers(mux *http.ServeMux, stub GRPCStub) {
+	mux.HandleFunc(APIPath+"/claim", grpcHTTPHandler(new(pb.ClaimRequest), func(ctx context.Context, req proto.Message) (proto.Message, error) {
 		msg, err := stub.Claim(ctx, req.(*pb.ClaimRequest))
 		return msg, err
 	}))
-	mux.HandleFunc(prefix+"/tryclaim", grpcHTTPHandler(new(pb.ClaimRequest), func(ctx context.Context, req proto.Message) (proto.Message, error) {
+	mux.HandleFunc(APIPath+"/tryclaim", grpcHTTPHandler(new(pb.ClaimRequest), func(ctx context.Context, req proto.Message) (proto.Message, error) {
 		msg, err := stub.TryClaim(ctx, req.(*pb.ClaimRequest))
 		return msg, err
 	}))
-	mux.HandleFunc(prefix+"/tasks", grpcHTTPHandler(new(pb.TasksRequest), func(ctx context.Context, req proto.Message) (proto.Message, error) {
+	mux.HandleFunc(APIPath+"/tasks", grpcHTTPHandler(new(pb.TasksRequest), func(ctx context.Context, req proto.Message) (proto.Message, error) {
 		msg, err := stub.Tasks(ctx, req.(*pb.TasksRequest))
 		return msg, err
 	}))
-	mux.HandleFunc(prefix+"/queuestats", grpcHTTPHandler(new(pb.QueuesRequest), func(ctx context.Context, req proto.Message) (proto.Message, error) {
+	mux.HandleFunc(APIPath+"/queuestats", grpcHTTPHandler(new(pb.QueuesRequest), func(ctx context.Context, req proto.Message) (proto.Message, error) {
 		msg, err := stub.QueueStats(ctx, req.(*pb.QueuesRequest))
 		return msg, err
 	}))
-	mux.HandleFunc(prefix+"/time", grpcHTTPHandler(new(pb.TimeRequest), func(ctx context.Context, req proto.Message) (proto.Message, error) {
+	mux.HandleFunc(APIPath+"/time", grpcHTTPHandler(new(pb.TimeRequest), func(ctx context.Context, req proto.Message) (proto.Message, error) {
 		msg, err := stub.Time(ctx, req.(*pb.TimeRequest))
 		return msg, err
 	}))
-	mux.HandleFunc(prefix+"/modify", grpcHTTPHandler(new(pb.ModifyRequest), func(ctx context.Context, req proto.Message) (proto.Message, error) {
+	mux.HandleFunc(APIPath+"/modify", grpcHTTPHandler(new(pb.ModifyRequest), func(ctx context.Context, req proto.Message) (proto.Message, error) {
 		msg, err := stub.Modify(ctx, req.(*pb.ModifyRequest))
 		return msg, err
 	}))
-
-	return mux
 }
 
-// HTTPListenAndServe creates a serve mux from the stub, rooted at the given URL prefix.
-func HTTPListenAndServe(addr string, stub GRPCStub, prefix string) {
-	mux := HTTPServeMux(stub, prefix)
+// HTTPListenAndServe creates a serve mux from the stub implementation.
+func HTTPListenAndServe(addr string, stub GRPCStub) {
+	mux := http.NewServeMux()
+	AddHTTPHandlers(mux, stub)
 	log.Fatal(http.ListenAndServe(addr, mux))
 }
