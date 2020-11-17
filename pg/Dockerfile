@@ -54,6 +54,8 @@ ENV PATH ${PATH}:/go/bin
 COPY cmd/eqsvc.sh /go/bin/
 WORKDIR /go/bin
 
+USER postgres
+
 # gRPC endpoint
 EXPOSE 37706
 
