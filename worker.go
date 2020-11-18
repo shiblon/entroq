@@ -180,7 +180,7 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 				if _, _, insErr := w.eqc.Modify(ctx, task.AsDeletion(), InsertingInto(errQ, WithValue(newVal))); err != nil {
 					return errors.Wrapf(insErr, "trying to insert movable task with own error: %q", err)
 				}
-				return nil
+				continue
 			}
 			return errors.Wrapf(err, "worker error (%q)", w.Qs)
 		}
