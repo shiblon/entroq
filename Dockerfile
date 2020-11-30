@@ -15,7 +15,7 @@ RUN go get -d -v ./... && go install -v ./...
 # Switch to a smaller container without build tools.
 FROM alpine:latest
 
-RUN apk --no-cache add ca-certificates openssl curl bash
+RUN apk --no-cache add ca-certificates openssl curl bash jq
 RUN mkdir -p /go/bin
 
 ENV PATH ${PATH}:/go/bin
