@@ -16,7 +16,7 @@ RUN go get -d -v ./... && go install -v ./...
 RUN mkdir -p /tmp/src \
  && cd /tmp/src \
  && apt-get update \
- && apt-get install -y curl bzip2 make \
+ && apt-get install -y curl bzip2 make jq \
  && curl -LO https://ftp.gnu.org/gnu/parallel/parallel-20201022.tar.bz2 \
  && tar xjf parallel-20201022.tar.bz2 \
  && cd parallel-20201022 \
