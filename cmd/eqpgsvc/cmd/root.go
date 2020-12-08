@@ -49,6 +49,11 @@ var (
 	dbUser   string
 	dbPass   string
 	attempts int
+	maxSize  int
+)
+
+const (
+	MB = 1024 * 1024
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -79,7 +84,10 @@ var rootCmd = &cobra.Command{
 			return errors.Wrapf(err, "error listening on port %d", port)
 		}
 
-		s := grpc.NewServer()
+		s := grpc.NewServer(
+			grpc.MaxRecvMsgSize(maxSize*MB),
+			grpc.MaxSendMsgSize(maxSize*MB),
+		)
 		pb.RegisterEntroQServer(s, svc)
 		hpb.RegisterHealthServer(s, health.NewServer())
 		log.Printf("Starting EntroQ server %d -> %v db=%v u=%v", port, dbAddr, dbName, dbUser)
@@ -107,6 +115,7 @@ func init() {
 	pflags.StringVar(&dbUser, "dbuser", "postgres", "Database user name.")
 	pflags.StringVar(&dbPass, "dbpwd", "postgres", "Database password.")
 	pflags.IntVar(&attempts, "attempts", 10, "Connection attempts, separated by 5-second pauses, before dying due to lack of backend connection.")
+	pflags.IntVar(&maxSize, "max_size_mb", 10, "Maximum server message size (send and receive) in megabytes. If larger than 4MB, you must also set your gRPC client max size to take advantage of this.")
 
 	viper.BindPFlag("port", pflags.Lookup("port"))
 	viper.BindPFlag("http_port", pflags.Lookup("http_port"))
@@ -115,6 +124,7 @@ func init() {
 	viper.BindPFlag("dbuser", pflags.Lookup("dbuser"))
 	viper.BindPFlag("dbpwd", pflags.Lookup("dbpwd"))
 	viper.BindPFlag("attempts", pflags.Lookup("attempts"))
+	viper.BindPFlag("max_size_mb", pflags.Lookup("max_size_mb"))
 }
 
 // initConfig reads in config file and ENV variables if set.
