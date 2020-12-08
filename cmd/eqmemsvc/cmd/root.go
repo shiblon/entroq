@@ -29,6 +29,12 @@ var (
 	cfgFile  string
 	port     int
 	httpPort int
+
+	maxSize int
+)
+
+const (
+	MB = 1024 * 1024
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -54,7 +60,10 @@ var rootCmd = &cobra.Command{
 			log.Fatalf("http and metric server: %v", http.ListenAndServe(fmt.Sprintf(":%d", httpPort), nil))
 		}()
 
-		s := grpc.NewServer()
+		s := grpc.NewServer(
+			grpc.MaxRecvMsgSize(maxSize*MB),
+			grpc.MaxSendMsgSize(maxSize*MB),
+		)
 		pb.RegisterEntroQServer(s, svc)
 		hpb.RegisterHealthServer(s, health.NewServer())
 		log.Printf("Starting EntroQ server %d -> mem", port)
@@ -77,9 +86,11 @@ func init() {
 	pflags.StringVar(&cfgFile, "config", "", "config file (default is $HOME/.config/eqmemsvc)")
 	pflags.IntVar(&port, "port", 37706, "Port to listen on.")
 	pflags.IntVar(&httpPort, "http_port", 9100, "Port to listen to HTTP requests on, including for /metrics.")
+	pflags.IntVar(&maxSize, "max_size_mb", 10, "Maximum server message size (send and receive) in megabytes. If larger than 4MB, you must also set your gRPC client max size to take advantage of this.")
 
 	viper.BindPFlag("port", pflags.Lookup("port"))
 	viper.BindPFlag("http_port", pflags.Lookup("http_port"))
+	viper.BindPFlag("max_size_mb", pflags.Lookup("max_size_mb"))
 }
 
 // initConfig reads in config file and ENV variables if set.
