@@ -62,6 +62,9 @@ const (
 	// ClaimRetryInterval is how long a grpc client holds a claim request open
 	// before dropping it and trying again.
 	ClaimRetryInterval = 2 * time.Minute
+
+	// MB helps with conversion to and from megabytes.
+	MB = 1024 * 1024
 )
 
 type backendOptions struct {
@@ -100,6 +103,16 @@ func WithNiladicDialer(f func() (net.Conn, error)) Option {
 	return WithDialOpts(grpc.WithDialer(func(string, time.Duration) (net.Conn, error) {
 		return f()
 	}))
+}
+
+// WithMaxSize is a convenience method for setting
+// WithDialOptions(grpc.WithDefaultCallOptions(grpc.MaxCallRecvSize(...), grpc.MaxCallSendSize(...))).
+// Default is 4MB.
+func WithMaxSize(maxMB int) Option {
+	return WithDialOpts(grpc.WithDefaultCallOptions(
+		grpc.MaxCallRecvMsgSize(maxMB*MB),
+		grpc.MaxCallSendMsgSize(maxMB*MB),
+	))
 }
 
 // Opener creates an opener function to be used to get a gRPC backend. If the
