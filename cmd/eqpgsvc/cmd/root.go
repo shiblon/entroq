@@ -63,6 +63,22 @@ var rootCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := context.Background()
 
+		if dbPass == "" {
+			dbPass = os.Getenv("PGPASSWORD")
+		}
+
+		if dbName == "" {
+			dbName = os.Getenv("PGDATABASE")
+		}
+
+		if dbUser == "" {
+			dbUser = os.Getenv("PGUSER")
+		}
+
+		if dbAddr == "" {
+			dbAddr = os.Getenv("PGHOST") + ":" + os.Getenv("PGPORT")
+		}
+
 		svc, err := qsvc.New(ctx, pg.Opener(dbAddr,
 			pg.WithDB(dbName),
 			pg.WithUsername(dbUser),
@@ -110,10 +126,10 @@ func init() {
 	pflags.StringVar(&cfgFile, "config", "", "config file (default is $HOME/.config/eqpgsvc)")
 	pflags.IntVar(&port, "port", 37706, "Service port number.")
 	pflags.IntVar(&httpPort, "http_port", 9100, "Port to listen to HTTP requests on, including for /metrics.")
-	pflags.StringVar(&dbAddr, "dbaddr", ":5432", "Address of PostgreSQL server.")
-	pflags.StringVar(&dbName, "dbname", "postgres", "Database housing tasks.")
-	pflags.StringVar(&dbUser, "dbuser", "postgres", "Database user name.")
-	pflags.StringVar(&dbPass, "dbpwd", "postgres", "Database password.")
+	pflags.StringVar(&dbAddr, "dbaddr", ":5432", "Address of PostgreSQL server. Overrides PGHOST:PGPORT environments.")
+	pflags.StringVar(&dbName, "dbname", "", "Name of database that houses tasks. Overrides PGNAME environment.")
+	pflags.StringVar(&dbUser, "dbuser", "", "Database user name. Overrides PGUSER environment.")
+	pflags.StringVar(&dbPass, "dbpwd", "", "Database password. Overrides PGPASSWORD environment.")
 	pflags.IntVar(&attempts, "attempts", 10, "Connection attempts, separated by 5-second pauses, before dying due to lack of backend connection.")
 	pflags.IntVar(&maxSize, "max_size_mb", 10, "Maximum server message size (send and receive) in megabytes. If larger than 4MB, you must also set your gRPC client max size to take advantage of this.")
 

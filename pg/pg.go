@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"net/url"
 	"strings"
@@ -20,7 +21,7 @@ import (
 )
 
 func escp(p string) string {
-	return strings.NewReplacer("=", "\\=", " ", "\\ ").Replace(p)
+	return "'" + strings.NewReplacer("\\", "\\\\", "'", "\\'").Replace(p) + "'"
 }
 
 // SSLMode is used to request a particular PostgreSQL SSL mode.
@@ -140,25 +141,54 @@ func Opener(hostPort string, opts ...PGOpt) entroq.BackendOpener {
 	}
 
 	return func(ctx context.Context) (entroq.Backend, error) {
-		connStr := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=%s",
-			escp(options.user),
-			escp(options.password),
-			hostPort,
-			escp(options.db),
-			options.sslMode,
-		)
+		u, err := url.Parse("postgres://" + hostPort)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to parse hostport %q", hostPort)
+		}
+		host := u.Hostname()
+		port := u.Port()
+
+		if port != "" && host == "" {
+			host = "::"
+		}
+
+		if host != "" && port == "" {
+			port = "5432"
+		}
+
+		params := []string{
+			"sslmode=" + string(options.sslMode),
+		}
+
+		if options.user != "" {
+			params = append(params, fmt.Sprintf("user=%s", escp(options.user)))
+		}
+
+		if options.password != "" {
+			params = append(params, fmt.Sprintf("password=%s", escp(options.password)))
+		}
+
+		if host != "" {
+			params = append(params, fmt.Sprintf("host=%s", escp(host)))
+		}
+
+		if port != "" {
+			params = append(params, fmt.Sprintf("port=%s", port))
+		}
 
 		if options.sslClientKeyFile != "" {
-			connStr += "&sslkey=" + url.QueryEscape(options.sslClientKeyFile)
+			params = append(params, "sslkey="+url.QueryEscape(options.sslClientKeyFile))
 		}
 
 		if options.sslClientCertFile != "" {
-			connStr += "&sslcert=" + url.QueryEscape(options.sslClientCertFile)
+			params = append(params, "sslcert="+url.QueryEscape(options.sslClientCertFile))
 		}
 
 		if options.sslServerCAFile != "" {
-			connStr += "&sslrootcert=" + url.QueryEscape(options.sslServerCAFile)
+			params = append(params, "sslrootcert="+url.QueryEscape(options.sslServerCAFile))
 		}
+
+		connStr := strings.Join(params, " ")
 
 		db, err := sql.Open("postgres", connStr)
 		if err != nil {
@@ -503,9 +533,11 @@ func (b *backend) modify(ctx context.Context, mod *entroq.Modification) (inserte
 	}
 	defer func() {
 		if err != nil {
-			tx.Rollback()
+			if rerr := tx.Rollback(); rerr != nil {
+				log.Printf("Error rolling back: %v", rerr)
+			}
 		} else {
-			tx.Commit()
+			err = tx.Commit()
 		}
 	}()
 
