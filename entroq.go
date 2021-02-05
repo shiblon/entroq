@@ -24,7 +24,6 @@ import (
 	"strings"
 	"time"
 
-	"entrogo.com/entroq/queues"
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
@@ -92,11 +91,6 @@ func (t *TaskData) String() string {
 	return s
 }
 
-// Namespace returns the namespace from this queue name, if any.
-func (t *TaskData) Namespace() (string, bool) {
-	return queues.Namespace(t.Queue)
-}
-
 // Task represents a unit of work, with a byte slice value payload.
 // Note that Claims is the number of times a task has successfully been claimed.
 // This is different than the version number, which increments for
@@ -123,11 +117,6 @@ func (t *Task) String() string {
 		fmt.Sprintf("c=%q m=%q", t.Created, t.Modified),
 		fmt.Sprintf("val=%q", string(t.Value)),
 	}, "\n\t") + "\n"
-}
-
-// Namespace returns the namespace of this task's queue, if present. Can be empty when present.
-func (t *Task) Namespace() (string, bool) {
-	return queues.Namespace(t.Queue)
 }
 
 // AsDeletion returns a ModifyArg that can be used in the Modify function, e.g.,
