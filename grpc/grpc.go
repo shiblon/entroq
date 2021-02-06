@@ -115,6 +115,15 @@ func WithMaxSize(maxMB int) Option {
 	))
 }
 
+type testCreds struct {
+}
+
+func (*testCreds) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
+	return map[string]string{"testz": "val"}, nil
+}
+
+func (*testCreds) RequireTransportSecurity() bool { return false }
+
 // Opener creates an opener function to be used to get a gRPC backend. If the
 // address string is empty, it defaults to the DefaultAddr, the default value
 // for the memory-backed gRPC server.
@@ -126,6 +135,8 @@ func Opener(addr string, opts ...Option) entroq.BackendOpener {
 	for _, opt := range opts {
 		opt(options)
 	}
+
+	options.dialOpts = append(options.dialOpts, grpc.WithPerRPCCredentials(new(testCreds)))
 
 	return func(ctx context.Context) (entroq.Backend, error) {
 		conn, err := grpc.DialContext(ctx, addr, options.dialOpts...)
