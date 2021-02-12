@@ -23,21 +23,23 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var (
-	flagModID      string
-	flagModQueueTo string
-	flagModVal     string
-	flagModForce   bool
-)
+var flagMod = struct {
+	id      string
+	queueTo string
+	val     string
+	force   bool
+	reset   bool
+}{}
 
 func init() {
 	rootCmd.AddCommand(modCmd)
 
-	modCmd.Flags().StringVarP(&flagModID, "task", "t", "", "Task ID to modify. Note that this will modify *any* version of this task ID without regard for what else is happening. Use with care.")
+	modCmd.Flags().StringVarP(&flagMod.id, "task", "t", "", "Task ID to modify. Note that this will modify *any* version of this task ID without regard for what else is happening. Use with care.")
 	modCmd.MarkFlagRequired("task")
-	modCmd.Flags().StringVarP(&flagModQueueTo, "queue_to", "Q", "", "New queue for task, if a change is desired.")
-	modCmd.Flags().StringVarP(&flagModVal, "val", "v", "", "Value to set in task.")
-	modCmd.Flags().BoolVarP(&flagModForce, "force", "f", false, "Force by spoofing the claimant if already claimed.")
+	modCmd.Flags().StringVarP(&flagMod.queueTo, "queue_to", "Q", "", "New queue for task, if a change is desired.")
+	modCmd.Flags().BoolVarP(&flagMod.reset, "reset", "r", false, "Reset Attempt and Err while changing the task, e.g., moving from an error queue back into service. Does not work on wrapped tasks (will just move the wrapping task, not the internals).")
+	modCmd.Flags().StringVarP(&flagMod.val, "val", "v", "", "Value to set in task.")
+	modCmd.Flags().BoolVarP(&flagMod.force, "force", "f", false, "Force by spoofing the claimant if already claimed.")
 }
 
 // modCmd represents the mod command
@@ -45,7 +47,7 @@ var modCmd = &cobra.Command{
 	Use:   "mod",
 	Short: "Modify a task by queue and ID.",
 	Run: func(cmd *cobra.Command, args []string) {
-		id, err := uuid.Parse(flagModID)
+		id, err := uuid.Parse(flagMod.id)
 		if err != nil {
 			log.Fatalf("Error parsing task ID: %v", err)
 		}
@@ -63,16 +65,20 @@ var modCmd = &cobra.Command{
 		task := tasks[0]
 
 		var chgArgs []entroq.ChangeArg
-		if flagModVal != "" {
-			chgArgs = append(chgArgs, entroq.ValueTo([]byte(flagModVal)))
+		if flagMod.val != "" {
+			chgArgs = append(chgArgs, entroq.ValueTo([]byte(flagMod.val)))
 		}
-		if flagModQueueTo != "" {
-			chgArgs = append(chgArgs, entroq.QueueTo(flagModQueueTo))
+		if flagMod.queueTo != "" {
+			chgArgs = append(chgArgs, entroq.QueueTo(flagMod.queueTo))
 		}
 
 		modArgs := []entroq.ModifyArg{task.AsChange(chgArgs...)}
-		if flagModForce {
+		if flagMod.force {
 			modArgs = append(modArgs, entroq.ModifyAs(task.Claimant))
+		}
+
+		if flagMod.reset {
+			modArgs = append(modArgs, entroq.AttemptToZero(), entroq.ErrToZero())
 		}
 		if _, _, err := eq.Modify(context.Background(), modArgs...); err != nil {
 			log.Fatalf("Could not modify task %q: %v", id, err)
