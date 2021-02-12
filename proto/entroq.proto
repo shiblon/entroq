@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package proto;
 
+option go_package = ".;proto";
+
 // TaskID contains the ID and version of a task. Together these make a unique
 // identifier for that task.
 message TaskID {
@@ -9,7 +11,7 @@ message TaskID {
   int32 version = 2;
 }
 
-// TaskData contains only the data portion of a task. Useful for insertion.
+// TaskData contains only the data portion of a task. Useful for insertion and for modifying tasks.
 message TaskData {
   // The name of the queue for this task.
   string queue = 1;
@@ -27,6 +29,12 @@ message TaskData {
   // insertion (allowing "consume -> db update -> modify" worker cycles to
   // safely update a database entry that references to-be-inserted tasks).
   string id = 4;
+
+  // Attempt and Err are used to indicate a "retryable error" with a number of
+  // times attempted. This is used by the worker, and can be changed during
+  // task modification.
+  int32 attempt = 5;
+  string err = 6;
 }
 
 // TaskChange identifies a task by ID and specifies the new data it should contain.
@@ -60,6 +68,12 @@ message Task {
 
   // The number of times this has been successfully claimed.
   int32 claims = 9;
+
+  // Attempt and Err are used to indicate a "retryable error" with a number of
+  // times attempted. This is used by the worker, and can be changed during
+  // task modification.
+  int32 attempt = 10;
+  string err = 11;
 }
 
 // QueueStats contains the name of the queue and the number of tasks within it.

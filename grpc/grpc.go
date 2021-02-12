@@ -231,6 +231,8 @@ func fromTaskProto(t *pb.Task) (*entroq.Task, error) {
 		Value:    t.Value,
 		Created:  fromMS(t.CreatedMs),
 		Modified: fromMS(t.ModifiedMs),
+		Attempt:  t.Attempt,
+		Err:      t.Err,
 	}, nil
 }
 
@@ -240,10 +242,12 @@ func protoFromTaskData(td *entroq.TaskData) *pb.TaskData {
 		id = td.ID.String()
 	}
 	return &pb.TaskData{
-		Queue: td.Queue,
-		AtMs:  toMS(td.At),
-		Value: td.Value,
-		Id:    id,
+		Queue:   td.Queue,
+		AtMs:    toMS(td.At),
+		Value:   td.Value,
+		Attempt: td.Attempt,
+		Err:     td.Err,
+		Id:      id,
 	}
 }
 

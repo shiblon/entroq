@@ -416,6 +416,8 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 			Created:  now,
 			Modified: now,
 			Value:    make([]byte, len(t.Value)),
+			Attempt:  t.Attempt,
+			Err:      t.Err,
 		}
 		copy(newTask.Value, t.Value)
 		if b.existsIDUnsafe(newTask.ID) {
