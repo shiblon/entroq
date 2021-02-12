@@ -52,166 +52,78 @@ func pgClient(ctx context.Context) (client *entroq.EntroQ, stop func(), err erro
 		WithConnectAttempts(10)))
 }
 
-func TestTasksWithID(t *testing.T) {
+func RunQTest(t *testing.T, tester qtest.Tester) {
+	t.Helper()
 	ctx := context.Background()
-
 	client, stop, err := pgClient(ctx)
 	if err != nil {
 		t.Fatalf("Get client: %v", err)
 	}
 	defer stop()
+	tester(ctx, t, client, "pgtest/"+uuid.New().String())
+}
 
-	qtest.TasksWithID(ctx, t, client, "pgtest/"+uuid.New().String())
+func TestTasksWithID(t *testing.T) {
+	RunQTest(t, qtest.TasksWithID)
 }
 
 func TestTasksOmitValue(t *testing.T) {
-	ctx := context.Background()
-
-	client, stop, err := pgClient(ctx)
-	if err != nil {
-		t.Fatalf("Get client: %v", err)
-	}
-	defer stop()
-
-	qtest.TasksOmitValue(ctx, t, client, "pgtest/"+uuid.New().String())
+	RunQTest(t, qtest.TasksOmitValue)
 }
 
 func TestTasksWithIDOnly(t *testing.T) {
-	ctx := context.Background()
-
-	client, stop, err := pgClient(ctx)
-	if err != nil {
-		t.Fatalf("Get client: %v", err)
-	}
-	defer stop()
-
-	qtest.TasksWithIDOnly(ctx, t, client, "pgtest/"+uuid.New().String())
+	RunQTest(t, qtest.TasksWithIDOnly)
 }
 
 func TestInsertWithID(t *testing.T) {
-	ctx := context.Background()
-
-	client, stop, err := pgClient(ctx)
-	if err != nil {
-		t.Fatalf("Failed to create pg service and client: %v", err)
-	}
-	defer stop()
-
-	qtest.InsertWithID(ctx, t, client, "pgtest/"+uuid.New().String())
+	RunQTest(t, qtest.InsertWithID)
 }
 
 func TestSimpleSequence(t *testing.T) {
-	ctx := context.Background()
-
-	client, stop, err := pgClient(ctx)
-	if err != nil {
-		t.Fatalf("Failed to create pg service and client: %v", err)
-	}
-	defer stop()
-
-	qtest.SimpleSequence(ctx, t, client, "pgtest/"+uuid.New().String())
+	RunQTest(t, qtest.SimpleSequence)
 }
 
 func TestSimpleChange(t *testing.T) {
-	ctx := context.Background()
-
-	client, stop, err := pgClient(ctx)
-	if err != nil {
-		t.Fatalf("Failed to create pg service and client: %v", err)
-	}
-	defer stop()
-
 	log.Printf("Simple change")
-	qtest.SimpleChange(ctx, t, client, "pgtest/"+uuid.New().String())
+	RunQTest(t, qtest.SimpleChange)
 }
 
 func TestSimpleWorker(t *testing.T) {
-	ctx := context.Background()
-
-	client, stop, err := pgClient(ctx)
-	if err != nil {
-		t.Fatalf("Failed to create pg service and client: %v", err)
-	}
-	defer stop()
-
 	log.Printf("Simple worker")
-	qtest.SimpleWorker(ctx, t, client, "pgtest/"+uuid.New().String())
+	RunQTest(t, qtest.SimpleWorker)
 }
 
 func TestMultiWorker(t *testing.T) {
-	ctx := context.Background()
-
-	client, stop, err := pgClient(ctx)
-	if err != nil {
-		t.Fatalf("Failed to create pg service and client: %v", err)
-	}
-	defer stop()
-
 	log.Printf("Multi worker")
-	qtest.MultiWorker(ctx, t, client, "pgtest/"+uuid.New().String())
+	RunQTest(t, qtest.MultiWorker)
 }
 
 func TestWorkerDependencyHandler(t *testing.T) {
-	ctx := context.Background()
-
-	client, stop, err := pgClient(ctx)
-	if err != nil {
-		t.Fatalf("Failed to create pg service and client: %v", err)
-	}
-	defer stop()
-
 	log.Printf("Worker dependency handler")
-	qtest.WorkerDependencyHandler(ctx, t, client, "pgtest/"+uuid.New().String())
+	RunQTest(t, qtest.WorkerDependencyHandler)
 }
 
 func TestWorkerMoveOnError(t *testing.T) {
-	ctx := context.Background()
-
-	client, stop, err := pgClient(ctx)
-	if err != nil {
-		t.Fatalf("Failed to create pg service and client: %v", err)
-	}
-	defer stop()
-
 	log.Printf("Worker move on error")
-	qtest.WorkerMoveOnError(ctx, t, client, "pgtest/"+uuid.New().String())
+	RunQTest(t, qtest.WorkerMoveOnError)
+}
+
+func TestWorkerRetryOnError(t *testing.T) {
+	log.Printf("Worker retry on error")
+	RunQTest(t, qtest.WorkerRetryOnError)
 }
 
 func TestWorkerRenewal(t *testing.T) {
-	ctx := context.Background()
-
-	client, stop, err := pgClient(ctx)
-	if err != nil {
-		t.Fatalf("Failed to create pg service and client: %v", err)
-	}
-	defer stop()
-
 	log.Printf("Worker renewal")
-	qtest.WorkerRenewal(ctx, t, client, "pgtest/"+uuid.New().String())
+	RunQTest(t, qtest.WorkerRenewal)
 }
 
 func TestQueueMatch(t *testing.T) {
-	ctx := context.Background()
-
-	client, stop, err := pgClient(ctx)
-	if err != nil {
-		t.Fatalf("Failed to create pg service and client: %v", err)
-	}
-	defer stop()
-
-	qtest.QueueMatch(ctx, t, client, "pgtest/"+uuid.New().String())
+	RunQTest(t, qtest.QueueMatch)
 }
 
 func TestQueueStats(t *testing.T) {
-	ctx := context.Background()
-
-	client, stop, err := pgClient(ctx)
-	if err != nil {
-		t.Fatalf("Failed to create pg service and client: %v", err)
-	}
-	defer stop()
-
-	qtest.QueueStats(ctx, t, client, "pgtest/"+uuid.New().String())
+	RunQTest(t, qtest.QueueStats)
 }
 
 func TestMapReduce_checkTiny(t *testing.T) {
@@ -307,7 +219,7 @@ func startPostgres(ctx context.Context) (port int, stop func(), err error) {
 	name := fmt.Sprintf("testpg-%s", uuid.New())
 
 	log.Printf("Starting postgres container %q...", name)
-	if err := run(ctx, "docker", "run", "-p", "0:5432", "--rm", "-d", "-e", "POSTGRES_PASSWORD=postgres", "--name", name, "postgres:11"); err != nil {
+	if err := run(ctx, "docker", "run", "-p", "0:5432", "--rm", "-d", "-e", "POSTGRES_PASSWORD=password", "--name", name, "postgres:11"); err != nil {
 		return 0, nil, errors.Wrap(err, "start postgres container")
 	}
 	time.Sleep(2 * time.Second) // give it some time to get pipes attached

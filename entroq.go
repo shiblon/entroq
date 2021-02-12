@@ -64,6 +64,10 @@ type TaskData struct {
 	At    time.Time
 	Value []byte
 
+	// These can be change by the user, so are part of the task data.
+	Attempt int32  `json:"attempt"`
+	Err     string `json:"err"`
+
 	// ID is an optional task ID to be used for task insertion.
 	// Default (uuid.Nil) causes the backend to assign one, and that is
 	// sufficient for many cases. If you desire to make a database entry that
@@ -108,12 +112,19 @@ type Task struct {
 
 	Created  time.Time `json:"created"`
 	Modified time.Time `json:"modified"`
+
+	// Worker retry logic uses these fields when moving tasks and when retrying them.
+	// It is left up to the consumer to determine how many attempts is too many
+	// and to produce a suitable retry or move error.
+	Attempt int32  `json:"attempt"`
+	Err     string `json:"err"`
 }
 
 // String returns a useful representation of this task.
 func (t *Task) String() string {
 	return fmt.Sprintf("Task [%q %s v%d]\n\t", t.Queue, t.ID, t.Version) + strings.Join([]string{
-		fmt.Sprintf("at=%q claimant=%s", t.At, t.Claimant),
+		fmt.Sprintf("at=%q claimant=%s claims=%d", t.At, t.Claimant, t.Claims),
+		fmt.Sprintf("attempt=%d err=%q", t.Attempt, t.Err),
 		fmt.Sprintf("c=%q m=%q", t.Created, t.Modified),
 		fmt.Sprintf("val=%q", string(t.Value)),
 	}, "\n\t") + "\n"
@@ -164,10 +175,12 @@ func (t *Task) IDVersion() *TaskID {
 // Data returns the data for this task.
 func (t *Task) Data() *TaskData {
 	return &TaskData{
-		Queue: t.Queue,
-		At:    t.At,
-		Value: t.Value,
-		ID:    t.ID,
+		Queue:   t.Queue,
+		At:      t.At,
+		Value:   t.Value,
+		ID:      t.ID,
+		Attempt: t.Attempt,
+		Err:     t.Err,
 	}
 }
 
@@ -930,6 +943,22 @@ func WithValue(value []byte) InsertArg {
 	}
 }
 
+// WithAttempt sets the number of attempts for this task. Usually not needed,
+// handled automatically by the worker.
+func WithAttempt(value int32) InsertArg {
+	return func(_ *Modification, d *TaskData) {
+		d.Attempt = value
+	}
+}
+
+// WithErr sets the error field of a task during insertion. Usually not needed,
+// as tasks are typically modified to add errors, not inserted with them.
+func WithErr(value string) InsertArg {
+	return func(_ *Modification, d *TaskData) {
+		d.Err = value
+	}
+}
+
 // WithID sets the task's ID for insertion. This is not normally needed, as the backend
 // will assign a new, unique ID for this task if none is specified. There are cases
 // where assigning an explicit insertion ID (always being careful that it is
@@ -1065,6 +1094,32 @@ func ArrivalTimeBy(d time.Duration) ChangeArg {
 func ValueTo(v []byte) ChangeArg {
 	return func(_ *Modification, t *Task) {
 		t.Value = v
+	}
+}
+
+// ErrTo sets the Err field in the task.
+func ErrTo(e string) ChangeArg {
+	return func(_ *Modification, t *Task) {
+		t.Err = e
+	}
+}
+
+// ErrToZero sets the Err field to its zero value (clears the error).
+func ErrToZero() ChangeArg {
+	return ErrTo("")
+}
+
+// AttemptToNext sets the Attempt field in Task to the next value (increments it).
+func AttemptToNext() ChangeArg {
+	return func(_ *Modification, t *Task) {
+		t.Attempt++
+	}
+}
+
+// AttemptToZero resets the Attempt field to zero.
+func AttemptToZero() ChangeArg {
+	return func(_ *Modification, t *Task) {
+		t.Attempt = 0
 	}
 }
 
