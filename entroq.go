@@ -806,7 +806,8 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.D
 
 	if err := g.Wait(); err != nil {
 		// Pass on renewed task if the error coming out wants us to.
-		if rterr, ok := err.(SetRenewedTasker); ok {
+		// Make sure to get the underlying error, since it may have been wrapped.
+		if rterr, ok := errors.Cause(err).(SetRenewedTasker); ok {
 			rterr.SetRenewedTask(renewed...)
 		}
 		return nil, errors.Wrap(err, "error running with renewal")

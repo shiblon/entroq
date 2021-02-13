@@ -509,43 +509,46 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		wrapped bool
 	}
 
+	newTask := func(val string) *entroq.Task {
+		return &entroq.Task{
+			Queue: queue,
+			ID:    uuid.New(),
+			Value: []byte(val),
+		}
+	}
+
 	cases := []tc{
 		{
-			name: "die",
-			input: &entroq.Task{
-				Queue: queue,
-				ID:    uuid.New(),
-				Value: []byte("die"),
-			},
-			moved:   false,
-			wrapped: true,
-		},
-		{
-			name: "move-wrapped",
-			input: &entroq.Task{
-				Queue: queue,
-				ID:    uuid.New(),
-				Value: []byte("move"),
-			},
+			name:    "move-wrapped",
+			input:   newTask("move"),
 			moved:   true,
 			wrapped: true,
 		},
 		{
-			name: "move-not-wrapped",
-			input: &entroq.Task{
-				Queue: queue,
-				ID:    uuid.New(),
-				Value: []byte("move"),
-			},
-			moved:   true,
-			wrapped: false,
+			name:  "move-not-wrapped",
+			input: newTask("move"),
+			moved: true,
+		},
+		{
+			name:  "wait-for-renewal",
+			input: newTask("move-wait"),
+			moved: true,
+		},
+		{
+			name:  "die",
+			input: newTask("die"),
 		},
 	}
 
 	runWorkerOneCase := func(ctx context.Context, c tc) {
 		t.Helper()
 
-		w := client.NewWorker(queue).WithOpts(entroq.WithWrappedMove(c.wrapped))
+		const leaseTime = 5 * time.Second
+
+		w := client.NewWorker(queue).WithOpts(
+			entroq.WithWrappedMove(c.wrapped),
+			entroq.WithLease(leaseTime),
+		)
 
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
@@ -557,6 +560,13 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 					return nil, errors.New("task asked to die")
 				case "move":
 					return nil, entroq.NewMoveTaskError(errors.New("task asked to move"))
+				case "move-wait":
+					select {
+					case <-time.After(leaseTime):
+						return nil, entroq.NewMoveTaskError(errors.New("task asked to move after renewal"))
+					case <-ctx.Done():
+						return nil, errors.Wrapf(ctx.Err(), "oops - test %q too too long, gave up before finishing", c.name)
+					}
 				default:
 					return []entroq.ModifyArg{task.AsDeletion()}, nil
 				}
@@ -571,7 +581,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		)); err != nil {
 			t.Fatalf("Test %q insert task work: %v", c.name, err)
 		}
-		waitCtx, _ := context.WithTimeout(ctx, 5*time.Second)
+		waitCtx, _ := context.WithTimeout(ctx, 2*leaseTime)
 		if err := client.WaitQueuesEmpty(waitCtx, entroq.MatchExact(queue)); err != nil && !entroq.IsCanceled(err) {
 			// Not fatal if the task asked the worker to die.
 			log.Printf("Test %q wait: %v", c.name, err)
