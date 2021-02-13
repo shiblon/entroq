@@ -500,24 +500,31 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	t.Helper()
 
-	queue := path.Join(qPrefix, "move_on_error")
+	baseQueue := path.Join(qPrefix, "move_on_error")
 
 	type tc struct {
 		name    string
 		input   *entroq.Task
+		die     bool
 		moved   bool
 		wrapped bool
 	}
 
 	newTask := func(val string) *entroq.Task {
+		id := uuid.New()
 		return &entroq.Task{
-			Queue: queue,
-			ID:    uuid.New(),
+			Queue: path.Join(baseQueue, val, id.String()),
+			ID:    id,
 			Value: []byte(val),
 		}
 	}
 
 	cases := []tc{
+		{
+			name:  "die",
+			input: newTask("die"),
+			die:   true,
+		},
 		{
 			name:    "move-wrapped",
 			input:   newTask("move"),
@@ -534,23 +541,21 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 			input: newTask("move-wait"),
 			moved: true,
 		},
-		{
-			name:  "die",
-			input: newTask("die"),
-		},
 	}
 
 	runWorkerOneCase := func(ctx context.Context, c tc) {
 		t.Helper()
 
+		log.Printf("Testing MoveTaskError %q", c.name)
+
 		const leaseTime = 5 * time.Second
 
-		w := client.NewWorker(queue).WithOpts(
+		w := client.NewWorker(c.input.Queue).WithOpts(
 			entroq.WithWrappedMove(c.wrapped),
 			entroq.WithLease(leaseTime),
 		)
 
-		ctx, cancel := context.WithCancel(ctx)
+		ctx, cancel := context.WithTimeout(ctx, 2*leaseTime)
 		defer cancel()
 		g, gctx := errgroup.WithContext(ctx)
 		g.Go(func() error {
@@ -571,22 +576,32 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 					return []entroq.ModifyArg{task.AsDeletion()}, nil
 				}
 			})
-			log.Printf("Worker exited: %v", err)
 			return err
 		})
 
-		if _, _, err := client.Modify(ctx, entroq.InsertingInto(queue,
+		if _, _, err := client.Modify(ctx, entroq.InsertingInto(c.input.Queue,
 			entroq.WithID(c.input.ID),
 			entroq.WithValue(c.input.Value),
 		)); err != nil {
 			t.Fatalf("Test %q insert task work: %v", c.name, err)
 		}
-		waitCtx, _ := context.WithTimeout(ctx, 2*leaseTime)
-		if err := client.WaitQueuesEmpty(waitCtx, entroq.MatchExact(queue)); err != nil && !entroq.IsCanceled(err) {
-			// Not fatal if the task asked the worker to die.
-			log.Printf("Test %q wait: %v", c.name, err)
+
+		if c.die {
+			if err := g.Wait(); err != nil && entroq.IsTimeout(err) {
+				t.Fatalf("Test %q expected to die, but not with a timeout error: %v", c.name, err)
+			}
+			// Delete the dead task, will always ve version 1.
+			if _, _, err := client.Modify(ctx, entroq.Deleting(c.input.ID, 1)); err != nil {
+				t.Fatalf("Test %q tried to clean up dead task: %v", c.name, err)
+			}
+			return
 		}
-		errTasks, err := client.Tasks(ctx, w.ErrQMap(queue))
+
+		waitCtx, _ := context.WithTimeout(ctx, 2*leaseTime)
+		if err := client.WaitQueuesEmpty(waitCtx, entroq.MatchExact(c.input.Queue)); err != nil && !entroq.IsCanceled(err) {
+			t.Fatalf("Test %q: no moved tasks found, task was not expected to die: %v", c.name, err)
+		}
+		errTasks, err := client.Tasks(ctx, w.ErrQMap(c.input.Queue))
 		if err != nil {
 			t.Fatalf("Test %q find in error queue: %v", c.name, err)
 		}
@@ -615,9 +630,9 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 			}
 		}
 		if c.moved && foundTask == nil {
-			t.Errorf("Test %q expected task to be moved, but is not found in %q", c.name, w.ErrQMap(queue))
+			t.Errorf("Test %q expected task to be moved, but is not found in %q", c.name, w.ErrQMap(c.input.Queue))
 		} else if !c.moved && foundTask != nil {
-			t.Errorf("Test %q expected task to be deleted, but showed up in %q", c.name, w.ErrQMap(queue))
+			t.Errorf("Test %q expected task to be deleted, but showed up in %q", c.name, w.ErrQMap(c.input.Queue))
 		}
 
 		cancel()

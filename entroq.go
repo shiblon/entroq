@@ -793,7 +793,7 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.D
 			case <-time.After(lease / 2):
 				var err error
 				if renewed, err = c.RenewAllFor(ctx, renewed, lease); err != nil {
-					return errors.Wrap(err, "could not extend lease")
+					return errors.Wrap(err, "renew all lease")
 				}
 			}
 		}
@@ -810,7 +810,7 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.D
 		if rterr, ok := errors.Cause(err).(SetRenewedTasker); ok {
 			rterr.SetRenewedTask(renewed...)
 		}
-		return nil, errors.Wrap(err, "error running with renewal")
+		return nil, errors.Wrap(err, "renew all")
 	}
 
 	// The task will have been overwritten with every renewal. Return final task.
@@ -821,7 +821,7 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.D
 func (c *EntroQ) DoWithRenew(ctx context.Context, task *Task, lease time.Duration, f func(context.Context) error) (*Task, error) {
 	finalTasks, err := c.DoWithRenewAll(ctx, []*Task{task}, lease, f)
 	if err != nil {
-		return nil, errors.Wrap(err, "with renew single task")
+		return nil, errors.Wrap(err, "renew")
 	}
 	return finalTasks[0], nil
 }
