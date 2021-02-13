@@ -212,14 +212,18 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 		return errors.New("No queues specified to work on")
 	}
 	defer func() {
-		log.Printf("Finishing EntroQ worker %q on client %v: err=%v", w.Qs, w.eqc.ID(), err)
+		if err == nil {
+			log.Printf("Graceful completion of worker %q for claimant %v", w.Qs, w.eqc.ID())
+		} else {
+			log.Printf("Worker quit for claimant %v: %v", w.eqc.ID(), err)
+		}
 	}()
 	log.Printf("Starting EntroQ worker %q on client %v, leasing for %v at a time", w.Qs, w.eqc.ID(), w.lease)
 
 	for {
 		select {
 		case <-ctx.Done():
-			return errors.Wrapf(ctx.Err(), "worker quit (%q)", w.Qs)
+			return errors.Wrapf(ctx.Err(), "worker quit", w.Qs)
 		default:
 		}
 
@@ -234,12 +238,11 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 		renewed, workErr := w.eqc.DoWithRenew(ctx, task, w.lease, func(ctx context.Context) error {
 			var err error
 			if args, err = f(ctx, task); err != nil {
-				return errors.Wrapf(err, "worker run with renew (%q)", w.Qs)
+				return errors.Wrapf(err, "work (%q)", w.Qs)
 			}
 			return nil
 		})
 		if workErr != nil {
-			log.Printf("Worker error (%q): %v", w.Qs, workErr)
 			if _, ok := AsDependency(workErr); ok {
 				log.Printf("Worker continuing after dependency (%q)", w.Qs)
 				continue
@@ -249,7 +252,6 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 				continue
 			}
 			if IsCanceled(workErr) {
-				log.Printf("Worker shutting down cleanly (%q)", w.Qs)
 				return nil
 			}
 			if retryErr, ok := AsRetryTaskError(workErr); ok {
@@ -277,7 +279,7 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 				continue
 			}
 			if moveErr, ok := AsMoveTaskError(workErr); ok {
-				log.Printf("Worker moving error task to %q instead of exiting: %v", errQ, workErr)
+				log.Printf("Worker moving to %q: %v", errQ, workErr)
 				renewed := task
 				if len(moveErr.Renewed) > 0 {
 					renewed = moveErr.Renewed[0]
@@ -288,7 +290,7 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 				}
 				continue
 			}
-			return errors.Wrapf(workErr, "worker error (%q)", w.Qs)
+			return errors.Wrap(workErr, "worker error")
 		}
 
 		modification := NewModification(uuid.Nil, args...)
