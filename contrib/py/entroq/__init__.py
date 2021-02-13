@@ -27,7 +27,8 @@ def is_dependency(exc):
 
 
 def dependency_error_details(exc, as_json=False):
-    if not is_dependency(exc): return None
+    if not is_dependency(exc):
+        return None
     # Should have dependency metadata.
     meta = exc.trailing_metadata()
     if not meta:
@@ -370,6 +371,7 @@ class EntroQ:
 
 class EQWorker:
     """Worker for claiming tasks from a given queue and running a given method."""
+
     def __init__(self, eq):
         """Create a worker using the given EntroQ client.
 

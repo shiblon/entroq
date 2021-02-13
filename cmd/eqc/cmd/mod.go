@@ -71,15 +71,15 @@ var modCmd = &cobra.Command{
 		if flagMod.queueTo != "" {
 			chgArgs = append(chgArgs, entroq.QueueTo(flagMod.queueTo))
 		}
+		if flagMod.reset {
+			chgArgs = append(chgArgs, entroq.AttemptToZero(), entroq.ErrToZero())
+		}
 
 		modArgs := []entroq.ModifyArg{task.AsChange(chgArgs...)}
 		if flagMod.force {
 			modArgs = append(modArgs, entroq.ModifyAs(task.Claimant))
 		}
 
-		if flagMod.reset {
-			modArgs = append(modArgs, entroq.AttemptToZero(), entroq.ErrToZero())
-		}
 		if _, _, err := eq.Modify(context.Background(), modArgs...); err != nil {
 			log.Fatalf("Could not modify task %q: %v", id, err)
 		}
