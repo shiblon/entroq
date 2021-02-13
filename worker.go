@@ -223,7 +223,7 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 	for {
 		select {
 		case <-ctx.Done():
-			return errors.Wrapf(ctx.Err(), "worker quit", w.Qs)
+			return errors.Wrap(ctx.Err(), "worker quit")
 		default:
 		}
 
