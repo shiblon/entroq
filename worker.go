@@ -257,11 +257,11 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 			if retryErr, ok := AsRetryTaskError(workErr); ok {
 				log.Printf("Worker received retryable error, incrementing attempt: %v", workErr)
 				renewed := task
-				if len(retryErr.Renewed) > 0 {
+				if len(retryErr.Renewed) != 0 {
 					renewed = retryErr.Renewed[0]
 				}
 
-				if w.MaxAttempts > 0 && renewed.Attempt+1 >= w.MaxAttempts {
+				if w.MaxAttempts > 1 && renewed.Attempt+1 >= w.MaxAttempts {
 					// Move instead - we retried enough times already.
 					log.Printf("Worker max attempts reached, moving to %q instead of retrying: %v", errQ, workErr)
 					if err := w.moveTaskWithError(ctx, renewed, errQ, workErr, true); err != nil {
@@ -281,7 +281,7 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 			if moveErr, ok := AsMoveTaskError(workErr); ok {
 				log.Printf("Worker moving to %q: %v", errQ, workErr)
 				renewed := task
-				if len(moveErr.Renewed) > 0 {
+				if len(moveErr.Renewed) != 0 {
 					renewed = moveErr.Renewed[0]
 				}
 
