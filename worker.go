@@ -66,17 +66,25 @@ type Worker struct {
 // and we want to stash them somewhere instead of just causing the worker to
 // crash, but allows us to handle that as an early error return.
 type MoveTaskError struct {
-	Err error
+	Err     error
+	Renewed []*Task
 }
 
 // NewMoveTaskError creates a new MoveTaskError from the given error.
 func NewMoveTaskError(err error) *MoveTaskError {
-	return &MoveTaskError{err}
+	return &MoveTaskError{Err: err}
 }
 
 // Error produces an error string.
 func (e *MoveTaskError) Error() string {
 	return e.Err.Error()
+}
+
+// SetRenewedTask allows upstream callers (like DoWithRenew) to set the renewed
+// task in the error itself, so that version skew may be overcome when doing
+// things like moving or retrying a task (incrementing attempts, etc.).
+func (e *MoveTaskError) SetRenewedTask(t ...*Task) {
+	e.Renewed = t
 }
 
 // AsMoveTaskError returns the underlying error and true iff the underlying
@@ -100,12 +108,20 @@ type ErrorTaskValue struct {
 // nonzero, and has been reached, then this behaves in the same ways as a
 // MoveTaskError.
 type RetryTaskError struct {
-	Err error
+	Err     error
+	Renewed []*Task
 }
 
 // NewRetryTaskError creates a new RetryTaskError from the given error.
 func NewRetryTaskError(err error) *RetryTaskError {
-	return &RetryTaskError{err}
+	return &RetryTaskError{Err: err}
+}
+
+// SetRenewedTask allows upstream callers (like DoWithRenew) to set the renewed
+// task in the error itself, so that version skew may be overcome when doing
+// things like moving or retrying a task (incrementing attempts, etc.).
+func (e *RetryTaskError) SetRenewedTask(t ...*Task) {
+	e.Renewed = t
 }
 
 // Error produces an error string.
@@ -236,17 +252,19 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 				log.Printf("Worker shutting down cleanly (%q)", w.Qs)
 				return nil
 			}
-			if _, ok := AsRetryTaskError(workErr); ok {
+			if retryErr, ok := AsRetryTaskError(workErr); ok {
 				log.Printf("Worker received retryable error, incrementing attempt: %v", workErr)
-				if w.MaxAttempts > 0 && task.Attempt+1 >= w.MaxAttempts {
+				renewed := retryErr.Renewed[0] // DoWithRenewAll ensures we will have this.
+
+				if w.MaxAttempts > 0 && renewed.Attempt+1 >= w.MaxAttempts {
 					// Move instead - we retried enough times already.
 					log.Printf("Worker max attempts reached, moving to %q instead of retrying: %v", errQ, workErr)
-					if err := w.moveTaskWithError(ctx, task, errQ, workErr, true); err != nil {
+					if err := w.moveTaskWithError(ctx, renewed, errQ, workErr, true); err != nil {
 						return errors.Wrap(err, "move work task instead of retry")
 					}
 				} else {
 					// Can retry. Increment attempts and move on.
-					if _, _, err := w.eqc.Modify(ctx, task.AsChange(
+					if _, _, err := w.eqc.Modify(ctx, renewed.AsChange(
 						ErrTo(errors.Cause(workErr).Error()),
 						AttemptToNext(),
 						ArrivalTimeBy(w.baseRetryDelay))); err != nil {
@@ -255,9 +273,11 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 				}
 				continue
 			}
-			if _, ok := AsMoveTaskError(workErr); ok {
+			if moveErr, ok := AsMoveTaskError(workErr); ok {
 				log.Printf("Worker moving error task to %q instead of exiting: %v", errQ, workErr)
-				if err := w.moveTaskWithError(ctx, task, errQ, workErr, false); err != nil {
+				renewed := moveErr.Renewed[0] // DoWithRenewAll ensures we will have this.
+
+				if err := w.moveTaskWithError(ctx, renewed, errQ, workErr, false); err != nil {
 					return errors.Wrap(err, "move work task")
 				}
 				continue
