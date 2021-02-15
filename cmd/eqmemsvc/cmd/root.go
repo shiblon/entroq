@@ -19,6 +19,7 @@ import (
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/metadata"
 
 	pb "entrogo.com/entroq/proto"
 	hpb "google.golang.org/grpc/health/grpc_health_v1"
@@ -63,6 +64,12 @@ var rootCmd = &cobra.Command{
 		s := grpc.NewServer(
 			grpc.MaxRecvMsgSize(maxSize*MB),
 			grpc.MaxSendMsgSize(maxSize*MB),
+			grpc.UnaryInterceptor(func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+				md, ok := metadata.FromIncomingContext(ctx)
+				log.Printf("interceptor metadata (ok=%v): %+v", ok, md)
+				log.Printf("interceptor info: %+v", info)
+				return handler(ctx, req)
+			}),
 		)
 		pb.RegisterEntroQServer(s, svc)
 		hpb.RegisterHealthServer(s, health.NewServer())
