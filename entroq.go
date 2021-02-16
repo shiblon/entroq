@@ -60,11 +60,11 @@ func (t TaskID) AsDependency() ModifyArg {
 
 // TaskData contains just the data, not the identifier or metadata. Used for insertions.
 type TaskData struct {
-	Queue string
-	At    time.Time
-	Value []byte
+	Queue string    `json:"queue"`
+	At    time.Time `json:"at"`
+	Value []byte    `json:"value"`
 
-	// These can be change by the user, so are part of the task data.
+	// These can be changed by the user, so are part of the task data.
 	Attempt int32  `json:"attempt"`
 	Err     string `json:"err"`
 
@@ -78,7 +78,7 @@ type TaskData struct {
 	//
 	// to be done safely, where the database update needs to refer to
 	// to-be-inserted tasks.
-	ID uuid.UUID
+	ID uuid.UUID `json:"id"`
 
 	// skipCollidingID indicates that a collision on insertion is not fatal,
 	// and the insertion can be removed if that happens, and then the
