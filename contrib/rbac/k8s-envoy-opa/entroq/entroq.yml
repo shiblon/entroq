@@ -37,6 +37,11 @@ spec:
               name: grpc
             - containerPort: 9100
               name: metrics
+        - name: eqc
+          image: shiblon/entroq:v0.4
+          command:
+            - |
+              bash -c 'sleep infinity & PID=$!; trap "kill $PID" INT TERM; echo starting; wait; echo exited;'
       volumes:
         - name: proxy-config
           configMap:
