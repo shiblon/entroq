@@ -15,19 +15,9 @@ spec:
       labels:
         app: entroq
     spec:
-      #initContainers:
-      #  - name: proxy-init
-      #    image: openpolicyagent/proxy_init:v5
-      #    args: ["-p", "8000", "-u", "1111", "-w", "8282"]
-      #    securityContext:
-      #      capabilities:
-      #        add:
-      #        - NET_ADMIN
-      #      runAsNonRoot: false
-      #      runAsUser: 0
       containers:
         - name: envoy
-          image: envoyproxy/envoy:v1.14.4
+          image: envoyproxy/envoy:v1.17.0
           securityContext:
             runAsUser: 1111
           volumeMounts:
@@ -51,6 +41,3 @@ spec:
         - name: proxy-config
           configMap:
             name: entroq-envoy-config
-        # - name: opa-policy
-        #  secret:
-        #    secretName: opa-policy
