@@ -2,6 +2,8 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: entroq
+  labels:
+    app: entroq
 spec:
   selector:
     matchLabels:
@@ -13,11 +15,42 @@ spec:
       labels:
         app: entroq
     spec:
+      #initContainers:
+      #  - name: proxy-init
+      #    image: openpolicyagent/proxy_init:v5
+      #    args: ["-p", "8000", "-u", "1111", "-w", "8282"]
+      #    securityContext:
+      #      capabilities:
+      #        add:
+      #        - NET_ADMIN
+      #      runAsNonRoot: false
+      #      runAsUser: 0
       containers:
+        - name: envoy
+          image: envoyproxy/envoy:v1.14.4
+          securityContext:
+            runAsUser: 1111
+          volumeMounts:
+          - readOnly: true
+            mountPath: "/config"
+            name: proxy-config
+          args: ["envoy", "--config-path", "/config/envoy.yaml"]
         - name: entroq
           image: shiblon/entroq:v0.4
+          args:
+            - "--port"
+            - "37707"
+            - "--http_port"
+            - "9100"
           ports:
-            - containerPort: 37706
+            - containerPort: 37707
               name: grpc
             - containerPort: 9100
               name: metrics
+      volumes:
+        - name: proxy-config
+          configMap:
+            name: entroq-envoy-config
+        # - name: opa-policy
+        #  secret:
+        #    secretName: opa-policy
