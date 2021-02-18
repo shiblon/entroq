@@ -1,0 +1,17 @@
+kind: Service
+apiVersion: v1
+metadata:
+  name: entroq
+spec:
+  selector:
+    app: entroq
+  ports:
+    - protocol: TCP
+      port: 37706
+      name: envoy-entroq
+    - protocol: TCP
+      port: 9100
+      name: entroq-metrics
+    - protocol: TCP
+      port: 8001
+      name: envoy-admin
