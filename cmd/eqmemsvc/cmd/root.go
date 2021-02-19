@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/encoding/protojson"
 
 	pb "entrogo.com/entroq/proto"
 	hpb "google.golang.org/grpc/health/grpc_health_v1"
@@ -61,14 +62,78 @@ var rootCmd = &cobra.Command{
 			log.Fatalf("http and metric server: %v", http.ListenAndServe(fmt.Sprintf(":%d", httpPort), nil))
 		}()
 
+		// TODO
+		const authKey = "authorization"
+
+		// TODO
+		getAuthzToken := func(ctx context.Context) string {
+			md, ok := metadata.FromIncomingContext(ctx)
+			if !ok {
+				return ""
+			}
+			vals := md[authKey]
+			if len(vals) == 0 {
+				return ""
+			}
+			return vals[0]
+		}
+
+		// TODO: returns JSON of the request, and the authorization header.
+		unaryOPARequest := func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo) ([]byte, error) {
+			authzReq := &pb.AuthzRequest{Authz: &pb.Authz{Token: getAuthzToken(ctx)}}
+			switch v := req.(type) {
+			case *pb.ClaimRequest:
+				authzReq.ClaimQueues = append(authzReq.ClaimQueues, v.Queues...)
+			case *pb.ModifyRequest:
+				// TODO: empty queues are always meaningful, we must insert
+				// them into the list. That way the authorizer can tell that
+				// someone is trying to do a "queueless admin" operation.
+				for _, ins := range v.Inserts {
+					authzReq.InsertQueues = append(authzReq.InsertQueues, ins.Queue)
+				}
+				for _, chg := range v.Changes {
+					authzReq.ChangeQueues = append(authzReq.ChangeQueues, chg.GetNewData().Queue, chg.GetOldId().Queue)
+				}
+				for _, del := range v.Deletes {
+					authzReq.DeleteQueues = append(authzReq.DeleteQueues, del.Queue)
+				}
+				for _, dep := range v.Deletes {
+					authzReq.DeleteQueues = append(authzReq.DeleteQueues, dep.Queue)
+				}
+				// TODO: send queue names for delete/depend stuff, too?
+				// We could make the queue name optional there, and then
+				// explicitly add the "empty queue" when it isn't set. Then
+				// there could be a blanket "let it through, they're admin"
+				// sort of setting for when the queue is left out. Other than
+				// that, there' really no reason they shouldn't know what queue
+				// they're deleting from, changing, or depending on.
+			case *pb.TasksRequest:
+				authzReq.TasksQueues = append(authzReq.TasksQueues, v.Queue)
+			}
+
+			b, err := protojson.Marshal(authzReq)
+			if err != nil {
+				return nil, errors.Wrap(err, "marshal authz req")
+			}
+			return b, nil
+		}
+
 		s := grpc.NewServer(
 			grpc.MaxRecvMsgSize(maxSize*MB),
 			grpc.MaxSendMsgSize(maxSize*MB),
+			// TODO
 			grpc.UnaryInterceptor(func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
-				md, ok := metadata.FromIncomingContext(ctx)
-				log.Printf("interceptor metadata (ok=%v): %+v", ok, md)
-				log.Printf("interceptor info: %+v", info)
+				opaReq, err := unaryOPARequest(ctx, req, info)
+				log.Printf("interceptor opareq (err=%v): %+v", err, string(opaReq))
 				return handler(ctx, req)
+			}),
+			// TODO
+			grpc.StreamInterceptor(func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+				ctx := ss.Context()
+				md, ok := metadata.FromIncomingContext(ctx)
+				log.Printf("stream interceptor metadata (ok=%v): %+v", ok, md)
+				log.Printf("stream interceptor info: %+v", info)
+				return handler(srv, ss)
 			}),
 		)
 		pb.RegisterEntroQServer(s, svc)
