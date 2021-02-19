@@ -204,18 +204,42 @@ message Authz {
   string token = 1;
 }
 
+// MatchType is the type of a queue name (e.g., exact match, pattern, etc.).
+enum MatchType {
+  MATCH_EXACT = 0;
+  // TODO: add prefix and patterns?
+}
+
+// QueueSpec contains a single queue specification (name, pattern, etc.)
+message QueueSpec {
+  string value = 1;
+  MatchType match_type = 2;
+
+  // Action indicates what this queue is being used for (e.g., CLAIM).
+  DepType action = 3;
+}
+
+
 // AuthzRequest contains authorization information and information about what
 // the user is attempting to do with which queues. Useful for subrequest
 // authorization (e.g., sending to OpenPolicyAgent).
 message AuthzRequest {
   Authz authz = 1;
 
-  repeated string claim_queues = 2;
-  repeated string delete_queues = 3;
-  repeated string depend_queues = 4;
-  repeated string change_queues = 5;
-  repeated string insert_queues = 6;
-  repeated string tasks_queues = 7;
+  repeated QueueSpec queues = 2;
+}
+
+// AuthzResponse is the authorization response, containing disallowed queues
+// with their actions.
+message AuthzResponse {
+  bool allow = 1;
+
+  repeated QueueSpec queues = 2;
+
+  // The reason is a message indicating why authorization failed. May include
+  // inforation like the user name or group memberships, for exmaple.
+  // Implementation-dependent.
+  string reason = 3;
 }
 
 // EntroQ is a service that allows for access to a task queue.
