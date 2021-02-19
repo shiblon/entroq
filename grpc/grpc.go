@@ -41,6 +41,7 @@ package grpc // import "entrogo.com/entroq/grpc"
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"time"
 
@@ -115,11 +116,13 @@ func WithMaxSize(maxMB int) Option {
 	))
 }
 
+// TODO: make more permanent and real, with options and stuff. Allow creds to
+// come from a function so that renewal is possible.
 type testCreds struct {
 }
 
 func (*testCreds) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
-	return map[string]string{"testz": "val"}, nil
+	return map[string]string{"authorization": "val"}, nil
 }
 
 func (*testCreds) RequireTransportSecurity() bool { return false }
@@ -242,6 +245,7 @@ func fromTaskProto(t *pb.Task) (*entroq.Task, error) {
 		Value:    t.Value,
 		Created:  fromMS(t.CreatedMs),
 		Modified: fromMS(t.ModifiedMs),
+		// Omit FromQueue - not needed here.
 	}, nil
 }
 
@@ -260,7 +264,11 @@ func protoFromTaskData(td *entroq.TaskData) *pb.TaskData {
 
 func changeProtoFromTask(t *entroq.Task) *pb.TaskChange {
 	return &pb.TaskChange{
-		OldId:   protoFromTaskID(t.IDVersion()),
+		OldId: &pb.TaskID{
+			ID:      t.ID,
+			Version: t.Version,
+			Queue:   t.FromQueue, // old queue goes in the ID for changes.
+		},
 		NewData: protoFromTaskData(t.Data()),
 	}
 
@@ -274,14 +282,8 @@ func fromTaskIDProto(tid *pb.TaskID) (*entroq.TaskID, error) {
 	return &entroq.TaskID{
 		ID:      id,
 		Version: tid.Version,
+		Queue:   tid.Queue,
 	}, nil
-}
-
-func protoFromTaskID(tid *entroq.TaskID) *pb.TaskID {
-	return &pb.TaskID{
-		Id:      tid.ID.String(),
-		Version: tid.Version,
-	}
 }
 
 // Tasks produces a list of tasks in a given queue, possibly limited by claimant.
@@ -290,7 +292,8 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 	for _, tid := range tq.IDs {
 		ids = append(ids, tid.String())
 	}
-	resp, err := pb.NewEntroQClient(b.conn).Tasks(ctx, &pb.TasksRequest{
+
+	stream, err := pb.NewEntroQClient(b.conn).StreamTasks(ctx, &pb.TasksRequest{
 		ClaimantId: tq.Claimant.String(),
 		Queue:      tq.Queue,
 		Limit:      int32(tq.Limit),
@@ -298,15 +301,24 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 		OmitValues: tq.OmitValues,
 	})
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to get tasks over gRPC")
+		return nil, errors.Wrap(err, "stream tasks")
 	}
 	var tasks []*entroq.Task
-	for _, t := range resp.Tasks {
-		task, err := fromTaskProto(t)
-		if err != nil {
-			return nil, errors.Wrap(err, "failed to parse task response")
+	for {
+		resp, err := stream.Recv()
+		if err == io.EOF {
+			break
 		}
-		tasks = append(tasks, task)
+		if err != nil {
+			return nil, errors.Wrap(err, "receive tasks")
+		}
+		for _, t := range resp.Tasks {
+			task, err := fromTaskProto(t)
+			if err != nil {
+				return nil, errors.Wrap(err, "parse tasks")
+			}
+			tasks = append(tasks, task)
+		}
 	}
 	return tasks, nil
 }
@@ -377,12 +389,14 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 		req.Deletes = append(req.Deletes, &pb.TaskID{
 			Id:      del.ID.String(),
 			Version: del.Version,
+			Queue:   del.Queue,
 		})
 	}
 	for _, dep := range mod.Depends {
 		req.Depends = append(req.Depends, &pb.TaskID{
 			Id:      dep.ID.String(),
 			Version: dep.Version,
+			Queue:   dep.Queue,
 		})
 	}
 

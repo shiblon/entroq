@@ -27,7 +27,8 @@ def is_dependency(exc):
 
 
 def dependency_error_details(exc, as_json=False):
-    if not is_dependency(exc): return None
+    if not is_dependency(exc):
+        return None
     # Should have dependency metadata.
     meta = exc.trailing_metadata()
     if not meta:
@@ -186,7 +187,7 @@ class EntroQ:
         return True
 
     def tasks(self, queue='', claimant_id='', task_ids=(), limit=0, omit_values=False):
-        """Return tasks that match the given fields. Typically used to itemize a queue.
+        """Return task iter for tasks that match the given fields. Typically used to itemize a queue.
 
         Args:
             queue: queue name, if filtering on queue name, otherwise task_ids must be given.
@@ -195,19 +196,20 @@ class EntroQ:
             limit: limit to this many results, all if 0.
             omit_values: only return metadata.
 
-        Returns:
-            [entroq_pb2.Task] for all matching tasks.
+        Yields:
+            A entroq_pb2.Task for each matching task.
         """
-        return list(self.stub.StreamTasks(entroq_pb2.TasksRequest(
-            queue=queue,
-            claimant_id=claimant_id,
-            limit=limit,
-            task_id=task_ids,
-            omit_values=omit_values))
-        )
+        for tresp in self.stub.StreamTasks(entroq_pb2.TasksRequest(
+                queue=queue,
+                claimant_id=claimant_id,
+                limit=limit,
+                task_id=task_ids,
+                omit_values=omit_values)):
+            for task in tresp.Tasks:
+                yield task
 
     def task_by_id(self, task_id, queue=''):
-        tasks = self.tasks(queue=queue, task_ids=[task_id], limit=1)
+        tasks = list(self.tasks(queue=queue, task_ids=[task_id], limit=1))
         if not tasks:
             raise ValueError("Task {task_id} not found".format(task_id=task_id))
         return tasks[0]
@@ -370,6 +372,7 @@ class EntroQ:
 
 class EQWorker:
     """Worker for claiming tasks from a given queue and running a given method."""
+
     def __init__(self, eq):
         """Create a worker using the given EntroQ client.
 

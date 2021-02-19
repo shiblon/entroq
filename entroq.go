@@ -38,24 +38,53 @@ const (
 
 // TaskID contains the identifying parts of a task. If IDs don't match
 // (identifier and version together), then operations fail on those tasks.
+//
+// Also contains the name of the queue in which this task resides. Can be
+// omitted, as it does not effect functionality, but might be required for
+// authorization, which is performed based on queue name. Present whenever
+// using tasks as a source of IDs.
 type TaskID struct {
 	ID      uuid.UUID
 	Version int32
+
+	Queue string
+}
+
+// NewTaskID creates a new TaskID with given options.
+func NewTaskID(id uuid.UUID, version int32, opts ...IDOption) *TaskID {
+	tID := &TaskID{
+		ID:      id,
+		Version: version,
+	}
+	for _, o := range opts {
+		o(tID)
+	}
+	return tID
+}
+
+// IDOption is an option for things that require task ID information. Allows additional ID-related metadata to be passed.
+type IDOption func(id *TaskID)
+
+// WithIDQueue specifies the queue for a particular task ID.
+func WithIDQueue(q string) IDOption {
+	return func(id *TaskID) {
+		id.Queue = q
+	}
 }
 
 // String produces the id:version string representation.
 func (t TaskID) String() string {
-	return fmt.Sprintf("%s:v%d", t.ID, t.Version)
+	return fmt.Sprintf("%s:v%d (in %s)", t.ID, t.Version, t.Queue)
 }
 
 // AsDeletion produces an appropriate ModifyArg to delete the task with this ID.
 func (t TaskID) AsDeletion() ModifyArg {
-	return Deleting(t.ID, t.Version)
+	return Deleting(t.ID, t.Version, WithIDQueue(t.Queue))
 }
 
 // AsDependency produces an appropriate ModifyArg to depend on this task ID.
 func (t TaskID) AsDependency() ModifyArg {
-	return DependingOn(t.ID, t.Version)
+	return DependingOn(t.ID, t.Version, WithIDQueue(t.Queue))
 }
 
 // TaskData contains just the data, not the identifier or metadata. Used for insertions.
@@ -108,6 +137,10 @@ type Task struct {
 
 	Created  time.Time `json:"created"`
 	Modified time.Time `json:"modified"`
+
+	// FromQueue specifies the previous queue for a task that is moving to another queue.
+	// Usually not present, can be used for change authorization (since two queues are in play, there).
+	FromQueue string
 }
 
 // String returns a useful representation of this task.
@@ -126,9 +159,9 @@ func (t *Task) String() string {
 // The above would cause the given task to be deleted, if it can be. It is
 // shorthand for
 //
-//   cli.Modify(ctx, Deleting(task1.ID(), task1.Version()))
+//   cli.Modify(ctx, Deleting(task1.ID, task1.Version, WithIDQueue(task1.Queue)))
 func (t *Task) AsDeletion() ModifyArg {
-	return Deleting(t.ID, t.Version)
+	return Deleting(t.ID, t.Version, WithIDQueue(t.Queue))
 }
 
 // AsChange returns a ModifyArg that can be used in the Modify function, e.g.,
@@ -148,17 +181,14 @@ func (t *Task) AsChange(args ...ChangeArg) ModifyArg {
 //
 // That is shorthand for
 //
-//   cli.Modify(ctx, DependingOn(task.ID(), task.Version()))
+//   cli.Modify(ctx, DependingOn(task.ID, task.Version, WithIDQueue(task.Queue)))
 func (t *Task) AsDependency() ModifyArg {
-	return DependingOn(t.ID, t.Version)
+	return DependingOn(t.ID, t.Version, WithIDQueue(t.Queue))
 }
 
 // ID returns a Task ID from this task.
 func (t *Task) IDVersion() *TaskID {
-	return &TaskID{
-		ID:      t.ID,
-		Version: t.Version,
-	}
+	return NewTaskID(t.ID, t.Version, WithIDQueue(t.Queue))
 }
 
 // Data returns the data for this task.
@@ -990,12 +1020,9 @@ func WithSkipColliding(s bool) InsertArg {
 // Deleting adds a deletion to a Modify call, e.g.,
 //
 //   cli.Modify(ctx, Deleting(id, version))
-func Deleting(id uuid.UUID, version int32) ModifyArg {
+func Deleting(id uuid.UUID, version int32, opts ...IDOption) ModifyArg {
 	return func(m *Modification) {
-		m.Deletes = append(m.Deletes, &TaskID{
-			ID:      id,
-			Version: version,
-		})
+		m.Deletes = append(m.Deletes, NewTaskID(id, version, opts...))
 	}
 }
 
@@ -1007,12 +1034,9 @@ func Deleting(id uuid.UUID, version int32) ModifyArg {
 //     InsertingInto("my queue",
 //       WithValue([]byte("hey"))),
 //       DependingOn(anotherID, someVersion))
-func DependingOn(id uuid.UUID, version int32) ModifyArg {
+func DependingOn(id uuid.UUID, version int32, opts ...IDOption) ModifyArg {
 	return func(m *Modification) {
-		m.Depends = append(m.Depends, &TaskID{
-			ID:      id,
-			Version: version,
-		})
+		m.Depends = append(m.Depends, NewTaskID(id, version, opts...))
 	}
 }
 
@@ -1023,6 +1047,12 @@ func DependingOn(id uuid.UUID, version int32) ModifyArg {
 func Changing(task *Task, changeArgs ...ChangeArg) ModifyArg {
 	return func(m *Modification) {
 		newTask := *task
+		// Set the FromQueue in *every* case.
+		// An empty FromQueue is different than one that has the same name as
+		// the new queue. This is used for authorization. Empty queues can be
+		// given very strict privileges (e.g., for admins to change a task no
+		// matter where it is).
+		newTask.FromQueue = task.Queue
 		for _, a := range changeArgs {
 			a(m, &newTask)
 		}
@@ -1043,6 +1073,8 @@ type ChangeArg func(m *Modification, t *Task)
 // QueueTo creates an option to modify a task's queue in the Changing function.
 func QueueTo(q string) ChangeArg {
 	return func(_ *Modification, t *Task) {
+		// Save the old queue for authorization to move this from one to another.
+		t.FromQueue = t.Queue
 		t.Queue = q
 	}
 }

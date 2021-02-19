@@ -265,28 +265,29 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 			return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse change id")
 		}
 		t := &entroq.Task{
-			ID:       id,
-			Version:  change.GetOldId().Version,
-			Claimant: claimant,
-			Queue:    change.GetNewData().Queue,
-			Value:    change.GetNewData().Value,
-			At:       fromMS(change.GetNewData().AtMs),
+			ID:        id,
+			Version:   change.GetOldId().Version,
+			FromQueue: change.GetOldId().Queue,
+			Claimant:  claimant,
+			Queue:     change.GetNewData().Queue,
+			Value:     change.GetNewData().Value,
+			At:        fromMS(change.GetNewData().AtMs),
 		}
 		modArgs = append(modArgs, entroq.Changing(t))
 	}
-	for _, delete := range req.Deletes {
-		id, err := uuid.Parse(delete.Id)
+	for _, del := range req.Deletes {
+		id, err := uuid.Parse(del.Id)
 		if err != nil {
 			return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse deletion id")
 		}
-		modArgs = append(modArgs, entroq.Deleting(id, delete.Version))
+		modArgs = append(modArgs, entroq.Deleting(id, del.Version, entroq.WithIDQueue(del.Queue)))
 	}
-	for _, depend := range req.Depends {
-		id, err := uuid.Parse(depend.Id)
+	for _, dep := range req.Depends {
+		id, err := uuid.Parse(dep.Id)
 		if err != nil {
-			return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse dependency id")
+			return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse depency id")
 		}
-		modArgs = append(modArgs, entroq.DependingOn(id, depend.Version))
+		modArgs = append(modArgs, entroq.DependingOn(id, dep.Version, entroq.WithIDQueue(dep.Queue)))
 	}
 	inserted, changed, err := s.impl.Modify(ctx, modArgs...)
 	if err != nil {
@@ -307,7 +308,7 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 				for _, tid := range dvals {
 					details = append(details, &pb.ModifyDep{
 						Type: dtype,
-						Id:   &pb.TaskID{Id: tid.ID.String(), Version: tid.Version},
+						Id:   &pb.TaskID{Id: tid.ID.String(), Version: tid.Version, Queue: tid.Queue},
 					})
 				}
 			}
@@ -374,8 +375,11 @@ func (s *QSvc) StreamTasks(req *pb.TasksRequest, stream pb.EntroQ_StreamTasksSer
 		return wrapErrorf(err, "get tasks to stream")
 	}
 
+	// Note, we send a full TasksResponse each time because there might be
+	// additional metadata added to that response later. This is more
+	// future-proof.
 	for _, task := range resp.Tasks {
-		if err := stream.Send(task); err != nil {
+		if err := stream.Send(&pb.TasksResponse{Tasks: []*pb.Task{task}}); err != nil {
 			return wrapErrorf(err, "send stream tasks")
 		}
 	}

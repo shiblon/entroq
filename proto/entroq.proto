@@ -2,11 +2,21 @@ syntax = "proto3";
 
 package proto;
 
+option go_package = ".;proto";
+
 // TaskID contains the ID and version of a task. Together these make a unique
 // identifier for that task.
 message TaskID {
   string id = 1;
   int32 version = 2;
+
+  // Optional queue name. This usually comes from the task itself, so it will
+  // be present in most use cases. There are some cases where it will be empty,
+  // like when using admin tools with special privileges. Usually you should
+  // set this, as Authorization policies will be looking for it to ensure that
+  // you are allowed to change, delete, or depend on this ID based on the queue
+  // name.
+  string queue = 3;
 }
 
 // TaskData contains only the data portion of a task. Useful for insertion.
@@ -189,6 +199,25 @@ message TimeResponse {
   int64 time_ms = 1;
 }
 
+// Authz contains info about authorization. Usually just a token.
+message Authz {
+  string token = 1;
+}
+
+// AuthzRequest contains authorization information and information about what
+// the user is attempting to do with which queues. Useful for subrequest
+// authorization (e.g., sending to OpenPolicyAgent).
+message AuthzRequest {
+  Authz authz = 1;
+
+  repeated string claim_queues = 2;
+  repeated string delete_queues = 3;
+  repeated string depend_queues = 4;
+  repeated string change_queues = 5;
+  repeated string insert_queues = 6;
+  repeated string tasks_queues = 7;
+}
+
 // EntroQ is a service that allows for access to a task queue.
 service EntroQ {
   rpc TryClaim(ClaimRequest) returns (ClaimResponse);
@@ -199,5 +228,8 @@ service EntroQ {
   rpc QueueStats(QueuesRequest) returns (QueuesResponse);
   rpc Time(TimeRequest) returns (TimeResponse);
 
-  rpc StreamTasks(TasksRequest) returns (stream Task);
+  // This is set to stream TasksResponse instead of just sending all tasks in a
+  // single one. Typically this will have one task per response, but it is best
+  // for the client to consume however many there are.
+  rpc StreamTasks(TasksRequest) returns (stream TasksResponse);
 }
