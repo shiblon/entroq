@@ -1,0 +1,15 @@
+{
+    "authz": {"token": "chris"},
+    "queues": [{
+    	"exact": "/ns=chris/inbox",
+        "actions": ["CLAIM"]
+    },
+    {
+    	"prefix": "/ns=global/outbox",
+        "actions": ["INSERT"]
+    },
+    {
+        "exact": "/ns=global/inbox",
+        "actions": ["CLAIM"]
+    }]
+}
