@@ -65,3 +65,13 @@ allow {
     count(failed_queues) == 0
 }
 
+# Example of how to add username-based queues even thought they're implicit.
+# This could be imported from another module if we want to keep "standard"
+# rules separate from system-dependent rules. You can specify as many of these
+# as you like.
+user_queues[q] {
+    q := {
+         "prefix": concat("", ["/ns=", username, "/"]),
+         "actions": ["ALL"]
+    }
+}
