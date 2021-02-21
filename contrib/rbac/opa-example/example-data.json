@@ -1,0 +1,21 @@
+{
+    "users": [{
+        "name": "chris",
+        "queues": [{
+        	"prefix": "/ns=chris/",
+        	"actions": ["ALL"]
+        },
+        {
+        	"exact": "/ns=useme/inbox",
+            "actions": ["CLAIM", "DEPEND"]
+        }],
+        "roles": ["something", "something-else"]
+    }],
+	"roles": [{
+        "name": "*",
+        "queues": [{
+        	"prefix": "/ns=global/",
+        	"actions": ["INSERT", "READ"]
+        }]
+    }]
+}
