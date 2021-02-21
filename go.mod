@@ -8,12 +8,13 @@ require (
 	github.com/google/uuid v1.1.2
 	github.com/lib/pq v1.0.0
 	github.com/mitchellh/go-homedir v1.1.0
+	github.com/open-policy-agent/opa v0.26.0
 	github.com/pkg/errors v0.9.1
 	github.com/prometheus/client_golang v1.8.0
 	github.com/spf13/cobra v0.0.3
 	github.com/spf13/viper v1.3.1
-	golang.org/x/net v0.0.0-20200625001655-4c5254603344
-	golang.org/x/sync v0.0.0-20190911185100-cd5d95a43a6e
+	golang.org/x/net v0.0.0-20200927032502-5d4f70055728
+	golang.org/x/sync v0.0.0-20200625203802-6e8e738ad208
 	google.golang.org/grpc v1.35.0
 	google.golang.org/protobuf v1.25.0
 )

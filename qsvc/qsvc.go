@@ -33,11 +33,8 @@
 package qsvc // import "entrogo.com/entroq/qsvc"
 
 import (
-	"bytes"
 	"context"
-	"io/ioutil"
 	"log"
-	"net/http"
 	"time"
 
 	"entrogo.com/entroq"
@@ -49,7 +46,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/encoding/protojson"
 
 	pb "entrogo.com/entroq/proto"
 )
@@ -57,9 +53,6 @@ import (
 const (
 	// MetricNS is the prometheus namespace for all metrics for this module.
 	MetricNS = "entroq"
-
-	// MetricInterval sets the collection interval for metrics.
-	MetricInterval = 1 * time.Minute
 )
 
 var (
@@ -78,26 +71,39 @@ var (
 type QSvc struct {
 	impl *entroq.EntroQ
 
-	metricCancel context.CancelFunc
+	metricCancel    context.CancelFunc
+	metricNamespace string
 
-	authHeader string
-	opaBaseURL string
+	authzHeader string
+	authzOPA    *OPA
 }
 
 // Option allows QSvc creation options to be defined.
 type Option func(*QSvc)
 
-// WithAuthorizationHeader sets the name of the header containing an authorization token. Default is "authorization".
-func WithAuthorizationHeader(h string) Option {
+// WithMetricInterval sets the interval between (potentially expensive) queue
+// stats requests for the purpose of providing metrics. It cannot be set to
+// less than 1 minute.
+func WithMetricInterval(d time.Duration) Option {
 	return func(s *QSvc) {
-		s.authHeader = h
+		if d < time.Minute {
+			d = time.Minute
+		}
+		s.metricInterval = d
 	}
 }
 
-// WithOpenPolicyAgent sets the URL (host and path) where an OpenPolicyAgent instance can be found.
-func WithOpenPolicyAgent(url string) Option {
+// WithAuthorizationHeader sets the name of the header containing an authorization token. Default is "authorization".
+func WithAuthorizationHeader(h string) Option {
 	return func(s *QSvc) {
-		s.opaBaseURL = url
+		s.authzHeader = h
+	}
+}
+
+// WithOPA sets the OPA implementation for use in authorization of requests.
+func WithOPA(opa *OPA) Option {
+	return func(s *QSvc) {
+		s.authzOPA = opa
 	}
 }
 
@@ -114,9 +120,10 @@ func New(ctx context.Context, opener entroq.BackendOpener, opts ...Option) (*QSv
 	mctx, mcancel := context.WithCancel(context.Background())
 
 	svc := &QSvc{
-		impl:         impl,
-		metricCancel: mcancel,
-		authHeader:   "authorization",
+		impl:           impl,
+		metricCancel:   mcancel,
+		metricInterval: time.Minute,
+		authzHeader:    "authorization",
 	}
 
 	for _, o := range opts {
@@ -131,7 +138,7 @@ func New(ctx context.Context, opener entroq.BackendOpener, opts ...Option) (*QSv
 			select {
 			case <-mctx.Done():
 				return
-			case <-time.After(MetricInterval):
+			case <-time.After(svc.metricInterval):
 			}
 		}
 	}()
@@ -148,39 +155,11 @@ func (s *QSvc) Close() error {
 // Authorize attempts to authorize an action. It sends a POST request to the
 // OPA service, if specified, and returns the resulting protobuf.
 func (s *QSvc) Authorize(ctx context.Context, req *pb.AuthzRequest) (*pb.AuthzResponse, error) {
-	if s.opaBaseURL == "" {
-		return &pb.AuthzResponse{
-			Allow:  true,
-			Reason: "Vacuous authorization: no service specified",
-		}, nil
+	if s.authzOPA == nil {
+		return new(pb.AuthzResponse), nil // Empty disallowed_queues means "go ahead".
 	}
 
-	b, err := protojson.Marshal(req)
-	if err != nil {
-		return nil, errors.Wrap(err, "marshal authz")
-	}
-
-	resp, err := http.Post(s.opaBaseURL+"/queues", "application/json", bytes.NewReader(b))
-	if err != nil {
-		return nil, errors.Wrap(err, "opa response")
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, errors.Errorf("opa status %v (%d)", resp.Status, resp.StatusCode)
-	}
-
-	rBytes, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, errors.Wrap(err, "opa read body")
-	}
-
-	authzResp := new(pb.AuthzResponse)
-	if err := protojson.Unmarshal(rBytes, authzResp); err != nil {
-		return nil, errors.Wrap(err, "opa unmarshal")
-	}
-
-	return authzResp, nil
+	return s.authzOPA.Authorize(ctx, req)
 }
 
 // RefreshMetrics collects stats and exports them as prometheus metrics.
@@ -245,71 +224,66 @@ func codeErrorf(code codes.Code, err error, format string, vals ...interface{}) 
 }
 
 // authzToken gets the Authorization token from headers (grpc context) if present, otherwise blank.
-func authzToken(ctx context.Context) string {
+func (s *QSvc) authzToken(ctx context.Context) string {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		return ""
 	}
-	// TODO: make an option?
-	vals := md["authorization"]
+	vals := md[s.authzHeader]
 	if len(vals) == 0 {
 		return ""
 	}
 	return vals[0]
 }
 
-func newAuthzRequest(ctx context.Context) *pb.AuthzRequest {
-	return &pb.AuthzRequest{Authz: &pb.Authz{Token: authzToken(ctx)}}
+func (s *QSvc) newAuthzRequest(ctx context.Context) *pb.AuthzRequest {
+	return &pb.AuthzRequest{Authz: &pb.Authz{Token: s.authzToken(ctx)}}
 }
 
-func claimAuthz(ctx context.Context, req *pb.ClaimRequest) *pb.AuthzRequest {
-	authz := newAuthzRequest(ctx)
-
-	// TODO: send claimant override information.
+func (s *QSvc) claimAuthz(ctx context.Context, req *pb.ClaimRequest) *pb.AuthzRequest {
+	authz := s.newAuthzRequest(ctx)
 
 	for _, q := range req.GetQueues() {
-		authz.Queues = append(authz.Queues, &pb.QueueSpec{Value: q, Action: pb.DepType_CLAIM})
+		authz.Queues = append(authz.Queues, &pb.QueueSpec{Exact: q, Action: pb.DepType_CLAIM})
 	}
 	return authz
 }
 
-func tasksAuthz(ctx context.Context, req *pb.TasksRequest) *pb.AuthzRequest {
-	authz := newAuthzRequest(ctx)
-	authz.Queues = append(authz.Queues, &pb.QueueSpec{Value: req.Queue, Action: pb.DepType_DETAIL})
+func (s *QSvc) tasksAuthz(ctx context.Context, req *pb.TasksRequest) *pb.AuthzRequest {
+	authz := s.newAuthzRequest(ctx)
+	authz.Queues = append(authz.Queues, &pb.QueueSpec{Exact: req.Queue, Action: pb.DepType_DETAIL})
 	return authz
 }
 
-func modifyAuthz(ctx context.Context, req *pb.ModifyRequest) *pb.AuthzRequest {
-	authz := newAuthzRequest(ctx)
-
-	// TODO: send claimant override information.
+func (s *QSvc) modifyAuthz(ctx context.Context, req *pb.ModifyRequest) *pb.AuthzRequest {
+	authz := s.newAuthzRequest(ctx)
 
 	for _, ins := range req.Inserts {
 		authz.Queues = append(authz.Queues,
-			&pb.QueueSpec{Value: ins.Queue, Action: pb.DepType_INSERT},
+			&pb.QueueSpec{Exact: ins.Queue, Action: pb.DepType_INSERT},
 		)
 	}
 	for _, chg := range req.Changes {
 		oldQueue, newQueue := chg.GetOldId().Queue, chg.GetNewData().Queue
 		if oldQueue == newQueue {
 			authz.Queues = append(authz.Queues,
-				&pb.QueueSpec{Value: chg.GetNewData().Queue, Action: pb.DepType_CHANGE},
+				&pb.QueueSpec{Exact: chg.GetNewData().Queue, Action: pb.DepType_CHANGE},
 			)
 		} else {
 			authz.Queues = append(authz.Queues,
-				&pb.QueueSpec{Value: chg.GetOldId().Queue, Action: pb.DepType_DELETE},
-				&pb.QueueSpec{Value: chg.GetNewData().Queue, Action: pb.DepType_INSERT},
+				&pb.QueueSpec{Exact: chg.GetOldId().Queue, Action: pb.DepType_DELETE},
+				&pb.QueueSpec{Exact: chg.GetNewData().Queue, Action: pb.DepType_INSERT},
 			)
 		}
 	}
 	for _, del := range req.Deletes {
 		authz.Queues = append(authz.Queues,
-			&pb.QueueSpec{Value: del.Queue, Action: pb.DepType_DELETE},
+			&pb.QueueSpec{Exact: del.Queue, Action: pb.DepType_DELETE},
 		)
 	}
 	for _, dep := range req.Depends {
 		authz.Queues = append(authz.Queues,
-			&pb.QueueSpec{Value: dep.Queue, Action: pb.DepType_DEPEND},
+			&pb.QueueSpec{Exact: dep.Queue, Action: pb.DepType_DEPEND},
 		)
 	}
 
@@ -318,7 +292,7 @@ func modifyAuthz(ctx context.Context, req *pb.ModifyRequest) *pb.AuthzRequest {
 
 // Claim is the blocking version of TryClaim.
 func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
-	authz, err := s.Authorize(ctx, claimAuthz(ctx, req))
+	authz, err := s.Authorize(ctx, s.claimAuthz(ctx, req))
 	if err != nil {
 		return nil, errors.Wrap(err, "claim auth")
 	}
@@ -358,7 +332,7 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 // available to claim. Callers can check for context cancelation codes to know
 // that this has happened, and may opt to immediately re-send the request.
 func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
-	authz, err := s.Authorize(ctx, claimAuthz(ctx, req))
+	authz, err := s.Authorize(ctx, s.claimAuthz(ctx, req))
 	if err != nil {
 		return nil, errors.Wrap(err, "claim auth")
 	}
@@ -392,7 +366,7 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 // reconstruct an entroq.DependencyError, or directly to find out which IDs
 // caused the dependency failure. Code UNKNOWN is returned on other errors.
 func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyResponse, error) {
-	authz, err := s.Authorize(ctx, modifyAuthz(ctx, req))
+	authz, err := s.Authorize(ctx, s.modifyAuthz(ctx, req))
 	if err != nil {
 		return nil, errors.Wrap(err, "claim auth")
 	}
@@ -497,7 +471,7 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 }
 
 func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksResponse, error) {
-	authz, err := s.Authorize(ctx, tasksAuthz(ctx, req))
+	authz, err := s.Authorize(ctx, s.tasksAuthz(ctx, req))
 	if err != nil {
 		return nil, errors.Wrap(err, "claim auth")
 	}
