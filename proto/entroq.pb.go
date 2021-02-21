@@ -87,50 +87,6 @@ func (DepType) EnumDescriptor() ([]byte, []int) {
 	return file_entroq_proto_rawDescGZIP(), []int{0}
 }
 
-// MatchType is the type of a queue name (e.g., exact match, pattern, etc.).
-type MatchType int32
-
-const (
-	MatchType_MATCH_EXACT MatchType = 0 // TODO: add prefix and patterns?
-)
-
-// Enum value maps for MatchType.
-var (
-	MatchType_name = map[int32]string{
-		0: "MATCH_EXACT",
-	}
-	MatchType_value = map[string]int32{
-		"MATCH_EXACT": 0,
-	}
-)
-
-func (x MatchType) Enum() *MatchType {
-	p := new(MatchType)
-	*p = x
-	return p
-}
-
-func (x MatchType) String() string {
-	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
-}
-
-func (MatchType) Descriptor() protoreflect.EnumDescriptor {
-	return file_entroq_proto_enumTypes[1].Descriptor()
-}
-
-func (MatchType) Type() protoreflect.EnumType {
-	return &file_entroq_proto_enumTypes[1]
-}
-
-func (x MatchType) Number() protoreflect.EnumNumber {
-	return protoreflect.EnumNumber(x)
-}
-
-// Deprecated: Use MatchType.Descriptor instead.
-func (MatchType) EnumDescriptor() ([]byte, []int) {
-	return file_entroq_proto_rawDescGZIP(), []int{1}
-}
-
 // TaskID contains the ID and version of a task. Together these make a unique
 // identifier for that task.
 type TaskID struct {
@@ -1216,245 +1172,6 @@ func (x *TimeResponse) GetTimeMs() int64 {
 	return 0
 }
 
-// Authz contains info about authorization. Usually just a token.
-type Authz struct {
-	state         protoimpl.MessageState
-	sizeCache     protoimpl.SizeCache
-	unknownFields protoimpl.UnknownFields
-
-	Token string `protobuf:"bytes,1,opt,name=token,proto3" json:"token,omitempty"`
-}
-
-func (x *Authz) Reset() {
-	*x = Authz{}
-	if protoimpl.UnsafeEnabled {
-		mi := &file_entroq_proto_msgTypes[16]
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		ms.StoreMessageInfo(mi)
-	}
-}
-
-func (x *Authz) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*Authz) ProtoMessage() {}
-
-func (x *Authz) ProtoReflect() protoreflect.Message {
-	mi := &file_entroq_proto_msgTypes[16]
-	if protoimpl.UnsafeEnabled && x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use Authz.ProtoReflect.Descriptor instead.
-func (*Authz) Descriptor() ([]byte, []int) {
-	return file_entroq_proto_rawDescGZIP(), []int{16}
-}
-
-func (x *Authz) GetToken() string {
-	if x != nil {
-		return x.Token
-	}
-	return ""
-}
-
-// QueueSpec contains a single queue specification (name, pattern, etc.)
-type QueueSpec struct {
-	state         protoimpl.MessageState
-	sizeCache     protoimpl.SizeCache
-	unknownFields protoimpl.UnknownFields
-
-	Value     string    `protobuf:"bytes,1,opt,name=value,proto3" json:"value,omitempty"`
-	MatchType MatchType `protobuf:"varint,2,opt,name=match_type,json=matchType,proto3,enum=proto.MatchType" json:"match_type,omitempty"`
-	// Action indicates what this queue is being used for (e.g., CLAIM).
-	Action DepType `protobuf:"varint,3,opt,name=action,proto3,enum=proto.DepType" json:"action,omitempty"`
-}
-
-func (x *QueueSpec) Reset() {
-	*x = QueueSpec{}
-	if protoimpl.UnsafeEnabled {
-		mi := &file_entroq_proto_msgTypes[17]
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		ms.StoreMessageInfo(mi)
-	}
-}
-
-func (x *QueueSpec) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*QueueSpec) ProtoMessage() {}
-
-func (x *QueueSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_entroq_proto_msgTypes[17]
-	if protoimpl.UnsafeEnabled && x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use QueueSpec.ProtoReflect.Descriptor instead.
-func (*QueueSpec) Descriptor() ([]byte, []int) {
-	return file_entroq_proto_rawDescGZIP(), []int{17}
-}
-
-func (x *QueueSpec) GetValue() string {
-	if x != nil {
-		return x.Value
-	}
-	return ""
-}
-
-func (x *QueueSpec) GetMatchType() MatchType {
-	if x != nil {
-		return x.MatchType
-	}
-	return MatchType_MATCH_EXACT
-}
-
-func (x *QueueSpec) GetAction() DepType {
-	if x != nil {
-		return x.Action
-	}
-	return DepType_CLAIM
-}
-
-// AuthzRequest contains authorization information and information about what
-// the user is attempting to do with which queues. Useful for subrequest
-// authorization (e.g., sending to OpenPolicyAgent).
-type AuthzRequest struct {
-	state         protoimpl.MessageState
-	sizeCache     protoimpl.SizeCache
-	unknownFields protoimpl.UnknownFields
-
-	Authz  *Authz       `protobuf:"bytes,1,opt,name=authz,proto3" json:"authz,omitempty"`
-	Queues []*QueueSpec `protobuf:"bytes,2,rep,name=queues,proto3" json:"queues,omitempty"`
-}
-
-func (x *AuthzRequest) Reset() {
-	*x = AuthzRequest{}
-	if protoimpl.UnsafeEnabled {
-		mi := &file_entroq_proto_msgTypes[18]
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		ms.StoreMessageInfo(mi)
-	}
-}
-
-func (x *AuthzRequest) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*AuthzRequest) ProtoMessage() {}
-
-func (x *AuthzRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_entroq_proto_msgTypes[18]
-	if protoimpl.UnsafeEnabled && x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use AuthzRequest.ProtoReflect.Descriptor instead.
-func (*AuthzRequest) Descriptor() ([]byte, []int) {
-	return file_entroq_proto_rawDescGZIP(), []int{18}
-}
-
-func (x *AuthzRequest) GetAuthz() *Authz {
-	if x != nil {
-		return x.Authz
-	}
-	return nil
-}
-
-func (x *AuthzRequest) GetQueues() []*QueueSpec {
-	if x != nil {
-		return x.Queues
-	}
-	return nil
-}
-
-// AuthzResponse is the authorization response, containing disallowed queues
-// with their actions.
-type AuthzResponse struct {
-	state         protoimpl.MessageState
-	sizeCache     protoimpl.SizeCache
-	unknownFields protoimpl.UnknownFields
-
-	Allow  bool         `protobuf:"varint,1,opt,name=allow,proto3" json:"allow,omitempty"`
-	Queues []*QueueSpec `protobuf:"bytes,2,rep,name=queues,proto3" json:"queues,omitempty"`
-	// The reason is a message indicating why authorization failed. May include
-	// inforation like the user name or group memberships, for exmaple.
-	// Implementation-dependent.
-	Reason string `protobuf:"bytes,3,opt,name=reason,proto3" json:"reason,omitempty"`
-}
-
-func (x *AuthzResponse) Reset() {
-	*x = AuthzResponse{}
-	if protoimpl.UnsafeEnabled {
-		mi := &file_entroq_proto_msgTypes[19]
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		ms.StoreMessageInfo(mi)
-	}
-}
-
-func (x *AuthzResponse) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*AuthzResponse) ProtoMessage() {}
-
-func (x *AuthzResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_entroq_proto_msgTypes[19]
-	if protoimpl.UnsafeEnabled && x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use AuthzResponse.ProtoReflect.Descriptor instead.
-func (*AuthzResponse) Descriptor() ([]byte, []int) {
-	return file_entroq_proto_rawDescGZIP(), []int{19}
-}
-
-func (x *AuthzResponse) GetAllow() bool {
-	if x != nil {
-		return x.Allow
-	}
-	return false
-}
-
-func (x *AuthzResponse) GetQueues() []*QueueSpec {
-	if x != nil {
-		return x.Queues
-	}
-	return nil
-}
-
-func (x *AuthzResponse) GetReason() string {
-	if x != nil {
-		return x.Reason
-	}
-	return ""
-}
-
 var File_entroq_proto protoreflect.FileDescriptor
 
 var file_entroq_proto_rawDesc = []byte{
@@ -1565,36 +1282,12 @@ var file_entroq_proto_rawDesc = []byte{
 	0x65, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x22, 0x27, 0x0a, 0x0c, 0x54, 0x69, 0x6d, 0x65,
 	0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x17, 0x0a, 0x07, 0x74, 0x69, 0x6d, 0x65,
 	0x5f, 0x6d, 0x73, 0x18, 0x01, 0x20, 0x01, 0x28, 0x03, 0x52, 0x06, 0x74, 0x69, 0x6d, 0x65, 0x4d,
-	0x73, 0x22, 0x1d, 0x0a, 0x05, 0x41, 0x75, 0x74, 0x68, 0x7a, 0x12, 0x14, 0x0a, 0x05, 0x74, 0x6f,
-	0x6b, 0x65, 0x6e, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x05, 0x74, 0x6f, 0x6b, 0x65, 0x6e,
-	0x22, 0x7a, 0x0a, 0x09, 0x51, 0x75, 0x65, 0x75, 0x65, 0x53, 0x70, 0x65, 0x63, 0x12, 0x14, 0x0a,
-	0x05, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x05, 0x76, 0x61,
-	0x6c, 0x75, 0x65, 0x12, 0x2f, 0x0a, 0x0a, 0x6d, 0x61, 0x74, 0x63, 0x68, 0x5f, 0x74, 0x79, 0x70,
-	0x65, 0x18, 0x02, 0x20, 0x01, 0x28, 0x0e, 0x32, 0x10, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2e,
-	0x4d, 0x61, 0x74, 0x63, 0x68, 0x54, 0x79, 0x70, 0x65, 0x52, 0x09, 0x6d, 0x61, 0x74, 0x63, 0x68,
-	0x54, 0x79, 0x70, 0x65, 0x12, 0x26, 0x0a, 0x06, 0x61, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x18, 0x03,
-	0x20, 0x01, 0x28, 0x0e, 0x32, 0x0e, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2e, 0x44, 0x65, 0x70,
-	0x54, 0x79, 0x70, 0x65, 0x52, 0x06, 0x61, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x22, 0x5c, 0x0a, 0x0c,
-	0x41, 0x75, 0x74, 0x68, 0x7a, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12, 0x22, 0x0a, 0x05,
-	0x61, 0x75, 0x74, 0x68, 0x7a, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x0c, 0x2e, 0x70, 0x72,
-	0x6f, 0x74, 0x6f, 0x2e, 0x41, 0x75, 0x74, 0x68, 0x7a, 0x52, 0x05, 0x61, 0x75, 0x74, 0x68, 0x7a,
-	0x12, 0x28, 0x0a, 0x06, 0x71, 0x75, 0x65, 0x75, 0x65, 0x73, 0x18, 0x02, 0x20, 0x03, 0x28, 0x0b,
-	0x32, 0x10, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2e, 0x51, 0x75, 0x65, 0x75, 0x65, 0x53, 0x70,
-	0x65, 0x63, 0x52, 0x06, 0x71, 0x75, 0x65, 0x75, 0x65, 0x73, 0x22, 0x67, 0x0a, 0x0d, 0x41, 0x75,
-	0x74, 0x68, 0x7a, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x14, 0x0a, 0x05, 0x61,
-	0x6c, 0x6c, 0x6f, 0x77, 0x18, 0x01, 0x20, 0x01, 0x28, 0x08, 0x52, 0x05, 0x61, 0x6c, 0x6c, 0x6f,
-	0x77, 0x12, 0x28, 0x0a, 0x06, 0x71, 0x75, 0x65, 0x75, 0x65, 0x73, 0x18, 0x02, 0x20, 0x03, 0x28,
-	0x0b, 0x32, 0x10, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2e, 0x51, 0x75, 0x65, 0x75, 0x65, 0x53,
-	0x70, 0x65, 0x63, 0x52, 0x06, 0x71, 0x75, 0x65, 0x75, 0x65, 0x73, 0x12, 0x16, 0x0a, 0x06, 0x72,
-	0x65, 0x61, 0x73, 0x6f, 0x6e, 0x18, 0x03, 0x20, 0x01, 0x28, 0x09, 0x52, 0x06, 0x72, 0x65, 0x61,
-	0x73, 0x6f, 0x6e, 0x2a, 0x50, 0x0a, 0x07, 0x44, 0x65, 0x70, 0x54, 0x79, 0x70, 0x65, 0x12, 0x09,
-	0x0a, 0x05, 0x43, 0x4c, 0x41, 0x49, 0x4d, 0x10, 0x00, 0x12, 0x0a, 0x0a, 0x06, 0x44, 0x45, 0x4c,
-	0x45, 0x54, 0x45, 0x10, 0x01, 0x12, 0x0a, 0x0a, 0x06, 0x43, 0x48, 0x41, 0x4e, 0x47, 0x45, 0x10,
-	0x02, 0x12, 0x0a, 0x0a, 0x06, 0x44, 0x45, 0x50, 0x45, 0x4e, 0x44, 0x10, 0x03, 0x12, 0x0a, 0x0a,
-	0x06, 0x44, 0x45, 0x54, 0x41, 0x49, 0x4c, 0x10, 0x04, 0x12, 0x0a, 0x0a, 0x06, 0x49, 0x4e, 0x53,
-	0x45, 0x52, 0x54, 0x10, 0x05, 0x2a, 0x1c, 0x0a, 0x09, 0x4d, 0x61, 0x74, 0x63, 0x68, 0x54, 0x79,
-	0x70, 0x65, 0x12, 0x0f, 0x0a, 0x0b, 0x4d, 0x41, 0x54, 0x43, 0x48, 0x5f, 0x45, 0x58, 0x41, 0x43,
-	0x54, 0x10, 0x00, 0x32, 0xbd, 0x03, 0x0a, 0x06, 0x45, 0x6e, 0x74, 0x72, 0x6f, 0x51, 0x12, 0x35,
+	0x73, 0x2a, 0x50, 0x0a, 0x07, 0x44, 0x65, 0x70, 0x54, 0x79, 0x70, 0x65, 0x12, 0x09, 0x0a, 0x05,
+	0x43, 0x4c, 0x41, 0x49, 0x4d, 0x10, 0x00, 0x12, 0x0a, 0x0a, 0x06, 0x44, 0x45, 0x4c, 0x45, 0x54,
+	0x45, 0x10, 0x01, 0x12, 0x0a, 0x0a, 0x06, 0x43, 0x48, 0x41, 0x4e, 0x47, 0x45, 0x10, 0x02, 0x12,
+	0x0a, 0x0a, 0x06, 0x44, 0x45, 0x50, 0x45, 0x4e, 0x44, 0x10, 0x03, 0x12, 0x0a, 0x0a, 0x06, 0x44,
+	0x45, 0x54, 0x41, 0x49, 0x4c, 0x10, 0x04, 0x12, 0x0a, 0x0a, 0x06, 0x49, 0x4e, 0x53, 0x45, 0x52,
+	0x54, 0x10, 0x05, 0x32, 0xbd, 0x03, 0x0a, 0x06, 0x45, 0x6e, 0x74, 0x72, 0x6f, 0x51, 0x12, 0x35,
 	0x0a, 0x08, 0x54, 0x72, 0x79, 0x43, 0x6c, 0x61, 0x69, 0x6d, 0x12, 0x13, 0x2e, 0x70, 0x72, 0x6f,
 	0x74, 0x6f, 0x2e, 0x43, 0x6c, 0x61, 0x69, 0x6d, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a,
 	0x14, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2e, 0x43, 0x6c, 0x61, 0x69, 0x6d, 0x52, 0x65, 0x73,
@@ -1638,72 +1331,62 @@ func file_entroq_proto_rawDescGZIP() []byte {
 	return file_entroq_proto_rawDescData
 }
 
-var file_entroq_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_entroq_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
+var file_entroq_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_entroq_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
 var file_entroq_proto_goTypes = []interface{}{
 	(DepType)(0),           // 0: proto.DepType
-	(MatchType)(0),         // 1: proto.MatchType
-	(*TaskID)(nil),         // 2: proto.TaskID
-	(*TaskData)(nil),       // 3: proto.TaskData
-	(*TaskChange)(nil),     // 4: proto.TaskChange
-	(*Task)(nil),           // 5: proto.Task
-	(*QueueStats)(nil),     // 6: proto.QueueStats
-	(*ClaimRequest)(nil),   // 7: proto.ClaimRequest
-	(*ClaimResponse)(nil),  // 8: proto.ClaimResponse
-	(*ModifyRequest)(nil),  // 9: proto.ModifyRequest
-	(*ModifyResponse)(nil), // 10: proto.ModifyResponse
-	(*ModifyDep)(nil),      // 11: proto.ModifyDep
-	(*TasksRequest)(nil),   // 12: proto.TasksRequest
-	(*TasksResponse)(nil),  // 13: proto.TasksResponse
-	(*QueuesRequest)(nil),  // 14: proto.QueuesRequest
-	(*QueuesResponse)(nil), // 15: proto.QueuesResponse
-	(*TimeRequest)(nil),    // 16: proto.TimeRequest
-	(*TimeResponse)(nil),   // 17: proto.TimeResponse
-	(*Authz)(nil),          // 18: proto.Authz
-	(*QueueSpec)(nil),      // 19: proto.QueueSpec
-	(*AuthzRequest)(nil),   // 20: proto.AuthzRequest
-	(*AuthzResponse)(nil),  // 21: proto.AuthzResponse
+	(*TaskID)(nil),         // 1: proto.TaskID
+	(*TaskData)(nil),       // 2: proto.TaskData
+	(*TaskChange)(nil),     // 3: proto.TaskChange
+	(*Task)(nil),           // 4: proto.Task
+	(*QueueStats)(nil),     // 5: proto.QueueStats
+	(*ClaimRequest)(nil),   // 6: proto.ClaimRequest
+	(*ClaimResponse)(nil),  // 7: proto.ClaimResponse
+	(*ModifyRequest)(nil),  // 8: proto.ModifyRequest
+	(*ModifyResponse)(nil), // 9: proto.ModifyResponse
+	(*ModifyDep)(nil),      // 10: proto.ModifyDep
+	(*TasksRequest)(nil),   // 11: proto.TasksRequest
+	(*TasksResponse)(nil),  // 12: proto.TasksResponse
+	(*QueuesRequest)(nil),  // 13: proto.QueuesRequest
+	(*QueuesResponse)(nil), // 14: proto.QueuesResponse
+	(*TimeRequest)(nil),    // 15: proto.TimeRequest
+	(*TimeResponse)(nil),   // 16: proto.TimeResponse
 }
 var file_entroq_proto_depIdxs = []int32{
-	2,  // 0: proto.TaskChange.old_id:type_name -> proto.TaskID
-	3,  // 1: proto.TaskChange.new_data:type_name -> proto.TaskData
-	5,  // 2: proto.ClaimResponse.task:type_name -> proto.Task
-	3,  // 3: proto.ModifyRequest.inserts:type_name -> proto.TaskData
-	4,  // 4: proto.ModifyRequest.changes:type_name -> proto.TaskChange
-	2,  // 5: proto.ModifyRequest.deletes:type_name -> proto.TaskID
-	2,  // 6: proto.ModifyRequest.depends:type_name -> proto.TaskID
-	5,  // 7: proto.ModifyResponse.inserted:type_name -> proto.Task
-	5,  // 8: proto.ModifyResponse.changed:type_name -> proto.Task
+	1,  // 0: proto.TaskChange.old_id:type_name -> proto.TaskID
+	2,  // 1: proto.TaskChange.new_data:type_name -> proto.TaskData
+	4,  // 2: proto.ClaimResponse.task:type_name -> proto.Task
+	2,  // 3: proto.ModifyRequest.inserts:type_name -> proto.TaskData
+	3,  // 4: proto.ModifyRequest.changes:type_name -> proto.TaskChange
+	1,  // 5: proto.ModifyRequest.deletes:type_name -> proto.TaskID
+	1,  // 6: proto.ModifyRequest.depends:type_name -> proto.TaskID
+	4,  // 7: proto.ModifyResponse.inserted:type_name -> proto.Task
+	4,  // 8: proto.ModifyResponse.changed:type_name -> proto.Task
 	0,  // 9: proto.ModifyDep.type:type_name -> proto.DepType
-	2,  // 10: proto.ModifyDep.id:type_name -> proto.TaskID
-	5,  // 11: proto.TasksResponse.tasks:type_name -> proto.Task
-	6,  // 12: proto.QueuesResponse.queues:type_name -> proto.QueueStats
-	1,  // 13: proto.QueueSpec.match_type:type_name -> proto.MatchType
-	0,  // 14: proto.QueueSpec.action:type_name -> proto.DepType
-	18, // 15: proto.AuthzRequest.authz:type_name -> proto.Authz
-	19, // 16: proto.AuthzRequest.queues:type_name -> proto.QueueSpec
-	19, // 17: proto.AuthzResponse.queues:type_name -> proto.QueueSpec
-	7,  // 18: proto.EntroQ.TryClaim:input_type -> proto.ClaimRequest
-	7,  // 19: proto.EntroQ.Claim:input_type -> proto.ClaimRequest
-	9,  // 20: proto.EntroQ.Modify:input_type -> proto.ModifyRequest
-	12, // 21: proto.EntroQ.Tasks:input_type -> proto.TasksRequest
-	14, // 22: proto.EntroQ.Queues:input_type -> proto.QueuesRequest
-	14, // 23: proto.EntroQ.QueueStats:input_type -> proto.QueuesRequest
-	16, // 24: proto.EntroQ.Time:input_type -> proto.TimeRequest
-	12, // 25: proto.EntroQ.StreamTasks:input_type -> proto.TasksRequest
-	8,  // 26: proto.EntroQ.TryClaim:output_type -> proto.ClaimResponse
-	8,  // 27: proto.EntroQ.Claim:output_type -> proto.ClaimResponse
-	10, // 28: proto.EntroQ.Modify:output_type -> proto.ModifyResponse
-	13, // 29: proto.EntroQ.Tasks:output_type -> proto.TasksResponse
-	15, // 30: proto.EntroQ.Queues:output_type -> proto.QueuesResponse
-	15, // 31: proto.EntroQ.QueueStats:output_type -> proto.QueuesResponse
-	17, // 32: proto.EntroQ.Time:output_type -> proto.TimeResponse
-	13, // 33: proto.EntroQ.StreamTasks:output_type -> proto.TasksResponse
-	26, // [26:34] is the sub-list for method output_type
-	18, // [18:26] is the sub-list for method input_type
-	18, // [18:18] is the sub-list for extension type_name
-	18, // [18:18] is the sub-list for extension extendee
-	0,  // [0:18] is the sub-list for field type_name
+	1,  // 10: proto.ModifyDep.id:type_name -> proto.TaskID
+	4,  // 11: proto.TasksResponse.tasks:type_name -> proto.Task
+	5,  // 12: proto.QueuesResponse.queues:type_name -> proto.QueueStats
+	6,  // 13: proto.EntroQ.TryClaim:input_type -> proto.ClaimRequest
+	6,  // 14: proto.EntroQ.Claim:input_type -> proto.ClaimRequest
+	8,  // 15: proto.EntroQ.Modify:input_type -> proto.ModifyRequest
+	11, // 16: proto.EntroQ.Tasks:input_type -> proto.TasksRequest
+	13, // 17: proto.EntroQ.Queues:input_type -> proto.QueuesRequest
+	13, // 18: proto.EntroQ.QueueStats:input_type -> proto.QueuesRequest
+	15, // 19: proto.EntroQ.Time:input_type -> proto.TimeRequest
+	11, // 20: proto.EntroQ.StreamTasks:input_type -> proto.TasksRequest
+	7,  // 21: proto.EntroQ.TryClaim:output_type -> proto.ClaimResponse
+	7,  // 22: proto.EntroQ.Claim:output_type -> proto.ClaimResponse
+	9,  // 23: proto.EntroQ.Modify:output_type -> proto.ModifyResponse
+	12, // 24: proto.EntroQ.Tasks:output_type -> proto.TasksResponse
+	14, // 25: proto.EntroQ.Queues:output_type -> proto.QueuesResponse
+	14, // 26: proto.EntroQ.QueueStats:output_type -> proto.QueuesResponse
+	16, // 27: proto.EntroQ.Time:output_type -> proto.TimeResponse
+	12, // 28: proto.EntroQ.StreamTasks:output_type -> proto.TasksResponse
+	21, // [21:29] is the sub-list for method output_type
+	13, // [13:21] is the sub-list for method input_type
+	13, // [13:13] is the sub-list for extension type_name
+	13, // [13:13] is the sub-list for extension extendee
+	0,  // [0:13] is the sub-list for field type_name
 }
 
 func init() { file_entroq_proto_init() }
@@ -1904,62 +1587,14 @@ func file_entroq_proto_init() {
 				return nil
 			}
 		}
-		file_entroq_proto_msgTypes[16].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*Authz); i {
-			case 0:
-				return &v.state
-			case 1:
-				return &v.sizeCache
-			case 2:
-				return &v.unknownFields
-			default:
-				return nil
-			}
-		}
-		file_entroq_proto_msgTypes[17].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*QueueSpec); i {
-			case 0:
-				return &v.state
-			case 1:
-				return &v.sizeCache
-			case 2:
-				return &v.unknownFields
-			default:
-				return nil
-			}
-		}
-		file_entroq_proto_msgTypes[18].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*AuthzRequest); i {
-			case 0:
-				return &v.state
-			case 1:
-				return &v.sizeCache
-			case 2:
-				return &v.unknownFields
-			default:
-				return nil
-			}
-		}
-		file_entroq_proto_msgTypes[19].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*AuthzResponse); i {
-			case 0:
-				return &v.state
-			case 1:
-				return &v.sizeCache
-			case 2:
-				return &v.unknownFields
-			default:
-				return nil
-			}
-		}
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: file_entroq_proto_rawDesc,
-			NumEnums:      2,
-			NumMessages:   20,
+			NumEnums:      1,
+			NumMessages:   16,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

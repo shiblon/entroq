@@ -36,33 +36,32 @@ name_matches(want, can) {
     startswith(want.prefix, can.prefix)
 }
 
-actions_satisfied(want, can) {
-    can["ALL"]
-}
-actions_satisfied(want, can) {
-    count(want - can) == 0
+# Find out what actions are not covered by allowed listings.
+actions_left(want, can) = x {
+	x := {y | y := (want - can)[_]; not can["ALL"]}
 }
 
-# Match exact to allowed prefix.
-queue_matches[q] {
-    some qi, mi
-    my_q := input.queues[qi]
-    allow_q := possible_queues[mi]
-    q := {"i": qi, "want": {x | x := my_q.actions[_]}, "can": {x | x := allow_q.actions[_]}}
-    name_matches(my_q, allow_q)
-    actions_satisfied(q.want, q.can)
-}
+failed_queues[q] {
+    my_q := input.queues[_]
+    want := {x | x := my_q.actions[_]}
+    # What we are allowed to do goes into "can".
+    # Determined by the union of all allowed actions across
+    # any queue spec that matches this one.
+    can := {aq.actions[_] |
+    	aq := possible_queues[_]
+        name_matches(my_q, aq)
+    }
+    # Replace the actions wanted in the input object with
+    # actions not satisfied by the allowed actions for any matching queues.
+    # Do this by removing actions and replacing them using an object union.
+    q := object.union(object.remove(my_q, ["actions"]), {"actions": actions_left(want, can)})
 
-missing[q] {
-    want := {x | x := numbers.range(0, count(input.queues)-1)[_]}
-    can := {x | x := queue_matches[_].i}
-    need := want - can
-    q := input.queues[i]
-    need[i]
+    # Only return queues that have missing actions. If there are none of these, the user is allowed.
+    count(q.actions) > 0
 }
 
 default allow = false
 allow {
-    count(missing) == 0
+    count(failed_queues) == 0
 }
 

@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+package proto;
+
+option go_package = ".;proto";
+
+// Authz contains info about authorization. Usually just a token.
+message Authz {
+  string token = 1;
+}
+
+// AuthzQueue contains a single queue specification (name, pattern, etc.)
+message AuthzQueue {
+  string exact = 1;
+  string prefix = 2;
+
+  enum Action {
+    READ = 0;
+    CLAIM = 1;
+    DELETE = 2; // Also used for "change from" this queue.
+    INSERT = 4; // Also used for "change to" this queue.
+    CHANGE = 8;
+    ANY = 65535;
+  }
+
+  // Action indicates what this queue is being used for (e.g., CLAIM).
+  repeated Action actions = 3;
+}
+
+
+// AuthzRequest contains authorization information and information about what
+// the user is attempting to do with which queues. Useful for subrequest
+// authorization (e.g., sending to OpenPolicyAgent).
+message AuthzRequest {
+  Authz authz = 1;
+
+  repeated AuthzQueue queues = 2;
+}
+
+// AuthzResponse is the authorization response, containing disallowed queues
+// with their actions. If the disallowed_queues field is empty, this action is
+// allowed.
+message AuthzResponse {
+  repeated AuthzQueue disallowed_queues = 1;
+}
+
+// AuthzEntity contains information about a person or a group.
+message AuthzEntity {
+  // Name is used to identify this entity unambiguously (user name, user ID).
+  string name = 1;
+
+  // Queues contains information about what this user is allowed to do with
+  // queues, queue matches, etc.
+  repeated AuthzQueue queues = 2;
+}
+
+// AuthzSpec contains information about what is allowed and disallowed for users, roles, etc.
+// This is used as configuration for the RBAC system. It defines what folks can and can't do.
+message AuthzSpec {
+  repeated AuthzEntity users = 1;
+  repeated AuthzEntity roles = 2;
+}
