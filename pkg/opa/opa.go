@@ -3,83 +3,106 @@
 package opa
 
 import (
+	"bytes"
 	"context"
 	"fmt"
-	"log"
-	"sync"
-	"time"
 
-	"github.com/open-policy-agent/opa/ast"
 	"github.com/open-policy-agent/opa/rego"
-
-	pb "entrogo.com/entroq/proto"
 )
+
+// Authz represents per-request authz information. It can ideally come in many
+// forms. The first supported form is a "token", such as from an Authorization
+// header.
+type Authz struct {
+	// Token contains the full value contents (omitting encoding and other
+	// common header information) of an Authorization HTTP header, including
+	// the type prefix (e.g., "Bearer")
+	Token string `json:"token"`
+}
+
+// QueueAuthz contains information about a single queue (it is expected that
+// only one match string will be specified, though multiple are technically
+// allowed).
+type QueueAuthz struct {
+	// Exact match queue string.
+	Exact string `json:"exact"`
+	// Prefix match queue string.
+	Prefix string `json:"prefix"`
+	// Actions contains the desired things to be done with this queue.
+	// TODO: make this an enum.
+	Actions []string `yaml:",flow" json:"actions"`
+}
+
+// AuthzRequest conatins an authorization request to send to OPA.
+type AuthzRequest struct {
+	// Authz contains information that came in with the request (headers).
+	Authz *Authz `json:"authz"`
+	// Queues contains information about what is desired: what queues to
+	// operate on, and what should be done to them.
+	Queues []*QueueAuthz `json:"queues"`
+}
+
+// AuthzResponse contains the reply from OPA. An empty UnmatchedQueues field implies
+// that the action is allowed.
+type AuthzResponse struct {
+	// UnmatchedQueues contains the queue information for things that were not
+	// found to be allowed. It will only contain the actions that were not
+	// matched. If multiple actions were desired for a single queue, only those
+	// disallowed are expected to be given back in the response.
+	UnmatchedQueues []*QueueAuthz `json:"queues"`
+}
+
+// AuthzDependencyError is a special type of error holding an AuthzResponse.
+type AuthzDependencyError AuthzResponse
+
+// Error satisfies the error interface.
+func (e *AuthzDependencyError) Error() string {
+	resp := (*AuthzResponse)(e)
+
+	y, err := yaml.Marshal(resp)
+	if err != nil {
+		return fmt.Sprintf("not authorized, failed to get data with reasons: %v", err)
+	}
+
+	return fmt.Sprintf("not authorized, missing queue/actions:\n%s", string(y))
+}
+
+// AuthzEntity contains information about a user or a role, and the things that
+// user or role are allowed to do.
+type AuthzEntity struct {
+	// Name is the identifier for this user or role (not necessarily
+	// human-friendly, more like a username).
+	Name string `yaml:"name" json:"name"`
+
+	// Roles contains memberships for this entity (roles it is a member of).
+	// It should be empty, and is ignored, when this entity represents a role.
+	Roles []string `yaml:"roles" json:"roles"`
+
+	// Queues contains information about what can be done to which queues.
+	Queues []*QueueAuthz `yaml:"queues" json:"queues"`
+}
+
+// AuthzPermissions contains all allowed actions for every user and role in the system.
+type AuthzPermissions struct {
+	// Users contains actual individual information, for when specific
+	// individuals need special overrides.
+	Users []*AuthzEntity `yaml:"users" json:"users"`
+
+	// Roles contains allowances for groups.
+	Roles []*AuthzEntity `yaml:"roles" json:"roles"`
+}
 
 // OPA is a client-like object for interacting with OPA authorization policies.
 type OPA struct {
-	sync.Mutex
-
-	policyGetter  PolicyGetter
-	policyRefresh time.Duration
-
-	cachedCompiler *ast.Compiler
-
-	cancelWatcher context.CancelFunc
-}
-
-func un(locker sync.Locker) {
-	locker.Unlock()
-}
-
-func lock(locker sync.Locker) sync.Locker {
-	locker.Lock()
-	return locker
+	impl Authorizer
 }
 
 // New creates a new OPA with the given options. A policy should be specified
 // so that it can do its work. This should be closed when no longer in use.
-func New(opts ...Option) (*OPA, error) {
-	a := new(OPA)
-	for _, opt := range opts {
-		opt(a)
+func New(authorizer Authorizer) *OPA {
+	return &OPA{
+		impl: authorizer,
 	}
-
-	if a.policyGetter == nil && a.cachedCompiler == nil {
-		return nil, fmt.Errorf("invalid OPA configuration---at least a policy or policy getter must be specified")
-	}
-
-	// If there is no refresh policy, don't kick off any refresh things.
-	if a.policyRefresh == 0 {
-		return a, nil
-	}
-
-	// There is a getter and a refresh policy, start a policy refresh watcher.
-
-	// Note that we are using a background context because this is truly a
-	// background process. Normally this is the wrong thing to do, but here is
-	// is correct.
-	ctx := context.Background()
-	ctx, a.cancelWatcher = context.WithCancel(context.Background())
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(a.policyRefresh):
-				refreshContext, _ := context.WithTimeout(ctx, 30*time.Second)
-				if err := a.refreshPolicy(refreshContext); err != nil {
-					log.Fatalf("Failed to refresh authorization policy: %v", err)
-				}
-			case <-time.After(a.policyRefresh + time.Minute):
-				// If we hit this case, then the refresh context failed to
-				// trigger an exit. This is a sort of watchdog case in case of
-				// bad getter implementations.
-				log.Fatal("Refresh took longer than expected and context failed to trigger an exit.")
-			}
-		}
-	}()
-
-	return a, nil
 }
 
 // Close shuts down policy refresh watchers, and releases OPA resources. Should
@@ -91,97 +114,78 @@ func (a *OPA) Close() error {
 	return nil
 }
 
-// Option defines creation options for OPA.
-type Option func(*OPA) error
+// Authorizer is an abstraction over Rego policy. Provide one of these to
+// manage policy files and changes. The query is expected to return a nil error
+// when authorized, and a non-nil error when not authorized (or smoething else
+// goes wrong). // TODO: specify the type of unauthorized error.
+type Authorizer interface {
+	Authorize(context.Context, *AuthzRequest) error
+	Close() error
+}
 
-// PolicyGetter is passed as a construction option for the queue service if an
-// OPA policy should be executed with each request. The getter provides the
-// actual policy content (Rego file) every time.
-type PolicyGetter func(ctx context.Context) (string, error)
+// StringAuthorizer keeps OPA policies as strings, and they are expected to never change.
+type StringAuthorizer struct {
+	EntitiesJSON string            // Entities JSON (must be JSON, not YAML).
+	RuleModules  map[string]string // Map from package name to Rego contents.
 
-// WithPolicyGetter sets this service up to use the provided getter to
-// obtain Rego policy and to note whether it should be reloaded.
-// If the interval is 0, it means "never refresh, just get the policy once".
-func WithPolicyGetter(getter PolicyGetter, interval time.Duration) Option {
-	return func(a *OPA) error {
-		a.policyGetter = getter
-		a.policyRefresh = interval
-		return nil
+	impl *rego.Rego
+	pr   *rego.PartialResult
+}
+
+// NewStringAuthorizer creates a valid policy authorize from various string contents:
+// - a query for the policy (e.g., "failed_queues"), expected to return content in the format of the AuthzResponse.
+// - a JSON string containing entity information shaped like AuthzEntities, and
+// - a map of module strings in Rego.
+func NewStringAuthorizer(query string, entitiesJSON string, rules map[string]string) *PolicyStringManager {
+	options := []func(*rego.Rego){
+		rego.Query(query),
+		rego.Store(inmem.NewFromReader(bytes.NewBufferString(entitiesJSON))),
+	}
+
+	for name, module := range rules {
+		options = append(options, rego.Module(name, module))
+	}
+
+	return &PolicyStringManager{
+		EntitiesJSON: entitiesJSON,
+		RuleModules:  rules,
+		impl:         rego.New(options...),
 	}
 }
 
-// WithPolicy sets the policy, and it is never changed. String contents of a Rego file.
-func WithPolicy(contents string) Option {
-	return func(a *OPA) error {
-		defer un(lock(a))
-		var err error
-		if a.cachedCompiler, err = a.compileModule(contents); err != nil {
-			return fmt.Errorf("set policy: %w", err)
-		}
-		return nil
+func (a *StringAuthorizer) partialResult(ctx context.Context) (*rego.PartialResult, error) {
+	if m.pr != nil {
+		return m.pr, nil
 	}
+	var err error
+	m.pr, err = m.impl.PartialResult(ctx)
+	return m.pr, err
 }
 
-// Authorize returns an appropriate Authz Response based on information in the
-// context, OPA policy, and request inputs.
-func (a *OPA) Authorize(ctx context.Context, req *pb.AuthzRequest) (*pb.AuthzResponse, error) {
-	compiler, err := a.regoCompiler(ctx)
+// Query checks for unmatched queues and actions. A nil error means authorized.
+func (a *StringAuthorizer) Authorize(ctx context.Context, req *AuthzRequest) error {
+	pr, err := m.partialResult()
 	if err != nil {
-		return nil, fmt.Errorf("authorize OPA: %w", err)
+		return fmt.Errorf("query: %w", err)
 	}
 
-	query := rego.New(
-		rego.Compiler(compiler),
-		// TODO: query?
-		rego.Input(req),
-	)
-
-	results, err := query.Eval(ctx)
+	r := pr.Rego(rego.Input(req))
+	results, err := r.Partial(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("authorize OPA query: %w", err)
+		return fmt.Errorf("query: %w", err)
 	}
 
-	log.Printf("Results: %+v", results)
+	// TODO: package up any non-empty results into a suitable error.
 
-	authzResp := new(pb.AuthzResponse)
-
-	// TODO: go through the results, get waht we need to create the right kind of error (or not).
-
-	return authzResp, nil
-}
-func (a *OPA) compileModule(module string) (*ast.Compiler, error) {
-	return ast.CompileModules(map[string]string{"entroq.rego": module})
-}
-
-func (a *OPA) refreshPolicy(ctx context.Context) error {
-	// No refresh if there's no getter.
-	if a.policyGetter == nil {
-		return nil
-	}
-
-	module, err := a.policyGetter(ctx)
-	if err != nil {
-		return fmt.Errorf("refresh policy: %w", err)
-	}
-
-	compiler, err := a.compileModule(module)
-	if err != nil {
-		return fmt.Errorf("refresh policy: %w", err)
-	}
-
-	defer un(lock(a))
-	a.cachedCompiler = compiler
-
+	// Nothing in failed queues, we're good.
 	return nil
 }
 
-func (a *OPA) regoCompiler(ctx context.Context) (*ast.Compiler, error) {
-	defer un(lock(a))
-	if a.cachedCompiler != nil {
-		return a.cachedCompiler, nil
+// Authorize returns an appropriate Authz Response based on information in the
+// context, OPA policy, and request inputs. If there is no error, the request
+// is authorized.
+func (a *OPA) Authorize(ctx context.Context, req *AuthzRequest) error {
+	if err := a.impl.Authorize(ctx, req); err != nil {
+		return fmt.Errorf("authorize: %w", err)
 	}
-	if err := a.refreshPolicy(ctx); err != nil {
-		return nil, fmt.Errorf("get compiler with first refresh: %w", err)
-	}
-	return a.cachedCompiler, nil
 }
