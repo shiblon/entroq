@@ -3,8 +3,8 @@ package authzopa // import "entrogo.com/entroq/pkg/authzopa"
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"log"
 
 	"entrogo.com/entroq/pkg/authz"
 	"github.com/open-policy-agent/opa/rego"
@@ -19,9 +19,9 @@ type OPA struct {
 // Policy provides the ability to get partial results, suitable for running OPA
 // authorization queries with new input.
 type Policy interface {
-	// Query produces a Rego partial result, which has everything ready to go
+	// PreparedQuery produces a Rego partial result, which has everything ready to go
 	// and is simply awaiting input for eval.
-	Query(context.Context) (rego.PreparedEvalQuery, error)
+	PreparedQuery(context.Context) (rego.PreparedEvalQuery, error)
 	// Close cleans up the policy, which might have file watchers and other
 	// resources held open.
 	Close() error
@@ -50,21 +50,51 @@ func (a *OPA) Close() error {
 	return a.policy.Close()
 }
 
+// AuthzErrorFromResultVals converts a slice of map[string]interface{} into an
+// AuthzError. It does this by converting to/from JSON, if possible. Note that
+// the argument is not a map, as we don't often have the right type coming back
+// from queries.
+func AuthzErrorFromResultVals(m []interface{}) (*authz.AuthzError, error) {
+	b, err := json.Marshal(m)
+	if err != nil {
+		return nil, fmt.Errorf("authz error from map: %w", err)
+	}
+
+	e := new(authz.AuthzError)
+	if err := json.Unmarshal(b, &e.Failed); err != nil {
+		return nil, fmt.Errorf("authz error from json: %w", err)
+	}
+
+	return e, nil
+}
+
 // Authorize checks for unmatched queues and actions. A nil error means authorized.
 func (a *OPA) Authorize(ctx context.Context, req *authz.Request) error {
-	prep, err := a.policy.Query(ctx)
+	prep, err := a.policy.PreparedQuery(ctx)
 	if err != nil {
 		return fmt.Errorf("prepare: %w", err)
 	}
-	queries, err := prep.Eval(ctx, rego.EvalInput(req))
+	results, err := prep.Eval(ctx, rego.EvalInput(req))
 	if err != nil {
 		return fmt.Errorf("authorize opa: %w", err)
 	}
 
-	log.Print(queries)
+	if len(results) == 0 {
+		return nil // Authorized
+	}
 
-	// TODO: package up any non-empty results into a suitable error.
+	exprs := results[0].Expressions
 
-	// Nothing in failed queues, we're good.
-	return nil
+	if len(exprs) != 1 {
+		return fmt.Errorf("authorize: empty result expression")
+	}
+
+	vals := exprs[0].Value.([]interface{})
+
+	respErr, err := AuthzErrorFromResultVals(vals)
+	if err != nil {
+		return fmt.Errorf("authorize get val: %w", err)
+	}
+
+	return respErr
 }
