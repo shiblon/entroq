@@ -20,7 +20,7 @@ const (
 	Change Action = "CHANGE"
 	Insert Action = "INSERT"
 	Read   Action = "READ"
-	Any    Action = "ANY"
+	All    Action = "ALL"
 )
 
 // Request conatins an authorization request to send to OPA.
@@ -56,9 +56,9 @@ type AuthzContext struct {
 // is not necessarily well defined, and depends on policy execution order.
 type QueueSpec struct {
 	// Exact match queue string.
-	Exact string `yaml:",omitempty" json:"exact"`
+	Exact string `yaml:",omitempty" json:"exact,omitempty"`
 	// Prefix match queue string.
-	Prefix string `yaml:",omitempty" json:"prefix"`
+	Prefix string `yaml:",omitempty" json:"prefix,omitempty"`
 	// Actions contains the desired things to be done with this queue.
 	Actions []Action `yaml:",flow" json:"actions"`
 }
@@ -110,6 +110,7 @@ type Entity struct {
 // AuthzError contains the reply from OPA, if non-empty. An empty UnmatchedQueues field implies
 // that the action is allowed.
 type AuthzError struct {
+	User string `json:"user"`
 	// Failed contains the queue information for things that were not
 	// found to be allowed by the policy. It will only contain the actions that
 	// were not matched. If multiple actions were desired for a single queue,
@@ -122,9 +123,9 @@ type AuthzError struct {
 func (e *AuthzError) Error() string {
 	y, err := yaml.Marshal(e.Failed)
 	if err != nil {
-		return fmt.Sprintf("not authorized, failed to get data with reasons: %v", err)
+		return fmt.Sprintf("user %q not authorized, failed to get data with reasons: %v", e.User, err)
 	}
-	return fmt.Sprintf("not authorized, missing queue/actions:\n%s", string(y))
+	return fmt.Sprintf("user %q not authorized, missing queue/actions:\n%s", e.User, string(y))
 }
 
 // Authorizer is an abstraction over Rego policy. Provide one of these to

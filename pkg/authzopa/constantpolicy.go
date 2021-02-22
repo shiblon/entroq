@@ -1,4 +1,4 @@
-package authzopa // import "entrogo.com/entroq/pkg/authzopa"
+package authzopa
 
 import (
 	"bytes"
@@ -18,9 +18,6 @@ const CoreModuleName = "entroq.authz"
 var (
 	//go:embed core-rules.rego
 	coreRego string
-
-	//go:embed core-query.rego
-	coreQuery string
 )
 
 // Constant creates OPA mechanisms from constant string values (rules + data) that never change.
@@ -92,7 +89,6 @@ func NewConstant(ctx context.Context, opts ...ConstantOption) (*Constant, error)
 		modules: map[string]string{
 			CoreModuleName: coreRego,
 		},
-		query: coreQuery,
 	}
 
 	for _, opt := range opts {
@@ -102,10 +98,8 @@ func NewConstant(ctx context.Context, opts ...ConstantOption) (*Constant, error)
 	}
 
 	// Create Rego options for a result.
-	var options []func(*rego.Rego)
-
-	if cp.query != "" {
-		options = append(options, rego.Query(cp.query))
+	options := []func(*rego.Rego){
+		rego.Query(`{"user": data.entroq.authz.username, "failed": data.entroq.authz.failed_queues}`),
 	}
 
 	if cp.perms != nil {
