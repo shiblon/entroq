@@ -50,24 +50,6 @@ func (a *OPA) Close() error {
 	return a.policy.Close()
 }
 
-// authzErrorFromResultVals converts a slice of map[string]interface{} into an
-// AuthzError. It does this by converting to/from JSON, if possible. Note that
-// the argument is not a map, as we don't often have the right type coming back
-// from queries.
-func authzErrorFromResultVals(m []interface{}) (*authz.AuthzError, error) {
-	b, err := json.Marshal(m)
-	if err != nil {
-		return nil, fmt.Errorf("authz error from map: %w", err)
-	}
-
-	e := new(authz.AuthzError)
-	if err := json.Unmarshal(b, &e.Failed); err != nil {
-		return nil, fmt.Errorf("authz error from json: %w", err)
-	}
-
-	return e, nil
-}
-
 // Authorize checks for unmatched queues and actions. A nil error means authorized.
 func (a *OPA) Authorize(ctx context.Context, req *authz.Request) error {
 	prep, err := a.policy.PreparedQuery(ctx)
@@ -79,22 +61,27 @@ func (a *OPA) Authorize(ctx context.Context, req *authz.Request) error {
 		return fmt.Errorf("authorize opa: %w", err)
 	}
 
-	if len(results) == 0 {
-		return nil // Authorized
-	}
-
 	exprs := results[0].Expressions
 
 	if len(exprs) != 1 {
 		return fmt.Errorf("authorize: empty result expression")
 	}
 
-	vals := exprs[0].Value.([]interface{})
+	val := exprs[0].Value.(map[string]interface{})
 
-	respErr, err := authzErrorFromResultVals(vals)
+	// Convert to JSON, so we can create an error if needed.
+	b, err := json.Marshal(val)
 	if err != nil {
-		return fmt.Errorf("authorize get val: %w", err)
+		return fmt.Errorf("authz response marshal: %v", err)
 	}
 
-	return respErr
+	e := new(authz.AuthzError)
+	if err := json.Unmarshal(b, e); err != nil {
+		return fmt.Errorf("authz convert to useful error: %v\njson=%v", err, string(b))
+	}
+
+	if len(e.Failed) != 0 {
+		return e
+	}
+	return nil
 }
