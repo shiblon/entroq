@@ -25,7 +25,7 @@ var (
 
 // Constant creates OPA mechanisms from constant string values (rules + data) that never change.
 type Constant struct {
-	partialQuery rego.PreparedPartialQuery
+	preparedQuery rego.PreparedEvalQuery
 
 	// OPA query for this policy.
 	query string
@@ -101,7 +101,7 @@ func NewConstant(ctx context.Context, opts ...ConstantOption) (*Constant, error)
 		}
 	}
 
-	// Create Rego options for a partial result.
+	// Create Rego options for a result.
 	var options []func(*rego.Rego)
 
 	if cp.query != "" {
@@ -119,18 +119,17 @@ func NewConstant(ctx context.Context, opts ...ConstantOption) (*Constant, error)
 	}
 
 	var err error
-	if cp.partialQuery, err = rego.New(options...).PrepareForPartial(ctx, rego.WithPartialEval()); err != nil {
-		return nil, fmt.Errorf("new constant partial: %w", err)
+	if cp.preparedQuery, err = rego.New(options...).PrepareForEval(ctx); err != nil {
+		return nil, fmt.Errorf("new constant prep: %w", err)
 	}
 
 	return cp, nil
 }
 
-// Query creates a prepared partial query given the data, policy, and query. Returns
-// a Rego partial result suitable for passing in new input and getting results
-// back.
-func (c *Constant) Query(ctx context.Context) (rego.PreparedPartialQuery, error) {
-	return c.partialQuery, nil
+// Query creates a prepared query given the data, policy, and query. Returns a
+// Rego result suitable for passing in new input and getting results back.
+func (c *Constant) Query(ctx context.Context) (rego.PreparedEvalQuery, error) {
+	return c.preparedQuery, nil
 }
 
 // Close closes the constant policy.
