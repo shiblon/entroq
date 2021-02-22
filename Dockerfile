@@ -1,7 +1,7 @@
 # Inspired by https://www.cloudreach.com/blog/containerize-this-golang-dockerfiles/
 
 # Build inside a Go container.
-FROM golang:alpine as builder
+FROM golang:1.16-alpine3.13 as builder
 
 ENV GOPATH /build
 ENV CGO_ENABLED 0
