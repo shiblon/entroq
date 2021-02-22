@@ -126,9 +126,9 @@ func NewConstant(ctx context.Context, opts ...ConstantOption) (*Constant, error)
 	return cp, nil
 }
 
-// Query creates a prepared query given the data, policy, and query. Returns a
+// PreparedQuery creates a prepared query given the data, policy, and query. Returns a
 // Rego result suitable for passing in new input and getting results back.
-func (c *Constant) Query(ctx context.Context) (rego.PreparedEvalQuery, error) {
+func (c *Constant) PreparedQuery(ctx context.Context) (rego.PreparedEvalQuery, error) {
 	return c.preparedQuery, nil
 }
 

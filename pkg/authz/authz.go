@@ -56,11 +56,11 @@ type AuthzContext struct {
 // is not necessarily well defined, and depends on policy execution order.
 type QueueSpec struct {
 	// Exact match queue string.
-	Exact string `json:"exact"`
+	Exact string `yaml:",omitempty" json:"exact"`
 	// Prefix match queue string.
-	Prefix string `json:"prefix"`
+	Prefix string `yaml:",omitempty" json:"prefix"`
 	// Actions contains the desired things to be done with this queue.
-	Actions []Action `json:"actions"`
+	Actions []Action `yaml:",flow" json:"actions"`
 }
 
 // Permissions contains all allowed actions for every user and role in the system.
@@ -120,7 +120,7 @@ type AuthzError struct {
 // Error satisfies the error interface, producing a string error that contains
 // unmatched queue/action information.
 func (e *AuthzError) Error() string {
-	y, err := yaml.Marshal(e)
+	y, err := yaml.Marshal(e.Failed)
 	if err != nil {
 		return fmt.Sprintf("not authorized, failed to get data with reasons: %v", err)
 	}
