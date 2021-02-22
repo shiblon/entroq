@@ -50,11 +50,11 @@ func (a *OPA) Close() error {
 	return a.policy.Close()
 }
 
-// AuthzErrorFromResultVals converts a slice of map[string]interface{} into an
+// authzErrorFromResultVals converts a slice of map[string]interface{} into an
 // AuthzError. It does this by converting to/from JSON, if possible. Note that
 // the argument is not a map, as we don't often have the right type coming back
 // from queries.
-func AuthzErrorFromResultVals(m []interface{}) (*authz.AuthzError, error) {
+func authzErrorFromResultVals(m []interface{}) (*authz.AuthzError, error) {
 	b, err := json.Marshal(m)
 	if err != nil {
 		return nil, fmt.Errorf("authz error from map: %w", err)
@@ -91,7 +91,7 @@ func (a *OPA) Authorize(ctx context.Context, req *authz.Request) error {
 
 	vals := exprs[0].Value.([]interface{})
 
-	respErr, err := AuthzErrorFromResultVals(vals)
+	respErr, err := authzErrorFromResultVals(vals)
 	if err != nil {
 		return fmt.Errorf("authorize get val: %w", err)
 	}
