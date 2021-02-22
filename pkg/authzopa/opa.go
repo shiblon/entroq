@@ -21,7 +21,7 @@ type OPA struct {
 type Policy interface {
 	// Query produces a Rego partial result, which has everything ready to go
 	// and is simply awaiting input for eval.
-	Query(context.Context) (rego.PreparedPartialQuery, error)
+	Query(context.Context) (rego.PreparedEvalQuery, error)
 	// Close cleans up the policy, which might have file watchers and other
 	// resources held open.
 	Close() error
@@ -56,7 +56,7 @@ func (a *OPA) Authorize(ctx context.Context, req *authz.Request) error {
 	if err != nil {
 		return fmt.Errorf("prepare: %w", err)
 	}
-	queries, err := prep.Partial(ctx, rego.EvalInput(req))
+	queries, err := prep.Eval(ctx, rego.EvalInput(req))
 	if err != nil {
 		return fmt.Errorf("authorize opa: %w", err)
 	}
