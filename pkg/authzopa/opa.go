@@ -15,7 +15,7 @@ import (
 // OPA is a client-like object for interacting with OPA authorization policies.
 // It adheres to the authz.Authorizer interface.
 type OPA struct {
-	baseURL       *url.URL
+	apiURL        *url.URL
 	allowTestUser bool
 }
 
@@ -36,10 +36,12 @@ func WithInsecureTestUser() Option {
 // should go, e.g., http://localhost:9020.
 func WithBaseURL(u string) Option {
 	return func(a *OPA) error {
-		var err error
-		if a.baseURL, err = url.Parse(u); err != nil {
+		base, err := url.Parse(u)
+		if err != nil {
 			return fmt.Errorf("set base URL: %w", err)
 		}
+		base.Path = "/v1/data/entroq/authz/queues_result"
+		a.apiURL = base
 		return nil
 	}
 }
@@ -53,7 +55,7 @@ func New(opts ...Option) (*OPA, error) {
 		}
 	}
 
-	if a.baseURL == nil {
+	if a.apiURL == nil {
 		return nil, fmt.Errorf("new opa has no base URL")
 	}
 
@@ -61,14 +63,12 @@ func New(opts ...Option) (*OPA, error) {
 }
 
 // Authorize checks for unmatched queues and actions. A nil error means authorized.
+// If the error satisfies errors.Is on a *authz.AuthzError, it can be unpacked to find
+// which queues and actions were not satisfied.
 func (a *OPA) Authorize(ctx context.Context, req *authz.Request) error {
 	if !a.allowTestUser && req.Authz.TestUser != "" {
 		return fmt.Errorf("insecure test user present, but not allowed")
 	}
-
-	fullURL := new(url.URL)
-	*fullURL = *a.baseURL
-	fullURL.Path = "/v1/data/entroq/authz/result"
 
 	body := map[string]*authz.Request{
 		"input": req,
@@ -79,7 +79,7 @@ func (a *OPA) Authorize(ctx context.Context, req *authz.Request) error {
 		return fmt.Errorf("authorize: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL.String(), bytes.NewBuffer(b))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.apiURL.String(), bytes.NewBuffer(b))
 	if err != nil {
 		return fmt.Errorf("authorize: %w", err)
 	}

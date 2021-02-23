@@ -3,7 +3,9 @@ package authzopa
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"os"
+	"strings"
 	"testing"
 
 	"embed"
@@ -13,30 +15,35 @@ import (
 )
 
 var (
-	//go:embed regodata/*.rego
-	regoContent embed.FS
+	//go:embed regodata
+	regoFS embed.FS
 )
 
 func parseModules() (map[string]*ast.Module, error) {
-	entries, err := regoContent.ReadDir(".")
-	if err != nil {
-		return nil, fmt.Errorf("parse module: %w", err)
-	}
-
 	result := make(map[string]*ast.Module)
-	for _, entry := range entries {
+
+	if err := fs.WalkDir(regoFS, ".", func(path string, entry fs.DirEntry, err error) error {
+		if !strings.HasSuffix(path, ".rego") {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("walk: %w", err)
+		}
 		if entry.IsDir() {
-			continue
+			return nil
 		}
-		b, err := regoContent.ReadFile(entry.Name())
+		b, err := regoFS.ReadFile(path)
 		if err != nil {
-			return nil, fmt.Errorf("parse module: %w", err)
+			return fmt.Errorf("walk: %w", err)
 		}
-		m, err := ast.ParseModule(entry.Name(), string(b))
+		m, err := ast.ParseModule(path, string(b))
 		if err != nil {
-			return nil, fmt.Errorf("parse module: %w", err)
+			return fmt.Errorf("walk: %w", err)
 		}
-		result[entry.Name()] = m
+		result[path] = m
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("parse module: %w", err)
 	}
 
 	return result, nil
