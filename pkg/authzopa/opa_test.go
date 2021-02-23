@@ -6,34 +6,39 @@ import (
 	"os"
 	"testing"
 
-	_ "embed"
+	"embed"
 
-	"entrogo.com/entroq/pkg/authz"
 	"github.com/open-policy-agent/opa/ast"
 	"github.com/open-policy-agent/opa/tester"
 )
 
 var (
-	//go:embed core-rules_test.rego
-	coreRegoTest string
-
-	//go:embed extra-rules.rego
-	extraRegoTest string
-
-	//go:embed queues_test.rego
-	queuesRegoTest string
+	//go:embed *.rego
+	regoContent embed.FS
 )
 
-func parseModules(modules map[string]string) (map[string]*ast.Module, error) {
-	result := make(map[string]*ast.Module)
+func parseModules() (map[string]*ast.Module, error) {
+	entries, err := regoContent.ReadDir(".")
+	if err != nil {
+		return nil, fmt.Errorf("parse module: %w", err)
+	}
 
-	for k, v := range modules {
-		m, err := ast.ParseModule(k, v)
+	result := make(map[string]*ast.Module)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		b, err := regoContent.ReadFile(entry.Name())
 		if err != nil {
 			return nil, fmt.Errorf("parse module: %w", err)
 		}
-		result[k] = m
+		m, err := ast.ParseModule(entry.Name(), string(b))
+		if err != nil {
+			return nil, fmt.Errorf("parse module: %w", err)
+		}
+		result[entry.Name()] = m
 	}
+
 	return result, nil
 }
 
@@ -42,13 +47,7 @@ func parseModules(modules map[string]string) (map[string]*ast.Module, error) {
 func TestCoreRules(t *testing.T) {
 	ctx := context.Background()
 
-	mods, err := parseModules(map[string]string{
-		"core-rules.rego":      coreRego,
-		"extra-rules.rego":     extraRegoTest,
-		"queues.rego":          queuesRego,
-		"core-rules_test.rego": coreRegoTest,
-		"queues_test.rego":     queuesRegoTest,
-	})
+	mods, err := parseModules()
 	if err != nil {
 		t.Fatalf("Failed to parse test modules: %v", err)
 	}
@@ -64,57 +63,5 @@ func TestCoreRules(t *testing.T) {
 
 	if err := (tester.PrettyReporter{Output: os.Stderr, Verbose: true}).Report(rch); err != nil {
 		t.Fatalf("Error in test: %v", err)
-	}
-}
-
-// TestOPA_Authorize_Basic tests that basic auth works using an extra provided
-// module that implements "username from basic auth".
-// TODO: write this extra module, depend on it in the core files?
-func TestOPA_Authorize_Basic(t *testing.T) {
-	ctx := context.Background()
-	loader := ConstantLoader(
-		WithConstantAdditionalModules(map[string]string{"extra-rules.rego": extraRegoTest}),
-		WithConstantPermissionsYAML(`
-users:
-- name: auser
-  queues:
-  - prefix: /ns=auser/
-    actions:
-    - ALL
-  - exact: /global/inbox
-    actions:
-    - INSERT
-roles:
-- name: "*"
-  queues:
-  - exact: /global/config
-    actions:
-    - READ
-- name: admin
-  queues:
-  - prefix: ""
-    actions:
-    - ALL
-`))
-	opa, err := New(ctx, loader, WithInsecureTestUser())
-	if err != nil {
-		t.Fatalf("Error creating constant policy: %v", err)
-	}
-	defer opa.Close()
-
-	req, err := authz.NewYAMLRequest(`
-authz:
-  testuser: "auser"
-queues:
-- exact: /ns=auser/myinbox
-  actions:
-  - CLAIM
-`)
-	if err != nil {
-		t.Fatalf("Error parsing request yaml: %v", err)
-	}
-
-	if err := opa.Authorize(ctx, req); err != nil {
-		t.Fatalf("Error authorizing: %v", err)
 	}
 }

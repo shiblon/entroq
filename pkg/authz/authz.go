@@ -3,9 +3,7 @@ package authz // import "entrogo.com/entroq/pkg/authz"
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"log"
 
 	yaml "gopkg.in/yaml.v2"
 )
@@ -45,12 +43,14 @@ func NewYAMLRequest(y string) (*Request, error) {
 // forms. The first supported form is a "token", such as from an Authorization
 // header.
 type AuthzContext struct {
-	// Token contains the full value contents (omitting encoding and other
-	// common header information) of an Authorization HTTP header, including
-	// the type prefix (e.g., "Bearer")
-	Token string `json:"token"`
+	// An HTTP Authorization header is split into its type and credentials and
+	// included here when available.
+	Type        string `json:"type"`
+	Credentials string `json:"credentials"`
 
 	// Never use this in practice. This allows the user to be set directly for testing.
+	// The code checks for this and creates an error if present, unless
+	// specifically allowed for testing.
 	TestUser string `json:"testuser"`
 }
 
@@ -64,50 +64,6 @@ type QueueSpec struct {
 	Prefix string `yaml:",omitempty" json:"prefix,omitempty"`
 	// Actions contains the desired things to be done with this queue.
 	Actions []Action `yaml:",flow" json:"actions"`
-}
-
-// Permissions contains all allowed actions for every user and role in the system.
-// TODO: do we need bindings between users and roles?
-type Permissions struct {
-	// Users contains actual individual information, for when specific
-	// individuals need special overrides.
-	Users []*Entity `json:"users"`
-
-	// Roles contains allowances for groups.
-	Roles []*Entity `json:"roles"`
-}
-
-// NewYAMLPermissions attempts to parse permissions as YAML, which is a superset of JSON, so can parse JSON, as well..
-func NewYAMLPermissions(s string) (*Permissions, error) {
-	p := new(Permissions)
-	if err := yaml.Unmarshal([]byte(s), p); err != nil {
-		return nil, fmt.Errorf("parse permissions: %w", err)
-	}
-	return p, nil
-}
-
-// String produces permissions in JSON format. Panics if it doesn't work (never expected).
-func (p *Permissions) String() string {
-	b, err := json.Marshal(p)
-	if err != nil {
-		log.Fatalf("Unable to produce JSON from permissions: %v", err)
-	}
-	return string(b)
-}
-
-// Entity contains information about a user or a role, and the things that
-// user or role are allowed to do.
-type Entity struct {
-	// Name is the identifier for this user or role (not necessarily
-	// human-friendly, more like a username).
-	Name string `json:"name"`
-
-	// Roles contains memberships for this entity (roles it is a member of).
-	// It should be empty, and is ignored, when this entity represents a role.
-	Roles []string `json:"roles"`
-
-	// Queues contains information about what can be done to which queues.
-	Queues []*QueueSpec `json:"queues"`
 }
 
 // AuthzError contains the reply from OPA, if non-empty. An empty UnmatchedQueues field implies
