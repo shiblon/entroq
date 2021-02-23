@@ -2,35 +2,22 @@
 package authzopa // import "entrogo.com/entroq/pkg/authzopa"
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/url"
 
 	"entrogo.com/entroq/pkg/authz"
-	"github.com/open-policy-agent/opa/rego"
 )
 
 // OPA is a client-like object for interacting with OPA authorization policies.
 // It adheres to the authz.Authorizer interface.
 type OPA struct {
-	policy Policy
-
+	baseURL       *url.URL
 	allowTestUser bool
 }
-
-// Policy provides the ability to get partial results, suitable for running OPA
-// authorization queries with new input.
-type Policy interface {
-	// PreparedQuery produces a Rego partial result, which has everything ready to go
-	// and is simply awaiting input for eval.
-	PreparedQuery(context.Context) (rego.PreparedEvalQuery, error)
-	// Close cleans up the policy, which might have file watchers and other
-	// resources held open.
-	Close() error
-}
-
-// PolicyLoader can be used to create a policy.
-type PolicyLoader func(context.Context) (Policy, error)
 
 // Option defines a setting for creating an OPA authorizer.
 type Option func(*OPA)
@@ -44,17 +31,16 @@ func WithInsecureTestUser() Option {
 	}
 }
 
-// New creates a new OPA with the given options. A policy loader must be
-// specified so that it can do its work. The OPA value should be closed when no
-// longer in use.
-func New(ctx context.Context, loader PolicyLoader, opts ...Option) (*OPA, error) {
-	p, err := loader(ctx)
+// New creates a new OPA client with the given URL and options.
+// The base URL should contain only the scheme and the host:port, e.g.,
+// http://localhost:9020.
+func New(opaBaseURL string, opts ...Option) (*OPA, error) {
+	u, err := url.Parse(opaBaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("new opa: %w", err)
 	}
-
 	a := &OPA{
-		policy: p,
+		baseURL: u,
 	}
 
 	for _, opt := range opts {
@@ -64,51 +50,49 @@ func New(ctx context.Context, loader PolicyLoader, opts ...Option) (*OPA, error)
 	return a, nil
 }
 
-// Close shuts down policy refresh watchers, and releases OPA resources. Should
-// be called if the OPA does not share a life cycle with the main process.
-func (a *OPA) Close() error {
-	return a.policy.Close()
-}
-
 // Authorize checks for unmatched queues and actions. A nil error means authorized.
 func (a *OPA) Authorize(ctx context.Context, req *authz.Request) error {
 	if !a.allowTestUser && req.Authz.TestUser != "" {
 		return fmt.Errorf("insecure test user present, but not allowed")
 	}
-	prep, err := a.policy.PreparedQuery(ctx)
+
+	fullURL := new(url.URL)
+	*fullURL = *a.baseURL
+	fullURL.Path = "/v1/data/entroq/authz/result"
+
+	body := map[string]*authz.Request{
+		"input": req,
+	}
+
+	b, err := json.Marshal(body)
 	if err != nil {
-		return fmt.Errorf("prepare: %w", err)
+		return fmt.Errorf("authorize: %w", err)
 	}
-	results, err := prep.Eval(ctx, rego.EvalInput(req))
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL.String(), bytes.NewBuffer(b))
 	if err != nil {
-		return fmt.Errorf("authorize opa: %w", err)
+		return fmt.Errorf("authorize: %w", err)
 	}
+	httpReq.Header.Add("Content-Type", "application/json")
 
-	if len(results) == 0 {
-		return fmt.Errorf("empty result")
-	}
-
-	exprs := results[0].Expressions
-
-	if len(exprs) != 1 {
-		return fmt.Errorf("authorize: empty result expression")
-	}
-
-	val := exprs[0].Value.(map[string]interface{})
-
-	// Convert to JSON, so we can create an error if needed.
-	b, err := json.Marshal(val)
+	resp, err := http.DefaultClient.Do(httpReq)
 	if err != nil {
-		return fmt.Errorf("authz response marshal: %v", err)
+		return fmt.Errorf("authorize: %w", err)
+	}
+	defer resp.Body.Close()
+
+	result := map[string]*authz.AuthzError{
+		"result": new(authz.AuthzError),
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("authorize: %w", err)
 	}
 
-	e := new(authz.AuthzError)
-	if err := json.Unmarshal(b, e); err != nil {
-		return fmt.Errorf("authz convert to useful error: %v\njson=%v", err, string(b))
-	}
-
-	if len(e.Failed) != 0 {
+	// Check result value.
+	if e := result["result"]; len(e.Failed) != 0 {
+		// We got an error with information about missing queue/actions.
 		return e
 	}
+
 	return nil
 }
