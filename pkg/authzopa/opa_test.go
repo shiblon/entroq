@@ -30,6 +30,11 @@ func TestCoreRules(t *testing.T) {
 		t.Fatalf("Failed to parse core module: %v", err)
 	}
 
+	extraMod, err := ast.ParseModule("extra-rules.rego", extraRegoTest)
+	if err != nil {
+		t.Fatalf("Failed to parse extra module: %v", err)
+	}
+
 	testMod, err := ast.ParseModule("core-rules_test.rego", coreRegoTest)
 	if err != nil {
 		t.Fatalf("Failed to parse core test module: %v", err)
@@ -39,6 +44,7 @@ func TestCoreRules(t *testing.T) {
 		SetModules(map[string]*ast.Module{
 			"core-rules.rego":      coreMod,
 			"core-rules_test.rego": testMod,
+			"extra-rules.rego":     extraMod,
 		}).
 		EnableFailureLine(true).
 		EnableTracing(true).
@@ -47,7 +53,7 @@ func TestCoreRules(t *testing.T) {
 		t.Fatalf("Error running tests: %v", err)
 	}
 
-	if err := (tester.PrettyReporter{Output: os.Stderr}).Report(rch); err != nil {
+	if err := (tester.PrettyReporter{Output: os.Stderr, Verbose: true}).Report(rch); err != nil {
 		t.Fatalf("Error in test: %v", err)
 	}
 }

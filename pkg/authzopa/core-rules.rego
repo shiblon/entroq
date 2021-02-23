@@ -5,12 +5,6 @@ username = u {
   u != ""
 }
 
-# TODO: get rid of this part.
-username = u {
-  u := input.authz["token"]
-  u != ""
-}
-
 # The user with this username. Rego will error out if there is more than one.
 this_user = u {
   u := data.users[_]
@@ -23,10 +17,12 @@ user_role_names[rn] {
 }
 
 user_role_names[rn] {
+  is_object(this_user)
   rn := this_user.roles[_]
 }
 
 user_queues[qs] {
+  is_object(this_user)
   qs := this_user.queues[_]
 }
 

@@ -10,14 +10,14 @@ test_actions_left {
 test_role_auto_only {
   # Make sure the wildcard is always in the role names
   user_role_names["*"]
-  with input.authz.testuser as "blah"
+  with input.authz as {"testuser": "blah"}
   with data.roles as []
   with data.users as []
 }
 
 test_role_auto_added {
   user_role_names["*"]
-  with input.authz.testuser as "blah"
+  with input.authz as {"testuser": "blah"}
   with data.users as [{
     "name": "blah",
     "roles": ["role1", "role2"]
@@ -26,7 +26,7 @@ test_role_auto_added {
 
 test_role_auto_with_others {
   count(user_role_names) == 3
-  with input.authz.testuser as "blah"
+  with input.authz as {"testuser": "blah"}
   with data.users as [{
     "name": "blah",
     "roles": ["role1", "role2"]
@@ -35,19 +35,23 @@ test_role_auto_with_others {
 
 test_role_auto_with_no_user {
   count(user_role_names) == 1
-  with input.authz.testuser as "blah"
+  with input.authz as {"testuser": "blah"}
   with data.users as []
 }
 
-test_no_user_queues {
-  count(user_queues) == 0
-  with input.authz.testuser as "blah"
+test_only_extra_user_queues {
+  user_queues == {{"prefix": "/ns=user/blah/", "actions": ["ALL"]}}
+  with input.authz as {"testuser": "blah"}
   with data.users as []
 }
 
 test_user_with_queues {
-  count(user_queues) == 2
-  with input.authz.testuser as "blah"
+  user_queues == {
+    {"prefix": "/ns=user/blah/", "actions": ["ALL"]},
+    {"exact": "q1", "actions": ["READ"]},
+    {"exact": "q2", "actions": ["CLAIM"]},
+  }
+  with input.authz as {"testuser": "blah"}
   with data.users as [{
     "name": "blah",
     "queues": [{
@@ -62,8 +66,8 @@ test_user_with_queues {
 }
 
 test_no_matching_user_queues {
-  count(user_queues) == 0
-  with input.authz.testuser as "auser"
+  user_queues == {{"prefix": "/ns=user/auser/", "actions": ["ALL"]}}
+  with input.authz as {"testuser": "auser"}
   with input.queues as [{
     "exact": "aqueue",
     "actions": ["CLAIM"]
@@ -80,7 +84,7 @@ test_no_matching_user_queues {
 
 test_only_match_wildcard_role_queues {
   count(role_queues) == 2
-  with input.authz.testuser as "blah"
+  with input.authz as {"testuser": "blah"}
   with input.queues as [{
     "exact": "/ns=global/inbox",
     "actions": ["CLAIM"]
@@ -101,7 +105,7 @@ test_only_match_wildcard_role_queues {
 
 test_only_match_wildcard_role_queues_single {
   count(role_queues) == 1
-  with input.authz.testuser as "auser"
+  with input.authz as {"testuser": "auser"}
   with input.queues as [{
     "exact": "aqueue",
     "actions": ["CLAIM"]
@@ -121,7 +125,7 @@ test_input_matches_no_queues {
     "exact": "aqueue",
     "actions": {"CLAIM", "DELETE"}
   }}
-  with input.authz.testuser as "auser"
+  with input.authz as {"testuser": "auser"}
   with input.queues as [{
     "exact": "aqueue",
     "actions": ["CLAIM", "DELETE"],
@@ -132,7 +136,7 @@ test_input_matches_no_queues {
 
 test_one_exact_exact_user_match {
   allow
-  with input.authz.testuser as "auser"
+  with input.authz as {"testuser": "auser"}
   with input.queues as [{
     "exact": "/users/auser/inbox",
     "actions": ["CLAIM", "DELETE"],
@@ -151,7 +155,7 @@ test_one_exact_match_missing_actions {
     "exact": "/users/auser/inbox",
     "actions": {"DELETE"}
   }}
-  with input.authz.testuser as "auser"
+  with input.authz as {"testuser": "auser"}
   with input.queues as [{
     "exact": "/users/auser/inbox",
     "actions": ["CLAIM", "DELETE"],
@@ -167,7 +171,7 @@ test_one_exact_match_missing_actions {
 
 test_one_exact_prefix_match {
   allow
-  with input.authz.testuser as "auser"
+  with input.authz as {"testuser": "auser"}
   with input.queues as [{
     "exact": "/users/auser/inbox",
     "actions": ["CLAIM", "DELETE"],
@@ -183,7 +187,7 @@ test_one_exact_prefix_match {
 
 test_one_prefix_prefix_match {
   allow
-  with input.authz.testuser as "auser"
+  with input.authz as {"testuser": "auser"}
   with input.queues as [{
     "prefix": "/users/auser/inbox",
     "actions": ["CLAIM", "DELETE"],
@@ -199,7 +203,7 @@ test_one_prefix_prefix_match {
 
 test_exact_against_multiple_mathches {
   allow
-  with input.authz.testuser as "auser"
+  with input.authz as {"testuser": "auser"}
   with input.queues as [{
     "exact": "/users/auser/inbox",
     "actions": ["CLAIM", "DELETE", "READ"]
@@ -230,7 +234,7 @@ test_exact_against_partial_actions {
     "exact": "/users/auser/inbox",
     "actions": {"CLAIM"}
   }}
-  with input.authz.testuser as "auser"
+  with input.authz as {"testuser": "auser"}
   with input.queues as [{
     "exact": "/users/auser/inbox",
     "actions": ["CLAIM", "DELETE", "READ"]
@@ -254,7 +258,7 @@ test_exact_against_partial_actions {
 
 test_prefix_prefix_match {
   allow
-  with input.authz.testuser as "auser"
+  with input.authz as {"testuser": "auser"}
   with input.queues as [{
     "prefix": "/auser/stuff",
     "actions": ["CLAIM"]
@@ -270,7 +274,7 @@ test_prefix_prefix_match {
 
 test_prefix_prefix_nomatch {
   not allow
-  with input.authz.testuser as "auser"
+  with input.authz as {"testuser": "auser"}
   with input.queues as [{
     "prefix": "/auser/stuff",
     "actions": ["CLAIM"]
