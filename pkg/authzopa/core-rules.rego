@@ -1,9 +1,18 @@
 package entroq.authz
 
-username = input.authz.token # TODO: parse JWT or something, strip "Bearer" off to figure that out.
+username = u {
+  u := input.authz.testuser
+  u != ""
+}
 
-# A set of users with this username.
-this_user[u] {
+# TODO: get rid of this part.
+username = u {
+  u := input.authz["token"]
+  u != ""
+}
+
+# The user with this username. Rego will error out if there is more than one.
+this_user = u {
   u := data.users[_]
   u.name == username
 }
@@ -12,16 +21,18 @@ this_user[u] {
 user_role_names[rn] {
   rn := "*"
 }
+
 user_role_names[rn] {
-  rn := this_user[_].roles[_]
+  rn := this_user.roles[_]
 }
 
-user_queues[q[_]] {
-  q := this_user[_].queues
+user_queues[qs] {
+  qs := this_user.queues[_]
 }
 
-role_queues[r.queues[_]] {
+role_queues[qs] {
   r := data.roles[_]
+  qs := r.queues[_]
   user_role_names[r.name]
 }
 

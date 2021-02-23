@@ -15,6 +15,9 @@ import (
 var (
 	//go:embed core-rules_test.rego
 	coreRegoTest string
+
+	//go:embed extra-rules.rego
+	extraRegoTest string
 )
 
 // TestCoreRules runs the OPA tests found in the file in this directory.
@@ -54,11 +57,13 @@ func TestCoreRules(t *testing.T) {
 // TODO: write this extra module, depend on it in the core files?
 func TestOPA_Authorize_Basic(t *testing.T) {
 	ctx := context.Background()
-	opa, err := New(ctx, ConstantLoader(WithConstantPermissionsYAML(`
+	opa, err := New(ctx, ConstantLoader(
+		WithConstantAdditionalModules(map[string]string{"extra-rules.rego": extraRegoTest}),
+		WithConstantPermissionsYAML(`
 users:
 - name: auser
   queues:
-  - prefix: /ns=users/auser/
+  - prefix: /ns=auser/
     actions:
     - ALL
   - exact: /global/inbox
@@ -83,9 +88,9 @@ roles:
 
 	req, err := authz.NewYAMLRequest(`
 authz:
-  token: "auser"
+  testuser: "auser"
 queues:
-- exact: /ns=users/auser/myinbox
+- exact: /ns=auser/myinbox
   actions:
   - CLAIM
 `)

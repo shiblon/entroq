@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"log"
 
-	yaml "gopkg.in/yaml.v3"
+	yaml "gopkg.in/yaml.v2"
 )
 
 // Action is an authorization-style action that can be requested (and
@@ -49,6 +49,9 @@ type AuthzContext struct {
 	// common header information) of an Authorization HTTP header, including
 	// the type prefix (e.g., "Bearer")
 	Token string `json:"token"`
+
+	// Never use this in practice. This allows the user to be set directly for testing.
+	TestUser string `json:"testuser"`
 }
 
 // QueueSpec contains information about a single queue (it is expected that
