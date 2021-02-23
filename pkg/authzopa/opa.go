@@ -14,6 +14,8 @@ import (
 // It adheres to the authz.Authorizer interface.
 type OPA struct {
 	policy Policy
+
+	allowTestUser bool
 }
 
 // Policy provides the ability to get partial results, suitable for running OPA
@@ -30,18 +32,36 @@ type Policy interface {
 // PolicyLoader can be used to create a policy.
 type PolicyLoader func(context.Context) (Policy, error)
 
+// Option defines a setting for creating an OPA authorizer.
+type Option func(*OPA)
+
+// WithInsecureTestUser must be set when doing testing and the use of the
+// Authz.TestUser (instead of a signed token, for example) is desired. Without
+// this option, the presence of the TestUser field causes an error.
+func WithInsecureTestUser() Option {
+	return func(a *OPA) {
+		a.allowTestUser = true
+	}
+}
+
 // New creates a new OPA with the given options. A policy loader must be
 // specified so that it can do its work. The OPA value should be closed when no
 // longer in use.
-func New(ctx context.Context, loader PolicyLoader) (*OPA, error) {
+func New(ctx context.Context, loader PolicyLoader, opts ...Option) (*OPA, error) {
 	p, err := loader(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("new opa: %w", err)
 	}
 
-	return &OPA{
+	a := &OPA{
 		policy: p,
-	}, nil
+	}
+
+	for _, opt := range opts {
+		opt(a)
+	}
+
+	return a, nil
 }
 
 // Close shuts down policy refresh watchers, and releases OPA resources. Should
@@ -52,6 +72,9 @@ func (a *OPA) Close() error {
 
 // Authorize checks for unmatched queues and actions. A nil error means authorized.
 func (a *OPA) Authorize(ctx context.Context, req *authz.Request) error {
+	if !a.allowTestUser && req.Authz.TestUser != "" {
+		return fmt.Errorf("insecure test user present, but not allowed")
+	}
 	prep, err := a.policy.PreparedQuery(ctx)
 	if err != nil {
 		return fmt.Errorf("prepare: %w", err)

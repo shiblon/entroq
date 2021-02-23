@@ -13,11 +13,12 @@ import (
 	_ "embed"
 )
 
-const CoreModuleName = "entroq.authz"
-
 var (
 	//go:embed core-rules.rego
 	coreRego string
+
+	//go:embed queues.rego
+	queuesRego string
 )
 
 // Constant creates OPA mechanisms from constant string values (rules + data) that never change.
@@ -74,9 +75,6 @@ func WithConstantPermissionsYAML(y string) ConstantOption {
 func WithConstantAdditionalModules(modules map[string]string) ConstantOption {
 	return func(p *Constant) error {
 		for k, v := range modules {
-			if k == CoreModuleName {
-				return fmt.Errorf("refusing to override core module %q", CoreModuleName)
-			}
 			p.modules[k] = v
 		}
 		return nil
@@ -87,7 +85,8 @@ func WithConstantAdditionalModules(modules map[string]string) ConstantOption {
 func NewConstant(ctx context.Context, opts ...ConstantOption) (*Constant, error) {
 	cp := &Constant{
 		modules: map[string]string{
-			CoreModuleName: coreRego,
+			"core-rules.rego": coreRego,
+			"queues.rego":     queuesRego,
 		},
 	}
 
