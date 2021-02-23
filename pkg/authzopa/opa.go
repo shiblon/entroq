@@ -20,31 +20,41 @@ type OPA struct {
 }
 
 // Option defines a setting for creating an OPA authorizer.
-type Option func(*OPA)
+type Option func(*OPA) error
 
 // WithInsecureTestUser must be set when doing testing and the use of the
 // Authz.TestUser (instead of a signed token, for example) is desired. Without
 // this option, the presence of the TestUser field causes an error.
 func WithInsecureTestUser() Option {
-	return func(a *OPA) {
+	return func(a *OPA) error {
 		a.allowTestUser = true
+		return nil
 	}
 }
 
-// New creates a new OPA client with the given URL and options.
-// The base URL should contain only the scheme and the host:port, e.g.,
-// http://localhost:9020.
-func New(opaBaseURL string, opts ...Option) (*OPA, error) {
-	u, err := url.Parse(opaBaseURL)
-	if err != nil {
-		return nil, fmt.Errorf("new opa: %w", err)
+// WithBaseURL sets the OPA base URL (scheme, host, port) to which v1 queries
+// should go, e.g., http://localhost:9020.
+func WithBaseURL(u string) Option {
+	return func(a *OPA) error {
+		var err error
+		if a.baseURL, err = url.Parse(u); err != nil {
+			return fmt.Errorf("set base URL: %w", err)
+		}
+		return nil
 	}
-	a := &OPA{
-		baseURL: u,
+}
+
+// New creates a new OPA client with the given options.
+func New(opts ...Option) (*OPA, error) {
+	a := new(OPA)
+	for _, opt := range opts {
+		if err := opt(a); err != nil {
+			return nil, fmt.Errorf("new opa: %w", err)
+		}
 	}
 
-	for _, opt := range opts {
-		opt(a)
+	if a.baseURL == nil {
+		return nil, fmt.Errorf("new opa has no base URL")
 	}
 
 	return a, nil
