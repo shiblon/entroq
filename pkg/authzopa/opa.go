@@ -61,6 +61,10 @@ func (a *OPA) Authorize(ctx context.Context, req *authz.Request) error {
 		return fmt.Errorf("authorize opa: %w", err)
 	}
 
+	if len(results) == 0 {
+		return fmt.Errorf("empty result")
+	}
+
 	exprs := results[0].Expressions
 
 	if len(exprs) != 1 {
