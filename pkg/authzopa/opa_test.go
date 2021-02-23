@@ -2,6 +2,7 @@ package authzopa
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 
@@ -18,34 +19,42 @@ var (
 
 	//go:embed extra-rules.rego
 	extraRegoTest string
+
+	//go:embed queues_test.rego
+	queuesRegoTest string
 )
+
+func parseModules(modules map[string]string) (map[string]*ast.Module, error) {
+	result := make(map[string]*ast.Module)
+
+	for k, v := range modules {
+		m, err := ast.ParseModule(k, v)
+		if err != nil {
+			return nil, fmt.Errorf("parse module: %w", err)
+		}
+		result[k] = m
+	}
+	return result, nil
+}
 
 // TestCoreRules runs the OPA tests found in the file in this directory.
 // These are the right way to test OPA in the raw.
 func TestCoreRules(t *testing.T) {
 	ctx := context.Background()
 
-	coreMod, err := ast.ParseModule("core-rules.rego", coreRego)
+	mods, err := parseModules(map[string]string{
+		"core-rules.rego":      coreRego,
+		"extra-rules.rego":     extraRegoTest,
+		"queues.rego":          queuesRego,
+		"core-rules_test.rego": coreRegoTest,
+		"queues_test.rego":     queuesRegoTest,
+	})
 	if err != nil {
-		t.Fatalf("Failed to parse core module: %v", err)
-	}
-
-	extraMod, err := ast.ParseModule("extra-rules.rego", extraRegoTest)
-	if err != nil {
-		t.Fatalf("Failed to parse extra module: %v", err)
-	}
-
-	testMod, err := ast.ParseModule("core-rules_test.rego", coreRegoTest)
-	if err != nil {
-		t.Fatalf("Failed to parse core test module: %v", err)
+		t.Fatalf("Failed to parse test modules: %v", err)
 	}
 
 	rch, err := tester.NewRunner().
-		SetModules(map[string]*ast.Module{
-			"core-rules.rego":      coreMod,
-			"core-rules_test.rego": testMod,
-			"extra-rules.rego":     extraMod,
-		}).
+		SetModules(mods).
 		EnableFailureLine(true).
 		EnableTracing(true).
 		RunTests(ctx, nil)
@@ -63,7 +72,7 @@ func TestCoreRules(t *testing.T) {
 // TODO: write this extra module, depend on it in the core files?
 func TestOPA_Authorize_Basic(t *testing.T) {
 	ctx := context.Background()
-	opa, err := New(ctx, ConstantLoader(
+	loader := ConstantLoader(
 		WithConstantAdditionalModules(map[string]string{"extra-rules.rego": extraRegoTest}),
 		WithConstantPermissionsYAML(`
 users:
@@ -86,7 +95,8 @@ roles:
   - prefix: ""
     actions:
     - ALL
-`)))
+`))
+	opa, err := New(ctx, loader, WithInsecureTestUser())
 	if err != nil {
 		t.Fatalf("Error creating constant policy: %v", err)
 	}

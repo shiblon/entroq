@@ -1,44 +1,5 @@
 package entroq.authz
 
-test_actions_left {
-  actions_left({"CLAIM"}, {"READ"}) == {"CLAIM"}
-  actions_left({"CLAIM"}, {"ALL"}) == set()
-  actions_left({"ALL"}, {"CLAIM"}) == {"ALL"} # Should never happen - user never requests "ALL".
-  actions_left({"CLAIM"}, {"CLAIM", "DEPEND", "READ"}) == set()
-}
-
-test_role_auto_only {
-  # Make sure the wildcard is always in the role names
-  user_role_names["*"]
-  with input.authz as {"testuser": "blah"}
-  with data.roles as []
-  with data.users as []
-}
-
-test_role_auto_added {
-  user_role_names["*"]
-  with input.authz as {"testuser": "blah"}
-  with data.users as [{
-    "name": "blah",
-    "roles": ["role1", "role2"]
-  }]
-}
-
-test_role_auto_with_others {
-  count(user_role_names) == 3
-  with input.authz as {"testuser": "blah"}
-  with data.users as [{
-    "name": "blah",
-    "roles": ["role1", "role2"]
-  }]
-}
-
-test_role_auto_with_no_user {
-  count(user_role_names) == 1
-  with input.authz as {"testuser": "blah"}
-  with data.users as []
-}
-
 test_only_extra_user_queues {
   user_queues == {{"prefix": "/ns=user/blah/", "actions": ["ALL"]}}
   with input.authz as {"testuser": "blah"}
