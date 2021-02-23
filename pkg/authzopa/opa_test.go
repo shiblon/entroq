@@ -13,7 +13,7 @@ import (
 )
 
 var (
-	//go:embed *.rego
+	//go:embed regodata/*.rego
 	regoContent embed.FS
 )
 
@@ -42,9 +42,8 @@ func parseModules() (map[string]*ast.Module, error) {
 	return result, nil
 }
 
-// TestCoreRules runs the OPA tests found in the file in this directory.
-// These are the right way to test OPA in the raw.
-func TestCoreRules(t *testing.T) {
+// TestRego runs the OPA tests found in the rego files under this package.
+func TestRego(t *testing.T) {
 	ctx := context.Background()
 
 	mods, err := parseModules()
