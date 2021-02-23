@@ -29,7 +29,7 @@ failed_queues[q] {
   q := queues.disallowed(input.queues, allowed_queues)[_]
 }
 
-authz_result := {
+queues_result := {
   "user": username,
   "failed": failed_queues
 }
