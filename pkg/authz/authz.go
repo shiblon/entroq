@@ -38,7 +38,7 @@ const (
 	Change Action = "CHANGE"
 	Insert Action = "INSERT"
 	Read   Action = "READ"
-	All    Action = "ALL"
+	All    Action = "*"
 )
 
 // Request conatins an authorization request to send to OPA.
