@@ -35,12 +35,10 @@ package qsvc // import "entrogo.com/entroq/qsvc"
 import (
 	"context"
 	"log"
-	"strings"
 	"time"
 
 	"entrogo.com/entroq"
 	"entrogo.com/entroq/pkg/authz"
-	"entrogo.com/entroq/pkg/authzopa"
 	"github.com/golang/protobuf/proto"
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
@@ -79,7 +77,7 @@ type QSvc struct {
 	metricInterval  time.Duration
 
 	authzHeader string
-	authzOPA    *authzopa.OPA
+	az          authz.Authorizer
 }
 
 // Option allows QSvc creation options to be defined.
@@ -104,10 +102,10 @@ func WithAuthorizationHeader(h string) Option {
 	}
 }
 
-// WithOPA sets the OPA implementation for use in authorization of requests.
-func WithOPA(opa *authzopa.OPA) Option {
+// WithAUthorizer sets the authorization implementation.
+func WithAuthorizer(az authz.Authorizer) Option {
 	return func(s *QSvc) {
-		s.authzOPA = opa
+		s.az = az
 	}
 }
 
@@ -156,14 +154,13 @@ func (s *QSvc) Close() error {
 	return errors.Wrap(s.impl.Close(), "qsvc close")
 }
 
-// Authorize attempts to authorize an action. It sends a POST request to the
-// OPA service, if specified, and returns the resulting error, if not authorized.
+// Authorize attempts to authorize an action.
 func (s *QSvc) Authorize(ctx context.Context, req *authz.Request) error {
-	if s.authzOPA == nil {
-		return nil // Empty disallowed_queues means "go ahead".
+	if s.az == nil {
+		return nil
 	}
 
-	return s.authzOPA.Authorize(ctx, req)
+	return s.az.Authorize(ctx, req)
 }
 
 // RefreshMetrics collects stats and exports them as prometheus metrics.
@@ -241,18 +238,9 @@ func (s *QSvc) authzToken(ctx context.Context) string {
 }
 
 func (s *QSvc) newAuthzRequest(ctx context.Context) *authz.Request {
-	pieces := strings.SplitN(s.authzToken(ctx), " ", 2)
-	var authType, authCreds string
-	switch len(pieces) {
-	case 1:
-		authCreds = pieces[0]
-	case 2:
-		authType, authCreds = pieces[0], pieces[1]
+	return &authz.Request{
+		Authz: authz.NewHeaderAuthorization(s.authzToken(ctx)),
 	}
-	return &authz.Request{Authz: &authz.AuthzContext{
-		Type:        authType,
-		Credentials: authCreds,
-	}}
 }
 
 func (s *QSvc) claimAuthz(ctx context.Context, req *pb.ClaimRequest) *authz.Request {

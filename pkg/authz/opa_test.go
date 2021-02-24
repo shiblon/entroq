@@ -1,4 +1,4 @@
-package authzopa
+package authz
 
 import (
 	"context"
@@ -15,7 +15,7 @@ import (
 )
 
 var (
-	//go:embed regodata
+	//go:embed opadata
 	regoFS embed.FS
 )
 

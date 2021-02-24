@@ -4,9 +4,29 @@ package authz // import "entrogo.com/entroq/pkg/authz"
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	yaml "gopkg.in/yaml.v2"
 )
+
+// Authorizer is an abstraction over Rego policy. Provide one of these to
+// manage policy files and changes. The query is expected to return a nil error
+// when authorized, and a non-nil error when not authorized (or smoething else
+// goes wrong). If the non-nil error is an AuthzError, it can be unpacked for
+// information about which queues and actions were disallowed.
+type Authorizer interface {
+	// Authorize sends a request with context to see if something is allowed.
+	// The request contains information about the entity making the request and
+	// a nil error indicates that the request is permitted. A non-nil error can
+	// be returned for system errors, or for permission denied reasons. The
+	// latter will be of type AuthzError and can be detected in standard
+	// errors.Is/As ways..
+	Authorize(context.Context, *Request) error
+
+	// Close cleans up any resources, or policy watchdogs, that the authorizer
+	// might need in order to do its work.
+	Close() error
+}
 
 // Action is an authorization-style action that can be requested (and
 // allowed or denied) for a particular queue spec.
@@ -24,7 +44,7 @@ const (
 // Request conatins an authorization request to send to OPA.
 type Request struct {
 	// Authz contains information that came in with the request (headers).
-	Authz *AuthzContext `json:"authz"`
+	Authz *Authorization `json:"authz"`
 	// Queues contains information about what is desired: what queues to
 	// operate on, and what should be done to them.
 	Queues []*Queue `json:"queues"`
@@ -39,10 +59,10 @@ func NewYAMLRequest(y string) (*Request, error) {
 	return req, nil
 }
 
-// AuthzContext represents per-request authz information. It can ideally come in many
+// AUthorization represents per-request authz information. It can ideally come in many
 // forms. The first supported form is a "token", such as from an Authorization
 // header.
-type AuthzContext struct {
+type Authorization struct {
 	// An HTTP Authorization header is split into its type and credentials and
 	// included here when available.
 	Type        string `json:"type"`
@@ -54,14 +74,32 @@ type AuthzContext struct {
 	TestUser string `json:"testuser"`
 }
 
+// NewHeaderAuthorization creates an authorization structure from a header value.
+func NewHeaderAuthorization(val string) *Authorization {
+	pieces := strings.SplitN(val, " ", 2)
+	az := new(Authorization)
+	switch len(pieces) {
+	case 1:
+		az.Credentials = pieces[0]
+	case 2:
+		az.Type, az.Credentials = pieces[0], pieces[1]
+	}
+	return az
+}
+
+// String returns the authoriation header value.
+func (a *Authorization) String() string {
+	return strings.TrimSpace(strings.Join([]string{a.Type, a.Credentials}, " "))
+}
+
 // Queue contains information about a single queue (it is expected that
 // only one match string will be specified. Behavior of multiple specifications
 // is not necessarily well defined, and depends on policy execution order.
 type Queue struct {
-	// Exact match queue string.
-	Exact string `yaml:",omitempty" json:"exact,omitempty"`
-	// Prefix match queue string.
-	Prefix string `yaml:",omitempty" json:"prefix,omitempty"`
+	// An exact name to match.
+	Exact string `yaml: ",omitempty" json:"exact,omitempty"`
+	// The kind of matching to do (default exact)
+	Prefix string `yaml: ",omitempty" json:"prefix,omitempty"`
 	// Actions contains the desired things to be done with this queue.
 	Actions []Action `yaml:",flow" json:"actions"`
 }
@@ -85,23 +123,4 @@ func (e *AuthzError) Error() string {
 		return fmt.Sprintf("user %q not authorized, failed to get data with reasons: %v", e.User, err)
 	}
 	return fmt.Sprintf("user %q not authorized, missing queue/actions:\n%s", e.User, string(y))
-}
-
-// Authorizer is an abstraction over Rego policy. Provide one of these to
-// manage policy files and changes. The query is expected to return a nil error
-// when authorized, and a non-nil error when not authorized (or smoething else
-// goes wrong). If the non-nil error is an AuthzError, it can be unpacked for
-// information about which queues and actions were disallowed.
-type Authorizer interface {
-	// Authorize sends a request with context to see if something is allowed.
-	// The request contains information about the entity making the request and
-	// a nil error indicates that the request is permitted. A non-nil error can
-	// be returned for system errors, or for permission denied reasons. The
-	// latter will be of type AuthzError and can be detected in standard
-	// errors.Is/As ways..
-	Authorize(context.Context, *Request) error
-
-	// Close cleans up any resources, or policy watchdogs, that the authorizer
-	// might need in order to do its work.
-	Close() error
 }
