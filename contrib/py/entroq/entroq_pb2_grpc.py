@@ -52,7 +52,7 @@ class EntroQStub(object):
     self.StreamTasks = channel.unary_stream(
         '/proto.EntroQ/StreamTasks',
         request_serializer=entroq__pb2.TasksRequest.SerializeToString,
-        response_deserializer=entroq__pb2.Task.FromString,
+        response_deserializer=entroq__pb2.TasksResponse.FromString,
         )
 
 
@@ -110,8 +110,10 @@ class EntroQServicer(object):
     raise NotImplementedError('Method not implemented!')
 
   def StreamTasks(self, request, context):
-    # missing associated documentation comment in .proto file
-    pass
+    """This is set to stream TasksResponse instead of just sending all tasks in a
+    single one. Typically this will have one task per response, but it is best
+    for the client to consume however many there are.
+    """
     context.set_code(grpc.StatusCode.UNIMPLEMENTED)
     context.set_details('Method not implemented!')
     raise NotImplementedError('Method not implemented!')
@@ -157,7 +159,7 @@ def add_EntroQServicer_to_server(servicer, server):
       'StreamTasks': grpc.unary_stream_rpc_method_handler(
           servicer.StreamTasks,
           request_deserializer=entroq__pb2.TasksRequest.FromString,
-          response_serializer=entroq__pb2.Task.SerializeToString,
+          response_serializer=entroq__pb2.TasksResponse.SerializeToString,
       ),
   }
   generic_handler = grpc.method_handlers_generic_handler(

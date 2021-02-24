@@ -20,8 +20,8 @@ DESCRIPTOR = _descriptor.FileDescriptor(
   name='entroq.proto',
   package='proto',
   syntax='proto3',
-  serialized_options=None,
-  serialized_pb=_b('\n\x0c\x65ntroq.proto\x12\x05proto\"%\n\x06TaskID\x12\n\n\x02id\x18\x01 \x01(\t\x12\x0f\n\x07version\x18\x02 \x01(\x05\"C\n\x08TaskData\x12\r\n\x05queue\x18\x01 \x01(\t\x12\r\n\x05\x61t_ms\x18\x02 \x01(\x03\x12\r\n\x05value\x18\x03 \x01(\x0c\x12\n\n\x02id\x18\x04 \x01(\t\"N\n\nTaskChange\x12\x1d\n\x06old_id\x18\x01 \x01(\x0b\x32\r.proto.TaskID\x12!\n\x08new_data\x18\x02 \x01(\x0b\x32\x0f.proto.TaskData\"\x9e\x01\n\x04Task\x12\r\n\x05queue\x18\x01 \x01(\t\x12\n\n\x02id\x18\x02 \x01(\t\x12\x0f\n\x07version\x18\x03 \x01(\x05\x12\r\n\x05\x61t_ms\x18\x04 \x01(\x03\x12\x13\n\x0b\x63laimant_id\x18\x05 \x01(\t\x12\r\n\x05value\x18\x06 \x01(\x0c\x12\x12\n\ncreated_ms\x18\x07 \x01(\x03\x12\x13\n\x0bmodified_ms\x18\x08 \x01(\x03\x12\x0e\n\x06\x63laims\x18\t \x01(\x05\"Y\n\nQueueStats\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x11\n\tnum_tasks\x18\x02 \x01(\x05\x12\x13\n\x0bnum_claimed\x18\x03 \x01(\x05\x12\x15\n\rnum_available\x18\x04 \x01(\x05\"Y\n\x0c\x43laimRequest\x12\x13\n\x0b\x63laimant_id\x18\x01 \x01(\t\x12\x0e\n\x06queues\x18\x02 \x03(\t\x12\x13\n\x0b\x64uration_ms\x18\x03 \x01(\x03\x12\x0f\n\x07poll_ms\x18\x04 \x01(\x03\"*\n\rClaimResponse\x12\x19\n\x04task\x18\x01 \x01(\x0b\x32\x0b.proto.Task\"\xaa\x01\n\rModifyRequest\x12\x13\n\x0b\x63laimant_id\x18\x01 \x01(\t\x12 \n\x07inserts\x18\x02 \x03(\x0b\x32\x0f.proto.TaskData\x12\"\n\x07\x63hanges\x18\x03 \x03(\x0b\x32\x11.proto.TaskChange\x12\x1e\n\x07\x64\x65letes\x18\x04 \x03(\x0b\x32\r.proto.TaskID\x12\x1e\n\x07\x64\x65pends\x18\x05 \x03(\x0b\x32\r.proto.TaskID\"M\n\x0eModifyResponse\x12\x1d\n\x08inserted\x18\x01 \x03(\x0b\x32\x0b.proto.Task\x12\x1c\n\x07\x63hanged\x18\x02 \x03(\x0b\x32\x0b.proto.Task\"Q\n\tModifyDep\x12\x1c\n\x04type\x18\x01 \x01(\x0e\x32\x0e.proto.DepType\x12\x19\n\x02id\x18\x02 \x01(\x0b\x32\r.proto.TaskID\x12\x0b\n\x03msg\x18\x03 \x01(\t\"g\n\x0cTasksRequest\x12\x13\n\x0b\x63laimant_id\x18\x01 \x01(\t\x12\r\n\x05queue\x18\x02 \x01(\t\x12\r\n\x05limit\x18\x03 \x01(\x05\x12\x0f\n\x07task_id\x18\x04 \x03(\t\x12\x13\n\x0bomit_values\x18\x05 \x01(\x08\"+\n\rTasksResponse\x12\x1a\n\x05tasks\x18\x01 \x03(\x0b\x32\x0b.proto.Task\"I\n\rQueuesRequest\x12\x14\n\x0cmatch_prefix\x18\x01 \x03(\t\x12\x13\n\x0bmatch_exact\x18\x02 \x03(\t\x12\r\n\x05limit\x18\x03 \x01(\x05\"3\n\x0eQueuesResponse\x12!\n\x06queues\x18\x01 \x03(\x0b\x32\x11.proto.QueueStats\"\r\n\x0bTimeRequest\"\x1f\n\x0cTimeResponse\x12\x0f\n\x07time_ms\x18\x01 \x01(\x03*P\n\x07\x44\x65pType\x12\t\n\x05\x43LAIM\x10\x00\x12\n\n\x06\x44\x45LETE\x10\x01\x12\n\n\x06\x43HANGE\x10\x02\x12\n\n\x06\x44\x45PEND\x10\x03\x12\n\n\x06\x44\x45TAIL\x10\x04\x12\n\n\x06INSERT\x10\x05\x32\xb4\x03\n\x06\x45ntroQ\x12\x35\n\x08TryClaim\x12\x13.proto.ClaimRequest\x1a\x14.proto.ClaimResponse\x12\x32\n\x05\x43laim\x12\x13.proto.ClaimRequest\x1a\x14.proto.ClaimResponse\x12\x35\n\x06Modify\x12\x14.proto.ModifyRequest\x1a\x15.proto.ModifyResponse\x12\x32\n\x05Tasks\x12\x13.proto.TasksRequest\x1a\x14.proto.TasksResponse\x12\x35\n\x06Queues\x12\x14.proto.QueuesRequest\x1a\x15.proto.QueuesResponse\x12\x39\n\nQueueStats\x12\x14.proto.QueuesRequest\x1a\x15.proto.QueuesResponse\x12/\n\x04Time\x12\x12.proto.TimeRequest\x1a\x13.proto.TimeResponse\x12\x31\n\x0bStreamTasks\x12\x13.proto.TasksRequest\x1a\x0b.proto.Task0\x01\x62\x06proto3')
+  serialized_options=_b('Z\007.;proto'),
+  serialized_pb=_b('\n\x0c\x65ntroq.proto\x12\x05proto\"4\n\x06TaskID\x12\n\n\x02id\x18\x01 \x01(\t\x12\x0f\n\x07version\x18\x02 \x01(\x05\x12\r\n\x05queue\x18\x03 \x01(\t\"C\n\x08TaskData\x12\r\n\x05queue\x18\x01 \x01(\t\x12\r\n\x05\x61t_ms\x18\x02 \x01(\x03\x12\r\n\x05value\x18\x03 \x01(\x0c\x12\n\n\x02id\x18\x04 \x01(\t\"N\n\nTaskChange\x12\x1d\n\x06old_id\x18\x01 \x01(\x0b\x32\r.proto.TaskID\x12!\n\x08new_data\x18\x02 \x01(\x0b\x32\x0f.proto.TaskData\"\x9e\x01\n\x04Task\x12\r\n\x05queue\x18\x01 \x01(\t\x12\n\n\x02id\x18\x02 \x01(\t\x12\x0f\n\x07version\x18\x03 \x01(\x05\x12\r\n\x05\x61t_ms\x18\x04 \x01(\x03\x12\x13\n\x0b\x63laimant_id\x18\x05 \x01(\t\x12\r\n\x05value\x18\x06 \x01(\x0c\x12\x12\n\ncreated_ms\x18\x07 \x01(\x03\x12\x13\n\x0bmodified_ms\x18\x08 \x01(\x03\x12\x0e\n\x06\x63laims\x18\t \x01(\x05\"m\n\nQueueStats\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x11\n\tnum_tasks\x18\x02 \x01(\x05\x12\x13\n\x0bnum_claimed\x18\x03 \x01(\x05\x12\x15\n\rnum_available\x18\x04 \x01(\x05\x12\x12\n\nmax_claims\x18\x05 \x01(\x05\"Y\n\x0c\x43laimRequest\x12\x13\n\x0b\x63laimant_id\x18\x01 \x01(\t\x12\x0e\n\x06queues\x18\x02 \x03(\t\x12\x13\n\x0b\x64uration_ms\x18\x03 \x01(\x03\x12\x0f\n\x07poll_ms\x18\x04 \x01(\x03\"*\n\rClaimResponse\x12\x19\n\x04task\x18\x01 \x01(\x0b\x32\x0b.proto.Task\"\xaa\x01\n\rModifyRequest\x12\x13\n\x0b\x63laimant_id\x18\x01 \x01(\t\x12 \n\x07inserts\x18\x02 \x03(\x0b\x32\x0f.proto.TaskData\x12\"\n\x07\x63hanges\x18\x03 \x03(\x0b\x32\x11.proto.TaskChange\x12\x1e\n\x07\x64\x65letes\x18\x04 \x03(\x0b\x32\r.proto.TaskID\x12\x1e\n\x07\x64\x65pends\x18\x05 \x03(\x0b\x32\r.proto.TaskID\"M\n\x0eModifyResponse\x12\x1d\n\x08inserted\x18\x01 \x03(\x0b\x32\x0b.proto.Task\x12\x1c\n\x07\x63hanged\x18\x02 \x03(\x0b\x32\x0b.proto.Task\"Q\n\tModifyDep\x12\x1c\n\x04type\x18\x01 \x01(\x0e\x32\x0e.proto.DepType\x12\x19\n\x02id\x18\x02 \x01(\x0b\x32\r.proto.TaskID\x12\x0b\n\x03msg\x18\x03 \x01(\t\"g\n\x0cTasksRequest\x12\x13\n\x0b\x63laimant_id\x18\x01 \x01(\t\x12\r\n\x05queue\x18\x02 \x01(\t\x12\r\n\x05limit\x18\x03 \x01(\x05\x12\x0f\n\x07task_id\x18\x04 \x03(\t\x12\x13\n\x0bomit_values\x18\x05 \x01(\x08\"+\n\rTasksResponse\x12\x1a\n\x05tasks\x18\x01 \x03(\x0b\x32\x0b.proto.Task\"I\n\rQueuesRequest\x12\x14\n\x0cmatch_prefix\x18\x01 \x03(\t\x12\x13\n\x0bmatch_exact\x18\x02 \x03(\t\x12\r\n\x05limit\x18\x03 \x01(\x05\"3\n\x0eQueuesResponse\x12!\n\x06queues\x18\x01 \x03(\x0b\x32\x11.proto.QueueStats\"\r\n\x0bTimeRequest\"\x1f\n\x0cTimeResponse\x12\x0f\n\x07time_ms\x18\x01 \x01(\x03*P\n\x07\x44\x65pType\x12\t\n\x05\x43LAIM\x10\x00\x12\n\n\x06\x44\x45LETE\x10\x01\x12\n\n\x06\x43HANGE\x10\x02\x12\n\n\x06\x44\x45PEND\x10\x03\x12\n\n\x06\x44\x45TAIL\x10\x04\x12\n\n\x06INSERT\x10\x05\x32\xbd\x03\n\x06\x45ntroQ\x12\x35\n\x08TryClaim\x12\x13.proto.ClaimRequest\x1a\x14.proto.ClaimResponse\x12\x32\n\x05\x43laim\x12\x13.proto.ClaimRequest\x1a\x14.proto.ClaimResponse\x12\x35\n\x06Modify\x12\x14.proto.ModifyRequest\x1a\x15.proto.ModifyResponse\x12\x32\n\x05Tasks\x12\x13.proto.TasksRequest\x1a\x14.proto.TasksResponse\x12\x35\n\x06Queues\x12\x14.proto.QueuesRequest\x1a\x15.proto.QueuesResponse\x12\x39\n\nQueueStats\x12\x14.proto.QueuesRequest\x1a\x15.proto.QueuesResponse\x12/\n\x04Time\x12\x12.proto.TimeRequest\x1a\x13.proto.TimeResponse\x12:\n\x0bStreamTasks\x12\x13.proto.TasksRequest\x1a\x14.proto.TasksResponse0\x01\x42\tZ\x07.;protob\x06proto3')
 )
 
 _DEPTYPE = _descriptor.EnumDescriptor(
@@ -57,8 +57,8 @@ _DEPTYPE = _descriptor.EnumDescriptor(
   ],
   containing_type=None,
   serialized_options=None,
-  serialized_start=1259,
-  serialized_end=1339,
+  serialized_start=1294,
+  serialized_end=1374,
 )
 _sym_db.RegisterEnumDescriptor(_DEPTYPE)
 
@@ -93,6 +93,13 @@ _TASKID = _descriptor.Descriptor(
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='queue', full_name='proto.TaskID.queue', index=2,
+      number=3, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=_b("").decode('utf-8'),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
   ],
   extensions=[
   ],
@@ -106,7 +113,7 @@ _TASKID = _descriptor.Descriptor(
   oneofs=[
   ],
   serialized_start=23,
-  serialized_end=60,
+  serialized_end=75,
 )
 
 
@@ -157,8 +164,8 @@ _TASKDATA = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=62,
-  serialized_end=129,
+  serialized_start=77,
+  serialized_end=144,
 )
 
 
@@ -195,8 +202,8 @@ _TASKCHANGE = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=131,
-  serialized_end=209,
+  serialized_start=146,
+  serialized_end=224,
 )
 
 
@@ -282,8 +289,8 @@ _TASK = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=212,
-  serialized_end=370,
+  serialized_start=227,
+  serialized_end=385,
 )
 
 
@@ -322,6 +329,13 @@ _QUEUESTATS = _descriptor.Descriptor(
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='max_claims', full_name='proto.QueueStats.max_claims', index=4,
+      number=5, type=5, cpp_type=1, label=1,
+      has_default_value=False, default_value=0,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
   ],
   extensions=[
   ],
@@ -334,8 +348,8 @@ _QUEUESTATS = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=372,
-  serialized_end=461,
+  serialized_start=387,
+  serialized_end=496,
 )
 
 
@@ -386,8 +400,8 @@ _CLAIMREQUEST = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=463,
-  serialized_end=552,
+  serialized_start=498,
+  serialized_end=587,
 )
 
 
@@ -417,8 +431,8 @@ _CLAIMRESPONSE = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=554,
-  serialized_end=596,
+  serialized_start=589,
+  serialized_end=631,
 )
 
 
@@ -476,8 +490,8 @@ _MODIFYREQUEST = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=599,
-  serialized_end=769,
+  serialized_start=634,
+  serialized_end=804,
 )
 
 
@@ -514,8 +528,8 @@ _MODIFYRESPONSE = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=771,
-  serialized_end=848,
+  serialized_start=806,
+  serialized_end=883,
 )
 
 
@@ -559,8 +573,8 @@ _MODIFYDEP = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=850,
-  serialized_end=931,
+  serialized_start=885,
+  serialized_end=966,
 )
 
 
@@ -618,8 +632,8 @@ _TASKSREQUEST = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=933,
-  serialized_end=1036,
+  serialized_start=968,
+  serialized_end=1071,
 )
 
 
@@ -649,8 +663,8 @@ _TASKSRESPONSE = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=1038,
-  serialized_end=1081,
+  serialized_start=1073,
+  serialized_end=1116,
 )
 
 
@@ -694,8 +708,8 @@ _QUEUESREQUEST = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=1083,
-  serialized_end=1156,
+  serialized_start=1118,
+  serialized_end=1191,
 )
 
 
@@ -725,8 +739,8 @@ _QUEUESRESPONSE = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=1158,
-  serialized_end=1209,
+  serialized_start=1193,
+  serialized_end=1244,
 )
 
 
@@ -749,8 +763,8 @@ _TIMEREQUEST = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=1211,
-  serialized_end=1224,
+  serialized_start=1246,
+  serialized_end=1259,
 )
 
 
@@ -780,8 +794,8 @@ _TIMERESPONSE = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=1226,
-  serialized_end=1257,
+  serialized_start=1261,
+  serialized_end=1292,
 )
 
 _TASKCHANGE.fields_by_name['old_id'].message_type = _TASKID
@@ -929,6 +943,7 @@ TimeResponse = _reflection.GeneratedProtocolMessageType('TimeResponse', (_messag
 _sym_db.RegisterMessage(TimeResponse)
 
 
+DESCRIPTOR._options = None
 
 _ENTROQ = _descriptor.ServiceDescriptor(
   name='EntroQ',
@@ -936,8 +951,8 @@ _ENTROQ = _descriptor.ServiceDescriptor(
   file=DESCRIPTOR,
   index=0,
   serialized_options=None,
-  serialized_start=1342,
-  serialized_end=1778,
+  serialized_start=1377,
+  serialized_end=1822,
   methods=[
   _descriptor.MethodDescriptor(
     name='TryClaim',
@@ -1008,7 +1023,7 @@ _ENTROQ = _descriptor.ServiceDescriptor(
     index=7,
     containing_service=None,
     input_type=_TASKSREQUEST,
-    output_type=_TASK,
+    output_type=_TASKSRESPONSE,
     serialized_options=None,
   ),
 ])
