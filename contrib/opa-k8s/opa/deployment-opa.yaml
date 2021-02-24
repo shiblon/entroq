@@ -1,0 +1,39 @@
+apiVersion: app/v1
+kind: Deployment
+metadata:
+  name: opa
+  labels:
+    app: opa
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+        - image: openpolicyagent/opa:v0.26.0
+          ports:
+            - name: rest
+              protocol: TCP
+              port: 8181
+          args:
+            - "--addr=:8181"
+            - "--server"
+            - "--watch"
+            - "--set-file=data=/etc/opa/data/opa-data.yaml"
+            - "--bunde=/etc/opa/packages/"
+          volumeMounts:
+            - name: core-packages
+              mountPath: /etc/opa/packages/core
+              readOnly: true
+            - name: policy-data
+              mountPath: /etc/opa/data
+              readOnly: true
+      volumes:
+        - name: example-packages
+          configMap:
+            name: eqopa-example
+        - name: core-packages
+          configMap:
+            name: eqopa-core
+        - name: policy-data
+          configMap:
+            name: eqopa-data

@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: opa
+spec:
+  selector:
+    matchLabels:
+      app: opa
+  ports:
+    - name: rest
+      protocol: TCP
+      port: 8181
