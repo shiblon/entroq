@@ -69,7 +69,8 @@ const (
 )
 
 type backendOptions struct {
-	dialOpts []grpc.DialOption
+	dialOpts    []grpc.DialOption
+	bearerToken string
 }
 
 // Option allows grpc-opener-specific options to be sent in Opener.
@@ -116,16 +117,30 @@ func WithMaxSize(maxMB int) Option {
 	))
 }
 
-// TODO: make more permanent and real, with options and stuff. Allow creds to
-// come from a function so that renewal is possible.
-type testCreds struct {
+// WithBearerToken sets a bearer token to use for all requests.
+func WithBearerToken(tok string) Option {
+	return func(opts *backendOptions) {
+		opts.bearerToken = tok
+	}
 }
 
-func (*testCreds) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
-	return map[string]string{"authorization": "val"}, nil
+// BearerCredentials implements the RPC Credentials interface, and provides a bearer token for gRPC communication.
+type BearerCredentials struct {
+	token string
 }
 
-func (*testCreds) RequireTransportSecurity() bool { return false }
+// NewBearerCredentials creates credentials for a bearer token.
+func NewBearerCredentials(tok string) *BearerCredentials {
+	return &BearerCredentials{token: tok}
+}
+
+// GetRequestMetadata provides an authorization header for a bearer token.
+func (c *BearerCredentials) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
+	return map[string]string{"authorization": "Bearer " + c.token}, nil
+}
+
+// RequireTransportSecurity is always false, tread carefully! If not on localhost, ensure security is on.
+func (*BearerCredentials) RequireTransportSecurity() bool { return false }
 
 // Opener creates an opener function to be used to get a gRPC backend. If the
 // address string is empty, it defaults to the DefaultAddr, the default value
@@ -139,7 +154,12 @@ func Opener(addr string, opts ...Option) entroq.BackendOpener {
 		opt(options)
 	}
 
-	options.dialOpts = append(options.dialOpts, grpc.WithPerRPCCredentials(new(testCreds)))
+	switch {
+	case options.bearerToken != "":
+		options.dialOpts = append(options.dialOpts, grpc.WithPerRPCCredentials(
+			NewBearerCredentials(options.bearerToken),
+		))
+	}
 
 	return func(ctx context.Context) (entroq.Backend, error) {
 		conn, err := grpc.DialContext(ctx, addr, options.dialOpts...)
