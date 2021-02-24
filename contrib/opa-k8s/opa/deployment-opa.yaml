@@ -19,7 +19,7 @@ spec:
             - "--server"
             - "--watch"
             - "--set-file=data=/etc/opa/data/opa-data.yaml"
-            - "--bunde=/etc/opa/packages/"
+            - "--bundle=/etc/opa/packages/"
           volumeMounts:
             - name: core-packages
               mountPath: /etc/opa/packages/core
