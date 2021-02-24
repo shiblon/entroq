@@ -27,7 +27,7 @@ type Request struct {
 	Authz *AuthzContext `json:"authz"`
 	// Queues contains information about what is desired: what queues to
 	// operate on, and what should be done to them.
-	Queues []*QueueSpec `json:"queues"`
+	Queues []*Queue `json:"queues"`
 }
 
 // NewYAMLRequest creates a request from YAML/JSON.
@@ -54,10 +54,10 @@ type AuthzContext struct {
 	TestUser string `json:"testuser"`
 }
 
-// QueueSpec contains information about a single queue (it is expected that
+// Queue contains information about a single queue (it is expected that
 // only one match string will be specified. Behavior of multiple specifications
 // is not necessarily well defined, and depends on policy execution order.
-type QueueSpec struct {
+type Queue struct {
 	// Exact match queue string.
 	Exact string `yaml:",omitempty" json:"exact,omitempty"`
 	// Prefix match queue string.
@@ -74,7 +74,7 @@ type AuthzError struct {
 	// found to be allowed by the policy. It will only contain the actions that
 	// were not matched. If multiple actions were desired for a single queue,
 	// only those disallowed are expected to be given back in the response.
-	Failed []*QueueSpec `json:"failed"`
+	Failed []*Queue `json:"failed"`
 }
 
 // Error satisfies the error interface, producing a string error that contains
