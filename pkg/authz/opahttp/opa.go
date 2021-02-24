@@ -7,55 +7,49 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
 
 	"entrogo.com/entroq/pkg/authz"
 )
 
+const DefaultURL = "http://localhost:9020/v1/data/entroq/authz/queues_result"
+
 // OPA is a client-like object for interacting with OPA authorization policies.
 // It adheres to the authz.Authorizer interface.
 type OPA struct {
-	apiURL        *url.URL
+	apiURL        string
 	allowTestUser bool
 }
 
 // Option defines a setting for creating an OPA authorizer.
-type Option func(*OPA) error
+type Option func(*OPA)
 
 // WithInsecureTestUser must be set when doing testing and the use of the
 // Authz.TestUser (instead of a signed token, for example) is desired. Without
 // this option, the presence of the TestUser field causes an error.
 func WithInsecureTestUser() Option {
-	return func(a *OPA) error {
+	return func(a *OPA) {
 		a.allowTestUser = true
-		return nil
 	}
 }
 
-// WithBaseURL sets the OPA base URL (scheme, host, port) to which v1 queries
-// should go, e.g., http://localhost:9020.
-func WithBaseURL(u string) Option {
-	return func(a *OPA) error {
-		base, err := url.Parse(u)
-		if err != nil {
-			return fmt.Errorf("set base URL: %w", err)
-		}
-		base.Path = "/v1/data/entroq/authz/queues_result"
-		a.apiURL = base
-		return nil
+// WithURL sets the complete OPA URL for a query authorization request, such as
+// its default value given in DefaultURL.
+func WithURL(u string) Option {
+	return func(a *OPA) {
+		a.apiURL = u
 	}
 }
 
 // New creates a new OPA client with the given options.
 func New(opts ...Option) (*OPA, error) {
-	a := new(OPA)
+	a := &OPA{
+		apiURL: DefaultURL,
+	}
 	for _, opt := range opts {
-		if err := opt(a); err != nil {
-			return nil, fmt.Errorf("new opa: %w", err)
-		}
+		opt(a)
 	}
 
-	if a.apiURL == nil {
+	if a.apiURL == "" {
 		return nil, fmt.Errorf("new opa has no base URL")
 	}
 
@@ -79,7 +73,7 @@ func (a *OPA) Authorize(ctx context.Context, req *authz.Request) error {
 		return fmt.Errorf("authorize: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.apiURL.String(), bytes.NewBuffer(b))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.apiURL, bytes.NewBuffer(b))
 	if err != nil {
 		return fmt.Errorf("authorize: %w", err)
 	}
