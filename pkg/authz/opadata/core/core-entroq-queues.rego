@@ -35,17 +35,21 @@ name_match(want, can) {
   startswith(want.prefix, can.prefix)
 }
 
+# has_wildcard indicates whether a set contains a wildcard, like ALL, ANY, or *.
+has_wildcard(actions) {
+  actions[["*", "ALL", "ANY"][_]]
+}
 # actions_left returns actions in "want" that are not covered by actions in "can".
 #
 # Use this on the actions of a particular user queue request and a matching
 # queue allowance from the data. Best when used only after a positive name_match
 #
-# If "ALL" is in "can", always returns the empty set (all are allowed, none are left).
+# If "can" is a wildcard, always returns the empty set (all are allowed, none are left).
 #
 # - want: a set of action strings that the user wishes to perform.
 # - can: a set of action strings that might be allowed.
 actions_left(want, can) = x {
-  x := {y | y := (want - can)[_]; not can["ALL"]}
+  x := {y | y := (want - can)[_]; not has_wildcard(can)}
 }
 
 # disallowed returns a set of queue specs, with actions filled in
