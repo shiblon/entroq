@@ -1,0 +1,9 @@
+{
+  "roles": {
+    "name": "*",
+    "queues": [
+      "prefix": "/",
+    ],
+    "actions": ["ALL"]
+  }
+}

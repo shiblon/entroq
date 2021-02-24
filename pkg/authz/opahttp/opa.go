@@ -1,5 +1,5 @@
-// Package authzopa implements the authz.Authorizer using an Open Policy Agent (OPA).
-package authzopa // import "entrogo.com/entroq/pkg/authzopa"
+// Package opahttp implements the authz.Authorizer using an Open Policy Agent (OPA).
+package opahttp // import "entrogo.com/entroq/pkg/authz/opahttp"
 
 import (
 	"bytes"
@@ -84,6 +84,7 @@ func (a *OPA) Authorize(ctx context.Context, req *authz.Request) error {
 		return fmt.Errorf("authorize: %w", err)
 	}
 	httpReq.Header.Add("Content-Type", "application/json")
+	httpReq.Header.Add("Authorization", req.Authz.String())
 
 	resp, err := http.DefaultClient.Do(httpReq)
 	if err != nil {
