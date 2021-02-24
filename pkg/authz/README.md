@@ -87,7 +87,7 @@ In that example, the users and roles are organized like this:
       "prefix": "/mystuff/",
       "actions": ["CLAIM", "CHANGE", "DELETE"]
     }]
-  }]
+  }],
   "roles": [{
     "name": "*",
     "queues": [{
