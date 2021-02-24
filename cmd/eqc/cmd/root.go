@@ -29,19 +29,21 @@ import (
 	homedir "github.com/mitchellh/go-homedir"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
 
-var (
-	cfgFile   string
-	svcAddr   string
-	jsonValue bool
-	secure    bool
+var rootFlags struct {
+	cfgFile    string
+	svcAddr    string
+	jsonValue  bool
+	secure     bool
+	authzToken string
+}
 
-	eq *entroq.EntroQ
-)
+var eq *entroq.EntroQ
 
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
@@ -54,7 +56,7 @@ queue listings, individual task information, etc.`,
 			return nil
 		}
 		var opts []eqgrpc.Option
-		if secure {
+		if rootFlags.secure {
 			pool, err := x509.SystemCertPool()
 			if err != nil {
 				return errors.Wrap(err, "cert pool")
@@ -66,7 +68,7 @@ queue listings, individual task information, etc.`,
 		}
 
 		var err error
-		eq, err = entroq.New(context.Background(), eqgrpc.Opener(svcAddr, opts...))
+		eq, err = entroq.New(context.Background(), eqgrpc.Opener(rootFlags.svcAddr, opts...))
 		if err != nil {
 			return errors.Wrap(err, "entroq client open")
 		}
@@ -95,11 +97,14 @@ func init() {
 	// Here you will define your flags and configuration settings.
 	// Cobra supports persistent flags, which, if defined here,
 	// will be global for your application.
-	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.config/eqc.yaml)")
+	rootCmd.PersistentFlags().StringVar(&rootFlags.cfgFile, "config", "", "config file (default is $HOME/.config/eqc.yaml)")
 
-	rootCmd.PersistentFlags().StringVarP(&svcAddr, "svcaddr", "s", ":37706", "address of service, uses port 37706 if none is specified")
-	rootCmd.PersistentFlags().BoolVarP(&jsonValue, "json", "j", false, "Display task values as JSON.")
-	rootCmd.PersistentFlags().BoolVarP(&secure, "secure", "S", false, "Use secure connection.")
+	rootCmd.PersistentFlags().StringVarP(&rootFlags.svcAddr, "svcaddr", "s", ":37706", "address of service, uses port 37706 if none is specified")
+	rootCmd.PersistentFlags().BoolVarP(&rootFlags.jsonValue, "json", "j", false, "Display task values as JSON.")
+	rootCmd.PersistentFlags().BoolVarP(&rootFlags.secure, "secure", "S", false, "Use secure connection.")
+	rootCmd.PersistentFlags().StringVar(&rootFlags.authzToken, "authz_token", "", "Pass an Authorization token.")
+
+	viper.BindPFlag("authz_token", pflag.Lookup("authz_token"))
 }
 
 func mustTaskString(t *entroq.Task) string {
@@ -108,7 +113,7 @@ func mustTaskString(t *entroq.Task) string {
 		log.Fatalf("Failed to marshal to JSON: %v", err)
 	}
 
-	if !jsonValue {
+	if !rootFlags.jsonValue {
 		return string(b)
 	}
 
@@ -136,9 +141,9 @@ func mustTaskString(t *entroq.Task) string {
 
 // initConfig reads in config file and ENV variables if set.
 func initConfig() {
-	if cfgFile != "" {
+	if rootFlags.cfgFile != "" {
 		// Use config file from the flag.
-		viper.SetConfigFile(cfgFile)
+		viper.SetConfigFile(rootFlags.cfgFile)
 	} else {
 		// Find home directory.
 		home, err := homedir.Dir()
@@ -152,8 +157,8 @@ func initConfig() {
 		viper.SetConfigName("eqc")
 	}
 
-	if !strings.Contains(svcAddr, ":") {
-		svcAddr += ":37706"
+	if !strings.Contains(rootFlags.svcAddr, ":") {
+		rootFlags.svcAddr += ":37706"
 	}
 
 	viper.AutomaticEnv() // read in environment variables that match
