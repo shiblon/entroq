@@ -17,5 +17,8 @@ spec:
           - name: metrics
             protocol: TCP
             port: 9100
-# TODO: args to set things up for OPA.
-
+        args:
+          - "--authz"
+          - "opahttp"
+          - "--opa_url"
+          - "http://localhost:8181"

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 
 	"entrogo.com/entroq/mem"
+	"entrogo.com/entroq/pkg/authz/opahttp"
 	"entrogo.com/entroq/qsvc"
 	homedir "github.com/mitchellh/go-homedir"
 	"github.com/pkg/errors"
@@ -25,13 +26,16 @@ import (
 )
 
 // Flags.
-var (
-	cfgFile  string
-	port     int
-	httpPort int
+var flags struct {
+	cfgFile       string
+	port          int
+	httpPort      int
+	authzStrategy string
+	opaURL        string
+	opaPath       string
 
 	maxSize int
-)
+}
 
 const (
 	MB = 1024 * 1024
@@ -44,12 +48,25 @@ var rootCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := context.Background()
 
-		lis, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+		lis, err := net.Listen("tcp", fmt.Sprintf(":%d", flags.port))
 		if err != nil {
-			return errors.Wrapf(err, "error listening on port %d", port)
+			return errors.Wrapf(err, "error listening on port %d", flags.port)
 		}
 
-		svc, err := qsvc.New(ctx, mem.Opener())
+		var authzOpt qsvc.Option
+		switch flags.authzStrategy {
+		case "opahttp":
+			authzOpt = qsvc.WithAuthorizer(opahttp.New(
+				opahttp.WithHostURL(flags.opaURL),
+				opahttp.WithAPIPath(flags.opaPath),
+			))
+		case "":
+			authzOpt = qsvc.WithAuthorizer(nil)
+		default:
+			return fmt.Errorf("Unknown Authz strategy: %q", flags.authzStrategy)
+		}
+
+		svc, err := qsvc.New(ctx, mem.Opener(), authzOpt)
 		if err != nil {
 			return errors.Wrap(err, "failed to open mem backend for qsvc")
 		}
@@ -57,16 +74,16 @@ var rootCmd = &cobra.Command{
 
 		go func() {
 			http.Handle("/metrics", promhttp.Handler())
-			log.Fatalf("http and metric server: %v", http.ListenAndServe(fmt.Sprintf(":%d", httpPort), nil))
+			log.Fatalf("http and metric server: %v", http.ListenAndServe(fmt.Sprintf(":%d", flags.httpPort), nil))
 		}()
 
 		s := grpc.NewServer(
-			grpc.MaxRecvMsgSize(maxSize*MB),
-			grpc.MaxSendMsgSize(maxSize*MB),
+			grpc.MaxRecvMsgSize(flags.maxSize*MB),
+			grpc.MaxSendMsgSize(flags.maxSize*MB),
 		)
 		pb.RegisterEntroQServer(s, svc)
 		hpb.RegisterHealthServer(s, health.NewServer())
-		log.Printf("Starting EntroQ server %d -> mem", port)
+		log.Printf("Starting EntroQ server %d -> mem", flags.port)
 		return s.Serve(lis)
 	},
 }
@@ -83,21 +100,26 @@ func Execute() {
 func init() {
 	cobra.OnInitialize(initConfig)
 	pflags := rootCmd.PersistentFlags()
-	pflags.StringVar(&cfgFile, "config", "", "config file (default is $HOME/.config/eqmemsvc)")
-	pflags.IntVar(&port, "port", 37706, "Port to listen on.")
-	pflags.IntVar(&httpPort, "http_port", 9100, "Port to listen to HTTP requests on, including for /metrics.")
-	pflags.IntVar(&maxSize, "max_size_mb", 10, "Maximum server message size (send and receive) in megabytes. If larger than 4MB, you must also set your gRPC client max size to take advantage of this.")
+	pflags.StringVar(&flags.cfgFile, "config", "", "config file (default is $HOME/.config/eqmemsvc)")
+	pflags.IntVar(&flags.port, "port", 37706, "Port to listen on.")
+	pflags.IntVar(&flags.httpPort, "http_port", 9100, "Port to listen to HTTP requests on, including for /metrics.")
+	pflags.IntVar(&flags.maxSize, "max_size_mb", 10, "Maximum server message size (send and receive) in megabytes. If larger than 4MB, you must also set your gRPC client max size to take advantage of this.")
+	pflags.StringVar(&flags.authzStrategy, "authz", "", "Strategy to use for authorization. Default is no authorization, everything allowed by every rquester.")
+	pflags.StringVar(&flags.opaURL, "opa_url", "", fmt.Sprintf("Base (scheme://host:port) URL for talking to OPA. Leave blank for default value %s.", opahttp.DefaultHostURL))
+	pflags.StringVar(&flags.opaPath, "opa_path", "", fmt.Sprintf("Path for OPA API access. Leave blank for default path %s.", opahttp.DefaultAPIPath))
 
 	viper.BindPFlag("port", pflags.Lookup("port"))
 	viper.BindPFlag("http_port", pflags.Lookup("http_port"))
 	viper.BindPFlag("max_size_mb", pflags.Lookup("max_size_mb"))
+	viper.BindPFlag("opa_base_url", pflags.Lookup("opa_base_url"))
+	viper.BindPFlag("opa_path", pflags.Lookup("opa_path"))
 }
 
 // initConfig reads in config file and ENV variables if set.
 func initConfig() {
-	if cfgFile != "" {
+	if flags.cfgFile != "" {
 		// Use config file from the flag.
-		viper.SetConfigFile(cfgFile)
+		viper.SetConfigFile(flags.cfgFile)
 	} else {
 		// Find home directory.
 		home, err := homedir.Dir()

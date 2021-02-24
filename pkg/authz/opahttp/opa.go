@@ -7,16 +7,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path"
 
 	"entrogo.com/entroq/pkg/authz"
 )
 
-const DefaultURL = "http://localhost:9020/v1/data/entroq/authz/queues_result"
+const (
+	DefaultHostURL = "http://localhost:8181"
+	DefaultAPIPath = "/v1/data/entroq/authz/queues_result"
+)
 
 // OPA is a client-like object for interacting with OPA authorization policies.
 // It adheres to the authz.Authorizer interface.
 type OPA struct {
-	apiURL        string
+	hostURL       string
+	apiPath       string
 	allowTestUser bool
 }
 
@@ -32,28 +37,47 @@ func WithInsecureTestUser() Option {
 	}
 }
 
-// WithURL sets the complete OPA URL for a query authorization request, such as
+// WithHostURL sets the host OPA URL for a query authorization request, such as
 // its default value given in DefaultURL.
-func WithURL(u string) Option {
+func WithHostURL(u string) Option {
 	return func(a *OPA) {
-		a.apiURL = u
+		if u != "" {
+			a.hostURL = u
+		}
+	}
+}
+
+// WithAPIPath sets the API path to request for authorization.
+func WithAPIPath(p string) Option {
+	return func(a *OPA) {
+		if p != "" {
+			a.apiPath = p
+		}
 	}
 }
 
 // New creates a new OPA client with the given options.
-func New(opts ...Option) (*OPA, error) {
+func New(opts ...Option) *OPA {
 	a := &OPA{
-		apiURL: DefaultURL,
+		hostURL: DefaultHostURL,
+		apiPath: DefaultAPIPath,
 	}
 	for _, opt := range opts {
 		opt(a)
 	}
 
-	if a.apiURL == "" {
-		return nil, fmt.Errorf("new opa has no base URL")
-	}
+	return a
+}
 
-	return a, nil
+func (a *OPA) fullURL() string {
+	h, p := a.hostURL, a.apiPath
+	if h == "" {
+		h = DefaultHostURL
+	}
+	if p == "" {
+		p = DefaultAPIPath
+	}
+	return path.Join(h, p)
 }
 
 // Authorize checks for unmatched queues and actions. A nil error means authorized.
@@ -73,7 +97,7 @@ func (a *OPA) Authorize(ctx context.Context, req *authz.Request) error {
 		return fmt.Errorf("authorize: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.apiURL, bytes.NewBuffer(b))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.fullURL(), bytes.NewBuffer(b))
 	if err != nil {
 		return fmt.Errorf("authorize: %w", err)
 	}
@@ -99,5 +123,10 @@ func (a *OPA) Authorize(ctx context.Context, req *authz.Request) error {
 		return e
 	}
 
+	return nil
+}
+
+// Close cleans up any resources used.
+func (a *OPA) Close() error {
 	return nil
 }
