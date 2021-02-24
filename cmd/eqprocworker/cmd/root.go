@@ -23,8 +23,8 @@ import (
 	"strings"
 
 	"entrogo.com/entroq"
-	"entrogo.com/entroq/contrib/pkg/procworker"
 	"entrogo.com/entroq/grpc"
+	"entrogo.com/entroq/pkg/procworker"
 	homedir "github.com/mitchellh/go-homedir"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"

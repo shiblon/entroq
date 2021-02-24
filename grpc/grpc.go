@@ -265,7 +265,7 @@ func protoFromTaskData(td *entroq.TaskData) *pb.TaskData {
 func changeProtoFromTask(t *entroq.Task) *pb.TaskChange {
 	return &pb.TaskChange{
 		OldId: &pb.TaskID{
-			ID:      t.ID,
+			Id:      t.ID.String(),
 			Version: t.Version,
 			Queue:   t.FromQueue, // old queue goes in the ID for changes.
 		},

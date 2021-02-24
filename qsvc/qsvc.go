@@ -35,9 +35,12 @@ package qsvc // import "entrogo.com/entroq/qsvc"
 import (
 	"context"
 	"log"
+	"strings"
 	"time"
 
 	"entrogo.com/entroq"
+	"entrogo.com/entroq/pkg/authz"
+	"entrogo.com/entroq/pkg/authzopa"
 	"github.com/golang/protobuf/proto"
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
@@ -73,9 +76,10 @@ type QSvc struct {
 
 	metricCancel    context.CancelFunc
 	metricNamespace string
+	metricInterval  time.Duration
 
 	authzHeader string
-	authzOPA    *OPA
+	authzOPA    *authzopa.OPA
 }
 
 // Option allows QSvc creation options to be defined.
@@ -101,7 +105,7 @@ func WithAuthorizationHeader(h string) Option {
 }
 
 // WithOPA sets the OPA implementation for use in authorization of requests.
-func WithOPA(opa *OPA) Option {
+func WithOPA(opa *authzopa.OPA) Option {
 	return func(s *QSvc) {
 		s.authzOPA = opa
 	}
@@ -153,10 +157,10 @@ func (s *QSvc) Close() error {
 }
 
 // Authorize attempts to authorize an action. It sends a POST request to the
-// OPA service, if specified, and returns the resulting protobuf.
-func (s *QSvc) Authorize(ctx context.Context, req *pb.AuthzRequest) (*pb.AuthzResponse, error) {
+// OPA service, if specified, and returns the resulting error, if not authorized.
+func (s *QSvc) Authorize(ctx context.Context, req *authz.Request) error {
 	if s.authzOPA == nil {
-		return new(pb.AuthzResponse), nil // Empty disallowed_queues means "go ahead".
+		return nil // Empty disallowed_queues means "go ahead".
 	}
 
 	return s.authzOPA.Authorize(ctx, req)
@@ -236,69 +240,86 @@ func (s *QSvc) authzToken(ctx context.Context) string {
 	return vals[0]
 }
 
-func (s *QSvc) newAuthzRequest(ctx context.Context) *pb.AuthzRequest {
-	return &pb.AuthzRequest{Authz: &pb.Authz{Token: s.authzToken(ctx)}}
+func (s *QSvc) newAuthzRequest(ctx context.Context) *authz.Request {
+	pieces := strings.SplitN(s.authzToken(ctx), " ", 2)
+	var authType, authCreds string
+	switch len(pieces) {
+	case 1:
+		authCreds = pieces[0]
+	case 2:
+		authType, authCreds = pieces[0], pieces[1]
+	}
+	return &authz.Request{Authz: &authz.AuthzContext{
+		Type:        authType,
+		Credentials: authCreds,
+	}}
 }
 
-func (s *QSvc) claimAuthz(ctx context.Context, req *pb.ClaimRequest) *pb.AuthzRequest {
-	authz := s.newAuthzRequest(ctx)
+func (s *QSvc) claimAuthz(ctx context.Context, req *pb.ClaimRequest) *authz.Request {
+	authReq := s.newAuthzRequest(ctx)
 
 	for _, q := range req.GetQueues() {
-		authz.Queues = append(authz.Queues, &pb.QueueSpec{Exact: q, Action: pb.DepType_CLAIM})
+		authReq.Queues = append(authReq.Queues, &authz.Queue{
+			Exact:   q,
+			Actions: []authz.Action{authz.Claim},
+		})
 	}
-	return authz
+	return authReq
 }
 
-func (s *QSvc) tasksAuthz(ctx context.Context, req *pb.TasksRequest) *pb.AuthzRequest {
-	authz := s.newAuthzRequest(ctx)
-	authz.Queues = append(authz.Queues, &pb.QueueSpec{Exact: req.Queue, Action: pb.DepType_DETAIL})
-	return authz
+func (s *QSvc) tasksAuthz(ctx context.Context, req *pb.TasksRequest) *authz.Request {
+	authReq := s.newAuthzRequest(ctx)
+	authReq.Queues = append(authReq.Queues, &authz.Queue{
+		Exact:   req.Queue,
+		Actions: []authz.Action{authz.Read},
+	})
+	return authReq
 }
 
-func (s *QSvc) modifyAuthz(ctx context.Context, req *pb.ModifyRequest) *pb.AuthzRequest {
-	authz := s.newAuthzRequest(ctx)
+func (s *QSvc) modifyAuthz(ctx context.Context, req *pb.ModifyRequest) *authz.Request {
+	authReq := s.newAuthzRequest(ctx)
 
 	for _, ins := range req.Inserts {
-		authz.Queues = append(authz.Queues,
-			&pb.QueueSpec{Exact: ins.Queue, Action: pb.DepType_INSERT},
-		)
+		authReq.Queues = append(authReq.Queues, &authz.Queue{
+			Exact:   ins.Queue,
+			Actions: []authz.Action{authz.Insert},
+		})
 	}
 	for _, chg := range req.Changes {
 		oldQueue, newQueue := chg.GetOldId().Queue, chg.GetNewData().Queue
 		if oldQueue == newQueue {
-			authz.Queues = append(authz.Queues,
-				&pb.QueueSpec{Exact: chg.GetNewData().Queue, Action: pb.DepType_CHANGE},
-			)
+			authReq.Queues = append(authReq.Queues, &authz.Queue{
+				Exact:   chg.GetNewData().Queue,
+				Actions: []authz.Action{authz.Change},
+			})
 		} else {
-			authz.Queues = append(authz.Queues,
-				&pb.QueueSpec{Exact: chg.GetOldId().Queue, Action: pb.DepType_DELETE},
-				&pb.QueueSpec{Exact: chg.GetNewData().Queue, Action: pb.DepType_INSERT},
-			)
+			authReq.Queues = append(authReq.Queues, &authz.Queue{
+				Exact:   chg.GetOldId().Queue,
+				Actions: []authz.Action{authz.Insert, authz.Delete, authz.Change},
+			})
 		}
 	}
 	for _, del := range req.Deletes {
-		authz.Queues = append(authz.Queues,
-			&pb.QueueSpec{Exact: del.Queue, Action: pb.DepType_DELETE},
-		)
+		authReq.Queues = append(authReq.Queues, &authz.Queue{
+			Exact:   del.Queue,
+			Actions: []authz.Action{authz.Delete},
+		})
 	}
 	for _, dep := range req.Depends {
-		authz.Queues = append(authz.Queues,
-			&pb.QueueSpec{Exact: dep.Queue, Action: pb.DepType_DEPEND},
-		)
+		authReq.Queues = append(authReq.Queues, &authz.Queue{
+			Exact:   dep.Queue,
+			Actions: []authz.Action{authz.Read},
+		})
 	}
 
-	return authz
+	return authReq
 }
 
 // Claim is the blocking version of TryClaim.
 func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
-	authz, err := s.Authorize(ctx, s.claimAuthz(ctx, req))
-	if err != nil {
+	if err := s.Authorize(ctx, s.claimAuthz(ctx, req)); err != nil {
 		return nil, errors.Wrap(err, "claim auth")
 	}
-	log.Println(authz)
-	// TODO: use authz info
-	// TODO: use the error for non-authorization? Might be better!
 
 	claimant, err := uuid.Parse(req.ClaimantId)
 	if err != nil {
@@ -332,13 +353,9 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 // available to claim. Callers can check for context cancelation codes to know
 // that this has happened, and may opt to immediately re-send the request.
 func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
-	authz, err := s.Authorize(ctx, s.claimAuthz(ctx, req))
-	if err != nil {
+	if err := s.Authorize(ctx, s.claimAuthz(ctx, req)); err != nil {
 		return nil, errors.Wrap(err, "claim auth")
 	}
-	log.Println(authz)
-	// TODO: use authz info
-	// TODO: use the error for non-authorization? Might be better!
 
 	claimant, err := uuid.Parse(req.ClaimantId)
 	if err != nil {
@@ -366,13 +383,9 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 // reconstruct an entroq.DependencyError, or directly to find out which IDs
 // caused the dependency failure. Code UNKNOWN is returned on other errors.
 func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyResponse, error) {
-	authz, err := s.Authorize(ctx, s.modifyAuthz(ctx, req))
-	if err != nil {
+	if err := s.Authorize(ctx, s.modifyAuthz(ctx, req)); err != nil {
 		return nil, errors.Wrap(err, "claim auth")
 	}
-	log.Println(authz)
-	// TODO: use authz info
-	// TODO: use the error for non-authorization? Might be better!
 
 	claimant, err := uuid.Parse(req.ClaimantId)
 	if err != nil {
@@ -471,13 +484,9 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 }
 
 func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksResponse, error) {
-	authz, err := s.Authorize(ctx, s.tasksAuthz(ctx, req))
-	if err != nil {
+	if err := s.Authorize(ctx, s.tasksAuthz(ctx, req)); err != nil {
 		return nil, errors.Wrap(err, "claim auth")
 	}
-	log.Println(authz)
-	// TODO: use authz info
-	// TODO: use the error for non-authorization? Might be better!
 
 	claimant := uuid.Nil
 	if req.ClaimantId != "" {
