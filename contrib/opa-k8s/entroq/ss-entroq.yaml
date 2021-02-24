@@ -2,6 +2,7 @@ apiVersion: app/v1
 kind: StatefulSet
 metadata:
   name: entroq
+  namespace: test
   labels:
     app: entroq
 spec:
@@ -21,4 +22,4 @@ spec:
           - "--authz"
           - "opahttp"
           - "--opa_url"
-          - "http://localhost:8181"
+          - "http://opa.test:8181"
