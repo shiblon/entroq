@@ -27,6 +27,9 @@ spec:
             - name: policy-data
               mountPath: /etc/opa/data
               readOnly: true
+            - name: example-packages
+              mountPath: /etc/opa/packages/example
+              readOnly: true
       volumes:
         - name: example-packages
           configMap:
