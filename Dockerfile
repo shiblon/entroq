@@ -3,14 +3,14 @@
 # Build inside a Go container.
 FROM golang:1.16-alpine3.13 as builder
 
-ENV GOPATH /build
+ENV GOBIN /build/bin
 ENV CGO_ENABLED 0
 
-COPY . $GOPATH/src/entrogo.com/entroq
-WORKDIR $GOPATH/src/entrogo.com/entroq
+RUN mkdir -p /src/entrogo.com/entroq apk add git
+WORKDIR /src/entrogo.com/entroq
 
-RUN apk add git
-RUN go get -d -v ./... && go install -v ./...
+COPY . /src/entrogo.com/entroq/
+RUN go install -v ./...
 
 # Switch to a smaller container without build tools.
 FROM alpine:latest

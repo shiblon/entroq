@@ -10,8 +10,8 @@
   "roles": {
     "name": "*",
     "queues": [{
-      "prefix": "/",
-      "actions": ["ALL"]
+      "prefix": "/global/",
+      "actions": ["READ"]
     }],
   }
 }
