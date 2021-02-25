@@ -110,15 +110,19 @@ func (a *OPA) Authorize(ctx context.Context, req *authz.Request) error {
 	}
 	defer resp.Body.Close()
 
-	result := map[string]*authz.AuthzError{
-		"result": new(authz.AuthzError),
+	type authzResult struct {
+		Results []*authz.AuthzError `json:"results"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	result := new(authzResult)
+	if err := json.NewDecoder(resp.Body).Decode(result); err != nil {
 		return fmt.Errorf("authorize: %w", err)
+	}
+	if len(result.Results) == 0 {
+		return fmt.Errorf("empty result, can't authorize")
 	}
 
 	// Check result value.
-	if e := result["result"]; len(e.Failed) != 0 {
+	if e := result.Results[0]; !e.Success() {
 		// We got an error with information about missing queue/actions.
 		return e
 	}
