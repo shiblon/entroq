@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"path"
+	"strings"
 
 	"entrogo.com/entroq/pkg/authz"
 )
@@ -77,7 +77,7 @@ func (a *OPA) fullURL() string {
 	if p == "" {
 		p = DefaultAPIPath
 	}
-	return path.Join(h, p)
+	return strings.TrimRight(h, "/") + "/" + p
 }
 
 // Authorize checks for unmatched queues and actions. A nil error means authorized.
