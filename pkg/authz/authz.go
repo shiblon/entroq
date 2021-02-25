@@ -107,12 +107,22 @@ type Queue struct {
 // AuthzError contains the reply from OPA, if non-empty. An empty UnmatchedQueues field implies
 // that the action is allowed.
 type AuthzError struct {
+	Allow bool `json:"allow"`
+
 	User string `json:"user"`
 	// Failed contains the queue information for things that were not
 	// found to be allowed by the policy. It will only contain the actions that
 	// were not matched. If multiple actions were desired for a single queue,
 	// only those disallowed are expected to be given back in the response.
 	Failed []*Queue `json:"failed"`
+
+	// For other kinds of errors.
+	Err string `json:"err"`
+}
+
+// Success returns whether this error represents success (instead of an auth error).
+func (e *AuthzError) Success() bool {
+	return e == nil || (e.Allow && e.Err == "" && len(e.Failed) == 0)
 }
 
 // Error satisfies the error interface, producing a string error that contains
@@ -121,6 +131,9 @@ func (e *AuthzError) Error() string {
 	y, err := yaml.Marshal(e.Failed)
 	if err != nil {
 		return fmt.Sprintf("user %q not authorized, failed to get data with reasons: %v", e.User, err)
+	}
+	if e.Err != "" {
+		return fmt.Sprintf("auth error: %v", err)
 	}
 	return fmt.Sprintf("user %q not authorized, missing queue/actions:\n%s", e.User, string(y))
 }

@@ -102,7 +102,7 @@ func WithAuthorizationHeader(h string) Option {
 	}
 }
 
-// WithAUthorizer sets the authorization implementation.
+// WithAuthorizer sets the authorization implementation.
 func WithAuthorizer(az authz.Authorizer) Option {
 	return func(s *QSvc) {
 		s.az = az
@@ -277,14 +277,20 @@ func (s *QSvc) modifyAuthz(ctx context.Context, req *pb.ModifyRequest) *authz.Re
 		oldQueue, newQueue := chg.GetOldId().Queue, chg.GetNewData().Queue
 		if oldQueue == newQueue {
 			authReq.Queues = append(authReq.Queues, &authz.Queue{
-				Exact:   chg.GetNewData().Queue,
+				Exact:   newQueue,
 				Actions: []authz.Action{authz.Change},
 			})
 		} else {
-			authReq.Queues = append(authReq.Queues, &authz.Queue{
-				Exact:   chg.GetOldId().Queue,
-				Actions: []authz.Action{authz.Insert, authz.Delete, authz.Change},
-			})
+			authReq.Queues = append(authReq.Queues,
+				&authz.Queue{
+					Exact:   oldQueue,
+					Actions: []authz.Action{authz.Delete},
+				},
+				&authz.Queue{
+					Exact:   newQueue,
+					Actions: []authz.Action{authz.Insert},
+				},
+			)
 		}
 	}
 	for _, del := range req.Deletes {

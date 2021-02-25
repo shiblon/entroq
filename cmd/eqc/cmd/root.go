@@ -67,6 +67,10 @@ queue listings, individual task information, etc.`,
 			opts = append(opts, eqgrpc.WithInsecure())
 		}
 
+		if rootFlags.authzToken != "" {
+			opts = append(opts, eqgrpc.WithBearerToken(rootFlags.authzToken))
+		}
+
 		var err error
 		eq, err = entroq.New(context.Background(), eqgrpc.Opener(rootFlags.svcAddr, opts...))
 		if err != nil {

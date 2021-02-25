@@ -21,19 +21,35 @@
 # the shape of the data that it works with.
 package entroq.authz
 
+import data.entroq.permissions
 import data.entroq.queues
-import data.entroq.permissions.allowed_queues
-import data.entroq.permissions.username
+import data.entroq.user
 
 failed_queues[q] {
-  q := queues.disallowed(input.queues, allowed_queues)[_]
+  q := queues.disallowed(input.queues, permissions.allowed_queues)[_]
 }
 
-queues_result := {
-  "user": username,
-  "failed": failed_queues
+failed_msg = m {
+  not user.username
+  m := "No username specified"
+}
+
+failed_msg = m {
+  user.username == ""
+  m := "No username specified"
 }
 
 allow {
+  user.username
   count(failed_queues) == 0
 }
+
+queues_result[r] {
+  r := {
+    "allow": allow,
+    "user": user.username,
+    "failed": failed_queues,
+    "err": failed_msg
+  }
+}
+
