@@ -3,7 +3,9 @@ package authz // import "entrogo.com/entroq/pkg/authz"
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 
 	yaml "gopkg.in/yaml.v2"
@@ -65,13 +67,13 @@ func NewYAMLRequest(y string) (*Request, error) {
 type Authorization struct {
 	// An HTTP Authorization header is split into its type and credentials and
 	// included here when available.
-	Type        string `json:"type"`
-	Credentials string `json:"credentials"`
+	Type        string `json:"type,omitempty"`
+	Credentials string `json:"credentials,omitempty"`
 
 	// Never use this in practice. This allows the user to be set directly for testing.
 	// The code checks for this and creates an error if present, unless
 	// specifically allowed for testing.
-	TestUser string `json:"testuser"`
+	TestUser string `json:"testuser,omitempty"`
 }
 
 // NewHeaderAuthorization creates an authorization structure from a header value.
@@ -97,18 +99,31 @@ func (a *Authorization) String() string {
 // is not necessarily well defined, and depends on policy execution order.
 type Queue struct {
 	// An exact name to match.
-	Exact string `yaml: ",omitempty" json:"exact,omitempty"`
+	Exact string `yaml:",omitempty" json:"exact,omitempty"`
 	// The kind of matching to do (default exact)
-	Prefix string `yaml: ",omitempty" json:"prefix,omitempty"`
+	Prefix string `yaml:",omitempty" json:"prefix,omitempty"`
 	// Actions contains the desired things to be done with this queue.
 	Actions []Action `yaml:",flow" json:"actions"`
 }
 
-// AuthzError contains the reply from OPA, if non-empty. An empty UnmatchedQueues field implies
-// that the action is allowed.
+// String creates a readable representation of a queue.
+func (q *Queue) String() string {
+	b, err := json.Marshal(q)
+	if err != nil {
+		log.Fatalf("Impossible situation: can't serialize a simple, known struct into JSON: %v", err)
+	}
+	return string(b)
+}
+
+// AuthzError contains the reply from OPA.
 type AuthzError struct {
+	// If Allow is true, then authorization succeeded and we can proceed.
+	// The reason we don't just go with "empty error and failures" is that
+	// non-affirmative things like that tend to cause unwanted authorizations
+	// for other reasons, like parsing JSON with no known fields present.
 	Allow bool `json:"allow"`
 
+	// User holds the inferred username. It must be present in a reply.
 	User string `json:"user"`
 	// Failed contains the queue information for things that were not
 	// found to be allowed by the policy. It will only contain the actions that
@@ -117,23 +132,27 @@ type AuthzError struct {
 	Failed []*Queue `json:"failed"`
 
 	// For other kinds of errors.
-	Err string `json:"err"`
+	Errors []string `json:"errors"`
 }
 
 // Success returns whether this error represents success (instead of an auth error).
 func (e *AuthzError) Success() bool {
-	return e == nil || (e.Allow && e.Err == "" && len(e.Failed) == 0)
+	return e == nil || (e.User != "" && len(e.Errors) == 0 && len(e.Failed) == 0)
 }
 
 // Error satisfies the error interface, producing a string error that contains
 // unmatched queue/action information.
 func (e *AuthzError) Error() string {
-	y, err := yaml.Marshal(e.Failed)
-	if err != nil {
-		return fmt.Sprintf("user %q not authorized, failed to get data with reasons: %v", e.User, err)
+	if e.Success() {
+		return "Success"
 	}
-	if e.Err != "" {
-		return fmt.Sprintf("auth error: %v", err)
+
+	results := []string{
+		fmt.Sprintf("user %q not authorized: %v", e.User, strings.Join(e.Errors, "; ")),
 	}
-	return fmt.Sprintf("user %q not authorized, missing queue/actions:\n%s", e.User, string(y))
+
+	for _, q := range e.Failed {
+		results = append(results, "Queue/Action mismatch: "+q.String())
+	}
+	return strings.Join(results, "\n")
 }

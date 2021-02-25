@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 
@@ -14,7 +15,7 @@ import (
 
 const (
 	DefaultHostURL = "http://localhost:8181"
-	DefaultAPIPath = "/v1/data/entroq/authz/queues_result"
+	DefaultAPIPath = "/v1/data/entroq/authz"
 )
 
 // OPA is a client-like object for interacting with OPA authorization policies.
@@ -77,7 +78,7 @@ func (a *OPA) fullURL() string {
 	if p == "" {
 		p = DefaultAPIPath
 	}
-	return strings.TrimRight(h, "/") + "/" + p
+	return strings.TrimRight(h, "/") + "/" + strings.TrimLeft(p, "/")
 }
 
 // Authorize checks for unmatched queues and actions. A nil error means authorized.
@@ -110,19 +111,21 @@ func (a *OPA) Authorize(ctx context.Context, req *authz.Request) error {
 	}
 	defer resp.Body.Close()
 
-	type authzResult struct {
-		Results []*authz.AuthzError `json:"results"`
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("no read: %w", err)
 	}
-	result := new(authzResult)
-	if err := json.NewDecoder(resp.Body).Decode(result); err != nil {
+
+	type authzResp struct {
+		Result *authz.AuthzError `json:"result"`
+	}
+	result := new(authzResp)
+	if err := json.NewDecoder(bytes.NewBuffer(respBytes)).Decode(result); err != nil {
 		return fmt.Errorf("authorize: %w", err)
-	}
-	if len(result.Results) == 0 {
-		return fmt.Errorf("empty result, can't authorize")
 	}
 
 	// Check result value.
-	if e := result.Results[0]; !e.Success() {
+	if e := result.Result; e != nil && !e.Success() {
 		// We got an error with information about missing queue/actions.
 		return e
 	}
