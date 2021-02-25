@@ -19,6 +19,7 @@ cat <<EOF > $tmp/example/kustomization.yaml
 configMapGenerator:
   - name: eqopa-example
     files:
+      - example-entroq-data.rego
       - example-entroq-permissions.rego
       - example-entroq-user.rego
 EOF

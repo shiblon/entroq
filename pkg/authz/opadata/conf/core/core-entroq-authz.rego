@@ -23,33 +23,36 @@ package entroq.authz
 
 import data.entroq.permissions
 import data.entroq.queues
-import data.entroq.user
+import data.entroq.user.username
 
-failed_queues[q] {
+user = u {
+  u := username
+}
+
+default allow = false
+allow {
+  user
+  not failed
+  not errors
+}
+
+failed[q] {
   q := queues.disallowed(input.queues, permissions.allowed_queues)[_]
 }
 
-failed_msg = m {
-  not user.username
-  m := "No username specified"
+# Errors are not merely helpful, they are essential. The presence of an error
+# can signal a lack of authorization *even if there are no computable failed
+# queues*, which can happen in several circumstances (like a username not
+# present in the query).
+errors[msg] {
+  not user
+  msg := "No username found"
 }
-
-failed_msg = m {
-  user.username == ""
-  m := "No username specified"
+errors[msg] {
+  user == ""
+  msg := "Empty username found"
 }
-
-allow {
-  user.username
-  count(failed_queues) == 0
+errors[msg] {
+  count(failed) > 0
+  msg := "Some queue/actions were not authorized"
 }
-
-queues_result[r] {
-  r := {
-    "allow": allow,
-    "user": user.username,
-    "failed": failed_queues,
-    "err": failed_msg
-  }
-}
-

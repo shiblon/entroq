@@ -3,12 +3,13 @@ package entroq.permissions
 test_this_user_found {
   this_user == {
     "name": "auser",
-    "queues": [
-      {"exact": "/a/queue", "actions": ["ALL"]}
-    ]
+    "queues": [{
+      "exact": "/a/queue",
+      "actions": ["ALL"]
+    }]
   }
   with input.authz as {"testuser": "auser"}
-  with data.users as [{
+  with data.entroq.policy.users as [{
     "name": "auser",
     "queues": [{
       "exact": "/a/queue",
@@ -20,7 +21,7 @@ test_this_user_found {
 test_this_user_not_found {
   not this_user
   with input.authz as {"testuser": "auser"}
-  with data.users as [{
+  with data.entroq.policy.users as [{
     "name": "buser",
   }]
 }
@@ -32,8 +33,8 @@ test_only_match_wildcard_role_queues {
     "exact": "/ns=global/inbox",
     "actions": ["CLAIM"]
   }]
-  with data.users as []
-  with data.roles as [{
+  with data.entroq.policy.users as []
+  with data.entroq.policy.roles as [{
     "name": "*",
     "queues": [{
       "prefix": "/ns=global/",
@@ -53,8 +54,8 @@ test_only_match_wildcard_role_queues_single {
     "exact": "aqueue",
     "actions": ["CLAIM"]
   }]
-  with data.users as []
-  with data.roles as [{
+  with data.entroq.policy.users as []
+  with data.entroq.policy.roles as [{
     "name": "*",
     "queues": [{
       "prefix": "/ns=global/",
@@ -66,8 +67,8 @@ test_only_match_wildcard_role_queues_single {
 test_only_extra_user_queues {
   user_queues == {{"prefix": "/ns=user/blah/", "actions": ["ALL"]}}
   with input.authz as {"testuser": "blah"}
-  with data.users as []
-  with data.roles as []
+  with data.entroq.policy.users as []
+  with data.entroq.policy.roles as []
 }
 
 test_user_with_queues {
@@ -77,7 +78,7 @@ test_user_with_queues {
     {"exact": "q2", "actions": ["CLAIM"]},
   }
   with input.authz as {"testuser": "blah"}
-  with data.users as [{
+  with data.entroq.policy.users as [{
     "name": "blah",
     "queues": [{
       "exact": "q1",
@@ -97,8 +98,8 @@ test_no_matching_user_queues {
     "exact": "aqueue",
     "actions": ["CLAIM"]
   }]
-  with data.users as []
-  with data.roles as [{
+  with data.entroq.policy.users as []
+  with data.entroq.policy.roles as [{
     "name": "*",
     "queues": [{
       "prefix": "/ns=global/",

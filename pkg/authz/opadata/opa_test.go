@@ -15,7 +15,7 @@ import (
 )
 
 var (
-	//go:embed opadata
+	//go:embed conf
 	regoFS embed.FS
 )
 

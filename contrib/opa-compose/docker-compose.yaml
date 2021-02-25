@@ -3,7 +3,10 @@ version: "3.3"
 services:
   entroq:
     image: shiblon/entroq:v0.5
-    command: ["--authz", "opahttp", "--opa_url", "http://opa:8181", "--opa_path", "/v1/data/entroq/authz/queues_result"]
+    command:
+      - "--authz=opahttp"
+      - "--opa_url=http://opa:8181"
+      - "--opa_path=/v1/data/entroq/authz"
 
   opa:
     image: openpolicyagent/opa:0.26.0
@@ -13,8 +16,10 @@ services:
       - "--server"
       - "--watch"
       - "--log-level=debug"
-      - "/etc/opa/config/core"
-      - "/etc/opa/config/example"
-#- "--set-file=data=/etc/opa/config/example-data/data.json"
+      - "/etc/opa/config"
+    ports:
+      - "8181:8181"
     volumes:
-      - "./opadata:/etc/opa/config"
+      - "./opadata/conf/core:/etc/opa/config/core"
+      - "./opadata/conf/example:/etc/opa/config/example"
+      - "./opadata/policy:/etc/opa/config/policy"

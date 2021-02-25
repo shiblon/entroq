@@ -19,7 +19,6 @@ spec:
             - "--addr=:8181"
             - "--server"
             - "--watch"
-            - "--set-file=data=/etc/opa/data/opa-data.yaml"
             - "/etc/opa/packages/"
           volumeMounts:
             - name: core-packages
@@ -28,16 +27,10 @@ spec:
             - name: example-packages
               mountPath: /etc/opa/packages/example
               readOnly: true
-            - name: policy-data
-              mountPath: /etc/opa/data
-              readOnly: true
       volumes:
-        - name: example-packages
-          configMap:
-            name: eqopa-example
         - name: core-packages
           configMap:
             name: eqopa-core
-        - name: policy-data
+        - name: example-packages
           configMap:
-            name: eqopa-data
+            name: eqopa-example
