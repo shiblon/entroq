@@ -104,7 +104,7 @@ func init() {
 	pflags.IntVar(&flags.port, "port", 37706, "Port to listen on.")
 	pflags.IntVar(&flags.httpPort, "http_port", 9100, "Port to listen to HTTP requests on, including for /metrics.")
 	pflags.IntVar(&flags.maxSize, "max_size_mb", 10, "Maximum server message size (send and receive) in megabytes. If larger than 4MB, you must also set your gRPC client max size to take advantage of this.")
-	pflags.StringVar(&flags.authzStrategy, "authz", "", "Strategy to use for authorization. Default is no authorization, everything allowed by every rquester.")
+	pflags.StringVar(&flags.authzStrategy, "authz", "none", "Strategy to use for authorization. Default is no authorization, everything allowed by every rquester.")
 	pflags.StringVar(&flags.opaURL, "opa_url", "", fmt.Sprintf("Base (scheme://host:port) URL for talking to OPA. Leave blank for default value %s.", opahttp.DefaultHostURL))
 	pflags.StringVar(&flags.opaPath, "opa_path", "", fmt.Sprintf("Path for OPA API access. Leave blank for default path %s.", opahttp.DefaultAPIPath))
 

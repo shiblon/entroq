@@ -2,7 +2,7 @@ version: "3.3"
 
 services:
   entroq:
-    image: shiblon/entroq:v0.5
+    image: shiblon/entroq:v0.4.4
     command:
       - "--authz=opahttp"
       - "--opa_url=http://opa:8181"
