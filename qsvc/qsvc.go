@@ -167,7 +167,8 @@ func (s *QSvc) Authorize(ctx context.Context, req *authz.Request) error {
 	// be unpacked and round-tripped through the grpc transport.
 	if err := s.az.Authorize(ctx, req); err != nil {
 		var details []proto.Message
-		authzErr, ok := errors.Unwrap(err).(*authz.AuthzError)
+		// TODO: unwrap after converting to fmt-friendly unwrap instead of pkgerrors unwrap.
+		authzErr, ok := err.(*authz.AuthzError)
 		if !ok {
 			return status.New(codes.PermissionDenied, fmt.Sprintf("unknown authz error: %v", err)).Err()
 		}
@@ -175,7 +176,7 @@ func (s *QSvc) Authorize(ctx context.Context, req *authz.Request) error {
 		for _, msg := range authzErr.Errors {
 			details = append(details, &pb.AuthzDep{
 				Actions: []pb.ActionType{pb.ActionType_DETAIL},
-				Exact:   msg,
+				Msg:     msg,
 			})
 		}
 		for _, q := range authzErr.Failed {
@@ -364,7 +365,7 @@ func (s *QSvc) modifyAuthz(ctx context.Context, req *pb.ModifyRequest) *authz.Re
 // Claim is the blocking version of TryClaim.
 func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
 	if err := s.Authorize(ctx, s.claimAuthz(ctx, req)); err != nil {
-		return nil, fmt.Errorf("claim auth: %w", err)
+		return nil, err // don't wrap, has status codes
 	}
 
 	claimant, err := uuid.Parse(req.ClaimantId)
@@ -400,7 +401,7 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 // that this has happened, and may opt to immediately re-send the request.
 func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
 	if err := s.Authorize(ctx, s.claimAuthz(ctx, req)); err != nil {
-		return nil, errors.Wrap(err, "claim auth")
+		return nil, err // don't wrap, has status codes
 	}
 
 	claimant, err := uuid.Parse(req.ClaimantId)
@@ -430,7 +431,7 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 // caused the dependency failure. Code UNKNOWN is returned on other errors.
 func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyResponse, error) {
 	if err := s.Authorize(ctx, s.modifyAuthz(ctx, req)); err != nil {
-		return nil, errors.Wrap(err, "claim auth")
+		return nil, err // don't wrap, has status codes
 	}
 
 	claimant, err := uuid.Parse(req.ClaimantId)
@@ -531,7 +532,7 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 
 func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksResponse, error) {
 	if err := s.Authorize(ctx, s.tasksAuthz(ctx, req)); err != nil {
-		return nil, errors.Wrap(err, "claim auth")
+		return nil, err // don't wrap, has status codes
 	}
 
 	claimant := uuid.Nil
