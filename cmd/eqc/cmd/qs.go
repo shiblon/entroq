@@ -20,7 +20,6 @@ import (
 	"fmt"
 
 	"entrogo.com/entroq"
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 )
 
@@ -58,12 +57,12 @@ var qsCmd = &cobra.Command{
 
 		qs, err := eq.QueueStats(context.Background(), opts...)
 		if err != nil {
-			return errors.Wrap(err, "get queues")
+			return fmt.Errorf("get queues: %w", err)
 		}
 
 		b, err := json.MarshalIndent(qs, "", "\t")
 		if err != nil {
-			return errors.Wrap(err, "queues json")
+			return fmt.Errorf("queues json: %w", err)
 		}
 		fmt.Println(string(b))
 
