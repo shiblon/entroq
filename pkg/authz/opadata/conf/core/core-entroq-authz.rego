@@ -21,12 +21,12 @@
 # the shape of the data that it works with.
 package entroq.authz
 
-import data.entroq.permissions
 import data.entroq.queues
 import data.entroq.user.username
+import data.entroq.permissions.allowed_queues
 
 failed[q] {
-  q := queues.disallowed(input.queues, permissions.allowed_queues)[_]
+  q := queues.disallowed(input.queues, allowed_queues)[_]
 }
 
 # Add a message containing user information if there are queue mismatches.
@@ -41,7 +41,7 @@ allow {
   # It is possible to have allowed queues for non-authorized users.
   # We only say "allow" if there are, in fact, some queues that _could_ be
   # allowed.
-  count(permissions.allowed_queues) > 0
+  count(allowed_queues) > 0
 
   # Only allow if none of the allowed queues failed.
   count(failed) == 0

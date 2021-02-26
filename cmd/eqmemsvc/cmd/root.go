@@ -60,7 +60,7 @@ var rootCmd = &cobra.Command{
 				opahttp.WithHostURL(flags.opaURL),
 				opahttp.WithAPIPath(flags.opaPath),
 			))
-		case "":
+		case "", "none":
 			authzOpt = qsvc.WithAuthorizer(nil)
 		default:
 			return fmt.Errorf("Unknown Authz strategy: %q", flags.authzStrategy)
@@ -111,6 +111,7 @@ func init() {
 	viper.BindPFlag("port", pflags.Lookup("port"))
 	viper.BindPFlag("http_port", pflags.Lookup("http_port"))
 	viper.BindPFlag("max_size_mb", pflags.Lookup("max_size_mb"))
+	viper.BindPFlag("authz", pflags.Lookup("authz"))
 	viper.BindPFlag("opa_base_url", pflags.Lookup("opa_base_url"))
 	viper.BindPFlag("opa_path", pflags.Lookup("opa_path"))
 }

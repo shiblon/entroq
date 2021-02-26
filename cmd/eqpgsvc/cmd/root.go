@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 
 	"entrogo.com/entroq/pg"
+	"entrogo.com/entroq/pkg/authz/opahttp"
 	"entrogo.com/entroq/qsvc"
 	homedir "github.com/mitchellh/go-homedir"
 	"github.com/pkg/errors"
@@ -44,12 +45,17 @@ var (
 	port     int
 	httpPort int
 
+	maxSize int
+
 	dbAddr   string
 	dbName   string
 	dbUser   string
 	dbPass   string
 	attempts int
-	maxSize  int
+
+	authzStrategy string
+	opaURL        string
+	opaPath       string
 )
 
 const (
@@ -62,6 +68,19 @@ var rootCmd = &cobra.Command{
 	Short: "A postgres-backed EntroQ service.",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := context.Background()
+
+		var authzOpt qsvc.Option
+		switch authzStrategy {
+		case "opahttp":
+			authzOpt = qsvc.WithAuthorizer(opahttp.New(
+				opahttp.WithHostURL(opaURL),
+				opahttp.WithAPIPath(opaPath),
+			))
+		case "", "none":
+			authzOpt = qsvc.WithAuthorizer(nil)
+		default:
+			return fmt.Errorf("Unknown Authz strategy: %q", authzStrategy)
+		}
 
 		if dbPass == "" {
 			dbPass = os.Getenv("PGPASSWORD")
@@ -79,12 +98,14 @@ var rootCmd = &cobra.Command{
 			dbAddr = os.Getenv("PGHOST") + ":" + os.Getenv("PGPORT")
 		}
 
-		svc, err := qsvc.New(ctx, pg.Opener(dbAddr,
+		opener := pg.Opener(dbAddr,
 			pg.WithDB(dbName),
 			pg.WithUsername(dbUser),
 			pg.WithPassword(dbPass),
 			pg.WithConnectAttempts(attempts),
-		))
+		)
+
+		svc, err := qsvc.New(ctx, opener, authzOpt)
 		if err != nil {
 			return errors.Wrap(err, "failed to open pg backend")
 		}
@@ -132,6 +153,9 @@ func init() {
 	pflags.StringVar(&dbPass, "dbpwd", "", "Database password. Overrides PGPASSWORD environment.")
 	pflags.IntVar(&attempts, "attempts", 10, "Connection attempts, separated by 5-second pauses, before dying due to lack of backend connection.")
 	pflags.IntVar(&maxSize, "max_size_mb", 10, "Maximum server message size (send and receive) in megabytes. If larger than 4MB, you must also set your gRPC client max size to take advantage of this.")
+	pflags.StringVar(&flags.authzStrategy, "authz", "", "Strategy to use for authorization. Default is no authorization, everything allowed by every rquester.")
+	pflags.StringVar(&flags.opaURL, "opa_url", "", fmt.Sprintf("Base (scheme://host:port) URL for talking to OPA. Leave blank for default value %s.", opahttp.DefaultHostURL))
+	pflags.StringVar(&flags.opaPath, "opa_path", "", fmt.Sprintf("Path for OPA API access. Leave blank for default path %s.", opahttp.DefaultAPIPath))
 
 	viper.BindPFlag("port", pflags.Lookup("port"))
 	viper.BindPFlag("http_port", pflags.Lookup("http_port"))
@@ -141,6 +165,9 @@ func init() {
 	viper.BindPFlag("dbpwd", pflags.Lookup("dbpwd"))
 	viper.BindPFlag("attempts", pflags.Lookup("attempts"))
 	viper.BindPFlag("max_size_mb", pflags.Lookup("max_size_mb"))
+	viper.BindPFlag("authz", pflags.Lookup("authz"))
+	viper.BindPFlag("opa_base_url", pflags.Lookup("opa_base_url"))
+	viper.BindPFlag("opa_path", pflags.Lookup("opa_path"))
 }
 
 // initConfig reads in config file and ENV variables if set.
