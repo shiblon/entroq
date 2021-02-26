@@ -29,18 +29,6 @@ failed[q] {
   q := queues.disallowed(input.queues, permissions.allowed_queues)[_]
 }
 
-# Errors are not merely helpful, they are essential. The presence of an error
-# can signal a lack of authorization *even if there are no computable failed
-# queues*, which can happen in several circumstances (like a username not
-# present in the query).
-errors[msg] {
-  not username
-  msg := "No username found"
-}
-errors[msg] {
-  username == ""
-  msg := "Empty username found"
-}
 # Add a message containing user information if there are queue mismatches.
 errors[msg] {
   count(failed) > 0
@@ -50,8 +38,15 @@ errors[msg] {
 
 default allow = false
 allow {
-  username
-  not failed
-  not errors
+  # It is possible to have allowed queues for non-authorized users.
+  # We only say "allow" if there are, in fact, some queues that _could_ be
+  # allowed.
+  count(permissions.allowed_queues) > 0
+
+  # Only allow if none of the allowed queues failed.
+  count(failed) == 0
+
+  # Only allow if there are no additional errors.
+  count(errors) == 0
 }
 

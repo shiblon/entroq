@@ -44,10 +44,10 @@ const (
 // authorization, which is performed based on queue name. Present whenever
 // using tasks as a source of IDs.
 type TaskID struct {
-	ID      uuid.UUID
-	Version int32
+	ID      uuid.UUID `json:"id"`
+	Version int32     `json:"version"`
 
-	Queue string
+	Queue string `json:"queue,omitempty"`
 }
 
 // NewTaskID creates a new TaskID with given options.
@@ -140,7 +140,7 @@ type Task struct {
 
 	// FromQueue specifies the previous queue for a task that is moving to another queue.
 	// Usually not present, can be used for change authorization (since two queues are in play, there).
-	FromQueue string
+	FromQueue string `json:"fromqueue,omitempty"`
 }
 
 // String returns a useful representation of this task.

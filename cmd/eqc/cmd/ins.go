@@ -20,7 +20,6 @@ import (
 	"fmt"
 
 	"entrogo.com/entroq"
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 )
 
@@ -41,7 +40,7 @@ func init() {
 // insCmd represents the ins command
 var insCmd = &cobra.Command{
 	Use:   "ins",
-	Short: "Insert a task into the EntroQ.",
+	Short: "Insert a task into EntroQ.",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if len(flagInsVal) == 0 {
 			flagInsVal = append(flagInsVal, "")
@@ -53,12 +52,12 @@ var insCmd = &cobra.Command{
 
 		ins, _, err := eq.Modify(context.Background(), entroq.InsertingInto(flagInsQueue, insArgs...))
 		if err != nil {
-			return errors.Wrap(err, "insert tasks")
+			return fmt.Errorf("insert tasks: %w", err)
 		}
 
 		b, err := json.MarshalIndent(ins, "", "\t")
 		if err != nil {
-			return errors.Wrap(err, "insert json")
+			return fmt.Errorf("insert json: %w", err)
 		}
 		fmt.Println(string(b))
 

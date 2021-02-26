@@ -19,6 +19,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -27,7 +28,6 @@ import (
 	"entrogo.com/entroq"
 	eqgrpc "entrogo.com/entroq/grpc"
 	homedir "github.com/mitchellh/go-homedir"
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
@@ -59,7 +59,7 @@ queue listings, individual task information, etc.`,
 		if rootFlags.secure {
 			pool, err := x509.SystemCertPool()
 			if err != nil {
-				return errors.Wrap(err, "cert pool")
+				return fmt.Errorf("cert pool: %w", err)
 			}
 			creds := credentials.NewClientTLSFromCert(pool, "")
 			opts = append(opts, eqgrpc.WithDialOpts(grpc.WithTransportCredentials(creds)))
@@ -74,7 +74,7 @@ queue listings, individual task information, etc.`,
 		var err error
 		eq, err = entroq.New(context.Background(), eqgrpc.Opener(rootFlags.svcAddr, opts...))
 		if err != nil {
-			return errors.Wrap(err, "entroq client open")
+			return fmt.Errorf("entroq client open: %w", err)
 		}
 		return nil
 	},
