@@ -9,6 +9,9 @@ ENV CGO_ENABLED 0
 RUN mkdir -p /src/entrogo.com/entroq apk add git
 WORKDIR /src/entrogo.com/entroq
 
+COPY go.mod go.sum /src/entrogo.com/entroq/
+RUN go mod download -x
+
 COPY . /src/entrogo.com/entroq/
 RUN go install -v ./...
 

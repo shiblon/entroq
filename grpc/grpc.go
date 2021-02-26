@@ -46,6 +46,7 @@ import (
 	"time"
 
 	"entrogo.com/entroq"
+	"entrogo.com/entroq/pkg/authz"
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
@@ -204,7 +205,7 @@ func (b *backend) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[strin
 		Limit:       int32(qq.Limit),
 	})
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to get queues over gRPC")
+		return nil, errors.Wrap(unpackGRPCError(err), "grpc queues")
 	}
 	qs := make(map[string]int)
 	for _, q := range resp.Queues {
@@ -326,13 +327,11 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 	var tasks []*entroq.Task
 	for {
 		resp, err := stream.Recv()
-		// TODO:
-		// case codes.PermissionDenied:
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return nil, errors.Wrap(err, "receive tasks")
+			return nil, errors.Wrap(unpackGRPCError(err), "receive tasks")
 		}
 		for _, t := range resp.Tasks {
 			task, err := fromTaskProto(t)
@@ -363,8 +362,6 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 			PollMs:     int64(cq.PollTime / time.Millisecond),
 		})
 		if err != nil {
-			// TODO:
-			// case codes.PermissionDenied:
 			if entroq.IsTimeout(err) {
 				// If we just timed out on our little request context, then
 				// we can go around again.
@@ -372,7 +369,7 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 				// is why we check that at the beginning of the loop, as well.
 				continue
 			}
-			return nil, errors.Wrap(err, "grpc claim")
+			return nil, errors.Wrap(unpackGRPCError(err), "grpc claim")
 		}
 		if resp.Task == nil {
 			return nil, errors.New("no task returned from backend Claim")
@@ -389,15 +386,99 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 		Queues:     cq.Queues,
 		DurationMs: int64(cq.Duration / time.Millisecond),
 	})
-	// TODO:
-	// case codes.PermissionDenied:
 	if err != nil {
-		return nil, errors.Wrap(err, "grpc try claim")
+		return nil, errors.Wrap(unpackGRPCError(err), "grpc try claim")
 	}
 	if resp.Task == nil {
 		return nil, nil
 	}
 	return fromTaskProto(resp.Task)
+}
+
+func authzErrFromStat(stat *status.Status) error {
+	if stat.Code() != codes.PermissionDenied {
+		return errors.Wrap(stat.Err(), "expected PermissionDenied, got something else")
+	}
+	authzErr := new(authz.AuthzError)
+	for _, det := range stat.Details() {
+		detail, ok := det.(*pb.AuthzDep)
+		if !ok {
+			return errors.Errorf("grpc unexpected authz type %T: %+v", det, det)
+		}
+		if len(detail.Actions) == 1 && detail.Actions[0] == pb.ActionType_DETAIL && detail.Msg != "" {
+			authzErr.Errors = append(authzErr.Errors, detail.Msg)
+			continue
+		}
+		q := &authz.Queue{
+			Exact:  detail.Exact,
+			Prefix: detail.Prefix,
+		}
+		for _, a := range detail.Actions {
+			q.Actions = append(q.Actions, authz.Action(a.String()))
+		}
+		authzErr.Failed = append(authzErr.Failed, q)
+	}
+	return authzErr
+}
+
+func depErrorFromStat(stat *status.Status) error {
+	if stat.Code() != codes.NotFound {
+		return errors.Wrap(stat.Err(), "expected NotFound, got something else")
+	}
+	// Dependency error, should have details.
+	depErr := entroq.DependencyError{
+		Message: stat.Err().Error(),
+	}
+	for _, det := range stat.Details() {
+		detail, ok := det.(*pb.ModifyDep)
+		if !ok {
+			return errors.Errorf("grpc unexpected dependency type %T: %+v", det, det)
+		}
+		if detail.Type == pb.ActionType_DETAIL {
+			if detail.Msg != "" {
+				depErr.Message += fmt.Sprintf(": %s", detail.Msg)
+			}
+			continue
+		}
+
+		tid, err := fromTaskIDProto(detail.Id)
+		if err != nil {
+			return errors.Wrap(err, "grpc dependency from proto")
+		}
+		switch detail.Type {
+		case pb.ActionType_CLAIM:
+			depErr.Claims = append(depErr.Claims, tid)
+		case pb.ActionType_DELETE:
+			depErr.Deletes = append(depErr.Deletes, tid)
+		case pb.ActionType_CHANGE:
+			depErr.Changes = append(depErr.Changes, tid)
+		case pb.ActionType_DEPEND:
+			depErr.Depends = append(depErr.Depends, tid)
+		case pb.ActionType_INSERT:
+			depErr.Inserts = append(depErr.Inserts, tid)
+		default:
+			return errors.Errorf("grpc dependency unknown type %v in detail %v", detail.Type, detail)
+		}
+	}
+	return depErr
+}
+
+func unpackGRPCError(grpcErr error) error {
+	if grpcErr == nil {
+		return nil
+	}
+	stat, ok := status.FromError(grpcErr)
+	if !ok {
+		return grpcErr
+	}
+	switch stat.Code() {
+	case codes.NotFound:
+		return depErrorFromStat(stat)
+	case codes.PermissionDenied:
+		return authzErrFromStat(stat)
+	default:
+		return grpcErr
+	}
 }
 
 // Modify modifies the task system with the given batch of modifications.
@@ -428,49 +509,7 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 
 	resp, err := pb.NewEntroQClient(b.conn).Modify(ctx, req)
 	if err != nil {
-		switch stat := status.Convert(errors.Cause(err)); stat.Code() {
-		case codes.NotFound:
-			// Dependency error, should have details.
-			depErr := entroq.DependencyError{
-				Message: err.Error(),
-			}
-			for _, det := range stat.Details() {
-				detail, ok := det.(*pb.ModifyDep)
-				if !ok {
-					return nil, nil, errors.Errorf("grpc modify unexpected detail type %T: %+v", det, det)
-				}
-				if detail.Type == pb.ActionType_DETAIL {
-					if detail.Msg != "" {
-						depErr.Message += fmt.Sprintf(": %s", detail.Msg)
-					}
-					continue
-				}
-
-				tid, err := fromTaskIDProto(detail.Id)
-				if err != nil {
-					return nil, nil, errors.Wrap(err, "grpc modify from proto")
-				}
-				switch detail.Type {
-				case pb.ActionType_CLAIM:
-					depErr.Claims = append(depErr.Claims, tid)
-				case pb.ActionType_DELETE:
-					depErr.Deletes = append(depErr.Deletes, tid)
-				case pb.ActionType_CHANGE:
-					depErr.Changes = append(depErr.Changes, tid)
-				case pb.ActionType_DEPEND:
-					depErr.Depends = append(depErr.Depends, tid)
-				case pb.ActionType_INSERT:
-					depErr.Inserts = append(depErr.Inserts, tid)
-				default:
-					return nil, nil, errors.Errorf("grpc modify unknown type %v in detail %v", detail.Type, detail)
-				}
-			}
-			return nil, nil, errors.Wrap(depErr, "grpc modify dependency")
-		// TODO:
-		// case codes.PermissionDenied:
-		default:
-			return nil, nil, errors.Wrap(err, "grpc modify")
-		}
+		return nil, nil, errors.Wrap(unpackGRPCError(err), "grpc modify")
 	}
 
 	for _, t := range resp.GetInserted() {
@@ -495,7 +534,7 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 func (b *backend) Time(ctx context.Context) (time.Time, error) {
 	resp, err := pb.NewEntroQClient(b.conn).Time(ctx, new(pb.TimeRequest))
 	if err != nil {
-		return time.Time{}, errors.Wrap(err, "grpc time")
+		return time.Time{}, errors.Wrap(unpackGRPCError(err), "grpc time")
 	}
 	return fromMS(resp.TimeMs).UTC(), nil
 }

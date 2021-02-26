@@ -159,8 +159,13 @@ message ModifyDep {
 // which queue/action pairs were not allowed.
 message AuthzDep {
   repeated ActionType actions = 1;
-  string exact = 2; // Double as an error message field for ActionType DETAIL.
+
+  // Matching.
+  string exact = 2;
   string prefix = 3;
+
+  // Errors. When type is DETAIL.
+  string msg = 4;
 }
 
 // TasksRequest is sent to request a complete listing of tasks for the

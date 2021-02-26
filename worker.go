@@ -76,7 +76,7 @@ func (e *MoveTaskError) Error() string {
 // error indicates a worker task should be moved to the error queue instead o
 // causing the worker to exit.
 func AsMoveTaskError(err error) (*MoveTaskError, bool) {
-	cause := errors.Cause(err)
+	cause := errors.Unwrap(err)
 	mte, ok := cause.(*MoveTaskError)
 	return mte, ok
 }

@@ -3,6 +3,7 @@ package authz // import "entrogo.com/entroq/pkg/authz"
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -151,4 +152,9 @@ func (e *AuthzError) Error() string {
 		vals = append(vals, fmt.Sprint(e.Errors))
 	}
 	return fmt.Sprintf("authorization failed: %s", strings.Join(vals, "; "))
+}
+
+// IsAuthz determines whether an error is an authorization error.
+func IsAuthz(err error) bool {
+	return errors.Is(err, new(AuthzError))
 }

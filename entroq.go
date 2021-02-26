@@ -676,7 +676,7 @@ func IsCanceled(err error) bool {
 	if err == nil {
 		return false
 	}
-	err = errors.Cause(err)
+	err = errors.Unwrap(err)
 	if err == context.Canceled {
 		return true
 	}
@@ -693,7 +693,7 @@ func IsTimeout(err error) bool {
 	if err == nil {
 		return false
 	}
-	err = errors.Cause(err)
+	err = errors.Unwrap(err)
 	if err == context.DeadlineExceeded {
 		return true
 	}
@@ -1362,8 +1362,7 @@ func (m DependencyError) Error() string {
 
 // AsDependency indicates whether the given error is a dependency error.
 func AsDependency(err error) (DependencyError, bool) {
-	// Force two-lvalue context.
-	d, ok := errors.Cause(err).(DependencyError)
+	d, ok := errors.Unwrap(err).(DependencyError)
 	return d, ok
 }
 
