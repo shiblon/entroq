@@ -488,3 +488,115 @@ naive implementation of MapReduce, in `contrib/mr`. If you look in there, you
 will see numerous idiomatic uses of the competing queue concept, complete with
 workers, using queue empty tests a part of system semantics, queues assigned to
 specific processes, and others.
+
+## Authorization
+
+EntroQ, when run by itself, doesn't do any authorization. If you simply include
+the library into a process, and access the backends directly (not the gRPC
+backend), then authorization is, in fact, not possible: you just have access to
+everything.
+
+If you do want to include authorization, however, there's good news: the gRPC
+service *does* allow authorization, and there is an OPA-based implementation of
+it ready to go and available for both in-memory and postgres backends.
+
+To use the OPA-HTTP strategy (where gRPC service request authorization is sent
+to the Open Policy Agent to get authorization approval or failure messages),
+you can specify the `--authz=opahttp` flag on the command line for the various
+services you can run.
+
+Note that this means that you would need to have a working OPA instance with
+appropriate packages running at a location that you can specify.
+
+### How it Works
+
+The `eqc` client has the ability to accept an authorization token, which it
+passes through gRPC in the standard `Authorization: Bearer <token>` HTTP
+header. If the OPA HTTP authorization strategy is enabled in the service flags,
+the server then packages up this header into a request, along with the desired
+actions on the desired queues (e.g., a claim on an inbox queue), and sends that
+request along to OPA.
+
+The authorization token is passed in two places: within the request itself, and
+in the standard `Authorization` HTTP header. This gives you some flexibility:
+you can use the OPA system authorization to get an `input.identity` created for
+you, or you can just unpack the input fields and do that by hand, bypassing the
+OPA internal authorization and just focusing on getting answers about your
+specific query.
+
+OPA must then have an `entroq.authz` package that is shapaed like an
+`authz.AuthzError` type, defined in [the authz package](pkg/authz/authz.go).
+
+The [opadata](pkg/authz/opadata) directory contains configurations that work in
+precisely this way, but it is important to understand the delineation of
+responsibilities first:
+
+- EntroQ client:
+  - Sends the authorization token in an `Authorization` header when asked.
+
+- EntroQ service:
+  - Forwards the `Authorization` header to OPA with a [request](pkg/authz/authz.go) representing desired queues and actions.
+  - Unpackes the OPA response and allows or disallows the request, accordingly.
+  - Packages up any unauthorized responses into structured errors for the client, if structure is desired.
+
+- OPA:
+  - Unpack the authorization token to get user information, if any.
+  - Produce a set of "permitted queues and actions" that can be matched against the request.
+  - Compare and produce either "allow" or a set of "failed" queues and actions, with error messages.
+
+- Some other system:
+  - Do authentication, generate tokens.
+
+Of note: there are two critical responsibilities that EntroQ *does not
+participate in at all*:
+
+- Generation of authorization tokens (from an authentication process), and
+- Interpretation of authorization tokens.
+
+Another system must be used for authentication and production of valid tokens
+for a user. EntroQ has zero opinions on that matter.
+
+Furthermore, OPA only *inspects* the authorization token, it does not produce
+one.
+
+Because EntroQ is particular about what it sends as "input" and what it
+receives as a "document" (in OPA parlance), some core OPA packages are already
+provided for you, under [authz/opadata](pkg/authz/opadata/conf/core). These
+files should be used without alteration in any OPA configuration that you
+ultimately use. They contain mehods for comparing queue specs, and the
+`entroq.authz` package in particular ensures that data is both properly shaped
+and has proper error semantics for a reply.
+
+The system user (deployer) is responsible for providing the following values:
+
+- `entroq.permissions.allowed_queues`: a set of queue specifications shaped like `Queue` in [authz](pkg/authz), and
+- `entroq.user.username`: a string containing a username, can be empty or undefined.
+
+Example configurations that are not terribly secure in how users are determined
+(e.g., no JWT validation) are found in
+[authz/opadata/conf/example](pkg/authz/opadata/conf/example), and policy data
+in the shape understood by those example files is found in
+[authz/opadata/policy/example](pkg/authz/opadata/policy/example).
+
+All of these have associated tests that can be run in the standard way, or you
+can invoke them using `go test` inside the `authz` direcory.
+
+These examples are used in [contrib/opa-compose](contrib/opa-compose), where a
+`docker-compose.yaml` file shows an example of how you might set up an EntroQ
+and OPA instance side by side, using simple JWT tokens to hold `sub` claims
+with usernames.
+
+The basic idea is this:
+
+- Define `entroq.user.username` such that the username is safely pulled from
+  whatever kind of token *your system* needs.
+- Define `entroq.permissions.allowed_queues` to contain all queue
+  specifications that are relevant for the user you get from `entroq.user`.
+- Define policy in whatever way you prefer (there are many possibilities of how
+  to provide "data" to OPA - we chose, for our example, to provide it as an
+  `entroq.policy` package, but you may choose to use a data service, push
+  documents directly into OPA, etc.).
+
+After that, the core files and EntroQ itself do the rest. You just have to have
+valid tokens, which you will need to get from somewhere, and OPA will need to
+know enough to unpack and validate them (e.g., it might need the signing key).
