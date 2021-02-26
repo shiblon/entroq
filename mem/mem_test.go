@@ -12,160 +12,71 @@ import (
 	"entrogo.com/entroq/qsvc/qtest"
 )
 
-func TestSimpleSequence(t *testing.T) {
+func RunQTest(t *testing.T, tester qtest.Tester) {
+	t.Helper()
 	ctx := context.Background()
-
 	client, stop, err := qtest.ClientService(ctx, Opener())
 	if err != nil {
 		t.Fatalf("Get client: %v", err)
 	}
 	defer stop()
+	tester(ctx, t, client, "")
+}
 
-	qtest.SimpleSequence(ctx, t, client, "")
+func TestSimpleSequence(t *testing.T) {
+	RunQTest(t, qtest.SimpleSequence)
 }
 
 func TestTasksWithID(t *testing.T) {
-	ctx := context.Background()
-
-	client, stop, err := qtest.ClientService(ctx, Opener())
-	if err != nil {
-		t.Fatalf("Get client: %v", err)
-	}
-	defer stop()
-
-	qtest.TasksWithID(ctx, t, client, "")
+	RunQTest(t, qtest.TasksWithID)
 }
 
 func TestTasksOmitValue(t *testing.T) {
-	ctx := context.Background()
-
-	client, stop, err := qtest.ClientService(ctx, Opener())
-	if err != nil {
-		t.Fatalf("Get client: %v", err)
-	}
-	defer stop()
-
-	qtest.TasksOmitValue(ctx, t, client, "")
+	RunQTest(t, qtest.TasksOmitValue)
 }
 
 func TestTasksWithIDOnly(t *testing.T) {
-	ctx := context.Background()
-
-	client, stop, err := qtest.ClientService(ctx, Opener())
-	if err != nil {
-		t.Fatalf("Get client: %v", err)
-	}
-	defer stop()
-
-	qtest.TasksWithIDOnly(ctx, t, client, "")
+	RunQTest(t, qtest.TasksWithIDOnly)
 }
 
 func TestInsertWithID(t *testing.T) {
-	ctx := context.Background()
-
-	client, stop, err := qtest.ClientService(ctx, Opener())
-	if err != nil {
-		t.Fatalf("Get client: %v", err)
-	}
-	defer stop()
-
-	qtest.InsertWithID(ctx, t, client, "")
+	RunQTest(t, qtest.InsertWithID)
 }
 
 func TestSimpleChange(t *testing.T) {
-	ctx := context.Background()
-
-	client, stop, err := qtest.ClientService(ctx, Opener())
-	if err != nil {
-		t.Fatalf("Get client: %v", err)
-	}
-	defer stop()
-
-	qtest.SimpleChange(ctx, t, client, "")
+	RunQTest(t, qtest.SimpleChange)
 }
 
 func TestSimpleWorker(t *testing.T) {
-	ctx := context.Background()
-
-	client, stop, err := qtest.ClientService(ctx, Opener())
-	if err != nil {
-		t.Fatalf("Get client: %v", err)
-	}
-	defer stop()
-
-	qtest.SimpleWorker(ctx, t, client, "")
+	RunQTest(t, qtest.SimpleWorker)
 }
 
 func TestMultiWorker(t *testing.T) {
-	ctx := context.Background()
-
-	client, stop, err := qtest.ClientService(ctx, Opener())
-	if err != nil {
-		t.Fatalf("Get client: %v", err)
-	}
-	defer stop()
-
-	qtest.MultiWorker(ctx, t, client, "")
+	RunQTest(t, qtest.MultiWorker)
 }
 
 func TestWorkerDependencyHandler(t *testing.T) {
-	ctx := context.Background()
-
-	client, stop, err := qtest.ClientService(ctx, Opener())
-	if err != nil {
-		t.Fatalf("Get client: %v", err)
-	}
-	defer stop()
-
-	qtest.WorkerDependencyHandler(ctx, t, client, "")
+	RunQTest(t, qtest.WorkerDependencyHandler)
 }
 
 func TestWorkerMoveOnError(t *testing.T) {
-	ctx := context.Background()
+	RunQTest(t, qtest.WorkerMoveOnError)
+}
 
-	client, stop, err := qtest.ClientService(ctx, Opener())
-	if err != nil {
-		t.Fatalf("Get client: %v", err)
-	}
-	defer stop()
-
-	qtest.WorkerMoveOnError(ctx, t, client, "")
+func TestWorkerRetryOnError(t *testing.T) {
+	RunQTest(t, qtest.WorkerRetryOnError)
 }
 
 func TestWorkerRenewal(t *testing.T) {
-	ctx := context.Background()
-
-	client, stop, err := qtest.ClientService(ctx, Opener())
-	if err != nil {
-		t.Fatalf("Get client: %v", err)
-	}
-	defer stop()
-
-	qtest.WorkerRenewal(ctx, t, client, "")
+	RunQTest(t, qtest.WorkerRenewal)
 }
 
 func TestQueueMatch(t *testing.T) {
-	ctx := context.Background()
-
-	client, stop, err := qtest.ClientService(ctx, Opener())
-	if err != nil {
-		t.Fatalf("Get client: %v", err)
-	}
-	defer stop()
-
-	qtest.QueueMatch(ctx, t, client, "")
+	RunQTest(t, qtest.QueueMatch)
 }
 
 func TestQueueStats(t *testing.T) {
-	ctx := context.Background()
-
-	client, stop, err := qtest.ClientService(ctx, Opener())
-	if err != nil {
-		t.Fatalf("Get client: %v", err)
-	}
-	defer stop()
-
-	qtest.QueueStats(ctx, t, client, "")
+	RunQTest(t, qtest.QueueStats)
 }
 
 func TestMapReduce_checkSmall(t *testing.T) {

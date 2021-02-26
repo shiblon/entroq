@@ -615,6 +615,9 @@ func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error 
 
 		return nil
 	})
+	if err != nil {
+		return errors.Wrap(err, "reduce task")
+	}
 
 	outputValue, err := json.Marshal(outputs)
 	if err != nil {

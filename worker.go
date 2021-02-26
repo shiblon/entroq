@@ -3,13 +3,14 @@ package entroq
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
 )
+
+const DefaultRetryDelay = 30 * time.Second
 
 // ErrQMap is a function that maps from an inbox name to its "move on error"
 // error box name. If no mapping is found, a suitable default should be
@@ -48,9 +49,15 @@ type Worker struct {
 	// encountered. if it returns a non-nil error, it will become fatal.
 	OnDepErr DependencyHandler
 
+	// MaxAttempts indicates how many attempts are too many before a retryable
+	// error becomes permanent and the task is moved to an error queue.
+	MaxAttempts int32
+
 	eqc *EntroQ
 
-	lease time.Duration
+	lease          time.Duration
+	wrappedMove    bool          // whether to wrap a moved error task or use the attempt/err fields.
+	baseRetryDelay time.Duration // put AT into the future when using RetryTaskError.
 }
 
 // MoveTaskError causes a task to be completely serialized, wrapped in a
@@ -59,24 +66,32 @@ type Worker struct {
 // and we want to stash them somewhere instead of just causing the worker to
 // crash, but allows us to handle that as an early error return.
 type MoveTaskError struct {
-	Err error
+	Err     error
+	Renewed []*Task
 }
 
 // NewMoveTaskError creates a new MoveTaskError from the given error.
 func NewMoveTaskError(err error) *MoveTaskError {
-	return &MoveTaskError{err}
+	return &MoveTaskError{Err: err}
 }
 
 // Error produces an error string.
 func (e *MoveTaskError) Error() string {
-	return fmt.Sprintf("task-specific, movable: %v", e.Err)
+	return e.Err.Error()
+}
+
+// SetRenewedTask allows upstream callers (like DoWithRenew) to set the renewed
+// task in the error itself, so that version skew may be overcome when doing
+// things like moving or retrying a task (incrementing attempts, etc.).
+func (e *MoveTaskError) SetRenewedTask(t ...*Task) {
+	e.Renewed = t
 }
 
 // AsMoveTaskError returns the underlying error and true iff the underlying
 // error indicates a worker task should be moved to the error queue instead o
 // causing the worker to exit.
 func AsMoveTaskError(err error) (*MoveTaskError, bool) {
-	cause := errors.Unwrap(err)
+	cause := errors.Cause(err)
 	mte, ok := cause.(*MoveTaskError)
 	return mte, ok
 }
@@ -88,6 +103,40 @@ type ErrorTaskValue struct {
 	Err  string `json:"err"`
 }
 
+// RetryTaskError causes a task to be retried, incrementing its Attempt field
+// and setting its Err to the text of the error. If MaxAttempts is positive and
+// nonzero, and has been reached, then this behaves in the same ways as a
+// MoveTaskError.
+type RetryTaskError struct {
+	Err     error
+	Renewed []*Task
+}
+
+// NewRetryTaskError creates a new RetryTaskError from the given error.
+func NewRetryTaskError(err error) *RetryTaskError {
+	return &RetryTaskError{Err: err}
+}
+
+// SetRenewedTask allows upstream callers (like DoWithRenew) to set the renewed
+// task in the error itself, so that version skew may be overcome when doing
+// things like moving or retrying a task (incrementing attempts, etc.).
+func (e *RetryTaskError) SetRenewedTask(t ...*Task) {
+	e.Renewed = t
+}
+
+// Error produces an error string.
+func (e *RetryTaskError) Error() string {
+	return e.Err.Error()
+}
+
+// AsRetryTaskError returns the underlying error and true iff the underlying
+// error is a retry error.
+func AsRetryTaskError(err error) (*RetryTaskError, bool) {
+	cause := errors.Cause(err)
+	rte, ok := cause.(*RetryTaskError)
+	return rte, ok
+}
+
 // NewWorker creates a new worker that makes it easy to claim and operate on
 // tasks in an endless loop.
 func NewWorker(eq *EntroQ, qs ...string) *Worker {
@@ -97,6 +146,8 @@ func NewWorker(eq *EntroQ, qs ...string) *Worker {
 
 		eqc:   eq,
 		lease: DefaultClaimDuration,
+
+		baseRetryDelay: DefaultRetryDelay,
 	}
 }
 
@@ -119,7 +170,37 @@ func (w *Worker) WithOpts(opts ...WorkerOption) *Worker {
 // a queue specified by calling ErrQMap on the original queue name.
 // This is useful for keeping track of failed tasks by moving them out of the
 // way instead of deleting them or allowing them to be picked up again.
+//
+// If this function returns a RetryTaskError, the original task has its attempt
+// field incremented, the err field is updated to contain the text of the
+// error, and the worker goes around again, leaving it to be reclaimed. If the
+// maximum number of attempts has been reached, however, the error acts like a
+// MoveTaskError, instead.
 type Work func(ctx context.Context, task *Task) ([]ModifyArg, error)
+
+func (w *Worker) moveTaskWithError(ctx context.Context, task *Task, newQ string, taskErr error, incrementAttempt bool) error {
+	if w.wrappedMove {
+		if incrementAttempt {
+			task.Attempt++
+		}
+		newVal, err := json.Marshal(&ErrorTaskValue{Task: task, Err: taskErr.Error()})
+		if err != nil {
+			return errors.Wrapf(err, "trying to marshal movable task with own error: %q", taskErr)
+		}
+		if _, _, err := w.eqc.Modify(ctx, task.AsDeletion(), InsertingInto(newQ, WithValue(newVal))); err != nil {
+			return errors.Wrapf(err, "trying to insert movable task with own error: %q", taskErr)
+		}
+		return nil
+	}
+	changeArgs := []ChangeArg{QueueTo(newQ), ErrTo(errors.Cause(taskErr).Error())}
+	if incrementAttempt {
+		changeArgs = append(changeArgs, AttemptToNext())
+	}
+	if _, _, err := w.eqc.Modify(ctx, task.AsChange(changeArgs...)); err != nil {
+		return errors.Wrapf(err, "trying to modify attempts and error message for moving task: %q", taskErr)
+	}
+	return nil
+}
 
 // Run attempts to run the given function once per each claimed task, in a
 // loop, until the context is canceled or an unrecoverable error is
@@ -131,14 +212,18 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 		return errors.New("No queues specified to work on")
 	}
 	defer func() {
-		log.Printf("Finishing EntroQ worker %q on client %v: err=%v", w.Qs, w.eqc.ID(), err)
+		if err == nil {
+			log.Printf("Graceful completion of worker %q for claimant %v", w.Qs, w.eqc.ID())
+		} else {
+			log.Printf("Worker quit for claimant %v: %v", w.eqc.ID(), err)
+		}
 	}()
 	log.Printf("Starting EntroQ worker %q on client %v, leasing for %v at a time", w.Qs, w.eqc.ID(), w.lease)
 
 	for {
 		select {
 		case <-ctx.Done():
-			return errors.Wrapf(ctx.Err(), "worker quit (%q)", w.Qs)
+			return errors.Wrap(ctx.Err(), "worker quit")
 		default:
 		}
 
@@ -150,39 +235,62 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 		errQ := w.ErrQMap(task.Queue)
 
 		var args []ModifyArg
-		renewed, err := w.eqc.DoWithRenew(ctx, task, w.lease, func(ctx context.Context) error {
+		renewed, workErr := w.eqc.DoWithRenew(ctx, task, w.lease, func(ctx context.Context) error {
 			var err error
 			if args, err = f(ctx, task); err != nil {
-				return errors.Wrapf(err, "worker run with renew (%q)", w.Qs)
+				return errors.Wrapf(err, "work (%q)", w.Qs)
 			}
 			return nil
 		})
-		if err != nil {
-			log.Printf("Worker error (%q): %v", w.Qs, err)
-			if _, ok := AsDependency(err); ok {
+		if workErr != nil {
+			if _, ok := AsDependency(workErr); ok {
 				log.Printf("Worker continuing after dependency (%q)", w.Qs)
 				continue
 			}
-			if IsTimeout(err) {
+			if IsTimeout(workErr) {
 				log.Printf("Worker continuing after timeout (%q)", w.Qs)
 				continue
 			}
-			if IsCanceled(err) {
-				log.Printf("Worker shutting down cleanly (%q)", w.Qs)
+			if IsCanceled(workErr) {
 				return nil
 			}
-			if _, ok := AsMoveTaskError(err); ok {
-				log.Printf("Worker moving error task to %q instead of exiting: %v", errQ, err)
-				newVal, marshalErr := json.Marshal(&ErrorTaskValue{Task: task, Err: err.Error()})
-				if marshalErr != nil {
-					return errors.Wrapf(marshalErr, "trying to marshal movable task with own error: %q", err)
+			if retryErr, ok := AsRetryTaskError(workErr); ok {
+				log.Printf("Worker received retryable error, incrementing attempt: %v", workErr)
+				renewed := task
+				if len(retryErr.Renewed) != 0 {
+					renewed = retryErr.Renewed[0]
 				}
-				if _, _, insErr := w.eqc.Modify(ctx, task.AsDeletion(), InsertingInto(errQ, WithValue(newVal))); err != nil {
-					return errors.Wrapf(insErr, "trying to insert movable task with own error: %q", err)
+
+				if w.MaxAttempts > 1 && renewed.Attempt+1 >= w.MaxAttempts {
+					// Move instead - we retried enough times already.
+					log.Printf("Worker max attempts reached, moving to %q instead of retrying: %v", errQ, workErr)
+					if err := w.moveTaskWithError(ctx, renewed, errQ, workErr, true); err != nil {
+						return errors.Wrap(err, "move work task instead of retry")
+					}
+				} else {
+					// Can retry. Increment attempts and move on.
+					if _, _, err := w.eqc.Modify(ctx, renewed.AsChange(
+						ErrTo(errors.Cause(workErr).Error()),
+						AttemptToNext(),
+						ArrivalTimeBy(w.baseRetryDelay))); err != nil {
+						return errors.Wrap(err, "retry task")
+					}
 				}
 				continue
 			}
-			return errors.Wrapf(err, "worker error (%q)", w.Qs)
+			if moveErr, ok := AsMoveTaskError(workErr); ok {
+				log.Printf("Worker moving to %q: %v", errQ, workErr)
+				renewed := task
+				if len(moveErr.Renewed) != 0 {
+					renewed = moveErr.Renewed[0]
+				}
+
+				if err := w.moveTaskWithError(ctx, renewed, errQ, workErr, false); err != nil {
+					return errors.Wrap(err, "move work task")
+				}
+				continue
+			}
+			return errors.Wrap(workErr, "worker error")
 		}
 
 		modification := NewModification(uuid.Nil, args...)
@@ -273,6 +381,36 @@ func WithErrQMap(f ErrQMap) WorkerOption {
 func WithDependencyHandler(f DependencyHandler) WorkerOption {
 	return func(w *Worker) {
 		w.OnDepErr = f
+	}
+}
+
+// WithMaxAttempts sets the maximum attempts that are allowed before a
+// RetryTaskError turns into a MoveTaskError (transparently). If this value is
+// 0 (the default), then there is no maximum, and attempts can be incremented
+// indefinitely without a move to an error queue.
+func WithMaxAttempts(m int32) WorkerOption {
+	return func(w *Worker) {
+		w.MaxAttempts = m
+	}
+}
+
+// WithBaseRetryDelay sets the base delay for a retried task (the first
+// attempt). Without any backoff settings, this is used for every retry. When
+// used, the task is modified when its attempt is incremented to have its
+// availabiliy time incremented by this amount from now.
+func WithBaseRetryDelay(d time.Duration) WorkerOption {
+	return func(w *Worker) {
+		w.baseRetryDelay = d
+	}
+}
+
+// WithWrappedMove changes behavior of a MoveTaskError to wrap the entire task
+// into a brand new error task, where the old task is serialized into bytes and
+// stored as the new tas's value. The default is to use Attempt and Err to
+// store necessary data in the existing task, instead.
+func WithWrappedMove(on bool) WorkerOption {
+	return func(w *Worker) {
+		w.wrappedMove = on
 	}
 }
 
