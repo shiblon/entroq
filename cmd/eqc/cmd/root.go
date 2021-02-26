@@ -84,6 +84,8 @@ queue listings, individual task information, etc.`,
 		}
 		return nil
 	},
+	SilenceUsage:  true,
+	SilenceErrors: true,
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.

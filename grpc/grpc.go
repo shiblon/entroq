@@ -326,6 +326,8 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 	var tasks []*entroq.Task
 	for {
 		resp, err := stream.Recv()
+		// TODO:
+		// case codes.PermissionDenied:
 		if err == io.EOF {
 			break
 		}
@@ -361,6 +363,8 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 			PollMs:     int64(cq.PollTime / time.Millisecond),
 		})
 		if err != nil {
+			// TODO:
+			// case codes.PermissionDenied:
 			if entroq.IsTimeout(err) {
 				// If we just timed out on our little request context, then
 				// we can go around again.
@@ -385,6 +389,8 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 		Queues:     cq.Queues,
 		DurationMs: int64(cq.Duration / time.Millisecond),
 	})
+	// TODO:
+	// case codes.PermissionDenied:
 	if err != nil {
 		return nil, errors.Wrap(err, "grpc try claim")
 	}
@@ -433,7 +439,7 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 				if !ok {
 					return nil, nil, errors.Errorf("grpc modify unexpected detail type %T: %+v", det, det)
 				}
-				if detail.Type == pb.DepType_DETAIL {
+				if detail.Type == pb.ActionType_DETAIL {
 					if detail.Msg != "" {
 						depErr.Message += fmt.Sprintf(": %s", detail.Msg)
 					}
@@ -445,21 +451,23 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 					return nil, nil, errors.Wrap(err, "grpc modify from proto")
 				}
 				switch detail.Type {
-				case pb.DepType_CLAIM:
+				case pb.ActionType_CLAIM:
 					depErr.Claims = append(depErr.Claims, tid)
-				case pb.DepType_DELETE:
+				case pb.ActionType_DELETE:
 					depErr.Deletes = append(depErr.Deletes, tid)
-				case pb.DepType_CHANGE:
+				case pb.ActionType_CHANGE:
 					depErr.Changes = append(depErr.Changes, tid)
-				case pb.DepType_DEPEND:
+				case pb.ActionType_DEPEND:
 					depErr.Depends = append(depErr.Depends, tid)
-				case pb.DepType_INSERT:
+				case pb.ActionType_INSERT:
 					depErr.Inserts = append(depErr.Inserts, tid)
 				default:
 					return nil, nil, errors.Errorf("grpc modify unknown type %v in detail %v", detail.Type, detail)
 				}
 			}
 			return nil, nil, errors.Wrap(depErr, "grpc modify dependency")
+		// TODO:
+		// case codes.PermissionDenied:
 		default:
 			return nil, nil, errors.Wrap(err, "grpc modify")
 		}

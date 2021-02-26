@@ -7,6 +7,8 @@ services:
       - "--authz=opahttp"
       - "--opa_url=http://opa:8181"
       - "--opa_path=/v1/data/entroq/authz"
+    ports:
+      - 37706:37706
 
   opa:
     image: openpolicyagent/opa:0.26.0

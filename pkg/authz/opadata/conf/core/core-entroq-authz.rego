@@ -25,17 +25,6 @@ import data.entroq.permissions
 import data.entroq.queues
 import data.entroq.user.username
 
-user = u {
-  u := username
-}
-
-default allow = false
-allow {
-  user
-  not failed
-  not errors
-}
-
 failed[q] {
   q := queues.disallowed(input.queues, permissions.allowed_queues)[_]
 }
@@ -45,14 +34,24 @@ failed[q] {
 # queues*, which can happen in several circumstances (like a username not
 # present in the query).
 errors[msg] {
-  not user
+  not username
   msg := "No username found"
 }
 errors[msg] {
-  user == ""
+  username == ""
   msg := "Empty username found"
 }
+# Add a message containing user information if there are queue mismatches.
 errors[msg] {
   count(failed) > 0
-  msg := "Some queue/actions were not authorized"
+  username
+  msg := concat("User: ", username)
 }
+
+default allow = false
+allow {
+  username
+  not failed
+  not errors
+}
+
