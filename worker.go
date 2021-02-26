@@ -261,7 +261,7 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 					renewed = retryErr.Renewed[0]
 				}
 
-				if w.MaxAttempts > 1 && renewed.Attempt+1 >= w.MaxAttempts {
+				if w.MaxAttempts != 0 && renewed.Attempt+1 >= w.MaxAttempts {
 					// Move instead - we retried enough times already.
 					log.Printf("Worker max attempts reached, moving to %q instead of retrying: %v", errQ, workErr)
 					if err := w.moveTaskWithError(ctx, renewed, errQ, workErr, true); err != nil {
