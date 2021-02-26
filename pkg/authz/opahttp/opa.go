@@ -125,7 +125,7 @@ func (a *OPA) Authorize(ctx context.Context, req *authz.Request) error {
 	}
 
 	// Check result value.
-	if e := result.Result; e != nil && !e.Success() {
+	if e := result.Result; !e.Allow {
 		// We got an error with information about missing queue/actions.
 		return e
 	}

@@ -3,9 +3,7 @@ package authz // import "entrogo.com/entroq/pkg/authz"
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
 
 	yaml "gopkg.in/yaml.v2"
@@ -106,13 +104,19 @@ type Queue struct {
 	Actions []Action `yaml:",flow" json:"actions"`
 }
 
-// String creates a readable representation of a queue.
+// String produces a simple string representing this queue spec.
 func (q *Queue) String() string {
-	b, err := json.Marshal(q)
-	if err != nil {
-		log.Fatalf("Impossible situation: can't serialize a simple, known struct into JSON: %v", err)
+	vals := []string{
+		fmt.Sprint(q.Actions),
 	}
-	return string(b)
+	if q.Exact != "" {
+		vals = append(vals, fmt.Sprintf("q:%s", q.Exact))
+	}
+	if q.Prefix != "" {
+		vals = append(vals, fmt.Sprintf("p:%s", q.Prefix))
+	}
+
+	return strings.Join(vals, " ")
 }
 
 // AuthzError contains the reply from OPA.
@@ -123,8 +127,6 @@ type AuthzError struct {
 	// for other reasons, like parsing JSON with no known fields present.
 	Allow bool `json:"allow"`
 
-	// User holds the inferred username. It must be present in a reply.
-	User string `json:"user"`
 	// Failed contains the queue information for things that were not
 	// found to be allowed by the policy. It will only contain the actions that
 	// were not matched. If multiple actions were desired for a single queue,
@@ -135,24 +137,18 @@ type AuthzError struct {
 	Errors []string `json:"errors"`
 }
 
-// Success returns whether this error represents success (instead of an auth error).
-func (e *AuthzError) Success() bool {
-	return e == nil || (e.User != "" && len(e.Errors) == 0 && len(e.Failed) == 0)
-}
-
 // Error satisfies the error interface, producing a string error that contains
 // unmatched queue/action information.
 func (e *AuthzError) Error() string {
-	if e.Success() {
-		return "Success"
+	if e.Allow {
+		return "authorization OK"
 	}
-
-	results := []string{
-		fmt.Sprintf("user %q not authorized: %v", e.User, strings.Join(e.Errors, "; ")),
+	var vals []string
+	if len(e.Failed) != 0 {
+		vals = append(vals, fmt.Sprint(e.Failed))
 	}
-
-	for _, q := range e.Failed {
-		results = append(results, "Queue/Action mismatch: "+q.String())
+	if len(e.Errors) != 0 {
+		vals = append(vals, fmt.Sprint(e.Errors))
 	}
-	return strings.Join(results, "\n")
+	return fmt.Sprintf("authorization failed: %s", strings.Join(vals, "; "))
 }

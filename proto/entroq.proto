@@ -135,22 +135,32 @@ message ModifyResponse {
   repeated Task changed = 2;
 }
 
-enum DepType {
+enum ActionType {
   CLAIM = 0;
   DELETE = 1;
   CHANGE = 2;
   DEPEND = 3;
   DETAIL = 4;
   INSERT = 5;
+
+  READ = 6;
 }
 
 // ModifyDep can be returned with a gRPC NotFound status indicating which
 // dependencies failed. This is done via the gRPC error return, not directly
 // in the response proto.
 message ModifyDep {
-  DepType type = 1;
+  ActionType type = 1;
   TaskID id = 2;
   string msg = 3; // Usually only used with type=DETAIL.
+}
+
+// AuthzDep can be returned with a gRPC PermissionDenied status indicating
+// which queue/action pairs were not allowed.
+message AuthzDep {
+  repeated ActionType actions = 1;
+  string exact = 2; // Double as an error message field for ActionType DETAIL.
+  string prefix = 3;
 }
 
 // TasksRequest is sent to request a complete listing of tasks for the

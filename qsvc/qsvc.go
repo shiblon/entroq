@@ -34,6 +34,7 @@ package qsvc // import "entrogo.com/entroq/qsvc"
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 
@@ -70,6 +71,8 @@ var (
 
 // QSvc is an EntroQServer.
 type QSvc struct {
+	pb.UnimplementedEntroQServer
+
 	impl *entroq.EntroQ
 
 	metricCancel    context.CancelFunc
@@ -160,7 +163,56 @@ func (s *QSvc) Authorize(ctx context.Context, req *authz.Request) error {
 		return nil
 	}
 
-	return s.az.Authorize(ctx, req)
+	// Most of this is error formatting to provide structured things that can
+	// be unpacked and round-tripped through the grpc transport.
+	if err := s.az.Authorize(ctx, req); err != nil {
+		var details []proto.Message
+		authzErr, ok := errors.Unwrap(err).(*authz.AuthzError)
+		if !ok {
+			return status.New(codes.PermissionDenied, fmt.Sprintf("unknown authz error: %v", err)).Err()
+		}
+
+		for _, msg := range authzErr.Errors {
+			details = append(details, &pb.AuthzDep{
+				Actions: []pb.ActionType{pb.ActionType_DETAIL},
+				Exact:   msg,
+			})
+		}
+		for _, q := range authzErr.Failed {
+			var actions []pb.ActionType
+			for _, a := range q.Actions {
+				switch a {
+				case "READ":
+					actions = append(actions, pb.ActionType_READ)
+				case "INSERT":
+					actions = append(actions, pb.ActionType_INSERT)
+				case "CLAIM":
+					actions = append(actions, pb.ActionType_CLAIM)
+				case "DELETE":
+					actions = append(actions, pb.ActionType_DELETE)
+				case "CHANGE":
+					actions = append(actions, pb.ActionType_CHANGE)
+				default:
+					details = append(details, &pb.AuthzDep{
+						Actions: []pb.ActionType{pb.ActionType_DETAIL},
+						Exact:   fmt.Sprintf("WARNING: Unknown action %q", a),
+					})
+				}
+			}
+			details = append(details, &pb.AuthzDep{
+				Actions: actions,
+				Exact:   q.Exact,
+				Prefix:  q.Prefix,
+			})
+		}
+		stat, sErr := status.New(codes.PermissionDenied, "queue action denied").WithDetails(details...)
+		if sErr != nil {
+			return status.New(codes.PermissionDenied, fmt.Sprintf("queue action denied, unable to add details to %v: %v", err, sErr)).Err()
+		}
+		return stat.Err()
+	}
+
+	return nil
 }
 
 // RefreshMetrics collects stats and exports them as prometheus metrics.
@@ -312,7 +364,7 @@ func (s *QSvc) modifyAuthz(ctx context.Context, req *pb.ModifyRequest) *authz.Re
 // Claim is the blocking version of TryClaim.
 func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
 	if err := s.Authorize(ctx, s.claimAuthz(ctx, req)); err != nil {
-		return nil, errors.Wrap(err, "claim auth")
+		return nil, fmt.Errorf("claim auth: %w", err)
 	}
 
 	claimant, err := uuid.Parse(req.ClaimantId)
@@ -437,16 +489,16 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 	inserted, changed, err := s.impl.Modify(ctx, modArgs...)
 	if err != nil {
 		if depErr, ok := entroq.AsDependency(err); ok {
-			tmap := map[pb.DepType][]*entroq.TaskID{
-				pb.DepType_INSERT: depErr.Inserts,
-				pb.DepType_DEPEND: depErr.Depends,
-				pb.DepType_DELETE: depErr.Deletes,
-				pb.DepType_CHANGE: depErr.Changes,
-				pb.DepType_CLAIM:  depErr.Claims,
+			tmap := map[pb.ActionType][]*entroq.TaskID{
+				pb.ActionType_INSERT: depErr.Inserts,
+				pb.ActionType_DEPEND: depErr.Depends,
+				pb.ActionType_DELETE: depErr.Deletes,
+				pb.ActionType_CHANGE: depErr.Changes,
+				pb.ActionType_CLAIM:  depErr.Claims,
 			}
 
 			details := []proto.Message{&pb.ModifyDep{
-				Type: pb.DepType_DETAIL,
+				Type: pb.ActionType_DETAIL,
 				Msg:  depErr.Message,
 			}}
 			for dtype, dvals := range tmap {
