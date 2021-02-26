@@ -556,7 +556,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 			entroq.WithLease(leaseTime),
 		)
 
-		ctx, cancel := context.WithTimeout(ctx, 2*leaseTime)
+		ctx, cancel := context.WithTimeout(ctx, 4*leaseTime)
 		defer cancel()
 		g, gctx := errgroup.WithContext(ctx)
 		g.Go(func() error {
