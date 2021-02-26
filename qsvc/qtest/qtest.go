@@ -33,6 +33,9 @@ const bufSize = 1 << 20
 // Dialer returns a net connection.
 type Dialer func() (net.Conn, error)
 
+// Tester runs a test helper, all of which these test functions are.
+type Tester func(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string)
+
 // ClientService starts an in-memory gRPC network service via StartService,
 // then creates an EntroQ client that connects to it. It returns the client and
 // a function that can be deferred for cleanup.
@@ -161,6 +164,7 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 	}
 
 	cancel()
+	log.Printf("Is canceled: %v", entroq.IsCanceled(g.Wait()))
 	if err := g.Wait(); err != nil && !entroq.IsCanceled(err) {
 		t.Fatalf("Worker exit error: %v", err)
 	}
@@ -215,13 +219,11 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	g, ctx := errgroup.WithContext(ctx)
 
 	for i := 0; i < numWorkers; i++ {
-		i := i
 		g.Go(func() error {
 			ti := 0
 			w := client.NewWorker(bigQueue, medQueue, smallQueue)
 			err := w.Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
 				ti++
-				fmt.Printf("Got task (%d@%d): %v\n", ti, i, task.Queue)
 				if task.Claims != 1 {
 					return nil, errors.Errorf("worker claim expected to be 1, was %d", task.Claims)
 				}
@@ -366,37 +368,178 @@ func WorkerDependencyHandler(ctx context.Context, t *testing.T, client *entroq.E
 	}
 }
 
-// WorkerMoveOnError tests that workers that have JustMoveTaskError results
+// WorkerRetryOnError test that workers that have RetryTaskError results
+// increment attempts and set the error properly. It also checks that after max
+// attempts, things get moved.
+func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	t.Helper()
+
+	newTask := func(val string) *entroq.Task {
+		return &entroq.Task{
+			Queue: path.Join(qPrefix, "retry_on_error", val),
+			ID:    uuid.New(),
+			Value: []byte(val),
+		}
+	}
+
+	type tc struct {
+		name        string
+		input       *entroq.Task
+		maxAttempt  int32
+		wantAttempt int32
+		wantErr     string
+		wantMove    bool
+	}
+
+	cases := []tc{
+		{
+			name:        "retry-no-max",
+			input:       newTask("retry"),
+			maxAttempt:  0,
+			wantAttempt: 1,
+			wantErr:     "retry error: retry",
+			wantMove:    false,
+		},
+		{
+			name:        "retry-larger-max",
+			input:       newTask("with max"),
+			maxAttempt:  3,
+			wantAttempt: 1,
+			wantErr:     "retry error: with max",
+			wantMove:    false,
+		},
+		{
+			name:        "retry-too-many",
+			input:       newTask("too many"),
+			maxAttempt:  1,
+			wantAttempt: 1,
+			wantErr:     "retry error: too many",
+			wantMove:    true,
+		},
+	}
+
+	runWorkerOneCase := func(ctx context.Context, c tc) {
+		t.Helper()
+
+		w := client.NewWorker(c.input.Queue).WithOpts(entroq.WithBaseRetryDelay(0), entroq.WithMaxAttempts(c.maxAttempt))
+
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		// Keep track of the retried task - after we get past attempt 0, we
+		// store it here. Then, if the task was not meant to be moved, we can
+		// see what happened without a separate claim section.
+		retriedTaskCh := make(chan *entroq.Task, 1)
+
+		g, gctx := errgroup.WithContext(ctx)
+		g.Go(func() error {
+			return w.Run(gctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
+				// Only attempt this again if it's the first time.
+				if task.Attempt == 0 {
+					return nil, entroq.NewRetryTaskError(errors.Errorf("retry error: %s", string(task.Value)))
+				}
+				// Save it so we know what happened with the retry error, and clean up.
+				retriedTaskCh <- task
+				return []entroq.ModifyArg{task.AsDeletion()}, nil
+			})
+		})
+
+		// Now stick our task in. The worker is ready and waiting.
+		if _, _, err := client.Modify(ctx, entroq.InsertingInto(c.input.Queue, entroq.WithID(c.input.ID), entroq.WithValue(c.input.Value))); err != nil {
+			t.Fatalf("Test %q insert task: %v", c.name, err)
+		}
+		waitCtx, _ := context.WithTimeout(ctx, 5*time.Second)
+		var changedTask *entroq.Task
+		if c.wantMove {
+			// Expect the queue to become empty, get stuff out of the error queue.
+			if err := client.WaitQueuesEmpty(waitCtx, entroq.MatchExact(c.input.Queue)); err != nil && !entroq.IsCanceled(err) {
+				t.Fatalf("Test %q expected queue %q to become empty, didn't happen: %v", c.name, c.input.Queue, err)
+			}
+			// Now check that it's in the error queue and looks okay.
+			errTasks, err := client.Tasks(ctx, w.ErrQMap(c.input.Queue))
+			if err != nil {
+				t.Fatalf("Test %q can't get tasks from error queue: %v", c.name, err)
+			}
+			if want, got := 1, len(errTasks); want != got {
+				t.Fatalf("Test %q expected %d error tasks, got %d", c.name, want, got)
+			}
+			changedTask = errTasks[0]
+		} else {
+			// Not moved, so we must have gotten it in the retriedTaskCh channel. Block on that for a bit.
+			select {
+			case changedTask = <-retriedTaskCh:
+				if want, got := c.input.ID, changedTask.ID; want != got {
+					t.Fatalf("Test %q retry task expected ID %v, got %v", c.name, want, got)
+				}
+			case <-time.After(5 * time.Second): // should be plenty of time for the worker to go round a couple of times.
+				t.Fatalf("Test %q took too long getting the retried task from something that had multiple attempts", c.name)
+			}
+		}
+		log.Printf("Test %q: changed task: %v", c.name, changedTask)
+		if want, got := c.wantErr, changedTask.Err; want != got {
+			t.Fatalf("Test %q expected err %q, got %q", c.name, want, got)
+		}
+		if want, got := c.wantAttempt, changedTask.Attempt; want != got {
+			t.Fatalf("Test %q expected attempt %d, got %d", c.name, want, got)
+		}
+
+		cancel()
+
+		if err := g.Wait(); err != nil && !entroq.IsCanceled(err) {
+			t.Fatalf("Test %q failed worker wait after cancel: %v", c.name, err)
+		}
+	}
+
+	for _, test := range cases {
+		runWorkerOneCase(ctx, test)
+	}
+}
+
+// WorkerMoveOnError tests that workers that have MoveTaskError results
 // move the task into an error queue with the expected wrapper and don't just
 // crash.
 func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	t.Helper()
 
-	queue := path.Join(qPrefix, "move_on_error")
+	baseQueue := path.Join(qPrefix, "move_on_error")
 
 	type tc struct {
-		name  string
-		input *entroq.Task
-		moved bool
+		name    string
+		input   *entroq.Task
+		die     bool
+		moved   bool
+		wrapped bool
+	}
+
+	newTask := func(val string) *entroq.Task {
+		id := uuid.New()
+		return &entroq.Task{
+			Queue: path.Join(baseQueue, val, id.String()),
+			ID:    id,
+			Value: []byte(val),
+		}
 	}
 
 	cases := []tc{
 		{
-			name: "die",
-			input: &entroq.Task{
-				Queue: queue,
-				ID:    uuid.New(),
-				Value: []byte("die"),
-			},
-			moved: false,
+			name:  "die",
+			input: newTask("die"),
+			die:   true,
 		},
 		{
-			name: "move",
-			input: &entroq.Task{
-				Queue: queue,
-				ID:    uuid.New(),
-				Value: []byte("move"),
-			},
+			name:    "move-wrapped",
+			input:   newTask("move"),
+			moved:   true,
+			wrapped: true,
+		},
+		{
+			name:  "move-not-wrapped",
+			input: newTask("move"),
+			moved: true,
+		},
+		{
+			name:  "wait-for-renewal",
+			input: newTask("move-wait"),
 			moved: true,
 		},
 	}
@@ -404,9 +547,16 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 	runWorkerOneCase := func(ctx context.Context, c tc) {
 		t.Helper()
 
-		w := client.NewWorker(queue)
+		log.Printf("Testing MoveTaskError %q", c.name)
 
-		ctx, cancel := context.WithCancel(ctx)
+		const leaseTime = 5 * time.Second
+
+		w := client.NewWorker(c.input.Queue).WithOpts(
+			entroq.WithWrappedMove(c.wrapped),
+			entroq.WithLease(leaseTime),
+		)
+
+		ctx, cancel := context.WithTimeout(ctx, 2*leaseTime)
 		defer cancel()
 		g, gctx := errgroup.WithContext(ctx)
 		g.Go(func() error {
@@ -416,43 +566,74 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 					return nil, errors.New("task asked to die")
 				case "move":
 					return nil, entroq.NewMoveTaskError(errors.New("task asked to move"))
+				case "move-wait":
+					select {
+					case <-time.After(leaseTime):
+						return nil, entroq.NewMoveTaskError(errors.New("task asked to move after renewal"))
+					case <-ctx.Done():
+						return nil, errors.Wrapf(ctx.Err(), "oops - test %q too too long, gave up before finishing", c.name)
+					}
 				default:
 					return []entroq.ModifyArg{task.AsDeletion()}, nil
 				}
 			})
-			log.Printf("Worker exited: %v", err)
 			return err
 		})
 
-		if _, _, err := client.Modify(ctx, entroq.InsertingInto(queue,
+		if _, _, err := client.Modify(ctx, entroq.InsertingInto(c.input.Queue,
 			entroq.WithID(c.input.ID),
 			entroq.WithValue(c.input.Value),
 		)); err != nil {
 			t.Fatalf("Test %q insert task work: %v", c.name, err)
 		}
-		waitCtx, _ := context.WithTimeout(ctx, 5*time.Second)
-		if err := client.WaitQueuesEmpty(waitCtx, entroq.MatchExact(queue)); err != nil && !entroq.IsCanceled(err) {
-			log.Printf("Test %q wait: %v", c.name, err)
+
+		if c.die {
+			if err := g.Wait(); err != nil && entroq.IsTimeout(err) {
+				t.Fatalf("Test %q expected to die, but not with a timeout error: %v", c.name, err)
+			}
+			// Delete the dead task, will always ve version 1.
+			if _, _, err := client.Modify(ctx, entroq.Deleting(c.input.ID, 1)); err != nil {
+				t.Fatalf("Test %q tried to clean up dead task: %v", c.name, err)
+			}
+			return
 		}
-		errTasks, err := client.Tasks(ctx, w.ErrQMap(queue))
+
+		waitCtx, _ := context.WithTimeout(ctx, 2*leaseTime)
+		if err := client.WaitQueuesEmpty(waitCtx, entroq.MatchExact(c.input.Queue)); err != nil && !entroq.IsCanceled(err) {
+			t.Fatalf("Test %q: no moved tasks found, task was not expected to die: %v", c.name, err)
+		}
+		errTasks, err := client.Tasks(ctx, w.ErrQMap(c.input.Queue))
 		if err != nil {
 			t.Fatalf("Test %q find in error queue: %v", c.name, err)
 		}
 		var foundTask *entroq.Task
 		for _, task := range errTasks {
-			et := new(entroq.ErrorTaskValue)
-			if err := json.Unmarshal(task.Value, et); err != nil {
-				t.Fatalf("Test %q failed to unmarshal error task value %q: %v", c.name, string(task.Value), err)
-			}
-			if et.Task.ID == c.input.ID {
-				foundTask = et.Task
-				break
+			if c.wrapped {
+				et := new(entroq.ErrorTaskValue)
+				if err := json.Unmarshal(task.Value, et); err != nil {
+					t.Fatalf("Test %q failed to unmarshal error task value %q: %v", c.name, string(task.Value), err)
+				}
+				if et.Task.ID == c.input.ID {
+					foundTask = et.Task
+					if !strings.Contains(et.Err, "asked to move") {
+						t.Fatalf("Test %q expected moved wrapped task to have an error, but had %q", c.name, et.Err)
+					}
+					break
+				}
+			} else {
+				if task.ID == c.input.ID {
+					foundTask = task
+					if !strings.Contains(foundTask.Err, "asked to move") {
+						t.Fatalf("Test %q expected moved task to have a move error, had %q", c.name, foundTask.Err)
+					}
+					break
+				}
 			}
 		}
 		if c.moved && foundTask == nil {
-			t.Errorf("Test %q expected task to be moved, but is not found in %q", c.name, w.ErrQMap(queue))
+			t.Errorf("Test %q expected task to be moved, but is not found in %q", c.name, w.ErrQMap(c.input.Queue))
 		} else if !c.moved && foundTask != nil {
-			t.Errorf("Test %q expected task to be deleted, but showed up in %q", c.name, w.ErrQMap(queue))
+			t.Errorf("Test %q expected task to be deleted, but showed up in %q", c.name, w.ErrQMap(c.input.Queue))
 		}
 
 		cancel()

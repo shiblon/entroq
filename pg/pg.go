@@ -251,7 +251,13 @@ func (b *backend) Close() error {
 // initDB sets up the database to have the appropriate tables and necessary
 // extensions to work as a task queue backend.
 func (b *backend) initDB(ctx context.Context) error {
+	// Note: ALTER TABLE commands are given to ensure that older versions of EntroQ databases are automatically upgraded.
+	// EntroQ systems were in service before Claims, Attempt, or Err were added to task types, so we attempt to add these
+	// columns to an existing table, then we create the whole thing if it isn't there.
 	_, err := b.db.ExecContext(ctx, `
+		ALTER TABLE IF EXISTS tasks ADD COLUMN IF NOT EXISTS claims INTEGER NOT NULL DEFAULT 0;
+		ALTER TABLE IF EXISTS tasks ADD COLUMN IF NOT EXISTS attempt INTEGER NOT NULL DEFAULT 0;
+		ALTER TABLE IF EXISTS tasks ADD COLUMN IF NOT EXISTS err TEXT NOT NULL DEFAULT '';
 		CREATE TABLE IF NOT EXISTS tasks (
 		  id UUID PRIMARY KEY NOT NULL,
 		  version INTEGER NOT NULL DEFAULT 0,
@@ -261,7 +267,9 @@ func (b *backend) initDB(ctx context.Context) error {
 		  modified TIMESTAMP WITH TIME ZONE NOT NULL,
 		  claimant UUID,
 		  value BYTEA,
-		  claims INTEGER NOT NULL DEFAULT 0
+		  claims INTEGER NOT NULL DEFAULT 0,
+		  attempt INTEGER NOT NULL DEFAULT 0,
+		  err TEXT NOT NULL DEFAULT ''
 		);
 		CREATE INDEX IF NOT EXISTS byID ON tasks (id);
 		CREATE INDEX IF NOT EXISTS byVersion ON tasks (version);
@@ -345,7 +353,7 @@ func (b *backend) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[s
 
 // Tasks returns a slice of all tasks in the given queue.
 func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Task, error) {
-	q := "SELECT id, version, queue, at, created, modified, claimant, value, claims FROM tasks WHERE true"
+	q := "SELECT id, version, queue, at, created, modified, claimant, value, claims, attempt, err FROM tasks WHERE true"
 	var values []interface{}
 
 	if tq.Queue != "" {
@@ -381,7 +389,7 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 	var tasks []*entroq.Task
 	for rows.Next() {
 		t := &entroq.Task{}
-		if err := rows.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Created, &t.Modified, &t.Claimant, &t.Value, &t.Claims); err != nil {
+		if err := rows.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Created, &t.Modified, &t.Claimant, &t.Value, &t.Claims, &t.Attempt, &t.Err); err != nil {
 			return nil, errors.Wrap(err, "task scan")
 		}
 		// NOTE: we can make this more efficient by not even asking for the
@@ -464,7 +472,7 @@ func (b *backend) tryClaimOne(ctx context.Context, q string, cq *entroq.ClaimQue
 				FOR UPDATE SKIP LOCKED
 				LIMIT 1
 			)
-		RETURNING id, version, queue, at, created, modified, claimant, value, claims
+		RETURNING id, version, queue, at, created, modified, claimant, value, claims, attempt, err
 	`, now.Add(cq.Duration), cq.Claimant, now, q, now).Scan(
 		&task.ID,
 		&task.Version,
@@ -475,6 +483,8 @@ func (b *backend) tryClaimOne(ctx context.Context, q string, cq *entroq.ClaimQue
 		&task.Claimant,
 		&task.Value,
 		&task.Claims,
+		&task.Attempt,
+		&task.Err,
 	); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
@@ -512,7 +522,7 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 			return nil, nil, errors.Wrap(err, "pg modify dependency")
 		}
 		if !isSerialization(err) {
-			// We didn't get a retriable serialization error, return.
+			// We didn't get a retryable serialization error, return.
 			return nil, nil, errors.Wrap(err, "pg modify unknown")
 		}
 		// Serialization error - go around again.
@@ -573,11 +583,11 @@ func (b *backend) modify(ctx context.Context, mod *entroq.Modification) (inserte
 
 		t := new(entroq.Task)
 		row := tx.QueryRowContext(ctx, `
-			INSERT INTO tasks (id, version, queue, at, claimant, value, created, modified)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-			RETURNING id, version, queue, at, claimant, value, created, modified
-		`, id, 0, ins.Queue, at, mod.Claimant, ins.Value, now, now)
-		if err := row.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Claimant, &t.Value, &t.Created, &t.Modified); err != nil {
+			INSERT INTO tasks (id, version, queue, at, claimant, value, created, modified, attempt, err)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			RETURNING id, version, queue, at, claimant, value, created, modified, attempt, err
+		`, id, 0, ins.Queue, at, mod.Claimant, ins.Value, now, now, ins.Attempt, ins.Err)
+		if err := row.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Claimant, &t.Value, &t.Created, &t.Modified, &t.Attempt, &t.Err); err != nil {
 			return nil, nil, errors.Wrap(err, "pg modify insert scan")
 		}
 		inserted = append(inserted, t)
@@ -586,11 +596,11 @@ func (b *backend) modify(ctx context.Context, mod *entroq.Modification) (inserte
 	for _, chg := range mod.Changes {
 		t := new(entroq.Task)
 		row := tx.QueryRowContext(ctx, `
-			UPDATE tasks SET version = version + 1, modified = $1, queue = $2, at = $3, value = $4
-			WHERE id = $5 AND version = $6
-			RETURNING id, version, queue, at, claimant, modified, created, value
-		`, now, chg.Queue, chg.At, chg.Value, chg.ID, chg.Version)
-		if err := row.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Claimant, &t.Modified, &t.Created, &t.Value); err != nil {
+			UPDATE tasks SET version = version + 1, modified = $1, queue = $2, at = $3, value = $4, attempt = $5, err = $6
+			WHERE id = $7 AND version = $8
+			RETURNING id, version, queue, at, claimant, modified, created, value, attempt, err
+		`, now, chg.Queue, chg.At, chg.Value, chg.Attempt, chg.Err, chg.ID, chg.Version)
+		if err := row.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Claimant, &t.Modified, &t.Created, &t.Value, &t.Attempt, &t.Err); err != nil {
 			return nil, nil, errors.Wrapf(err, "pg modify update scan %s", chg.ID)
 		}
 		changed = append(changed, t)
@@ -628,7 +638,7 @@ func depQuery(ctx context.Context, tx *sql.Tx, m *entroq.Modification) (map[uuid
 		strIDs = append(strIDs, id.String())
 	}
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id, version, queue, at, claimant, value, created, modified FROM tasks
+		SELECT id, version, queue, at, claimant, value, created, modified, attempt, err FROM tasks
 		WHERE id = any($1) FOR UPDATE
 	`, pq.Array(strIDs))
 	if err != nil {
@@ -637,7 +647,7 @@ func depQuery(ctx context.Context, tx *sql.Tx, m *entroq.Modification) (map[uuid
 	defer rows.Close()
 	for rows.Next() {
 		t := new(entroq.Task)
-		if err := rows.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Claimant, &t.Value, &t.Created, &t.Modified); err != nil {
+		if err := rows.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Claimant, &t.Value, &t.Created, &t.Modified, &t.Attempt, &t.Err); err != nil {
 			return nil, errors.Wrap(err, "pg dep scan")
 		}
 		if foundDeps[t.ID] != nil {

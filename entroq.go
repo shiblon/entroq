@@ -89,9 +89,13 @@ func (t TaskID) AsDependency() ModifyArg {
 
 // TaskData contains just the data, not the identifier or metadata. Used for insertions.
 type TaskData struct {
-	Queue string
-	At    time.Time
-	Value []byte
+	Queue string    `json:"queue"`
+	At    time.Time `json:"at"`
+	Value []byte    `json:"value"`
+
+	// These can be changed by the user, so are part of the task data.
+	Attempt int32  `json:"attempt"`
+	Err     string `json:"err"`
 
 	// ID is an optional task ID to be used for task insertion.
 	// Default (uuid.Nil) causes the backend to assign one, and that is
@@ -103,7 +107,7 @@ type TaskData struct {
 	//
 	// to be done safely, where the database update needs to refer to
 	// to-be-inserted tasks.
-	ID uuid.UUID
+	ID uuid.UUID `json:"id"`
 
 	// skipCollidingID indicates that a collision on insertion is not fatal,
 	// and the insertion can be removed if that happens, and then the
@@ -141,12 +145,19 @@ type Task struct {
 	// FromQueue specifies the previous queue for a task that is moving to another queue.
 	// Usually not present, can be used for change authorization (since two queues are in play, there).
 	FromQueue string `json:"fromqueue,omitempty"`
+
+	// Worker retry logic uses these fields when moving tasks and when retrying them.
+	// It is left up to the consumer to determine how many attempts is too many
+	// and to produce a suitable retry or move error.
+	Attempt int32  `json:"attempt"`
+	Err     string `json:"err"`
 }
 
 // String returns a useful representation of this task.
 func (t *Task) String() string {
 	return fmt.Sprintf("Task [%q %s v%d]\n\t", t.Queue, t.ID, t.Version) + strings.Join([]string{
-		fmt.Sprintf("at=%q claimant=%s", t.At, t.Claimant),
+		fmt.Sprintf("at=%q claimant=%s claims=%d", t.At, t.Claimant, t.Claims),
+		fmt.Sprintf("attempt=%d err=%q", t.Attempt, t.Err),
 		fmt.Sprintf("c=%q m=%q", t.Created, t.Modified),
 		fmt.Sprintf("val=%q", string(t.Value)),
 	}, "\n\t") + "\n"
@@ -194,10 +205,12 @@ func (t *Task) IDVersion() *TaskID {
 // Data returns the data for this task.
 func (t *Task) Data() *TaskData {
 	return &TaskData{
-		Queue: t.Queue,
-		At:    t.At,
-		Value: t.Value,
-		ID:    t.ID,
+		Queue:   t.Queue,
+		At:      t.At,
+		Value:   t.Value,
+		ID:      t.ID,
+		Attempt: t.Attempt,
+		Err:     t.Err,
 	}
 }
 
@@ -676,7 +689,7 @@ func IsCanceled(err error) bool {
 	if err == nil {
 		return false
 	}
-	err = errors.Unwrap(err)
+	err = errors.Cause(err)
 	if err == context.Canceled {
 		return true
 	}
@@ -693,7 +706,7 @@ func IsTimeout(err error) bool {
 	if err == nil {
 		return false
 	}
-	err = errors.Unwrap(err)
+	err = errors.Cause(err)
 	if err == context.DeadlineExceeded {
 		return true
 	}
@@ -782,6 +795,17 @@ func (c *EntroQ) RenewAllFor(ctx context.Context, tasks []*Task, duration time.D
 	return changed, nil
 }
 
+// SetRenewedTasker matches errors that contain information about the "latest version" of a task.
+// This is used, for example, in DoWithRenewAll. If an error matching this
+// interface is passed back from its "do" function, that error contains
+// information about the final renewed task(s), which will contain the latest
+// version information. This can be used to do final modifications on the task,
+// which would otherwise fail because the original task has new "renewed"
+// versions over time.
+type SetRenewedTasker interface {
+	SetRenewedTask(...*Task)
+}
+
 // DoWithRenewAll runs the provided function while keeping all given tasks leases renewed.
 func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.Duration, f func(context.Context) error) ([]*Task, error) {
 	g, ctx := errgroup.WithContext(ctx)
@@ -799,7 +823,7 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.D
 			case <-time.After(lease / 2):
 				var err error
 				if renewed, err = c.RenewAllFor(ctx, renewed, lease); err != nil {
-					return errors.Wrap(err, "could not extend lease")
+					return errors.Wrap(err, "renew all lease")
 				}
 			}
 		}
@@ -811,7 +835,12 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.D
 	})
 
 	if err := g.Wait(); err != nil {
-		return nil, errors.Wrap(err, "error running with renewal")
+		// Pass on renewed task if the error coming out wants us to.
+		// Make sure to get the underlying error, since it may have been wrapped.
+		if rterr, ok := errors.Cause(err).(SetRenewedTasker); ok {
+			rterr.SetRenewedTask(renewed...)
+		}
+		return nil, errors.Wrap(err, "renew all")
 	}
 
 	// The task will have been overwritten with every renewal. Return final task.
@@ -822,7 +851,7 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.D
 func (c *EntroQ) DoWithRenew(ctx context.Context, task *Task, lease time.Duration, f func(context.Context) error) (*Task, error) {
 	finalTasks, err := c.DoWithRenewAll(ctx, []*Task{task}, lease, f)
 	if err != nil {
-		return nil, errors.Wrap(err, "with renew single task")
+		return nil, errors.Wrap(err, "renew")
 	}
 	return finalTasks[0], nil
 }
@@ -957,6 +986,22 @@ func WithArrivalTimeIn(duration time.Duration) InsertArg {
 func WithValue(value []byte) InsertArg {
 	return func(_ *Modification, d *TaskData) {
 		d.Value = value
+	}
+}
+
+// WithAttempt sets the number of attempts for this task. Usually not needed,
+// handled automatically by the worker.
+func WithAttempt(value int32) InsertArg {
+	return func(_ *Modification, d *TaskData) {
+		d.Attempt = value
+	}
+}
+
+// WithErr sets the error field of a task during insertion. Usually not needed,
+// as tasks are typically modified to add errors, not inserted with them.
+func WithErr(value string) InsertArg {
+	return func(_ *Modification, d *TaskData) {
+		d.Err = value
 	}
 }
 
@@ -1097,6 +1142,32 @@ func ArrivalTimeBy(d time.Duration) ChangeArg {
 func ValueTo(v []byte) ChangeArg {
 	return func(_ *Modification, t *Task) {
 		t.Value = v
+	}
+}
+
+// ErrTo sets the Err field in the task.
+func ErrTo(e string) ChangeArg {
+	return func(_ *Modification, t *Task) {
+		t.Err = e
+	}
+}
+
+// ErrToZero sets the Err field to its zero value (clears the error).
+func ErrToZero() ChangeArg {
+	return ErrTo("")
+}
+
+// AttemptToNext sets the Attempt field in Task to the next value (increments it).
+func AttemptToNext() ChangeArg {
+	return func(_ *Modification, t *Task) {
+		t.Attempt++
+	}
+}
+
+// AttemptToZero resets the Attempt field to zero.
+func AttemptToZero() ChangeArg {
+	return func(_ *Modification, t *Task) {
+		t.Attempt = 0
 	}
 }
 
@@ -1362,7 +1433,7 @@ func (m DependencyError) Error() string {
 
 // AsDependency indicates whether the given error is a dependency error.
 func AsDependency(err error) (DependencyError, bool) {
-	d, ok := errors.Unwrap(err).(DependencyError)
+	d, ok := errors.Cause(err).(DependencyError)
 	return d, ok
 }
 

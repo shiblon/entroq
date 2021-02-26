@@ -256,6 +256,8 @@ func protoFromTask(t *entroq.Task) *pb.Task {
 		Value:      t.Value,
 		CreatedMs:  toMS(t.Created),
 		ModifiedMs: toMS(t.Modified),
+		Attempt:    t.Attempt,
+		Err:        t.Err,
 	}
 }
 
@@ -455,6 +457,8 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 			entroq.InsertingInto(insert.Queue,
 				entroq.WithArrivalTime(fromMS(insert.AtMs)),
 				entroq.WithValue(insert.Value),
+				entroq.WithAttempt(insert.Attempt),
+				entroq.WithErr(insert.Err),
 				entroq.WithID(id)))
 	}
 	for _, change := range req.Changes {
@@ -463,13 +467,14 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 			return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse change id")
 		}
 		t := &entroq.Task{
-			ID:        id,
-			Version:   change.GetOldId().Version,
-			FromQueue: change.GetOldId().Queue,
-			Claimant:  claimant,
-			Queue:     change.GetNewData().Queue,
-			Value:     change.GetNewData().Value,
-			At:        fromMS(change.GetNewData().AtMs),
+			ID:       id,
+			Version:  change.GetOldId().Version,
+			Claimant: claimant,
+			Queue:    change.GetNewData().Queue,
+			Value:    change.GetNewData().Value,
+			At:       fromMS(change.GetNewData().AtMs),
+			Attempt:  change.GetNewData().Attempt,
+			Err:      change.GetNewData().Err,
 		}
 		modArgs = append(modArgs, entroq.Changing(t))
 	}
