@@ -14,5 +14,5 @@ cd ../../..
 echo "Now in directory $PWD, running docker"
 
 docker run --rm -it -v "$PWD":/src "$imgname" \
-  bash -c "python -m grpc_tools.protoc -Iproto --python_out="$target_dir"/ --grpc_python_out="$target_dir"/ proto/*.proto && sed -i'' -e 's/^import entroq_pb2 as/from . import entroq_pb2 as/' '$target_dir/entroq_pb2_grpc.py'"
+  bash -c "python -m grpc_tools.protoc -Iproto --python_out="$target_dir"/ --grpc_python_out="$target_dir"/ proto/*.proto && sed -i'' -e 's/^import entroq_pb2 as/from . &/' '$target_dir/entroq_pb2_grpc.py'"
 
