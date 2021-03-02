@@ -16,5 +16,10 @@ RUN apt-get update \
  && go install "google.golang.org/protobuf/cmd/protoc-gen-go@${go_proto_version}" \
  && go install "google.golang.org/grpc/cmd/protoc-gen-go-grpc@${go_grpc_version}"
 
+FROM debian:buster-slim
+
+RUN mkdir -p /bin
+COPY --from=gotools /bin/* /bin/
+
 WORKDIR /src
 VOLUME /src
