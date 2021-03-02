@@ -6,7 +6,7 @@ FROM golang:1.16-alpine3.13 as builder
 ENV GOBIN /build/bin
 ENV CGO_ENABLED 0
 
-RUN mkdir -p /src/entrogo.com/entroq apk add git
+RUN mkdir -p /src/entrogo.com/entroq
 WORKDIR /src/entrogo.com/entroq
 
 COPY go.mod go.sum /src/entrogo.com/entroq/
