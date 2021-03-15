@@ -229,7 +229,7 @@ func (r *Reader) scanN(n int) []byte {
 // discardToDelimiter attempts to read until it finds a delimiter. Assumes that
 // the buffer begins full. It may be filled again, in here.
 func (r *Reader) discardToDelimiter() error {
-	for !r.atDelimiter() {
+	for !r.atDelimiter() && !r.Done() {
 		r.scanN(r.end - r.pos)
 		if err := r.fillBuf(); err != nil {
 			return fmt.Errorf("discard: %w", err)
@@ -245,12 +245,12 @@ func (r *Reader) discardToDelimiter() error {
 // record to begin with a delimiter. Returns a wrapped io.EOF when complete.
 // More idiomatically, check Done after every iteration.
 func (r *Reader) Next() ([]byte, error) {
-	if r.Done() {
-		return nil, io.EOF
-	}
 	buf := new(bytes.Buffer)
 	if err := r.fillBuf(); err != nil {
 		return nil, fmt.Errorf("next: %w", err)
+	}
+	if r.Done() {
+		return nil, io.EOF
 	}
 
 	// Find the first real delimiter. This can help get things on track after a
