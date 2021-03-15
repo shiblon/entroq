@@ -175,6 +175,21 @@ func TestReader_Next_corrupt(t *testing.T) {
 			raw:  "hello",
 			want: []string{""},
 		},
+		{
+			name: "garbage-in-front",
+			raw:  "hello\xfe\xfd\x01A",
+			want: []string{"", "A"},
+		},
+		{
+			name: "garbage-in-back",
+			raw:  "\xfe\xfd\x02AB\xfe\xfdfooey",
+			want: []string{"AB", ""},
+		},
+		{
+			name: "garbage-in-middle",
+			raw:  "\xfe\xfd\x02AB\xfe\xfdrandom crap\xfe\xfd\x02BC",
+			want: []string{"AB", "", "BC"},
+		},
 	}
 
 	for _, test := range cases {
@@ -187,9 +202,9 @@ func TestReader_Next_corrupt(t *testing.T) {
 				case want == "" && errors.Is(err, CorruptRecord):
 					// do nothing, this is fine
 				case want == "" && !errors.Is(err, CorruptRecord):
-					t.Fatalf("Next_corrupt %q: expected corruption error, got %v with value %q", test.name, err, string(b))
+					t.Fatalf("Next_corrupt %q i=%d: expected corruption error, got %v with value %q", test.name, i, err, string(b))
 				default:
-					t.Fatalf("Next_corrupt %q: %v", test.name, err)
+					t.Fatalf("Next_corrupt %q i=%d: %v", test.name, i, err)
 				}
 			}
 			if diff := cmp.Diff(string(b), want); diff != "" {

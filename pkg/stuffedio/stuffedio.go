@@ -253,15 +253,15 @@ func (r *Reader) Next() ([]byte, error) {
 		return nil, io.EOF
 	}
 
-	// Find the first real delimiter. This can help get things on track after a
-	// corrupt record, or at the start of a shard that comes in the middle of a
-	// record. We strictly require every record to be prefixed with the
-	// delimiter, including the first, allowing this logic to work properly.
-	if err := r.discardToDelimiter(); err != nil {
-		return nil, fmt.Errorf("next: %w", err)
-	}
-
 	if !r.discardLeader() {
+		// Find the first real delimiter for next time. This can help get
+		// things on track after a corrupt record, or at the start of a shard
+		// that comes in the middle of a record. We strictly require every
+		// record to be prefixed with the delimiter, including the first,
+		// allowing this logic to work properly.
+		if err := r.discardToDelimiter(); err != nil {
+			return nil, fmt.Errorf("next: error discarding to next delimiter after corruption: %w", err)
+		}
 		return nil, fmt.Errorf("next: no leading delimiter in record: %w", CorruptRecord)
 	}
 
