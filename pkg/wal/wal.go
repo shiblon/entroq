@@ -102,11 +102,12 @@ func (w *RecWriter) Append(p []byte) error {
 
 // RecReader wraps an io.Reader and allows full records to be pulled at once.
 type RecReader struct {
-	src   io.Reader
-	buf   []byte
-	pos   int  // position in the unused read buffer.
-	end   int  // one past the end of unused data.
-	ended bool // EOF reached, don't read again.
+	src     io.Reader
+	buf     []byte
+	pos     int  // position in the unused read buffer.
+	end     int  // one past the end of unused data.
+	ended   bool // EOF reached, don't read again.
+	started bool // First read has occurred.
 }
 
 // NewRecReader creates a RecReader from the given src, which is assumed to be
@@ -148,8 +149,8 @@ func (r *RecReader) fillBuf() error {
 	return nil
 }
 
-// consumeLeader advances the position of the buffer, only if it contains a leading delimiter.
-func (r *RecReader) consumeLeader() bool {
+// discardLeader advances the position of the buffer, only if it contains a leading delimiter.
+func (r *RecReader) discardLeader() bool {
 	if r.end-r.pos < len(reserved) {
 		return false
 	}
@@ -211,7 +212,25 @@ func (r *RecReader) scanN(n int) ([]byte, error) {
 	return r.buf[start:r.pos], nil
 }
 
-// Next returns the next record in the underying stream.
+// discardToDelimiter attempts to read until it finds a delimiter. Assumes that
+// the buffer begins full. It may be filled again, in here.
+func (r *RecReader) discardToDelimiter() error {
+	for !r.isDelimiter(r.pos) {
+		if _, err := r.scanN(r.end - r.pos); err != nil {
+			return fmt.Errorf("discard: %w", err)
+		}
+		if err := f.fillBuf(); err != nil {
+			return fmt.Errorf("discard: %w", err)
+		}
+	}
+	return nil
+}
+
+// Next returns the next record in the underying stream, or an error. It begins
+// by consuming the stream until it finds a delimiter (requiring each record to
+// start with one), so even if there was an error in a previous record, this
+// can skip bytes until it finds a new one. It does not require the first
+// record to begin with a delimiter.
 func (r *RecReader) Next() ([]byte, error) {
 	if r.Done() {
 		return nil, io.EOF
@@ -220,8 +239,21 @@ func (r *RecReader) Next() ([]byte, error) {
 	if err := r.fillBuf(); err != nil {
 		return nil, fmt.Errorf("next: %w", err)
 	}
+
+	// If we have "started" (read another record previously), fast forward to
+	// the next delimiter in case the previous read failed due to corruption.
+	if r.started {
+		if err := r.discardToDelimiter(); err != nil {
+			return nil, fmt.Errorf("next: %w", err)
+		}
+	}
+	r.started = true
+
+	// Every record (except perhaps the first) begins with a delimiter. Discard
+	// it if present.
+	r.discardLeader()
+
 	// Read the first (small) section.
-	r.consumeLeader()
 	b, err := r.pullN(1)
 	if err != nil {
 		return nil, fmt.Errorf("next: %w", err)
