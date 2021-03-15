@@ -187,8 +187,8 @@ func TestReader_Next_corrupt(t *testing.T) {
 		},
 		{
 			name: "garbage-in-middle",
-			raw:  "\xfe\xfd\x02AB\xfe\xfdrandom crap\xfe\xfd\x02BC",
-			want: []string{"AB", "", "BC"},
+			raw:  "\xfe\xfd\x02AB\xfe\xfdrandom crap\xfe\xfd\x02BC\xfe\xfd\x02CD",
+			want: []string{"AB", "", "BC", "CD"},
 		},
 	}
 
