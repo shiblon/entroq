@@ -31,7 +31,7 @@ func Example() {
 	// A very short message
 }
 
-func TestWriter_Append_short(t *testing.T) {
+func TestWriter_Append(t *testing.T) {
 	cases := []struct {
 		name  string
 		write string
@@ -45,10 +45,16 @@ func TestWriter_Append_short(t *testing.T) {
 			want:  "Short message",
 		},
 		{
-			name:  "with-delimiters",
+			name:  "tail-delimiters",
 			write: "short\xfe\xfd",
-			raw:   "\xfe\xfd\x05short",
+			raw:   "\xfe\xfd\x05short\x00\x00",
 			want:  "short\xfe\xfd",
+		},
+		{
+			name:  "leading-delimiters",
+			write: "\xfe\xfdshort",
+			raw:   "\xfe\xfd\x00\x05\x00short",
+			want:  "\xfe\xfdshort",
 		},
 	}
 

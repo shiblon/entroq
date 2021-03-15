@@ -112,6 +112,13 @@ func (w *Writer) Append(p []byte) error {
 		}
 		p = p[end:]
 	}
+	// If the last pass through found a reserved sequence, then that means
+	// it _ended_ with a reserved sequence. That means we need an empty record to terminate.
+	if foundReserved {
+		if _, err := buf.Write([]byte{0, 0}); err != nil {
+			return fmt.Errorf("write rec: %w", err)
+		}
+	}
 	if _, err := io.Copy(w.dest, buf); err != nil {
 		return fmt.Errorf("write rec: %w", err)
 	}
