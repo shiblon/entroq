@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func Example() {
+func ExampleWriter_Append() {
 	buf := new(bytes.Buffer)
 
 	w := NewWriter(buf)
@@ -17,21 +17,26 @@ func Example() {
 
 	fmt.Printf("%q\n", string(buf.Bytes()))
 
-	r := NewReader(buf)
+	// Output:
+	// "\xfe\xfd\x14A very short message"
+}
+
+func ExampleReader() {
+	r := NewReader(bytes.NewBuffer([]byte("\xfe\xfd\x14A very short message\x00\x00\xfe\xfd\x05hello")))
 	for !r.Done() {
 		b, err := r.Next()
 		if err != nil {
 			log.Fatalf("Error reading: %v", err)
 		}
-		fmt.Println(string(b))
+		fmt.Printf("%q\n", string(b))
 	}
 
 	// Output:
-	// "\xfe\xfd\x14A very short message"
-	// A very short message
+	// "A very short message\xfe\xfd"
+	// "hello"
 }
 
-func TestWriter_Append(t *testing.T) {
+func TestWriter_Append_one(t *testing.T) {
 	cases := []struct {
 		name  string
 		write string
@@ -42,19 +47,31 @@ func TestWriter_Append(t *testing.T) {
 			name:  "simple",
 			write: "Short message",
 			raw:   "\xfe\xfd\x0dShort message",
-			want:  "Short message",
 		},
 		{
 			name:  "tail-delimiters",
 			write: "short\xfe\xfd",
 			raw:   "\xfe\xfd\x05short\x00\x00",
-			want:  "short\xfe\xfd",
 		},
 		{
 			name:  "leading-delimiters",
 			write: "\xfe\xfdshort",
 			raw:   "\xfe\xfd\x00\x05\x00short",
-			want:  "\xfe\xfdshort",
+		},
+		{
+			name:  "middle-delimiters",
+			write: "short\xfe\xfdmessage",
+			raw:   "\xfe\xfd\x05short\x07\x00message",
+		},
+		{
+			name:  "longer-message",
+			write: "This is a much longer message, containing many more characters than can fit into a single short message of 252 characters. It kind of rambles on, as a result. Good luck figuring out where the break needs to be! It turns out that 252 bytes is really quite a lot of text for a short test like this.",
+			raw:   "\xfe\xfd\xfcThis is a much longer message, containing many more characters than can fit into a single short message of 252 characters. It kind of rambles on, as a result. Good luck figuring out where the break needs to be! It turns out that 252 bytes is really qui\x2c\x00te a lot of text for a short test like this.",
+		},
+		{
+			name:  "longer-message-with-delimiter",
+			write: "This is a much longer message, containing many more characters than can fit into a single short message of 252 characters. It kind of rambles on, as a result. Good luck figuring out where the break needs to be! It turns out that 252 bytes is really quite a lot of text for a short test like this.\xfe\xfd",
+			raw:   "\xfe\xfd\xfcThis is a much longer message, containing many more characters than can fit into a single short message of 252 characters. It kind of rambles on, as a result. Good luck figuring out where the break needs to be! It turns out that 252 bytes is really qui\x2c\x00te a lot of text for a short test like this.\x00\x00",
 		},
 	}
 
@@ -72,8 +89,11 @@ func TestWriter_Append(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Append_short %q: reading: %v", test.name, err)
 		}
-		if want, got := test.want, string(b); want != got {
+		if want, got := test.write, string(b); want != got {
 			t.Errorf("Append_short %q: wanted read %q, got %q", test.name, want, got)
 		}
 	}
+}
+
+func TestReader_Next(t *testing.T) {
 }

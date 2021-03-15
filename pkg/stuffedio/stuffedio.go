@@ -114,6 +114,8 @@ func (w *Writer) Append(p []byte) error {
 	}
 	// If the last pass through found a reserved sequence, then that means
 	// it _ended_ with a reserved sequence. That means we need an empty record to terminate.
+	// Empty records indicate "the whole thing was a delimiter" (zero
+	// non-delimiter bytes, which is less than the record max).
 	if foundReserved {
 		if _, err := buf.Write([]byte{0, 0}); err != nil {
 			return fmt.Errorf("write rec: %w", err)
