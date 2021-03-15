@@ -1,7 +1,7 @@
-// Package wal implements a straightforward write-ahead log using
-// consistent-overhead byte stuffing as described in
+// Package stuffedio implements a straightforward self-synchronizing log using
+// consistent-overhead word stuffing (yes, COWS) as described in Paul Khuong's
 // https://www.pvk.ca/Blog/2021/01/11/stuff-your-logs/.
-package wal
+package stuffedio
 
 import (
 	"bytes"
@@ -9,21 +9,35 @@ import (
 	"io"
 )
 
+var (
+	reserved = []byte{0xfe, 0xfd}
+)
+
 const (
-	reserved   = [2]byte{0xfe, 0xfd}
-	radix      = 0xfd
-	smallLimit = 0xfc
-	largeLimit = 0xfcfc
+	radix      int = 0xfd
+	smallLimit int = 0xfc
+	largeLimit int = 0xfcfc
 )
 
 var (
-	ShortRead = fmt.Errorf("short read")
+	// CorruptRecord errors are returned (wrapped, use errors.Is to detect)
+	// when a situation is encountered that can't happen in a clean record.
+	// It is usually safe to skip after receiving this error, provided that a
+	// missing entry doesn't cause consistency issues for the reader.
+	CorruptRecord = fmt.Errorf("corrupt record")
 )
 
-// RecWriter wraps an underlying writer and appends records to the stream when
+// Writer wraps an underlying writer and appends records to the stream when
 // requested, encoding them using constant-overhead word stuffing.
-type RecWriter struct {
+type Writer struct {
 	dest io.Writer
+}
+
+// NewWriter creates a new Writer with the underlying output writer.
+func NewWriter(dest io.Writer) *Writer {
+	return &Writer{
+		dest: dest,
+	}
 }
 
 func isDelimiter(b []byte, pos int) bool {
@@ -33,7 +47,7 @@ func isDelimiter(b []byte, pos int) bool {
 	return bytes.Equal(b[pos:pos+len(reserved)], reserved[:])
 }
 
-func findReserved(p []byte, end int) (end int, found bool) {
+func findReserved(p []byte, end int) (int, bool) {
 	if end > len(p) {
 		end = len(p)
 	}
@@ -41,7 +55,7 @@ func findReserved(p []byte, end int) (end int, found bool) {
 		return end, false
 	}
 	// Check up to the penultimate position (two-byte check).
-	for i := start; i < end-len(reserved)+1; i++ {
+	for i := 0; i < end-len(reserved)+1; i++ {
 		if isDelimiter(p, i) {
 			return i, true
 		}
@@ -51,7 +65,7 @@ func findReserved(p []byte, end int) (end int, found bool) {
 
 // Append adds a record to the end of the underlying writer. It encodes it
 // using word stuffing.
-func (w *RecWriter) Append(p []byte) error {
+func (w *Writer) Append(p []byte) error {
 	if len(p) == 0 {
 		return nil
 	}
@@ -65,7 +79,9 @@ func (w *RecWriter) Append(p []byte) error {
 	end, foundReserved := findReserved(p, smallLimit)
 
 	// Add the size and data.
-	if _, err := buf.Write(append(make([]byte, 0, 1+end), byte(end), p[:end]...)); err != nil {
+	rec := append(make([]byte, 0, 1+end), byte(end))
+	rec = append(rec, p[:end]...)
+	if _, err := buf.Write(rec); err != nil {
 		return fmt.Errorf("write rec: %w", err)
 	}
 
@@ -83,14 +99,16 @@ func (w *RecWriter) Append(p []byte) error {
 	for len(p) != 0 {
 		end, foundReserved = findReserved(p, largeLimit)
 		// Little-Endian length.
-		len1 := (end - start) % radix
-		len2 := (end - start) / radix
-		if _, err := buf.Write(append(make([]byte, 0, 2+end), byte(len1), byte(len2), p[:end]...)); err != nil {
+		len1 := end % radix
+		len2 := end / radix
+		rec := append(make([]byte, 0, 2+end), byte(len1), byte(len2))
+		rec = append(rec, p[:end]...)
+		if _, err := buf.Write(rec); err != nil {
 			return fmt.Errorf("write rec: %w", err)
 		}
 
 		if foundReserved {
-			end += 2
+			end += len(reserved)
 		}
 		p = p[end:]
 	}
@@ -100,20 +118,19 @@ func (w *RecWriter) Append(p []byte) error {
 	return nil
 }
 
-// RecReader wraps an io.Reader and allows full records to be pulled at once.
-type RecReader struct {
-	src     io.Reader
-	buf     []byte
-	pos     int  // position in the unused read buffer.
-	end     int  // one past the end of unused data.
-	ended   bool // EOF reached, don't read again.
-	started bool // First read has occurred.
+// Reader wraps an io.Reader and allows full records to be pulled at once.
+type Reader struct {
+	src   io.Reader
+	buf   []byte
+	pos   int  // position in the unused read buffer.
+	end   int  // one past the end of unused data.
+	ended bool // EOF reached, don't read again.
 }
 
-// NewRecReader creates a RecReader from the given src, which is assumed to be
+// NewReader creates a Reader from the given src, which is assumed to be
 // a word-stuffed log.
-func NewRecReader(src io.Reader) *RecReader {
-	return &RecReader{
+func NewReader(src io.Reader) *Reader {
+	return &Reader{
 		src: src,
 		buf: make([]byte, 1<<17),
 	}
@@ -121,11 +138,11 @@ func NewRecReader(src io.Reader) *RecReader {
 
 // fillBuf ensures that the internal buffer is at least half full, which is
 // enough space for one short read and one long read.
-func (r *RecReader) fillBuf() error {
+func (r *Reader) fillBuf() error {
 	if r.ended {
 		return nil // just use pos/end, no more reading.
 	}
-	if r.end-r.pos >= len(buf)/2 {
+	if r.end-r.pos >= len(r.buf)/2 {
 		// Don't bother filling if it's at least half full.
 		// The buffer is designed to
 		return nil
@@ -146,40 +163,31 @@ func (r *RecReader) fillBuf() error {
 		r.ended = true
 	}
 	r.end += n
+	if r.end < len(r.buf) {
+		// Assume a short read means there's no more data.
+		r.ended = true
+	}
 	return nil
 }
 
 // discardLeader advances the position of the buffer, only if it contains a leading delimiter.
-func (r *RecReader) discardLeader() bool {
+func (r *Reader) discardLeader() bool {
 	if r.end-r.pos < len(reserved) {
 		return false
 	}
 	if bytes.Equal(r.buf[r.pos:r.pos+len(reserved)], reserved[:]) {
-		r.pos += 2
+		r.pos += len(reserved)
 		return true
 	}
 	return false
 }
 
-// pullN gets the next n bytes from the buffer, consuing it. The buffer must
-// already have at least that many bytes, or it will return an error. It does
-// not trigger a read.
-func (r *RecReader) pullN(n int) ([]byte, error) {
-	// Get the next n values from the buffer, consuming it.
-	if want, have := n, r.end-r.pos; want > have {
-		return nil, fmt.Errorf("pull n: want %d bytes, only have %d", want, have)
-	}
-	start := r.pos
-	r.pos += n
-	return r.buf[start:r.pos], nil
-}
-
-func (r *RecReader) isDelimiter(pos int) bool {
-	return isDelimiter(r.buf[:r.end], pos)
+func (r *Reader) atDelimiter() bool {
+	return isDelimiter(r.buf[r.pos:r.end], 0)
 }
 
 // Done indicates whether the underlying stream is exhausted and all records are returned.
-func (r *RecReader) Done() bool {
+func (r *Reader) Done() bool {
 	return r.end == r.pos && r.ended
 }
 
@@ -187,39 +195,34 @@ func (r *RecReader) Done() bool {
 // It conumes them from the buffer. It does not read from the source: ensure
 // that the buffer is full enough to proceed before calling. It can only go up
 // to the penultimate byte, to ensure that it doesn't read half a delimiter.
-func (r *RecReader) scanN(n int) ([]byte, error) {
+func (r *Reader) scanN(n int) []byte {
 	start := r.pos
-	maxEnd := r.end - len(reserved) + 1
+	maxEnd := r.end
 	// Ensure that we don't go beyond the end of the buffer (minus 1). The
 	// caller should never ask for more than this. But it can happen if, for
 	// example, the underlying stream is exhausted on a final block, with only
 	// the implicit delimiter.
 	if have := maxEnd - r.pos; n > have {
-		if !r.ended {
-			return nil, fmt.Errorf("scan: asked for %d, only had %d to read on in-progress buffer", n, have)
-		}
 		n = have
 	}
 	if maxEnd > start+n {
 		maxEnd = start + n
 	}
 	for r.pos < maxEnd {
-		if r.isDelimiter(r.pos) {
+		if r.atDelimiter() {
 			break
 		}
 		r.pos++
 	}
-	return r.buf[start:r.pos], nil
+	return r.buf[start:r.pos]
 }
 
 // discardToDelimiter attempts to read until it finds a delimiter. Assumes that
 // the buffer begins full. It may be filled again, in here.
-func (r *RecReader) discardToDelimiter() error {
-	for !r.isDelimiter(r.pos) {
-		if _, err := r.scanN(r.end - r.pos); err != nil {
-			return fmt.Errorf("discard: %w", err)
-		}
-		if err := f.fillBuf(); err != nil {
+func (r *Reader) discardToDelimiter() error {
+	for !r.atDelimiter() {
+		r.scanN(r.end - r.pos)
+		if err := r.fillBuf(); err != nil {
 			return fmt.Errorf("discard: %w", err)
 		}
 	}
@@ -230,8 +233,9 @@ func (r *RecReader) discardToDelimiter() error {
 // by consuming the stream until it finds a delimiter (requiring each record to
 // start with one), so even if there was an error in a previous record, this
 // can skip bytes until it finds a new one. It does not require the first
-// record to begin with a delimiter.
-func (r *RecReader) Next() ([]byte, error) {
+// record to begin with a delimiter. Returns a wrapped io.EOF when complete.
+// More idiomatically, check Done after every iteration.
+func (r *Reader) Next() ([]byte, error) {
 	if r.Done() {
 		return nil, io.EOF
 	}
@@ -240,27 +244,26 @@ func (r *RecReader) Next() ([]byte, error) {
 		return nil, fmt.Errorf("next: %w", err)
 	}
 
-	// If we have "started" (read another record previously), fast forward to
-	// the next delimiter in case the previous read failed due to corruption.
-	if r.started {
-		if err := r.discardToDelimiter(); err != nil {
-			return nil, fmt.Errorf("next: %w", err)
-		}
+	// Find the first real delimiter. This can help get things on track after a
+	// corrupt record, or at the start of a shard that comes in the middle of a
+	// record. We strictly require every record to be prefixed with the
+	// delimiter, including the first, allowing this logic to work properly.
+	if err := r.discardToDelimiter(); err != nil {
+		return nil, fmt.Errorf("next: %w", err)
 	}
-	r.started = true
 
-	// Every record (except perhaps the first) begins with a delimiter. Discard
-	// it if present.
-	r.discardLeader()
+	if !r.discardLeader() {
+		return nil, fmt.Errorf("next: no leading delimiter in record: %w", CorruptRecord)
+	}
 
 	// Read the first (small) section.
-	b, err := r.pullN(1)
-	if err != nil {
-		return nil, fmt.Errorf("next: %w", err)
+	b := r.scanN(1)
+	if len(b) != 1 {
+		return nil, fmt.Errorf("next: short read on size byte: %w", CorruptRecord)
 	}
 	smallSize := int(b[0])
 	if smallSize > smallLimit {
-		return nil, fmt.Errorf("next: short size header %d is too large", smallSize)
+		return nil, fmt.Errorf("next: short size header %d is too large: %w", smallSize, CorruptRecord)
 	}
 	// The size portion can't be part of a delimiter, because it would have
 	// triggered a "too big" error. Now we scan for delimiters while reading
@@ -268,15 +271,12 @@ func (r *RecReader) Next() ([]byte, error) {
 	// always read exactly the right number of bytes. But the point of this is
 	// that sometimes a record will be corrupted, so we might encounter a
 	// delimiter in an unexpected place, so we scan and then check the size of
-	// the return value. It can be wrong. In that case, return a meaingful
+	// the return value. It can be wrong. In that case, return a meaningful
 	// error so the caller can decide whether to keep going with the next
 	// record.
-	b, err := r.scanN(smallSize)
-	if err != nil {
-		return nil, fmt.Errorf("next: %w", err)
-	}
+	b = r.scanN(smallSize)
 	if len(b) != smallSize {
-		return nil, fmt.Errorf("next wanted %d, got %d: %w", smallSize, len(b), ShortRead)
+		return nil, fmt.Errorf("next: wanted short %d, got %d: %w", smallSize, len(b), CorruptRecord)
 	}
 
 	if _, err := buf.Write(b); err != nil {
@@ -290,28 +290,25 @@ func (r *RecReader) Next() ([]byte, error) {
 	}
 
 	// Now we read zero or more large sections, stopping when we hit a delimiter or the end of the input stream.
-	for !r.isDelimiter(r.pos) && !r.Done() {
+	for !r.atDelimiter() && !r.Done() {
 		if err := r.fillBuf(); err != nil {
 			return nil, fmt.Errorf("next: %w", err)
 		}
 		// Extract 2 size bytes, convert using the radix.
-		b, err := r.pullN(2)
-		if err != nil {
-			return nil, fmt.Errorf("next: %w", err)
+		b := r.scanN(2)
+		if len(b) != 2 {
+			return nil, fmt.Errorf("next: short read on size bytes: %w", CorruptRecord)
 		}
-		if b[0] >= radix || b[1] >= radix {
-			return nil, fmt.Errorf("next: one of the two size bytes has an invalid value: %x", b[0])
+		if int(b[0]) >= radix || int(b[1]) >= radix {
+			return nil, fmt.Errorf("next: one of the two size bytes has an invalid value: %x: %w", b[0], CorruptRecord)
 		}
 		size := int(b[0]) + radix*int(b[1]) // little endian size, in radix base.
 		if size > largeLimit {
-			return nil, fmt.Errorf("next: large interior size %d", size)
+			return nil, fmt.Errorf("next: large interior size %d: %w", size, CorruptRecord)
 		}
-		b, err := r.scanN(size)
-		if err != nil {
-			return nil, fmt.Errorf("next: %w", err)
-		}
+		b = r.scanN(size)
 		if len(b) != size {
-			return nil, fmt.Errorf("next wanted %d, got %d: %w", size, len(b), ShortRead)
+			return nil, fmt.Errorf("next: wanted long %d, got %d: %w", size, len(b), CorruptRecord)
 		}
 		if _, err := buf.Write(b); err != nil {
 			return nil, fmt.Errorf("next: %w", err)
@@ -326,5 +323,5 @@ func (r *RecReader) Next() ([]byte, error) {
 
 	// Note: the last block will always have an extra delimiter appended to the
 	// end of it, so we have to not return that part.
-	return buf.Bytes()[:buf.Len()-len(reserved)]
+	return buf.Bytes()[:buf.Len()-len(reserved)], nil
 }
