@@ -93,9 +93,11 @@ type TaskData struct {
 	At    time.Time `json:"at"`
 	Value []byte    `json:"value"`
 
-	// These can be changed by the user, so are part of the task data.
-	Attempt int32  `json:"attempt"`
-	Err     string `json:"err"`
+	// Attempt indicates which "attempt number" this task is on. Used by workers.
+	Attempt int32 `json:"attempt"`
+
+	// Err contains error information for this task. Used by workers.
+	Err string `json:"err"`
 
 	// ID is an optional task ID to be used for task insertion.
 	// Default (uuid.Nil) causes the backend to assign one, and that is
