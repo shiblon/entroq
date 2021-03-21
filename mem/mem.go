@@ -71,6 +71,13 @@ func Opener() entroq.BackendOpener {
 	}
 }
 
+// TODO:
+// - Have a read-only snapshot that uses an RLock for snapshotting itself and for use.
+// - Have working memory that is read-write, and represents a diff from the snapshot and the current state of things.
+// - A goroutine (?) that moves things from the working memory into the snapshot, using a WLock on it and an RLock on working memory.
+// - All modifications RLock the snapshot and WLock working memory to compute the next working memory state.
+// - BIG QUESTIONS about hwo to make statistics less computationally intensive.
+
 type backend struct {
 	sync.Mutex
 
