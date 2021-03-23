@@ -2,7 +2,6 @@
 package mem // import "entrogo.com/entroq/mem"
 
 import (
-	"container/heap"
 	"context"
 	"fmt"
 	"log"
@@ -92,7 +91,7 @@ func (b *backend) insertUnsafe(t *entroq.Task) {
 	// to take a pointer to the heap before manipulating it.
 	h, ok := b.heaps[t.Queue]
 	if !ok {
-		h = new(taskHeap)
+		h = newHeap(t.Queue)
 		b.heaps[t.Queue] = h
 	}
 	item := newItem(t)
@@ -297,44 +296,59 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 	return entroq.WaitTryClaim(ctx, cq, b.TryClaim, b.nw)
 }
 
+func (b *backend) matchClaimHeapsUnsafe(cq *entroq.ClaimQuery) []*taskHeap {
+	var heaps []*taskHeap
+	for _, q := range cq.Queues {
+		if h, ok := b.heaps[q]; ok {
+			heaps = append(heaps, h)
+		}
+	}
+	return heaps
+}
+
+func (b *backend) tryClaimHeapUnsafe(ctx context.Context, cq *entroq.ClaimQuery, h *taskHeap) (*entroq.Task, error) {
+	if h.Len() == 0 {
+		return nil, nil
+	}
+
+	now, err := b.Time(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "try claim current time")
+	}
+	top := h.items[0].task
+	if top.At.After(now) {
+		return nil, nil
+	}
+
+	// Found one.
+	top = top.Copy()
+	top.Version++
+	top.Claims++
+	top.At = now.Add(cq.Duration)
+	top.Modified = now
+	top.Claimant = cq.Claimant
+	h.items[0].task = top
+
+	h.FixItem(h.items[0])
+
+	return top, nil
+}
+
 // TryClaim attempts to claim against multiple queues. Only one will win.
 func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
 	defer un(lock(b))
 
-	var heaps []*taskHeap
-	// Get all of the heaps and shuffle them.
-	for _, q := range cq.Queues {
-		heaps = append(heaps, b.heaps[q])
-	}
+	heaps := b.matchClaimHeapsUnsafe(cq)
 	rand.Shuffle(len(heaps), func(i, j int) { heaps[i], heaps[j] = heaps[j], heaps[i] })
 
-	// Try to find a claimable task in any of them.
 	for _, h := range heaps {
-		if h.Len() == 0 {
-			continue
-		}
-
-		now, err := b.Time(ctx)
+		task, err := b.tryClaimHeapUnsafe(ctx, cq, h)
 		if err != nil {
-			return nil, errors.Wrap(err, "try claim current time")
+			return nil, fmt.Errorf("try claim: %w", err)
 		}
-		top := h.items[0].task
-		if top.At.After(now) {
-			continue
+		if task != nil {
+			return task, nil
 		}
-
-		// Found one.
-		top = top.Copy()
-		top.Version++
-		top.Claims++
-		top.At = now.Add(cq.Duration)
-		top.Modified = now
-		top.Claimant = cq.Claimant
-		h.items[0].task = top
-
-		heap.Fix(h, 0)
-
-		return top, nil
 	}
 	// None found in any queue.
 	return nil, nil
@@ -342,6 +356,7 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 
 // Modify attempts to modify a batch of tasks in the queue system.
 func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserted []*entroq.Task, changed []*entroq.Task, err error) {
+	// TODO: If any of these lack a queue, fail. Queues are required, now.
 	defer un(lock(b))
 
 	found := make(map[uuid.UUID]*entroq.Task)

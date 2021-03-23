@@ -2,6 +2,7 @@ package mem
 
 import (
 	"container/heap"
+	"sync"
 
 	"entrogo.com/entroq"
 )
@@ -16,7 +17,16 @@ func newItem(task *entroq.Task) *hItem {
 }
 
 type taskHeap struct {
+	sync.RWMutex
+
+	name  string
 	items []*hItem
+}
+
+func newHeap(name string) *taskHeap {
+	return &taskHeap{
+		name: name,
+	}
 }
 
 func (h *taskHeap) Len() int {
