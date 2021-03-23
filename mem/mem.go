@@ -17,53 +17,6 @@ import (
 	"github.com/pkg/errors"
 )
 
-type hItem struct {
-	idx  int
-	task *entroq.Task
-}
-
-type taskHeap struct {
-	items []*hItem
-}
-
-func (h *taskHeap) Len() int {
-	if h == nil {
-		return 0
-	}
-	return len(h.items)
-}
-
-func (h *taskHeap) Items() []*hItem {
-	if h == nil {
-		return nil
-	}
-	return h.items
-}
-
-func (h *taskHeap) Less(i, j int) bool {
-	return h.items[i].task.At.Before(h.items[j].task.At)
-}
-
-func (h *taskHeap) Swap(i, j int) {
-	h.items[i], h.items[j] = h.items[j], h.items[i]
-	h.items[i].idx = i
-	h.items[j].idx = j
-}
-
-func (h *taskHeap) Push(x interface{}) {
-	item := x.(*hItem)
-	item.idx = len(h.items)
-	h.items = append(h.items, item)
-}
-
-func (h *taskHeap) Pop() interface{} {
-	n := len(h.items)
-	item := h.items[n-1]
-	item.idx = -1
-	h.items = h.items[:n-1]
-	return item
-}
-
 // Opener returns a constructor of the in-memory backend.
 func Opener() entroq.BackendOpener {
 	return func(ctx context.Context) (entroq.Backend, error) {
@@ -76,6 +29,8 @@ func Opener() entroq.BackendOpener {
 // - Have working memory that is read-write, and represents a diff from the snapshot and the current state of things.
 // - A goroutine (?) that moves things from the working memory into the snapshot, using a WLock on it and an RLock on working memory.
 // - All modifications RLock the snapshot and WLock working memory to compute the next working memory state.
+// - Some statistics (queue length, max claims, max attempts, for example) can be updated as we go.
+// - WaitEmpty can be implemented in that case.
 // - BIG QUESTIONS about hwo to make statistics less computationally intensive.
 
 type backend struct {
@@ -140,8 +95,8 @@ func (b *backend) insertUnsafe(t *entroq.Task) {
 		h = new(taskHeap)
 		b.heaps[t.Queue] = h
 	}
-	item := &hItem{task: t}
-	heap.Push(h, item)
+	item := newItem(t)
+	h.PushItem(item)
 	b.byID[t.ID] = item
 }
 
@@ -162,7 +117,7 @@ func (b *backend) removeUnsafe(id *entroq.TaskID) {
 	}
 
 	delete(b.byID, id.ID)
-	heap.Remove(h, item.idx)
+	h.RemoveItem(item)
 	if h.Len() == 0 {
 		delete(b.heaps, item.task.Queue)
 	}
@@ -179,8 +134,7 @@ func (b *backend) replaceUnsafe(id *entroq.TaskID, newTask *entroq.Task) {
 	// If the queues are the same, replace and fix order. No other changes.
 	if item.task.Queue == newTask.Queue {
 		item.task = newTask
-		h := b.heaps[item.task.Queue]
-		heap.Fix(h, item.idx)
+		b.heaps[item.task.Queue].FixItem(item)
 		return
 	}
 
