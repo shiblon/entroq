@@ -354,10 +354,43 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 	return nil, nil
 }
 
+func checkModHasQueues(m *entroq.Modification) error {
+	for _, ins := range m.Inserts {
+		if ins.Queue == "" {
+			return fmt.Errorf("modify: missing Queue for insertion %v", ins)
+		}
+	}
+
+	for _, chg := range m.Changes {
+		if chg.Queue == "" {
+			return fmt.Errorf("modify: missing Queue for change %v", chg)
+		}
+		if chg.FromQueue == "" {
+			return fmt.Errorf("modify: missing FromQueue for change %v", chg)
+		}
+	}
+
+	for _, del := range m.Deletes {
+		if del.Queue == "" {
+			return fmt.Errorf("modify: missing Queue in deletion %v", del)
+		}
+	}
+
+	for _, dep := range m.Depends {
+		if dep.Queue == "" {
+			return fmt.Errorf("modify: missing Queue in dependency %v", dep)
+		}
+	}
+	return nil
+}
+
 // Modify attempts to modify a batch of tasks in the queue system.
 func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserted []*entroq.Task, changed []*entroq.Task, err error) {
-	// TODO: If any of these lack a queue, fail. Queues are required, now.
 	defer un(lock(b))
+
+	if err := checkModHasQueues(mod); err != nil {
+		return nil, nil, errors.Wrap(err, "modify")
+	}
 
 	found := make(map[uuid.UUID]*entroq.Task)
 	deps, err := mod.AllDependencies()
