@@ -356,7 +356,7 @@ func WorkerDependencyHandler(ctx context.Context, t *testing.T, client *entroq.E
 
 	err := w.Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
 		// Return a modification that will fail because it depends on a non-existent task ID.
-		return []entroq.ModifyArg{task.AsDeletion(), entroq.DependingOn(uuid.New(), 0)}, nil
+		return []entroq.ModifyArg{task.AsDeletion(), entroq.DependingOn(uuid.New(), 0, entroq.WithIDQueue("no queue"))}, nil
 	})
 
 	if errors.Cause(err) != upgradeError {
@@ -591,8 +591,10 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 			if err := g.Wait(); err != nil && entroq.IsTimeout(err) {
 				t.Fatalf("Test %q expected to die, but not with a timeout error: %v", c.name, err)
 			}
-			// Delete the dead task, will always ve version 1.
-			if _, _, err := client.Modify(ctx, entroq.Deleting(c.input.ID, 1)); err != nil {
+			// Delete the dead task, will always be version 1.
+			// Note: don't overwrite like this in real use.
+			c.input.Version = 1
+			if _, _, err := client.Modify(ctx, c.input.AsDeletion()); err != nil {
 				t.Fatalf("Test %q tried to clean up dead task: %v", c.name, err)
 			}
 			return
