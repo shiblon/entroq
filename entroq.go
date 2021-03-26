@@ -233,6 +233,14 @@ func (t *Task) CopyOmitValue() *Task {
 	return newT
 }
 
+// CopyWithValue lets you specify whether the value should be copied.
+func (t *Task) CopyWithValue(ok bool) *Task {
+	if ok {
+		return t.Copy()
+	}
+	return t.CopyOmitValue()
+}
+
 // ClaimQuery contains information necessary to attempt to make a claim on a task in a specific queue.
 type ClaimQuery struct {
 	Queues   []string      // Queues to attempt to claim from. Only one wins.

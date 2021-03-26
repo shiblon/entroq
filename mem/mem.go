@@ -388,6 +388,9 @@ func checkModHasQueues(m *entroq.Modification) error {
 func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserted []*entroq.Task, changed []*entroq.Task, err error) {
 	defer un(lock(b))
 
+	// TODO: is this necessary? We can get all of the queues straight out of
+	// the ID map in a very short amount of time, by locking it and enumerating
+	// all queues from there.
 	if err := checkModHasQueues(mod); err != nil {
 		return nil, nil, errors.Wrap(err, "modify")
 	}
