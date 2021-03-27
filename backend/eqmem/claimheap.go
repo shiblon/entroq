@@ -2,6 +2,7 @@ package mem
 
 import (
 	"container/heap"
+	"math/rand"
 	"time"
 )
 
@@ -23,7 +24,8 @@ func newItem(q string, id uuid.UUID, at time.Time) *claimItem {
 }
 
 type claimHeap struct {
-	items []*hItem
+	items []*claimItem
+	byID  map[uuid.UUID]*claimItem
 }
 
 func newClaimHeap() *claimHeap {
@@ -37,11 +39,54 @@ func (h *claimHeap) Len() int {
 	return len(h.items)
 }
 
-func (h *claimHeap) Items() []*hItem {
+func (h *claimHeap) Items() []*claimItem {
 	if h == nil {
 		return nil
 	}
 	return h.items
+}
+
+func (h *claimHeap) Top() *claimItem {
+	return h.items[0]
+}
+
+func (h *claimHeap) RandomAvailable(now time.Time) *claimItem {
+	return h.randAvail(now, 0)
+}
+
+func (h *claimHeap) randAvail(now time.Time, index int) *claimItem {
+	if index >= len(h.items) {
+		return nil
+	}
+
+	// If this one matches, then randomly try to find one below it. If that
+	// fails, return this one.
+	var item *claimItem
+	if candidate := h.items[index]; !now.Before(candidate.at) {
+		item = candidate
+	}
+
+	// If we found one, then make a random draw less likely to produce a search
+	// below this item. Otherwise we always search below this item.
+	threshold := 1.0
+	if item != nil {
+		threshold = 0.33
+	}
+
+	next1, next2 := index*2+1, index*2+2
+	if rand.Float64() < threshold {
+		if candidate := m.randAvail(now, next1); candidate != nil {
+			item = candidate
+		}
+	}
+
+	if rand.Float64() < threshold {
+		if candidate := m.randAvail(now, next2); candidate != nil {
+			item = candidate
+		}
+	}
+
+	return item
 }
 
 func (h *claimHeap) Less(i, j int) bool {
@@ -68,12 +113,25 @@ func (h *claimHeap) Pop() interface{} {
 	return item
 }
 
+func (h *claimHeap) FindItem(id uuid.UUID) (*claimItem, bool) {
+	i, ok := h.byID[id]
+	return i, ok
+}
+
 func (h *claimHeap) PushItem(item *claimItem) {
 	heap.Push(h, item)
+	h.byID[item.id] = item
 }
 
 func (h *claimHeap) RemoveItem(item *claimItem) {
 	heap.Remove(h, item.idx)
+	delete(h.byID[item.id])
+}
+
+func (h *claimHeap) UpdateItem(item *claimItem, at time.Time, claimant uuid.UUID) {
+	item.at = at
+	item.claimant = claimant
+	h.FixItem(item)
 }
 
 func (h *claimHeap) FixItem(item *claimItem) {
