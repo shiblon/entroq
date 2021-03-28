@@ -759,9 +759,13 @@ func TasksWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	if want, got := len(ids), len(tasks); want != got {
 		t.Fatalf("Expected %d tasks in 'all' query, got %d", want, got)
 	}
-	for i, task := range tasks {
-		if want, got := ids[i], task.ID; want != got {
-			t.Fatalf("Wanted queried task %d to have ID %q, got %q", i, want, got)
+	want := make(map[uuid.UUID]bool)
+	for _, id := range ids {
+		want[id] = true
+	}
+	for _, task := range tasks {
+		if !want[task.ID] {
+			t.Fatalf("Wanted queried task %d to have ID present in task listing, but not found", task.ID)
 		}
 	}
 
