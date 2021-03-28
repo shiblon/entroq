@@ -931,8 +931,6 @@ func InsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 
 // SimpleSequence tests some basic functionality of a task manager, over gRPC.
 func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	t.Helper()
-
 	now := time.Now()
 
 	queue := path.Join(qPrefix, "simple_sequence")
@@ -1211,15 +1209,22 @@ func EqualAllTasks(want, got []*entroq.Task) string {
 	}
 	var diffs []string
 
-	gotMap := make(map[uuid.UUID]*entroq.Task)
-	for _, g := range got {
-		gotMap[g.ID] = g
+	matched := func(w, g *entroq.Task) bool {
+		return (w == nil) == (g == nil) && w.Queue == g.Queue && w.Claimant == g.Claimant && bytes.Equal(w.Value, g.Value)
 	}
 
 	for _, w := range want {
-		g := gotMap[w.ID]
-		if (w == nil) != (g == nil) || w.Queue != g.Queue || w.Claimant != g.Claimant || !bytes.Equal(w.Value, g.Value) {
-			diffs = append(diffs, cmp.Diff(w, g))
+		found := false
+		var potentialDiffs []string
+		for _, g := range got {
+			if matched(w, g) {
+				found = true
+				break
+			}
+			potentialDiffs = append(potentialDiffs, cmp.Diff(w, g))
+		}
+		if !found {
+			diffs = append(diffs, fmt.Sprintf("Task %v not found, differs from all of these:\n%v", strings.Join(potentialDiffs, "\n")))
 		}
 	}
 	if len(diffs) != 0 {
