@@ -498,7 +498,7 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted 
 			byQ[c.FromQueue].deleteID(d.ID)
 			byQ[c.Queue].insertTask(newTask)
 		} else {
-			// Version was already checked earlier.
+			// Original version was already checked earlier.
 			byQ[c.Queue].updateTask(newTask)
 		}
 		changed = append(changed, newTask)
