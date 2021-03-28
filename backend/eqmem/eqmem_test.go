@@ -2,13 +2,8 @@ package eqmem
 
 import (
 	"context"
-	"math/rand"
-	"reflect"
 	"testing"
-	"testing/quick"
 
-	"entrogo.com/entroq"
-	"entrogo.com/entroq/contrib/mrtest"
 	"entrogo.com/entroq/qsvc/qtest"
 )
 
@@ -79,6 +74,7 @@ func TestQueueStats(t *testing.T) {
 	RunQTest(t, qtest.QueueStats)
 }
 
+/*
 func TestMapReduce_checkSmall(t *testing.T) {
 	config := &quick.Config{
 		MaxCount: 2,
@@ -124,3 +120,4 @@ func TestMapReduce_checkLarge(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+*/

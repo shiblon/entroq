@@ -296,7 +296,6 @@ func changeProtoFromTask(t *entroq.Task) *pb.TaskChange {
 		},
 		NewData: protoFromTaskData(t.Data()),
 	}
-
 }
 
 func fromTaskIDProto(tid *pb.TaskID) (*entroq.TaskID, error) {
