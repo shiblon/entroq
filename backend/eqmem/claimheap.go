@@ -1,9 +1,11 @@
-package mem
+package eqmem
 
 import (
 	"container/heap"
 	"math/rand"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type claimItem struct {
@@ -75,13 +77,13 @@ func (h *claimHeap) randAvail(now time.Time, index int) *claimItem {
 
 	next1, next2 := index*2+1, index*2+2
 	if rand.Float64() < threshold {
-		if candidate := m.randAvail(now, next1); candidate != nil {
+		if candidate := h.randAvail(now, next1); candidate != nil {
 			item = candidate
 		}
 	}
 
 	if rand.Float64() < threshold {
-		if candidate := m.randAvail(now, next2); candidate != nil {
+		if candidate := h.randAvail(now, next2); candidate != nil {
 			item = candidate
 		}
 	}
@@ -133,20 +135,19 @@ func (h *claimHeap) RemoveID(id uuid.UUID) bool {
 
 func (h *claimHeap) RemoveItem(item *claimItem) {
 	heap.Remove(h, item.idx)
-	delete(h.byID[item.id])
+	delete(h.byID, item.id)
 }
 
-func (h *claimHeap) UpdateID(id uuid.UUID, at time.Time, claimant uuid.UUID) bool {
+func (h *claimHeap) UpdateID(id uuid.UUID, at time.Time) bool {
 	item, ok := h.FindItem(id)
 	if ok {
-		h.UpdateItem(item, at, claimant)
+		h.UpdateItem(item, at)
 	}
 	return ok
 }
 
-func (h *claimHeap) UpdateItem(item *claimItem, at time.Time, claimant uuid.UUID) {
+func (h *claimHeap) UpdateItem(item *claimItem, at time.Time) {
 	item.at = at
-	item.claimant = claimant
 	h.FixItem(item)
 }
 
