@@ -72,7 +72,7 @@ func (s *Queue) Len() int {
 }
 
 // Has indicates whether a given ID is in this task store.
-func (s *Queue) Has(id uuid.UUID) {
+func (s *Queue) Has(id uuid.UUID) bool {
 	_, ok := s.Get(id)
 	return ok
 }

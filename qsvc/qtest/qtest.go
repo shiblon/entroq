@@ -1240,9 +1240,11 @@ func EqualAllTasksVersionIncr(want, got []*entroq.Task, versionBump int) string 
 	if diff := EqualAllTasks(want, got); diff != "" {
 		return diff
 	}
+	wantByID := make(map[uuid.UUID]*entroq.Task)
+	gotByID := make(map[uuid.UUID]*entroq.Task)
 	var diffs []string
-	for i, w := range want {
-		g := got[i]
+	for id, w := range wantByID {
+		g := gotByID[id]
 		if w.Version+int32(versionBump) != g.Version {
 			diffs = append(diffs, cmp.Diff(g, w))
 		}

@@ -31,7 +31,9 @@ type claimHeap struct {
 }
 
 func newClaimHeap() *claimHeap {
-	return new(claimHeap)
+	return &claimHeap{
+		byID: make(map[uuid.UUID]*claimItem),
+	}
 }
 
 func (h *claimHeap) Len() int {

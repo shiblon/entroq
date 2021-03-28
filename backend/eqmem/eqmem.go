@@ -15,6 +15,7 @@ import (
 	"entrogo.com/entroq"
 	"entrogo.com/entroq/subq"
 	"github.com/google/uuid"
+	"github.com/pkg/errors"
 )
 
 type EQMem struct {
@@ -22,26 +23,26 @@ type EQMem struct {
 
 	nw entroq.NotifyWaiter
 
-	// byQueue allows tasks to be accessed by queue name. The returned type is
+	// queues allows tasks to be accessed by queue name. The returned type is
 	// safe for concurrent use, and follows sync.Map semantics.
-	byQueue map[string]*Queue
+	queues map[string]*Queue
 
-	// byID gets the queue name for a given task ID. This is used to quickly
+	// ids gets the queue name for a given task ID. This is used to quickly
 	// look up tasks when the queue name is unknown. That should never be the
 	// case, however, since modifications are done on existing tasks, and have
 	// to go through RBAC based on queue names.
-	byID map[uuid.UUID]string
+	ids map[uuid.UUID]string
 
 	// locks contains lockers for each known queue. The locks know their own
 	// queue name, as well.
-	locks map[string]*queueLock
+	locks map[string]*qLock
 
 	// claimIndex contains information making it easy to search for tasks to
 	// claim.
 	claimIndex map[string]*claimHeap
 }
 
-type queueLock struct {
+type qLock struct {
 	sync.Mutex
 	q string
 }
@@ -66,61 +67,21 @@ func Opener() entroq.BackendOpener {
 func New() *EQMem {
 	return &EQMem{
 		nw:         subq.New(),
-		byQueue:    make(map[string]*Queue),
-		byID:       make(map[uuid.UUID]string),
-		locks:      make(map[string]*queueLock),
+		queues:     make(map[string]*Queue),
+		ids:        make(map[uuid.UUID]string),
+		locks:      make(map[string]*qLock),
 		claimIndex: make(map[string]*claimHeap),
 	}
 }
 
-func (m *EQMem) queueNames() []string {
-	defer un(lock(m))
-	var qs []string
-	for q := range m.byQueue {
-		qs = append(qs, q)
-	}
-	return qs
-}
-
-func (m *EQMem) claimLocks(cq *entroq.ClaimQuery) []*queueLock {
-	defer un(lock(m))
-	var locks []*queueLock
-	for _, q := range cq.Queues {
-		if ql, ok := m.locks[q]; ok {
-			locks = append(locks, ql)
-		}
-	}
-	// These should be shuffled, because it's for claims.
-	rand.Shuffle(len(locks), func(i, j int) {
-		locks[i], locks[j] = locks[j], locks[i]
-	})
-	return locks
-}
-
-func (m *EQMem) getTask(queue string, id uuid.UUID) (*entroq.Task, bool) {
-	if queue == "" || id == uuid.Nil {
-		return nil, false
-	}
-	tasks, ok := m.queueTasks(queue)
-	if !ok {
-		return nil, false
-	}
-	return tasks.Get(id)
-}
-
-func (m *EQMem) claimHeap(queue string) (*claimHeap, bool) {
-	defer un(lock(m))
-	h, ok := m.claimIndex[queue]
-	return h, ok
-}
-
-func (m *EQMem) mustTryClaimOne(ql *queueLock, now time.Time, cq *entroq.ClaimQuery) *entroq.Task {
+func (m *EQMem) mustTryClaimOne(ql *qLock, now time.Time, cq *entroq.ClaimQuery) *entroq.Task {
 	defer un(lock(ql))
-	// Has to be done inside the lock - we're trusting that holding this lock
-	// means that this specific queue entry in the claim index is not being
-	// messed with.
-	h, ok := m.claimHeap(ql.q)
-	if !ok {
+
+	h := func() *claimHeap {
+		defer un(lock(m))
+		return m.claimIndex[ql.q]
+	}()
+	if h == nil {
 		return nil
 	}
 
@@ -196,10 +157,25 @@ func (m *EQMem) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Ta
 		return nil, errors.Wrap(err, "eqmem claim time")
 	}
 
-	qls := m.claimLocks(cq)
+	qls := func() []*qLock {
+		defer un(lock(m))
+		var qls []*qLock
+		for _, q := range cq.Queues {
+			if ql, ok := m.locks[q]; ok {
+				qls = append(qls, ql)
+			}
+		}
+		return qls
+	}()
+
 	if len(qls) == 0 {
 		return nil, nil
 	}
+
+	// Shuffle to avoid favoring one queue.
+	rand.Shuffle(len(qls), func(i, j int) {
+		qls[i], qls[j] = qls[j], qls[i]
+	})
 
 	for _, ql := range qls {
 		if task := m.mustTryClaimOne(ql, now, cq); task != nil {
@@ -210,113 +186,107 @@ func (m *EQMem) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Ta
 	return nil, nil
 }
 
-func ensureModQueues(mod *entroq.Modification, byID map[uuid.UUID]string) {
+func (m *EQMem) unsafeEnsureQueue(q string) {
+	if _, ok := m.locks[q]; !ok {
+		m.locks[q] = &qLock{q: q}
+	}
+	if _, ok := m.queues[q]; !ok {
+		m.queues[q] = NewQueue(q)
+	}
+	if _, ok := m.claimIndex[q]; !ok {
+		m.claimIndex[q] = newClaimHeap()
+	}
+}
+
+func (m *EQMem) unsafeCleanQueue(q string) {
+	ts, ok := m.queues[q]
+	if !ok || ts.Len() != 0 {
+		return
+	}
+	delete(m.queues, q)
+	delete(m.locks, q)
+	delete(m.claimIndex, q)
+}
+
+func ensureModQueues(mod *entroq.Modification, ids map[uuid.UUID]string) {
 	for _, d := range mod.Deletes {
 		if d.Queue == "" {
-			d.Queue = byID[d.ID]
+			d.Queue = ids[d.ID]
 		}
 	}
 
 	for _, d := range mod.Depends {
 		if d.Queue == "" {
-			d.Queue = byID[d.ID]
+			d.Queue = ids[d.ID]
 		}
 	}
 
 	for _, c := range mod.Changes {
 		if c.FromQueue == "" {
-			c.FromQueue = byID[c.ID]
+			c.FromQueue = ids[c.ID]
 		}
 	}
 }
 
 type modQueue struct {
-	lock  *queueLock
+	q     string
+	lock  *qLock
 	tasks *Queue
 	heap  *claimHeap
 }
 
-// modLocks finds all queues from a particular modification request. If any of
+// modPrep finds all queues from a particular modification request. If any of
 // the given queues are not found, then it returns a "not okay" value as the
 // second parameter. Otherwise it returns a list of queue locks that can be
 // locked in the caller when ready. It can create new locks (e.g., for
 // insertions). The modification is altered in this call to ensure that
 // everything for which a queue can be found has one (e.g., deletions that have
 // only IDs will get a queue here if they can be found).
-func (m *EQMem) modLocks(mod *entroq.Modification) (info []*modQueue, delNew func()) {
+//
+// Also, if any queue indexes don't have a queue represented, that is fixed here.
+func (m *EQMem) modPrep(mod *entroq.Modification) []*modQueue {
 	// This has to be locked the whole time so that IDs and queues are matched
 	// properly if queues are missing somewhere.
 	defer un(lock(m))
-	ensureModQueues(mod, m.byID)
 
-	var queues map[string]bool
-	lockMap := make(map[string]bool)
-
-	var newQs []string
-	var locks []*queueLock
-	addLock := func(q string, addIfMissing bool) {
-		// No queue, or already known, skip.
-		if q == "" || lockMap[q] {
-			return
-		}
-		ql, ok := m.locks[q]
-		if !ok {
-			if !addIfMissing {
-				return
-			}
-			ql = &queueLock{q: q}
-			// Just added one - keep track in case we need to remove it later.
-			newQs = append(newQs, q)
-			m.locks[q] = ql
-		}
-		lockMap[q] = true
-		locks = append(locks, ql)
-	}
-
+	ensureModQueues(mod, m.ids)
+	queues := make(map[string]bool)
 	for _, ins := range mod.Inserts {
-		addLock(ins.Queue, true)
+		queues[ins.Queue] = true
 	}
 	for _, c := range mod.Changes {
-		addLock(c.FromQueue, false)
-		addLock(c.Queue, true)
+		queues[c.FromQueue] = true
+		queues[c.Queue] = true
 	}
 	for _, d := range mod.Deletes {
-		addLock(d.Queue, false)
+		queues[d.Queue] = true
 	}
 	for _, d := range mod.Depends {
-		addLock(d.Queue, false)
+		queues[d.Queue] = true
 	}
 
-	delNew = func() {
-		if len(newQs) == 0 {
-			return
-		}
-		// It is allowed to acquire this lock while the queue locks are
-		// acquired because it is released first. Thus, the order of
-		// simultaneous locks will always be queues, then global.
-		defer un(lock(m))
-		for _, q := range newQs {
-			delete(m.locks, q)
-		}
-	}
+	log.Printf("queues: %+v", queues)
 
-	// We have all of the locks we need. Sort to avoid dining philosophers problems.
-	sort.Slice(locks, func(i, j int) bool {
-		return locks[i].q < locks[j].q
-	})
-
-	// Finally, fill in the full info from the qlocks, queue tasks, and heap information.
-	for _, ql := range locks {
-		qts, _ := m.queueTasks(ql.q)
-		h := m.claimIndex[ql.q]
+	var info []*modQueue
+	for q := range queues {
+		if q == "" {
+			continue
+		}
+		m.unsafeEnsureQueue(q)
 		info = append(info, &modQueue{
-			lock:  ql,
-			tasks: qts,
-			heap:  h,
+			q:     q,
+			lock:  m.locks[q],
+			tasks: m.queues[q],
+			heap:  m.claimIndex[q],
 		})
 	}
 
-	return locks, delNew
+	// We have all of the locks we need. Sort to avoid dining philosophers problems.
+	sort.Slice(info, func(i, j int) bool {
+		return info[i].q < info[j].q
+	})
+
+	return info
 }
 
 // Modify attempts to do an atomic modification on the system, given a
@@ -344,34 +314,40 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted 
 	// - Modify claimHeaps and actual tasks. Take special care with deletions and insertions.
 	// - Unlock queues.
 
-	modQueues, delNew, err := m.modLocks(mod)
+	now, err := m.Time(ctx)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "eqmem modify")
+		return nil, nil, errors.Wrap(err, "modify get time")
 	}
+	modQueues := m.modPrep(mod)
 
-	// Now lock all of the queues and defer unlocking them at the same time.
+	// Lock all queues, and store them in a place that's easy to look up.
 	byQ := make(map[string]*modQueue)
 	for _, mq := range modQueues {
-		defer un(lock(ql))
-		byQ[mq.lock.q] = mq
+		defer un(lock(mq.lock))
+		byQ[mq.q] = mq
 	}
 
+	// Set things up to delete empty queues if any were left empty after the
+	// modification. We don't do this as we go along because it is quite
+	// possible to have one task deleted from a queue, making it empty, and
+	// another added in the same transaction.
 	defer func() {
-		// When an error is returned, that means any new queue locks we created
-		// need to be uncreated. This has to happen before the queue locks are
-		// released, though, which is why we defer after all of the other lock
-		// deferrals are in place.
-		if err != nil {
-			delNew()
+		defer un(lock(m))
+		for _, mq := range modQueues {
+			m.unsafeCleanQueue(mq.q)
 		}
 	}()
 
 	// Find the actual tasks involved. Queues were filled in when obtaining locks.
 	found := make(map[uuid.UUID]*entroq.Task)
 	addFound := func(q string, id uuid.UUID) {
-		t, ok := m.getTask(q, id)
-		if ok {
-			found[t.ID] = t
+		if q == "" || id == uuid.Nil {
+			return
+		}
+		if ts, ok := m.queues[q]; ok {
+			if t, ok := ts.Get(id); ok {
+				found[t.ID] = t
+			}
 		}
 	}
 	for _, d := range mod.Deletes {
@@ -381,10 +357,10 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted 
 		addFound(d.Queue, d.ID)
 	}
 	for _, c := range mod.Changes {
-		addFound(d.FromQueue, d.ID)
+		addFound(c.FromQueue, c.ID)
 	}
 	for _, t := range mod.Inserts {
-		addFound(d.Queue, d.ID)
+		addFound(t.Queue, t.ID)
 	}
 
 	if err := mod.DependencyError(found); err != nil {
@@ -397,40 +373,26 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted 
 
 	deleteID := func(q string, id uuid.UUID) {
 		mq := byQ[q]
-		mq.heap.Remove(id)
-		if ok := mq.tasks.Delete(id); !ok {
-			log.Fatalf("Inconsistent state: task %v not found in queue %q to delete", id, q)
-		}
+		mq.heap.RemoveID(id)
+		mq.tasks.Delete(id)
 
 		defer un(lock(m))
-		delete(m.byID, id)
-		if mq.tasks.Len() == 0 {
-			delete(m.byQueue, mq.lock.q)
-			delete(m.claimIndex, m.lock.q)
-			delete(m.locks, m.lock.q)
-		}
+		delete(m.ids, id)
+		m.unsafeCleanQueue(mq.q)
 	}
 
 	insertTask := func(t *entroq.Task) {
 		mq := byQ[t.Queue]
-		func() {
-			defer un(lock(m))
-			if mq.heap == nil {
-				mq.heap = newClaimHeap()
-				m.claimIndex[m.lock.q] = mq.heap
-			}
-			if mq.tasks == nil {
-				mq.tasks = NewQueue(m.lock.q)
-				m.byQueue[m.lock.q] = mq.tasks
-			}
-		}()
-		mq.heap.PushItem(newItem(m.lock.q, t.ID, t.At))
+		mq.heap.PushItem(newItem(mq.q, t.ID, t.At))
 		mq.tasks.Set(t.ID, t)
+
+		defer un(lock(m))
+		m.ids[t.ID] = t.Queue
 	}
 
 	updateTask := func(t *entroq.Task) {
 		mq := byQ[t.Queue]
-		if ok := mq.heap.UpdateID(t.ID, t.At, t.Claimant); !ok {
+		if ok := mq.heap.UpdateID(t.ID, t.At); !ok {
 			log.Fatalf("Inconsistent state: task %v not found in queue heap %q", t.ID, t.Queue)
 		}
 		mq.tasks.Set(t.ID, t)
@@ -444,7 +406,7 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted 
 		c.Version++
 		c.Modified = now
 		if c.FromQueue != c.Queue {
-			deleteID(c.FromQueue, d.ID)
+			deleteID(c.FromQueue, c.ID)
 			insertTask(newTask)
 		} else {
 			// Original version was already checked earlier.
@@ -453,14 +415,19 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted 
 		changed = append(changed, newTask)
 	}
 	for _, t := range mod.Inserts {
-		newTask := t.Copy()
-		newTask.Version = 0
-		newTask.Claimant = mod.Claimant
-		newTask.Claims = 0
-		newTask.Created = now
-		newTask.Modified = now
-		newTask.Attempt = 0
-		newTask.Err = ""
+		id := t.ID
+		if id == uuid.Nil {
+			id = uuid.New()
+		}
+		newTask := &entroq.Task{
+			ID:       id,
+			Queue:    t.Queue,
+			Claimant: mod.Claimant,
+			At:       now,
+			Created:  now,
+			Modified: now,
+			Value:    t.Value,
+		}
 		insertTask(newTask)
 		inserted = append(inserted, newTask)
 	}
@@ -476,13 +443,13 @@ func (m *EQMem) Time(_ context.Context) (time.Time, error) {
 
 func (m *EQMem) queueForID(id uuid.UUID) (string, bool) {
 	defer un(lock(m))
-	q, ok := m.byID[id]
+	q, ok := m.ids[id]
 	return q, ok
 }
 
 func (m *EQMem) queueTasks(queue string) (*Queue, bool) {
 	defer un(lock(m))
-	q, ok := m.byQueue[queue]
+	q, ok := m.queues[queue]
 	return q, ok
 }
 
@@ -507,7 +474,7 @@ func (m *EQMem) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Tas
 		if tq.Claimant != uuid.Nil && tq.Claimant != t.Claimant && t.At.After(now) {
 			return false
 		}
-		found = append(found, t.CopyWithValue(!t.OmitValues))
+		found = append(found, t.CopyWithValue(!tq.OmitValues))
 		return true
 	}
 
@@ -545,7 +512,7 @@ func (m *EQMem) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Tas
 	}
 
 	// No ID list, just a queue, range over it.
-	qts, ok := m.queueTasks(q)
+	qts, ok := m.queueTasks(tq.Queue)
 	if !ok {
 		return nil, nil
 	}
@@ -581,8 +548,20 @@ func (m *EQMem) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[string]
 
 // QueueStats returns statistics for each queue in the query.
 func (m *EQMem) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[string]*entroq.QueueStat, error) {
+	now, err := m.Time(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "queue stats time")
+	}
+	var qnames []string
+	func() {
+		defer un(lock(m))
+		for q := range m.queues {
+			qnames = append(qnames, q)
+		}
+	}()
+
 	qs := make(map[string]*entroq.QueueStat)
-	for _, q := range m.queueNames() {
+	for _, q := range qnames {
 		if !queueMatches(q, qq) {
 			continue
 		}
@@ -597,7 +576,7 @@ func (m *EQMem) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[str
 		stats := &entroq.QueueStat{
 			Name: q,
 		}
-		qts.Range(func(_, t *entroq.Task) bool {
+		qts.Range(func(_ uuid.UUID, t *entroq.Task) bool {
 			stats.Size++
 			if !now.Before(t.At) {
 				if t.Claimant != uuid.Nil {
