@@ -11,14 +11,20 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"entrogo.com/entroq"
+	"entrogo.com/entroq/subq"
+	"github.com/google/uuid"
 )
 
 type EQMem struct {
 	sync.Mutex
 
+	nw entroq.NotifyWaiter
+
 	// byQueue allows tasks to be accessed by queue name. The returned type is
 	// safe for concurrent use, and follows sync.Map semantics.
-	byQueue map[string]*Tasks
+	byQueue map[string]*Queue
 
 	// byID gets the queue name for a given task ID. This is used to quickly
 	// look up tasks when the queue name is unknown. That should never be the
@@ -49,12 +55,20 @@ func un(f func()) {
 	f()
 }
 
+// Opener returns a constructor of the in-memory backend.
+func Opener() entroq.BackendOpener {
+	return func(_ context.Context) (entroq.Backend, error) {
+		return New(), nil
+	}
+}
+
 // New returns a new in-memory implementation, ready to be used.
 func New() *EQMem {
 	return &EQMem{
-		queueTasks: new(sync.Map),
-		queueLocks: make(map[string]*queueLock),
-		modIndex:   makeModMap(),
+		nw:         subq.New(),
+		byQueue:    make(map[string]*Queue),
+		byID:       make(map[uuid.UUID]string),
+		locks:      make(map[string]*queueLock),
 		claimIndex: make(map[string]*claimHeap),
 	}
 }
@@ -70,9 +84,9 @@ func (m *EQMem) queueNames() []string {
 
 func (m *EQMem) claimLocks(cq *entroq.ClaimQuery) []*queueLock {
 	defer un(lock(m))
-	var locks []queueLock
+	var locks []*queueLock
 	for _, q := range cq.Queues {
-		if ql, ok := m.queueLocks[q]; ok {
+		if ql, ok := m.locks[q]; ok {
 			locks = append(locks, ql)
 		}
 	}
@@ -87,16 +101,11 @@ func (m *EQMem) getTask(queue string, id uuid.UUID) (*entroq.Task, bool) {
 	if queue == "" || id == uuid.Nil {
 		return nil, false
 	}
-	tasks, ok := m.queueTasks.Load(queue)
+	tasks, ok := m.queueTasks(queue)
 	if !ok {
 		return nil, false
 	}
-	task, ok := tasks.(*sync.Map).Load(id)
-	if !ok {
-		return nil, false
-	}
-
-	return task.(*entroq.Task), true
+	return tasks.Get(id)
 }
 
 func (m *EQMem) claimHeap(queue string) (*claimHeap, bool) {
@@ -125,8 +134,8 @@ func (m *EQMem) mustTryClaimOne(ql *queueLock, now time.Time, cq *entroq.ClaimQu
 	// - Update the task at+claimant in the claim index.
 	// - Run fix.
 	// - Update the task itself in the task store.
-	newAt = now.Add(cq.Duration)
-	h.UpdateItem(item, newAt, cq.Claimant)
+	newAt := now.Add(cq.Duration)
+	h.UpdateItem(item, newAt)
 
 	qts, ok := m.queueTasks(ql.q)
 	if !ok {
@@ -149,6 +158,11 @@ func (m *EQMem) mustTryClaimOne(ql *queueLock, now time.Time, cq *entroq.ClaimQu
 	}
 
 	return found
+}
+
+// Claim waits for a task to be available to claim.
+func (m *EQMem) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
+	return entroq.WaitTryClaim(ctx, cq, m.TryClaim, m.nw)
 }
 
 // TryClaim attempts to claim a task from the given queue query. If no task is
@@ -188,7 +202,7 @@ func (m *EQMem) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Ta
 	}
 
 	for _, ql := range qls {
-		if task := m.mustTryClaimOne(now, ql); task != nil {
+		if task := m.mustTryClaimOne(ql, now, cq); task != nil {
 			return task, nil
 		}
 	}
@@ -211,7 +225,7 @@ func ensureModQueues(mod *entroq.Modification, byID map[uuid.UUID]string) {
 
 	for _, c := range mod.Changes {
 		if c.FromQueue == "" {
-			c.FromQueue = byID[d.ID]
+			c.FromQueue = byID[c.ID]
 		}
 	}
 }
@@ -236,8 +250,9 @@ func (m *EQMem) modLocks(mod *entroq.Modification) (info []*modQueue, delNew fun
 	ensureModQueues(mod, m.byID)
 
 	var queues map[string]bool
-	lockMap = make(map[string]bool)
+	lockMap := make(map[string]bool)
 
+	var newQs []string
 	var locks []*queueLock
 	addLock := func(q string, addIfMissing bool) {
 		// No queue, or already known, skip.
@@ -272,7 +287,7 @@ func (m *EQMem) modLocks(mod *entroq.Modification) (info []*modQueue, delNew fun
 		addLock(d.Queue, false)
 	}
 
-	delNew := func() {
+	delNew = func() {
 		if len(newQs) == 0 {
 			return
 		}
@@ -281,7 +296,7 @@ func (m *EQMem) modLocks(mod *entroq.Modification) (info []*modQueue, delNew fun
 		// simultaneous locks will always be queues, then global.
 		defer un(lock(m))
 		for _, q := range newQs {
-			delete(m.locks[q])
+			delete(m.locks, q)
 		}
 	}
 
@@ -301,7 +316,7 @@ func (m *EQMem) modLocks(mod *entroq.Modification) (info []*modQueue, delNew fun
 		})
 	}
 
-	return locks, delNew, nil
+	return locks, delNew
 }
 
 // Modify attempts to do an atomic modification on the system, given a
@@ -421,12 +436,9 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted 
 		mq.tasks.Set(t.ID, t)
 	}
 
-	var inserts []*entroq.Task
-	var changes []*entroq.Task
 	for _, d := range mod.Deletes {
 		deleteID(d.Queue, d.ID)
 	}
-	var changed []*entroq.Task
 	for _, c := range mod.Changes {
 		newTask := c.Copy()
 		c.Version++
@@ -440,7 +452,6 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted 
 		}
 		changed = append(changed, newTask)
 	}
-	var inserted []*entroq.Task
 	for _, t := range mod.Inserts {
 		newTask := t.Copy()
 		newTask.Version = 0
@@ -564,7 +575,7 @@ func queueMatches(val string, qq *entroq.QueuesQuery) bool {
 }
 
 // Queues returns the list of queue and their sizes, based on query contents.
-func (m *EQMem) Queues(ctx context.Context, qq *entroq.Query) (map[string]int, error) {
+func (m *EQMem) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[string]int, error) {
 	return entroq.QueuesFromStats(m.QueueStats(ctx, qq))
 }
 
@@ -605,4 +616,9 @@ func (m *EQMem) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[str
 	}
 
 	return qs, nil
+}
+
+// Close cleans up this implementation.
+func (*EQMem) Close() error {
+	return nil
 }

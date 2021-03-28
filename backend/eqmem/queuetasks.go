@@ -3,23 +3,10 @@ package eqmem
 import (
 	"fmt"
 	"sync"
+
+	"entrogo.com/entroq"
+	"github.com/google/uuid"
 )
-
-type rlocker interface {
-	RLock()
-}
-
-func rlock(l rlocker) func() {
-	l.RLock()
-	return l.Unlock()
-}
-
-func lock(l sync.Locker) func() {
-	l.Lock()
-	return l.Unlock()
-}
-
-func un(f func()) { f() }
 
 // Queue is a synchronized map of task IDs to task values. It uses a
 // sync.Map underneath, but makes certain operations safer and quicker, like
