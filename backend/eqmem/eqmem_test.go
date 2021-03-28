@@ -2,8 +2,13 @@ package eqmem
 
 import (
 	"context"
+	"math/rand"
+	"reflect"
 	"testing"
+	"testing/quick"
 
+	"entrogo.com/entroq"
+	"entrogo.com/entroq/contrib/mrtest"
 	"entrogo.com/entroq/qsvc/qtest"
 )
 
@@ -18,64 +23,63 @@ func RunQTest(t *testing.T, tester qtest.Tester) {
 	tester(ctx, t, client, "")
 }
 
-func TestSimpleSequence(t *testing.T) {
+func TestEQMemSimpleSequence(t *testing.T) {
 	RunQTest(t, qtest.SimpleSequence)
 }
 
-func TestTasksWithID(t *testing.T) {
+func TestEQMemTasksWithID(t *testing.T) {
 	RunQTest(t, qtest.TasksWithID)
 }
 
-func TestTasksOmitValue(t *testing.T) {
+func TestEQMemTasksOmitValue(t *testing.T) {
 	RunQTest(t, qtest.TasksOmitValue)
 }
 
-func TestTasksWithIDOnly(t *testing.T) {
+func TestEQMemTasksWithIDOnly(t *testing.T) {
 	RunQTest(t, qtest.TasksWithIDOnly)
 }
 
-func TestInsertWithID(t *testing.T) {
+func TestEQMemInsertWithID(t *testing.T) {
 	RunQTest(t, qtest.InsertWithID)
 }
 
-func TestSimpleChange(t *testing.T) {
+func TestEQMemSimpleChange(t *testing.T) {
 	RunQTest(t, qtest.SimpleChange)
 }
 
-func TestSimpleWorker(t *testing.T) {
+func TestEQMemSimpleWorker(t *testing.T) {
 	RunQTest(t, qtest.SimpleWorker)
 }
 
-func TestMultiWorker(t *testing.T) {
+func TestEQMemMultiWorker(t *testing.T) {
 	RunQTest(t, qtest.MultiWorker)
 }
 
-func TestWorkerDependencyHandler(t *testing.T) {
+func TestEQMemWorkerDependencyHandler(t *testing.T) {
 	RunQTest(t, qtest.WorkerDependencyHandler)
 }
 
-func TestWorkerMoveOnError(t *testing.T) {
+func TestEQMemWorkerMoveOnError(t *testing.T) {
 	RunQTest(t, qtest.WorkerMoveOnError)
 }
 
-func TestWorkerRetryOnError(t *testing.T) {
+func TestEQMemWorkerRetryOnError(t *testing.T) {
 	RunQTest(t, qtest.WorkerRetryOnError)
 }
 
-func TestWorkerRenewal(t *testing.T) {
+func TestEQMemWorkerRenewal(t *testing.T) {
 	RunQTest(t, qtest.WorkerRenewal)
 }
 
-func TestQueueMatch(t *testing.T) {
+func TestEQMemQueueMatch(t *testing.T) {
 	RunQTest(t, qtest.QueueMatch)
 }
 
-func TestQueueStats(t *testing.T) {
+func TestEQMemQueueStats(t *testing.T) {
 	RunQTest(t, qtest.QueueStats)
 }
 
-/*
-func TestMapReduce_checkSmall(t *testing.T) {
+func TestEQMemMapReduce_checkSmall(t *testing.T) {
 	config := &quick.Config{
 		MaxCount: 2,
 		Values: func(values []reflect.Value, rand *rand.Rand) {
@@ -98,7 +102,7 @@ func TestMapReduce_checkSmall(t *testing.T) {
 	}
 }
 
-func TestMapReduce_checkLarge(t *testing.T) {
+func TestEQMemMapReduce_checkLarge(t *testing.T) {
 	config := &quick.Config{
 		MaxCount: 5,
 		Values: func(values []reflect.Value, rand *rand.Rand) {
@@ -120,4 +124,3 @@ func TestMapReduce_checkLarge(t *testing.T) {
 		t.Fatal(err)
 	}
 }
-*/
