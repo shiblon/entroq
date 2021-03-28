@@ -157,7 +157,11 @@ type Task struct {
 
 // String returns a useful representation of this task.
 func (t *Task) String() string {
-	return fmt.Sprintf("Task [%q %s v%d]\n\t", t.Queue, t.ID, t.Version) + strings.Join([]string{
+	qInfo := fmt.Sprintf("%q", t.Queue)
+	if t.FromQueue != "" && t.FromQueue != t.Queue {
+		qInfo = fmt.Sprintf("%q -> %q", t.FromQueue, t.Queue)
+	}
+	return fmt.Sprintf("Task [%s %s v%d]\n\t", qInfo, t.ID, t.Version) + strings.Join([]string{
 		fmt.Sprintf("at=%q claimant=%s claims=%d", t.At, t.Claimant, t.Claims),
 		fmt.Sprintf("attempt=%d err=%q", t.Attempt, t.Err),
 		fmt.Sprintf("c=%q m=%q", t.Created, t.Modified),
@@ -794,7 +798,6 @@ func (c *EntroQ) RenewAllFor(ctx context.Context, tasks []*Task, duration time.D
 		modArgs = append(modArgs, Changing(t, ArrivalTimeBy(duration)))
 		taskIDs = append(taskIDs, t.IDVersion().String())
 	}
-	log.Printf("Renewing tasks %v", taskIDs)
 	_, changed, err := c.Modify(ctx, modArgs...)
 	if err != nil {
 		return nil, errors.Wrapf(err, "renewal failed for tasks %q", taskIDs)
@@ -919,7 +922,6 @@ func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (inserted []*
 		log.Printf("Trying modification again due to skippable colliding inserts. %v -> %v", mod.Inserts, newInserts)
 		mod.Inserts = newInserts
 	}
-	return c.backend.Modify(ctx, NewModification(c.clientID, modArgs...))
 }
 
 // ModifyArg is an argument to the Modify function, which does batch modifications to the task store.
@@ -1102,12 +1104,9 @@ func DependingOn(id uuid.UUID, version int32, opts ...IDOption) ModifyArg {
 func Changing(task *Task, changeArgs ...ChangeArg) ModifyArg {
 	return func(m *Modification) {
 		newTask := *task
-		// Set the FromQueue in *every* case.
-		// An empty FromQueue is different than one that has the same name as
-		// the new queue. This is used for authorization. Empty queues can be
-		// given very strict privileges (e.g., for admins to change a task no
-		// matter where it is).
-		newTask.FromQueue = task.Queue
+		if newTask.FromQueue == "" {
+			newTask.FromQueue = task.Queue
+		}
 		for _, a := range changeArgs {
 			a(m, &newTask)
 		}

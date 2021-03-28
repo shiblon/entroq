@@ -83,8 +83,6 @@ func StartService(ctx context.Context, opener entroq.BackendOpener) (*grpc.Serve
 
 // SimpleChange tests that changing things in the task leave most of it intact, and can handle things like queue moves.
 func SimpleChange(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	t.Helper()
-
 	inQueue := path.Join(qPrefix, "simple_change", "in")
 	outQueue := path.Join(qPrefix, "simple_change", "out")
 
@@ -475,7 +473,6 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 				t.Fatalf("Test %q took too long getting the retried task from something that had multiple attempts", c.name)
 			}
 		}
-		log.Printf("Test %q: changed task: %v", c.name, changedTask)
 		if want, got := c.wantErr, changedTask.Err; want != got {
 			t.Fatalf("Test %q expected err %q, got %q", c.name, want, got)
 		}

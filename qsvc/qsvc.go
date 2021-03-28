@@ -467,14 +467,15 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 			return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse change id")
 		}
 		t := &entroq.Task{
-			ID:       id,
-			Version:  change.GetOldId().Version,
-			Claimant: claimant,
-			Queue:    change.GetNewData().Queue,
-			Value:    change.GetNewData().Value,
-			At:       fromMS(change.GetNewData().AtMs),
-			Attempt:  change.GetNewData().Attempt,
-			Err:      change.GetNewData().Err,
+			ID:        id,
+			Version:   change.GetOldId().Version,
+			Claimant:  claimant,
+			Queue:     change.GetNewData().Queue,
+			Value:     change.GetNewData().Value,
+			At:        fromMS(change.GetNewData().AtMs),
+			Attempt:   change.GetNewData().Attempt,
+			Err:       change.GetNewData().Err,
+			FromQueue: change.GetOldId().Queue,
 		}
 		modArgs = append(modArgs, entroq.Changing(t))
 	}

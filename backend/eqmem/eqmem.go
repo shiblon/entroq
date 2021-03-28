@@ -27,11 +27,11 @@ type EQMem struct {
 	// safe for concurrent use, and follows sync.Map semantics.
 	queues map[string]*Queue
 
-	// ids gets the queue name for a given task ID. This is used to quickly
+	// qByID gets the queue name for a given task ID. This is used to quickly
 	// look up tasks when the queue name is unknown. That should never be the
 	// case, however, since modifications are done on existing tasks, and have
 	// to go through RBAC based on queue names.
-	ids map[uuid.UUID]string
+	qByID map[uuid.UUID]string
 
 	// locks contains lockers for each known queue. The locks know their own
 	// queue name, as well.
@@ -68,7 +68,7 @@ func New() *EQMem {
 	return &EQMem{
 		nw:         subq.New(),
 		queues:     make(map[string]*Queue),
-		ids:        make(map[uuid.UUID]string),
+		qByID:      make(map[uuid.UUID]string),
 		locks:      make(map[string]*qLock),
 		claimIndex: make(map[string]*claimHeap),
 	}
@@ -208,22 +208,24 @@ func (m *EQMem) unsafeCleanQueue(q string) {
 	delete(m.claimIndex, q)
 }
 
-func ensureModQueues(mod *entroq.Modification, ids map[uuid.UUID]string) {
+func ensureModQueues(mod *entroq.Modification, qByID map[uuid.UUID]string) {
 	for _, d := range mod.Deletes {
 		if d.Queue == "" {
-			d.Queue = ids[d.ID]
+			d.Queue = qByID[d.ID]
 		}
 	}
 
 	for _, d := range mod.Depends {
 		if d.Queue == "" {
-			d.Queue = ids[d.ID]
+			d.Queue = qByID[d.ID]
 		}
 	}
 
 	for _, c := range mod.Changes {
+		// This has to be unconditionally set. The modification doesn't expect to set
+		// the FromQueue in call cases.
 		if c.FromQueue == "" {
-			c.FromQueue = ids[c.ID]
+			c.FromQueue = qByID[c.ID]
 		}
 	}
 }
@@ -249,7 +251,7 @@ func (m *EQMem) modPrep(mod *entroq.Modification) []*modQueue {
 	// properly if queues are missing somewhere.
 	defer un(lock(m))
 
-	ensureModQueues(mod, m.ids)
+	ensureModQueues(mod, m.qByID)
 	queues := make(map[string]bool)
 	for _, ins := range mod.Inserts {
 		queues[ins.Queue] = true
@@ -264,8 +266,6 @@ func (m *EQMem) modPrep(mod *entroq.Modification) []*modQueue {
 	for _, d := range mod.Depends {
 		queues[d.Queue] = true
 	}
-
-	log.Printf("queues: %+v", queues)
 
 	var info []*modQueue
 	for q := range queues {
@@ -377,7 +377,7 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted 
 		mq.tasks.Delete(id)
 
 		defer un(lock(m))
-		delete(m.ids, id)
+		delete(m.qByID, id)
 		m.unsafeCleanQueue(mq.q)
 	}
 
@@ -387,7 +387,7 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted 
 		mq.tasks.Set(t.ID, t)
 
 		defer un(lock(m))
-		m.ids[t.ID] = t.Queue
+		m.qByID[t.ID] = t.Queue
 	}
 
 	updateTask := func(t *entroq.Task) {
@@ -422,11 +422,11 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted 
 		newTask := &entroq.Task{
 			ID:       id,
 			Queue:    t.Queue,
+			At:       t.At,
+			Value:    t.Value,
 			Claimant: mod.Claimant,
-			At:       now,
 			Created:  now,
 			Modified: now,
-			Value:    t.Value,
 		}
 		insertTask(newTask)
 		inserted = append(inserted, newTask)
@@ -443,7 +443,7 @@ func (m *EQMem) Time(_ context.Context) (time.Time, error) {
 
 func (m *EQMem) queueForID(id uuid.UUID) (string, bool) {
 	defer un(lock(m))
-	q, ok := m.ids[id]
+	q, ok := m.qByID[id]
 	return q, ok
 }
 
@@ -578,7 +578,7 @@ func (m *EQMem) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[str
 		}
 		qts.Range(func(_ uuid.UUID, t *entroq.Task) bool {
 			stats.Size++
-			if !now.Before(t.At) {
+			if t.At.After(now) {
 				if t.Claimant != uuid.Nil {
 					stats.Claimed++
 				}
