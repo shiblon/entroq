@@ -546,6 +546,7 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 	if _, _, err := w.client.Modify(ctx, modArgs...); err != nil {
 		return errors.Wrap(err, "merge output")
 	}
+
 	return nil
 }
 

@@ -107,8 +107,6 @@ func SimpleChange(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 // SimpleWorker tests basic worker functionality while tasks are coming in and
 // being waited on.
 func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	t.Helper()
-
 	queue := path.Join(qPrefix, "simple_worker")
 
 	var consumed []*entroq.Task
@@ -173,8 +171,6 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 }
 
 func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	t.Helper()
-
 	bigQueue := path.Join(qPrefix, "multi_worker_big")
 	medQueue := path.Join(qPrefix, "multi_worker_medium")
 	smallQueue := path.Join(qPrefix, "multi_worker_small")
@@ -312,8 +308,6 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 // handlers get called on dependency errors, and that upgrades to fatal errors
 // happen appropriately.
 func WorkerDependencyHandler(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	t.Helper()
-
 	queue := path.Join(qPrefix, "dep-handler-queue")
 
 	timesHandled := make(chan int, 1)
@@ -370,8 +364,6 @@ func WorkerDependencyHandler(ctx context.Context, t *testing.T, client *entroq.E
 // increment attempts and set the error properly. It also checks that after max
 // attempts, things get moved.
 func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	t.Helper()
-
 	newTask := func(val string) *entroq.Task {
 		return &entroq.Task{
 			Queue: path.Join(qPrefix, "retry_on_error", val),
@@ -496,8 +488,6 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 // move the task into an error queue with the expected wrapper and don't just
 // crash.
 func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	t.Helper()
-
 	baseQueue := path.Join(qPrefix, "move_on_error")
 
 	type tc struct {
@@ -717,7 +707,6 @@ func TasksOmitValue(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 
 // TasksWithID exercises the task query mechanism that allows specific task IDs to be looked up.
 func TasksWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	t.Helper()
 	queue := path.Join(qPrefix, "tasks_with_id")
 
 	ids := []uuid.UUID{
@@ -782,7 +771,6 @@ func TasksWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 
 // TasksWithIDOnly tests that tasks listed by ID only (no queue) can return from multiple queues.
 func TasksWithIDOnly(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	t.Helper()
 	q1 := path.Join(qPrefix, "id_only_1")
 	q2 := path.Join(qPrefix, "id_only_2")
 
@@ -843,7 +831,6 @@ func TasksWithIDOnly(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 // InsertWithID tests the ability to insert tasks with a specified ID,
 // including errors when an existing ID is used for insertion.
 func InsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	t.Helper()
 	queue := path.Join(qPrefix, "insert_with_id")
 
 	knownID := uuid.New()
@@ -1049,8 +1036,6 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 
 // QueueMatch tests various queue matching functions against a client.
 func QueueMatch(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	t.Helper()
-
 	queue1 := path.Join(qPrefix, "queue-1")
 	queue2 := path.Join(qPrefix, "queue-2")
 	queue3 := path.Join(qPrefix, "queue-3")
@@ -1150,8 +1135,6 @@ func QueueMatch(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefi
 
 // QueueStats checks that queue stats basically work.
 func QueueStats(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	t.Helper()
-
 	nothingClaimedQueue := path.Join(qPrefix, "queue-1")
 	partiallyClaimedQueue := path.Join(qPrefix, "queue-2")
 

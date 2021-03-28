@@ -187,25 +187,24 @@ func (m *EQMem) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Ta
 }
 
 func (m *EQMem) unsafeEnsureQueue(q string) {
-	if _, ok := m.locks[q]; !ok {
+	if ql, ok := m.locks[q]; ql == nil || !ok {
 		m.locks[q] = &qLock{q: q}
 	}
-	if _, ok := m.queues[q]; !ok {
+	if ts, ok := m.queues[q]; ts == nil || !ok {
 		m.queues[q] = NewQueue(q)
 	}
-	if _, ok := m.claimIndex[q]; !ok {
+	if h, ok := m.claimIndex[q]; h == nil || !ok {
 		m.claimIndex[q] = newClaimHeap()
 	}
 }
 
 func (m *EQMem) unsafeCleanQueue(q string) {
 	ts, ok := m.queues[q]
-	if !ok || ts.Len() != 0 {
-		return
+	if ok && ts.Len() == 0 {
+		delete(m.queues, q)
+		delete(m.locks, q)
+		delete(m.claimIndex, q)
 	}
-	delete(m.queues, q)
-	delete(m.locks, q)
-	delete(m.claimIndex, q)
 }
 
 func ensureModQueues(mod *entroq.Modification, qByID map[uuid.UUID]string) {
@@ -313,7 +312,6 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted 
 	//
 	// - Modify claimHeaps and actual tasks. Take special care with deletions and insertions.
 	// - Unlock queues.
-
 	now, err := m.Time(ctx)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "modify get time")
@@ -378,7 +376,6 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted 
 
 		defer un(lock(m))
 		delete(m.qByID, id)
-		m.unsafeCleanQueue(mq.q)
 	}
 
 	insertTask := func(t *entroq.Task) {
@@ -521,7 +518,11 @@ func (m *EQMem) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Tas
 	}
 
 	qts.Range(func(_ uuid.UUID, t *entroq.Task) bool {
-		return tryAdd(t)
+		if tq.Limit != 0 && tq.Limit <= len(found) {
+			return false
+		}
+		tryAdd(t)
+		return true
 	})
 
 	return found, nil
