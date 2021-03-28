@@ -194,21 +194,86 @@ func (m *EQMem) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Ta
 	return nil, nil
 }
 
+type modQueue struct {
+	impl  *EQMem
+	lock  *queueLock
+	tasks *Queue
+	heap  *claimHeap
+}
+
+func (m *modQueue) getID(id uuid.UUID) (*entroq.Task, bool) {
+	if m.tasks == nil {
+		return nil, false
+	}
+	return m.tasks.Get(id)
+}
+
+func (m *modQueue) deleteID(id uuid.UUID) {
+	if m.heap == nil || m.tasks == nil {
+		log.Fatalf("Inconsistent state: delete ID has either no heap or tasks for queue %q", m.lock.q)
+	}
+	item, ok := m.heap.FindItem(id)
+	if !ok {
+		log.Fatalf("Inconsistent state: delete ID has no task ID %v in queue heap %q", id, m.lock.q)
+	}
+	m.heap.RemoveItem(item)
+	m.tasks.Delete(id)
+
+	// Now we have a little bit of work to do on the global stuff.
+	defer un(lock(m.impl))
+	delete(m.impl.byID, id)
+	if m.tasks.Len() == 0 {
+		delete(m.impl.byQueue, m.lock.q)
+		delete(m.impl.claimIndex, m.lock.q)
+		delete(m.impl.locks, m.lock.q)
+	}
+}
+
+func (m *modQueue) insertTask(t *entroq.Task) {
+	func() {
+		defer un(lock(m.impl))
+		if m.heap == nil {
+			m.heap = newClaimHeap()
+			m.impl.claimIndex[m.lock.q] = m.heap
+		}
+		if m.tasks == nil {
+			m.tasks = NewQueue(m.lock.q)
+			m.impl.byQueue[m.lock.q] = m.tasks
+		}
+	}()
+
+	m.heap.PushItem(newItem(m.lock.q, t.ID, t.At))
+	m.tasks.Set(t.ID, t)
+}
+
+func (m *modQueue) updateTask(t *entroq.Task) {
+	if m.heap == nil || m.tasks == nil {
+		log.Fatalf("Inconsistent state: update ID has either no heap or tasks for queue %q", m.lock.q)
+	}
+	item, ok := m.heap.FindItem(t.ID)
+	if !ok {
+		log.Fatalf("Inconsistent state: update ID has no task ID %v in queue heap %q", id, m.lock.q)
+	}
+	m.heap.UpdateItem(item, t.At, t.Claimant)
+	m.tasks.Set(t.ID, t)
+}
+
 // modLocks finds all queues from a particular modification request. If any of
 // the given queues are not found, then it returns a "not okay" value as the
 // second parameter. Otherwise it returns a list of queue locks that can be
 // locked in the caller when ready. It can create new locks (e.g., for
 // insertions).
-func (m *EQMem) modLocks(mod *entroq.Modification) (locks []*queueLock, delNew func(), err error) {
+func (m *EQMem) modLocks(mod *entroq.Modification) (info []*modQueue, delNew func(), err error) {
 	// This has to be locked the whole time so that IDs and queues are matched
 	// properly if queues are missing somewhere.
 	defer un(lock(m))
 
-	depErr := new(entroq.DependencyError)
+	depErr := entroq.DependencyError{}
 
 	var queues map[string]bool
 	lockMap = make(map[string]bool)
 
+	var locks []*queueLock
 	addLock := func(q string, addIfMissing bool) bool {
 		// Already there, skip.
 		if lockMap[q] {
@@ -305,6 +370,18 @@ func (m *EQMem) modLocks(mod *entroq.Modification) (locks []*queueLock, delNew f
 		return locks[i].q < locks[j].q
 	})
 
+	// Finally, fill in the full info from the qlocks, queue tasks, and heap information.
+	for _, ql := range locks {
+		qts, _ := m.queueTasks(ql.q)
+		h := m.claimIndex[ql.q]
+		info = append(info, &modQueue{
+			impl:  m,
+			lock:  ql,
+			tasks: qts,
+			heap:  h,
+		})
+	}
+
 	return locks, delNew, nil
 }
 
@@ -330,14 +407,16 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted 
 	// - Modify claimHeaps and actual tasks. Take special care with deletions and insertions.
 	// - Unlock queues.
 
-	qls, delNew, err := m.modLocks(mod)
+	modQueues, delNew, err := m.modLocks(mod)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "eqmem modify")
 	}
 
 	// Now lock all of the queues and defer unlocking them at the same time.
-	for _, ql := range qls {
+	byQ := make(map[string]*modQueue)
+	for _, mq := range modQueues {
 		defer un(lock(ql))
+		byQ[mq.lock.q] = mq
 	}
 
 	defer func() {
@@ -361,12 +440,85 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted 
 	//     corresponding modifications must be made to all affected heaps.
 	// - deferrals handle unlocking in the proper order.
 
-	// TODO
-	// TODO
-	// TODO
-	// TODO
-	// TODO
-	// TODO
+	// Check basic dependency stuff. This method doesn't give us enough
+	// information to do what we need here, but it is important to eliminate
+	// some sources of error.
+	if __, err := mod.AllDependencies(); err != nil {
+		return nil, nil, errors.Wrap(err, "eqmem modify")
+	}
+
+	depErr := entroq.DependencyError{}
+
+	// Check whether we can proceed.
+	// Queues are guaranteed to be set by this time because the lock retrieval
+	// method ensures that they are there.
+	for _, d := range mod.Depends {
+		t, ok := byQ[d.Queue].getID(d.ID)
+		if !ok || t.Version != d.Version {
+			depErr.Depends = append(depErr.Depends, d)
+		}
+	}
+	for _, d := range mod.Deletes {
+		t, ok := byQ[d.Queue].getID(d.ID)
+		if !ok || t.Version != d.Version {
+			depErr.Deletes = append(depErr.Deletes, d)
+		}
+	}
+	for _, c := range mod.Changes {
+		t, ok := byQ[c.FromQueue].getID(c.ID)
+		if !ok || t.Version != c.Version {
+			depErr.Changes = append(depErr.Changes, c.IDVersion())
+		}
+	}
+	for _, t := range mod.Inserts {
+		// Ensure that inserts are not already there.
+		if _, ok := byQ[t.Queue].getID(t.ID); ok {
+			depErr.Inserts = append(depErr.Inserts, t.IDVersion())
+		}
+	}
+
+	if depErr.HasMissing() || depErr.HasCollisions() {
+		return nil, nil, depErr
+	}
+
+	// Now that we know we can proceed with our process, make all of the necessary changes.
+	// We got all of the queue-based stuff handed to us previously, so we
+	// already hold all of the locks for that stuff and can edit with impunity.
+	var inserts []*entroq.Task
+	var changes []*entroq.Task
+	for _, d := range mod.Deletes {
+		byQ[d.Queue].deleteID(d.ID)
+	}
+	var changed []*entroq.Task
+	for _, c := range mod.Changes {
+		newTask := c.Copy()
+		c.Version++
+		c.Modified = now
+		if c.FromQueue != c.Queue {
+			byQ[c.FromQueue].deleteID(d.ID)
+			byQ[c.Queue].insertTask(newTask)
+		} else {
+			// Version was already checked earlier.
+			byQ[c.Queue].updateTask(newTask)
+		}
+		changed = append(changed, newTask)
+	}
+	var inserted []*entroq.Task
+	for _, t := range mod.Inserts {
+		newTask := t.Copy()
+		newTask.Version = 0
+		newTask.Claimant = mod.Claimant
+		newTask.Claims = 0
+		newTask.Created = now
+		newTask.Modified = now
+		newTask.Attempt = 0
+		newTask.Err = ""
+		byQ[t.Queue].insertTask(newTask)
+		inserted = append(inserted, newTask)
+	}
+
+	// All done!
+	return inserted, changed, nil
 }
 
 // Time returns the current time.
