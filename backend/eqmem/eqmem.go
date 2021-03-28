@@ -84,11 +84,13 @@ func (m *EQMem) claimLocks(cq *entroq.ClaimQuery) []*queueLock {
 }
 
 func (m *EQMem) getTask(queue string, id uuid.UUID) (*entroq.Task, bool) {
+	if queue == "" || id == uuid.Nil {
+		return nil, false
+	}
 	tasks, ok := m.queueTasks.Load(queue)
 	if !ok {
 		return nil, false
 	}
-
 	task, ok := tasks.(*sync.Map).Load(id)
 	if !ok {
 		return nil, false
@@ -194,175 +196,93 @@ func (m *EQMem) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Ta
 	return nil, nil
 }
 
+func ensureModQueues(mod *entroq.Modification, byID map[uuid.UUID]string) {
+	for _, d := range mod.Deletes {
+		if d.Queue == "" {
+			d.Queue = byID[d.ID]
+		}
+	}
+
+	for _, d := range mod.Depends {
+		if d.Queue == "" {
+			d.Queue = byID[d.ID]
+		}
+	}
+
+	for _, c := range mod.Changes {
+		if c.FromQueue == "" {
+			c.FromQueue = byID[d.ID]
+		}
+	}
+}
+
 type modQueue struct {
-	impl  *EQMem
 	lock  *queueLock
 	tasks *Queue
 	heap  *claimHeap
-}
-
-func (m *modQueue) getID(id uuid.UUID) (*entroq.Task, bool) {
-	if m.tasks == nil {
-		return nil, false
-	}
-	return m.tasks.Get(id)
-}
-
-func (m *modQueue) deleteID(id uuid.UUID) {
-	if m.heap == nil || m.tasks == nil {
-		log.Fatalf("Inconsistent state: delete ID has either no heap or tasks for queue %q", m.lock.q)
-	}
-	item, ok := m.heap.FindItem(id)
-	if !ok {
-		log.Fatalf("Inconsistent state: delete ID has no task ID %v in queue heap %q", id, m.lock.q)
-	}
-	m.heap.RemoveItem(item)
-	m.tasks.Delete(id)
-
-	// Now we have a little bit of work to do on the global stuff.
-	defer un(lock(m.impl))
-	delete(m.impl.byID, id)
-	if m.tasks.Len() == 0 {
-		delete(m.impl.byQueue, m.lock.q)
-		delete(m.impl.claimIndex, m.lock.q)
-		delete(m.impl.locks, m.lock.q)
-	}
-}
-
-func (m *modQueue) insertTask(t *entroq.Task) {
-	func() {
-		defer un(lock(m.impl))
-		if m.heap == nil {
-			m.heap = newClaimHeap()
-			m.impl.claimIndex[m.lock.q] = m.heap
-		}
-		if m.tasks == nil {
-			m.tasks = NewQueue(m.lock.q)
-			m.impl.byQueue[m.lock.q] = m.tasks
-		}
-	}()
-
-	m.heap.PushItem(newItem(m.lock.q, t.ID, t.At))
-	m.tasks.Set(t.ID, t)
-}
-
-func (m *modQueue) updateTask(t *entroq.Task) {
-	if m.heap == nil || m.tasks == nil {
-		log.Fatalf("Inconsistent state: update ID has either no heap or tasks for queue %q", m.lock.q)
-	}
-	item, ok := m.heap.FindItem(t.ID)
-	if !ok {
-		log.Fatalf("Inconsistent state: update ID has no task ID %v in queue heap %q", id, m.lock.q)
-	}
-	m.heap.UpdateItem(item, t.At, t.Claimant)
-	m.tasks.Set(t.ID, t)
 }
 
 // modLocks finds all queues from a particular modification request. If any of
 // the given queues are not found, then it returns a "not okay" value as the
 // second parameter. Otherwise it returns a list of queue locks that can be
 // locked in the caller when ready. It can create new locks (e.g., for
-// insertions).
-func (m *EQMem) modLocks(mod *entroq.Modification) (info []*modQueue, delNew func(), err error) {
+// insertions). The modification is altered in this call to ensure that
+// everything for which a queue can be found has one (e.g., deletions that have
+// only IDs will get a queue here if they can be found).
+func (m *EQMem) modLocks(mod *entroq.Modification) (info []*modQueue, delNew func()) {
 	// This has to be locked the whole time so that IDs and queues are matched
 	// properly if queues are missing somewhere.
 	defer un(lock(m))
-
-	depErr := entroq.DependencyError{}
+	ensureModQueues(mod, m.byID)
 
 	var queues map[string]bool
 	lockMap = make(map[string]bool)
 
 	var locks []*queueLock
-	addLock := func(q string, addIfMissing bool) bool {
-		// Already there, skip.
-		if lockMap[q] {
-			return true
+	addLock := func(q string, addIfMissing bool) {
+		// No queue, or already known, skip.
+		if q == "" || lockMap[q] {
+			return
 		}
 		ql, ok := m.locks[q]
 		if !ok {
 			if !addIfMissing {
-				return false
+				return
 			}
-			ql := &queueLock{q: q}
+			ql = &queueLock{q: q}
 			// Just added one - keep track in case we need to remove it later.
 			newQs = append(newQs, q)
 			m.locks[q] = ql
 		}
 		lockMap[q] = true
 		locks = append(locks, ql)
-		return true
 	}
 
 	for _, ins := range mod.Inserts {
 		addLock(ins.Queue, true)
 	}
-
 	for _, c := range mod.Changes {
-		if c.FromQueue == "" {
-			q, ok := m.byID[c.ID]
-			if !ok {
-				depErr.Changes = append(depErr.Changes, c.IDVersion())
-				continue
-			}
-			c.FromQueue = q
-		}
-		if !addLock(c.FromQueue, false) {
-			depErr.Changes = append(depErr.Changes, c.IDVersion())
-		}
+		addLock(c.FromQueue, false)
 		addLock(c.Queue, true)
 	}
-
 	for _, d := range mod.Deletes {
-		if d.Queue == "" {
-			q, ok := m.byID[d.ID]
-			if !ok {
-				depErr.Deletes = append(depErr.Deletes, d)
-				continue
-			}
-			d.Queue = q
-		}
-		if !addLock(d.Queue, false) {
-			depErr.Deletes = append(depErr.Deletes, d)
-		}
+		addLock(d.Queue, false)
 	}
-
 	for _, d := range mod.Depends {
-		if d.Queue == "" {
-			q, ok := m.byID[d.ID]
-			if !ok {
-				depErr.Depends = append(depErr.Depends, d)
-				continue
-			}
-		}
-		if !addLock(d.Queue, false) {
-			depErr.Depends = append(depErr.Depends, d)
-		}
+		addLock(d.Queue, false)
 	}
 
 	delNew := func() {
 		if len(newQs) == 0 {
 			return
 		}
-		// This is ticklish. The only reason we can acquire this lock later,
-		// while the queue locks are held, is that it will *always be last in
-		// line* after the queues. When it's acquired in Modify and Claim at
-		// the beginning, it is *also released*. Thus, we avoid deadlock
-		// conditions because the only time this lock is held simultaneously
-		// with queue locks is in this unique case at the *end*, and all
-		// modifications hold it in this way.
+		// It is allowed to acquire this lock while the queue locks are
+		// acquired because it is released first. Thus, the order of
+		// simultaneous locks will always be queues, then global.
 		defer un(lock(m))
 		for _, q := range newQs {
 			delete(m.locks[q])
 		}
-	}
-
-	if depErr.HasMissing() {
-		// Delete all new queue locks and return an error.
-		for _, q := range newQs {
-			delete(m.locks[q])
-		}
-		return nil, nil, depErr
 	}
 
 	// We have all of the locks we need. Sort to avoid dining philosophers problems.
@@ -375,7 +295,6 @@ func (m *EQMem) modLocks(mod *entroq.Modification) (info []*modQueue, delNew fun
 		qts, _ := m.queueTasks(ql.q)
 		h := m.claimIndex[ql.q]
 		info = append(info, &modQueue{
-			impl:  m,
 			lock:  ql,
 			tasks: qts,
 			heap:  h,
@@ -403,6 +322,9 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted 
 	//
 	// - Get all relevant queue locks, order them lexicographically.
 	// - Lock all queue locks, hold thme for the rest of the function (unlock at the end).
+	// - Sometimes it's okay to grab the global lock before manipulating global
+	//   indices (it will have already been released, and it always comes after
+	//   the queue locks have been obtained).
 	//
 	// - Modify claimHeaps and actual tasks. Take special care with deletions and insertions.
 	// - Unlock queues.
@@ -429,65 +351,80 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted 
 		}
 	}()
 
-	// Now that we have all of the relevnt queues locked, we can check modification validity.
-	// Steps:
-	// - Gather all dependencies that we can find.
-	// - Create a dependency error and bail if it's non-empty.
-	// - Perform modifications.
-	// - - For things that have At or Claimant changed,
-	// 	   the corresponding heap needs to be updated for the given ID.
-	// - - For things that have their queue changed or are inserted or deleted,
-	//     corresponding modifications must be made to all affected heaps.
-	// - deferrals handle unlocking in the proper order.
-
-	// Check basic dependency stuff. This method doesn't give us enough
-	// information to do what we need here, but it is important to eliminate
-	// some sources of error.
-	if __, err := mod.AllDependencies(); err != nil {
-		return nil, nil, errors.Wrap(err, "eqmem modify")
-	}
-
-	depErr := entroq.DependencyError{}
-
-	// Check whether we can proceed.
-	// Queues are guaranteed to be set by this time because the lock retrieval
-	// method ensures that they are there.
-	for _, d := range mod.Depends {
-		t, ok := byQ[d.Queue].getID(d.ID)
-		if !ok || t.Version != d.Version {
-			depErr.Depends = append(depErr.Depends, d)
+	// Find the actual tasks involved. Queues were filled in when obtaining locks.
+	found := make(map[uuid.UUID]*entroq.Task)
+	addFound := func(q string, id uuid.UUID) {
+		t, ok := m.getTask(q, id)
+		if ok {
+			found[t.ID] = t
 		}
 	}
 	for _, d := range mod.Deletes {
-		t, ok := byQ[d.Queue].getID(d.ID)
-		if !ok || t.Version != d.Version {
-			depErr.Deletes = append(depErr.Deletes, d)
-		}
+		addFound(d.Queue, d.ID)
+	}
+	for _, d := range mod.Depends {
+		addFound(d.Queue, d.ID)
 	}
 	for _, c := range mod.Changes {
-		t, ok := byQ[c.FromQueue].getID(c.ID)
-		if !ok || t.Version != c.Version {
-			depErr.Changes = append(depErr.Changes, c.IDVersion())
-		}
+		addFound(d.FromQueue, d.ID)
 	}
 	for _, t := range mod.Inserts {
-		// Ensure that inserts are not already there.
-		if _, ok := byQ[t.Queue].getID(t.ID); ok {
-			depErr.Inserts = append(depErr.Inserts, t.IDVersion())
-		}
+		addFound(d.Queue, d.ID)
 	}
 
-	if depErr.HasMissing() || depErr.HasCollisions() {
-		return nil, nil, depErr
+	if err := mod.DependencyError(found); err != nil {
+		return nil, nil, errors.Wrap(err, "eqmem modify")
 	}
 
 	// Now that we know we can proceed with our process, make all of the necessary changes.
 	// We got all of the queue-based stuff handed to us previously, so we
 	// already hold all of the locks for that stuff and can edit with impunity.
+
+	deleteID := func(q string, id uuid.UUID) {
+		mq := byQ[q]
+		mq.heap.Remove(id)
+		if ok := mq.tasks.Delete(id); !ok {
+			log.Fatalf("Inconsistent state: task %v not found in queue %q to delete", id, q)
+		}
+
+		defer un(lock(m))
+		delete(m.byID, id)
+		if mq.tasks.Len() == 0 {
+			delete(m.byQueue, mq.lock.q)
+			delete(m.claimIndex, m.lock.q)
+			delete(m.locks, m.lock.q)
+		}
+	}
+
+	insertTask := func(t *entroq.Task) {
+		mq := byQ[t.Queue]
+		func() {
+			defer un(lock(m))
+			if mq.heap == nil {
+				mq.heap = newClaimHeap()
+				m.claimIndex[m.lock.q] = mq.heap
+			}
+			if mq.tasks == nil {
+				mq.tasks = NewQueue(m.lock.q)
+				m.byQueue[m.lock.q] = mq.tasks
+			}
+		}()
+		mq.heap.PushItem(newItem(m.lock.q, t.ID, t.At))
+		mq.tasks.Set(t.ID, t)
+	}
+
+	updateTask := func(t *entroq.Task) {
+		mq := byQ[t.Queue]
+		if ok := mq.heap.UpdateID(t.ID, t.At, t.Claimant); !ok {
+			log.Fatalf("Inconsistent state: task %v not found in queue heap %q", t.ID, t.Queue)
+		}
+		mq.tasks.Set(t.ID, t)
+	}
+
 	var inserts []*entroq.Task
 	var changes []*entroq.Task
 	for _, d := range mod.Deletes {
-		byQ[d.Queue].deleteID(d.ID)
+		deleteID(d.Queue, d.ID)
 	}
 	var changed []*entroq.Task
 	for _, c := range mod.Changes {
@@ -495,11 +432,11 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted 
 		c.Version++
 		c.Modified = now
 		if c.FromQueue != c.Queue {
-			byQ[c.FromQueue].deleteID(d.ID)
-			byQ[c.Queue].insertTask(newTask)
+			deleteID(c.FromQueue, d.ID)
+			insertTask(newTask)
 		} else {
 			// Original version was already checked earlier.
-			byQ[c.Queue].updateTask(newTask)
+			updateTask(newTask)
 		}
 		changed = append(changed, newTask)
 	}
@@ -513,7 +450,7 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted 
 		newTask.Modified = now
 		newTask.Attempt = 0
 		newTask.Err = ""
-		byQ[t.Queue].insertTask(newTask)
+		insertTask(newTask)
 		inserted = append(inserted, newTask)
 	}
 
@@ -669,43 +606,3 @@ func (m *EQMem) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[str
 
 	return qs, nil
 }
-
-// Tasks are actually in a two-layered structure: map[queue]map[id]task. If we do that with sync.Map structures (both of them), then readers can access it without locking the whole structure: both listings and stats can just iterate over them and we're all set!
-//
-// A simple ID->queue structure, which would be locked all at once, can be used for finding queues from only IDs: map[id]queue (with its own lock)
-//
-// Now we're talking about a main data structure and two indices, with possibly a 4th for holding queue-oriented locks:
-//
-// - map[queue]map[id]task <- sync.Map, no main locks
-// - map[id]struct{version, queue, claimant, at} <- has its own "global" lock for lookups
-// - map[queue]heap (or similar) <- has its own "global" lock
-// - map[queue]lock? <- the "truly required" modification locks. All queues referenced in a claim or modify operation have to be held to do anything. A global lock on this structure would also be required to list queues, etc.
-//
-// If we view it in this way, now we have the following behaviors:
-//
-// Claim:
-// - Lock "lock map"
-// - Get queue locks and names that match from that map
-// - Unlock "lock map"
-// - In turn, lock for each queue, then access heap/btree to find task to claim
-// - Update actual task in queue-task map
-// - Update the heap/btree because of new arrival time
-// - Release lock
-//
-// Note that claim operations never alter the queue of a task, and thus they never touch the id->queue map. They do change the arrival time, so they cause a heap event on that queue.
-//
-// Modify:
-// - Lock "lock map"
-// - Get queue locks and names that match modification from map
-// - DO NOT unlock "lock map" <- modification can change it by insertion and deletion, and we don't want another modification to insert into a queue and create an entry (or delete one that's there), that will confuse us.
-// - Lock all relevant queues in sorted order
-// - Modify queue-task map, ID-heap-index-queue map, and queue-heap map
-// - Possibly modify the lock map, adding or deleting a queue entry
-// - Unlock "lock map"
-//
-// List:
-// - Just iterate over the queue-task map. Done
-//
-// Stats:
-// - Just iterate over queue-task maps.
-//
