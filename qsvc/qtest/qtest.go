@@ -652,8 +652,6 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 
 // WorkerRenewal tests that task claims are renewed periodically for longer-running work tasks.
 func WorkerRenewal(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	t.Helper()
-
 	queue := path.Join(qPrefix, "worker_renewal")
 
 	_, _, err := client.Modify(ctx, entroq.InsertingInto(queue))
