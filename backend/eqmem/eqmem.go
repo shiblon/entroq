@@ -403,9 +403,9 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted 
 	}
 	for _, c := range mod.Changes {
 		newTask := c.Copy()
-		c.Version++
-		c.Claimant = mod.Claimant
-		c.Modified = now
+		newTask.Version++
+		newTask.Claimant = mod.Claimant
+		newTask.Modified = now
 		if c.FromQueue != c.Queue {
 			deleteID(c.FromQueue, c.ID)
 			insertTask(newTask)
