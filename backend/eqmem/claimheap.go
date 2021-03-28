@@ -123,9 +123,25 @@ func (h *claimHeap) PushItem(item *claimItem) {
 	h.byID[item.id] = item
 }
 
+func (h *claimHeap) RemoveID(id uuid.UUID) bool {
+	item, ok := h.FindItem(id)
+	if ok {
+		h.RemoveItem(item)
+	}
+	return ok
+}
+
 func (h *claimHeap) RemoveItem(item *claimItem) {
 	heap.Remove(h, item.idx)
 	delete(h.byID[item.id])
+}
+
+func (h *claimHeap) UpdateID(id uuid.UUID, at time.Time, claimant uuid.UUID) bool {
+	item, ok := h.FindItem(id)
+	if ok {
+		h.UpdateItem(item, at, claimant)
+	}
+	return ok
 }
 
 func (h *claimHeap) UpdateItem(item *claimItem, at time.Time, claimant uuid.UUID) {
