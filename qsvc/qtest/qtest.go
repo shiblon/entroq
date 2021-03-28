@@ -544,8 +544,6 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 	runWorkerOneCase := func(ctx context.Context, c tc) {
 		t.Helper()
 
-		log.Printf("Testing MoveTaskError %q", c.name)
-
 		const leaseTime = 5 * time.Second
 
 		w := client.NewWorker(c.input.Queue).WithOpts(
@@ -691,7 +689,6 @@ func WorkerRenewal(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPr
 
 // TasksOmitValue exercises the task query where values are not desired.
 func TasksOmitValue(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	t.Helper()
 	queue := path.Join(qPrefix, "tasks_omit_value")
 
 	inserted, _, err := client.Modify(ctx,
@@ -1213,8 +1210,14 @@ func EqualAllTasks(want, got []*entroq.Task) string {
 		return ""
 	}
 	var diffs []string
-	for i, w := range want {
-		g := got[i]
+
+	gotMap := make(map[uuid.UUID]*entroq.Task)
+	for _, g := range got {
+		gotMap[g.ID] = g
+	}
+
+	for _, w := range want {
+		g := gotMap[w.ID]
 		if (w == nil) != (g == nil) || w.Queue != g.Queue || w.Claimant != g.Claimant || !bytes.Equal(w.Value, g.Value) {
 			diffs = append(diffs, cmp.Diff(w, g))
 		}

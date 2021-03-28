@@ -432,6 +432,8 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted 
 		inserted = append(inserted, newTask)
 	}
 
+	entroq.NotifyModified(m.nw, inserted, changed)
+
 	// All done!
 	return inserted, changed, nil
 }
