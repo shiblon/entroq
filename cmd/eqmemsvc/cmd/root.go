@@ -10,7 +10,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"entrogo.com/entroq/mem"
+	"entrogo.com/entroq/backend/eqmem"
 	"entrogo.com/entroq/pkg/authz/opahttp"
 	"entrogo.com/entroq/qsvc"
 	homedir "github.com/mitchellh/go-homedir"
@@ -66,9 +66,9 @@ var rootCmd = &cobra.Command{
 			return fmt.Errorf("Unknown Authz strategy: %q", flags.authzStrategy)
 		}
 
-		svc, err := qsvc.New(ctx, mem.Opener(), authzOpt)
+		svc, err := qsvc.New(ctx, eqmem.Opener(), authzOpt)
 		if err != nil {
-			return errors.Wrap(err, "failed to open mem backend for qsvc")
+			return errors.Wrap(err, "failed to open eqmem backend for qsvc")
 		}
 		defer svc.Close()
 
@@ -83,7 +83,7 @@ var rootCmd = &cobra.Command{
 		)
 		pb.RegisterEntroQServer(s, svc)
 		hpb.RegisterHealthServer(s, health.NewServer())
-		log.Printf("Starting EntroQ server %d -> mem", flags.port)
+		log.Printf("Starting EntroQ server %d -> eqmem", flags.port)
 		return s.Serve(lis)
 	},
 }

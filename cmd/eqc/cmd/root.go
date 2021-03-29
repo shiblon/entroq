@@ -129,11 +129,14 @@ func mustTaskString(t *entroq.Task) string {
 	if err := json.Unmarshal(b, &tm); err != nil {
 		log.Fatalf("Error creating map from JSON: %v", err)
 	}
+	if val, ok := tm["value"]; !ok || val == nil {
+		return string(b)
+	}
 	v, err := base64.StdEncoding.DecodeString(tm["value"].(string))
 	if err != nil {
 		log.Fatalf("Failed to b64 deserialize byte value: %v", err)
 	}
-	if err := json.Unmarshal([]byte(v), &vm); err != nil {
+	if err := json.Unmarshal(v, &vm); err != nil {
 		log.Fatalf("Failed to unmarshal JSON value: %v", err)
 	}
 	tm["value"] = vm
