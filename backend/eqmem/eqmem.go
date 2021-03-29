@@ -105,14 +105,14 @@ func (m *EQMem) mustTryClaimOne(ql *qLock, now time.Time, cq *entroq.ClaimQuery)
 
 	var found *entroq.Task
 	if err := qts.Update(item.id, func(t *entroq.Task) *entroq.Task {
+		t = t.Copy() // avoid data race, don't change in place
 		t.At = newAt
 		t.Claimant = cq.Claimant
 		t.Version++
 		t.Claims++
 		t.Modified = now
 
-		found = t.Copy()
-
+		found = t
 		return t
 	}); err != nil {
 		log.Fatalf("Inconsistent internal state: could not update task in %q after claim started", ql.q)
@@ -221,8 +221,6 @@ func ensureModQueues(mod *entroq.Modification, qByID map[uuid.UUID]string) {
 	}
 
 	for _, c := range mod.Changes {
-		// This has to be unconditionally set. The modification doesn't expect to set
-		// the FromQueue in call cases.
 		if c.FromQueue == "" {
 			c.FromQueue = qByID[c.ID]
 		}
@@ -342,8 +340,8 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted 
 		if q == "" || id == uuid.Nil {
 			return
 		}
-		if ts, ok := m.queues[q]; ok {
-			if t, ok := ts.Get(id); ok {
+		if mq, ok := byQ[q]; ok {
+			if t, ok := mq.tasks.Get(id); ok {
 				found[t.ID] = t
 			}
 		}
@@ -369,13 +367,16 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted 
 	// We got all of the queue-based stuff handed to us previously, so we
 	// already hold all of the locks for that stuff and can edit with impunity.
 
+	var finalLockedSteps []func()
+
 	deleteID := func(q string, id uuid.UUID) {
 		mq := byQ[q]
 		mq.heap.RemoveID(id)
 		mq.tasks.Delete(id)
 
-		defer un(lock(m))
-		delete(m.qByID, id)
+		finalLockedSteps = append(finalLockedSteps, func() {
+			delete(m.qByID, id)
+		})
 	}
 
 	insertTask := func(t *entroq.Task) {
@@ -383,8 +384,9 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted 
 		mq.heap.PushItem(newItem(mq.q, t.ID, t.At))
 		mq.tasks.Set(t.ID, t)
 
-		defer un(lock(m))
-		m.qByID[t.ID] = t.Queue
+		finalLockedSteps = append(finalLockedSteps, func() {
+			m.qByID[t.ID] = t.Queue
+		})
 	}
 
 	updateTask := func(t *entroq.Task) {
@@ -412,16 +414,16 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted 
 		}
 		changed = append(changed, newTask)
 	}
-	for _, t := range mod.Inserts {
-		id := t.ID
+	for _, td := range mod.Inserts {
+		id := td.ID
 		if id == uuid.Nil {
 			id = uuid.New()
 		}
 		newTask := &entroq.Task{
 			ID:       id,
-			Queue:    t.Queue,
-			At:       t.At,
-			Value:    t.Value,
+			Queue:    td.Queue,
+			At:       td.At,
+			Value:    td.Value,
 			Claimant: mod.Claimant,
 			Created:  now,
 			Modified: now,
@@ -429,6 +431,13 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted 
 		insertTask(newTask)
 		inserted = append(inserted, newTask)
 	}
+
+	func() {
+		defer un(lock(m))
+		for _, step := range finalLockedSteps {
+			step()
+		}
+	}()
 
 	entroq.NotifyModified(m.nw, inserted, changed)
 
