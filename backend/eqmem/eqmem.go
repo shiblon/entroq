@@ -25,7 +25,7 @@ type EQMem struct {
 
 	// queues allows tasks to be accessed by queue name. The returned type is
 	// safe for concurrent use, and follows sync.Map semantics.
-	queues map[string]*Queue
+	queues map[string]*taskQueue
 
 	// qByID gets the queue name for a given task ID. This is used to quickly
 	// look up tasks when the queue name is unknown. That should never be the
@@ -67,7 +67,7 @@ func Opener() entroq.BackendOpener {
 func New() *EQMem {
 	return &EQMem{
 		nw:         subq.New(),
-		queues:     make(map[string]*Queue),
+		queues:     make(map[string]*taskQueue),
 		qByID:      make(map[uuid.UUID]string),
 		locks:      make(map[string]*qLock),
 		claimIndex: make(map[string]*claimHeap),
@@ -92,8 +92,7 @@ func (m *EQMem) mustTryClaimOne(ql *qLock, now time.Time, cq *entroq.ClaimQuery)
 
 	// Found one - time to modify it for claiming and return it.
 	// We are under the queue lock for this task's queue, so we now have to
-	// - Update the task at+claimant in the claim index.
-	// - Run fix.
+	// - Update the task at+claimant in the corresponding heap.
 	// - Update the task itself in the task store.
 	newAt := now.Add(cq.Duration)
 	h.UpdateItem(item, newAt)
@@ -191,7 +190,7 @@ func (m *EQMem) unsafeEnsureQueue(q string) {
 		m.locks[q] = &qLock{q: q}
 	}
 	if ts, ok := m.queues[q]; ts == nil || !ok {
-		m.queues[q] = NewQueue(q)
+		m.queues[q] = newTaskQueue(q)
 	}
 	if h, ok := m.claimIndex[q]; h == nil || !ok {
 		m.claimIndex[q] = newClaimHeap()
@@ -230,7 +229,7 @@ func ensureModQueues(mod *entroq.Modification, qByID map[uuid.UUID]string) {
 type modQueue struct {
 	q     string
 	lock  *qLock
-	tasks *Queue
+	tasks *taskQueue
 	heap  *claimHeap
 }
 
@@ -456,7 +455,7 @@ func (m *EQMem) queueForID(id uuid.UUID) (string, bool) {
 	return q, ok
 }
 
-func (m *EQMem) queueTasks(queue string) (*Queue, bool) {
+func (m *EQMem) queueTasks(queue string) (*taskQueue, bool) {
 	defer un(lock(m))
 	q, ok := m.queues[queue]
 	return q, ok
