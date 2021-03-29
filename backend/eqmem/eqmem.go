@@ -57,18 +57,20 @@ func un(f func()) {
 // Opener returns a constructor of the in-memory backend.
 func Opener() entroq.BackendOpener {
 	return func(_ context.Context) (entroq.Backend, error) {
-		return New(), nil
+		back, err := New()
+		return back, err
 	}
 }
 
 // New returns a new in-memory implementation, ready to be used.
-func New() *EQMem {
-	return &EQMem{
+func New() (*EQMem, error) {
+	m := &EQMem{
 		nw:     subq.New(),
 		queues: make(map[string]*taskQueue),
 		qByID:  make(map[uuid.UUID]string),
 		locks:  make(map[string]*qLock),
 	}
+	return m, nil
 }
 
 // claimPrep prepares for attempting to claim a task by very briefly locking
