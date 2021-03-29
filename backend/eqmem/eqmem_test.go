@@ -124,3 +124,26 @@ func TestEQMemMapReduce_checkLarge(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestEQMemMapReduce_checkHuge(t *testing.T) {
+	config := &quick.Config{
+		MaxCount: 5,
+		Values: func(values []reflect.Value, rand *rand.Rand) {
+			values[0] = reflect.ValueOf(rand.Intn(50000) + 5000)
+			values[1] = reflect.ValueOf(rand.Intn(1000) + 1)
+			values[2] = reflect.ValueOf(rand.Intn(200) + 1)
+		},
+	}
+
+	ctx := context.Background()
+	check := func(ndocs, nm, nr int) bool {
+		client, err := entroq.New(ctx, Opener())
+		if err != nil {
+			t.Fatalf("Open mem client: %v", err)
+		}
+		return mrtest.MRCheck(ctx, client, ndocs, nm, nr)
+	}
+	if err := quick.Check(check, config); err != nil {
+		t.Fatal(err)
+	}
+}

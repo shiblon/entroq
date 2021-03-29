@@ -211,14 +211,6 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 	if len(w.Qs) == 0 {
 		return errors.New("No queues specified to work on")
 	}
-	defer func() {
-		if err == nil {
-			log.Printf("Graceful completion of worker %q for claimant %v", w.Qs, w.eqc.ID())
-		} else {
-			log.Printf("Worker quit for claimant %v: %v", w.eqc.ID(), err)
-		}
-	}()
-	log.Printf("Starting EntroQ worker %q on client %v, leasing for %v at a time", w.Qs, w.eqc.ID(), w.lease)
 
 	for {
 		select {
