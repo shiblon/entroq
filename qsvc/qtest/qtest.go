@@ -534,7 +534,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 	runWorkerOneCase := func(ctx context.Context, c tc) {
 		t.Helper()
 
-		const leaseTime = 5 * time.Second
+		const leaseTime = 10 * time.Second
 
 		w := client.NewWorker(c.input.Queue).WithOpts(
 			entroq.WithWrappedMove(c.wrapped),
@@ -585,7 +585,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 			return
 		}
 
-		waitCtx, _ := context.WithTimeout(ctx, 2*leaseTime)
+		waitCtx, _ := context.WithTimeout(ctx, 3*leaseTime)
 		if err := client.WaitQueuesEmpty(waitCtx, entroq.MatchExact(c.input.Queue)); err != nil && !entroq.IsCanceled(err) {
 			t.Fatalf("Test %q: no moved tasks found, task was not expected to die: %v", c.name, err)
 		}
