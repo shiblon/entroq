@@ -253,9 +253,15 @@ func (m *EQMem) mustTryClaimOne(ql *qLock, now time.Time, cq *entroq.ClaimQuery)
 	}
 
 	if m.journal != nil {
+		// Create a modification that represents the changes from this claim.
+		// Remember that we already incremented the version number, so we have
+		// to undo that part first.
+		modTask := found.Copy()
+		modTask.Version--
 		mod := &entroq.Modification{
-			Changes: []*entroq.Task{found},
+			Changes: []*entroq.Task{modTask},
 		}
+		// Marshal mod and store in journal.
 		b, err := json.Marshal(mod)
 		if err != nil {
 			log.Fatalf("Inconsistent internal state: updated task but couldn't marshal JSON: %v", err)
