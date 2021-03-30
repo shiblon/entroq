@@ -27,12 +27,16 @@ import (
 
 // Flags.
 var flags struct {
-	cfgFile       string
+	cfgFile string
+
 	port          int
 	httpPort      int
 	authzStrategy string
 	opaURL        string
 	opaPath       string
+
+	journal  string
+	snapshot bool
 
 	maxSize int
 }
@@ -53,6 +57,19 @@ var rootCmd = &cobra.Command{
 			return errors.Wrapf(err, "error listening on port %d", flags.port)
 		}
 
+		if flags.snapshot && flags.journal == "" {
+			return errors.Wrapf(err, "bad flag setting: snapshots implies journal dir, but it's missing")
+		}
+
+		if flags.snapshot {
+			if err := eqmem.TakeSnapshot(ctx, flags.journal); err != nil {
+				return errors.Wrapf(err, "take snapshot in %q", flags.journal)
+			}
+			return nil
+		}
+
+		// Not taking a snapshot - start up a system.
+
 		var authzOpt qsvc.Option
 		switch flags.authzStrategy {
 		case "opahttp":
@@ -66,7 +83,7 @@ var rootCmd = &cobra.Command{
 			return fmt.Errorf("Unknown Authz strategy: %q", flags.authzStrategy)
 		}
 
-		svc, err := qsvc.New(ctx, eqmem.Opener(), authzOpt)
+		svc, err := qsvc.New(ctx, eqmem.Opener(eqmem.WithJournal(flags.journal)), authzOpt)
 		if err != nil {
 			return errors.Wrap(err, "failed to open eqmem backend for qsvc")
 		}
@@ -108,12 +125,16 @@ func init() {
 	pflags.StringVar(&flags.opaURL, "opa_url", "", fmt.Sprintf("Base (scheme://host:port) URL for talking to OPA. Leave blank for default value %s.", opahttp.DefaultHostURL))
 	pflags.StringVar(&flags.opaPath, "opa_path", "", fmt.Sprintf("Path for OPA API access. Leave blank for default path %s.", opahttp.DefaultAPIPath))
 
+	pflags.StringVar(&flags.journal, "journal", "", "Journal directory, if persistence is desired. Default is memory-only, ephemeral.")
+	pflags.BoolVar(&flags.snapshot, "journal_snapshot", false, "If set, starts up, reads the journal, and outputs a snapshot for all but the live journal. Requires the journal flag to be set.")
+
 	viper.BindPFlag("port", pflags.Lookup("port"))
 	viper.BindPFlag("http_port", pflags.Lookup("http_port"))
 	viper.BindPFlag("max_size_mb", pflags.Lookup("max_size_mb"))
 	viper.BindPFlag("authz", pflags.Lookup("authz"))
 	viper.BindPFlag("opa_base_url", pflags.Lookup("opa_base_url"))
 	viper.BindPFlag("opa_path", pflags.Lookup("opa_path"))
+	viper.BindPFlag("journal", pflags.Lookup("journal"))
 }
 
 // initConfig reads in config file and ENV variables if set.
