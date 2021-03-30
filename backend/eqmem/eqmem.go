@@ -39,6 +39,7 @@ type EQMem struct {
 	// queue name, as well.
 	locks map[string]*qLock
 
+	// A journaler, if one has been requested via a journal directory.
 	journal *wal.WAL
 
 	// journalDir, if non-empty, is expected to be a directory containing
@@ -89,9 +90,9 @@ func WithJournal(dir string) Option {
 // snapshot to be created, and then the system to be closed.
 // This is private to avoid mistakes and misuse, since setting this places the
 // system into a state where it cannot safely be used afterward.
-func withOutputSnapshot(o bool) Option {
+func withOutputSnapshot() Option {
 	return func(m *EQMem) {
-		m.outputSnapshot = o
+		m.outputSnapshot = true
 	}
 }
 
@@ -129,7 +130,7 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 // TakeSnapshot brings the system up empty, loads a snapshot + journals,
 // then outputs a new snapshot and exits.
 func TakeSnapshot(ctx context.Context, journalDir string) error {
-	m, err := New(ctx, WithJournal(journalDir), withOutputSnapshot(true))
+	m, err := New(ctx, WithJournal(journalDir), withOutputSnapshot())
 	if err != nil {
 		return errors.Wrap(err, "load for snapshot")
 	}
