@@ -5,6 +5,7 @@ package eqmem
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"math/rand"
 	"sort"
@@ -36,6 +37,10 @@ type EQMem struct {
 	// locks contains lockers for each known queue. The locks know their own
 	// queue name, as well.
 	locks map[string]*qLock
+
+	// journalDir, if non-empty, is expected to be a directory containing
+	// journals and possibly snapshots for persisting EntroQ state.
+	journalDir string
 }
 
 type qLock struct {
@@ -62,13 +67,27 @@ func Opener() entroq.BackendOpener {
 	}
 }
 
+// Option represents options for creationg of the in-memory implementation.
+type Option func(*EQMem)
+
+// WithJournal sets up a file-based journal system so that the in-memory
+// implementation can be persisted.
+func WithJournal(dir string) Option {
+	return func(m *EQMem) {
+		m.journalDir = dir
+	}
+}
+
 // New returns a new in-memory implementation, ready to be used.
-func New() (*EQMem, error) {
+func New(opts ...Option) (*EQMem, error) {
 	m := &EQMem{
 		nw:     subq.New(),
 		queues: make(map[string]*taskQueue),
 		qByID:  make(map[uuid.UUID]string),
 		locks:  make(map[string]*qLock),
+	}
+	for _, opt := range opts {
+		opt(m)
 	}
 	return m, nil
 }
@@ -275,6 +294,38 @@ func (m *EQMem) modPrep(mod *entroq.Modification) []*qLock {
 	return locks
 }
 
+// queueUnsafeInsertTask performs queue-level operations on a task, then
+// returns a function to call under global lock to finish the job.
+func (m *EQMem) queueUnsafeInsertTask(ql *qLock, t *entroq.Task) func() {
+	ql.heap.PushItem(newItem(ql.queue, t.ID, t.At))
+	ql.tasks.Set(t.ID, t)
+	return func() {
+		m.qByID[t.ID] = t.Queue
+	}
+}
+
+// queueUnsafeDeleteID performs a queue-level deletion operation, then returns
+// a function to be called under the global lock to finish the job.
+func (m *EQMem) queueUnsafeDeleteID(ql *qLock, id uuid.UUID) func() {
+	ql.heap.RemoveID(id)
+	ql.tasks.Delete(id)
+	return func() {
+		delete(m.qByID, id)
+	}
+}
+
+// queueUnsafeUpdateTask performs a queue-level task update. Note that if the
+// queue changes, insert and delete should be used instead. This is same-queue
+// only. Returns a function to be called to finish global fixups, if needed.
+func (m *EQMem) queueUnsafeUpdateTask(ql *qLock, t *entroq.Task) func() {
+	if ok := ql.heap.UpdateID(t.ID, t.At); !ok {
+		log.Fatalf("Inconsistent state: task %v not found in queue heap %q for update", t.ID, t.Queue)
+	}
+	ql.tasks.Set(t.ID, t)
+	// Nothing to do at present.
+	return nil
+}
+
 // Modify attempts to do an atomic modification on the system, given a
 // particular set of modification information (deletions, changes, insertions,
 // dependencies).
@@ -359,30 +410,17 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted,
 
 	deleteID := func(q string, id uuid.UUID) {
 		ql := byQ[q]
-		ql.heap.RemoveID(id)
-		ql.tasks.Delete(id)
-
-		finalLockedSteps = append(finalLockedSteps, func() {
-			delete(m.qByID, id)
-		})
+		finalLockedSteps = append(finalLockedSteps, m.queueUnsafeDeleteID(ql, id))
 	}
 
 	insertTask := func(t *entroq.Task) {
 		ql := byQ[t.Queue]
-		ql.heap.PushItem(newItem(ql.queue, t.ID, t.At))
-		ql.tasks.Set(t.ID, t)
-
-		finalLockedSteps = append(finalLockedSteps, func() {
-			m.qByID[t.ID] = t.Queue
-		})
+		finalLockedSteps = append(finalLockedSteps, m.queueUnsafeInsertTask(ql, t))
 	}
 
 	updateTask := func(t *entroq.Task) {
 		ql := byQ[t.Queue]
-		if ok := ql.heap.UpdateID(t.ID, t.At); !ok {
-			log.Fatalf("Inconsistent state: task %v not found in queue heap %q", t.ID, t.Queue)
-		}
-		ql.tasks.Set(t.ID, t)
+		finalLockedSteps = append(finalLockedSteps, m.queueUnsafeUpdateTask(ql, t))
 	}
 
 	now, err := m.Time(ctx)
@@ -428,7 +466,9 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted,
 	func() {
 		defer un(lock(m))
 		for _, step := range finalLockedSteps {
-			step()
+			if step != nil {
+				step()
+			}
 		}
 	}()
 
@@ -600,5 +640,50 @@ func (m *EQMem) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[str
 
 // Close cleans up this implementation.
 func (*EQMem) Close() error {
+	return nil
+}
+
+type journaler struct {
+	impl *EQMem
+}
+
+// Play replays a modification from the journal.
+func (j *journaler) Play(ctx context.Context, b []byte) error {
+	mod := new(entroq.Modification)
+	if err := json.Unmarshal(b, mod); err != nil {
+		return errors.Wrap(err, "eqmem play mod")
+	}
+
+	if _, _, err := j.impl.Modify(ctx, mod); err != nil {
+		return errors.Wrap(err, "eqmeme play mod")
+	}
+	return nil
+}
+
+type snapshotLoader struct {
+	impl *EQMem
+}
+
+// Load loads a task from the snapshot.
+func (s *snapshotLoader) Load(ctx context.Context, b []byte) error {
+	// When adding things to the journal, we are basically adding a JSON-serialized modification.
+	task := new(entroq.Task)
+	if err := json.Unmarshal(b, task); err != nil {
+		return errors.Wrap(err, "eqmem load task")
+	}
+
+	var ql *qLock
+	func() {
+		defer un(lock(s.impl))
+		s.impl.unsafeEnsureQueue(task.Queue)
+		ql = s.impl.locks[task.Queue]
+	}()
+
+	defer un(lock(ql))
+	finish := s.impl.queueUnsafeInsertTask(ql, task)
+
+	defer un(lock(s.impl))
+	finish()
+
 	return nil
 }
