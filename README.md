@@ -281,12 +281,12 @@ import (
   "context"
 
   "entrogo.com/entroq"
-  "entrogo.com/entroq/mem"
+  "entrogo.com/entroq/backend/eqmem"
 )
 
 func main() {
   ctx := context.Background()
-  eq := entroq.New(ctx, mem.Opener())
+  eq := entroq.New(ctx, eqmem.Opener())
 
   // Use eq.Modify, eq.Insert, eq.Claim, etc., probably in goroutines.
 }

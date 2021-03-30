@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"entrogo.com/entroq"
-	"entrogo.com/entroq/mem"
+	"entrogo.com/entroq/backend/eqmem"
 	"github.com/google/go-cmp/cmp"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
@@ -46,7 +46,7 @@ func mustCleanPath(p string) string {
 func TestRun(t *testing.T) {
 	ctx := context.Background()
 
-	eq, err := entroq.New(ctx, mem.Opener())
+	eq, err := entroq.New(ctx, eqmem.Opener())
 	if err != nil {
 		t.Fatalf("Can't open eq: %v", err)
 	}
