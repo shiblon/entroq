@@ -90,6 +90,7 @@ func WithJournal(dir string) Option {
 // snapshot to be created, and then the system to be closed.
 // This is private to avoid mistakes and misuse, since setting this places the
 // system into a state where it cannot safely be used afterward.
+// Use TakeSnapshot to get this behavior.
 func withOutputSnapshot() Option {
 	return func(m *EQMem) {
 		m.outputSnapshot = true
@@ -185,15 +186,20 @@ func (m *EQMem) walLoaderOpts(forSnapshot bool) []wal.Option {
 				return errors.Wrap(err, "eqmem play mod")
 			}
 
+			// Since changes represent the *final state* in the journal, we
+			// decrement the version number before attempting to apply the
+			// modification.
+			for _, chg := range mod.Changes {
+				chg.Version--
+			}
+
 			if _, _, err := m.Modify(ctx, mod); err != nil {
 				return errors.Wrap(err, "eqmeme play mod")
 			}
 			return nil
 		}),
-	}
-
-	if forSnapshot {
-		opts = append(opts, wal.WithExcludeLiveJournal(true))
+		wal.WithAllowWrite(!forSnapshot),
+		wal.WithExcludeLiveJournal(forSnapshot),
 	}
 
 	return opts
@@ -254,13 +260,11 @@ func (m *EQMem) mustTryClaimOne(ql *qLock, now time.Time, cq *entroq.ClaimQuery)
 	}
 
 	if m.journal != nil {
-		// Create a modification that represents the changes from this claim.
-		// Remember that we already incremented the version number, so we have
-		// to undo that part first.
-		modTask := found.Copy()
-		modTask.Version--
+		// Update for claim. Note that we need the final state, not the
+		// original version. Journal playback decrements the version number by
+		// 1 when applying modifications.
 		mod := &entroq.Modification{
-			Changes: []*entroq.Task{modTask},
+			Changes: []*entroq.Task{found},
 		}
 		// Marshal mod and store in journal.
 		b, err := json.Marshal(mod)
@@ -528,16 +532,6 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted,
 		return nil, nil, errors.Wrap(err, "eqmem modify")
 	}
 
-	if m.journal != nil {
-		b, err := json.Marshal(mod)
-		if err != nil {
-			return nil, nil, errors.Wrap(err, "eqmem modify marshal")
-		}
-		if err := m.journal.Append(b); err != nil {
-			return nil, nil, errors.Wrap(err, "eqmem modify journal")
-		}
-	}
-
 	// Now that we know we can proceed with our process, make all of the necessary changes.
 	// We got all of the queue-based stuff handed to us previously, so we
 	// already hold all of the locks for that stuff and can edit with impunity.
@@ -607,6 +601,31 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted,
 			}
 		}
 	}()
+
+	// Now we can journal things. We have to take care to use what was actually
+	// inserted and what was actually changed.
+	// Note that this means that what is journaled has a version *1 ahead* of
+	// the version it is looking for. Thus, when reading journal entries, we
+	// decrement the version by one before applying a modification. What's
+	// journaled is the final state.
+	if m.journal != nil {
+		jMod := new(entroq.Modification)
+		jMod.Deletes = mod.Deletes
+		jMod.Depends = mod.Depends
+		// TODO: this messes with the timestamps! It would be better if we
+		// could restore created/modified.
+		for _, ins := range inserted {
+			jMod.Inserts = append(jMod.Inserts, ins.Data())
+		}
+		jMod.Changes = changed
+		b, err := json.Marshal(jMod)
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "eqmem modify marshal")
+		}
+		if err := m.journal.Append(b); err != nil {
+			return nil, nil, errors.Wrap(err, "eqmem modify journal")
+		}
+	}
 
 	entroq.NotifyModified(m.nw, inserted, changed)
 
