@@ -15,6 +15,7 @@ import (
 
 	"entrogo.com/entroq"
 	"entrogo.com/entroq/subq"
+	"entrogo.com/stuffedio/wal"
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
 )
@@ -38,9 +39,15 @@ type EQMem struct {
 	// queue name, as well.
 	locks map[string]*qLock
 
+	journal *wal.WAL
+
 	// journalDir, if non-empty, is expected to be a directory containing
 	// journals and possibly snapshots for persisting EntroQ state.
 	journalDir string
+
+	// outputSnapshot, if true, indicates tha the system should start up, read
+	// journals, and dump a snapshot before closing itself down.
+	outputSnapshot bool
 }
 
 type qLock struct {
@@ -60,9 +67,9 @@ func un(f func()) {
 }
 
 // Opener returns a constructor of the in-memory backend.
-func Opener() entroq.BackendOpener {
-	return func(_ context.Context) (entroq.Backend, error) {
-		back, err := New()
+func Opener(opts ...Option) entroq.BackendOpener {
+	return func(ctx context.Context) (entroq.Backend, error) {
+		back, err := New(ctx, opts...)
 		return back, err
 	}
 }
@@ -78,8 +85,18 @@ func WithJournal(dir string) Option {
 	}
 }
 
+// withOutputSnapshot causes the journal to be loaded (without live files), a
+// snapshot to be created, and then the system to be closed.
+// This is private to avoid mistakes and misuse, since setting this places the
+// system into a state where it cannot safely be used afterward.
+func withOutputSnapshot(o bool) Option {
+	return func(m *EQMem) {
+		m.outputSnapshot = o
+	}
+}
+
 // New returns a new in-memory implementation, ready to be used.
-func New(opts ...Option) (*EQMem, error) {
+func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 	m := &EQMem{
 		nw:     subq.New(),
 		queues: make(map[string]*taskQueue),
@@ -89,7 +106,96 @@ func New(opts ...Option) (*EQMem, error) {
 	for _, opt := range opts {
 		opt(m)
 	}
+
+	// If we have a journal dir, then we can use it.
+	if m.journalDir != "" {
+		var err error
+		if m.journal, err = wal.Open(ctx, m.journalDir, m.walLoaderOpts(m.outputSnapshot)...); err != nil {
+			return nil, errors.Wrap(err, "open WAL")
+		}
+
+		// Now it's loaded. If we are to output a snapshot, then we create it
+		// here and close the whole system down.
+		if m.outputSnapshot {
+			if _, err := m.journal.CreateSnapshot(m.makeSnapshot); err != nil {
+				return nil, errors.Wrap(err, "output snapshot")
+			}
+		}
+	}
+
 	return m, nil
+}
+
+// TakeSnapshot brings the system up empty, loads a snapshot + journals,
+// then outputs a new snapshot and exits.
+func TakeSnapshot(ctx context.Context, journalDir string) error {
+	m, err := New(ctx, WithJournal(journalDir), withOutputSnapshot(true))
+	if err != nil {
+		return errors.Wrap(err, "load for snapshot")
+	}
+	return m.Close()
+}
+
+func (m *EQMem) makeSnapshot(a wal.ValueAdder) error {
+	var err error
+	for _, ts := range m.queues {
+		ts.Range(func(_ uuid.UUID, t *entroq.Task) bool {
+			var b []byte
+			if b, err = json.Marshal(t); err != nil {
+				err = errors.Wrap(err, "marshal for snapshot")
+				return false
+			}
+			if err = a.AddValue(b); err != nil {
+				err = errors.Wrap(err, "add value")
+				return false
+			}
+			return true
+		})
+	}
+	return err
+}
+
+func (m *EQMem) walLoaderOpts(forSnapshot bool) []wal.Option {
+	opts := []wal.Option{
+		wal.WithSnapshotLoaderFunc(func(ctx context.Context, b []byte) error {
+			task := new(entroq.Task)
+			if err := json.Unmarshal(b, task); err != nil {
+				return errors.Wrap(err, "eqmem load task")
+			}
+
+			var ql *qLock
+			func() {
+				defer un(lock(m))
+				m.unsafeEnsureQueue(task.Queue)
+				ql = m.locks[task.Queue]
+			}()
+
+			defer un(lock(ql))
+			finish := m.queueUnsafeInsertTask(ql, task)
+
+			defer un(lock(m))
+			finish()
+
+			return nil
+		}),
+		wal.WithJournalPlayerFunc(func(ctx context.Context, b []byte) error {
+			mod := new(entroq.Modification)
+			if err := json.Unmarshal(b, mod); err != nil {
+				return errors.Wrap(err, "eqmem play mod")
+			}
+
+			if _, _, err := m.Modify(ctx, mod); err != nil {
+				return errors.Wrap(err, "eqmeme play mod")
+			}
+			return nil
+		}),
+	}
+
+	if forSnapshot {
+		opts = append(opts, wal.WithExcludeLiveJournal(true))
+	}
+
+	return opts
 }
 
 // claimPrep prepares for attempting to claim a task by very briefly locking
@@ -144,6 +250,10 @@ func (m *EQMem) mustTryClaimOne(ql *qLock, now time.Time, cq *entroq.ClaimQuery)
 		return t
 	}); err != nil {
 		log.Fatalf("Inconsistent internal state: could not update task in %q after claim started", ql.queue)
+	}
+
+	if m.journal != nil {
+		// TODO: store a modification in the journal
 	}
 
 	return found
@@ -472,6 +582,10 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted,
 		}
 	}()
 
+	if m.journal != nil {
+		// TODO: store the modification in the journal.
+	}
+
 	entroq.NotifyModified(m.nw, inserted, changed)
 
 	// All done!
@@ -639,51 +753,9 @@ func (m *EQMem) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[str
 }
 
 // Close cleans up this implementation.
-func (*EQMem) Close() error {
-	return nil
-}
-
-type journaler struct {
-	impl *EQMem
-}
-
-// Play replays a modification from the journal.
-func (j *journaler) Play(ctx context.Context, b []byte) error {
-	mod := new(entroq.Modification)
-	if err := json.Unmarshal(b, mod); err != nil {
-		return errors.Wrap(err, "eqmem play mod")
+func (m *EQMem) Close() error {
+	if m.journal != nil {
+		return m.journal.Close()
 	}
-
-	if _, _, err := j.impl.Modify(ctx, mod); err != nil {
-		return errors.Wrap(err, "eqmeme play mod")
-	}
-	return nil
-}
-
-type snapshotLoader struct {
-	impl *EQMem
-}
-
-// Load loads a task from the snapshot.
-func (s *snapshotLoader) Load(ctx context.Context, b []byte) error {
-	// When adding things to the journal, we are basically adding a JSON-serialized modification.
-	task := new(entroq.Task)
-	if err := json.Unmarshal(b, task); err != nil {
-		return errors.Wrap(err, "eqmem load task")
-	}
-
-	var ql *qLock
-	func() {
-		defer un(lock(s.impl))
-		s.impl.unsafeEnsureQueue(task.Queue)
-		ql = s.impl.locks[task.Queue]
-	}()
-
-	defer un(lock(ql))
-	finish := s.impl.queueUnsafeInsertTask(ql, task)
-
-	defer un(lock(s.impl))
-	finish()
-
 	return nil
 }
