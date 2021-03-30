@@ -225,17 +225,17 @@ func (m *EQMem) mustTryClaimOne(ql *qLock, now time.Time, cq *entroq.ClaimQuery)
 		return nil
 	}
 
+	qts, ok := m.queueTasks(ql.queue)
+	if !ok {
+		log.Fatalf("Inconsistent internal state: could not find queue %q after finding a claimable task in it", ql.queue)
+	}
+
 	// Found one - time to modify it for claiming and return it.
 	// We are under the queue lock for this task's queue, so we now have to
 	// - Update the task at+claimant in the corresponding heap.
 	// - Update the task itself in the task store.
 	newAt := now.Add(cq.Duration)
 	ql.heap.UpdateItem(item, newAt)
-
-	qts, ok := m.queueTasks(ql.queue)
-	if !ok {
-		log.Fatalf("Inconsistent internal state: could not find queue %q after finding a claimable task in it", ql.queue)
-	}
 
 	var found *entroq.Task
 	if err := qts.Update(item.id, func(t *entroq.Task) *entroq.Task {
@@ -253,7 +253,16 @@ func (m *EQMem) mustTryClaimOne(ql *qLock, now time.Time, cq *entroq.ClaimQuery)
 	}
 
 	if m.journal != nil {
-		// TODO: store a modification in the journal
+		mod := &entroq.Modification{
+			Changes: []*entroq.Task{found},
+		}
+		b, err := json.Marshal(mod)
+		if err != nil {
+			log.Fatalf("Inconsistent internal state: updated task but couldn't marshal JSON: %v", err)
+		}
+		if err := m.journal.Append(b); err != nil {
+			log.Fatalf("Inconsistent internal state: updated task but couldn't write to journal: %v", err)
+		}
 	}
 
 	return found
@@ -512,6 +521,16 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted,
 		return nil, nil, errors.Wrap(err, "eqmem modify")
 	}
 
+	if m.journal != nil {
+		b, err := json.Marshal(mod)
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "eqmem modify marshal")
+		}
+		if err := m.journal.Append(b); err != nil {
+			return nil, nil, errors.Wrap(err, "eqmem modify journal")
+		}
+	}
+
 	// Now that we know we can proceed with our process, make all of the necessary changes.
 	// We got all of the queue-based stuff handed to us previously, so we
 	// already hold all of the locks for that stuff and can edit with impunity.
@@ -581,10 +600,6 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted,
 			}
 		}
 	}()
-
-	if m.journal != nil {
-		// TODO: store the modification in the journal.
-	}
 
 	entroq.NotifyModified(m.nw, inserted, changed)
 
@@ -755,7 +770,9 @@ func (m *EQMem) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[str
 // Close cleans up this implementation.
 func (m *EQMem) Close() error {
 	if m.journal != nil {
-		return m.journal.Close()
+		err := m.journal.Close()
+		m.journal = nil
+		return err
 	}
 	return nil
 }
