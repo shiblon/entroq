@@ -1195,12 +1195,12 @@ func WithModification(src *Modification) ModifyArg {
 type Modification struct {
 	now time.Time
 
-	Claimant uuid.UUID
+	Claimant uuid.UUID `json:"claimant"`
 
-	Inserts []*TaskData
-	Changes []*Task
-	Deletes []*TaskID
-	Depends []*TaskID
+	Inserts []*TaskData `json:"inserts"`
+	Changes []*Task     `json:"changes"`
+	Deletes []*TaskID   `json:"deletes"`
+	Depends []*TaskID   `json:"depends"`
 }
 
 // NewModification creates a new modification: insertions, deletions, changes,
