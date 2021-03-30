@@ -264,7 +264,8 @@ func (m *EQMem) mustTryClaimOne(ql *qLock, now time.Time, cq *entroq.ClaimQuery)
 		// original version. Journal playback decrements the version number by
 		// 1 when applying modifications.
 		mod := &entroq.Modification{
-			Changes: []*entroq.Task{found},
+			Claimant: cq.Claimant,
+			Changes:  []*entroq.Task{found},
 		}
 		// Marshal mod and store in journal.
 		b, err := json.Marshal(mod)
@@ -609,15 +610,17 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted,
 	// decrement the version by one before applying a modification. What's
 	// journaled is the final state.
 	if m.journal != nil {
-		jMod := new(entroq.Modification)
-		jMod.Deletes = mod.Deletes
-		jMod.Depends = mod.Depends
+		jMod := &entroq.Modification{
+			Claimant: mod.Claimant,
+			Deletes:  mod.Deletes,
+			Depends:  mod.Depends,
+			Changes:  changed,
+		}
 		// TODO: this messes with the timestamps! It would be better if we
 		// could restore created/modified.
 		for _, ins := range inserted {
 			jMod.Inserts = append(jMod.Inserts, ins.Data())
 		}
-		jMod.Changes = changed
 		b, err := json.Marshal(jMod)
 		if err != nil {
 			return nil, nil, errors.Wrap(err, "eqmem modify marshal")
