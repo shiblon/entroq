@@ -44,7 +44,10 @@ type EQMem struct {
 
 	// journalDir, if non-empty, is expected to be a directory containing
 	// journals and possibly snapshots for persisting EntroQ state.
-	journalDir string
+	// Other options for journals are below.
+	journalDir      string
+	maxJournalBytes int64
+	maxJournalItems int
 
 	// outputSnapshot, if true, indicates tha the system should start up, read
 	// journals, and dump a snapshot before closing itself down.
@@ -86,6 +89,22 @@ func WithJournal(dir string) Option {
 	}
 }
 
+// WithMaxJournalBytes sets a maximum on the number of bytes before rotation.
+// Default is wal.DefaultMaxBytes.
+func WithMaxJournalBytes(max int64) Option {
+	return func(m *EQMem) {
+		m.maxJournalBytes = max
+	}
+}
+
+// WithMaxJournalEntries sets a maximum on the number of entries in the journal
+// before rotation. Default is wal.DefaultMaxIndices.
+func WithMaxJournalEntries(max int) Option {
+	return func(m *EQMem) {
+		m.maxJournalEntries = max
+	}
+}
+
 // withOutputSnapshot causes the journal to be loaded (without live files), a
 // snapshot to be created, and then the system to be closed.
 // This is private to avoid mistakes and misuse, since setting this places the
@@ -112,7 +131,7 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 	// If we have a journal dir, then we can use it.
 	if m.journalDir != "" {
 		var err error
-		if m.journal, err = wal.Open(ctx, m.journalDir, m.walLoaderOpts(m.outputSnapshot)...); err != nil {
+		if m.journal, err = wal.Open(ctx, m.journalDir, m.walLoaderOpts()...); err != nil {
 			return nil, errors.Wrap(err, "open WAL")
 		}
 
@@ -157,8 +176,12 @@ func (m *EQMem) makeSnapshot(a wal.ValueAdder) error {
 	return err
 }
 
-func (m *EQMem) walLoaderOpts(forSnapshot bool) []wal.Option {
+func (m *EQMem) walLoaderOpts() []wal.Option {
 	opts := []wal.Option{
+		wal.WithMaxJournalBytes(m.maxJournalBytes),
+		wal.WithMaxJournalIndices(m.maxJournalEntries),
+		wal.WithAllowWrite(!m.outputSnapshot),
+		wal.WithExcludeLiveJournal(m.outputSnapshot),
 		wal.WithSnapshotLoaderFunc(func(ctx context.Context, b []byte) error {
 			task := new(entroq.Task)
 			if err := json.Unmarshal(b, task); err != nil {
@@ -198,8 +221,6 @@ func (m *EQMem) walLoaderOpts(forSnapshot bool) []wal.Option {
 			}
 			return nil
 		}),
-		wal.WithAllowWrite(!forSnapshot),
-		wal.WithExcludeLiveJournal(forSnapshot),
 	}
 
 	return opts
