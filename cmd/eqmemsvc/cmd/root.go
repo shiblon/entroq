@@ -37,6 +37,7 @@ var flags struct {
 
 	journal  string
 	snapshot bool
+	cleanup  bool
 
 	maxSize int
 }
@@ -57,12 +58,16 @@ var rootCmd = &cobra.Command{
 			return errors.Wrapf(err, "error listening on port %d", flags.port)
 		}
 
+		if flags.cleanup && !flags.snapshot {
+			return errors.Wrap(err, "bad flag setting: cleanup can only be specified with snapshot")
+		}
+
 		if flags.snapshot && flags.journal == "" {
 			return errors.Wrapf(err, "bad flag setting: snapshots implies journal dir, but it's missing")
 		}
 
 		if flags.snapshot {
-			if err := eqmem.TakeSnapshot(ctx, flags.journal); err != nil {
+			if err := eqmem.TakeSnapshot(ctx, flags.journal, flags.cleanup); err != nil {
 				return errors.Wrapf(err, "take snapshot in %q", flags.journal)
 			}
 			return nil
@@ -127,6 +132,7 @@ func init() {
 
 	pflags.StringVar(&flags.journal, "journal", "", "Journal directory, if persistence is desired. Default is memory-only, ephemeral.")
 	pflags.BoolVar(&flags.snapshot, "journal_snapshot", false, "If set, starts up, reads the journal, and outputs a snapshot for all but the live journal. Requires the journal flag to be set.")
+	pflags.BoolVar(&flags.cleanup, "journal_cleanup", false, "If set, cleans up the journal before startup. Requires the journal flag to be set to a path and the journal_snapshot option to be set.")
 
 	viper.BindPFlag("port", pflags.Lookup("port"))
 	viper.BindPFlag("http_port", pflags.Lookup("http_port"))

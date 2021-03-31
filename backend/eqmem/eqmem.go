@@ -193,13 +193,20 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 }
 
 // TakeSnapshot brings the system up empty, loads a snapshot + journals,
-// then outputs a new snapshot and exits.
-func TakeSnapshot(ctx context.Context, journalDir string) error {
+// then outputs a new snapshot and exits. Cleans up old files after
+// snapshotting if requested. Otherwise they are just moved out of the way.
+func TakeSnapshot(ctx context.Context, journalDir string, cleanup bool) error {
 	m, err := New(ctx, WithJournal(journalDir), withOutputSnapshot())
 	if err != nil {
 		return errors.Wrap(err, "load for snapshot")
 	}
-	return m.Close()
+	defer m.Close()
+	if cleanup {
+		if err := wal.Cleanup(journalDir); err != nil {
+			return errors.Wrap(err, "snapshot cleanup")
+		}
+	}
+	return nil
 }
 
 func (m *EQMem) makeSnapshot(a wal.ValueAdder) error {
