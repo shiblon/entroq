@@ -97,11 +97,11 @@ func WithMaxJournalBytes(max int64) Option {
 	}
 }
 
-// WithMaxJournalEntries sets a maximum on the number of entries in the journal
+// WithMaxJournalItems sets a maximum on the number of entries in the journal
 // before rotation. Default is wal.DefaultMaxIndices.
-func WithMaxJournalEntries(max int) Option {
+func WithMaxJournalItems(max int) Option {
 	return func(m *EQMem) {
-		m.maxJournalEntries = max
+		m.maxJournalItems = max
 	}
 }
 
@@ -130,8 +130,53 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 
 	// If we have a journal dir, then we can use it.
 	if m.journalDir != "" {
+		walOpts := []wal.Option{
+			wal.WithMaxJournalBytes(m.maxJournalBytes),
+			wal.WithMaxJournalIndices(m.maxJournalItems),
+			wal.WithAllowWrite(!m.outputSnapshot),
+			wal.WithExcludeLiveJournal(m.outputSnapshot),
+			wal.WithSnapshotLoaderFunc(func(ctx context.Context, b []byte) error {
+				task := new(entroq.Task)
+				if err := json.Unmarshal(b, task); err != nil {
+					return errors.Wrap(err, "eqmem load task")
+				}
+
+				var ql *qLock
+				func() {
+					defer un(lock(m))
+					m.unsafeEnsureQueue(task.Queue)
+					ql = m.locks[task.Queue]
+				}()
+
+				defer un(lock(ql))
+				finish := m.queueUnsafeInsertTask(ql, task)
+
+				defer un(lock(m))
+				finish()
+
+				return nil
+			}),
+			wal.WithJournalPlayerFunc(func(ctx context.Context, b []byte) error {
+				mod := new(entroq.Modification)
+				if err := json.Unmarshal(b, mod); err != nil {
+					return errors.Wrap(err, "eqmem play mod")
+				}
+
+				// Since changes represent the *final state* in the journal, we
+				// decrement the version number before attempting to apply the
+				// modification.
+				for _, chg := range mod.Changes {
+					chg.Version--
+				}
+
+				if _, _, err := m.Modify(ctx, mod); err != nil {
+					return errors.Wrap(err, "eqmeme play mod")
+				}
+				return nil
+			}),
+		}
 		var err error
-		if m.journal, err = wal.Open(ctx, m.journalDir, m.walLoaderOpts()...); err != nil {
+		if m.journal, err = wal.Open(ctx, m.journalDir, walOpts...); err != nil {
 			return nil, errors.Wrap(err, "open WAL")
 		}
 
@@ -174,56 +219,6 @@ func (m *EQMem) makeSnapshot(a wal.ValueAdder) error {
 		})
 	}
 	return err
-}
-
-func (m *EQMem) walLoaderOpts() []wal.Option {
-	opts := []wal.Option{
-		wal.WithMaxJournalBytes(m.maxJournalBytes),
-		wal.WithMaxJournalIndices(m.maxJournalEntries),
-		wal.WithAllowWrite(!m.outputSnapshot),
-		wal.WithExcludeLiveJournal(m.outputSnapshot),
-		wal.WithSnapshotLoaderFunc(func(ctx context.Context, b []byte) error {
-			task := new(entroq.Task)
-			if err := json.Unmarshal(b, task); err != nil {
-				return errors.Wrap(err, "eqmem load task")
-			}
-
-			var ql *qLock
-			func() {
-				defer un(lock(m))
-				m.unsafeEnsureQueue(task.Queue)
-				ql = m.locks[task.Queue]
-			}()
-
-			defer un(lock(ql))
-			finish := m.queueUnsafeInsertTask(ql, task)
-
-			defer un(lock(m))
-			finish()
-
-			return nil
-		}),
-		wal.WithJournalPlayerFunc(func(ctx context.Context, b []byte) error {
-			mod := new(entroq.Modification)
-			if err := json.Unmarshal(b, mod); err != nil {
-				return errors.Wrap(err, "eqmem play mod")
-			}
-
-			// Since changes represent the *final state* in the journal, we
-			// decrement the version number before attempting to apply the
-			// modification.
-			for _, chg := range mod.Changes {
-				chg.Version--
-			}
-
-			if _, _, err := m.Modify(ctx, mod); err != nil {
-				return errors.Wrap(err, "eqmeme play mod")
-			}
-			return nil
-		}),
-	}
-
-	return opts
 }
 
 // claimPrep prepares for attempting to claim a task by very briefly locking
@@ -602,14 +597,23 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted,
 		if id == uuid.Nil {
 			id = uuid.New()
 		}
+		// Restore timings if we're reading from a journal.
+		created := td.Created
+		if created.IsZero() {
+			created = now
+		}
+		modified := td.Modified
+		if modified.IsZero() {
+			modified = now
+		}
 		newTask := &entroq.Task{
 			ID:       id,
 			Queue:    td.Queue,
 			At:       td.At,
 			Value:    td.Value,
 			Claimant: mod.Claimant,
-			Created:  now,
-			Modified: now,
+			Created:  created,
+			Modified: modified,
 		}
 		insertTask(newTask)
 		inserted = append(inserted, newTask)
