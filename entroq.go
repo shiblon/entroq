@@ -115,6 +115,12 @@ type TaskData struct {
 	// and the insertion can be removed if that happens, and then the
 	// modification can be retried.
 	skipCollidingID bool
+
+	// These timings are here so that journaling can restore full state.
+	// Usually they are blank, and there are no convenience methods to allow
+	// them to be set. Leave them at default values in all cases.
+	Created  time.Time `json:"created"`
+	Modified time.Time `json:"modified"`
 }
 
 // String returns a string representation of the task data, excluding the value.
@@ -211,12 +217,14 @@ func (t *Task) IDVersion() *TaskID {
 // Data returns the data for this task.
 func (t *Task) Data() *TaskData {
 	return &TaskData{
-		Queue:   t.Queue,
-		At:      t.At,
-		Value:   t.Value,
-		ID:      t.ID,
-		Attempt: t.Attempt,
-		Err:     t.Err,
+		Queue:    t.Queue,
+		At:       t.At,
+		Value:    t.Value,
+		ID:       t.ID,
+		Attempt:  t.Attempt,
+		Err:      t.Err,
+		Created:  t.Created,
+		Modified: t.Modified,
 	}
 }
 
