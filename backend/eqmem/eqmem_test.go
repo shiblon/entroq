@@ -2,6 +2,7 @@ package eqmem
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"os"
 	"reflect"
@@ -17,8 +18,15 @@ import (
 
 func RunQTest(t *testing.T, tester qtest.Tester) {
 	t.Helper()
+
+	tmpDir, err := os.MkdirTemp("", "memtest-")
+	if err != nil {
+		t.Fatalf("Temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
 	ctx := context.Background()
-	client, stop, err := qtest.ClientService(ctx, Opener())
+	client, stop, err := qtest.ClientService(ctx, Opener(WithJournal(tmpDir)))
 	if err != nil {
 		t.Fatalf("Get client: %v", err)
 	}
@@ -209,5 +217,110 @@ func TestEQMemJournalClaim(t *testing.T) {
 
 	if diff := cmp.Diff(expect, stats); diff != "" {
 		t.Errorf("Unexpected diff (-want +got):\n%v", diff)
+	}
+}
+
+func TestEQMem_stressJournalStats(t *testing.T) {
+	journalDir, err := os.MkdirTemp("", "eqjournal-")
+	if err != nil {
+		t.Fatalf("Error opening temp dir for journal: %v", err)
+	}
+	defer os.RemoveAll(journalDir)
+
+	ctx := context.Background()
+
+	opener := Opener(WithJournal(journalDir), WithMaxJournalItems(100))
+
+	// Create a journaled memory implementation with a relatively small journal max size.
+	eq, err := entroq.New(ctx, opener)
+	if err != nil {
+		t.Fatalf("Error creating client: %v", err)
+	}
+
+	expectQueues := map[string]*entroq.QueueStat{
+		"/queue/1": new(entroq.QueueStat),
+		"/queue/2": new(entroq.QueueStat),
+		"/queue/3": new(entroq.QueueStat),
+	}
+
+	// Do a bunch of random filling, keep track of how much we did.
+	for q, s := range expectQueues {
+		s.Name = q
+		for i, n := 0, rand.Intn(1000); i < n; i++ {
+			if _, _, err := eq.Modify(ctx, entroq.InsertingInto(q, entroq.WithValue([]byte(fmt.Sprintf("value %d", i))))); err != nil {
+				t.Fatalf("Error inserting into %q: %v", q, err)
+			}
+			s.Size++
+			s.Available++
+		}
+	}
+
+	// Close and reopen, check stats.
+	eq.Close()
+	eq = nil
+
+	if eq, err = entroq.New(ctx, opener); err != nil {
+		t.Fatalf("Error opening client a second time: %v", err)
+	}
+
+	var statOpts []entroq.QueuesOpt
+	for q := range expectQueues {
+		statOpts = append(statOpts, entroq.MatchExact(q))
+	}
+	qstats, err := eq.QueueStats(ctx, statOpts...)
+	if err != nil {
+		t.Fatalf("Error getting queue stats: %v", err)
+	}
+
+	if diff := cmp.Diff(expectQueues, qstats); diff != "" {
+		t.Fatalf("Unexpected diff (-want +got):\n%v", diff)
+	}
+
+	// Now do a few claims and moves.
+	var qs []string
+	for q := range expectQueues {
+		qs = append(qs, q)
+	}
+
+	now, err := eq.Time(ctx)
+	if err != nil {
+		t.Fatalf("Failed to get current time: %v", err)
+	}
+
+	for i, q := range qs {
+		for ci, cn := 0, rand.Intn(expectQueues[q].Size/4); ci < cn; ci++ {
+			task, err := eq.Claim(ctx, entroq.From(q))
+			if err != nil {
+				t.Fatalf("Error claiming task: %v", err)
+			}
+			expectQueues[q].Claimed++
+			expectQueues[q].Available--
+			newQ := qs[(i+1)%len(qs)]
+			if _, _, err := eq.Modify(ctx, task.AsChange(entroq.QueueTo(newQ), entroq.ArrivalTimeTo(now))); err != nil {
+				t.Fatalf("Error moving from %q to %q: %v", q, newQ, err)
+			}
+			expectQueues[q].Size--
+			expectQueues[q].Claimed--
+			expectQueues[newQ].Size++
+			expectQueues[newQ].Available++
+		}
+		expectQueues[q].MaxClaims = 1
+	}
+
+	// Close, reload, check stats again.
+	eq.Close()
+	eq = nil
+
+	if eq, err = entroq.New(ctx, opener); err != nil {
+		t.Fatalf("Error opening client a third time: %v", err)
+	}
+	defer eq.Close()
+
+	if qstats, err = eq.QueueStats(ctx, statOpts...); err != nil {
+		t.Fatalf("Error getting queue stats: %v", err)
+	}
+
+	if diff := cmp.Diff(expectQueues, qstats); diff != "" {
+		t.Fatalf("Unexpected diff (-want +got):\n%v", diff)
 	}
 }
