@@ -170,7 +170,7 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 				}
 
 				if _, _, err := m.Modify(ctx, mod); err != nil {
-					return errors.Wrap(err, "eqmeme play mod")
+					return errors.Wrap(err, "eqmem play mod")
 				}
 				return nil
 			}),
@@ -395,9 +395,8 @@ func ensureModQueues(mod *entroq.Modification, qByID map[uuid.UUID]string) {
 	}
 
 	for _, c := range mod.Changes {
-		if c.FromQueue == "" {
-			c.FromQueue = qByID[c.ID]
-		}
+		// Always from where it already is. Always.
+		c.FromQueue = qByID[c.ID]
 	}
 }
 

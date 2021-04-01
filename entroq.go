@@ -165,14 +165,12 @@ type Task struct {
 func (t *Task) String() string {
 	qInfo := fmt.Sprintf("%q", t.Queue)
 	if t.FromQueue != "" && t.FromQueue != t.Queue {
-		qInfo = fmt.Sprintf("%q -> %q", t.FromQueue, t.Queue)
+		qInfo = fmt.Sprintf("%q <- %q", t.Queue, t.FromQueue)
 	}
-	return fmt.Sprintf("Task [%s %s v%d]\n\t", qInfo, t.ID, t.Version) + strings.Join([]string{
-		fmt.Sprintf("at=%q claimant=%s claims=%d", t.At, t.Claimant, t.Claims),
-		fmt.Sprintf("attempt=%d err=%q", t.Attempt, t.Err),
-		fmt.Sprintf("c=%q m=%q", t.Created, t.Modified),
+	return fmt.Sprintf("Task [%s %s:v%d]\n\t", qInfo, t.ID, t.Version) + strings.Join([]string{
+		fmt.Sprintf("at=%q claimant=%s claims=%d attempt=%d err=%q", t.At, t.Claimant, t.Claims, t.Attempt, t.Err),
 		fmt.Sprintf("val=%q", string(t.Value)),
-	}, "\n\t") + "\n"
+	}, "\n\t")
 }
 
 // AsDeletion returns a ModifyArg that can be used in the Modify function, e.g.,
@@ -1112,9 +1110,7 @@ func DependingOn(id uuid.UUID, version int32, opts ...IDOption) ModifyArg {
 func Changing(task *Task, changeArgs ...ChangeArg) ModifyArg {
 	return func(m *Modification) {
 		newTask := *task
-		if newTask.FromQueue == "" {
-			newTask.FromQueue = task.Queue
-		}
+		newTask.FromQueue = task.Queue
 		for _, a := range changeArgs {
 			a(m, &newTask)
 		}
@@ -1209,6 +1205,24 @@ type Modification struct {
 	Changes []*Task     `json:"changes"`
 	Deletes []*TaskID   `json:"deletes"`
 	Depends []*TaskID   `json:"depends"`
+}
+
+// String produces a friendly version of this modification.
+func (m *Modification) String() string {
+	var out []string
+	if len(m.Inserts) != 0 {
+		out = append(out, fmt.Sprintf("ins: %v", m.Inserts))
+	}
+	if len(m.Changes) != 0 {
+		out = append(out, fmt.Sprintf("chg: %v", m.Changes))
+	}
+	if len(m.Deletes) != 0 {
+		out = append(out, fmt.Sprintf("del: %v", m.Deletes))
+	}
+	if len(m.Depends) != 0 {
+		out = append(out, fmt.Sprintf("dep: %v", m.Depends))
+	}
+	return "mod:\n\t" + strings.Join(out, "\n\t")
 }
 
 // NewModification creates a new modification: insertions, deletions, changes,

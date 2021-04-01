@@ -199,14 +199,12 @@ func TestEQMemJournalClaim(t *testing.T) {
 			Claimed:   1,
 			Available: 0,
 			Size:      1,
-			MaxClaims: 1,
 		},
 		"/queue/of/others": &entroq.QueueStat{
 			Name:      "/queue/of/others",
 			Claimed:   0,
 			Available: 1,
 			Size:      1,
-			MaxClaims: 0,
 		},
 	}
 
@@ -215,12 +213,18 @@ func TestEQMemJournalClaim(t *testing.T) {
 		t.Fatalf("Queue stats: %v", err)
 	}
 
+	// Set MaxClaims because we have no idea whether things get claimed twice.
+	for q, s := range expect {
+		s.MaxClaims = stats[q].MaxClaims
+	}
+
 	if diff := cmp.Diff(expect, stats); diff != "" {
 		t.Errorf("Unexpected diff (-want +got):\n%v", diff)
 	}
 }
 
-func TestEQMem_stressJournalStats(t *testing.T) {
+func stressJournalStats(t *testing.T) {
+	const maxQueueTasks = 5000
 	journalDir, err := os.MkdirTemp("", "eqjournal-")
 	if err != nil {
 		t.Fatalf("Error opening temp dir for journal: %v", err)
@@ -246,7 +250,7 @@ func TestEQMem_stressJournalStats(t *testing.T) {
 	// Do a bunch of random filling, keep track of how much we did.
 	for q, s := range expectQueues {
 		s.Name = q
-		for i, n := 0, rand.Intn(1000); i < n; i++ {
+		for i, n := 0, rand.Intn(maxQueueTasks); i < n; i++ {
 			if _, _, err := eq.Modify(ctx, entroq.InsertingInto(q, entroq.WithValue([]byte(fmt.Sprintf("value %d", i))))); err != nil {
 				t.Fatalf("Error inserting into %q: %v", q, err)
 			}
@@ -287,15 +291,19 @@ func TestEQMem_stressJournalStats(t *testing.T) {
 		t.Fatalf("Failed to get current time: %v", err)
 	}
 
+	nextQ := func(i int) string {
+		return qs[(i+1)%len(qs)]
+	}
+
 	for i, q := range qs {
-		for ci, cn := 0, rand.Intn(expectQueues[q].Size/4); ci < cn; ci++ {
+		newQ := nextQ(i)
+		for ci, cn := 0, rand.Intn(expectQueues[q].Size/2); ci < cn; ci++ {
 			task, err := eq.Claim(ctx, entroq.From(q))
 			if err != nil {
 				t.Fatalf("Error claiming task: %v", err)
 			}
 			expectQueues[q].Claimed++
 			expectQueues[q].Available--
-			newQ := qs[(i+1)%len(qs)]
 			if _, _, err := eq.Modify(ctx, task.AsChange(entroq.QueueTo(newQ), entroq.ArrivalTimeTo(now))); err != nil {
 				t.Fatalf("Error moving from %q to %q: %v", q, newQ, err)
 			}
@@ -304,7 +312,6 @@ func TestEQMem_stressJournalStats(t *testing.T) {
 			expectQueues[newQ].Size++
 			expectQueues[newQ].Available++
 		}
-		expectQueues[q].MaxClaims = 1
 	}
 
 	// Close, reload, check stats again.
@@ -320,7 +327,64 @@ func TestEQMem_stressJournalStats(t *testing.T) {
 		t.Fatalf("Error getting queue stats: %v", err)
 	}
 
+	for q, s := range expectQueues {
+		// We don't know what this will be beforehand.
+		s.MaxClaims = qstats[q].MaxClaims
+	}
+
 	if diff := cmp.Diff(expectQueues, qstats); diff != "" {
 		t.Fatalf("Unexpected diff (-want +got):\n%v", diff)
 	}
+}
+
+func TestEQMem_stressJournalStats(t *testing.T) {
+	N := 1
+	for i := 0; i < N; i++ {
+		stressJournalStats(t)
+	}
+}
+
+func TestEQMem_journalClaimModClaim(t *testing.T) {
+	// This test exercises a specific bug that was found in the journal stress
+	// test, but produced it reliably.
+	journalDir, err := os.MkdirTemp("", "eqjournal-")
+	if err != nil {
+		t.Fatalf("Error opening temp dir for journal: %v", err)
+	}
+	// TODO: changing a task makes it available now by default?
+	defer os.RemoveAll(journalDir)
+
+	ctx := context.Background()
+
+	opener := Opener(WithJournal(journalDir), WithMaxJournalItems(100))
+	eq, err := entroq.New(ctx, opener)
+	if err != nil {
+		t.Fatalf("Error opening: %v", err)
+	}
+
+	if _, _, err := eq.Modify(ctx, entroq.InsertingInto("/queue/1")); err != nil {
+		t.Fatalf("Error inserting: %v", err)
+	}
+
+	task, err := eq.Claim(ctx, entroq.From("/queue/1"))
+	if err != nil {
+		t.Fatalf("Error claiming: %v", err)
+	}
+
+	if _, _, err := eq.Modify(ctx, task.AsChange(entroq.QueueTo("/queue/2"), entroq.ArrivalTimeBy(0))); err != nil {
+		t.Fatalf("Error changing: %v", err)
+	}
+
+	if _, err := eq.Claim(ctx, entroq.From("/queue/2")); err != nil {
+		t.Fatalf("Error claiming again: %v", err)
+	}
+
+	eq.Close()
+
+	// Try opening and reading the journal again.
+	eq, err = entroq.New(ctx, opener)
+	if err != nil {
+		t.Fatalf("Error opening again: %v", err)
+	}
+	defer eq.Close()
 }
