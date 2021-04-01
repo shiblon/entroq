@@ -534,7 +534,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 	runWorkerOneCase := func(ctx context.Context, c tc) {
 		t.Helper()
 
-		const leaseTime = 10 * time.Second
+		const leaseTime = 15 * time.Second
 
 		w := client.NewWorker(c.input.Queue).WithOpts(
 			entroq.WithWrappedMove(c.wrapped),
