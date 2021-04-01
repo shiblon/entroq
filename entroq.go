@@ -74,7 +74,7 @@ func WithIDQueue(q string) IDOption {
 
 // String produces the id:version string representation.
 func (t TaskID) String() string {
-	return fmt.Sprintf("%s:v%d (in %s)", t.ID, t.Version, t.Queue)
+	return fmt.Sprintf("%s:v%d (in %q)", t.ID, t.Version, t.Queue)
 }
 
 // AsDeletion produces an appropriate ModifyArg to delete the task with this ID.
@@ -1110,7 +1110,10 @@ func DependingOn(id uuid.UUID, version int32, opts ...IDOption) ModifyArg {
 func Changing(task *Task, changeArgs ...ChangeArg) ModifyArg {
 	return func(m *Modification) {
 		newTask := *task
+		// From queue is always the current queue.
 		newTask.FromQueue = task.Queue
+		// Reset when changing, at least by default. Callers may override.
+		newTask.At = m.now
 		for _, a := range changeArgs {
 			a(m, &newTask)
 		}

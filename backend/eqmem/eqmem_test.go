@@ -286,11 +286,6 @@ func stressJournalStats(t *testing.T) {
 		qs = append(qs, q)
 	}
 
-	now, err := eq.Time(ctx)
-	if err != nil {
-		t.Fatalf("Failed to get current time: %v", err)
-	}
-
 	nextQ := func(i int) string {
 		return qs[(i+1)%len(qs)]
 	}
@@ -304,7 +299,7 @@ func stressJournalStats(t *testing.T) {
 			}
 			expectQueues[q].Claimed++
 			expectQueues[q].Available--
-			if _, _, err := eq.Modify(ctx, task.AsChange(entroq.QueueTo(newQ), entroq.ArrivalTimeTo(now))); err != nil {
+			if _, _, err := eq.Modify(ctx, task.AsChange(entroq.QueueTo(newQ))); err != nil {
 				t.Fatalf("Error moving from %q to %q: %v", q, newQ, err)
 			}
 			expectQueues[q].Size--
@@ -351,7 +346,6 @@ func TestEQMem_journalClaimModClaim(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error opening temp dir for journal: %v", err)
 	}
-	// TODO: changing a task makes it available now by default?
 	defer os.RemoveAll(journalDir)
 
 	ctx := context.Background()
@@ -371,7 +365,7 @@ func TestEQMem_journalClaimModClaim(t *testing.T) {
 		t.Fatalf("Error claiming: %v", err)
 	}
 
-	if _, _, err := eq.Modify(ctx, task.AsChange(entroq.QueueTo("/queue/2"), entroq.ArrivalTimeBy(0))); err != nil {
+	if _, _, err := eq.Modify(ctx, task.AsChange(entroq.QueueTo("/queue/2"))); err != nil {
 		t.Fatalf("Error changing: %v", err)
 	}
 
