@@ -71,8 +71,8 @@ var rootCmd = &cobra.Command{
 			}
 		}
 
-		if flags.cleanup && !flags.snapshotAndQuit {
-			return errors.Wrap(err, "bad flag setting: cleanup can only be specified with snapshot_and_quit")
+		if flags.cleanup && !flags.snapshotAndQuit && flags.periodicSnapshot == "" {
+			return errors.Wrap(err, "bad flag setting: cleanup can only be specified with snapshot functions")
 		}
 
 		if flags.periodicSnapshot != "" && flags.snapshotAndQuit {
