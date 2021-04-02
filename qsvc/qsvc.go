@@ -222,7 +222,7 @@ func (s *QSvc) Authorize(ctx context.Context, req *authz.Request) error {
 func (s *QSvc) RefreshMetrics(ctx context.Context) error {
 	stats, err := s.impl.QueueStats(ctx)
 	if err != nil {
-		return errors.Wrap(err, "collectMetricStats")
+		return errors.Wrap(err, "refresh metrics")
 	}
 
 	// Clear it out, then repopulate.

@@ -1295,8 +1295,7 @@ func (m *Modification) AllDependencies() (map[uuid.UUID]int32, error) {
 }
 
 func (m *Modification) otherwiseClaimed(task *Task) bool {
-	var zeroUUID uuid.UUID
-	return task.At.After(m.now) && task.Claimant != zeroUUID && task.Claimant != m.Claimant
+	return task.At.After(m.now) && task.Claimant != uuid.Nil && task.Claimant != m.Claimant
 }
 
 func (m *Modification) badInserts(foundDeps map[uuid.UUID]*Task) []*TaskID {
@@ -1425,6 +1424,13 @@ func (m DependencyError) HasClaims() bool {
 // HasCollisions indicates whether any of the inserted tasks collided with existing IDs.
 func (m DependencyError) HasCollisions() bool {
 	return len(m.Inserts) > 0
+}
+
+// OnlyClaims indicates that the error was only related to claimants. Useful
+// for backends to do "force" operations, making it easy to ignore this
+// particular error.
+func (m DependencyError) OnlyClaims() bool {
+	return !m.HasMissing() && !m.HasCollisions()
 }
 
 // Error produces a helpful error string indicating what was missing.

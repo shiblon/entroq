@@ -59,6 +59,7 @@ func RunQTest(t *testing.T, tester qtest.Tester) {
 	if err != nil {
 		t.Fatalf("Get client: %v", err)
 	}
+	defer client.Close()
 	defer stop()
 	tester(ctx, t, client, "pgtest/"+uuid.New().String())
 }
@@ -84,37 +85,30 @@ func TestSimpleSequence(t *testing.T) {
 }
 
 func TestSimpleChange(t *testing.T) {
-	log.Printf("Simple change")
 	RunQTest(t, qtest.SimpleChange)
 }
 
 func TestSimpleWorker(t *testing.T) {
-	log.Printf("Simple worker")
 	RunQTest(t, qtest.SimpleWorker)
 }
 
 func TestMultiWorker(t *testing.T) {
-	log.Printf("Multi worker")
 	RunQTest(t, qtest.MultiWorker)
 }
 
 func TestWorkerDependencyHandler(t *testing.T) {
-	log.Printf("Worker dependency handler")
 	RunQTest(t, qtest.WorkerDependencyHandler)
 }
 
 func TestWorkerMoveOnError(t *testing.T) {
-	log.Printf("Worker move on error")
 	RunQTest(t, qtest.WorkerMoveOnError)
 }
 
 func TestWorkerRetryOnError(t *testing.T) {
-	log.Printf("Worker retry on error")
 	RunQTest(t, qtest.WorkerRetryOnError)
 }
 
 func TestWorkerRenewal(t *testing.T) {
-	log.Printf("Worker renewal")
 	RunQTest(t, qtest.WorkerRenewal)
 }
 

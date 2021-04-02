@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
 	"path"
 	"strings"
@@ -160,7 +159,6 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 	}
 
 	cancel()
-	log.Printf("Is canceled: %v", entroq.IsCanceled(g.Wait()))
 	if err := g.Wait(); err != nil && !entroq.IsCanceled(err) {
 		t.Fatalf("Worker exit error: %v", err)
 	}
