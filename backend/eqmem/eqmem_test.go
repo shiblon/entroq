@@ -382,3 +382,50 @@ func TestEQMem_journalClaimModClaim(t *testing.T) {
 	}
 	defer eq.Close()
 }
+
+func TestEQMem_journalInsClaimDel(t *testing.T) {
+	// This pattern, when performed from the command line, caused claimant
+	// mismatch issues when reading from the journal.
+	// This test ensures that that command-line pattern doesn't cause journals
+	// to fail to load: the loader is special and has extra privileges, so
+	// claimant mismatches should be ignored.
+	journalDir, err := os.MkdirTemp("", "eqjournal-")
+	if err != nil {
+		t.Fatalf("Error opening temp journal dir: %v", err)
+	}
+	defer os.RemoveAll(journalDir)
+	ctx := context.Background()
+	opener := Opener(WithJournal(journalDir))
+
+	eq1, err := entroq.New(ctx, opener)
+	if err != nil {
+		t.Fatalf("Error opening 1: %v", err)
+	}
+
+	if _, _, err := eq1.Modify(ctx, entroq.InsertingInto("hello", entroq.WithValue([]byte("hello")))); err != nil {
+		t.Fatalf("Error inserting: %v", err)
+	}
+	eq1.Close()
+
+	// Now a new client claims and deletes.
+	eq2, err := entroq.New(ctx, opener)
+	if err != nil {
+		t.Fatalf("Error opening 2: %v", err)
+	}
+
+	task, err := eq2.Claim(ctx, entroq.From("hello"))
+	if err != nil {
+		t.Fatalf("Error claiming 2: %v", err)
+	}
+
+	if _, _, err := eq2.Modify(ctx, task.AsDeletion()); err != nil {
+		t.Fatalf("Error deleting 2: %v", err)
+	}
+	eq2.Close()
+
+	eq3, err := entroq.New(ctx, opener)
+	if err != nil {
+		t.Fatalf("Failed to open 3: %v", err)
+	}
+	eq3.Close()
+}

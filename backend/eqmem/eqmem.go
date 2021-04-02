@@ -93,6 +93,9 @@ func WithJournal(dir string) Option {
 // Default is wal.DefaultMaxBytes.
 func WithMaxJournalBytes(max int64) Option {
 	return func(m *EQMem) {
+		if max <= 0 {
+			return
+		}
 		m.maxJournalBytes = max
 	}
 }
@@ -101,6 +104,9 @@ func WithMaxJournalBytes(max int64) Option {
 // before rotation. Default is wal.DefaultMaxIndices.
 func WithMaxJournalItems(max int) Option {
 	return func(m *EQMem) {
+		if max <= 0 {
+			return
+		}
 		m.maxJournalItems = max
 	}
 }
@@ -169,7 +175,7 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 					chg.Version--
 				}
 
-				if _, _, err := m.Modify(ctx, mod); err != nil {
+				if _, _, err := m.modifyImpl(ctx, mod, true); err != nil {
 					return errors.Wrap(err, "eqmem play mod")
 				}
 				return nil
@@ -183,6 +189,10 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 		// Now it's loaded. If we are to output a snapshot, then we create it
 		// here and close the whole system down.
 		if m.outputSnapshot {
+			if !m.journal.SnapshotUseful() {
+				log.Printf("Snapshot requested, but not useful: empty, or frozen journals already collapsed")
+				return m, nil
+			}
 			if _, err := m.journal.CreateSnapshot(m.makeSnapshot); err != nil {
 				return nil, errors.Wrap(err, "output snapshot")
 			}
@@ -483,6 +493,10 @@ func (m *EQMem) queueUnsafeUpdateTask(ql *qLock, t *entroq.Task) func() {
 // particular set of modification information (deletions, changes, insertions,
 // dependencies).
 func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted, changed []*entroq.Task, err error) {
+	return m.modifyImpl(ctx, mod, false)
+}
+
+func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignoreClaimant bool) (inserted, changed []*entroq.Task, err error) {
 	// Modify does a different locking dance than Claim. Like Claim, it
 	// releases the global lock quickly and leaves a gap between that and the
 	// multi-queue locking that happens. Unlike Claim, it locks *all* of the
@@ -552,7 +566,13 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted,
 	}
 
 	if err := mod.DependencyError(found); err != nil {
-		return nil, nil, errors.Wrap(err, "eqmem modify")
+		depErr, ok := entroq.AsDependency(err)
+		// If we are doing special "ignore claimant" work (like reading from a
+		// journal), then only throw an error if we have something other than
+		// claim problems or something other than a dependency error.
+		if !ignoreClaimant || !ok || !depErr.OnlyClaims() {
+			return nil, nil, errors.Wrap(err, "eqmem modify")
+		}
 	}
 
 	// Now that we know we can proceed with our process, make all of the necessary changes.

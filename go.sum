@@ -1,7 +1,7 @@
 cloud.google.com/go v0.26.0/go.mod h1:aQUYkXzVsufM+DwF1aE+0xfcU+56JwCaLick0ClmMTw=
 cloud.google.com/go v0.34.0/go.mod h1:aQUYkXzVsufM+DwF1aE+0xfcU+56JwCaLick0ClmMTw=
-entrogo.com/stuffedio v0.7.5 h1:hLgAnwEGOMSmiNbnKHUEwvk7aheKNDD/7I+We1jZQkU=
-entrogo.com/stuffedio v0.7.5/go.mod h1:4VGFyE5G1yGgfz/7TsJncUBp4lS3cVEhODHhi/E9Xbo=
+entrogo.com/stuffedio v0.7.9 h1:pc7auHBXotLBABam6BuC+1yl9lN7cC83VVwwyo5sH4Q=
+entrogo.com/stuffedio v0.7.9/go.mod h1:4VGFyE5G1yGgfz/7TsJncUBp4lS3cVEhODHhi/E9Xbo=
 github.com/BurntSushi/toml v0.3.1 h1:WXkYYl6Yr3qBf1K79EBnL4mak0OimBfB0XUf9Vl28OQ=
 github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
 github.com/Knetic/govaluate v3.0.1-0.20171022003610-9aa49832a739+incompatible/go.mod h1:r7JcOSlj0wfOMncg0iLm8Leh48TZaKVeNIfJntJ2wa0=
