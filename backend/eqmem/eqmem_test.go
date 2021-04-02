@@ -386,9 +386,14 @@ func TestEQMem_journalClaimModClaim(t *testing.T) {
 func TestEQMem_journalInsClaimClaimDel(t *testing.T) {
 	// This pattern, when performed from the command line, caused claimant
 	// mismatch issues when reading from the journal.
-	// This test ensures that that command-line pattern doesn't cause journals
-	// to fail to load: the loader is special and has extra privileges, so
-	// claimant mismatches should be ignored.
+	// Basically, you insert, then claim, then shut down.
+	// Then claim *again* for deletion, after At expiration (mimicking an eqc
+	// clear without forcing). The final journal read will fail without the fix.
+	//
+	// The fix was to ensure that journal reads ignore "claim errors", meaning they
+	// only fail if there is a true dependency error, and they don't have to wait
+	// for tasks to expire to perform modifications even though the journal
+	// process has its very own ID.
 	journalDir, err := os.MkdirTemp("", "eqjournal-")
 	if err != nil {
 		t.Fatalf("Error opening temp journal dir: %v", err)
