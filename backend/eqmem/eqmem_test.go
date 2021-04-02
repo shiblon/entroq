@@ -383,7 +383,7 @@ func TestEQMem_journalClaimModClaim(t *testing.T) {
 	defer eq.Close()
 }
 
-func TestEQMem_journalInsClaimDel(t *testing.T) {
+func TestEQMem_journalInsClaimClaimDel(t *testing.T) {
 	// This pattern, when performed from the command line, caused claimant
 	// mismatch issues when reading from the journal.
 	// This test ensures that that command-line pattern doesn't cause journals
@@ -405,6 +405,12 @@ func TestEQMem_journalInsClaimDel(t *testing.T) {
 	if _, _, err := eq1.Modify(ctx, entroq.InsertingInto("hello", entroq.WithValue([]byte("hello")))); err != nil {
 		t.Fatalf("Error inserting: %v", err)
 	}
+
+	if _, err := eq1.Claim(ctx, entroq.From("hello"), entroq.ClaimFor(0)); err != nil {
+		t.Fatalf("Error claiming: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+
 	eq1.Close()
 
 	// Now a new client claims and deletes.
