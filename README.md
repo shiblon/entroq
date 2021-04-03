@@ -2,6 +2,10 @@
 
 A task queue with strong competing-consumer semantics and transactional updates.
 
+See here for an article explaining how this might fit into your system:
+
+https://www.datamachines.io/blog/asynchronous-thinking-for-microservice-system-design
+
 Pronounced "Entro-Q" ("Entro-Queue"), as in the letter than comes after
 "Entro-P". We aim to take the next step away from parallel systems chaos. It is
 also the descendent of `github.com/shiblon/taskstore`, an earlier and less
@@ -18,19 +22,23 @@ A Docker container is available on Docker Hub as `shiblon/entroq`. You can use
 this to start an EntroQ service, then talk to it using the provided Go or
 Python libraries. It exposes port `37706` by default.
 
-If you merely want a single-process in-memory work queue for Go, you can just
-use the in-memory implementation of the library without any server at all. For
-other languages, you should use the service and the gRPC-based
-language-specific library to talk to it.
+The default service that runs uses an in-memory work queue, coupled with an
+optional write-ahead log for persistence and fault tolerance. There is also a
+PostgreSQL-backed version that can be chosen.
+
+If you merely want an in-process work queue for Go, you can just use the
+in-memory implementation of the library without any server at all. For other
+languages, you should use the service and the gRPC-based language-specific
+library to talk to it.
 
 There is also a command-line client that you can use to talk to the EntroQ
 service:
 
-    go install entrogo.com/entroq/cmd/eqc
+    go install entrogo.com/entroq/cmd/eqc@latest
     eqc --help
 
 You can then run `eqc` to talk to an EntroQ service (such as one started in the
-`shiblon/entroq` container).
+`shiblon/entroq` container from Docker Hub).
 
 There is also a Python-based command line, installable via pip:
 
@@ -41,13 +49,14 @@ There is also a Python-based command line, installable via pip:
 
 EntroQ supports precisely two atomic mutating operations:
 
-- Claim an available task from one or more queues, or
-- Update a set of tasks (delete, change, insert), optionally depending on other task versions.
+- Claim an available task from one of possibly several queues, or
+- Update a set of tasks (delete, change, insert), optionally depending on the passive existence of other task versions.
 
 There are a few read-only accessors, as well, such as a way to list tasks
 within a queue, a way to list queues with their sizes, etc. These read-only
 operations do not have any transactional properties, and are best-effort
-snapshots of queue state.
+snapshots of queue state. Every effort has been made to ensure that these
+read-only operations do not cause starvation of fundamental operations.
 
 Both `Claim` and `Modify` change the version number of every task they affect.
 Any time any task is mutated, its version increments. Thus, if one process
@@ -82,8 +91,8 @@ EntroQ can hold multiple "queues", though these do not exist as first-class
 concepts in the system. A queue only exists so long as there are tasks that
 want to be in it. If no tasks are in a particular queue, that queue does not
 exist. In database terms, you can think of the queue as being a property of the
-task, not the other way around. Indeed, in the Postgres backend, it is simply a
-column in a `tasks` table.
+task, not the other way around. Indeed, in the PostgreSQL backend, it is simply
+a column in a `tasks` table.
 
 Because task IDs are durable, and only the version increments during mutation,
 it is possible to track a single task through multiple modifications. Any
@@ -104,7 +113,13 @@ immediately), if that is desired.
 
 When more than one queue is specified in a `Claim` operation, only one task
 will be returned from one of those queues. This allows a worker to be a fan-in
-consumer, fairly pulling tasks from multiple queues.
+consumer, fairly pulling tasks from multiple queues. If a "fast lane" is
+desired for a particular worker, this can be achieved by simply having more
+than one queue that it claims from. Tasks will be pulled fairly from multiple
+queues, and thus the shortest will be consumed earlier than any longer ones.
+This is how things tend to work in amusement parks, for example. More complex
+priority schemes have been considered, but tend to be fraught with peril and
+unintended consequences.
 
 When successfully claiming a task, the following happen atomically:
 
@@ -132,13 +147,21 @@ transaction. There are four kinds of modifications that can be made:
 - Insert: add one or more tasks to desired queues.
 - Delete: delete one or more tasks.
 - Change: change the value, queue, or arrival time of a given task.
-- Depend: require presence of one or more tasks and versions.
+- Depend: require passive presence of one or more tasks and versions.
 
 If any of the dependencies are not present (tasks to be deleted, changed, or
 depended upon, or tasks to be inserted when a colliding ID is specified), then
 the entire operation fails with an error indicating exactly which tasks were
 not present in the requested version or had colliding identifiers in the case
 of insertion.
+
+Because work is not lost until explicitly acknowledged (deleted), it is usually
+safe to simply abandon work when receiving a deependency error, and grab
+another task to work on. EntroQ has been designed to avoid starving any queue
+with tasks that might have inherent data that causes crashes or bugs in
+workers. These tasks will stick around and be retried periodically, but
+meanwhile others will go ahead of them because ready tasks are selected at
+random from each queue.
 
 ### Workers
 
@@ -148,7 +171,9 @@ more queues. These can be run in goroutines (or threads, or your language's
 equivalent). Creating a worker using the standard library allows you to focus
 on writing only the logic that happens once a task has been acquired. In the
 background the claimed task is renewed for as long as the worker code is
-running.
+running. Good worker code is available in Go, and less-good-but-reasonable code
+for workers is provided in `contrib/py`. The principles are straightforward to
+implement in any language that can speak gRPC.
 
 The code that a worker runs is responsible for doing something with the claimed
 task, then returning the intended modifications that should happen when it is
@@ -160,6 +185,20 @@ This is a very common way of using EntroQ: stand up an EntroQ service, then
 start up one or more workers responsible for handling the flow of tasks through
 your system. Initial injection of tasks can easily be done with the provided
 libraries or command-line clients.
+
+Rather than design a pipeline, it makes sense to have workers that are
+responsible for doing small tasks, and one or more worker types that are
+responsible for implementing a pipeline state machine. In its simplest form,
+you can create a "trampoline" worker that handles responses to a single global
+queue and pushes them into individual task queues depending on contents and
+disposition.
+
+Pipelines are very brittle ideas and should generally be avoided. In a pipeline
+that grows over time, the complexity of each component increases exponentially
+with the number of possible input and output types. A trampoline, on the other
+hand, allows every worker to be "single-purpose", encoding state transitions in
+one place instead of spreading them across the entirety of a microservice
+architecture.
 
 ### Commit Once, Maybe Work Twice
 
@@ -212,8 +251,8 @@ manual intervention, should these ever be used. As a general rule,
     Only work on claimed tasks, and never override the claimant or version.
 
 If you need to force something, you probably want to use the command-line
-client, not a worker, and then you should be sure of the potential consequences
-to your system.
+client so that a human with human judgement is involved, not in a worker. Then
+you should be sure of the potential consequences to your system.
 
 To further ensure safety when using a competing-consumer work queue like
 EntroQ, it is important to adhere to a few simple principles:
@@ -267,10 +306,10 @@ In Go, there are three primary backend implementations:
 
 ### In-Memory Backend
 
-The `mem` backend allows your `EntroQ` instance to work completely in-process.
-You can use exactly the same library calls to talk to it as you would if it
-were somewhere on the network, making it easy to start in memory and progress
-to persistent and/or networked implementations later as needed.
+The `eqmem` backend allows your `EntroQ` instance to work completely
+in-process. You can use exactly the same library calls to talk to it as you
+would if it were somewhere on the network, making it easy to start in memory
+and progress to database or networked implementations later as needed.
 
 The following is a short example of how to create an in-memory work queue:
 
@@ -292,10 +331,20 @@ func main() {
 }
 ```
 
+The memory backend contains a write-ahead log implementation for persistence.
+See the code documentation for how to set parameters to specify the journal
+directory and when journals should be rotated.
+
+The [EntroQ Docker Hub Image](https://hub.docker.com/r/shiblon/entroq) defaults
+to using an in-memory implementation backed by a journal with periodic
+snapshots. See the volume mounts in the relevant `Dockerfile` to know how to
+mount your own data directories into a running container. The default container
+starts a gRPC service using this journal-backed in-memory implementation.
+
 ### gRPC Backend
 
 The `grpc` backend is somewhat special. It converts an `entroq.EntroQ` client
-into a gRPC *client* that can talk to the proviced `qsvc` implementation,
+into a gRPC *client* that can talk to the provided `qsvc` implementation,
 described below.
 
 This allows you to stand up a gRPC endpoint in front of your "real" persistent
@@ -305,7 +354,9 @@ standard gRPC service interface.
 
 All clients would then use the `grpc` backend to connect to this service, again
 with gRPC authentication and all else that it provides. This is the preferred
-way to use the EntroQ client library.
+way to use the EntroQ client library. In fact, the `eqc` command-line client is
+really just a gRPC client that can be used to speak to the default Docker
+container mentioned earlier.
 
 As a basic example of how to set up a gRPC-based EntroQ client:
 
@@ -333,7 +384,8 @@ parameters, including mTLS parameters and other familiar gRPC controls.
 ### PostgreSQL Backend
 
 The `pg` backend uses a PostgreSQL database. This is a performant, persistent
-backend option.
+backend option that is suitable for heavy loads (though if your load on this
+system is truly heavy, you might have gotten your task granularity wrong).
 
 ```go
 package main
@@ -372,7 +424,8 @@ it, or run the database and EntroQ service separately.
 
 Note that no matter how you run things, there is no need to create any tables
 in your database. The EntroQ service checks for the existence of a `tasks`
-table and creates it if it is not present.
+table and creates it if it is not present. It is also carefully set up to
+update older tables when newer versions are deployed.
 
 If running the service and database in the same container, you can choose one
 of the images at Docker Hub with the tag prefix `pg-`. For example, you might
@@ -391,8 +444,9 @@ persistence across container restarts. The EntroQ service is exposed on port
 37706.
 
 The `eqc` command-line utility is included in the `entroq` container, so you
-can play around with it using `docker exec`. If the container's name is stored
-in `$container`:
+can play around with it using `docker exec`.
+
+If the container's name is stored in `$container`, then you can run
 
 ```
 docker exec $container eqc --help
@@ -421,7 +475,7 @@ services:
       - /tmp/postgres/data:/var/lib/postgresql/data
 
   queue:
-    image: "shiblon/entroq:v0.3"
+    image: "shiblon/entroq:v0.5"
     depends_on:
       - database
     deploy:
@@ -455,14 +509,16 @@ backend connections based on flag settings.
 
 There is no *service* backend for `grpc`, though one could conceivably make
 sense as a sort of proxy. But in that case you should really just use a
-standard gRPC proxy.
+standard gRPC proxy. There are very good reasons to not build your own gRPC
+proxy, no matter how convenient it might seem given the architecture.
 
 When using one of these services, this is your main server and should be
 treated as a singleton. Clients should use the `grpc` backend to connect to it.
 
 Does making the server a singleton affect performance? Yes, of course, you can't
 scale a singleton, but in practice if you are hitting a work queue that hard you
-likely have a granularity problem in your design.
+likely have a granularity problem in your design. Additionally, a single
+process like this can easily handle thousands of workers.
 
 ## Python Implementation
 
@@ -484,10 +540,10 @@ Use of these can be seen in the command-line client, implemented in
 ## Examples
 
 One of the most complete Go examples that is also used as a stress test is a
-naive implementation of MapReduce, in `contrib/mr`. If you look in there, you
-will see numerous idiomatic uses of the competing queue concept, complete with
-workers, using queue empty tests a part of system semantics, queues assigned to
-specific processes, and others.
+**very naive** implementation of MapReduce, in `contrib/mr`. If you look in
+there, you will see numerous idiomatic uses of the competing queue concept,
+complete with workers, using queue empty tests a part of system semantics,
+queues assigned to specific processes, and others.
 
 ## Authorization
 
@@ -497,8 +553,9 @@ backend), then authorization is, in fact, not possible: you just have access to
 everything.
 
 If you do want to include authorization, however, there's good news: the gRPC
-service *does* allow authorization, and there is an OPA-based implementation of
-it ready to go and available for both in-memory and postgres backends.
+service *does* allow authorization, and there is an
+[OPA](https://openpolicyagent.org)-based implementation of it ready to go and
+available for both in-memory and postgres backends.
 
 To use the OPA-HTTP strategy (where gRPC service request authorization is sent
 to the Open Policy Agent to get authorization approval or failure messages),
