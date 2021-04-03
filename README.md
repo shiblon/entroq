@@ -6,6 +6,9 @@ See here for an article explaining how this might fit into your system:
 
 https://www.datamachines.io/blog/asynchronous-thinking-for-microservice-system-design
 
+The Go components of this package can be found in online documenation for the
+[entrogo.com/entroq](https://pkg.go.dev/entrogo.com/entroq) Go package.
+
 Pronounced "Entro-Q" ("Entro-Queue"), as in the letter than comes after
 "Entro-P". We aim to take the next step away from parallel systems chaos. It is
 also the descendent of `github.com/shiblon/taskstore`, an earlier and less
