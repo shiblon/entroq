@@ -10,6 +10,8 @@ import (
 	"github.com/pkg/errors"
 )
 
+// DefaultRetryDelay is the amount by which to advance the arrival time when a
+// worker task errors out as retryable.
 const DefaultRetryDelay = 30 * time.Second
 
 // ErrQMap is a function that maps from an inbox name to its "move on error"
@@ -156,6 +158,7 @@ func (c *EntroQ) NewWorker(qs ...string) *Worker {
 	return NewWorker(c, qs...)
 }
 
+// WithOpts sets options on a newly-created worker.
 func (w *Worker) WithOpts(opts ...WorkerOption) *Worker {
 	for _, opt := range opts {
 		opt(w)
@@ -211,14 +214,6 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 	if len(w.Qs) == 0 {
 		return errors.New("No queues specified to work on")
 	}
-	defer func() {
-		if err == nil {
-			log.Printf("Graceful completion of worker %q for claimant %v", w.Qs, w.eqc.ID())
-		} else {
-			log.Printf("Worker quit for claimant %v: %v", w.eqc.ID(), err)
-		}
-	}()
-	log.Printf("Starting EntroQ worker %q on client %v, leasing for %v at a time", w.Qs, w.eqc.ID(), w.lease)
 
 	for {
 		select {
