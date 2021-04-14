@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
 	"path"
 	"strings"
@@ -83,8 +82,6 @@ func StartService(ctx context.Context, opener entroq.BackendOpener) (*grpc.Serve
 
 // SimpleChange tests that changing things in the task leave most of it intact, and can handle things like queue moves.
 func SimpleChange(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	t.Helper()
-
 	inQueue := path.Join(qPrefix, "simple_change", "in")
 	outQueue := path.Join(qPrefix, "simple_change", "out")
 
@@ -109,8 +106,6 @@ func SimpleChange(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 // SimpleWorker tests basic worker functionality while tasks are coming in and
 // being waited on.
 func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	t.Helper()
-
 	queue := path.Join(qPrefix, "simple_worker")
 
 	var consumed []*entroq.Task
@@ -164,7 +159,6 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 	}
 
 	cancel()
-	log.Printf("Is canceled: %v", entroq.IsCanceled(g.Wait()))
 	if err := g.Wait(); err != nil && !entroq.IsCanceled(err) {
 		t.Fatalf("Worker exit error: %v", err)
 	}
@@ -175,8 +169,6 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 }
 
 func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	t.Helper()
-
 	bigQueue := path.Join(qPrefix, "multi_worker_big")
 	medQueue := path.Join(qPrefix, "multi_worker_medium")
 	smallQueue := path.Join(qPrefix, "multi_worker_small")
@@ -314,8 +306,6 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 // handlers get called on dependency errors, and that upgrades to fatal errors
 // happen appropriately.
 func WorkerDependencyHandler(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	t.Helper()
-
 	queue := path.Join(qPrefix, "dep-handler-queue")
 
 	timesHandled := make(chan int, 1)
@@ -356,7 +346,7 @@ func WorkerDependencyHandler(ctx context.Context, t *testing.T, client *entroq.E
 
 	err := w.Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
 		// Return a modification that will fail because it depends on a non-existent task ID.
-		return []entroq.ModifyArg{task.AsDeletion(), entroq.DependingOn(uuid.New(), 0)}, nil
+		return []entroq.ModifyArg{task.AsDeletion(), entroq.DependingOn(uuid.New(), 0, entroq.WithIDQueue("no queue"))}, nil
 	})
 
 	if errors.Cause(err) != upgradeError {
@@ -372,8 +362,6 @@ func WorkerDependencyHandler(ctx context.Context, t *testing.T, client *entroq.E
 // increment attempts and set the error properly. It also checks that after max
 // attempts, things get moved.
 func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	t.Helper()
-
 	newTask := func(val string) *entroq.Task {
 		return &entroq.Task{
 			Queue: path.Join(qPrefix, "retry_on_error", val),
@@ -475,7 +463,6 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 				t.Fatalf("Test %q took too long getting the retried task from something that had multiple attempts", c.name)
 			}
 		}
-		log.Printf("Test %q: changed task: %v", c.name, changedTask)
 		if want, got := c.wantErr, changedTask.Err; want != got {
 			t.Fatalf("Test %q expected err %q, got %q", c.name, want, got)
 		}
@@ -499,8 +486,6 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 // move the task into an error queue with the expected wrapper and don't just
 // crash.
 func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	t.Helper()
-
 	baseQueue := path.Join(qPrefix, "move_on_error")
 
 	type tc struct {
@@ -547,9 +532,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 	runWorkerOneCase := func(ctx context.Context, c tc) {
 		t.Helper()
 
-		log.Printf("Testing MoveTaskError %q", c.name)
-
-		const leaseTime = 5 * time.Second
+		const leaseTime = 15 * time.Second
 
 		w := client.NewWorker(c.input.Queue).WithOpts(
 			entroq.WithWrappedMove(c.wrapped),
@@ -591,14 +574,16 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 			if err := g.Wait(); err != nil && entroq.IsTimeout(err) {
 				t.Fatalf("Test %q expected to die, but not with a timeout error: %v", c.name, err)
 			}
-			// Delete the dead task, will always ve version 1.
-			if _, _, err := client.Modify(ctx, entroq.Deleting(c.input.ID, 1)); err != nil {
+			// Delete the dead task, will always be version 1.
+			// Note: don't overwrite like this in real use.
+			c.input.Version = 1
+			if _, _, err := client.Modify(ctx, c.input.AsDeletion()); err != nil {
 				t.Fatalf("Test %q tried to clean up dead task: %v", c.name, err)
 			}
 			return
 		}
 
-		waitCtx, _ := context.WithTimeout(ctx, 2*leaseTime)
+		waitCtx, _ := context.WithTimeout(ctx, 3*leaseTime)
 		if err := client.WaitQueuesEmpty(waitCtx, entroq.MatchExact(c.input.Queue)); err != nil && !entroq.IsCanceled(err) {
 			t.Fatalf("Test %q: no moved tasks found, task was not expected to die: %v", c.name, err)
 		}
@@ -655,8 +640,6 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 
 // WorkerRenewal tests that task claims are renewed periodically for longer-running work tasks.
 func WorkerRenewal(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	t.Helper()
-
 	queue := path.Join(qPrefix, "worker_renewal")
 
 	_, _, err := client.Modify(ctx, entroq.InsertingInto(queue))
@@ -692,7 +675,6 @@ func WorkerRenewal(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPr
 
 // TasksOmitValue exercises the task query where values are not desired.
 func TasksOmitValue(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	t.Helper()
 	queue := path.Join(qPrefix, "tasks_omit_value")
 
 	inserted, _, err := client.Modify(ctx,
@@ -723,7 +705,6 @@ func TasksOmitValue(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 
 // TasksWithID exercises the task query mechanism that allows specific task IDs to be looked up.
 func TasksWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	t.Helper()
 	queue := path.Join(qPrefix, "tasks_with_id")
 
 	ids := []uuid.UUID{
@@ -760,9 +741,13 @@ func TasksWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	if want, got := len(ids), len(tasks); want != got {
 		t.Fatalf("Expected %d tasks in 'all' query, got %d", want, got)
 	}
-	for i, task := range tasks {
-		if want, got := ids[i], task.ID; want != got {
-			t.Fatalf("Wanted queried task %d to have ID %q, got %q", i, want, got)
+	want := make(map[uuid.UUID]bool)
+	for _, id := range ids {
+		want[id] = true
+	}
+	for _, task := range tasks {
+		if !want[task.ID] {
+			t.Fatalf("Wanted queried task %d to have ID present in task listing, but not found", task.ID)
 		}
 	}
 
@@ -784,7 +769,6 @@ func TasksWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 
 // TasksWithIDOnly tests that tasks listed by ID only (no queue) can return from multiple queues.
 func TasksWithIDOnly(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	t.Helper()
 	q1 := path.Join(qPrefix, "id_only_1")
 	q2 := path.Join(qPrefix, "id_only_2")
 
@@ -845,7 +829,6 @@ func TasksWithIDOnly(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 // InsertWithID tests the ability to insert tasks with a specified ID,
 // including errors when an existing ID is used for insertion.
 func InsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	t.Helper()
 	queue := path.Join(qPrefix, "insert_with_id")
 
 	knownID := uuid.New()
@@ -931,8 +914,6 @@ func InsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 
 // SimpleSequence tests some basic functionality of a task manager, over gRPC.
 func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	t.Helper()
-
 	now := time.Now()
 
 	queue := path.Join(qPrefix, "simple_sequence")
@@ -1053,8 +1034,6 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 
 // QueueMatch tests various queue matching functions against a client.
 func QueueMatch(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	t.Helper()
-
 	queue1 := path.Join(qPrefix, "queue-1")
 	queue2 := path.Join(qPrefix, "queue-2")
 	queue3 := path.Join(qPrefix, "queue-3")
@@ -1154,8 +1133,6 @@ func QueueMatch(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefi
 
 // QueueStats checks that queue stats basically work.
 func QueueStats(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	t.Helper()
-
 	nothingClaimedQueue := path.Join(qPrefix, "queue-1")
 	partiallyClaimedQueue := path.Join(qPrefix, "queue-2")
 
@@ -1210,10 +1187,23 @@ func EqualAllTasks(want, got []*entroq.Task) string {
 		return ""
 	}
 	var diffs []string
-	for i, w := range want {
-		g := got[i]
-		if (w == nil) != (g == nil) || w.Queue != g.Queue || w.Claimant != g.Claimant || !bytes.Equal(w.Value, g.Value) {
-			diffs = append(diffs, cmp.Diff(w, g))
+
+	matched := func(w, g *entroq.Task) bool {
+		return (w == nil) == (g == nil) && w.Queue == g.Queue && w.Claimant == g.Claimant && bytes.Equal(w.Value, g.Value)
+	}
+
+	for _, w := range want {
+		found := false
+		var potentialDiffs []string
+		for _, g := range got {
+			if matched(w, g) {
+				found = true
+				break
+			}
+			potentialDiffs = append(potentialDiffs, cmp.Diff(w, g))
+		}
+		if !found {
+			diffs = append(diffs, fmt.Sprintf("Task %v not found, differs from all of these:\n%v", strings.Join(potentialDiffs, "\n")))
 		}
 	}
 	if len(diffs) != 0 {
@@ -1238,9 +1228,11 @@ func EqualAllTasksVersionIncr(want, got []*entroq.Task, versionBump int) string 
 	if diff := EqualAllTasks(want, got); diff != "" {
 		return diff
 	}
+	wantByID := make(map[uuid.UUID]*entroq.Task)
+	gotByID := make(map[uuid.UUID]*entroq.Task)
 	var diffs []string
-	for i, w := range want {
-		g := got[i]
+	for id, w := range wantByID {
+		g := gotByID[id]
 		if w.Version+int32(versionBump) != g.Version {
 			diffs = append(diffs, cmp.Diff(g, w))
 		}

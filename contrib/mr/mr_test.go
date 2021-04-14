@@ -12,15 +12,15 @@ import (
 	"testing/quick"
 
 	"entrogo.com/entroq"
+	"entrogo.com/entroq/backend/eqmem"
 	. "entrogo.com/entroq/contrib/mr"
 	"entrogo.com/entroq/contrib/mrtest"
-	"entrogo.com/entroq/mem"
 )
 
 func TestMapReduce_inMemorySmall(t *testing.T) {
 	ctx := context.Background()
 
-	eq, err := entroq.New(ctx, mem.Opener())
+	eq, err := entroq.New(ctx, eqmem.Opener())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestMapReduce_check(t *testing.T) {
 
 	ctx := context.Background()
 	check := func(ndocs, nm, nr int) bool {
-		client, err := entroq.New(ctx, mem.Opener())
+		client, err := entroq.New(ctx, eqmem.Opener())
 		if err != nil {
 			t.Fatalf("Open mem client: %v", err)
 		}

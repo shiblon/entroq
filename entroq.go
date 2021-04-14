@@ -74,7 +74,7 @@ func WithIDQueue(q string) IDOption {
 
 // String produces the id:version string representation.
 func (t TaskID) String() string {
-	return fmt.Sprintf("%s:v%d (in %s)", t.ID, t.Version, t.Queue)
+	return fmt.Sprintf("%s:v%d (in %q)", t.ID, t.Version, t.Queue)
 }
 
 // AsDeletion produces an appropriate ModifyArg to delete the task with this ID.
@@ -115,6 +115,12 @@ type TaskData struct {
 	// and the insertion can be removed if that happens, and then the
 	// modification can be retried.
 	skipCollidingID bool
+
+	// These timings are here so that journaling can restore full state.
+	// Usually they are blank, and there are no convenience methods to allow
+	// them to be set. Leave them at default values in all cases.
+	Created  time.Time `json:"created"`
+	Modified time.Time `json:"modified"`
 }
 
 // String returns a string representation of the task data, excluding the value.
@@ -157,12 +163,14 @@ type Task struct {
 
 // String returns a useful representation of this task.
 func (t *Task) String() string {
-	return fmt.Sprintf("Task [%q %s v%d]\n\t", t.Queue, t.ID, t.Version) + strings.Join([]string{
-		fmt.Sprintf("at=%q claimant=%s claims=%d", t.At, t.Claimant, t.Claims),
-		fmt.Sprintf("attempt=%d err=%q", t.Attempt, t.Err),
-		fmt.Sprintf("c=%q m=%q", t.Created, t.Modified),
+	qInfo := fmt.Sprintf("%q", t.Queue)
+	if t.FromQueue != "" && t.FromQueue != t.Queue {
+		qInfo = fmt.Sprintf("%q <- %q", t.Queue, t.FromQueue)
+	}
+	return fmt.Sprintf("Task [%s %s:v%d]\n\t", qInfo, t.ID, t.Version) + strings.Join([]string{
+		fmt.Sprintf("at=%q claimant=%s claims=%d attempt=%d err=%q", t.At, t.Claimant, t.Claims, t.Attempt, t.Err),
 		fmt.Sprintf("val=%q", string(t.Value)),
-	}, "\n\t") + "\n"
+	}, "\n\t")
 }
 
 // AsDeletion returns a ModifyArg that can be used in the Modify function, e.g.,
@@ -207,12 +215,14 @@ func (t *Task) IDVersion() *TaskID {
 // Data returns the data for this task.
 func (t *Task) Data() *TaskData {
 	return &TaskData{
-		Queue:   t.Queue,
-		At:      t.At,
-		Value:   t.Value,
-		ID:      t.ID,
-		Attempt: t.Attempt,
-		Err:     t.Err,
+		Queue:    t.Queue,
+		At:       t.At,
+		Value:    t.Value,
+		ID:       t.ID,
+		Attempt:  t.Attempt,
+		Err:      t.Err,
+		Created:  t.Created,
+		Modified: t.Modified,
 	}
 }
 
@@ -231,6 +241,14 @@ func (t *Task) CopyOmitValue() *Task {
 	*newT = *t
 	newT.Value = nil
 	return newT
+}
+
+// CopyWithValue lets you specify whether the value should be copied.
+func (t *Task) CopyWithValue(ok bool) *Task {
+	if ok {
+		return t.Copy()
+	}
+	return t.CopyOmitValue()
 }
 
 // ClaimQuery contains information necessary to attempt to make a claim on a task in a specific queue.
@@ -786,7 +804,6 @@ func (c *EntroQ) RenewAllFor(ctx context.Context, tasks []*Task, duration time.D
 		modArgs = append(modArgs, Changing(t, ArrivalTimeBy(duration)))
 		taskIDs = append(taskIDs, t.IDVersion().String())
 	}
-	log.Printf("Renewing tasks %v", taskIDs)
 	_, changed, err := c.Modify(ctx, modArgs...)
 	if err != nil {
 		return nil, errors.Wrapf(err, "renewal failed for tasks %q", taskIDs)
@@ -911,7 +928,6 @@ func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (inserted []*
 		log.Printf("Trying modification again due to skippable colliding inserts. %v -> %v", mod.Inserts, newInserts)
 		mod.Inserts = newInserts
 	}
-	return c.backend.Modify(ctx, NewModification(c.clientID, modArgs...))
 }
 
 // ModifyArg is an argument to the Modify function, which does batch modifications to the task store.
@@ -1094,12 +1110,10 @@ func DependingOn(id uuid.UUID, version int32, opts ...IDOption) ModifyArg {
 func Changing(task *Task, changeArgs ...ChangeArg) ModifyArg {
 	return func(m *Modification) {
 		newTask := *task
-		// Set the FromQueue in *every* case.
-		// An empty FromQueue is different than one that has the same name as
-		// the new queue. This is used for authorization. Empty queues can be
-		// given very strict privileges (e.g., for admins to change a task no
-		// matter where it is).
+		// From queue is always the current queue.
 		newTask.FromQueue = task.Queue
+		// Reset when changing, at least by default. Callers may override.
+		newTask.At = m.now
 		for _, a := range changeArgs {
 			a(m, &newTask)
 		}
@@ -1188,12 +1202,30 @@ func WithModification(src *Modification) ModifyArg {
 type Modification struct {
 	now time.Time
 
-	Claimant uuid.UUID
+	Claimant uuid.UUID `json:"claimant"`
 
-	Inserts []*TaskData
-	Changes []*Task
-	Deletes []*TaskID
-	Depends []*TaskID
+	Inserts []*TaskData `json:"inserts"`
+	Changes []*Task     `json:"changes"`
+	Deletes []*TaskID   `json:"deletes"`
+	Depends []*TaskID   `json:"depends"`
+}
+
+// String produces a friendly version of this modification.
+func (m *Modification) String() string {
+	var out []string
+	if len(m.Inserts) != 0 {
+		out = append(out, fmt.Sprintf("ins: %v", m.Inserts))
+	}
+	if len(m.Changes) != 0 {
+		out = append(out, fmt.Sprintf("chg: %v", m.Changes))
+	}
+	if len(m.Deletes) != 0 {
+		out = append(out, fmt.Sprintf("del: %v", m.Deletes))
+	}
+	if len(m.Depends) != 0 {
+		out = append(out, fmt.Sprintf("dep: %v", m.Depends))
+	}
+	return "mod:\n\t" + strings.Join(out, "\n\t")
 }
 
 // NewModification creates a new modification: insertions, deletions, changes,
@@ -1263,8 +1295,7 @@ func (m *Modification) AllDependencies() (map[uuid.UUID]int32, error) {
 }
 
 func (m *Modification) otherwiseClaimed(task *Task) bool {
-	var zeroUUID uuid.UUID
-	return task.At.After(m.now) && task.Claimant != zeroUUID && task.Claimant != m.Claimant
+	return task.At.After(m.now) && task.Claimant != uuid.Nil && task.Claimant != m.Claimant
 }
 
 func (m *Modification) badInserts(foundDeps map[uuid.UUID]*Task) []*TaskID {
@@ -1393,6 +1424,13 @@ func (m DependencyError) HasClaims() bool {
 // HasCollisions indicates whether any of the inserted tasks collided with existing IDs.
 func (m DependencyError) HasCollisions() bool {
 	return len(m.Inserts) > 0
+}
+
+// OnlyClaims indicates that the error was only related to claimants. Useful
+// for backends to do "force" operations, making it easy to ignore this
+// particular error.
+func (m DependencyError) OnlyClaims() bool {
+	return !m.HasMissing() && !m.HasCollisions()
 }
 
 // Error produces a helpful error string indicating what was missing.

@@ -30,6 +30,10 @@ WORKDIR /go/bin
 RUN adduser -S -D -H -h /go/src/entrogo.com/entroq -u 100 appuser
 USER appuser
 
+# Memory journal location, if needed.
+RUN mkdir -p /data/entroq
+VOLUME /data/entroq
+
 # gRPC endpoint
 EXPOSE 37706
 
@@ -42,4 +46,4 @@ ENTRYPOINT ["./eqsvc.sh"]
 # Other options include "pg" with its associated flags.
 # If flags are left off, or the command is left off, the default in-memory
 # service is started.
-CMD ["mem"]
+CMD ["mem", "--journal", "/data/entroq/journal", "--mkdir", "--periodic_snapshot", "1h", "--journal_cleanup"]

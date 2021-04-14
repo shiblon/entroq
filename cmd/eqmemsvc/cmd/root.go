@@ -9,8 +9,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
-	"entrogo.com/entroq/mem"
+	"entrogo.com/entroq/backend/eqmem"
 	"entrogo.com/entroq/pkg/authz/opahttp"
 	"entrogo.com/entroq/qsvc"
 	homedir "github.com/mitchellh/go-homedir"
@@ -25,14 +26,25 @@ import (
 	hpb "google.golang.org/grpc/health/grpc_health_v1"
 )
 
+const minSnapshotPeriod = time.Minute
+
 // Flags.
 var flags struct {
-	cfgFile       string
+	cfgFile string
+
 	port          int
 	httpPort      int
 	authzStrategy string
 	opaURL        string
 	opaPath       string
+
+	journal          string
+	createJournalDir bool
+	snapshotAndQuit  bool
+	periodicSnapshot string
+	journalMaxItems  int
+	journalMaxBytes  int
+	cleanup          bool
 
 	maxSize int
 }
@@ -53,6 +65,59 @@ var rootCmd = &cobra.Command{
 			return errors.Wrapf(err, "error listening on port %d", flags.port)
 		}
 
+		if flags.journal == "" {
+			if flags.snapshotAndQuit || flags.cleanup || flags.periodicSnapshot != "" || flags.createJournalDir {
+				return errors.Wrap(err, "bad flag: journal settings given, but no journal directory specified")
+			}
+		}
+
+		if flags.cleanup && !flags.snapshotAndQuit && flags.periodicSnapshot == "" {
+			return errors.Wrap(err, "bad flag setting: cleanup can only be specified with snapshot functions")
+		}
+
+		if flags.periodicSnapshot != "" && flags.snapshotAndQuit {
+			return errors.Wrap(err, "bad flag setting: periodic_snapshot can't be honored with snapshot_and_quit")
+		}
+
+		if flags.createJournalDir {
+			os.MkdirAll(flags.journal, 0755)
+		}
+
+		if flags.snapshotAndQuit {
+			if err := eqmem.TakeSnapshot(ctx, flags.journal, flags.cleanup); err != nil {
+				return errors.Wrapf(err, "take snapshot in %q", flags.journal)
+			}
+			return nil
+		}
+
+		if psf := flags.periodicSnapshot; psf != "" {
+			period, err := time.ParseDuration(psf)
+			if err != nil {
+				return errors.Wrapf(err, "periodic snapshot %q doesn't parse to a duration (use one of 'm', 'h', 'd' units)", psf)
+			}
+			if period < minSnapshotPeriod {
+				log.Printf("Snapshot period %v smaller than %v: clamping", period, minSnapshotPeriod)
+				period = minSnapshotPeriod
+			}
+
+			// Start a goroutine that runs a snapshot periodically.
+			go func() {
+				for {
+					select {
+					case <-ctx.Done():
+						log.Printf("periodic snapshot halted: %v", ctx.Err())
+						return
+					case <-time.After(period):
+						if err := eqmem.TakeSnapshot(ctx, flags.journal, flags.cleanup); err != nil {
+							log.Printf("Error taking periodic snapshot in %q: %v", flags.journal, err)
+						}
+					}
+				}
+			}()
+		}
+
+		// Not taking a snapshot - start up a system.
+
 		var authzOpt qsvc.Option
 		switch flags.authzStrategy {
 		case "opahttp":
@@ -66,9 +131,13 @@ var rootCmd = &cobra.Command{
 			return fmt.Errorf("Unknown Authz strategy: %q", flags.authzStrategy)
 		}
 
-		svc, err := qsvc.New(ctx, mem.Opener(), authzOpt)
+		svc, err := qsvc.New(ctx, eqmem.Opener(
+			eqmem.WithJournal(flags.journal),
+			eqmem.WithMaxJournalBytes(int64(flags.journalMaxBytes)),
+			eqmem.WithMaxJournalItems(flags.journalMaxItems),
+		), authzOpt)
 		if err != nil {
-			return errors.Wrap(err, "failed to open mem backend for qsvc")
+			return errors.Wrap(err, "failed to open eqmem backend for qsvc")
 		}
 		defer svc.Close()
 
@@ -83,7 +152,7 @@ var rootCmd = &cobra.Command{
 		)
 		pb.RegisterEntroQServer(s, svc)
 		hpb.RegisterHealthServer(s, health.NewServer())
-		log.Printf("Starting EntroQ server %d -> mem", flags.port)
+		log.Printf("Starting EntroQ server %d -> eqmem", flags.port)
 		return s.Serve(lis)
 	},
 }
@@ -108,12 +177,24 @@ func init() {
 	pflags.StringVar(&flags.opaURL, "opa_url", "", fmt.Sprintf("Base (scheme://host:port) URL for talking to OPA. Leave blank for default value %s.", opahttp.DefaultHostURL))
 	pflags.StringVar(&flags.opaPath, "opa_path", "", fmt.Sprintf("Path for OPA API access. Leave blank for default path %s.", opahttp.DefaultAPIPath))
 
+	pflags.StringVar(&flags.journal, "journal", "", "Journal directory, if persistence is desired. Default is memory-only, ephemeral.")
+	pflags.BoolVar(&flags.createJournalDir, "mkdir", false, "Create the journal directory if it doesn't exist.")
+	pflags.BoolVar(&flags.snapshotAndQuit, "snapshot_and_quit", false, "If set, starts up, reads the journal, and outputs a snapshot for all but the live journal. Requires the journal flag to be set.")
+	pflags.StringVar(&flags.periodicSnapshot, "periodic_snapshot", "", "If set, starts a goroutine that periodically generates snapshots on the given interval, specified using standard units. Note that anything under 1m will be clamped to 1m. Default is not to start up a periodic snapshotter. It is recommended in production to start a separate process in a script loop with snapshot_and_quit set instead, but this is good for development and testing.")
+	pflags.BoolVar(&flags.cleanup, "journal_cleanup", false, "If set, cleans up the journal before startup. Requires the journal flag to be set and the snapshot_and_quit option to be set.")
+	pflags.IntVar(&flags.journalMaxItems, "journal_max_items", 0, "If non-zero, sets the maximum number of items before journals are rotated. Normally leave this at the default.")
+	pflags.IntVar(&flags.journalMaxBytes, "journal_max_bytes", 0, "If non-zero, sets the maximum byte count of a journal file before rotation occurs.")
+
 	viper.BindPFlag("port", pflags.Lookup("port"))
 	viper.BindPFlag("http_port", pflags.Lookup("http_port"))
 	viper.BindPFlag("max_size_mb", pflags.Lookup("max_size_mb"))
 	viper.BindPFlag("authz", pflags.Lookup("authz"))
 	viper.BindPFlag("opa_base_url", pflags.Lookup("opa_base_url"))
 	viper.BindPFlag("opa_path", pflags.Lookup("opa_path"))
+	viper.BindPFlag("journal", pflags.Lookup("journal"))
+	viper.BindPFlag("periodic_snapshot", pflags.Lookup("periodic_snapshot"))
+	viper.BindPFlag("journal_max_items", pflags.Lookup("journal_max_items"))
+	viper.BindPFlag("journal_max_bytes", pflags.Lookup("journal_max_bytes"))
 }
 
 // initConfig reads in config file and ENV variables if set.

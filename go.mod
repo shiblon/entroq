@@ -3,9 +3,10 @@ module entrogo.com/entroq
 go 1.16
 
 require (
+	entrogo.com/stuffedio v0.7.9
 	github.com/dgrijalva/jwt-go v3.2.0+incompatible
 	github.com/golang/protobuf v1.4.3
-	github.com/google/go-cmp v0.5.0
+	github.com/google/go-cmp v0.5.5
 	github.com/google/uuid v1.1.2
 	github.com/lib/pq v1.0.0
 	github.com/mitchellh/go-homedir v1.1.0

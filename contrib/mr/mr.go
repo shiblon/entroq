@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
-	"log"
 	"path"
 	"sort"
 	"strconv"
@@ -546,6 +545,7 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 	if _, _, err := w.client.Modify(ctx, modArgs...); err != nil {
 		return errors.Wrap(err, "merge output")
 	}
+
 	return nil
 }
 
@@ -602,7 +602,6 @@ func reduceSortedKVs(ctx context.Context, reduce Reducer, kvs []*KV) ([]*KV, err
 func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error {
 	var outputs []*KV
 	task, err := w.client.DoWithRenew(ctx, task, claimDuration, func(ctx context.Context) error {
-		log.Printf("Reduce %q starting reduce task", w.Name)
 		var kvs []*KV
 		if err := json.Unmarshal(task.Value, &kvs); err != nil {
 			return errors.Wrap(err, "reduce from json")
@@ -650,8 +649,6 @@ func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error 
 // - run reduce over it and place the resulting sorted key/value pairs into the output queue.
 // - quit
 func (w *ReduceWorker) Run(ctx context.Context) error {
-	log.Printf("Reducer %q starting on queue %q", w.Name, w.InputQueue)
-	defer log.Printf("Reducer %q finished", w.Name)
 	// First, merge until there is no more mapping work to do.
 	for {
 		mergeTasks, err := w.client.Tasks(ctx, w.InputQueue, entroq.LimitTasks(200))
@@ -664,7 +661,6 @@ func (w *ReduceWorker) Run(ctx context.Context) error {
 				return errors.Wrap(err, "reduce empty check")
 			}
 			if empty {
-				log.Printf("Reducer %q done merging", w.Name)
 				break // all done - no more map tasks, 1 or fewer merge tasks.
 			}
 
@@ -677,25 +673,19 @@ func (w *ReduceWorker) Run(ctx context.Context) error {
 			continue
 		}
 		// More than one merge task is in the queue. Merge and check again.
-		log.Printf("Reducer %q merging %d tasks", w.Name, len(mergeTasks))
 		if err := w.mergeTasks(ctx, mergeTasks); err != nil {
 			if _, ok := entroq.AsDependency(err); !ok {
 				return errors.Wrapf(err, "merge %d tasks", len(mergeTasks))
 			}
-			log.Printf("Trying again in mr.ReduceWorker.Run: %v", err)
 			continue
 		}
-		log.Printf("Reducer %q merged %d tasks, pushing to %q", w.Name, len(mergeTasks), w.InputQueue)
 	}
-
-	log.Printf("Reducer %q merge finished. Reducing.", w.Name)
 
 	task, err := w.client.TryClaim(ctx, entroq.From(w.InputQueue), entroq.ClaimFor(claimDuration))
 	if err != nil {
 		return errors.Wrap(err, "reduce claim")
 	}
 	if task == nil {
-		log.Printf("Reducer %q has nothing to do", w.Name)
 		return nil
 	}
 	if err := w.reduceTask(ctx, task); err != nil {
@@ -800,7 +790,6 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 		qReduceOutput = path.Join(qReduce, "output")
 	)
 
-	log.Printf("Creating tasks for inputs")
 	// First create map tasks for all of the data.
 	for _, kv := range mr.Data {
 		b, err := json.Marshal(kv)
@@ -811,7 +800,6 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 			return "", errors.Wrap(err, "insert map input")
 		}
 	}
-	log.Printf("Created %d tasks", len(mr.Data))
 
 	// When all tasks are present, start map and reduce workers. They'll all exit when finished.
 	g, ctx := errgroup.WithContext(ctx)
@@ -831,12 +819,10 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 			if err := worker.Run(ctx); !entroq.IsCanceled(err) {
 				return errors.Wrap(err, "map worker")
 			}
-			log.Printf("Map worker %q clean shutdown", worker.Name)
 			return nil
 		})
 	}
 
-	log.Printf("Starting empty check")
 	g.Go(func() error {
 		for {
 			empty, err := mr.client.QueuesEmpty(ctx, entroq.MatchExact(qMapInput))
@@ -855,7 +841,6 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 		}
 	})
 
-	log.Printf("Starting %d reducers", mr.NumReducers)
 	for i := 0; i < mr.NumReducers; i++ {
 		name := fmt.Sprint(i)
 		worker := NewReduceWorker(mr.client, qMapInput, path.Join(qReduceInput, name),
@@ -868,7 +853,6 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 		})
 	}
 
-	log.Printf("Waiting for mappers and reducers to finish")
 	if err := g.Wait(); err != nil {
 		return "", errors.Wrap(err, "pipeline error")
 	}
