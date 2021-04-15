@@ -27,11 +27,12 @@ COPY --from=builder /build/bin/* /go/bin/
 COPY cmd/eqsvc.sh /go/bin/
 WORKDIR /go/bin
 
+# Memory journal location, if needed.
+RUN mkdir -p /data/entroq/journal && chmod -R a+rwx /data
+
 RUN adduser -S -D -H -h /go/src/entrogo.com/entroq -u 100 appuser
 USER appuser
 
-# Memory journal location, if needed.
-RUN mkdir -p /data/entroq
 VOLUME /data/entroq
 
 # gRPC endpoint
