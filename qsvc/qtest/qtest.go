@@ -18,7 +18,6 @@ import (
 	"entrogo.com/entroq/qsvc"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/uuid"
-	pkgerrors "github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
@@ -45,7 +44,7 @@ type Tester func(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 func ClientService(ctx context.Context, opener entroq.BackendOpener) (client *entroq.EntroQ, stop func(), err error) {
 	s, dial, err := StartService(ctx, opener)
 	if err != nil {
-		return nil, nil, pkgerrors.Wrap(err, "client service")
+		return nil, nil, fmt.Errorf("client service: %w", err)
 	}
 	defer func() {
 		if err != nil {
@@ -57,7 +56,7 @@ func ClientService(ctx context.Context, opener entroq.BackendOpener) (client *en
 		eqgrpc.WithNiladicDialer(dial),
 		eqgrpc.WithInsecure()))
 	if err != nil {
-		return nil, nil, pkgerrors.Wrap(err, "start client on in-memory service")
+		return nil, nil, fmt.Errorf("start client on in-memory service: %w", err)
 	}
 
 	return client, func() {
@@ -71,7 +70,7 @@ func StartService(ctx context.Context, opener entroq.BackendOpener) (*grpc.Serve
 	lis := bufconn.Listen(bufSize)
 	svc, err := qsvc.New(ctx, opener)
 	if err != nil {
-		return nil, nil, pkgerrors.Wrap(err, "start service")
+		return nil, nil, fmt.Errorf("start service: %w", err)
 	}
 	s := grpc.NewServer()
 	hpb.RegisterHealthServer(s, health.NewServer())
@@ -117,7 +116,7 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 	g.Go(func() error {
 		return client.NewWorker(queue).Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
 			if task.Claims != 1 {
-				return nil, pkgerrors.Errorf("worker claim expected claims to be 1, got %d", task.Claims)
+				return nil, fmt.Errorf("worker claim expected claims to be 1, got %d", task.Claims)
 			}
 			consumed = append(consumed, task)
 			return []entroq.ModifyArg{task.AsDeletion()}, nil
@@ -218,7 +217,7 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 			err := w.Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
 				ti++
 				if task.Claims != 1 {
-					return nil, pkgerrors.Errorf("worker claim expected to be 1, was %d", task.Claims)
+					return nil, fmt.Errorf("worker claim expected to be 1, was %d", task.Claims)
 				}
 				consumedCh <- task
 				return []entroq.ModifyArg{task.AsDeletion()}, nil
@@ -233,7 +232,7 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	g.Go(func() error {
 		waitCtx, _ := context.WithTimeout(ctx, 1*time.Minute)
 		if err := client.WaitQueuesEmpty(waitCtx, entroq.MatchExact(bigQueue, medQueue, smallQueue)); err != nil {
-			return pkgerrors.Wrap(err, "waiting for empty queues")
+			return fmt.Errorf("waiting for empty queues: %w", err)
 		}
 		// All done. Stop the workers.
 		cancel()
@@ -425,7 +424,7 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 			return w.Run(gctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
 				// Only attempt this again if it's the first time.
 				if task.Attempt == 0 {
-					return nil, entroq.NewRetryTaskError(pkgerrors.Errorf("retry error: %s", string(task.Value)))
+					return nil, entroq.NewRetryTaskError(fmt.Errorf("retry error: %s", string(task.Value)))
 				}
 				// Save it so we know what happened with the retry error, and clean up.
 				retriedTaskCh <- task
@@ -547,15 +546,15 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 			err := w.Run(gctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
 				switch string(task.Value) {
 				case "die":
-					return nil, pkgerrors.New("task asked to die")
+					return nil, fmt.Errorf("task asked to die")
 				case "move":
-					return nil, entroq.NewMoveTaskError(pkgerrors.New("task asked to move"))
+					return nil, entroq.NewMoveTaskError(fmt.Errorf("task asked to move"))
 				case "move-wait":
 					select {
 					case <-time.After(leaseTime):
-						return nil, entroq.NewMoveTaskError(pkgerrors.New("task asked to move after renewal"))
+						return nil, entroq.NewMoveTaskError(fmt.Errorf("task asked to move after renewal"))
 					case <-ctx.Done():
-						return nil, pkgerrors.Wrapf(ctx.Err(), "oops - test %q too too long, gave up before finishing", c.name)
+						return nil, fmt.Errorf("oops - test %q too too long, gave up before finishing: %w", c.name, ctx.Err())
 					}
 				default:
 					return []entroq.ModifyArg{task.AsDeletion()}, nil
@@ -660,7 +659,7 @@ func WorkerRenewal(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPr
 	renewed, err := client.DoWithRenew(ctx, task, 6*time.Second, func(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
-			return pkgerrors.Wrap(ctx.Err(), "worker do with renew")
+			return fmt.Errorf("worker do with renew: %w", ctx.Err())
 		case <-time.After(10 * time.Second): // long enough for 3 renewals.
 			return nil
 		}
@@ -1158,14 +1157,14 @@ func QueueStats(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefi
 	}
 
 	want := map[string]*entroq.QueueStat{
-		nothingClaimedQueue: &entroq.QueueStat{
+		nothingClaimedQueue: {
 			Name:      nothingClaimedQueue,
 			Size:      2,
 			Claimed:   0,
 			Available: 2,
 			MaxClaims: 0,
 		},
-		partiallyClaimedQueue: &entroq.QueueStat{
+		partiallyClaimedQueue: {
 			Name:      partiallyClaimedQueue,
 			Size:      3,
 			Claimed:   1,

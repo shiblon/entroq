@@ -3,6 +3,7 @@ package procworker
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
@@ -14,7 +15,6 @@ import (
 	"entrogo.com/entroq"
 	"entrogo.com/entroq/backend/eqmem"
 	"github.com/google/go-cmp/cmp"
-	pkgerrors "github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -22,14 +22,14 @@ func waitEmpty(ctx context.Context, eq *entroq.EntroQ, q string) error {
 	for {
 		empty, err := eq.QueuesEmpty(ctx, entroq.MatchExact(q))
 		if err != nil {
-			return pkgerrors.Wrap(err, "queue empty")
+			return fmt.Errorf("queue empty: %w", err)
 		}
 		if empty {
 			return nil
 		}
 		select {
 		case <-ctx.Done():
-			return pkgerrors.Wrap(err, "queue empty")
+			return fmt.Errorf("queue empty: %w", err)
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
