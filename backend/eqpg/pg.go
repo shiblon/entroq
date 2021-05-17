@@ -5,6 +5,7 @@ package eqpg // import "entrogo.com/entroq/backend/eqpg"
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -499,8 +500,11 @@ func isSerialization(err error) bool {
 	if err == nil {
 		return false
 	}
-	e, ok := pkgerrors.Cause(err).(*pq.Error)
-	return ok && e.Code == "40001"
+	pgerr := new(pq.Error)
+	if ok := errors.As(err, pgerr); ok {
+		return pgerr.Code == "40001"
+	}
+	return false
 }
 
 // Modify attempts to apply an atomic modification to the task store. Either

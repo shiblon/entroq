@@ -19,6 +19,7 @@ package entroq // import "entrogo.com/entroq"
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -704,18 +705,27 @@ func From(qs ...string) ClaimOpt {
 	}
 }
 
+func asStatusCode(err error) (codes.Code, bool) {
+	// We have to sequentially unwrap errors to find the underlying cause,
+	// since the status package does not expose its error type.
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		if code := status.Code(e); code != codes.Unknown {
+			return code, true
+		}
+	}
+	return codes.OK, false
+}
+
 // IsCanceled indicates whether the error is a canceled error.
 func IsCanceled(err error) bool {
 	if err == nil {
 		return false
 	}
-	err = pkgerrors.Cause(err)
-	if err == context.Canceled {
+	if errors.Is(err, context.Canceled) {
 		return true
 	}
-
-	if status.Code(err) == codes.Canceled {
-		return true
+	if code, ok := asStatusCode(err); ok {
+		return code == codes.Canceled
 	}
 
 	return false
@@ -726,13 +736,11 @@ func IsTimeout(err error) bool {
 	if err == nil {
 		return false
 	}
-	err = pkgerrors.Cause(err)
-	if err == context.DeadlineExceeded {
+	if errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
-
-	if status.Code(err) == codes.DeadlineExceeded {
-		return true
+	if code, ok := asStatusCode(err); ok {
+		return code == codes.DeadlineExceeded
 	}
 
 	return false
@@ -825,6 +833,18 @@ type SetRenewedTasker interface {
 	SetRenewedTask(...*Task)
 }
 
+func asSetRenewedTasker(err error) (SetRenewedTasker, bool) {
+	if err == nil {
+		return nil, false
+	}
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		if rterr, ok := e.(SetRenewedTasker); ok {
+			return rterr, true
+		}
+	}
+	return nil, false
+}
+
 // DoWithRenewAll runs the provided function while keeping all given tasks leases renewed.
 func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.Duration, f func(context.Context) error) ([]*Task, error) {
 	g, ctx := errgroup.WithContext(ctx)
@@ -856,7 +876,7 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.D
 	if err := g.Wait(); err != nil {
 		// Pass on renewed task if the error coming out wants us to.
 		// Make sure to get the underlying error, since it may have been wrapped.
-		if rterr, ok := pkgerrors.Cause(err).(SetRenewedTasker); ok {
+		if rterr, ok := asSetRenewedTasker(err); ok {
 			rterr.SetRenewedTask(renewed...)
 		}
 		return nil, pkgerrors.Wrap(err, "renew all")
@@ -1473,8 +1493,12 @@ func (m DependencyError) Error() string {
 
 // AsDependency indicates whether the given error is a dependency error.
 func AsDependency(err error) (DependencyError, bool) {
-	d, ok := pkgerrors.Cause(err).(DependencyError)
-	return d, ok
+	derr := DependencyError{}
+	if ok := errors.As(err, &derr); ok {
+		return derr, true
+	}
+
+	return DependencyError{}, false
 }
 
 // Time gets the time as the backend understands it, in UTC. Default is just
