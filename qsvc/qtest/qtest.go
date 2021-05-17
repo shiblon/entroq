@@ -1203,7 +1203,7 @@ func EqualAllTasks(want, got []*entroq.Task) string {
 			potentialDiffs = append(potentialDiffs, cmp.Diff(w, g))
 		}
 		if !found {
-			diffs = append(diffs, fmt.Sprintf("Task %v not found, differs from all of these:\n%v", strings.Join(potentialDiffs, "\n")))
+			diffs = append(diffs, fmt.Sprintf("Task %v not found, differs from all of these:\n%v", w, strings.Join(potentialDiffs, "\n")))
 		}
 	}
 	if len(diffs) != 0 {
