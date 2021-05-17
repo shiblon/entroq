@@ -851,7 +851,10 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 			ReduceToOutput(qReduceOutput))
 
 		g.Go(func() error {
-			return fmt.Errorf("reduce worker: %w", worker.Run(ctx))
+			if err := worker.Run(ctx); err != nil {
+				return fmt.Errorf("reduce worker: %w", err)
+			}
+			return nil
 		})
 	}
 
