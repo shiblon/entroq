@@ -171,7 +171,7 @@ func (s *QSvc) Authorize(ctx context.Context, req *authz.Request) error {
 	if err := s.az.Authorize(ctx, req); err != nil {
 		var details []proto.Message
 		authzErr := new(authz.AuthzError)
-		if !errors.As(err, authzErr) {
+		if !errors.As(err, &authzErr) {
 			return status.New(codes.PermissionDenied, fmt.Sprintf("unknown authz error: %v", err)).Err()
 		}
 
