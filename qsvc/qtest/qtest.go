@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"entrogo.com/entroq"
-	grpcbackend "entrogo.com/entroq/grpc"
+	"entrogo.com/entroq/backend/eqgrpc"
 	"entrogo.com/entroq/qsvc"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/uuid"
@@ -52,9 +52,9 @@ func ClientService(ctx context.Context, opener entroq.BackendOpener) (client *en
 		}
 	}()
 
-	client, err = entroq.New(ctx, grpcbackend.Opener("bufnet",
-		grpcbackend.WithNiladicDialer(dial),
-		grpcbackend.WithInsecure()))
+	client, err = entroq.New(ctx, eqgrpc.Opener("bufnet",
+		eqgrpc.WithNiladicDialer(dial),
+		eqgrpc.WithInsecure()))
 	if err != nil {
 		return nil, nil, pkgerrors.Wrap(err, "start client on in-memory service")
 	}
