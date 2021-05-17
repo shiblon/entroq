@@ -3,6 +3,7 @@ package entroq
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"time"
 
@@ -93,9 +94,15 @@ func (e *MoveTaskError) SetRenewedTask(t ...*Task) {
 // error indicates a worker task should be moved to the error queue instead o
 // causing the worker to exit.
 func AsMoveTaskError(err error) (*MoveTaskError, bool) {
-	cause := pkgerrors.Cause(err)
-	mte, ok := cause.(*MoveTaskError)
-	return mte, ok
+	if err == nil {
+		return nil, false
+	}
+	mterr := new(MoveTaskError)
+	if errors.As(err, &mterr) {
+		return mterr, true
+	}
+
+	return nil, false
 }
 
 // ErrorTaskValue holds a task that is moved to an error queue, with an error
@@ -134,9 +141,15 @@ func (e *RetryTaskError) Error() string {
 // AsRetryTaskError returns the underlying error and true iff the underlying
 // error is a retry error.
 func AsRetryTaskError(err error) (*RetryTaskError, bool) {
-	cause := pkgerrors.Cause(err)
-	rte, ok := cause.(*RetryTaskError)
-	return rte, ok
+	if err == nil {
+		return nil, false
+	}
+	rterr := new(RetryTaskError)
+	if errors.As(err, &rterr) {
+		return rterr, true
+	}
+
+	return nil, false
 }
 
 // NewWorker creates a new worker that makes it easy to claim and operate on
@@ -181,6 +194,17 @@ func (w *Worker) WithOpts(opts ...WorkerOption) *Worker {
 // MoveTaskError, instead.
 type Work func(ctx context.Context, task *Task) ([]ModifyArg, error)
 
+func taskErrMsg(err error) string {
+	if err == nil {
+		return ""
+	}
+	var firstErr error
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		firstErr = e
+	}
+	return firstErr.Error()
+}
+
 func (w *Worker) moveTaskWithError(ctx context.Context, task *Task, newQ string, taskErr error, incrementAttempt bool) error {
 	if w.wrappedMove {
 		if incrementAttempt {
@@ -195,7 +219,7 @@ func (w *Worker) moveTaskWithError(ctx context.Context, task *Task, newQ string,
 		}
 		return nil
 	}
-	changeArgs := []ChangeArg{QueueTo(newQ), ErrTo(pkgerrors.Cause(taskErr).Error())}
+	changeArgs := []ChangeArg{QueueTo(newQ), ErrTo(taskErrMsg(taskErr))}
 	if incrementAttempt {
 		changeArgs = append(changeArgs, AttemptToNext())
 	}
@@ -265,7 +289,7 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 				} else {
 					// Can retry. Increment attempts and move on.
 					if _, _, err := w.eqc.Modify(ctx, renewed.AsChange(
-						ErrTo(pkgerrors.Cause(workErr).Error()),
+						ErrTo(taskErrMsg(workErr)),
 						AttemptToNext(),
 						ArrivalTimeBy(w.baseRetryDelay))); err != nil {
 						return pkgerrors.Wrap(err, "retry task")
