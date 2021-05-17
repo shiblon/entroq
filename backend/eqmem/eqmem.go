@@ -1,7 +1,7 @@
 // Package eqmem implements an in-memory entroq that has fine-grained locking
 // and can handle simultaneously stats/task listing and modifications to a
 // large extent.
-package eqmem
+package eqmem // import "entrogo.com/entroq/backend/eqmem"
 
 import (
 	"context"

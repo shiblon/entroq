@@ -4,12 +4,11 @@ package subq // import "entrogo.com/entroq/subq"
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"reflect"
 	"sync"
 	"time"
-
-	pkgerrors "github.com/pkg/errors"
 )
 
 // SubQ is a queue subscription service. It is not public, though; it is based
@@ -215,7 +214,7 @@ func (s *SubQ) Wait(ctx context.Context, qs []string, pollWait time.Duration, co
 			case <-listeners[0].Ch():
 				// Got a value, go around again to run condition to see if it's still there.
 			case <-ctx.Done():
-				return pkgerrors.Wrap(ctx.Err(), "subq wait")
+				return fmt.Errorf("subq wait: %w", ctx.Err())
 			}
 			continue
 		}
@@ -254,7 +253,7 @@ func (s *SubQ) Wait(ctx context.Context, qs []string, pollWait time.Duration, co
 		chosen, _, _ := reflect.Select(cases)
 		if chosen == 0 {
 			// Context was canceled. Get it out and wrap its error.
-			return pkgerrors.Wrap(ctx.Err(), "subq wait multi")
+			return fmt.Errorf("subq wait multi: %w", ctx.Err())
 		}
 		// Otherwise, we just go around again. Either the time case
 		// fired, in which case it's a release valve, or a notification
