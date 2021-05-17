@@ -34,6 +34,7 @@ package qsvc // import "entrogo.com/entroq/qsvc"
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -42,7 +43,6 @@ import (
 	"entrogo.com/entroq/pkg/authz"
 	"github.com/golang/protobuf/proto"
 	"github.com/google/uuid"
-	pkgerrors "github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"google.golang.org/grpc/codes"
@@ -116,7 +116,7 @@ func WithAuthorizer(az authz.Authorizer) Option {
 func New(ctx context.Context, opener entroq.BackendOpener, opts ...Option) (*QSvc, error) {
 	impl, err := entroq.New(ctx, opener)
 	if err != nil {
-		return nil, pkgerrors.Wrap(err, "qsvc backend client")
+		return nil, fmt.Errorf("qsvc backend client: %w", err)
 	}
 
 	// Note that you should *never* use a background context like this unless
@@ -154,7 +154,10 @@ func New(ctx context.Context, opener entroq.BackendOpener, opts ...Option) (*QSv
 // Close closes the backend connections and flushes the connection free.
 func (s *QSvc) Close() error {
 	s.metricCancel() // Don't bother waiting for it
-	return pkgerrors.Wrap(s.impl.Close(), "qsvc close")
+	if err := s.impl.Close(); err != nil {
+		return fmt.Errorf("qsvc close: %w", err)
+	}
+	return nil
 }
 
 // Authorize attempts to authorize an action.
@@ -167,9 +170,8 @@ func (s *QSvc) Authorize(ctx context.Context, req *authz.Request) error {
 	// be unpacked and round-tripped through the grpc transport.
 	if err := s.az.Authorize(ctx, req); err != nil {
 		var details []proto.Message
-		// TODO: unwrap after converting to fmt-friendly unwrap instead of pkgerrors unwrap.
-		authzErr, ok := err.(*authz.AuthzError)
-		if !ok {
+		authzErr := new(authz.AuthzError)
+		if !errors.As(err, authzErr) {
 			return status.New(codes.PermissionDenied, fmt.Sprintf("unknown authz error: %v", err)).Err()
 		}
 
@@ -222,7 +224,7 @@ func (s *QSvc) Authorize(ctx context.Context, req *authz.Request) error {
 func (s *QSvc) RefreshMetrics(ctx context.Context) error {
 	stats, err := s.impl.QueueStats(ctx)
 	if err != nil {
-		return pkgerrors.Wrap(err, "refresh metrics")
+		return fmt.Errorf("refresh metrics: %w", err)
 	}
 
 	// Clear it out, then repopulate.
@@ -265,7 +267,7 @@ func wrapErrorf(err error, format string, vals ...interface{}) error {
 	if err == nil {
 		return nil
 	}
-	err = pkgerrors.Wrapf(err, format, vals...)
+	err = fmt.Errorf(format, append(vals, err)...)
 	if entroq.IsTimeout(err) {
 		return status.New(codes.DeadlineExceeded, err.Error()).Err()
 	}
@@ -276,7 +278,10 @@ func wrapErrorf(err error, format string, vals ...interface{}) error {
 }
 
 func codeErrorf(code codes.Code, err error, format string, vals ...interface{}) error {
-	return status.New(code, pkgerrors.Wrapf(err, format, vals...).Error()).Err()
+	if err != nil {
+		return nil
+	}
+	return status.New(code, fmt.Errorf(format, vals...).Error()).Err()
 }
 
 // authzToken gets the Authorization token from headers (grpc context) if present, otherwise blank.
