@@ -19,7 +19,7 @@ import (
 	"entrogo.com/entroq/contrib/mrtest"
 	"entrogo.com/entroq/qsvc/qtest"
 	"github.com/google/uuid"
-	"github.com/pkg/errors"
+	pkgerrors "github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 
 	_ "github.com/lib/pq"
@@ -175,29 +175,29 @@ func run(ctx context.Context, name string, args ...string) error {
 
 	outPipe, err := cmd.StdoutPipe()
 	if err != nil {
-		return errors.Wrapf(err, "open stdout %q %q", name, args)
+		return pkgerrors.Wrapf(err, "open stdout %q %q", name, args)
 	}
 	errPipe, err := cmd.StderrPipe()
 	if err != nil {
-		return errors.Wrapf(err, "open stderr %q %q", name, args)
+		return pkgerrors.Wrapf(err, "open stderr %q %q", name, args)
 	}
 
 	if err := cmd.Start(); err != nil {
-		return errors.Wrapf(err, "start %q %q", name, args)
+		return pkgerrors.Wrapf(err, "start %q %q", name, args)
 	}
 
 	g, ctx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
 		if _, err := io.Copy(os.Stdout, outPipe); err != nil {
-			return errors.Wrap(err, "stdout copy")
+			return pkgerrors.Wrap(err, "stdout copy")
 		}
 		return nil
 	})
 
 	g.Go(func() error {
 		if _, err := io.Copy(os.Stderr, errPipe); err != nil {
-			return errors.Wrap(err, "stderr copy")
+			return pkgerrors.Wrap(err, "stderr copy")
 		}
 		return nil
 	})
@@ -214,7 +214,7 @@ func startPostgres(ctx context.Context) (port int, stop func(), err error) {
 
 	log.Printf("Starting postgres container %q...", name)
 	if err := run(ctx, "docker", "run", "-p", "0:5432", "--rm", "-d", "-e", "POSTGRES_PASSWORD=password", "--name", name, "postgres:11"); err != nil {
-		return 0, nil, errors.Wrap(err, "start postgres container")
+		return 0, nil, pkgerrors.Wrap(err, "start postgres container")
 	}
 	time.Sleep(2 * time.Second) // give it some time to get pipes attached
 	log.Print("Container is up")
@@ -238,11 +238,11 @@ func startPostgres(ctx context.Context) (port int, stop func(), err error) {
 	// Now the container is running. Get its port.
 	portOut, err := exec.CommandContext(ctx, "docker", "inspect", "-f", `{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}`, name).Output()
 	if err != nil {
-		return 0, nil, errors.Wrap(err, "unable to get port")
+		return 0, nil, pkgerrors.Wrap(err, "unable to get port")
 	}
 	port, err = strconv.Atoi(strings.TrimSpace(string(portOut)))
 	if err != nil {
-		return 0, nil, errors.Wrapf(err, "failed to parse port number %q", portOut)
+		return 0, nil, pkgerrors.Wrapf(err, "failed to parse port number %q", portOut)
 	}
 
 	return port, stopFunc, nil

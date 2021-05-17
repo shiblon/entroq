@@ -14,7 +14,7 @@ import (
 	"entrogo.com/entroq"
 	"entrogo.com/entroq/backend/eqmem"
 	"github.com/google/go-cmp/cmp"
-	"github.com/pkg/errors"
+	pkgerrors "github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -22,14 +22,14 @@ func waitEmpty(ctx context.Context, eq *entroq.EntroQ, q string) error {
 	for {
 		empty, err := eq.QueuesEmpty(ctx, entroq.MatchExact(q))
 		if err != nil {
-			return errors.Wrap(err, "queue empty")
+			return pkgerrors.Wrap(err, "queue empty")
 		}
 		if empty {
 			return nil
 		}
 		select {
 		case <-ctx.Done():
-			return errors.Wrap(err, "queue empty")
+			return pkgerrors.Wrap(err, "queue empty")
 		case <-time.After(500 * time.Millisecond):
 		}
 	}

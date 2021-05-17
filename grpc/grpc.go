@@ -48,7 +48,7 @@ import (
 	"entrogo.com/entroq"
 	"entrogo.com/entroq/pkg/authz"
 	"github.com/google/uuid"
-	"github.com/pkg/errors"
+	pkgerrors "github.com/pkg/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -165,15 +165,15 @@ func Opener(addr string, opts ...Option) entroq.BackendOpener {
 	return func(ctx context.Context) (entroq.Backend, error) {
 		conn, err := grpc.DialContext(ctx, addr, options.dialOpts...)
 		if err != nil {
-			return nil, errors.Wrapf(err, "dial %q", addr)
+			return nil, pkgerrors.Wrapf(err, "dial %q", addr)
 		}
 		hclient := hpb.NewHealthClient(conn)
 		resp, err := hclient.Check(ctx, &hpb.HealthCheckRequest{})
 		if err != nil {
-			return nil, errors.Wrap(err, "health check")
+			return nil, pkgerrors.Wrap(err, "health check")
 		}
 		if st := resp.GetStatus(); st != hpb.HealthCheckResponse_SERVING {
-			return nil, errors.Errorf("health serving status: %q", st)
+			return nil, pkgerrors.Errorf("health serving status: %q", st)
 		}
 		return New(conn, opts...)
 	}
@@ -194,7 +194,7 @@ func New(conn *grpc.ClientConn, opts ...Option) (*backend, error) {
 
 // Close closes the underlying connection to the gRPC task service.
 func (b *backend) Close() error {
-	return errors.Wrap(b.conn.Close(), "pg backend close")
+	return pkgerrors.Wrap(b.conn.Close(), "pg backend close")
 }
 
 // Queues produces a mapping from queue names to queue sizes.
@@ -205,7 +205,7 @@ func (b *backend) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[strin
 		Limit:       int32(qq.Limit),
 	})
 	if err != nil {
-		return nil, errors.Wrap(unpackGRPCError(err), "grpc queues")
+		return nil, pkgerrors.Wrap(unpackGRPCError(err), "grpc queues")
 	}
 	qs := make(map[string]int)
 	for _, q := range resp.Queues {
@@ -222,7 +222,7 @@ func (b *backend) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[s
 		Limit:       int32(qq.Limit),
 	})
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to get queue stats over gRPC")
+		return nil, pkgerrors.Wrap(err, "failed to get queue stats over gRPC")
 	}
 	qs := make(map[string]*entroq.QueueStat)
 	for _, q := range resp.Queues {
@@ -248,12 +248,12 @@ func toMS(t time.Time) int64 {
 func fromTaskProto(t *pb.Task) (*entroq.Task, error) {
 	cid, err := uuid.Parse(t.ClaimantId)
 	if err != nil {
-		return nil, errors.Wrap(err, "claimant UUID parse failure")
+		return nil, pkgerrors.Wrap(err, "claimant UUID parse failure")
 	}
 
 	id, err := uuid.Parse(t.Id)
 	if err != nil {
-		return nil, errors.Wrap(err, "task UUID parse failure")
+		return nil, pkgerrors.Wrap(err, "task UUID parse failure")
 	}
 
 	return &entroq.Task{
@@ -301,7 +301,7 @@ func changeProtoFromTask(t *entroq.Task) *pb.TaskChange {
 func fromTaskIDProto(tid *pb.TaskID) (*entroq.TaskID, error) {
 	id, err := uuid.Parse(tid.Id)
 	if err != nil {
-		return nil, errors.Wrapf(err, "parse %q", tid.Id)
+		return nil, pkgerrors.Wrapf(err, "parse %q", tid.Id)
 	}
 	return &entroq.TaskID{
 		ID:      id,
@@ -325,7 +325,7 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 		OmitValues: tq.OmitValues,
 	})
 	if err != nil {
-		return nil, errors.Wrap(err, "stream tasks")
+		return nil, pkgerrors.Wrap(err, "stream tasks")
 	}
 	var tasks []*entroq.Task
 	for {
@@ -334,12 +334,12 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 			break
 		}
 		if err != nil {
-			return nil, errors.Wrap(unpackGRPCError(err), "receive tasks")
+			return nil, pkgerrors.Wrap(unpackGRPCError(err), "receive tasks")
 		}
 		for _, t := range resp.Tasks {
 			task, err := fromTaskProto(t)
 			if err != nil {
-				return nil, errors.Wrap(err, "parse tasks")
+				return nil, pkgerrors.Wrap(err, "parse tasks")
 			}
 			tasks = append(tasks, task)
 		}
@@ -354,7 +354,7 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 		// Check whether the parent context was canceled.
 		select {
 		case <-ctx.Done():
-			return nil, errors.Wrap(ctx.Err(), "grpc claim")
+			return nil, pkgerrors.Wrap(ctx.Err(), "grpc claim")
 		default:
 		}
 		ctx, _ := context.WithTimeout(ctx, ClaimRetryInterval)
@@ -372,10 +372,10 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 				// is why we check that at the beginning of the loop, as well.
 				continue
 			}
-			return nil, errors.Wrap(unpackGRPCError(err), "grpc claim")
+			return nil, pkgerrors.Wrap(unpackGRPCError(err), "grpc claim")
 		}
 		if resp.Task == nil {
-			return nil, errors.New("no task returned from backend Claim")
+			return nil, pkgerrors.New("no task returned from backend Claim")
 		}
 		return fromTaskProto(resp.Task)
 	}
@@ -390,7 +390,7 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 		DurationMs: int64(cq.Duration / time.Millisecond),
 	})
 	if err != nil {
-		return nil, errors.Wrap(unpackGRPCError(err), "grpc try claim")
+		return nil, pkgerrors.Wrap(unpackGRPCError(err), "grpc try claim")
 	}
 	if resp.Task == nil {
 		return nil, nil
@@ -400,13 +400,13 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 
 func authzErrFromStat(stat *status.Status) error {
 	if stat.Code() != codes.PermissionDenied {
-		return errors.Wrap(stat.Err(), "expected PermissionDenied, got something else")
+		return pkgerrors.Wrap(stat.Err(), "expected PermissionDenied, got something else")
 	}
 	authzErr := new(authz.AuthzError)
 	for _, det := range stat.Details() {
 		detail, ok := det.(*pb.AuthzDep)
 		if !ok {
-			return errors.Errorf("grpc unexpected authz type %T: %+v", det, det)
+			return pkgerrors.Errorf("grpc unexpected authz type %T: %+v", det, det)
 		}
 		if len(detail.Actions) == 1 && detail.Actions[0] == pb.ActionType_DETAIL && detail.Msg != "" {
 			authzErr.Errors = append(authzErr.Errors, detail.Msg)
@@ -426,7 +426,7 @@ func authzErrFromStat(stat *status.Status) error {
 
 func depErrorFromStat(stat *status.Status) error {
 	if stat.Code() != codes.NotFound {
-		return errors.Wrap(stat.Err(), "expected NotFound, got something else")
+		return pkgerrors.Wrap(stat.Err(), "expected NotFound, got something else")
 	}
 	// Dependency error, should have details.
 	depErr := entroq.DependencyError{
@@ -435,7 +435,7 @@ func depErrorFromStat(stat *status.Status) error {
 	for _, det := range stat.Details() {
 		detail, ok := det.(*pb.ModifyDep)
 		if !ok {
-			return errors.Errorf("grpc unexpected dependency type %T: %+v", det, det)
+			return pkgerrors.Errorf("grpc unexpected dependency type %T: %+v", det, det)
 		}
 		if detail.Type == pb.ActionType_DETAIL {
 			if detail.Msg != "" {
@@ -446,7 +446,7 @@ func depErrorFromStat(stat *status.Status) error {
 
 		tid, err := fromTaskIDProto(detail.Id)
 		if err != nil {
-			return errors.Wrap(err, "grpc dependency from proto")
+			return pkgerrors.Wrap(err, "grpc dependency from proto")
 		}
 		switch detail.Type {
 		case pb.ActionType_CLAIM:
@@ -460,7 +460,7 @@ func depErrorFromStat(stat *status.Status) error {
 		case pb.ActionType_INSERT:
 			depErr.Inserts = append(depErr.Inserts, tid)
 		default:
-			return errors.Errorf("grpc dependency unknown type %v in detail %v", detail.Type, detail)
+			return pkgerrors.Errorf("grpc dependency unknown type %v in detail %v", detail.Type, detail)
 		}
 	}
 	return depErr
@@ -512,20 +512,20 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 
 	resp, err := pb.NewEntroQClient(b.conn).Modify(ctx, req)
 	if err != nil {
-		return nil, nil, errors.Wrap(unpackGRPCError(err), "grpc modify")
+		return nil, nil, pkgerrors.Wrap(unpackGRPCError(err), "grpc modify")
 	}
 
 	for _, t := range resp.GetInserted() {
 		task, err := fromTaskProto(t)
 		if err != nil {
-			return nil, nil, errors.Wrap(err, "grpc modify task proto")
+			return nil, nil, pkgerrors.Wrap(err, "grpc modify task proto")
 		}
 		inserted = append(inserted, task)
 	}
 	for _, t := range resp.GetChanged() {
 		task, err := fromTaskProto(t)
 		if err != nil {
-			return nil, nil, errors.Wrap(err, "grpc modify changed")
+			return nil, nil, pkgerrors.Wrap(err, "grpc modify changed")
 		}
 		changed = append(changed, task)
 	}
@@ -537,7 +537,7 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 func (b *backend) Time(ctx context.Context) (time.Time, error) {
 	resp, err := pb.NewEntroQClient(b.conn).Time(ctx, new(pb.TimeRequest))
 	if err != nil {
-		return time.Time{}, errors.Wrap(unpackGRPCError(err), "grpc time")
+		return time.Time{}, pkgerrors.Wrap(unpackGRPCError(err), "grpc time")
 	}
 	return fromMS(resp.TimeMs).UTC(), nil
 }

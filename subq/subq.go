@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pkg/errors"
+	pkgerrors "github.com/pkg/errors"
 )
 
 // SubQ is a queue subscription service. It is not public, though; it is based
@@ -215,7 +215,7 @@ func (s *SubQ) Wait(ctx context.Context, qs []string, pollWait time.Duration, co
 			case <-listeners[0].Ch():
 				// Got a value, go around again to run condition to see if it's still there.
 			case <-ctx.Done():
-				return errors.Wrap(ctx.Err(), "subq wait")
+				return pkgerrors.Wrap(ctx.Err(), "subq wait")
 			}
 			continue
 		}
@@ -254,7 +254,7 @@ func (s *SubQ) Wait(ctx context.Context, qs []string, pollWait time.Duration, co
 		chosen, _, _ := reflect.Select(cases)
 		if chosen == 0 {
 			// Context was canceled. Get it out and wrap its error.
-			return errors.Wrap(ctx.Err(), "subq wait multi")
+			return pkgerrors.Wrap(ctx.Err(), "subq wait multi")
 		}
 		// Otherwise, we just go around again. Either the time case
 		// fired, in which case it's a release valve, or a notification

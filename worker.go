@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/pkg/errors"
+	pkgerrors "github.com/pkg/errors"
 )
 
 // DefaultRetryDelay is the amount by which to advance the arrival time when a
@@ -93,7 +93,7 @@ func (e *MoveTaskError) SetRenewedTask(t ...*Task) {
 // error indicates a worker task should be moved to the error queue instead o
 // causing the worker to exit.
 func AsMoveTaskError(err error) (*MoveTaskError, bool) {
-	cause := errors.Cause(err)
+	cause := pkgerrors.Cause(err)
 	mte, ok := cause.(*MoveTaskError)
 	return mte, ok
 }
@@ -134,7 +134,7 @@ func (e *RetryTaskError) Error() string {
 // AsRetryTaskError returns the underlying error and true iff the underlying
 // error is a retry error.
 func AsRetryTaskError(err error) (*RetryTaskError, bool) {
-	cause := errors.Cause(err)
+	cause := pkgerrors.Cause(err)
 	rte, ok := cause.(*RetryTaskError)
 	return rte, ok
 }
@@ -188,19 +188,19 @@ func (w *Worker) moveTaskWithError(ctx context.Context, task *Task, newQ string,
 		}
 		newVal, err := json.Marshal(&ErrorTaskValue{Task: task, Err: taskErr.Error()})
 		if err != nil {
-			return errors.Wrapf(err, "trying to marshal movable task with own error: %q", taskErr)
+			return pkgerrors.Wrapf(err, "trying to marshal movable task with own error: %q", taskErr)
 		}
 		if _, _, err := w.eqc.Modify(ctx, task.AsDeletion(), InsertingInto(newQ, WithValue(newVal))); err != nil {
-			return errors.Wrapf(err, "trying to insert movable task with own error: %q", taskErr)
+			return pkgerrors.Wrapf(err, "trying to insert movable task with own error: %q", taskErr)
 		}
 		return nil
 	}
-	changeArgs := []ChangeArg{QueueTo(newQ), ErrTo(errors.Cause(taskErr).Error())}
+	changeArgs := []ChangeArg{QueueTo(newQ), ErrTo(pkgerrors.Cause(taskErr).Error())}
 	if incrementAttempt {
 		changeArgs = append(changeArgs, AttemptToNext())
 	}
 	if _, _, err := w.eqc.Modify(ctx, task.AsChange(changeArgs...)); err != nil {
-		return errors.Wrapf(err, "trying to modify attempts and error message for moving task: %q", taskErr)
+		return pkgerrors.Wrapf(err, "trying to modify attempts and error message for moving task: %q", taskErr)
 	}
 	return nil
 }
@@ -212,19 +212,19 @@ func (w *Worker) moveTaskWithError(ctx context.Context, task *Task, newQ string,
 // updated.
 func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 	if len(w.Qs) == 0 {
-		return errors.New("No queues specified to work on")
+		return pkgerrors.New("No queues specified to work on")
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			return errors.Wrap(ctx.Err(), "worker quit")
+			return pkgerrors.Wrap(ctx.Err(), "worker quit")
 		default:
 		}
 
 		task, err := w.eqc.Claim(ctx, From(w.Qs...), ClaimFor(w.lease))
 		if err != nil {
-			return errors.Wrapf(err, "worker claim (%q)", w.Qs)
+			return pkgerrors.Wrapf(err, "worker claim (%q)", w.Qs)
 		}
 
 		errQ := w.ErrQMap(task.Queue)
@@ -233,7 +233,7 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 		renewed, workErr := w.eqc.DoWithRenew(ctx, task, w.lease, func(ctx context.Context) error {
 			var err error
 			if args, err = f(ctx, task); err != nil {
-				return errors.Wrapf(err, "work (%q)", w.Qs)
+				return pkgerrors.Wrapf(err, "work (%q)", w.Qs)
 			}
 			return nil
 		})
@@ -260,15 +260,15 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 					// Move instead - we retried enough times already.
 					log.Printf("Worker max attempts reached, moving to %q instead of retrying: %v", errQ, workErr)
 					if err := w.moveTaskWithError(ctx, renewed, errQ, workErr, true); err != nil {
-						return errors.Wrap(err, "move work task instead of retry")
+						return pkgerrors.Wrap(err, "move work task instead of retry")
 					}
 				} else {
 					// Can retry. Increment attempts and move on.
 					if _, _, err := w.eqc.Modify(ctx, renewed.AsChange(
-						ErrTo(errors.Cause(workErr).Error()),
+						ErrTo(pkgerrors.Cause(workErr).Error()),
 						AttemptToNext(),
 						ArrivalTimeBy(w.baseRetryDelay))); err != nil {
-						return errors.Wrap(err, "retry task")
+						return pkgerrors.Wrap(err, "retry task")
 					}
 				}
 				continue
@@ -281,18 +281,18 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 				}
 
 				if err := w.moveTaskWithError(ctx, renewed, errQ, workErr, false); err != nil {
-					return errors.Wrap(err, "move work task")
+					return pkgerrors.Wrap(err, "move work task")
 				}
 				continue
 			}
-			return errors.Wrap(workErr, "worker error")
+			return pkgerrors.Wrap(workErr, "worker error")
 		}
 
 		modification := NewModification(uuid.Nil, args...)
 		for _, task := range modification.Changes {
 			if task.ID == renewed.ID && task.Version != renewed.Version {
 				if task.Version > renewed.Version {
-					return errors.Errorf("task updated inside worker body, expected version <= %v, got %v", renewed.Version, task.Version)
+					return pkgerrors.Errorf("task updated inside worker body, expected version <= %v, got %v", renewed.Version, task.Version)
 				}
 				log.Printf("Rewriting change version %v => %v", task.Version, renewed.Version)
 				task.Version = renewed.Version
@@ -301,7 +301,7 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 		for _, id := range modification.Depends {
 			if id.ID == renewed.ID && task.Version != renewed.Version {
 				if task.Version > renewed.Version {
-					return errors.Errorf("task updated inside worker body, expected version <= %v, got %v", renewed.Version, task.Version)
+					return pkgerrors.Errorf("task updated inside worker body, expected version <= %v, got %v", renewed.Version, task.Version)
 				}
 				log.Printf("Rewriting depend version %v => %v", task.Version, renewed.Version)
 				id.Version = renewed.Version
@@ -310,7 +310,7 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 		for _, id := range modification.Deletes {
 			if id.ID == renewed.ID && task.Version != renewed.Version {
 				if task.Version > renewed.Version {
-					return errors.Errorf("task updated inside worker body, expected version <= %v, got %v", renewed.Version, task.Version)
+					return pkgerrors.Errorf("task updated inside worker body, expected version <= %v, got %v", renewed.Version, task.Version)
 				}
 				log.Printf("Rewriting delete version %v => %v", task.Version, renewed.Version)
 				id.Version = renewed.Version
@@ -322,7 +322,7 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 				if w.OnDepErr != nil {
 					if err := w.OnDepErr(depErr); err != nil {
 						log.Printf("Dependency error upgraded to fatal: %v", err)
-						return errors.Wrap(err, "worker depdency error upgraded to fatal")
+						return pkgerrors.Wrap(err, "worker depdency error upgraded to fatal")
 					}
 				}
 				log.Printf("Worker ack failed (%q), throwing away: %v", w.Qs, err)
@@ -336,7 +336,7 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 				log.Printf("Worker exiting cleanly (%q) instead of acking: %v", w.Qs, err)
 				return nil
 			}
-			return errors.Wrapf(err, "worker ack (%q)", w.Qs)
+			return pkgerrors.Wrapf(err, "worker ack (%q)", w.Qs)
 		}
 	}
 }
