@@ -25,7 +25,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/pkg/errors"
+	pkgerrors "github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -334,7 +334,7 @@ func PollTryClaim(ctx context.Context, eq *ClaimQuery, tc BackendClaimFunc) (*Ta
 		// Don't wait longer than the check interval or canceled context.
 		task, err := tc(ctx, eq)
 		if err != nil {
-			return nil, errors.Wrap(err, "poll try claim")
+			return nil, pkgerrors.Wrap(err, "poll try claim")
 		}
 		if task != nil {
 			return task, nil
@@ -347,7 +347,7 @@ func PollTryClaim(ctx context.Context, eq *ClaimQuery, tc BackendClaimFunc) (*Ta
 				curWait = maxCheckInterval
 			}
 		case <-ctx.Done():
-			return nil, errors.Wrap(ctx.Err(), "poll try claim")
+			return nil, pkgerrors.Wrap(ctx.Err(), "poll try claim")
 		}
 	}
 }
@@ -422,10 +422,10 @@ func WaitTryClaim(ctx context.Context, eq *ClaimQuery, tc BackendClaimFunc, w Wa
 		task, condErr = tc(ctx, eq)
 		return task != nil || condErr != nil
 	}); err != nil {
-		return nil, errors.Wrap(err, "wait try claim")
+		return nil, pkgerrors.Wrap(err, "wait try claim")
 	}
 	if condErr != nil {
-		return nil, errors.Wrap(condErr, "wait try claim condition")
+		return nil, pkgerrors.Wrap(condErr, "wait try claim condition")
 	}
 	return task, nil
 }
@@ -508,7 +508,7 @@ type BackendOpener func(ctx context.Context) (Backend, error)
 func New(ctx context.Context, opener BackendOpener, opts ...Option) (*EntroQ, error) {
 	backend, err := opener(ctx)
 	if err != nil {
-		return nil, errors.Wrap(err, "backend connection")
+		return nil, pkgerrors.Wrap(err, "backend connection")
 	}
 	eq := &EntroQ{
 		clientID: uuid.New(),
@@ -554,11 +554,11 @@ func (c *EntroQ) QueueStats(ctx context.Context, opts ...QueuesOpt) (map[string]
 // options are specified, returns an error.
 func (c *EntroQ) QueuesEmpty(ctx context.Context, opts ...QueuesOpt) (bool, error) {
 	if len(opts) == 0 {
-		return false, errors.New("empty check: no queue options specified")
+		return false, pkgerrors.New("empty check: no queue options specified")
 	}
 	qs, err := c.Queues(ctx, opts...)
 	if err != nil {
-		return false, errors.Wrap(err, "empty check")
+		return false, pkgerrors.Wrap(err, "empty check")
 	}
 	for _, size := range qs {
 		if size > 0 {
@@ -573,14 +573,14 @@ func (c *EntroQ) WaitQueuesEmpty(ctx context.Context, opts ...QueuesOpt) error {
 	for {
 		empty, err := c.QueuesEmpty(ctx, opts...)
 		if err != nil {
-			return errors.Wrap(err, "wait empty")
+			return pkgerrors.Wrap(err, "wait empty")
 		}
 		if empty {
 			return nil
 		}
 		select {
 		case <-ctx.Done():
-			return errors.Wrap(ctx.Err(), "wait empty")
+			return pkgerrors.Wrap(ctx.Err(), "wait empty")
 		case <-time.After(2 * time.Second):
 		}
 	}
@@ -709,7 +709,7 @@ func IsCanceled(err error) bool {
 	if err == nil {
 		return false
 	}
-	err = errors.Cause(err)
+	err = pkgerrors.Cause(err)
 	if err == context.Canceled {
 		return true
 	}
@@ -726,7 +726,7 @@ func IsTimeout(err error) bool {
 	if err == nil {
 		return false
 	}
-	err = errors.Cause(err)
+	err = pkgerrors.Cause(err)
 	if err == context.DeadlineExceeded {
 		return true
 	}
@@ -759,7 +759,7 @@ func claimQueryFromOpts(claimant uuid.UUID, opts ...ClaimOpt) *ClaimQuery {
 func (c *EntroQ) Claim(ctx context.Context, opts ...ClaimOpt) (*Task, error) {
 	query := claimQueryFromOpts(c.clientID, opts...)
 	if len(query.Queues) == 0 {
-		return nil, errors.New("no queues specified for claim")
+		return nil, pkgerrors.New("no queues specified for claim")
 	}
 	return c.backend.Claim(ctx, query)
 }
@@ -772,7 +772,7 @@ func (c *EntroQ) Claim(ctx context.Context, opts ...ClaimOpt) (*Task, error) {
 func (c *EntroQ) TryClaim(ctx context.Context, opts ...ClaimOpt) (*Task, error) {
 	query := claimQueryFromOpts(c.clientID, opts...)
 	if len(query.Queues) == 0 {
-		return nil, errors.New("no queues specified for try claim")
+		return nil, pkgerrors.New("no queues specified for try claim")
 	}
 	return c.backend.TryClaim(ctx, query)
 }
@@ -782,7 +782,7 @@ func (c *EntroQ) TryClaim(ctx context.Context, opts ...ClaimOpt) (*Task, error) 
 func (c *EntroQ) RenewFor(ctx context.Context, task *Task, duration time.Duration) (*Task, error) {
 	changed, err := c.RenewAllFor(ctx, []*Task{task}, duration)
 	if err != nil {
-		return nil, errors.Wrap(err, "renew task")
+		return nil, pkgerrors.Wrap(err, "renew task")
 	}
 	return changed[0], nil
 }
@@ -806,10 +806,10 @@ func (c *EntroQ) RenewAllFor(ctx context.Context, tasks []*Task, duration time.D
 	}
 	_, changed, err := c.Modify(ctx, modArgs...)
 	if err != nil {
-		return nil, errors.Wrapf(err, "renewal failed for tasks %q", taskIDs)
+		return nil, pkgerrors.Wrapf(err, "renewal failed for tasks %q", taskIDs)
 	}
 	if len(changed) != len(tasks) {
-		return nil, errors.Errorf("renewal expected %d updated tasks, got %d", len(tasks), len(changed))
+		return nil, pkgerrors.Errorf("renewal expected %d updated tasks, got %d", len(tasks), len(changed))
 	}
 	return changed, nil
 }
@@ -838,11 +838,11 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.D
 			case <-doneCh:
 				return nil
 			case <-ctx.Done():
-				return errors.Wrap(ctx.Err(), "renew all stopped")
+				return pkgerrors.Wrap(ctx.Err(), "renew all stopped")
 			case <-time.After(lease / 2):
 				var err error
 				if renewed, err = c.RenewAllFor(ctx, renewed, lease); err != nil {
-					return errors.Wrap(err, "renew all lease")
+					return pkgerrors.Wrap(err, "renew all lease")
 				}
 			}
 		}
@@ -856,10 +856,10 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.D
 	if err := g.Wait(); err != nil {
 		// Pass on renewed task if the error coming out wants us to.
 		// Make sure to get the underlying error, since it may have been wrapped.
-		if rterr, ok := errors.Cause(err).(SetRenewedTasker); ok {
+		if rterr, ok := pkgerrors.Cause(err).(SetRenewedTasker); ok {
 			rterr.SetRenewedTask(renewed...)
 		}
-		return nil, errors.Wrap(err, "renew all")
+		return nil, pkgerrors.Wrap(err, "renew all")
 	}
 
 	// The task will have been overwritten with every renewal. Return final task.
@@ -870,7 +870,7 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.D
 func (c *EntroQ) DoWithRenew(ctx context.Context, task *Task, lease time.Duration, f func(context.Context) error) (*Task, error) {
 	finalTasks, err := c.DoWithRenewAll(ctx, []*Task{task}, lease, f)
 	if err != nil {
-		return nil, errors.Wrap(err, "renew")
+		return nil, pkgerrors.Wrap(err, "renew")
 	}
 	return finalTasks[0], nil
 }
@@ -892,15 +892,15 @@ func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (inserted []*
 		depErr, ok := AsDependency(err)
 		// If not a dependency error, pass it on out.
 		if !ok {
-			return nil, nil, errors.Wrap(err, "modify")
+			return nil, nil, pkgerrors.Wrap(err, "modify")
 		}
 		// If anything is missing or there's a claim problem, bail.
 		if depErr.HasMissing() || depErr.HasClaims() {
-			return nil, nil, errors.Wrap(err, "modify non-ins deps")
+			return nil, nil, pkgerrors.Wrap(err, "modify non-ins deps")
 		}
 		// No collisions? Not sure what's going on.
 		if !depErr.HasCollisions() {
-			return nil, nil, errors.Wrap(err, "non-collision errors")
+			return nil, nil, pkgerrors.Wrap(err, "non-collision errors")
 		}
 
 		// If we get this far, the only errors we have are insertion collisions.
@@ -921,7 +921,7 @@ func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (inserted []*
 					continue
 				}
 				// Can't skip this one. Bail.
-				return nil, nil, errors.Wrap(err, "unskippable collision")
+				return nil, nil, pkgerrors.Wrap(err, "unskippable collision")
 			}
 			newInserts = append(newInserts, td)
 		}
@@ -1248,13 +1248,13 @@ func (m *Modification) modDependencies() (map[uuid.UUID]int32, error) {
 	deps := make(map[uuid.UUID]int32)
 	for _, t := range m.Changes {
 		if _, ok := deps[t.ID]; ok {
-			return nil, errors.New("duplicates found in dependencies")
+			return nil, pkgerrors.New("duplicates found in dependencies")
 		}
 		deps[t.ID] = t.Version
 	}
 	for _, t := range m.Deletes {
 		if _, ok := deps[t.ID]; ok {
-			return nil, errors.New("duplicates found in dependencies")
+			return nil, pkgerrors.New("duplicates found in dependencies")
 		}
 		deps[t.ID] = t.Version
 	}
@@ -1273,11 +1273,11 @@ func (m *Modification) modDependencies() (map[uuid.UUID]int32, error) {
 func (m *Modification) AllDependencies() (map[uuid.UUID]int32, error) {
 	deps, err := m.modDependencies()
 	if err != nil {
-		return nil, errors.Wrap(err, "get dependencies")
+		return nil, pkgerrors.Wrap(err, "get dependencies")
 	}
 	for _, t := range m.Depends {
 		if _, ok := deps[t.ID]; ok {
-			return nil, errors.New("duplicates found in dependencies")
+			return nil, pkgerrors.New("duplicates found in dependencies")
 		}
 		deps[t.ID] = t.Version
 	}
@@ -1287,7 +1287,7 @@ func (m *Modification) AllDependencies() (map[uuid.UUID]int32, error) {
 			continue
 		}
 		if _, ok := deps[t.ID]; ok {
-			return nil, errors.New("duplicates found in dependencies")
+			return nil, pkgerrors.New("duplicates found in dependencies")
 		}
 		deps[t.ID] = -1
 	}
@@ -1473,7 +1473,7 @@ func (m DependencyError) Error() string {
 
 // AsDependency indicates whether the given error is a dependency error.
 func AsDependency(err error) (DependencyError, bool) {
-	d, ok := errors.Cause(err).(DependencyError)
+	d, ok := pkgerrors.Cause(err).(DependencyError)
 	return d, ok
 }
 

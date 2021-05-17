@@ -42,7 +42,7 @@ import (
 	"entrogo.com/entroq/pkg/authz"
 	"github.com/golang/protobuf/proto"
 	"github.com/google/uuid"
-	"github.com/pkg/errors"
+	pkgerrors "github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"google.golang.org/grpc/codes"
@@ -116,7 +116,7 @@ func WithAuthorizer(az authz.Authorizer) Option {
 func New(ctx context.Context, opener entroq.BackendOpener, opts ...Option) (*QSvc, error) {
 	impl, err := entroq.New(ctx, opener)
 	if err != nil {
-		return nil, errors.Wrap(err, "qsvc backend client")
+		return nil, pkgerrors.Wrap(err, "qsvc backend client")
 	}
 
 	// Note that you should *never* use a background context like this unless
@@ -154,7 +154,7 @@ func New(ctx context.Context, opener entroq.BackendOpener, opts ...Option) (*QSv
 // Close closes the backend connections and flushes the connection free.
 func (s *QSvc) Close() error {
 	s.metricCancel() // Don't bother waiting for it
-	return errors.Wrap(s.impl.Close(), "qsvc close")
+	return pkgerrors.Wrap(s.impl.Close(), "qsvc close")
 }
 
 // Authorize attempts to authorize an action.
@@ -222,7 +222,7 @@ func (s *QSvc) Authorize(ctx context.Context, req *authz.Request) error {
 func (s *QSvc) RefreshMetrics(ctx context.Context) error {
 	stats, err := s.impl.QueueStats(ctx)
 	if err != nil {
-		return errors.Wrap(err, "refresh metrics")
+		return pkgerrors.Wrap(err, "refresh metrics")
 	}
 
 	// Clear it out, then repopulate.
@@ -265,7 +265,7 @@ func wrapErrorf(err error, format string, vals ...interface{}) error {
 	if err == nil {
 		return nil
 	}
-	err = errors.Wrapf(err, format, vals...)
+	err = pkgerrors.Wrapf(err, format, vals...)
 	if entroq.IsTimeout(err) {
 		return status.New(codes.DeadlineExceeded, err.Error()).Err()
 	}
@@ -276,7 +276,7 @@ func wrapErrorf(err error, format string, vals ...interface{}) error {
 }
 
 func codeErrorf(code codes.Code, err error, format string, vals ...interface{}) error {
-	return status.New(code, errors.Wrapf(err, format, vals...).Error()).Err()
+	return status.New(code, pkgerrors.Wrapf(err, format, vals...).Error()).Err()
 }
 
 // authzToken gets the Authorization token from headers (grpc context) if present, otherwise blank.

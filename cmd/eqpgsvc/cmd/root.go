@@ -27,7 +27,7 @@ import (
 	"entrogo.com/entroq/pkg/authz/opahttp"
 	"entrogo.com/entroq/qsvc"
 	homedir "github.com/mitchellh/go-homedir"
-	"github.com/pkg/errors"
+	pkgerrors "github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -107,7 +107,7 @@ var rootCmd = &cobra.Command{
 
 		svc, err := qsvc.New(ctx, opener, authzOpt)
 		if err != nil {
-			return errors.Wrap(err, "failed to open pg backend")
+			return pkgerrors.Wrap(err, "failed to open pg backend")
 		}
 		defer svc.Close()
 
@@ -118,7 +118,7 @@ var rootCmd = &cobra.Command{
 
 		lis, err := net.Listen("tcp", fmt.Sprintf("[::]:%d", port))
 		if err != nil {
-			return errors.Wrapf(err, "error listening on port %d", port)
+			return pkgerrors.Wrapf(err, "error listening on port %d", port)
 		}
 
 		s := grpc.NewServer(

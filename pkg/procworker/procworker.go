@@ -26,7 +26,7 @@ import (
 	"time"
 
 	"entrogo.com/entroq"
-	"github.com/pkg/errors"
+	pkgerrors "github.com/pkg/errors"
 )
 
 const MaxStdOutSize = 1024 * 1024
@@ -185,11 +185,11 @@ func Run(ctx context.Context, t *entroq.Task) ([]entroq.ModifyArg, error) {
 		outWriters = append(outWriters, outbuf)
 	} else {
 		if err := os.MkdirAll(filepath.Dir(output.Outfile), 0775); err != nil {
-			return nil, errors.Wrapf(err, "creating stdout dir %q", output.Outfile)
+			return nil, pkgerrors.Wrapf(err, "creating stdout dir %q", output.Outfile)
 		}
 		outFile, err := os.Create(output.Outfile)
 		if err != nil {
-			return nil, errors.Wrapf(err, "creating stdout file %q", output.Outfile)
+			return nil, pkgerrors.Wrapf(err, "creating stdout file %q", output.Outfile)
 		}
 		defer outFile.Close()
 		outWriters = append(outWriters, outFile)
@@ -200,11 +200,11 @@ func Run(ctx context.Context, t *entroq.Task) ([]entroq.ModifyArg, error) {
 		errWriters = append(errWriters, errbuf)
 	} else {
 		if err := os.MkdirAll(filepath.Dir(output.Errfile), 0775); err != nil {
-			return nil, errors.Wrapf(err, "creating stdout dir %q", output.Errfile)
+			return nil, pkgerrors.Wrapf(err, "creating stdout dir %q", output.Errfile)
 		}
 		errFile, err := os.Create(output.Errfile)
 		if err != nil {
-			return nil, errors.Wrapf(err, "creating stderr file %q", output.Errfile)
+			return nil, pkgerrors.Wrapf(err, "creating stderr file %q", output.Errfile)
 		}
 		defer errFile.Close()
 		errWriters = append(errWriters, errFile)

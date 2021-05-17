@@ -18,7 +18,7 @@ import (
 	"time"
 
 	"entrogo.com/entroq"
-	"github.com/pkg/errors"
+	pkgerrors "github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -96,7 +96,7 @@ func (e *CollectingMapEmitter) AsModifyArgs(qPrefix string, additional ...entroq
 		sort.Sort(byKey(kvs))
 		value, err := json.Marshal(kvs)
 		if err != nil {
-			return nil, errors.Wrap(err, "emit to modify args")
+			return nil, pkgerrors.Wrap(err, "emit to modify args")
 		}
 		queue := path.Join(qPrefix, fmt.Sprint(shard))
 		args = append(args, entroq.InsertingInto(queue, entroq.WithValue(value)))
@@ -146,7 +146,7 @@ func (e *reducingProxyMapEmitter) reduceAndEmit(ctx context.Context, threshold i
 
 		kvs, err = reduceSortedKVs(ctx, e.reduce, e.collection)
 		if err != nil {
-			err = errors.Wrap(err, "reduce and emit error")
+			err = pkgerrors.Wrap(err, "reduce and emit error")
 		}
 	}()
 
@@ -156,7 +156,7 @@ func (e *reducingProxyMapEmitter) reduceAndEmit(ctx context.Context, threshold i
 
 	for _, kv := range kvs {
 		if err := e.target.Emit(ctx, kv.Key, kv.Value); err != nil {
-			return errors.Wrap(err, "proxy emit")
+			return pkgerrors.Wrap(err, "proxy emit")
 		}
 	}
 
@@ -178,14 +178,14 @@ func (e *reducingProxyMapEmitter) Emit(ctx context.Context, key, value []byte) e
 		e.collection = append(e.collection, NewKV(key, value))
 	}()
 
-	return errors.Wrap(e.reduceAndEmit(ctx, 100), "reducing proxy emit")
+	return pkgerrors.Wrap(e.reduceAndEmit(ctx, 100), "reducing proxy emit")
 }
 
 // AsModifyArgs creates task insertions. This one simply forwards to the target
 // implementation.
 func (e *reducingProxyMapEmitter) AsModifyArgs(prefix string, additional ...entroq.ModifyArg) ([]entroq.ModifyArg, error) {
 	if err := e.reduceAndEmit(e.emitCtx, 1); err != nil {
-		return nil, errors.Wrap(err, "proxy modify args")
+		return nil, pkgerrors.Wrap(err, "proxy modify args")
 	}
 	return e.target.AsModifyArgs(prefix, additional...)
 }
@@ -212,12 +212,12 @@ func WordCountMapper(ctx context.Context, key, value []byte, emit MapEmitFunc) e
 		if (numEmitted+1)%1000 == 0 {
 			select {
 			case <-ctx.Done():
-				return errors.Wrap(ctx.Err(), "canceled map operation")
+				return pkgerrors.Wrap(ctx.Err(), "canceled map operation")
 			default:
 			}
 		}
 		if err := emit(ctx, []byte(word), []byte(fmt.Sprint(count))); err != nil {
-			return errors.Wrap(err, "word count output error")
+			return pkgerrors.Wrap(err, "word count output error")
 		}
 		numEmitted++
 	}
@@ -353,10 +353,10 @@ func (w *MapWorker) Run(ctx context.Context) error {
 		}
 		kv := new(KV)
 		if err := json.Unmarshal(task.Value, kv); err != nil {
-			return nil, errors.Wrap(err, "map run json")
+			return nil, pkgerrors.Wrap(err, "map run json")
 		}
 		if err := w.Map(ctx, kv.Key, kv.Value, emitter.Emit); err != nil {
-			return nil, errors.Wrap(err, "map run map")
+			return nil, pkgerrors.Wrap(err, "map run map")
 		}
 
 		return emitter.AsModifyArgs(w.OutputPrefix, task.AsDeletion())
@@ -382,7 +382,7 @@ type ReducerInput interface {
 	// 		process(input.Value())
 	// 	}
 	// 	if err := input.Err(); err != nil {
-	// 		return errors.Wrap(err, "error getting input")
+	// 		return pkgerrors.Wrap(err, "error getting input")
 	// 	}
 	Next() bool
 }
@@ -394,10 +394,10 @@ type Reducer func(ctx context.Context, input ReducerInput) ([]byte, error)
 // FirstValueReducer outputs its first value and quits.
 func FirstValueReducer(ctx context.Context, input ReducerInput) ([]byte, error) {
 	if !input.Next() {
-		return nil, errors.New("no inputs to reducer")
+		return nil, pkgerrors.New("no inputs to reducer")
 	}
 	if err := input.Err(); err != nil {
-		return nil, errors.Wrap(err, "reduce")
+		return nil, pkgerrors.Wrap(err, "reduce")
 	}
 	return input.Value(), nil
 }
@@ -414,12 +414,12 @@ func SumReducer(ctx context.Context, input ReducerInput) ([]byte, error) {
 	for input.Next() {
 		count, err := strconv.Atoi(string(input.Value()))
 		if err != nil {
-			return nil, errors.Wrap(err, "int conversion in SumReducer")
+			return nil, pkgerrors.Wrap(err, "int conversion in SumReducer")
 		}
 		sum += count
 	}
 	if err := input.Err(); err != nil {
-		return nil, errors.Wrap(err, "get SumReducer value")
+		return nil, pkgerrors.Wrap(err, "get SumReducer value")
 	}
 	return []byte(fmt.Sprint(sum)), nil
 }
@@ -431,7 +431,7 @@ func SliceReducer(ctx context.Context, input ReducerInput) ([]byte, error) {
 		vals = append(vals, input.Value())
 	}
 	if err := input.Err(); err != nil {
-		return nil, errors.Wrap(err, "get reduce value")
+		return nil, pkgerrors.Wrap(err, "get reduce value")
 	}
 	return json.Marshal(vals)
 }
@@ -517,7 +517,7 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 		for _, task := range tasks {
 			var vals []*KV
 			if err := json.Unmarshal(task.Value, &vals); err != nil {
-				return errors.Wrap(err, "merge from json")
+				return pkgerrors.Wrap(err, "merge from json")
 			}
 			kvs = append(kvs, vals...)
 		}
@@ -529,21 +529,21 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 		// Now all key/value pairs are merged into a single sorted list. Create a new task and delete the others.
 		combined, err := json.Marshal(kvs)
 		if err != nil {
-			return errors.Wrap(err, "merge to json")
+			return pkgerrors.Wrap(err, "merge to json")
 		}
 
 		modArgs = append(modArgs, entroq.InsertingInto(w.InputQueue, entroq.WithValue(combined)))
 		return nil
 	})
 	if err != nil {
-		return errors.Wrap(err, "merge while claimed")
+		return pkgerrors.Wrap(err, "merge while claimed")
 	}
 
 	for _, t := range tasks {
 		modArgs = append(modArgs, t.AsDeletion())
 	}
 	if _, _, err := w.client.Modify(ctx, modArgs...); err != nil {
-		return errors.Wrap(err, "merge output")
+		return pkgerrors.Wrap(err, "merge output")
 	}
 
 	return nil
@@ -589,7 +589,7 @@ func reduceSortedKVs(ctx context.Context, reduce Reducer, kvs []*KV) ([]*KV, err
 			}
 		}
 		if err != nil {
-			return nil, errors.Wrap(err, "reduce sorted kvs")
+			return nil, pkgerrors.Wrap(err, "reduce sorted kvs")
 		}
 		outputs = append(outputs, NewKV(last.Key, output))
 	}
@@ -604,26 +604,26 @@ func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error 
 	task, err := w.client.DoWithRenew(ctx, task, claimDuration, func(ctx context.Context) error {
 		var kvs []*KV
 		if err := json.Unmarshal(task.Value, &kvs); err != nil {
-			return errors.Wrap(err, "reduce from json")
+			return pkgerrors.Wrap(err, "reduce from json")
 		}
 
 		var err error
 		if outputs, err = reduceSortedKVs(ctx, w.Reduce, kvs); err != nil {
-			return errors.Wrap(err, "reduce sorted")
+			return pkgerrors.Wrap(err, "reduce sorted")
 		}
 
 		return nil
 	})
 	if err != nil {
-		return errors.Wrap(err, "reduce task")
+		return pkgerrors.Wrap(err, "reduce task")
 	}
 
 	outputValue, err := json.Marshal(outputs)
 	if err != nil {
-		return errors.Wrap(err, "reduce to json")
+		return pkgerrors.Wrap(err, "reduce to json")
 	}
 	if _, _, err := w.client.Modify(ctx, task.AsDeletion(), entroq.InsertingInto(w.OutputQueue, entroq.WithValue(outputValue))); err != nil {
-		return errors.Wrap(err, "reduce output")
+		return pkgerrors.Wrap(err, "reduce output")
 	}
 	return nil
 }
@@ -653,12 +653,12 @@ func (w *ReduceWorker) Run(ctx context.Context) error {
 	for {
 		mergeTasks, err := w.client.Tasks(ctx, w.InputQueue, entroq.LimitTasks(200))
 		if err != nil {
-			return errors.Wrap(err, "reduce get tasks")
+			return pkgerrors.Wrap(err, "reduce get tasks")
 		}
 		if len(mergeTasks) <= 1 {
 			empty, err := w.client.QueuesEmpty(ctx, entroq.MatchExact(w.MapEmptyQueue))
 			if err != nil {
-				return errors.Wrap(err, "reduce empty check")
+				return pkgerrors.Wrap(err, "reduce empty check")
 			}
 			if empty {
 				break // all done - no more map tasks, 1 or fewer merge tasks.
@@ -667,7 +667,7 @@ func (w *ReduceWorker) Run(ctx context.Context) error {
 			// Nothing to do - sleep and continue.
 			select {
 			case <-ctx.Done():
-				return errors.Wrap(ctx.Err(), "reduce worker done")
+				return pkgerrors.Wrap(ctx.Err(), "reduce worker done")
 			case <-time.After(shuffleWait):
 			}
 			continue
@@ -675,7 +675,7 @@ func (w *ReduceWorker) Run(ctx context.Context) error {
 		// More than one merge task is in the queue. Merge and check again.
 		if err := w.mergeTasks(ctx, mergeTasks); err != nil {
 			if _, ok := entroq.AsDependency(err); !ok {
-				return errors.Wrapf(err, "merge %d tasks", len(mergeTasks))
+				return pkgerrors.Wrapf(err, "merge %d tasks", len(mergeTasks))
 			}
 			continue
 		}
@@ -683,13 +683,13 @@ func (w *ReduceWorker) Run(ctx context.Context) error {
 
 	task, err := w.client.TryClaim(ctx, entroq.From(w.InputQueue), entroq.ClaimFor(claimDuration))
 	if err != nil {
-		return errors.Wrap(err, "reduce claim")
+		return pkgerrors.Wrap(err, "reduce claim")
 	}
 	if task == nil {
 		return nil
 	}
 	if err := w.reduceTask(ctx, task); err != nil {
-		return errors.Wrap(err, "reduce")
+		return pkgerrors.Wrap(err, "reduce")
 	}
 	return nil
 }
@@ -794,10 +794,10 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 	for _, kv := range mr.Data {
 		b, err := json.Marshal(kv)
 		if err != nil {
-			return "", errors.Wrap(err, "marshal input")
+			return "", pkgerrors.Wrap(err, "marshal input")
 		}
 		if _, _, err := mr.client.Modify(ctx, entroq.InsertingInto(qMapInput, entroq.WithValue(b))); err != nil {
-			return "", errors.Wrap(err, "insert map input")
+			return "", pkgerrors.Wrap(err, "insert map input")
 		}
 	}
 
@@ -817,7 +817,7 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 
 		g.Go(func() error {
 			if err := worker.Run(ctx); !entroq.IsCanceled(err) {
-				return errors.Wrap(err, "map worker")
+				return pkgerrors.Wrap(err, "map worker")
 			}
 			return nil
 		})
@@ -827,7 +827,7 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 		for {
 			empty, err := mr.client.QueuesEmpty(ctx, entroq.MatchExact(qMapInput))
 			if err != nil {
-				return errors.Wrap(err, "map worker empty queue check")
+				return pkgerrors.Wrap(err, "map worker empty queue check")
 			}
 			if empty {
 				mapCancel()
@@ -835,7 +835,7 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 			}
 			select {
 			case <-ctx.Done():
-				return errors.Wrap(ctx.Err(), "empty checker")
+				return pkgerrors.Wrap(ctx.Err(), "empty checker")
 			case <-time.After(5 * time.Second):
 			}
 		}
@@ -849,12 +849,12 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 			ReduceToOutput(qReduceOutput))
 
 		g.Go(func() error {
-			return errors.Wrap(worker.Run(ctx), "reduce worker")
+			return pkgerrors.Wrap(worker.Run(ctx), "reduce worker")
 		})
 	}
 
 	if err := g.Wait(); err != nil {
-		return "", errors.Wrap(err, "pipeline error")
+		return "", pkgerrors.Wrap(err, "pipeline error")
 	}
 
 	return qReduceOutput, nil

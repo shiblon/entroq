@@ -17,7 +17,7 @@ import (
 	"entrogo.com/entroq/subq"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
-	"github.com/pkg/errors"
+	pkgerrors "github.com/pkg/errors"
 )
 
 func escp(p string) string {
@@ -143,7 +143,7 @@ func Opener(hostPort string, opts ...PGOpt) entroq.BackendOpener {
 	return func(ctx context.Context) (entroq.Backend, error) {
 		u, err := url.Parse("postgres://" + hostPort)
 		if err != nil {
-			return nil, errors.Wrapf(err, "failed to parse hostport %q", hostPort)
+			return nil, pkgerrors.Wrapf(err, "failed to parse hostport %q", hostPort)
 		}
 		host := u.Hostname()
 		port := u.Port()
@@ -192,7 +192,7 @@ func Opener(hostPort string, opts ...PGOpt) entroq.BackendOpener {
 
 		db, err := sql.Open("postgres", connStr)
 		if err != nil {
-			return nil, errors.Wrap(err, "failed to open postgres DB")
+			return nil, pkgerrors.Wrap(err, "failed to open postgres DB")
 		}
 		for i := 0; i < options.attempts; i++ {
 			if err = db.PingContext(ctx); err == nil {
@@ -201,12 +201,12 @@ func Opener(hostPort string, opts ...PGOpt) entroq.BackendOpener {
 			if i < options.attempts-1 {
 				select {
 				case <-ctx.Done():
-					return nil, errors.Wrap(ctx.Err(), "pg opener")
+					return nil, pkgerrors.Wrap(ctx.Err(), "pg opener")
 				case <-time.After(5 * time.Second):
 				}
 			}
 		}
-		return nil, errors.Wrap(err, "time out postgres init")
+		return nil, pkgerrors.Wrap(err, "time out postgres init")
 	}
 }
 
@@ -238,14 +238,14 @@ func New(ctx context.Context, db *sql.DB, nw entroq.NotifyWaiter) (*backend, err
 		return nil, io.EOF
 	}
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to initialize database")
+		return nil, pkgerrors.Wrap(err, "failed to initialize database")
 	}
 	return b, nil
 }
 
 // Close closes the underlying database connection.
 func (b *backend) Close() error {
-	return errors.Wrap(b.db.Close(), "pg backend close")
+	return pkgerrors.Wrap(b.db.Close(), "pg backend close")
 }
 
 // initDB sets up the database to have the appropriate tables and necessary
@@ -276,7 +276,7 @@ func (b *backend) initDB(ctx context.Context) error {
 		CREATE INDEX IF NOT EXISTS byQueue ON tasks (queue);
 		CREATE INDEX IF NOT EXISTS byQueueAt ON tasks (queue, at);
 	`)
-	return errors.Wrap(err, "initDB")
+	return pkgerrors.Wrap(err, "initDB")
 }
 
 // Queues returns the queues and their sizes.
@@ -321,7 +321,7 @@ func (b *backend) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[s
 
 	rows, err := b.db.QueryContext(ctx, q, values...)
 	if err != nil {
-		return nil, errors.Wrap(err, "queue names")
+		return nil, pkgerrors.Wrap(err, "queue names")
 	}
 
 	defer rows.Close()
@@ -335,7 +335,7 @@ func (b *backend) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[s
 			maxClaims int
 		)
 		if err := rows.Scan(&q, &count, &claimed, &available, &maxClaims); err != nil {
-			return nil, errors.Wrap(err, "row scan")
+			return nil, pkgerrors.Wrap(err, "row scan")
 		}
 		queues[q] = &entroq.QueueStat{
 			Name:      q,
@@ -346,7 +346,7 @@ func (b *backend) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[s
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, errors.Wrap(err, "queue iteration")
+		return nil, pkgerrors.Wrap(err, "queue iteration")
 	}
 	return queues, nil
 }
@@ -383,14 +383,14 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 
 	rows, err := b.db.QueryContext(ctx, q, values...)
 	if err != nil {
-		return nil, errors.Wrapf(err, "queue tasks %q", tq.Queue)
+		return nil, pkgerrors.Wrapf(err, "queue tasks %q", tq.Queue)
 	}
 	defer rows.Close()
 	var tasks []*entroq.Task
 	for rows.Next() {
 		t := &entroq.Task{}
 		if err := rows.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Created, &t.Modified, &t.Claimant, &t.Value, &t.Claims, &t.Attempt, &t.Err); err != nil {
-			return nil, errors.Wrap(err, "task scan")
+			return nil, pkgerrors.Wrap(err, "task scan")
 		}
 		// NOTE: we can make this more efficient by not even asking for the
 		// value, but it complicates the code a lot and may not be worth the
@@ -401,7 +401,7 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 		tasks = append(tasks, t)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, errors.Wrapf(err, "queue task iteration %q", tq.Queue)
+		return nil, pkgerrors.Wrapf(err, "queue task iteration %q", tq.Queue)
 	}
 	return tasks, nil
 }
@@ -431,7 +431,7 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 	for _, q := range qs {
 		t, err := b.tryClaimOne(ctx, q, cq)
 		if err != nil {
-			return nil, errors.Wrap(err, "try claim")
+			return nil, pkgerrors.Wrap(err, "try claim")
 		}
 		if t != nil {
 			return t, nil
@@ -446,7 +446,7 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 func (b *backend) tryClaimOne(ctx context.Context, q string, cq *entroq.ClaimQuery) (*entroq.Task, error) {
 	task := new(entroq.Task)
 	if cq.Duration == 0 {
-		return nil, errors.Errorf("no duration set for claim %q", cq.Queues)
+		return nil, pkgerrors.Errorf("no duration set for claim %q", cq.Queues)
 	}
 	now := time.Now()
 
@@ -489,7 +489,7 @@ func (b *backend) tryClaimOne(ctx context.Context, q string, cq *entroq.ClaimQue
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
-		return nil, errors.Wrap(err, "claim update")
+		return nil, pkgerrors.Wrap(err, "claim update")
 	}
 
 	return task, nil
@@ -499,7 +499,7 @@ func isSerialization(err error) bool {
 	if err == nil {
 		return false
 	}
-	e, ok := errors.Cause(err).(*pq.Error)
+	e, ok := pkgerrors.Cause(err).(*pq.Error)
 	return ok && e.Code == "40001"
 }
 
@@ -519,11 +519,11 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 		}
 		if _, ok := entroq.AsDependency(err); ok {
 			// We know what's wrong, no reason to retry.
-			return nil, nil, errors.Wrap(err, "pg modify dependency")
+			return nil, nil, pkgerrors.Wrap(err, "pg modify dependency")
 		}
 		if !isSerialization(err) {
 			// We didn't get a retryable serialization error, return.
-			return nil, nil, errors.Wrap(err, "pg modify unknown")
+			return nil, nil, pkgerrors.Wrap(err, "pg modify unknown")
 		}
 		// Serialization error - go around again.
 		time.Sleep(time.Second)
@@ -539,7 +539,7 @@ func (b *backend) modify(ctx context.Context, mod *entroq.Modification) (inserte
 	now := time.Now()
 	tx, err := b.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "failed to start transaction")
+		return nil, nil, pkgerrors.Wrap(err, "failed to start transaction")
 	}
 	defer func() {
 		if err != nil {
@@ -553,11 +553,11 @@ func (b *backend) modify(ctx context.Context, mod *entroq.Modification) (inserte
 
 	foundDeps, err := depQuery(ctx, tx, mod)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "get deps")
+		return nil, nil, pkgerrors.Wrap(err, "get deps")
 	}
 
 	if err := mod.DependencyError(foundDeps); err != nil {
-		return nil, nil, errors.Wrap(err, "dependency issue found")
+		return nil, nil, pkgerrors.Wrap(err, "dependency issue found")
 	}
 
 	// Once we get here, we know that all of the dependencies were present.
@@ -566,7 +566,7 @@ func (b *backend) modify(ctx context.Context, mod *entroq.Modification) (inserte
 	for _, tid := range mod.Deletes {
 		q := "DELETE FROM tasks WHERE id = $1 AND version = $2"
 		if _, err := tx.ExecContext(ctx, q, tid.ID, tid.Version); err != nil {
-			return nil, nil, errors.Wrapf(err, "pg modify delete %s", tid)
+			return nil, nil, pkgerrors.Wrapf(err, "pg modify delete %s", tid)
 		}
 	}
 
@@ -588,7 +588,7 @@ func (b *backend) modify(ctx context.Context, mod *entroq.Modification) (inserte
 			RETURNING id, version, queue, at, claimant, value, created, modified, attempt, err
 		`, id, 0, ins.Queue, at, mod.Claimant, ins.Value, now, now, ins.Attempt, ins.Err)
 		if err := row.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Claimant, &t.Value, &t.Created, &t.Modified, &t.Attempt, &t.Err); err != nil {
-			return nil, nil, errors.Wrap(err, "pg modify insert scan")
+			return nil, nil, pkgerrors.Wrap(err, "pg modify insert scan")
 		}
 		inserted = append(inserted, t)
 	}
@@ -601,7 +601,7 @@ func (b *backend) modify(ctx context.Context, mod *entroq.Modification) (inserte
 			RETURNING id, version, queue, at, claimant, modified, created, value, attempt, err
 		`, now, chg.Queue, chg.At, chg.Value, chg.Attempt, chg.Err, chg.ID, chg.Version)
 		if err := row.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Claimant, &t.Modified, &t.Created, &t.Value, &t.Attempt, &t.Err); err != nil {
-			return nil, nil, errors.Wrapf(err, "pg modify update scan %s", chg.ID)
+			return nil, nil, pkgerrors.Wrapf(err, "pg modify update scan %s", chg.ID)
 		}
 		changed = append(changed, t)
 	}
@@ -620,7 +620,7 @@ func depQuery(ctx context.Context, tx *sql.Tx, m *entroq.Modification) (map[uuid
 	// all deletes, and update all changes.
 	dependencies, err := m.AllDependencies()
 	if err != nil {
-		return nil, errors.Wrap(err, "pg dep query")
+		return nil, pkgerrors.Wrap(err, "pg dep query")
 	}
 
 	foundDeps := make(map[uuid.UUID]*entroq.Task)
@@ -642,21 +642,21 @@ func depQuery(ctx context.Context, tx *sql.Tx, m *entroq.Modification) (map[uuid
 		WHERE id = any($1) FOR UPDATE
 	`, pq.Array(strIDs))
 	if err != nil {
-		return nil, errors.Wrap(err, "pg dep query")
+		return nil, pkgerrors.Wrap(err, "pg dep query")
 	}
 	defer rows.Close()
 	for rows.Next() {
 		t := new(entroq.Task)
 		if err := rows.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Claimant, &t.Value, &t.Created, &t.Modified, &t.Attempt, &t.Err); err != nil {
-			return nil, errors.Wrap(err, "pg dep scan")
+			return nil, pkgerrors.Wrap(err, "pg dep scan")
 		}
 		if foundDeps[t.ID] != nil {
-			return nil, errors.Errorf("pg duplicate ID %q found", t.ID)
+			return nil, pkgerrors.Errorf("pg duplicate ID %q found", t.ID)
 		}
 		foundDeps[t.ID] = t
 	}
 	if err := rows.Err(); err != nil {
-		return nil, errors.Wrap(err, "pg dep iteration")
+		return nil, pkgerrors.Wrap(err, "pg dep iteration")
 	}
 
 	return foundDeps, nil
@@ -667,7 +667,7 @@ func (b *backend) Time(ctx context.Context) (time.Time, error) {
 	row := b.db.QueryRowContext(ctx, "SELECT now()")
 	var t time.Time
 	if err := row.Scan(&t); err != nil {
-		return time.Time{}, errors.Wrap(err, "postgres time")
+		return time.Time{}, pkgerrors.Wrap(err, "postgres time")
 	}
 	return t, nil
 }

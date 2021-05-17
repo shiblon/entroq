@@ -17,7 +17,7 @@ import (
 	"entrogo.com/entroq/subq"
 	"entrogo.com/stuffedio/wal"
 	"github.com/google/uuid"
-	"github.com/pkg/errors"
+	pkgerrors "github.com/pkg/errors"
 )
 
 type EQMem struct {
@@ -144,7 +144,7 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 			wal.WithSnapshotLoaderFunc(func(ctx context.Context, b []byte) error {
 				task := new(entroq.Task)
 				if err := json.Unmarshal(b, task); err != nil {
-					return errors.Wrap(err, "eqmem load task")
+					return pkgerrors.Wrap(err, "eqmem load task")
 				}
 
 				var ql *qLock
@@ -165,7 +165,7 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 			wal.WithJournalPlayerFunc(func(ctx context.Context, b []byte) error {
 				mod := new(entroq.Modification)
 				if err := json.Unmarshal(b, mod); err != nil {
-					return errors.Wrap(err, "eqmem play mod")
+					return pkgerrors.Wrap(err, "eqmem play mod")
 				}
 
 				// Since changes represent the *final state* in the journal, we
@@ -176,14 +176,14 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 				}
 
 				if _, _, err := m.modifyImpl(ctx, mod, true); err != nil {
-					return errors.Wrap(err, "eqmem play mod")
+					return pkgerrors.Wrap(err, "eqmem play mod")
 				}
 				return nil
 			}),
 		}
 		var err error
 		if m.journal, err = wal.Open(ctx, m.journalDir, walOpts...); err != nil {
-			return nil, errors.Wrap(err, "open WAL")
+			return nil, pkgerrors.Wrap(err, "open WAL")
 		}
 
 		// Now it's loaded. If we are to output a snapshot, then we create it
@@ -194,7 +194,7 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 				return m, nil
 			}
 			if _, err := m.journal.CreateSnapshot(m.makeSnapshot); err != nil {
-				return nil, errors.Wrap(err, "output snapshot")
+				return nil, pkgerrors.Wrap(err, "output snapshot")
 			}
 		}
 	}
@@ -208,12 +208,12 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 func TakeSnapshot(ctx context.Context, journalDir string, cleanup bool) error {
 	m, err := New(ctx, WithJournal(journalDir), withOutputSnapshot())
 	if err != nil {
-		return errors.Wrap(err, "load for snapshot")
+		return pkgerrors.Wrap(err, "load for snapshot")
 	}
 	defer m.Close()
 	if cleanup {
 		if err := wal.Cleanup(journalDir); err != nil {
-			return errors.Wrap(err, "snapshot cleanup")
+			return pkgerrors.Wrap(err, "snapshot cleanup")
 		}
 	}
 	return nil
@@ -225,11 +225,11 @@ func (m *EQMem) makeSnapshot(a wal.ValueAdder) error {
 		ts.Range(func(_ uuid.UUID, t *entroq.Task) bool {
 			var b []byte
 			if b, err = json.Marshal(t); err != nil {
-				err = errors.Wrap(err, "marshal for snapshot")
+				err = pkgerrors.Wrap(err, "marshal for snapshot")
 				return false
 			}
 			if err = a.AddValue(b); err != nil {
-				err = errors.Wrap(err, "add value")
+				err = pkgerrors.Wrap(err, "add value")
 				return false
 			}
 			return true
@@ -351,7 +351,7 @@ func (m *EQMem) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Ta
 
 	now, err := m.Time(ctx)
 	if err != nil {
-		return nil, errors.Wrap(err, "eqmem claim time")
+		return nil, pkgerrors.Wrap(err, "eqmem claim time")
 	}
 
 	// Shuffle to avoid favoring one queue.
@@ -571,7 +571,7 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 		// journal), then only throw an error if we have something other than
 		// claim problems or something other than a dependency error.
 		if !ignoreClaimant || !ok || !depErr.OnlyClaims() {
-			return nil, nil, errors.Wrap(err, "eqmem modify")
+			return nil, nil, pkgerrors.Wrap(err, "eqmem modify")
 		}
 	}
 
@@ -598,7 +598,7 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 
 	now, err := m.Time(ctx)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "modify get time")
+		return nil, nil, pkgerrors.Wrap(err, "modify get time")
 	}
 
 	for _, d := range mod.Deletes {
@@ -674,10 +674,10 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 		}
 		b, err := json.Marshal(jMod)
 		if err != nil {
-			return nil, nil, errors.Wrap(err, "eqmem modify marshal")
+			return nil, nil, pkgerrors.Wrap(err, "eqmem modify marshal")
 		}
 		if err := m.journal.Append(b); err != nil {
-			return nil, nil, errors.Wrap(err, "eqmem modify journal")
+			return nil, nil, pkgerrors.Wrap(err, "eqmem modify journal")
 		}
 	}
 
@@ -714,7 +714,7 @@ func (m *EQMem) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Tas
 
 	now, err := m.Time(ctx)
 	if err != nil {
-		return nil, errors.Wrap(err, "eqmem tasks time")
+		return nil, pkgerrors.Wrap(err, "eqmem tasks time")
 	}
 
 	var found []*entroq.Task
@@ -800,7 +800,7 @@ func (m *EQMem) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[string]
 func (m *EQMem) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[string]*entroq.QueueStat, error) {
 	now, err := m.Time(ctx)
 	if err != nil {
-		return nil, errors.Wrap(err, "queue stats time")
+		return nil, pkgerrors.Wrap(err, "queue stats time")
 	}
 	var qnames []string
 	func() {
