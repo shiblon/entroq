@@ -1,6 +1,6 @@
-// Package pg provides an entroq.Backend using PostgreSQL. Use Opener with
+// Package eqpg provides an entroq.Backend using PostgreSQL. Use Opener with
 // entroq.New to create a task client that talks to a PostgreSQL backend.
-package pg // import "entrogo.com/entroq/pg"
+package eqpg // import "entrogo.com/entroq/backend/eqpg"
 
 import (
 	"context"
