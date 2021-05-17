@@ -245,7 +245,10 @@ func New(ctx context.Context, db *sql.DB, nw entroq.NotifyWaiter) (*backend, err
 
 // Close closes the underlying database connection.
 func (b *backend) Close() error {
-	return fmt.Errorf("pg backend close: %w", b.db.Close())
+	if err := b.db.Close(); err != nil {
+		return fmt.Errorf("pg backend close: %w", err)
+	}
+	return nil
 }
 
 // initDB sets up the database to have the appropriate tables and necessary
@@ -276,7 +279,10 @@ func (b *backend) initDB(ctx context.Context) error {
 		CREATE INDEX IF NOT EXISTS byQueue ON tasks (queue);
 		CREATE INDEX IF NOT EXISTS byQueueAt ON tasks (queue, at);
 	`)
-	return fmt.Errorf("initDB: %w", err)
+	if err != nil {
+		return fmt.Errorf("initDB: %w", err)
+	}
+	return nil
 }
 
 // Queues returns the queues and their sizes.
