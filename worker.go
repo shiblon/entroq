@@ -4,11 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"time"
 
 	"github.com/google/uuid"
-	pkgerrors "github.com/pkg/errors"
 )
 
 // DefaultRetryDelay is the amount by which to advance the arrival time when a
@@ -212,10 +212,10 @@ func (w *Worker) moveTaskWithError(ctx context.Context, task *Task, newQ string,
 		}
 		newVal, err := json.Marshal(&ErrorTaskValue{Task: task, Err: taskErr.Error()})
 		if err != nil {
-			return pkgerrors.Wrapf(err, "trying to marshal movable task with own error: %q", taskErr)
+			return fmt.Errorf("trying to marshal movable task with own error: %q: %w", taskErr, err)
 		}
 		if _, _, err := w.eqc.Modify(ctx, task.AsDeletion(), InsertingInto(newQ, WithValue(newVal))); err != nil {
-			return pkgerrors.Wrapf(err, "trying to insert movable task with own error: %q", taskErr)
+			return fmt.Errorf("trying to insert movable task with own error: %q: %w", taskErr, err)
 		}
 		return nil
 	}
@@ -224,7 +224,7 @@ func (w *Worker) moveTaskWithError(ctx context.Context, task *Task, newQ string,
 		changeArgs = append(changeArgs, AttemptToNext())
 	}
 	if _, _, err := w.eqc.Modify(ctx, task.AsChange(changeArgs...)); err != nil {
-		return pkgerrors.Wrapf(err, "trying to modify attempts and error message for moving task: %q", taskErr)
+		return fmt.Errorf("trying to modify attempts and error message for moving task: %q: %w", taskErr, err)
 	}
 	return nil
 }
@@ -236,19 +236,19 @@ func (w *Worker) moveTaskWithError(ctx context.Context, task *Task, newQ string,
 // updated.
 func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 	if len(w.Qs) == 0 {
-		return pkgerrors.New("No queues specified to work on")
+		return fmt.Errorf("No queues specified to work on")
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			return pkgerrors.Wrap(ctx.Err(), "worker quit")
+			return fmt.Errorf("worker quit: %w", ctx.Err())
 		default:
 		}
 
 		task, err := w.eqc.Claim(ctx, From(w.Qs...), ClaimFor(w.lease))
 		if err != nil {
-			return pkgerrors.Wrapf(err, "worker claim (%q)", w.Qs)
+			return fmt.Errorf("worker claim (%q): %w", w.Qs, err)
 		}
 
 		errQ := w.ErrQMap(task.Queue)
@@ -257,7 +257,7 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 		renewed, workErr := w.eqc.DoWithRenew(ctx, task, w.lease, func(ctx context.Context) error {
 			var err error
 			if args, err = f(ctx, task); err != nil {
-				return pkgerrors.Wrapf(err, "work (%q)", w.Qs)
+				return fmt.Errorf("work (%q): %w", w.Qs, err)
 			}
 			return nil
 		})
@@ -284,7 +284,7 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 					// Move instead - we retried enough times already.
 					log.Printf("Worker max attempts reached, moving to %q instead of retrying: %v", errQ, workErr)
 					if err := w.moveTaskWithError(ctx, renewed, errQ, workErr, true); err != nil {
-						return pkgerrors.Wrap(err, "move work task instead of retry")
+						return fmt.Errorf("move work task instead of retry: %w", err)
 					}
 				} else {
 					// Can retry. Increment attempts and move on.
@@ -292,7 +292,7 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 						ErrTo(taskErrMsg(workErr)),
 						AttemptToNext(),
 						ArrivalTimeBy(w.baseRetryDelay))); err != nil {
-						return pkgerrors.Wrap(err, "retry task")
+						return fmt.Errorf("retry task: %w", err)
 					}
 				}
 				continue
@@ -305,18 +305,18 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 				}
 
 				if err := w.moveTaskWithError(ctx, renewed, errQ, workErr, false); err != nil {
-					return pkgerrors.Wrap(err, "move work task")
+					return fmt.Errorf("move work task: %w", err)
 				}
 				continue
 			}
-			return pkgerrors.Wrap(workErr, "worker error")
+			return fmt.Errorf("worker error: %w", workErr)
 		}
 
 		modification := NewModification(uuid.Nil, args...)
 		for _, task := range modification.Changes {
 			if task.ID == renewed.ID && task.Version != renewed.Version {
 				if task.Version > renewed.Version {
-					return pkgerrors.Errorf("task updated inside worker body, expected version <= %v, got %v", renewed.Version, task.Version)
+					return fmt.Errorf("task updated inside worker body, expected version <= %v, got %v", renewed.Version, task.Version)
 				}
 				log.Printf("Rewriting change version %v => %v", task.Version, renewed.Version)
 				task.Version = renewed.Version
@@ -325,7 +325,7 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 		for _, id := range modification.Depends {
 			if id.ID == renewed.ID && task.Version != renewed.Version {
 				if task.Version > renewed.Version {
-					return pkgerrors.Errorf("task updated inside worker body, expected version <= %v, got %v", renewed.Version, task.Version)
+					return fmt.Errorf("task updated inside worker body, expected version <= %v, got %v", renewed.Version, task.Version)
 				}
 				log.Printf("Rewriting depend version %v => %v", task.Version, renewed.Version)
 				id.Version = renewed.Version
@@ -334,7 +334,7 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 		for _, id := range modification.Deletes {
 			if id.ID == renewed.ID && task.Version != renewed.Version {
 				if task.Version > renewed.Version {
-					return pkgerrors.Errorf("task updated inside worker body, expected version <= %v, got %v", renewed.Version, task.Version)
+					return fmt.Errorf("task updated inside worker body, expected version <= %v, got %v", renewed.Version, task.Version)
 				}
 				log.Printf("Rewriting delete version %v => %v", task.Version, renewed.Version)
 				id.Version = renewed.Version
@@ -346,7 +346,7 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 				if w.OnDepErr != nil {
 					if err := w.OnDepErr(depErr); err != nil {
 						log.Printf("Dependency error upgraded to fatal: %v", err)
-						return pkgerrors.Wrap(err, "worker depdency error upgraded to fatal")
+						return fmt.Errorf("worker depdency error upgraded to fatal: %w", err)
 					}
 				}
 				log.Printf("Worker ack failed (%q), throwing away: %v", w.Qs, err)
@@ -360,7 +360,7 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 				log.Printf("Worker exiting cleanly (%q) instead of acking: %v", w.Qs, err)
 				return nil
 			}
-			return pkgerrors.Wrapf(err, "worker ack (%q)", w.Qs)
+			return fmt.Errorf("worker ack (%q): %w", w.Qs, err)
 		}
 	}
 }
