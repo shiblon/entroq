@@ -23,7 +23,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"entrogo.com/entroq/pg"
+	"entrogo.com/entroq/backend/eqpg"
 	"entrogo.com/entroq/pkg/authz/opahttp"
 	"entrogo.com/entroq/qsvc"
 	homedir "github.com/mitchellh/go-homedir"
@@ -98,11 +98,11 @@ var rootCmd = &cobra.Command{
 			dbAddr = os.Getenv("PGHOST") + ":" + os.Getenv("PGPORT")
 		}
 
-		opener := pg.Opener(dbAddr,
-			pg.WithDB(dbName),
-			pg.WithUsername(dbUser),
-			pg.WithPassword(dbPass),
-			pg.WithConnectAttempts(attempts),
+		opener := eqpg.Opener(dbAddr,
+			eqpg.WithDB(dbName),
+			eqpg.WithUsername(dbUser),
+			eqpg.WithPassword(dbPass),
+			eqpg.WithConnectAttempts(attempts),
 		)
 
 		svc, err := qsvc.New(ctx, opener, authzOpt)
