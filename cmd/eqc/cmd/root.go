@@ -26,7 +26,7 @@ import (
 	"strings"
 
 	"entrogo.com/entroq"
-	eqgrpc "entrogo.com/entroq/grpc"
+	"entrogo.com/entroq/eqgrpc"
 	homedir "github.com/mitchellh/go-homedir"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"

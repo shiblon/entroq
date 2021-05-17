@@ -1,4 +1,4 @@
-// Package grpc provides a gRPC backend for EntroQ. This is the backend that is
+// Package eqgrpc provides a gRPC backend for EntroQ. This is the backend that is
 // commonly used by clients of an EntroQ task service, set up thus:
 //
 // 	Server:
@@ -21,14 +21,14 @@
 // 		log.Fatalf("Can't start this service")
 // 	}
 //
-// 	s := grpc.NewServer()
+// 	s := eqgrpc.NewServer()
 // 	pb.RegisterEntroQServer(s, svc)
 // 	s.Serve(lis)
 //
 // With the server set up this way, the client simply uses the EntroQ library,
-// hands it the grpc Opener, and they're off:
+// hands it the eqgrpc Opener, and they're off:
 //
-// 	client, err := entroq.New(ctx, grpc.Opener("myhost:54321", grpc.WithInsecure()))
+// 	client, err := entroq.New(ctx, eqgrpc.Opener("myhost:54321", eqgrpc.WithInsecure()))
 //
 // That creates a client library that uses a gRPC connection to do its work.
 // Note that Claim will block on the *client* side doing this instead of
@@ -36,7 +36,7 @@
 // That is actually what we want; rather than hold connections open, we allow
 // the client to poll with exponential backoff. In large-scale systems, this is
 // better behavior.
-package grpc // import "entrogo.com/entroq/grpc"
+package eqgrpc // import "entrogo.com/entroq/backend/eqgrpc"
 
 import (
 	"context"

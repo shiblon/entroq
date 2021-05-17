@@ -23,7 +23,7 @@ import (
 	"strings"
 
 	"entrogo.com/entroq"
-	"entrogo.com/entroq/grpc"
+	"entrogo.com/entroq/backend/eqgrpc"
 	"entrogo.com/entroq/pkg/procworker"
 	homedir "github.com/mitchellh/go-homedir"
 	"github.com/spf13/cobra"
@@ -87,7 +87,7 @@ var rootCmd = &cobra.Command{
 			log.Fatal("No inbox specified.")
 		}
 		ctx := context.Background()
-		eq, err := entroq.New(ctx, grpc.Opener(eqaddr, grpc.WithInsecure()))
+		eq, err := entroq.New(ctx, eqgrpc.Opener(eqaddr, eqgrpc.WithInsecure()))
 		if err != nil {
 			log.Fatalf("Error opening EntroQ service: %v", err)
 		}

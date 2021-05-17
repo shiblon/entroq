@@ -370,12 +370,12 @@ import (
   "context"
 
   "entrogo.com/entroq"
-  "entrogo.com/entroq/grpc"
+  "entrogo.com/entroq/backend/eqgrpc"
 )
 
 func main() {
   ctx := context.Background()
-  eq := entroq.New(ctx, grpc.Opener(":37706"))
+  eq := entroq.New(ctx, eqgrpc.Opener(":37706"))
 
   // Use eq.Modify, eq.Insert, eq.Claim, etc., probably in goroutines.
 }
