@@ -177,7 +177,10 @@ func (e *reducingProxyMapEmitter) Emit(ctx context.Context, key, value []byte) e
 		e.collection = append(e.collection, NewKV(key, value))
 	}()
 
-	return fmt.Errorf("reducing proxy emit: %w", e.reduceAndEmit(ctx, 100))
+	if err := e.reduceAndEmit(ctx, 100); err != nil {
+		return fmt.Errorf("reducing proxy emit: %w", err)
+	}
+	return nil
 }
 
 // AsModifyArgs creates task insertions. This one simply forwards to the target
