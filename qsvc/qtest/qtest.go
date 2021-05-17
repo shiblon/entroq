@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"path"
@@ -311,7 +312,7 @@ func WorkerDependencyHandler(ctx context.Context, t *testing.T, client *entroq.E
 	timesHandled := make(chan int, 1)
 	timesHandled <- 0
 
-	upgradeError := pkgerrors.New("upgraded")
+	upgradeError := errors.New("upgraded")
 
 	leaseTime := 3 * time.Second
 
@@ -349,7 +350,7 @@ func WorkerDependencyHandler(ctx context.Context, t *testing.T, client *entroq.E
 		return []entroq.ModifyArg{task.AsDeletion(), entroq.DependingOn(uuid.New(), 0, entroq.WithIDQueue("no queue"))}, nil
 	})
 
-	if pkgerrors.Cause(err) != upgradeError {
+	if !errors.Is(err, upgradeError) {
 		t.Fatalf("Expected upgrade error, got %v", err)
 	}
 
