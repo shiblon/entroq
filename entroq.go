@@ -835,18 +835,6 @@ type SetRenewedTasker interface {
 	SetRenewedTask(...*Task)
 }
 
-func asSetRenewedTasker(err error) (SetRenewedTasker, bool) {
-	if err == nil {
-		return nil, false
-	}
-	for e := err; e != nil; e = errors.Unwrap(e) {
-		if rterr, ok := e.(SetRenewedTasker); ok {
-			return rterr, true
-		}
-	}
-	return nil, false
-}
-
 // DoWithRenewAll runs the provided function while keeping all given tasks leases renewed.
 func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.Duration, f func(context.Context) error) ([]*Task, error) {
 	g, ctx := errgroup.WithContext(ctx)
@@ -879,7 +867,8 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.D
 	if err := g.Wait(); err != nil {
 		// Pass on renewed task if the error coming out wants us to.
 		// Make sure to get the underlying error, since it may have been wrapped.
-		if rterr, ok := asSetRenewedTasker(err); ok {
+		var rterr SetRenewedTasker
+		if errors.As(err, &rterr) {
 			rterr.SetRenewedTask(renewed...)
 		}
 		return nil, fmt.Errorf("renew all: %w", err)
