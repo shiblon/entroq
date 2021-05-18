@@ -531,8 +531,6 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 	}
 
 	runWorkerOneCase := func(ctx context.Context, c tc) {
-		t.Helper()
-
 		const leaseTime = 5 * time.Second
 
 		w := client.NewWorker(c.input.Queue).WithOpts(
@@ -639,7 +637,9 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 	// Feed test cases one at a time to the worker, wait for empty, then
 	// depending on desired outcomes, check error queue for expected value.
 	for _, test := range cases {
-		runWorkerOneCase(ctx, test)
+		t.Run("case="+test.name, func(*testing.T) {
+			runWorkerOneCase(ctx, test)
+		})
 	}
 }
 
