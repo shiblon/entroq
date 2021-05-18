@@ -799,7 +799,7 @@ func (c *EntroQ) RenewFor(ctx context.Context, task *Task, duration time.Duratio
 
 // RenewAllFor attempts to renew all given tasks' leases (update arrival times)
 // for the given duration. Returns the new tasks.
-func (c *EntroQ) RenewAllFor(ctx context.Context, tasks []*Task, duration time.Duration) ([]*Task, error) {
+func (c *EntroQ) RenewAllFor(ctx context.Context, tasks []*Task, duration time.Duration) (result []*Task, err error) {
 	if len(tasks) == 0 {
 		return nil, nil
 	}
@@ -837,12 +837,44 @@ type SetRenewedTasker interface {
 
 // DoWithRenewAll runs the provided function while keeping all given tasks leases renewed.
 func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.Duration, f func(context.Context) error) ([]*Task, error) {
-	g, ctx := errgroup.WithContext(ctx)
+	// The use of contexts is subtle, here. There are cases where a gRPC client
+	// context cancelation can result in a delayed call to the server that
+	// actually makes it there. There appears, in other words, to be a race
+	// condition between client cancelation and actual server calls.
+	//
+	// What this means that we can't use two goroutines in this group, one for
+	// each of renewal and user-defined calls, because we can get into a
+	// situation where the following sequence happens:
+	//
+	// - task is renewed
+	// - just before the user function finished (closing doneCh), another renewal is started
+	// - user function finishes before the server call goes out
+	// - context is canceled, client call is canceled
+	// - but the call is already en route to the server
+	//
+	// In this case, the renewed value comes back to us for the first renewal,
+	// but the second is detached and we don't have its version anymore, so we
+	// send back the wrong task version and any attempt to change it fails.
+	//
+	// Thus, we use a special group context that can be canceled after a
+	// blocking renewal loop exits with an error. If it exits cleanly, then it
+	// got a signal from the completion of the user function already.
+	//
+	// This means that the only thing that really cancels the renewal loop is
+	// cancelation of the *parent context*, which will also cancel the user
+	// function and an appropriate error will be returned to the caller (who
+	// canceled this to begin with).
+	g, gctx := errgroup.WithContext(ctx)
+	gctx, cancelGroup := context.WithCancel(gctx)
 
 	doneCh := make(chan struct{})
+	g.Go(func() error {
+		defer close(doneCh)
+		return f(gctx)
+	})
 
 	renewed := tasks
-	g.Go(func() error {
+	if err := func() error {
 		for {
 			select {
 			case <-doneCh:
@@ -857,12 +889,10 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.D
 				renewed = r
 			}
 		}
-	})
-
-	g.Go(func() error {
-		defer close(doneCh)
-		return f(ctx)
-	})
+	}(); err != nil && !IsCanceled(err) {
+		cancelGroup() // Terminate the user-provided function early.
+		return nil, fmt.Errorf("renew loop: %w", err)
+	}
 
 	if err := g.Wait(); err != nil {
 		// Pass on renewed task if the error coming out wants us to.
