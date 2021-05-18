@@ -289,6 +289,14 @@ type QueuesQuery struct {
 	Limit int
 }
 
+func newQueuesQuery(opts ...QueuesOpt) *QueuesQuery {
+	q := new(QueuesQuery)
+	for _, opt := range opts {
+		opt(q)
+	}
+	return q
+}
+
 // QueueStat holds high-level information about a queue.
 // Note that available + claimed may not add up to size. This is because a task
 // can be unavailable (AT in the future) without being claimed by anyone.
@@ -534,19 +542,13 @@ func (c *EntroQ) ID() uuid.UUID {
 
 // Queues returns a mapping from all queue names to their task counts.
 func (c *EntroQ) Queues(ctx context.Context, opts ...QueuesOpt) (map[string]int, error) {
-	query := new(QueuesQuery)
-	for _, opt := range opts {
-		opt(query)
-	}
+	query := newQueuesQuery(opts...)
 	return c.backend.Queues(ctx, query)
 }
 
 // QueueStats returns a mapping from queue names to task stats.
 func (c *EntroQ) QueueStats(ctx context.Context, opts ...QueuesOpt) (map[string]*QueueStat, error) {
-	query := new(QueuesQuery)
-	for _, opt := range opts {
-		opt(query)
-	}
+	query := newQueuesQuery(opts...)
 	return c.backend.QueueStats(ctx, query)
 }
 
@@ -556,6 +558,7 @@ func (c *EntroQ) QueuesEmpty(ctx context.Context, opts ...QueuesOpt) (bool, erro
 	if len(opts) == 0 {
 		return false, fmt.Errorf("empty check: no queue options specified")
 	}
+
 	qs, err := c.Queues(ctx, opts...)
 	if err != nil {
 		return false, fmt.Errorf("empty check: %w", err)
@@ -859,10 +862,11 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.D
 			case <-ctx.Done():
 				return fmt.Errorf("renew all stopped: %w", ctx.Err())
 			case <-time.After(lease / 2):
-				var err error
-				if renewed, err = c.RenewAllFor(ctx, renewed, lease); err != nil {
+				r, err := c.RenewAllFor(ctx, renewed, lease)
+				if err != nil {
 					return fmt.Errorf("renew all lease: %w", err)
 				}
+				renewed = r
 			}
 		}
 	})
