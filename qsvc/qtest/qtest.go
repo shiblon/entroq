@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"path"
 	"strings"
@@ -532,18 +533,18 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 	runWorkerOneCase := func(ctx context.Context, c tc) {
 		t.Helper()
 
-		const leaseTime = 15 * time.Second
+		const leaseTime = 5 * time.Second
 
 		w := client.NewWorker(c.input.Queue).WithOpts(
 			entroq.WithWrappedMove(c.wrapped),
 			entroq.WithLease(leaseTime),
 		)
 
-		ctx, cancel := context.WithTimeout(ctx, 4*leaseTime)
+		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 		g, gctx := errgroup.WithContext(ctx)
 		g.Go(func() error {
-			err := w.Run(gctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
+			if err := w.Run(gctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
 				switch string(task.Value) {
 				case "die":
 					return nil, fmt.Errorf("task asked to die")
@@ -554,13 +555,17 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 					case <-time.After(leaseTime):
 						return nil, entroq.NewMoveTaskError(fmt.Errorf("task asked to move after renewal"))
 					case <-ctx.Done():
-						return nil, fmt.Errorf("oops - test %q too too long, gave up before finishing: %w", c.name, ctx.Err())
+						return nil, fmt.Errorf("oops - test %q took too long, gave up before finishing: %w", c.name, ctx.Err())
 					}
 				default:
 					return []entroq.ModifyArg{task.AsDeletion()}, nil
 				}
-			})
-			return err
+			}); err != nil && !entroq.IsCanceled(err) {
+				// Log quickly so we can see it before waits fail below.
+				log.Printf("Worker Run error: %v", err)
+				return err
+			}
+			return nil
 		})
 
 		if _, _, err := client.Modify(ctx, entroq.InsertingInto(c.input.Queue,
