@@ -709,7 +709,9 @@ func From(qs ...string) ClaimOpt {
 
 func asStatusCode(err error) (codes.Code, bool) {
 	// We have to sequentially unwrap errors to find the underlying cause,
-	// since the status package does not expose its error type.
+	// since the status package does not expose its error type and the
+	// GRPCStatus interface is ephemeral and clearly meant to be an
+	// implementation detail in that package.
 	for e := err; e != nil; e = errors.Unwrap(e) {
 		if code := status.Code(e); code != codes.Unknown {
 			return code, true
