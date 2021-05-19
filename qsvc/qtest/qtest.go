@@ -634,12 +634,19 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		}
 	}
 
+	stressCount := 30
+	if testing.Short() {
+		stressCount = 1
+	}
+
 	// Feed test cases one at a time to the worker, wait for empty, then
 	// depending on desired outcomes, check error queue for expected value.
 	for _, test := range cases {
-		t.Run("case="+test.name, func(*testing.T) {
-			runWorkerOneCase(ctx, test)
-		})
+		for i := 0; i < stressCount; i++ {
+			t.Run(fmt.Sprintf("case=%v-%v", test.name, i), func(*testing.T) {
+				runWorkerOneCase(ctx, test)
+			})
+		}
 	}
 }
 
