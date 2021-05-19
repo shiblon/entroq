@@ -256,6 +256,9 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 		var args []ModifyArg
 		renewed, workErr := w.eqc.DoWithRenew(ctx, task, w.lease, func(ctx context.Context) error {
 			var err error
+			// TODO: capture Move errors here instead of passing them all the way through the renew function.
+			// A Move error can go through the renew function as a nil error, and renewals can be captured here.
+			// This allows us to remove all the complicated "pass renewals through the error" logic.
 			if args, err = f(ctx, task); err != nil {
 				return fmt.Errorf("work (%q): %w", w.Qs, err)
 			}
