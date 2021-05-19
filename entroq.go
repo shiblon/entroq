@@ -824,17 +824,6 @@ func (c *EntroQ) RenewAllFor(ctx context.Context, tasks []*Task, duration time.D
 	return changed, nil
 }
 
-// SetRenewedTasker matches errors that contain information about the "latest version" of a task.
-// This is used, for example, in DoWithRenewAll. If an error matching this
-// interface is passed back from its "do" function, that error contains
-// information about the final renewed task(s), which will contain the latest
-// version information. This can be used to do final modifications on the task,
-// which would otherwise fail because the original task has new "renewed"
-// versions over time.
-type SetRenewedTasker interface {
-	SetRenewedTask(...*Task)
-}
-
 // DoWithRenewAll runs the provided function while keeping all given tasks leases renewed.
 func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.Duration, f func(context.Context) error) ([]*Task, error) {
 	// The use of contexts is subtle, here. There are cases where a gRPC client
@@ -895,12 +884,6 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.D
 	}
 
 	if err := g.Wait(); err != nil {
-		// Pass on renewed task if the error coming out wants us to.
-		// Make sure to get the underlying error, since it may have been wrapped.
-		var rterr SetRenewedTasker
-		if errors.As(err, &rterr) {
-			rterr.SetRenewedTask(renewed...)
-		}
 		return nil, fmt.Errorf("renew all: %w", err)
 	}
 
