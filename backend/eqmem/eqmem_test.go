@@ -137,6 +137,9 @@ func TestEQMemMapReduce_checkLarge(t *testing.T) {
 }
 
 func TestEQMemMapReduce_checkHuge(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping huge MR test in short testing mode.")
+	}
 	config := &quick.Config{
 		MaxCount: 5,
 		Values: func(values []reflect.Value, rand *rand.Rand) {
