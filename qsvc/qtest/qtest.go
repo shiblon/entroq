@@ -4,7 +4,6 @@ package qtest // import "entrogo.com/entroq/qsvc/qtest"
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -483,18 +482,16 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 	}
 }
 
-// WorkerMoveOnError tests that workers that have MoveTaskError results
-// move the task into an error queue with the expected wrapper and don't just
-// crash.
+// WorkerMoveOnError tests that workers that have MoveTaskError results,
+// causing tasks to be moved instead of crashing.
 func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	baseQueue := path.Join(qPrefix, "move_on_error")
 
 	type tc struct {
-		name    string
-		input   *entroq.Task
-		die     bool
-		moved   bool
-		wrapped bool
+		name  string
+		input *entroq.Task
+		die   bool
+		moved bool
 	}
 
 	newTask := func(val string) *entroq.Task {
@@ -513,13 +510,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 			die:   true,
 		},
 		{
-			name:    "move-wrapped",
-			input:   newTask("move"),
-			moved:   true,
-			wrapped: true,
-		},
-		{
-			name:  "move-not-wrapped",
+			name:  "move",
 			input: newTask("move"),
 			moved: true,
 		},
@@ -534,7 +525,6 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		const leaseTime = 5 * time.Second
 
 		w := client.NewWorker(c.input.Queue).WithOpts(
-			entroq.WithWrappedMove(c.wrapped),
 			entroq.WithLease(leaseTime),
 		)
 
@@ -596,26 +586,12 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		}
 		var foundTask *entroq.Task
 		for _, task := range errTasks {
-			if c.wrapped {
-				et := new(entroq.ErrorTaskValue)
-				if err := json.Unmarshal(task.Value, et); err != nil {
-					t.Fatalf("Test %q failed to unmarshal error task value %q: %v", c.name, string(task.Value), err)
+			if task.ID == c.input.ID {
+				foundTask = task
+				if !strings.Contains(foundTask.Err, "asked to move") {
+					t.Fatalf("Test %q expected moved task to have a move error, had %q", c.name, foundTask.Err)
 				}
-				if et.Task.ID == c.input.ID {
-					foundTask = et.Task
-					if !strings.Contains(et.Err, "asked to move") {
-						t.Fatalf("Test %q expected moved wrapped task to have an error, but had %q", c.name, et.Err)
-					}
-					break
-				}
-			} else {
-				if task.ID == c.input.ID {
-					foundTask = task
-					if !strings.Contains(foundTask.Err, "asked to move") {
-						t.Fatalf("Test %q expected moved task to have a move error, had %q", c.name, foundTask.Err)
-					}
-					break
-				}
+				break
 			}
 		}
 		if c.moved && foundTask == nil {
