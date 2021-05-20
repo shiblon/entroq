@@ -74,6 +74,12 @@ func NewMoveTaskError(err error) *MoveTaskError {
 	return &MoveTaskError{Err: err}
 }
 
+// MoveTaskErrorf creates a MoveTaskError given a format string and values,
+// just like fmt.Errorf.
+func MoveTaskErrorf(format string, values ...interface{}) *MoveTaskError {
+	return NewMoveTaskError(fmt.Errorf(format, values...))
+}
+
 // Error produces an error string.
 func (e *MoveTaskError) Error() string {
 	return e.Err.Error()
@@ -90,6 +96,12 @@ type RetryTaskError struct {
 // NewRetryTaskError creates a new RetryTaskError from the given error.
 func NewRetryTaskError(err error) *RetryTaskError {
 	return &RetryTaskError{Err: err}
+}
+
+// RetryTaskErrorf creates a RetryTaskError in the same way that you would
+// create an error with fmt.Errorf.
+func RetryTaskErrorf(format string, values ...interface{}) *RetryTaskError {
+	return NewRetryTaskError(fmt.Errorf(format, values...))
 }
 
 // Error produces an error string.
