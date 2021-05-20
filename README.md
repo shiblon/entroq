@@ -421,49 +421,30 @@ impossible, just not done).
 
 ### Starting a PostgreSQL Instance
 
-If you wish to start an EntroQ service backed by PostgreSQL, you have two easy
-options: run a container with the database and the EntroQ service both inside of
-it, or run the database and EntroQ service separately.
+If you wish to start an EntroQ service backed by PostgreSQL, you can run the
+database and EntroQ service in containers on the same Docker network fairly
+easily.
 
 Note that no matter how you run things, there is no need to create any tables
 in your database. The EntroQ service checks for the existence of a `tasks`
 table and creates it if it is not present. It is also carefully set up to
 update older tables when newer versions are deployed.
 
-If running the service and database in the same container, you can choose one
-of the images at Docker Hub with the tag prefix `pg-`. For example, you might
-choose to run
-
-```
-shiblon/entroq:pg-v0.3
-```
-
-This starts a container with both postgres and the
-EntroQ service running next to one another, communicating via the container's
-local network. The base image is a PostgreSQL image, so any environment
-variables you would normally use to configure the database are available to
-you. You can also mount a filesystem at `/var/lib/postgresql/data` to get
-persistence across container restarts. The EntroQ service is exposed on port
-37706.
-
 The `eqc` command-line utility is included in the `entroq` container, so you
 can play around with it using `docker exec`.
 
-If the container's name is stored in `$container`, then you can run
+If you are using version 0.7, for example, you can run
 
 ```
-docker exec $container eqc --help
+docker exec shiblon/entroq:v0.7 eqc --help
 ```
 
-If you prefer to have the EntroQ service and database running in separate
-containers, an example `docker-compose` file is shown below that should give
+An example `docker-compose` file is shown below that should give
 you the idea of how they interoperate.
 
 Note that we use `/tmp` for the example below. This is not recommended in
 production for obvious reasons, but should illuminate the way things fit
-together. Note that the image name does not include the `pg-` tag prefix
-in the example below: the image containing a database is not needed in this
-case.
+together.
 
 ```yaml
 version: "3"
@@ -478,7 +459,7 @@ services:
       - /tmp/postgres/data:/var/lib/postgresql/data
 
   queue:
-    image: "shiblon/entroq:v0.5"
+    image: "shiblon/entroq:v0.7"
     depends_on:
       - database
     deploy:
