@@ -23,11 +23,10 @@ import (
 	"os"
 	"path/filepath"
 
-	"entrogo.com/entroq/pg"
+	"entrogo.com/entroq/backend/eqpg"
 	"entrogo.com/entroq/pkg/authz/opahttp"
 	"entrogo.com/entroq/qsvc"
 	homedir "github.com/mitchellh/go-homedir"
-	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -98,16 +97,16 @@ var rootCmd = &cobra.Command{
 			dbAddr = os.Getenv("PGHOST") + ":" + os.Getenv("PGPORT")
 		}
 
-		opener := pg.Opener(dbAddr,
-			pg.WithDB(dbName),
-			pg.WithUsername(dbUser),
-			pg.WithPassword(dbPass),
-			pg.WithConnectAttempts(attempts),
+		opener := eqpg.Opener(dbAddr,
+			eqpg.WithDB(dbName),
+			eqpg.WithUsername(dbUser),
+			eqpg.WithPassword(dbPass),
+			eqpg.WithConnectAttempts(attempts),
 		)
 
 		svc, err := qsvc.New(ctx, opener, authzOpt)
 		if err != nil {
-			return errors.Wrap(err, "failed to open pg backend")
+			return fmt.Errorf("failed to open pg backend: %w", err)
 		}
 		defer svc.Close()
 
@@ -118,7 +117,7 @@ var rootCmd = &cobra.Command{
 
 		lis, err := net.Listen("tcp", fmt.Sprintf("[::]:%d", port))
 		if err != nil {
-			return errors.Wrapf(err, "error listening on port %d", port)
+			return fmt.Errorf("error listening on port %d: %w", port, err)
 		}
 
 		s := grpc.NewServer(

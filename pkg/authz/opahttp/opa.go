@@ -5,12 +5,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
 
 	"entrogo.com/entroq/pkg/authz"
-	"github.com/pkg/errors"
 )
 
 const (
@@ -86,7 +86,7 @@ func (a *OPA) fullURL() string {
 // which queues and actions were not satisfied.
 func (a *OPA) Authorize(ctx context.Context, req *authz.Request) error {
 	if !a.allowTestUser && req.Authz.TestUser != "" {
-		return errors.New("insecure test user present, but not allowed")
+		return fmt.Errorf("insecure test user present, but not allowed")
 	}
 
 	body := map[string]*authz.Request{
@@ -95,25 +95,25 @@ func (a *OPA) Authorize(ctx context.Context, req *authz.Request) error {
 
 	b, err := json.Marshal(body)
 	if err != nil {
-		return errors.Wrap(err, "authorize")
+		return fmt.Errorf("authorize: %w", err)
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.fullURL(), bytes.NewBuffer(b))
 	if err != nil {
-		return errors.Wrap(err, "authorize")
+		return fmt.Errorf("authorize: %w", err)
 	}
 	httpReq.Header.Add("Content-Type", "application/json")
 	httpReq.Header.Add("Authorization", req.Authz.String())
 
 	resp, err := http.DefaultClient.Do(httpReq)
 	if err != nil {
-		return errors.Wrap(err, "authorize")
+		return fmt.Errorf("authorize: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return errors.Wrap(err, "no read")
+		return fmt.Errorf("no read: %w", err)
 	}
 
 	type authzResp struct {
@@ -121,7 +121,7 @@ func (a *OPA) Authorize(ctx context.Context, req *authz.Request) error {
 	}
 	result := new(authzResp)
 	if err := json.NewDecoder(bytes.NewBuffer(respBytes)).Decode(result); err != nil {
-		return errors.Wrap(err, "authorize")
+		return fmt.Errorf("authorize: %w", err)
 	}
 
 	// Check result value.

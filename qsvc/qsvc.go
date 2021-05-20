@@ -6,7 +6,7 @@
 // 		"log"
 // 		"net"
 //
-// 		"entrogo.com/entroq/pg"
+// 		"entrogo.com/entroq/backend/eqpg"
 // 		"entrogo.com/entroq/qsvc"
 // 		pb "entrogo.com/entroq/proto"
 //
@@ -21,7 +21,7 @@
 // 			log.Fatalf("Failed to listen: %v", err)
 // 		}
 //
-//		svc, err := qsvc.New(ctx, pg.Opener("localhost:5432", "postgres", "postgres", false))
+//		svc, err := qsvc.New(ctx, eqpg.Opener("localhost:5432", "postgres", "postgres", false))
 //		if err != nil {
 //			log.Fatalf("Failed to open service backends: %v", err)
 //		}
@@ -34,6 +34,7 @@ package qsvc // import "entrogo.com/entroq/qsvc"
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -42,7 +43,6 @@ import (
 	"entrogo.com/entroq/pkg/authz"
 	"github.com/golang/protobuf/proto"
 	"github.com/google/uuid"
-	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"google.golang.org/grpc/codes"
@@ -116,7 +116,7 @@ func WithAuthorizer(az authz.Authorizer) Option {
 func New(ctx context.Context, opener entroq.BackendOpener, opts ...Option) (*QSvc, error) {
 	impl, err := entroq.New(ctx, opener)
 	if err != nil {
-		return nil, errors.Wrap(err, "qsvc backend client")
+		return nil, fmt.Errorf("qsvc backend client: %w", err)
 	}
 
 	// Note that you should *never* use a background context like this unless
@@ -154,7 +154,10 @@ func New(ctx context.Context, opener entroq.BackendOpener, opts ...Option) (*QSv
 // Close closes the backend connections and flushes the connection free.
 func (s *QSvc) Close() error {
 	s.metricCancel() // Don't bother waiting for it
-	return errors.Wrap(s.impl.Close(), "qsvc close")
+	if err := s.impl.Close(); err != nil {
+		return fmt.Errorf("qsvc close: %w", err)
+	}
+	return nil
 }
 
 // Authorize attempts to authorize an action.
@@ -167,9 +170,8 @@ func (s *QSvc) Authorize(ctx context.Context, req *authz.Request) error {
 	// be unpacked and round-tripped through the grpc transport.
 	if err := s.az.Authorize(ctx, req); err != nil {
 		var details []proto.Message
-		// TODO: unwrap after converting to fmt-friendly unwrap instead of pkgerrors unwrap.
-		authzErr, ok := err.(*authz.AuthzError)
-		if !ok {
+		authzErr := new(authz.AuthzError)
+		if !errors.As(err, &authzErr) {
 			return status.New(codes.PermissionDenied, fmt.Sprintf("unknown authz error: %v", err)).Err()
 		}
 
@@ -222,7 +224,7 @@ func (s *QSvc) Authorize(ctx context.Context, req *authz.Request) error {
 func (s *QSvc) RefreshMetrics(ctx context.Context) error {
 	stats, err := s.impl.QueueStats(ctx)
 	if err != nil {
-		return errors.Wrap(err, "refresh metrics")
+		return fmt.Errorf("refresh metrics: %w", err)
 	}
 
 	// Clear it out, then repopulate.
@@ -261,11 +263,8 @@ func protoFromTask(t *entroq.Task) *pb.Task {
 	}
 }
 
-func wrapErrorf(err error, format string, vals ...interface{}) error {
-	if err == nil {
-		return nil
-	}
-	err = errors.Wrapf(err, format, vals...)
+func autoCodeErrorf(format string, vals ...interface{}) error {
+	err := fmt.Errorf(format, vals...)
 	if entroq.IsTimeout(err) {
 		return status.New(codes.DeadlineExceeded, err.Error()).Err()
 	}
@@ -275,8 +274,8 @@ func wrapErrorf(err error, format string, vals ...interface{}) error {
 	return err
 }
 
-func codeErrorf(code codes.Code, err error, format string, vals ...interface{}) error {
-	return status.New(code, errors.Wrapf(err, format, vals...).Error()).Err()
+func codeErrorf(code codes.Code, format string, vals ...interface{}) error {
+	return status.New(code, fmt.Errorf(format, vals...).Error()).Err()
 }
 
 // authzToken gets the Authorization token from headers (grpc context) if present, otherwise blank.
@@ -372,7 +371,7 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 
 	claimant, err := uuid.Parse(req.ClaimantId)
 	if err != nil {
-		return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse claimant ID")
+		return nil, codeErrorf(codes.InvalidArgument, "failed to parse claimant ID: %w", err)
 	}
 	duration := time.Duration(req.DurationMs) * time.Millisecond
 	pollTime := time.Duration(0)
@@ -386,7 +385,7 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 		entroq.ClaimAs(claimant),
 		entroq.ClaimPollTime(pollTime))
 	if err != nil {
-		return nil, wrapErrorf(err, "qsvc claim")
+		return nil, autoCodeErrorf("qsvc claim: %w", err)
 	}
 	if task == nil {
 		return new(pb.ClaimResponse), nil
@@ -408,7 +407,7 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 
 	claimant, err := uuid.Parse(req.ClaimantId)
 	if err != nil {
-		return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse claimant ID")
+		return nil, codeErrorf(codes.InvalidArgument, "failed to parse claimant ID: %w", err)
 	}
 	duration := time.Duration(req.DurationMs) * time.Millisecond
 	task, err := s.impl.TryClaim(ctx,
@@ -416,7 +415,7 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 		entroq.ClaimFor(duration),
 		entroq.ClaimAs(claimant))
 	if err != nil {
-		return nil, wrapErrorf(err, "try claim")
+		return nil, autoCodeErrorf("try claim: %w", err)
 	}
 	if task == nil {
 		return new(pb.ClaimResponse), nil
@@ -438,7 +437,7 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 
 	claimant, err := uuid.Parse(req.ClaimantId)
 	if err != nil {
-		return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse claimant ID")
+		return nil, codeErrorf(codes.InvalidArgument, "failed to parse claimant ID: %w", err)
 	}
 	modArgs := []entroq.ModifyArg{
 		entroq.ModifyAs(claimant),
@@ -450,7 +449,7 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 		)
 		if insert.Id != "" {
 			if id, err = uuid.Parse(insert.Id); err != nil {
-				return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse explicit insertion ID")
+				return nil, codeErrorf(codes.InvalidArgument, "failed to parse explicit insertion ID: %w", err)
 			}
 		}
 		modArgs = append(modArgs,
@@ -464,7 +463,7 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 	for _, change := range req.Changes {
 		id, err := uuid.Parse(change.GetOldId().Id)
 		if err != nil {
-			return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse change id")
+			return nil, codeErrorf(codes.InvalidArgument, "failed to parse change id: %w", err)
 		}
 		t := &entroq.Task{
 			ID:        id,
@@ -482,14 +481,14 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 	for _, del := range req.Deletes {
 		id, err := uuid.Parse(del.Id)
 		if err != nil {
-			return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse deletion id")
+			return nil, codeErrorf(codes.InvalidArgument, "failed to parse deletion id: %w", err)
 		}
 		modArgs = append(modArgs, entroq.Deleting(id, del.Version, entroq.WithIDQueue(del.Queue)))
 	}
 	for _, dep := range req.Depends {
 		id, err := uuid.Parse(dep.Id)
 		if err != nil {
-			return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse depency id")
+			return nil, codeErrorf(codes.InvalidArgument, "failed to parse depency id: %w", err)
 		}
 		modArgs = append(modArgs, entroq.DependingOn(id, dep.Version, entroq.WithIDQueue(dep.Queue)))
 	}
@@ -519,11 +518,11 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 
 			stat, sErr := status.New(codes.NotFound, "modification dependency error").WithDetails(details...)
 			if sErr != nil {
-				return nil, codeErrorf(codes.NotFound, sErr, "dependency failed, and failed to add details %v", err)
+				return nil, codeErrorf(codes.NotFound, "dependency failed, and failed to add details %v: %w", err, sErr)
 			}
 			return nil, stat.Err()
 		}
-		return nil, wrapErrorf(err, "modification failed")
+		return nil, autoCodeErrorf("modification failed: %w", err)
 	}
 	// Assemble the response.
 	resp := new(pb.ModifyResponse)
@@ -545,7 +544,7 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 	if req.ClaimantId != "" {
 		var err error
 		if claimant, err = uuid.Parse(req.ClaimantId); err != nil {
-			return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse claimant ID")
+			return nil, codeErrorf(codes.InvalidArgument, "failed to parse claimant ID: %w", err)
 		}
 	}
 	// Claimant will only really be limited if it is nonzero.
@@ -554,7 +553,7 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 	for _, sID := range req.TaskId {
 		id, err := uuid.Parse(sID)
 		if err != nil {
-			return nil, codeErrorf(codes.InvalidArgument, err, "invalid task ID: %q", sID)
+			return nil, codeErrorf(codes.InvalidArgument, "invalid task ID %q: %w", sID)
 		}
 		ids = append(ids, id)
 	}
@@ -568,7 +567,7 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 	}
 	tasks, err := s.impl.Tasks(ctx, req.Queue, opts...)
 	if err != nil {
-		return nil, wrapErrorf(err, "failed to get tasks")
+		return nil, autoCodeErrorf("failed to get tasks: %w", err)
 	}
 	resp := new(pb.TasksResponse)
 	for _, task := range tasks {
@@ -580,7 +579,7 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 func (s *QSvc) StreamTasks(req *pb.TasksRequest, stream pb.EntroQ_StreamTasksServer) error {
 	resp, err := s.Tasks(stream.Context(), req)
 	if err != nil {
-		return wrapErrorf(err, "get tasks to stream")
+		return autoCodeErrorf("get tasks to stream: %w", err)
 	}
 
 	// Note, we send a full TasksResponse each time because there might be
@@ -588,7 +587,7 @@ func (s *QSvc) StreamTasks(req *pb.TasksRequest, stream pb.EntroQ_StreamTasksSer
 	// future-proof.
 	for _, task := range resp.Tasks {
 		if err := stream.Send(&pb.TasksResponse{Tasks: []*pb.Task{task}}); err != nil {
-			return wrapErrorf(err, "send stream tasks")
+			return autoCodeErrorf("send stream tasks: %w", err)
 		}
 	}
 	return nil
@@ -601,7 +600,7 @@ func (s *QSvc) Queues(ctx context.Context, req *pb.QueuesRequest) (*pb.QueuesRes
 		entroq.MatchExact(req.MatchExact...),
 		entroq.LimitQueues(int(req.Limit)))
 	if err != nil {
-		return nil, wrapErrorf(err, "failed to get queues")
+		return nil, autoCodeErrorf("failed to get queues: %w", err)
 	}
 	resp := new(pb.QueuesResponse)
 	for name, count := range queueMap {
@@ -620,7 +619,7 @@ func (s *QSvc) QueueStats(ctx context.Context, req *pb.QueuesRequest) (*pb.Queue
 		entroq.MatchExact(req.MatchExact...),
 		entroq.LimitQueues(int(req.Limit)))
 	if err != nil {
-		return nil, wrapErrorf(err, "failed to get queues")
+		return nil, autoCodeErrorf("failed to get queues: %w", err)
 	}
 	resp := new(pb.QueuesResponse)
 	for _, stat := range queueMap {
