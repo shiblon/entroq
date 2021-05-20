@@ -267,7 +267,7 @@ func wrapErrorf(err error, format string, vals ...interface{}) error {
 	if err == nil {
 		return nil
 	}
-	err = fmt.Errorf(format, append(vals, err)...)
+	err = fmt.Errorf(format+": %w", append(vals, err)...)
 	if entroq.IsTimeout(err) {
 		return status.New(codes.DeadlineExceeded, err.Error()).Err()
 	}
