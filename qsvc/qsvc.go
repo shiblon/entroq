@@ -263,11 +263,8 @@ func protoFromTask(t *entroq.Task) *pb.Task {
 	}
 }
 
-func wrapErrorf(err error, format string, vals ...interface{}) error {
-	if err == nil {
-		return nil
-	}
-	err = fmt.Errorf(format+": %w", append(vals, err)...)
+func wrapErrorf(format string, vals ...interface{}) error {
+	err := fmt.Errorf(format, vals...)
 	if entroq.IsTimeout(err) {
 		return status.New(codes.DeadlineExceeded, err.Error()).Err()
 	}
@@ -388,7 +385,7 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 		entroq.ClaimAs(claimant),
 		entroq.ClaimPollTime(pollTime))
 	if err != nil {
-		return nil, wrapErrorf(err, "qsvc claim")
+		return nil, wrapErrorf("qsvc claim: %w", err)
 	}
 	if task == nil {
 		return new(pb.ClaimResponse), nil
@@ -418,7 +415,7 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 		entroq.ClaimFor(duration),
 		entroq.ClaimAs(claimant))
 	if err != nil {
-		return nil, wrapErrorf(err, "try claim")
+		return nil, wrapErrorf("try claim: %w", err)
 	}
 	if task == nil {
 		return new(pb.ClaimResponse), nil
@@ -525,7 +522,7 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 			}
 			return nil, stat.Err()
 		}
-		return nil, wrapErrorf(err, "modification failed")
+		return nil, wrapErrorf("modification failed: %w", err)
 	}
 	// Assemble the response.
 	resp := new(pb.ModifyResponse)
@@ -570,7 +567,7 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 	}
 	tasks, err := s.impl.Tasks(ctx, req.Queue, opts...)
 	if err != nil {
-		return nil, wrapErrorf(err, "failed to get tasks")
+		return nil, wrapErrorf("failed to get tasks: %w", err)
 	}
 	resp := new(pb.TasksResponse)
 	for _, task := range tasks {
@@ -582,7 +579,7 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 func (s *QSvc) StreamTasks(req *pb.TasksRequest, stream pb.EntroQ_StreamTasksServer) error {
 	resp, err := s.Tasks(stream.Context(), req)
 	if err != nil {
-		return wrapErrorf(err, "get tasks to stream")
+		return wrapErrorf("get tasks to stream: %w", err)
 	}
 
 	// Note, we send a full TasksResponse each time because there might be
@@ -590,7 +587,7 @@ func (s *QSvc) StreamTasks(req *pb.TasksRequest, stream pb.EntroQ_StreamTasksSer
 	// future-proof.
 	for _, task := range resp.Tasks {
 		if err := stream.Send(&pb.TasksResponse{Tasks: []*pb.Task{task}}); err != nil {
-			return wrapErrorf(err, "send stream tasks")
+			return wrapErrorf("send stream tasks: %w", err)
 		}
 	}
 	return nil
@@ -603,7 +600,7 @@ func (s *QSvc) Queues(ctx context.Context, req *pb.QueuesRequest) (*pb.QueuesRes
 		entroq.MatchExact(req.MatchExact...),
 		entroq.LimitQueues(int(req.Limit)))
 	if err != nil {
-		return nil, wrapErrorf(err, "failed to get queues")
+		return nil, wrapErrorf("failed to get queues: %w", err)
 	}
 	resp := new(pb.QueuesResponse)
 	for name, count := range queueMap {
@@ -622,7 +619,7 @@ func (s *QSvc) QueueStats(ctx context.Context, req *pb.QueuesRequest) (*pb.Queue
 		entroq.MatchExact(req.MatchExact...),
 		entroq.LimitQueues(int(req.Limit)))
 	if err != nil {
-		return nil, wrapErrorf(err, "failed to get queues")
+		return nil, wrapErrorf("failed to get queues: %w", err)
 	}
 	resp := new(pb.QueuesResponse)
 	for _, stat := range queueMap {
