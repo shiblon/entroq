@@ -505,8 +505,7 @@ func isSerialization(err error) bool {
 	if err == nil {
 		return false
 	}
-	pgerr := new(pq.Error)
-	if ok := errors.As(err, pgerr); ok {
+	if pgerr := new(pq.Error); errors.As(err, pgerr) {
 		return pgerr.Code == "40001"
 	}
 	return false

@@ -277,10 +277,7 @@ func wrapErrorf(err error, format string, vals ...interface{}) error {
 	return err
 }
 
-func codeErrorf(code codes.Code, err error, format string, vals ...interface{}) error {
-	if err != nil {
-		return nil
-	}
+func codeErrorf(code codes.Code, format string, vals ...interface{}) error {
 	return status.New(code, fmt.Errorf(format, vals...).Error()).Err()
 }
 
@@ -377,7 +374,7 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 
 	claimant, err := uuid.Parse(req.ClaimantId)
 	if err != nil {
-		return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse claimant ID")
+		return nil, codeErrorf(codes.InvalidArgument, "failed to parse claimant ID: %w", err)
 	}
 	duration := time.Duration(req.DurationMs) * time.Millisecond
 	pollTime := time.Duration(0)
@@ -413,7 +410,7 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 
 	claimant, err := uuid.Parse(req.ClaimantId)
 	if err != nil {
-		return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse claimant ID")
+		return nil, codeErrorf(codes.InvalidArgument, "failed to parse claimant ID: %w", err)
 	}
 	duration := time.Duration(req.DurationMs) * time.Millisecond
 	task, err := s.impl.TryClaim(ctx,
@@ -443,7 +440,7 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 
 	claimant, err := uuid.Parse(req.ClaimantId)
 	if err != nil {
-		return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse claimant ID")
+		return nil, codeErrorf(codes.InvalidArgument, "failed to parse claimant ID: %w", err)
 	}
 	modArgs := []entroq.ModifyArg{
 		entroq.ModifyAs(claimant),
@@ -455,7 +452,7 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 		)
 		if insert.Id != "" {
 			if id, err = uuid.Parse(insert.Id); err != nil {
-				return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse explicit insertion ID")
+				return nil, codeErrorf(codes.InvalidArgument, "failed to parse explicit insertion ID: %w", err)
 			}
 		}
 		modArgs = append(modArgs,
@@ -469,7 +466,7 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 	for _, change := range req.Changes {
 		id, err := uuid.Parse(change.GetOldId().Id)
 		if err != nil {
-			return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse change id")
+			return nil, codeErrorf(codes.InvalidArgument, "failed to parse change id: %w", err)
 		}
 		t := &entroq.Task{
 			ID:        id,
@@ -487,14 +484,14 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 	for _, del := range req.Deletes {
 		id, err := uuid.Parse(del.Id)
 		if err != nil {
-			return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse deletion id")
+			return nil, codeErrorf(codes.InvalidArgument, "failed to parse deletion id: %w", err)
 		}
 		modArgs = append(modArgs, entroq.Deleting(id, del.Version, entroq.WithIDQueue(del.Queue)))
 	}
 	for _, dep := range req.Depends {
 		id, err := uuid.Parse(dep.Id)
 		if err != nil {
-			return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse depency id")
+			return nil, codeErrorf(codes.InvalidArgument, "failed to parse depency id: %w", err)
 		}
 		modArgs = append(modArgs, entroq.DependingOn(id, dep.Version, entroq.WithIDQueue(dep.Queue)))
 	}
@@ -524,7 +521,7 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 
 			stat, sErr := status.New(codes.NotFound, "modification dependency error").WithDetails(details...)
 			if sErr != nil {
-				return nil, codeErrorf(codes.NotFound, sErr, "dependency failed, and failed to add details %v", err)
+				return nil, codeErrorf(codes.NotFound, "dependency failed, and failed to add details %v: %w", err, sErr)
 			}
 			return nil, stat.Err()
 		}
@@ -550,7 +547,7 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 	if req.ClaimantId != "" {
 		var err error
 		if claimant, err = uuid.Parse(req.ClaimantId); err != nil {
-			return nil, codeErrorf(codes.InvalidArgument, err, "failed to parse claimant ID")
+			return nil, codeErrorf(codes.InvalidArgument, "failed to parse claimant ID: %w", err)
 		}
 	}
 	// Claimant will only really be limited if it is nonzero.
@@ -559,7 +556,7 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 	for _, sID := range req.TaskId {
 		id, err := uuid.Parse(sID)
 		if err != nil {
-			return nil, codeErrorf(codes.InvalidArgument, err, "invalid task ID: %q", sID)
+			return nil, codeErrorf(codes.InvalidArgument, "invalid task ID %q: %w", sID)
 		}
 		ids = append(ids, id)
 	}
