@@ -4,8 +4,9 @@ package qtest // import "entrogo.com/entroq/qsvc/qtest"
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"net"
 	"path"
 	"strings"
@@ -13,11 +14,10 @@ import (
 	"time"
 
 	"entrogo.com/entroq"
-	grpcbackend "entrogo.com/entroq/grpc"
+	"entrogo.com/entroq/backend/eqgrpc"
 	"entrogo.com/entroq/qsvc"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/uuid"
-	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
@@ -44,7 +44,7 @@ type Tester func(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 func ClientService(ctx context.Context, opener entroq.BackendOpener) (client *entroq.EntroQ, stop func(), err error) {
 	s, dial, err := StartService(ctx, opener)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "client service")
+		return nil, nil, fmt.Errorf("client service: %w", err)
 	}
 	defer func() {
 		if err != nil {
@@ -52,11 +52,11 @@ func ClientService(ctx context.Context, opener entroq.BackendOpener) (client *en
 		}
 	}()
 
-	client, err = entroq.New(ctx, grpcbackend.Opener("bufnet",
-		grpcbackend.WithNiladicDialer(dial),
-		grpcbackend.WithInsecure()))
+	client, err = entroq.New(ctx, eqgrpc.Opener("bufnet",
+		eqgrpc.WithNiladicDialer(dial),
+		eqgrpc.WithInsecure()))
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "start client on in-memory service")
+		return nil, nil, fmt.Errorf("start client on in-memory service: %w", err)
 	}
 
 	return client, func() {
@@ -70,7 +70,7 @@ func StartService(ctx context.Context, opener entroq.BackendOpener) (*grpc.Serve
 	lis := bufconn.Listen(bufSize)
 	svc, err := qsvc.New(ctx, opener)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "start service")
+		return nil, nil, fmt.Errorf("start service: %w", err)
 	}
 	s := grpc.NewServer()
 	hpb.RegisterHealthServer(s, health.NewServer())
@@ -116,7 +116,7 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 	g.Go(func() error {
 		return client.NewWorker(queue).Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
 			if task.Claims != 1 {
-				return nil, errors.Errorf("worker claim expected claims to be 1, got %d", task.Claims)
+				return nil, fmt.Errorf("worker claim expected claims to be 1, got %d", task.Claims)
 			}
 			consumed = append(consumed, task)
 			return []entroq.ModifyArg{task.AsDeletion()}, nil
@@ -217,7 +217,7 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 			err := w.Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
 				ti++
 				if task.Claims != 1 {
-					return nil, errors.Errorf("worker claim expected to be 1, was %d", task.Claims)
+					return nil, fmt.Errorf("worker claim expected to be 1, was %d", task.Claims)
 				}
 				consumedCh <- task
 				return []entroq.ModifyArg{task.AsDeletion()}, nil
@@ -232,7 +232,7 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	g.Go(func() error {
 		waitCtx, _ := context.WithTimeout(ctx, 1*time.Minute)
 		if err := client.WaitQueuesEmpty(waitCtx, entroq.MatchExact(bigQueue, medQueue, smallQueue)); err != nil {
-			return errors.Wrap(err, "waiting for empty queues")
+			return fmt.Errorf("waiting for empty queues: %w", err)
 		}
 		// All done. Stop the workers.
 		cancel()
@@ -349,7 +349,7 @@ func WorkerDependencyHandler(ctx context.Context, t *testing.T, client *entroq.E
 		return []entroq.ModifyArg{task.AsDeletion(), entroq.DependingOn(uuid.New(), 0, entroq.WithIDQueue("no queue"))}, nil
 	})
 
-	if errors.Cause(err) != upgradeError {
+	if !errors.Is(err, upgradeError) {
 		t.Fatalf("Expected upgrade error, got %v", err)
 	}
 
@@ -424,7 +424,7 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 			return w.Run(gctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
 				// Only attempt this again if it's the first time.
 				if task.Attempt == 0 {
-					return nil, entroq.NewRetryTaskError(errors.Errorf("retry error: %s", string(task.Value)))
+					return nil, entroq.RetryTaskErrorf("retry error: %s", string(task.Value))
 				}
 				// Save it so we know what happened with the retry error, and clean up.
 				retriedTaskCh <- task
@@ -482,18 +482,16 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 	}
 }
 
-// WorkerMoveOnError tests that workers that have MoveTaskError results
-// move the task into an error queue with the expected wrapper and don't just
-// crash.
+// WorkerMoveOnError tests that workers that have MoveTaskError results,
+// causing tasks to be moved instead of crashing.
 func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	baseQueue := path.Join(qPrefix, "move_on_error")
 
 	type tc struct {
-		name    string
-		input   *entroq.Task
-		die     bool
-		moved   bool
-		wrapped bool
+		name  string
+		input *entroq.Task
+		die   bool
+		moved bool
 	}
 
 	newTask := func(val string) *entroq.Task {
@@ -512,13 +510,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 			die:   true,
 		},
 		{
-			name:    "move-wrapped",
-			input:   newTask("move"),
-			moved:   true,
-			wrapped: true,
-		},
-		{
-			name:  "move-not-wrapped",
+			name:  "move",
 			input: newTask("move"),
 			moved: true,
 		},
@@ -530,37 +522,38 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 	}
 
 	runWorkerOneCase := func(ctx context.Context, c tc) {
-		t.Helper()
-
-		const leaseTime = 15 * time.Second
+		const leaseTime = 5 * time.Second
 
 		w := client.NewWorker(c.input.Queue).WithOpts(
-			entroq.WithWrappedMove(c.wrapped),
 			entroq.WithLease(leaseTime),
 		)
 
-		ctx, cancel := context.WithTimeout(ctx, 4*leaseTime)
+		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 		g, gctx := errgroup.WithContext(ctx)
 		g.Go(func() error {
-			err := w.Run(gctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
+			if err := w.Run(gctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
 				switch string(task.Value) {
 				case "die":
-					return nil, errors.New("task asked to die")
+					return nil, fmt.Errorf("task asked to die")
 				case "move":
-					return nil, entroq.NewMoveTaskError(errors.New("task asked to move"))
+					return nil, entroq.MoveTaskErrorf("task asked to move")
 				case "move-wait":
 					select {
 					case <-time.After(leaseTime):
-						return nil, entroq.NewMoveTaskError(errors.New("task asked to move after renewal"))
+						return nil, entroq.MoveTaskErrorf("task asked to move after renewal")
 					case <-ctx.Done():
-						return nil, errors.Wrapf(ctx.Err(), "oops - test %q too too long, gave up before finishing", c.name)
+						return nil, fmt.Errorf("oops - test %q took too long, gave up before finishing: %w", c.name, ctx.Err())
 					}
 				default:
 					return []entroq.ModifyArg{task.AsDeletion()}, nil
 				}
-			})
-			return err
+			}); err != nil && !entroq.IsCanceled(err) {
+				// Log quickly so we can see it before waits fail below.
+				log.Printf("Worker Run error: %v", err)
+				return err
+			}
+			return nil
 		})
 
 		if _, _, err := client.Modify(ctx, entroq.InsertingInto(c.input.Queue,
@@ -593,26 +586,12 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		}
 		var foundTask *entroq.Task
 		for _, task := range errTasks {
-			if c.wrapped {
-				et := new(entroq.ErrorTaskValue)
-				if err := json.Unmarshal(task.Value, et); err != nil {
-					t.Fatalf("Test %q failed to unmarshal error task value %q: %v", c.name, string(task.Value), err)
+			if task.ID == c.input.ID {
+				foundTask = task
+				if !strings.Contains(foundTask.Err, "asked to move") {
+					t.Fatalf("Test %q expected moved task to have a move error, had %q", c.name, foundTask.Err)
 				}
-				if et.Task.ID == c.input.ID {
-					foundTask = et.Task
-					if !strings.Contains(et.Err, "asked to move") {
-						t.Fatalf("Test %q expected moved wrapped task to have an error, but had %q", c.name, et.Err)
-					}
-					break
-				}
-			} else {
-				if task.ID == c.input.ID {
-					foundTask = task
-					if !strings.Contains(foundTask.Err, "asked to move") {
-						t.Fatalf("Test %q expected moved task to have a move error, had %q", c.name, foundTask.Err)
-					}
-					break
-				}
+				break
 			}
 		}
 		if c.moved && foundTask == nil {
@@ -631,10 +610,19 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		}
 	}
 
+	stressCount := 30
+	if testing.Short() {
+		stressCount = 1
+	}
+
 	// Feed test cases one at a time to the worker, wait for empty, then
 	// depending on desired outcomes, check error queue for expected value.
 	for _, test := range cases {
-		runWorkerOneCase(ctx, test)
+		for i := 0; i < stressCount; i++ {
+			t.Run(fmt.Sprintf("case=%v-%v", test.name, i), func(*testing.T) {
+				runWorkerOneCase(ctx, test)
+			})
+		}
 	}
 }
 
@@ -659,7 +647,7 @@ func WorkerRenewal(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPr
 	renewed, err := client.DoWithRenew(ctx, task, 6*time.Second, func(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
-			return errors.Wrap(ctx.Err(), "worker do with renew")
+			return fmt.Errorf("worker do with renew: %w", ctx.Err())
 		case <-time.After(10 * time.Second): // long enough for 3 renewals.
 			return nil
 		}
@@ -1157,14 +1145,14 @@ func QueueStats(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefi
 	}
 
 	want := map[string]*entroq.QueueStat{
-		nothingClaimedQueue: &entroq.QueueStat{
+		nothingClaimedQueue: {
 			Name:      nothingClaimedQueue,
 			Size:      2,
 			Claimed:   0,
 			Available: 2,
 			MaxClaims: 0,
 		},
-		partiallyClaimedQueue: &entroq.QueueStat{
+		partiallyClaimedQueue: {
 			Name:      partiallyClaimedQueue,
 			Size:      3,
 			Claimed:   1,
@@ -1203,7 +1191,7 @@ func EqualAllTasks(want, got []*entroq.Task) string {
 			potentialDiffs = append(potentialDiffs, cmp.Diff(w, g))
 		}
 		if !found {
-			diffs = append(diffs, fmt.Sprintf("Task %v not found, differs from all of these:\n%v", strings.Join(potentialDiffs, "\n")))
+			diffs = append(diffs, fmt.Sprintf("Task %v not found, differs from all of these:\n%v", w, strings.Join(potentialDiffs, "\n")))
 		}
 	}
 	if len(diffs) != 0 {

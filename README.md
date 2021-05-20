@@ -370,12 +370,12 @@ import (
   "context"
 
   "entrogo.com/entroq"
-  "entrogo.com/entroq/grpc"
+  "entrogo.com/entroq/backend/eqgrpc"
 )
 
 func main() {
   ctx := context.Background()
-  eq := entroq.New(ctx, grpc.Opener(":37706"))
+  eq := entroq.New(ctx, eqgrpc.Opener(":37706"))
 
   // Use eq.Modify, eq.Insert, eq.Claim, etc., probably in goroutines.
 }
@@ -397,12 +397,12 @@ import (
   "context"
 
   "entrogo.com/entroq"
-  "entrogo.com/entroq/pg"
+  "entrogo.com/entroq/backend/eqpg"
 )
 
 func main() {
   ctx := context.Background()
-  eq := entroq.New(ctx, pg.Opener(":5432", pg.WithDB("postgres"), pg.WithUsername("myuser")))
+  eq := entroq.New(ctx, eqpg.Opener(":5432", eqpg.WithDB("postgres"), eqpg.WithUsername("myuser")))
   // The above supports other postgres-related parameters, as well.
 
   // Use eq.Modify, eq.Insert, eq.Claim, etc., probably in goroutines.

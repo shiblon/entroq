@@ -137,6 +137,9 @@ func TestEQMemMapReduce_checkLarge(t *testing.T) {
 }
 
 func TestEQMemMapReduce_checkHuge(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping huge MR test in short testing mode.")
+	}
 	config := &quick.Config{
 		MaxCount: 5,
 		Values: func(values []reflect.Value, rand *rand.Rand) {
@@ -194,13 +197,13 @@ func TestEQMemJournalClaim(t *testing.T) {
 	}
 
 	expect := map[string]*entroq.QueueStat{
-		"/queue/of/tasks": &entroq.QueueStat{
+		"/queue/of/tasks": {
 			Name:      "/queue/of/tasks",
 			Claimed:   1,
 			Available: 0,
 			Size:      1,
 		},
-		"/queue/of/others": &entroq.QueueStat{
+		"/queue/of/others": {
 			Name:      "/queue/of/others",
 			Claimed:   0,
 			Available: 1,

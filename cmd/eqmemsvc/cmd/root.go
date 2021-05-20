@@ -15,7 +15,6 @@ import (
 	"entrogo.com/entroq/pkg/authz/opahttp"
 	"entrogo.com/entroq/qsvc"
 	homedir "github.com/mitchellh/go-homedir"
-	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -62,32 +61,32 @@ var rootCmd = &cobra.Command{
 
 		lis, err := net.Listen("tcp", fmt.Sprintf(":%d", flags.port))
 		if err != nil {
-			return errors.Wrapf(err, "error listening on port %d", flags.port)
+			return fmt.Errorf("error listening on port %d: %w", flags.port, err)
 		}
 
 		if flags.journal == "" {
 			if flags.snapshotAndQuit || flags.cleanup || flags.periodicSnapshot != "" || flags.createJournalDir {
-				return errors.Wrap(err, "bad flag: journal settings given, but no journal directory specified")
+				return fmt.Errorf("bad flag: journal settings given, but no journal directory specified: %w", err)
 			}
 		}
 
 		if flags.cleanup && !flags.snapshotAndQuit && flags.periodicSnapshot == "" {
-			return errors.Wrap(err, "bad flag setting: cleanup can only be specified with snapshot functions")
+			return fmt.Errorf("bad flag setting: cleanup can only be specified with snapshot functions: %w", err)
 		}
 
 		if flags.periodicSnapshot != "" && flags.snapshotAndQuit {
-			return errors.Wrap(err, "bad flag setting: periodic_snapshot can't be honored with snapshot_and_quit")
+			return fmt.Errorf("bad flag setting: periodic_snapshot can't be honored with snapshot_and_quit: %w", err)
 		}
 
 		if flags.createJournalDir {
 			if err := os.MkdirAll(flags.journal, 0755); err != nil {
-				return errors.Wrap(err, "can't create journal dir")
+				return fmt.Errorf("can't create journal dir: %w", err)
 			}
 		}
 
 		if flags.snapshotAndQuit {
 			if err := eqmem.TakeSnapshot(ctx, flags.journal, flags.cleanup); err != nil {
-				return errors.Wrapf(err, "take snapshot in %q", flags.journal)
+				return fmt.Errorf("take snapshot in %q: %w", flags.journal, err)
 			}
 			return nil
 		}
@@ -95,7 +94,7 @@ var rootCmd = &cobra.Command{
 		if psf := flags.periodicSnapshot; psf != "" {
 			period, err := time.ParseDuration(psf)
 			if err != nil {
-				return errors.Wrapf(err, "periodic snapshot %q doesn't parse to a duration (use one of 'm', 'h', 'd' units)", psf)
+				return fmt.Errorf("periodic snapshot %q doesn't parse to a duration (use one of 'm', 'h', 'd' units): %w", psf, err)
 			}
 			if period < minSnapshotPeriod {
 				log.Printf("Snapshot period %v smaller than %v: clamping", period, minSnapshotPeriod)
@@ -139,7 +138,7 @@ var rootCmd = &cobra.Command{
 			eqmem.WithMaxJournalItems(flags.journalMaxItems),
 		), authzOpt)
 		if err != nil {
-			return errors.Wrap(err, "failed to open eqmem backend for qsvc")
+			return fmt.Errorf("failed to open eqmem backend for qsvc: %w", err)
 		}
 		defer svc.Close()
 
