@@ -6,7 +6,7 @@
 // 		"log"
 // 		"net"
 //
-// 		"entrogo.com/entroq/pg"
+// 		"entrogo.com/entroq/backend/eqpg"
 // 		"entrogo.com/entroq/qsvc"
 // 		pb "entrogo.com/entroq/proto"
 //
@@ -21,7 +21,7 @@
 // 			log.Fatalf("Failed to listen: %v", err)
 // 		}
 //
-//		svc, err := qsvc.New(ctx, pg.Opener("localhost:5432", "postgres", "postgres", false))
+//		svc, err := qsvc.New(ctx, eqpg.Opener("localhost:5432", "postgres", "postgres", false))
 //		if err != nil {
 //			log.Fatalf("Failed to open service backends: %v", err)
 //		}
