@@ -424,7 +424,7 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 			return w.Run(gctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
 				// Only attempt this again if it's the first time.
 				if task.Attempt == 0 {
-					return nil, entroq.NewRetryTaskError(fmt.Errorf("retry error: %s", string(task.Value)))
+					return nil, entroq.RetryTaskErrorf("retry error: %s", string(task.Value))
 				}
 				// Save it so we know what happened with the retry error, and clean up.
 				retriedTaskCh <- task
@@ -537,11 +537,11 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 				case "die":
 					return nil, fmt.Errorf("task asked to die")
 				case "move":
-					return nil, entroq.NewMoveTaskError(fmt.Errorf("task asked to move"))
+					return nil, entroq.MoveTaskErrorf("task asked to move")
 				case "move-wait":
 					select {
 					case <-time.After(leaseTime):
-						return nil, entroq.NewMoveTaskError(fmt.Errorf("task asked to move after renewal"))
+						return nil, entroq.MoveTaskErrorf("task asked to move after renewal")
 					case <-ctx.Done():
 						return nil, fmt.Errorf("oops - test %q took too long, gave up before finishing: %w", c.name, ctx.Err())
 					}
