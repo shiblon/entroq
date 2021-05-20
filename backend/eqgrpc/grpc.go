@@ -193,7 +193,10 @@ func New(conn *grpc.ClientConn, opts ...Option) (*backend, error) {
 
 // Close closes the underlying connection to the gRPC task service.
 func (b *backend) Close() error {
-	return fmt.Errorf("pg backend close: %w", b.conn.Close())
+	if err := b.conn.Close(); err != nil {
+		return fmt.Errorf("grpc backend close: %w", err)
+	}
+	return nil
 }
 
 // Queues produces a mapping from queue names to queue sizes.
