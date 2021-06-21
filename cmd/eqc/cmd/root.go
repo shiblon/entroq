@@ -36,11 +36,12 @@ import (
 )
 
 var rootFlags struct {
-	cfgFile    string
-	svcAddr    string
-	jsonValue  bool
-	secure     bool
-	authzToken string
+	cfgFile      string
+	svcAddr      string
+	jsonValue    bool
+	secure       bool
+	authzToken   string
+	maxMsgSizeMB int
 }
 
 var eq *entroq.EntroQ
@@ -69,6 +70,10 @@ queue listings, individual task information, etc.`,
 
 		if rootFlags.authzToken != "" {
 			opts = append(opts, eqgrpc.WithBearerToken(rootFlags.authzToken))
+		}
+
+		if size := rootFlags.maxMsgSizeMB; size != 0 {
+			opts = append(opts, eqgrpc.WithMaxSize(size))
 		}
 
 		var err error
@@ -109,6 +114,7 @@ func init() {
 	rootCmd.PersistentFlags().BoolVarP(&rootFlags.jsonValue, "json", "j", false, "Display task values as JSON.")
 	rootCmd.PersistentFlags().BoolVarP(&rootFlags.secure, "secure", "S", false, "Use secure connection.")
 	rootCmd.PersistentFlags().StringVar(&rootFlags.authzToken, "authz_token", "", "Pass an Authorization token.")
+	rootCmd.PersistentFlags().IntVar(&rootFlags.maxMsgSizeMB, "max_msg_size_mb", 10, "Maximum gRPC message size in megabytes.")
 
 	viper.BindPFlag("authz_token", pflag.Lookup("authz_token"))
 }
