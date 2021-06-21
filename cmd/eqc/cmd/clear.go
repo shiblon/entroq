@@ -53,7 +53,7 @@ var clearCmd = &cobra.Command{
 				if empty {
 					break
 				}
-				tasks, err := eq.Tasks(ctx, flagClearQueue, entroq.LimitTasks(100))
+				tasks, err := eq.Tasks(ctx, flagClearQueue, entroq.LimitTasks(100), entroq.OmitValues())
 				if err != nil {
 					log.Fatalf("Failed to get tasks from %q: %v", flagClearQueue, err)
 				}
