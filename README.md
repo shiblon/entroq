@@ -7,7 +7,7 @@ See here for an article explaining how this might fit into your system:
 https://www.datamachines.io/blog/asynchronous-thinking-for-microservice-system-design
 
 The Go components of this package can be found in online documenation for the
-[entrogo.com/entroq](https://pkg.go.dev/entrogo.com/entroq) Go package.
+[github.com/shiblon/entroq](https://pkg.go.dev/github.com/shiblon/entroq) Go package.
 
 Pronounced "Entro-Q" ("Entro-Queue"), as in the letter than comes after
 "Entro-P". We aim to take the next step away from parallel systems chaos. It is
@@ -37,7 +37,7 @@ library to talk to it.
 There is also a command-line client that you can use to talk to the EntroQ
 service:
 
-    go install entrogo.com/entroq/cmd/eqc@latest
+    go install github.com/shiblon/entroq/cmd/eqc@latest
     eqc --help
 
 You can then run `eqc` to talk to an EntroQ service (such as one started in the
@@ -322,8 +322,8 @@ package main
 import (
   "context"
 
-  "entrogo.com/entroq"
-  "entrogo.com/entroq/backend/eqmem"
+  "github.com/shiblon/entroq"
+  "github.com/shiblon/entroq/backend/eqmem"
 )
 
 func main() {
@@ -369,8 +369,8 @@ package main
 import (
   "context"
 
-  "entrogo.com/entroq"
-  "entrogo.com/entroq/backend/eqgrpc"
+  "github.com/shiblon/entroq"
+  "github.com/shiblon/entroq/backend/eqgrpc"
 )
 
 func main() {
@@ -396,8 +396,8 @@ package main
 import (
   "context"
 
-  "entrogo.com/entroq"
-  "entrogo.com/entroq/backend/eqpg"
+  "github.com/shiblon/entroq"
+  "github.com/shiblon/entroq/backend/eqpg"
 )
 
 func main() {

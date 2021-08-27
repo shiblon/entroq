@@ -11,17 +11,17 @@ import (
 	"path/filepath"
 	"time"
 
-	"entrogo.com/entroq/backend/eqmem"
-	"entrogo.com/entroq/pkg/authz/opahttp"
-	"entrogo.com/entroq/qsvc"
 	homedir "github.com/mitchellh/go-homedir"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/shiblon/entroq/backend/eqmem"
+	"github.com/shiblon/entroq/pkg/authz/opahttp"
+	"github.com/shiblon/entroq/qsvc"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 
-	pb "entrogo.com/entroq/proto"
+	pb "github.com/shiblon/entroq/proto"
 	hpb "google.golang.org/grpc/health/grpc_health_v1"
 )
 

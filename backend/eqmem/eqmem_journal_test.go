@@ -6,8 +6,8 @@ import (
 	"log"
 	"os"
 
-	"entrogo.com/entroq"
-	"entrogo.com/entroq/backend/eqmem"
+	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/backend/eqmem"
 )
 
 func Example_journal() {

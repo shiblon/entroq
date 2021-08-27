@@ -14,7 +14,7 @@
 
 package main
 
-import "entrogo.com/entroq/cmd/eqc/cmd"
+import "github.com/shiblon/entroq/cmd/eqc/cmd"
 
 func main() {
 	cmd.Execute()

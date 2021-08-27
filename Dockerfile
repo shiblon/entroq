@@ -6,13 +6,13 @@ FROM golang:1.16-alpine3.13 as builder
 ENV GOBIN /build/bin
 ENV CGO_ENABLED 0
 
-RUN mkdir -p /src/entrogo.com/entroq
-WORKDIR /src/entrogo.com/entroq
+RUN mkdir -p /src/github.com/shiblon/entroq
+WORKDIR /src/github.com/shiblon/entroq
 
-COPY go.mod go.sum /src/entrogo.com/entroq/
+COPY go.mod go.sum /src/github.com/shiblon/entroq/
 RUN go mod download -x
 
-COPY . /src/entrogo.com/entroq/
+COPY . /src/github.com/shiblon/entroq/
 RUN go install -v ./...
 
 # Switch to a smaller container without build tools.
@@ -30,7 +30,7 @@ WORKDIR /go/bin
 # Memory journal location, if needed.
 RUN mkdir -p /data/entroq/journal && chmod -R a+rwx /data
 
-RUN adduser -S -D -H -h /go/src/entrogo.com/entroq -u 100 appuser
+RUN adduser -S -D -H -h /go/src/github.com/shiblon/entroq -u 100 appuser
 USER appuser
 
 VOLUME /data/entroq

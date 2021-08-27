@@ -1,6 +1,6 @@
 // Package subq abstracts the idea of subscribing to a particular queue so that
 // changes can be immediately notified.
-package subq // import "entrogo.com/entroq/subq"
+package subq
 
 import (
 	"context"

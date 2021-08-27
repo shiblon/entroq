@@ -25,9 +25,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"entrogo.com/entroq"
-	"entrogo.com/entroq/backend/eqgrpc"
 	homedir "github.com/mitchellh/go-homedir"
+	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/backend/eqgrpc"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"

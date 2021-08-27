@@ -6,9 +6,10 @@
 // 		"log"
 // 		"net"
 //
-// 		"entrogo.com/entroq/backend/eqpg"
-// 		"entrogo.com/entroq/qsvc"
-// 		pb "entrogo.com/entroq/proto"
+// 		"github.com/shiblon/entroq/backend/eqpg"
+// 		"github.com/shiblon/entroq/qsvc"
+//
+// 		pb "github.com/shiblon/entroq/proto"
 //
 // 		"google.golang.org/grpc"
 // 	)
@@ -30,7 +31,7 @@
 // 		pb.RegisterEntroQServer(s, svc)
 // 		s.Serve(listener)
 // 	}
-package qsvc // import "entrogo.com/entroq/qsvc"
+package qsvc
 
 import (
 	"context"
@@ -39,17 +40,17 @@ import (
 	"log"
 	"time"
 
-	"entrogo.com/entroq"
-	"entrogo.com/entroq/pkg/authz"
 	"github.com/golang/protobuf/proto"
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/authz"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
-	pb "entrogo.com/entroq/proto"
+	pb "github.com/shiblon/entroq/proto"
 )
 
 const (

@@ -18,8 +18,8 @@ import (
 	"context"
 	"log"
 
-	"entrogo.com/entroq"
 	"github.com/google/uuid"
+	"github.com/shiblon/entroq"
 	"github.com/spf13/cobra"
 )
 

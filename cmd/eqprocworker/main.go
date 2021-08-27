@@ -14,7 +14,7 @@
 
 package main
 
-import "entrogo.com/entroq/cmd/eqprocworker/cmd"
+import "github.com/shiblon/entroq/cmd/eqprocworker/cmd"
 
 func main() {
 	cmd.Execute()

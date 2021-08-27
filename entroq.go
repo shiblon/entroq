@@ -15,7 +15,7 @@
 // Package entroq contains the main task queue client and data definitions. The
 // client relies on a backend to implement the actual transactional
 // functionality, the interface for which is also defined here.
-package entroq // import "entrogo.com/entroq"
+package entroq
 
 import (
 	"context"

@@ -2,7 +2,7 @@
 // inside the task manager (no outside files). This limits what it is good for,
 // but makes for a lovely stress test, and shows off some useful task manager
 // interaction patterns.
-package mr // import "entrogo.com/entroq/contrib/mr"
+package mr
 
 import (
 	"bytes"
@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"entrogo.com/entroq"
+	"github.com/shiblon/entroq"
 	"golang.org/x/sync/errgroup"
 )
 

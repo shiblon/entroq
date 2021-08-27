@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"entrogo.com/entroq"
-	"entrogo.com/entroq/backend/eqmem"
 	"github.com/google/go-cmp/cmp"
+	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/backend/eqmem"
 	"golang.org/x/sync/errgroup"
 )
 

@@ -1,5 +1,5 @@
 // Package authz contains standard data structures for representing permissions and authorization requests / responses.
-package authz // import "entrogo.com/entroq/pkg/authz"
+package authz
 
 import (
 	"context"
