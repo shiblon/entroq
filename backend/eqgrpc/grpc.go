@@ -36,7 +36,7 @@
 // That is actually what we want; rather than hold connections open, we allow
 // the client to poll with exponential backoff. In large-scale systems, this is
 // better behavior.
-package eqgrpc // import "entrogo.com/entroq/backend/eqgrpc"
+package eqgrpc
 
 import (
 	"context"
@@ -45,14 +45,14 @@ import (
 	"net"
 	"time"
 
-	"entrogo.com/entroq"
-	"entrogo.com/entroq/pkg/authz"
 	"github.com/google/uuid"
+	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/authz"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	pb "entrogo.com/entroq/proto"
+	pb "github.com/shiblon/entroq/proto"
 	hpb "google.golang.org/grpc/health/grpc_health_v1"
 )
 

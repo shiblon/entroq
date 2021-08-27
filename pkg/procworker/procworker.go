@@ -25,7 +25,7 @@ import (
 	"strings"
 	"time"
 
-	"entrogo.com/entroq"
+	"github.com/shiblon/entroq"
 )
 
 const MaxStdOutSize = 1024 * 1024

@@ -1,5 +1,5 @@
 // Package opahttp implements the authz.Authorizer using an Open Policy Agent (OPA).
-package opahttp // import "entrogo.com/entroq/pkg/authz/opahttp"
+package opahttp
 
 import (
 	"bytes"
@@ -10,7 +10,7 @@ import (
 	"net/http"
 	"strings"
 
-	"entrogo.com/entroq/pkg/authz"
+	"github.com/shiblon/entroq/pkg/authz"
 )
 
 const (

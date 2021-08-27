@@ -1,6 +1,6 @@
 // Package eqpg provides an entroq.Backend using PostgreSQL. Use Opener with
 // entroq.New to create a task client that talks to a PostgreSQL backend.
-package eqpg // import "entrogo.com/entroq/backend/eqpg"
+package eqpg
 
 import (
 	"context"
@@ -14,10 +14,10 @@ import (
 	"strings"
 	"time"
 
-	"entrogo.com/entroq"
-	"entrogo.com/entroq/subq"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
+	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/subq"
 )
 
 func escp(p string) string {

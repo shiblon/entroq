@@ -1,5 +1,5 @@
 // Package queues contains helper functions for manipulation of queue names.
-package queues // import entrogo.com/entroq/pkg/queues
+package queues
 
 import (
 	"path"

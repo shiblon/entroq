@@ -1,7 +1,7 @@
 // Package eqmem implements an in-memory entroq that has fine-grained locking
 // and can handle simultaneously stats/task listing and modifications to a
 // large extent.
-package eqmem // import "entrogo.com/entroq/backend/eqmem"
+package eqmem
 
 import (
 	"context"
@@ -14,10 +14,10 @@ import (
 	"sync"
 	"time"
 
-	"entrogo.com/entroq"
-	"entrogo.com/entroq/subq"
-	"entrogo.com/stuffedio/wal"
 	"github.com/google/uuid"
+	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/subq"
+	"github.com/shiblon/stuffedio/wal"
 )
 
 type EQMem struct {

@@ -21,7 +21,7 @@ import (
 	"log"
 	"time"
 
-	"entrogo.com/entroq"
+	"github.com/shiblon/entroq"
 	"github.com/spf13/cobra"
 )
 

@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"sync"
 
-	"entrogo.com/entroq"
 	"github.com/google/uuid"
+	"github.com/shiblon/entroq"
 )
 
 // taskQueue is a synchronized map of task IDs to task values. It uses a
