@@ -554,7 +554,7 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 	for _, sID := range req.TaskId {
 		id, err := uuid.Parse(sID)
 		if err != nil {
-			return nil, codeErrorf(codes.InvalidArgument, "invalid task ID %q: %w", sID)
+			return nil, codeErrorf(codes.InvalidArgument, "invalid task ID %q: %w", sID, err)
 		}
 		ids = append(ids, id)
 	}
