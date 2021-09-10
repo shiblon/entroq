@@ -31,8 +31,9 @@ type EQMem struct {
 
 	// qByID gets the queue name for a given task ID. This is used to quickly
 	// look up tasks when the queue name is unknown. That should never be the
-	// case, however, since modifications are done on existing tasks, and have
-	// to go through RBAC based on queue names.
+	// case, since modifications are done on existing tasks, and have
+	// to go through RBAC based on queue names, but it is possible to try to
+	// reinsert a task when it has been moved to another queue.
 	qByID map[uuid.UUID]string
 
 	// locks contains lockers for each known queue. The locks know their own
@@ -419,14 +420,24 @@ func ensureModQueues(mod *entroq.Modification, qByID map[uuid.UUID]string) {
 // only IDs will get a queue here if they can be found).
 //
 // Also, if any queue indexes don't have a queue represented, that is fixed here.
-func (m *EQMem) modPrep(mod *entroq.Modification) []*qLock {
+func (m *EQMem) modPrep(mod *entroq.Modification) (locks []*qLock, misplacedInsIDs map[uuid.UUID]string) {
 	// This has to be locked the whole time so that IDs and queues are matched
 	// properly if queues are missing somewhere.
 	defer un(lock(m))
 
+	misplacedInsIDs = make(map[uuid.UUID]string)
+
 	ensureModQueues(mod, m.qByID)
 	queues := make(map[string]bool)
 	for _, ins := range mod.Inserts {
+		// If we have an ID to insert, find the queue for that task to return it.
+		// Also make sure we get the lock for that queue.
+		if ins.ID != uuid.Nil {
+			if foundQueue, ok := m.qByID[ins.ID]; ok && foundQueue != ins.Queue {
+				misplacedInsIDs[ins.ID] = foundQueue
+				queues[foundQueue] = true
+			}
+		}
 		queues[ins.Queue] = true
 	}
 	for _, c := range mod.Changes {
@@ -440,7 +451,6 @@ func (m *EQMem) modPrep(mod *entroq.Modification) []*qLock {
 		queues[d.Queue] = true
 	}
 
-	var locks []*qLock
 	for q := range queues {
 		if q == "" {
 			continue
@@ -454,7 +464,7 @@ func (m *EQMem) modPrep(mod *entroq.Modification) []*qLock {
 		return locks[i].queue < locks[j].queue
 	})
 
-	return locks
+	return locks, misplacedInsIDs
 }
 
 // queueUnsafeInsertTask performs queue-level operations on a task, then
@@ -517,7 +527,7 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 	//
 	// - Modify claimHeaps and actual tasks. Take special care with deletions and insertions.
 	// - Unlock queues.
-	queueLocks := m.modPrep(mod)
+	queueLocks, misplacedInsIDs := m.modPrep(mod)
 	if len(queueLocks) == 0 {
 		return nil, nil, nil
 	}
@@ -563,6 +573,12 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 	}
 	for _, t := range mod.Inserts {
 		addFound(t.Queue, t.ID)
+		// If the insert task ID was found in *another* queue, we still want to
+		// know that. This can happen if a task is moved, and then an attempt
+		// is made to reinsert it. This should cause a collision.
+		if q, ok := misplacedInsIDs[t.ID]; ok {
+			addFound(q, t.ID)
+		}
 	}
 
 	if err := mod.DependencyError(found); err != nil {

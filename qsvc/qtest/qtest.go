@@ -522,6 +522,10 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 	}
 
 	runWorkerOneCase := func(ctx context.Context, c tc) {
+		// Before starting, create a brand new ID for the task in the case.
+		// Otherwise we'll try to reinsert a moved task when we create work.
+		c.input.ID = uuid.New()
+
 		const leaseTime = 5 * time.Second
 
 		w := client.NewWorker(c.input.Queue).WithOpts(
@@ -858,6 +862,19 @@ func InsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 		t.Fatalf("Expected error inserting with existing ID %v, but got no error", knownID)
 	}
 	depErr, ok := entroq.AsDependency(err)
+	if !ok {
+		t.Fatalf("Expected dependency error, got %v", err)
+	}
+	if want, got := 1, len(depErr.Inserts); want != got {
+		t.Fatalf("Expected %d insertion errors in dependency error, got %v", want, got)
+	}
+
+	// Try to insert with a known ID when the task is in a different queue.
+	_, _, err = client.Modify(ctx, entroq.InsertingInto(queue+"/elsewhere", entroq.WithID(knownID)))
+	if err == nil {
+		t.Fatalf("Expected error inserting existing ID %v into a different queue, but got no error", knownID)
+	}
+	depErr, ok = entroq.AsDependency(err)
 	if !ok {
 		t.Fatalf("Expected dependency error, got %v", err)
 	}
