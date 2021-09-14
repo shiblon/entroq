@@ -690,10 +690,10 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 		}
 		b, err := json.Marshal(jMod)
 		if err != nil {
-			return nil, nil, fmt.Errorf("eqmem modify marshal: %w", err)
+			log.Fatalf("Inconsistent internal state: modification succeeded but could not marshal JSON: %v", err)
 		}
 		if err := m.journal.Append(b); err != nil {
-			return nil, nil, fmt.Errorf("eqmem modify journal: %w", err)
+			log.Fatalf("Inconsistent internal state: modification succeeded but could not append to journal: %v", err)
 		}
 	}
 
