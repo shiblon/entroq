@@ -1194,7 +1194,7 @@ func EqualAllTasks(want, got []*entroq.Task) string {
 	var diffs []string
 
 	matched := func(w, g *entroq.Task) bool {
-		return (w == nil) == (g == nil) && w.Queue == g.Queue && w.Claimant == g.Claimant && bytes.Equal(w.Value, g.Value)
+		return (w == nil) == (g == nil) && (w.ID == uuid.Nil || w.ID == g.ID) && w.Queue == g.Queue && w.Claimant == g.Claimant && bytes.Equal(w.Value, g.Value)
 	}
 
 	for _, w := range want {
@@ -1230,6 +1230,7 @@ func EqualAllTasksOmitValues(want, got []*entroq.Task) string {
 // EqualAllTasksVersionIncr returns a non-empty diff if any of the tasks are
 // unequal, taking a version increment into account for the 'got' tasks.
 func EqualAllTasksVersionIncr(want, got []*entroq.Task, versionBump int) string {
+	// Basic test for core elements.
 	if diff := EqualAllTasks(want, got); diff != "" {
 		return diff
 	}
