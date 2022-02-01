@@ -31,7 +31,7 @@ func RunQTest(t *testing.T, tester qtest.Tester) {
 		t.Fatalf("Get client: %v", err)
 	}
 	defer stop()
-	tester(ctx, t, client, fmt.Sprintf("%04d", rand.Int31n(10000)))
+	tester(ctx, t, client, "")
 }
 
 func TestEQMemSimpleSequence(t *testing.T) {
