@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"path"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -163,7 +164,7 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 		t.Fatalf("Worker exit error: %v", err)
 	}
 
-	if diff := EqualAllTasksVersionIncr(inserted, consumed, 1); diff != "" {
+	if diff := EqualAllTasksUnorderedSkipTimesAndCounters(inserted, consumed, expectVersionIncr(1)); diff != "" {
 		t.Errorf("Tasks inserted not the same as tasks consumed:\n%v", diff)
 	}
 }
@@ -682,7 +683,7 @@ func TasksOmitValue(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	if err != nil {
 		t.Fatalf("Failed to get tasks without values: %v", err)
 	}
-	if diff := EqualAllTasksOmitValues(inserted, tasks); diff != "" {
+	if diff := EqualAllTasksUnorderedSkipTimesAndCounters(inserted, tasks, expectEmptyValue()); diff != "" {
 		t.Errorf("Task listing without values had unexpected results (-want +got):\n%v", diff)
 	}
 
@@ -690,7 +691,7 @@ func TasksOmitValue(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	if err != nil {
 		t.Fatalf("Failed to get tasks with values: %v", err)
 	}
-	if diff := EqualAllTasks(inserted, tasksWithVals); diff != "" {
+	if diff := EqualAllTasksUnorderedSkipTimesAndCounters(inserted, tasksWithVals); diff != "" {
 		t.Fatalf("Task listing with values had unexpected results (-want +got):\n%v", diff)
 	}
 }
@@ -932,7 +933,8 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 		t.Fatalf("Got unexpected non-nil claim response from empty queue:\n%s", task)
 	}
 
-	const futureTaskDuration = 5 * time.Second
+	const futureTaskDuration = 2 * time.Second
+	futureTime := now.Add(futureTaskDuration)
 
 	insWant := []*entroq.Task{
 		{
@@ -943,7 +945,7 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 		},
 		{
 			Queue:    queue,
-			At:       now.Add(futureTaskDuration),
+			At:       futureTime,
 			Value:    []byte("there"),
 			Claimant: client.ID(),
 		},
@@ -960,7 +962,7 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	if changed != nil {
 		t.Fatalf("Got unexpected changes during insertion: %+v", err)
 	}
-	if diff := EqualAllTasks(insWant, inserted); diff != "" {
+	if diff := EqualAllTasksOrderedSkipIDAndTime(insWant, inserted); diff != "" {
 		t.Fatalf("Modify tasks unexpected result, ignoring ID and time fields (-want +got):\n%v", diff)
 	}
 	// Also check that their arrival times are 100 ms apart as expected:
@@ -983,7 +985,7 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	if err != nil {
 		t.Fatalf("Tasks call failed after insertions: %v", err)
 	}
-	if diff := EqualAllTasks(insWant, tasksGot); diff != "" {
+	if diff := EqualAllTasksUnorderedSkipTimesAndCounters(inserted, tasksGot); diff != "" {
 		t.Fatalf("Tasks unexpected return, ignoring ID and time fields (-want +got):\n%+v", diff)
 	}
 
@@ -997,11 +999,8 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	if claimed == nil {
 		t.Fatalf("Unexpected nil result from blocking Claim")
 	}
-	if diff := EqualTasksVersionIncr(insWant[0], claimed, 1); diff != "" {
+	if diff := EqualTasksVersionIncr(inserted[0], claimed, 1); diff != "" {
 		t.Fatalf("Claim tasks differ, ignoring ID and times:\n%v", diff)
-	}
-	if got, lower, upper := claimed.At, now.Add(9*time.Second), now.Add(11*time.Second); got.Before(lower) || got.After(upper) {
-		t.Fatalf("Claimed arrival time not in time bounds [%v, %v]: %v", lower, upper, claimed.At)
 	}
 	if claimed.Claims != 1 {
 		t.Fatalf("Expected claim to increment task claims to %d, got %d", 1, claimed.Claims)
@@ -1026,11 +1025,12 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	if err != nil {
 		t.Fatalf("Got unexpected error for claiming from a queue with one ready task: %v", err)
 	}
-	if diff := EqualTasksVersionIncr(insWant[1], claimed, 1); diff != "" {
+	if diff := EqualTasksVersionIncr(inserted[1], claimed, 1); diff != "" {
 		t.Fatalf("Claim got unexpected task, ignoring ID and time fields (-want +got):\n%v", diff)
 	}
-	if got, lower, upper := claimed.At, time.Now().Add(4*time.Second), time.Now().Add(6*time.Second); got.Before(lower) || got.After(upper) {
-		t.Fatalf("Claimed arrival time not in time bounds [%v, %v]: %v", lower, upper, claimed.At)
+	log.Printf("Now: %v", now)
+	if got := claimed.At; got.Before(futureTime) {
+		t.Fatalf("Claimed arrival time %v came earlier than expedcted time %v", got, futureTime)
 	}
 	if claimed.Claims != 1 {
 		t.Fatalf("Expected claim to increment task claims to %d, got %d", 1, claimed.Claims)
@@ -1183,78 +1183,141 @@ func QueueStats(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefi
 	}
 }
 
-// EqualAllTasks returns a string diff if any of the tasks in the lists are unequal.
-func EqualAllTasks(want, got []*entroq.Task) string {
-	if len(want) != len(got) {
-		return cmp.Diff(want, got)
-	}
-	if len(want) == 0 {
-		return ""
-	}
-	var diffs []string
-
-	matched := func(w, g *entroq.Task) bool {
-		return (w == nil) == (g == nil) && (w.ID == uuid.Nil || w.ID == g.ID) && w.Queue == g.Queue && w.Claimant == g.Claimant && bytes.Equal(w.Value, g.Value)
-	}
-
-	for _, w := range want {
-		found := false
-		var potentialDiffs []string
-		for _, g := range got {
-			if matched(w, g) {
-				found = true
-				break
-			}
-			potentialDiffs = append(potentialDiffs, cmp.Diff(w, g))
-		}
-		if !found {
-			diffs = append(diffs, fmt.Sprintf("Task %v not found, differs from all of these:\n%v", w, strings.Join(potentialDiffs, "\n")))
-		}
-	}
-	if len(diffs) != 0 {
-		return strings.Join(diffs, "\n")
-	}
-	return ""
+type taskQueueVersionValue struct {
+	Queue   string
+	Version int32
+	Value   []byte
 }
 
-// EqualAllTasksOmitValues returns a string diff if any tasks in the list are
-// unequal, not counting values in want (leaving got alone).
-func EqualAllTasksOmitValues(want, got []*entroq.Task) string {
-	var wantNoVal []*entroq.Task
-	for _, t := range want {
-		wantNoVal = append(wantNoVal, t.CopyOmitValue())
+func newTaskQueueVersionValue(t *entroq.Task) *taskQueueVersionValue {
+	n := &taskQueueVersionValue{
+		Queue:   t.Queue,
+		Version: t.Version,
+		Value:   make([]byte, len(t.Value)),
 	}
-	return EqualAllTasks(wantNoVal, got)
+	copy(n.Value, t.Value)
+	return n
 }
 
-// EqualAllTasksVersionIncr returns a non-empty diff if any of the tasks are
-// unequal, taking a version increment into account for the 'got' tasks.
-func EqualAllTasksVersionIncr(want, got []*entroq.Task, versionBump int) string {
-	// Basic test for core elements.
-	if diff := EqualAllTasks(want, got); diff != "" {
-		return diff
+type taskIDQueueVersionValue struct {
+	Queue    string
+	ID       uuid.UUID
+	Version  int32
+	Value    []byte
+	Claimant uuid.UUID
+}
+
+func newTaskIDQueueVersionValue(t *entroq.Task) *taskIDQueueVersionValue {
+	n := &taskIDQueueVersionValue{
+		ID:       t.ID,
+		Queue:    t.Queue,
+		Version:  t.Version,
+		Claimant: t.Claimant,
+		Value:    make([]byte, len(t.Value)),
 	}
-	wantByID := make(map[uuid.UUID]*entroq.Task)
-	gotByID := make(map[uuid.UUID]*entroq.Task)
-	var diffs []string
-	for id, w := range wantByID {
-		g := gotByID[id]
-		if w.Version+int32(versionBump) != g.Version {
-			diffs = append(diffs, cmp.Diff(g, w))
+	copy(n.Value, t.Value)
+	return n
+}
+
+type cmpOpts struct {
+	versionIncr int
+	valueEmpty  bool
+}
+
+type cmpOpt func(*cmpOpts)
+
+func expectVersionIncr(by int) cmpOpt {
+	if by < 0 {
+		by = 0
+	}
+	return func(o *cmpOpts) {
+		o.versionIncr = by
+	}
+}
+
+func expectEmptyValue() cmpOpt {
+	return func(o *cmpOpts) {
+		o.valueEmpty = true
+	}
+}
+
+// EqualAllTasksUnorderedSkipTimesAndCounters returns a diff if any non-time
+// fields are different between unordered task lists. Sorts by ID to accomplish
+// this.
+func EqualAllTasksUnorderedSkipTimesAndCounters(want, got []*entroq.Task, opts ...cmpOpt) string {
+	options := new(cmpOpts)
+	for _, o := range opts {
+		o(options)
+	}
+	ws := make([]*taskIDQueueVersionValue, len(want))
+	for i, t := range want {
+		ws[i] = newTaskIDQueueVersionValue(t)
+		if options.versionIncr != 0 {
+			ws[i].Version += int32(options.versionIncr)
+		}
+		if options.valueEmpty {
+			ws[i].Value = []byte{}
 		}
 	}
-	if len(diffs) != 0 {
-		return strings.Join(diffs, "\n")
+	gs := make([]*taskIDQueueVersionValue, len(got))
+	for i, t := range got {
+		gs[i] = newTaskIDQueueVersionValue(t)
 	}
-	return ""
+
+	sort.Slice(ws, func(i, j int) bool {
+		return ws[i].ID.String() < ws[j].ID.String()
+	})
+
+	sort.Slice(gs, func(i, j int) bool {
+		return gs[i].ID.String() < gs[j].ID.String()
+	})
+
+	return cmp.Diff(ws, gs)
 }
 
-// Checks for task equality, ignoring Version and all time fields.
-func EqualTasks(want, got *entroq.Task) string {
-	return EqualAllTasks([]*entroq.Task{want}, []*entroq.Task{got})
+// EqualAllTasksUnorderedByValue checks that all task values from want are represented in got.
+// It assumes IDs and queues are not important. Suitable for tests that set a
+// unique value per task, but don't have ID information. Returns a string diff if different.
+func EqualAllTasksUnorderedByValue(want, got []*entroq.Task) string {
+	wantVals := make([][]byte, len(want))
+	for i, w := range want {
+		wantVals[i] = make([]byte, len(w.Value))
+		copy(wantVals[i], w.Value)
+	}
+
+	gotVals := make([][]byte, len(got))
+	for i, w := range got {
+		gotVals[i] = make([]byte, len(w.Value))
+		copy(gotVals[i], w.Value)
+	}
+
+	sort.Slice(wantVals, func(a, b int) bool {
+		return bytes.Compare(wantVals[a], wantVals[b]) < 0
+	})
+	sort.Slice(gotVals, func(a, b int) bool {
+		return bytes.Compare(gotVals[a], gotVals[b]) < 0
+	})
+	return cmp.Diff(wantVals, gotVals)
+}
+
+// EqualAllTasksOrderedSkipIDAndTime returns a string diff if the order of
+// tasks or values of tasks in two slices is not equal. The slices should also be
+// the same length.
+func EqualAllTasksOrderedSkipIDAndTime(want, got []*entroq.Task) string {
+	gotSimplified := make([]*taskQueueVersionValue, len(got))
+	for i, t := range got {
+		gotSimplified[i] = newTaskQueueVersionValue(t)
+	}
+
+	wantSimplified := make([]*taskQueueVersionValue, len(want))
+	for i, t := range want {
+		wantSimplified[i] = newTaskQueueVersionValue(t)
+	}
+
+	return cmp.Diff(wantSimplified, gotSimplified)
 }
 
 // EqualTasksVersionIncr checks for equality, allowing a version increment.
 func EqualTasksVersionIncr(want, got *entroq.Task, versionBump int) string {
-	return EqualAllTasksVersionIncr([]*entroq.Task{want}, []*entroq.Task{got}, versionBump)
+	return EqualAllTasksUnorderedSkipTimesAndCounters([]*entroq.Task{want}, []*entroq.Task{got}, expectVersionIncr(versionBump))
 }
