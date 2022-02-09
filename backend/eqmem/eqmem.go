@@ -819,8 +819,8 @@ func (m *EQMem) Close() error {
 	return nil
 }
 
-// Obtain lock structures for every queue. If one doesn't exist, create it,
-// mark it depended on, and create a cleanup goroutine for it.
+// Obtain lock structures for every queue, creating them as needed and
+// incrementing dependents.
 func (m *EQMem) locksForQueues(qs []string) []*qLock {
 	defer un(lock(m))
 	var locks []*qLock
@@ -830,8 +830,9 @@ func (m *EQMem) locksForQueues(qs []string) []*qLock {
 	return locks
 }
 
-// Get a single lock for a queue, creating it with its cleanup goroutine if it
-// doesn't yet exist.
+// Get a single lock for a queue, creating it if it doesn't exist. If newly
+// created, a cleanup goroutine is also launched in the background to handle
+// empty queues. Dependents are incremented here.
 func (m *EQMem) lockForQueueUnsafe(q string) *qLock {
 	ql := m.locksSuperUnsafe[q]
 	ts := m.queues[q]
@@ -890,7 +891,8 @@ func (m *EQMem) lockForQueueUnsafe(q string) *qLock {
 // structures. If the lock doesn't exist, it creates it. It holds the global
 // mutex during the collection operation, markes the queues as depended on,
 // releases the lock, and finally locks the queue locks themselves.
-// It returns a list of locks and a function to unlock them in the proper way.
+// It returns a list of locks and a function to unlock them in the proper way,
+// decrementing dependents and avoiding multi-lock race conditions.
 func (m *EQMem) lockQueues(qs []string) ([]*qLock, func()) {
 	if len(qs) == 0 {
 		return nil, func() {}
