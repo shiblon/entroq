@@ -841,6 +841,7 @@ func (m *EQMem) lockForQueueUnsafe(q string) *qLock {
 	}
 
 	if ql != nil {
+		ql.dependents++
 		return ql
 	}
 
