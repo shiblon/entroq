@@ -36,9 +36,10 @@ type EQMem struct {
 	// reinsert a task when it has been moved to another queue.
 	qByID map[uuid.UUID]string
 
-	// locks contains lockers for each known queue. The locks know their own
-	// queue name, as well.
-	locks map[string]*qLock
+	// locksSuperUnsafe contains lockers for each known queue. The locks know
+	// their own queue name, as well. Do not use directly. They require use of the
+	// mutex to access *every time*.
+	locksSuperUnsafe map[string]*qLock
 
 	// A journaler, if one has been requested via a journal directory.
 	journal *wal.WAL
@@ -60,6 +61,11 @@ type qLock struct {
 	queue string
 	heap  *claimHeap
 	tasks *taskQueue
+	// Because we become dependent on the *existence* of the lock before we can
+	// actually take it, and the global lock must be released before taking
+	// this one, this gets incremented while we hold the global lock,
+	// and decremented when unlocking the queue lock.
+	dependents int
 }
 
 func lock(l sync.Locker) func() {
@@ -126,10 +132,10 @@ func withOutputSnapshot() Option {
 // New returns a new in-memory implementation, ready to be used.
 func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 	m := &EQMem{
-		nw:     subq.New(),
-		queues: make(map[string]*taskQueue),
-		qByID:  make(map[uuid.UUID]string),
-		locks:  make(map[string]*qLock),
+		nw:               subq.New(),
+		queues:           make(map[string]*taskQueue),
+		qByID:            make(map[uuid.UUID]string),
+		locksSuperUnsafe: make(map[string]*qLock),
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -148,18 +154,10 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 					return fmt.Errorf("eqmem load task: %w", err)
 				}
 
-				var ql *qLock
-				func() {
-					defer un(lock(m))
-					m.unsafeEnsureQueue(task.Queue)
-					ql = m.locks[task.Queue]
-				}()
+				qls, unlock := m.lockQueues([]string{task.Queue})
+				defer unlock()
 
-				defer un(lock(ql))
-				finish := m.queueUnsafeInsertTask(ql, task)
-
-				defer un(lock(m))
-				finish()
+				m.queueUnsafeInsertTask(qls[0], task)
 
 				return nil
 			}),
@@ -239,27 +237,15 @@ func (m *EQMem) makeSnapshot(a wal.ValueAdder) error {
 	return err
 }
 
-// claimPrep prepares for attempting to claim a task by very briefly locking
-// the global data structures, just to get a handle on the exact queue locks
-// and heaps that are needed.
-func (m *EQMem) claimPrep(cq *entroq.ClaimQuery) []*qLock {
-	defer un(lock(m))
-
-	var qls []*qLock
-	for _, q := range cq.Queues {
-		if ql, ok := m.locks[q]; ok {
-			qls = append(qls, ql)
-		}
-	}
-	return qls
-}
-
 // mustTryClaimOne attempts to make a claim on exactly one queue using the
 // provided indexing lock structure. If there is some kind of error it will be
 // because of an inconsistent state (a bug), and therefore errors are fatal
 // here.
-func (m *EQMem) mustTryClaimOne(ql *qLock, now time.Time, cq *entroq.ClaimQuery) *entroq.Task {
-	defer un(lock(ql))
+func (m *EQMem) mustTryClaimOne(q string, now time.Time, cq *entroq.ClaimQuery) *entroq.Task {
+	qls, unlock := m.lockQueues([]string{q})
+	defer unlock()
+
+	ql := qls[0]
 
 	item := ql.heap.RandomAvailable(now)
 	if item == nil {
@@ -345,51 +331,26 @@ func (m *EQMem) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Ta
 	// lock, it is safe to release the "everything" lock and only reacquire it
 	// to update the modification index, so long as that queue's lock is held, too.
 
-	qls := m.claimPrep(cq)
-	if len(qls) == 0 {
-		return nil, nil
-	}
+	queues := make([]string, len(cq.Queues))
+	copy(queues, cq.Queues)
+
+	// Shuffle to avoid favoring one queue.
+	rand.Shuffle(len(queues), func(i, j int) {
+		queues[i], queues[j] = queues[j], queues[i]
+	})
 
 	now, err := m.Time(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("eqmem claim time: %w", err)
 	}
 
-	// Shuffle to avoid favoring one queue.
-	rand.Shuffle(len(qls), func(i, j int) {
-		qls[i], qls[j] = qls[j], qls[i]
-	})
-
-	for _, ql := range qls {
-		if task := m.mustTryClaimOne(ql, now, cq); task != nil {
+	for _, q := range queues {
+		if task := m.mustTryClaimOne(q, now, cq); task != nil {
 			return task, nil
 		}
 	}
 
 	return nil, nil
-}
-
-func (m *EQMem) unsafeEnsureQueue(q string) {
-	ts, ok := m.queues[q]
-	if ts == nil || !ok {
-		ts = newTaskQueue(q)
-		m.queues[q] = ts
-	}
-	if ql, ok := m.locks[q]; ql == nil || !ok {
-		m.locks[q] = &qLock{
-			queue: q,
-			heap:  newClaimHeap(),
-			tasks: ts,
-		}
-	}
-}
-
-func (m *EQMem) unsafeCleanQueue(q string) {
-	ts, ok := m.queues[q]
-	if ok && ts.Len() == 0 {
-		delete(m.queues, q)
-		delete(m.locks, q)
-	}
 }
 
 func ensureModQueues(mod *entroq.Modification, qByID map[uuid.UUID]string) {
@@ -420,7 +381,7 @@ func ensureModQueues(mod *entroq.Modification, qByID map[uuid.UUID]string) {
 // only IDs will get a queue here if they can be found).
 //
 // Also, if any queue indexes don't have a queue represented, that is fixed here.
-func (m *EQMem) modPrep(mod *entroq.Modification) (locks []*qLock, misplacedInsIDs map[uuid.UUID]string) {
+func (m *EQMem) modPrep(mod *entroq.Modification) (sortedQueues []string, misplacedInsIDs map[uuid.UUID]string) {
 	// This has to be locked the whole time so that IDs and queues are matched
 	// properly if queues are missing somewhere.
 	defer un(lock(m))
@@ -451,20 +412,15 @@ func (m *EQMem) modPrep(mod *entroq.Modification) (locks []*qLock, misplacedInsI
 		queues[d.Queue] = true
 	}
 
-	for q := range queues {
-		if q == "" {
-			continue
-		}
-		m.unsafeEnsureQueue(q)
-		locks = append(locks, m.locks[q])
-	}
+	delete(queues, "") // in case there's an empty queue in there.
 
 	// We have all of the locks we need. Sort to avoid dining philosophers problems.
-	sort.Slice(locks, func(i, j int) bool {
-		return locks[i].queue < locks[j].queue
-	})
+	for q := range queues {
+		sortedQueues = append(sortedQueues, q)
+	}
+	sort.Strings(sortedQueues)
 
-	return locks, misplacedInsIDs
+	return sortedQueues, misplacedInsIDs
 }
 
 // queueUnsafeInsertTask performs queue-level operations on a task, then
@@ -520,35 +476,25 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 	// 	 any are unspecified, find them first.
 	//
 	// - Get all relevant queue locks, order them lexicographically.
-	// - Lock all queue locks, hold thme for the rest of the function (unlock at the end).
+	// - Lock all queue locks, hold them for the rest of the function (unlock at the end).
 	// - Sometimes it's okay to grab the global lock before manipulating global
 	//   indices (it will have already been released, and it always comes after
 	//   the queue locks have been obtained).
 	//
 	// - Modify claimHeaps and actual tasks. Take special care with deletions and insertions.
 	// - Unlock queues.
-	queueLocks, misplacedInsIDs := m.modPrep(mod)
-	if len(queueLocks) == 0 {
+	queues, misplacedInsIDs := m.modPrep(mod)
+	if len(queues) == 0 {
 		return nil, nil, nil
 	}
 
 	// Lock all queues, and store them in a place that's easy to look up.
 	byQ := make(map[string]*qLock)
-	for _, ql := range queueLocks {
-		defer un(lock(ql))
+	qls, unlockQueues := m.lockQueues(queues)
+	defer unlockQueues()
+	for _, ql := range qls {
 		byQ[ql.queue] = ql
 	}
-
-	// Set things up to delete empty queues if any were left empty after the
-	// modification. We don't do this as we go along because it is quite
-	// possible to have one task deleted from a queue, making it empty, and
-	// another added in the same transaction.
-	defer func() {
-		defer un(lock(m))
-		for _, ql := range queueLocks {
-			m.unsafeCleanQueue(ql.queue)
-		}
-	}()
 
 	// Find the actual tasks involved. Queues were filled in when obtaining locks.
 	found := make(map[uuid.UUID]*entroq.Task)
@@ -871,4 +817,98 @@ func (m *EQMem) Close() error {
 		return err
 	}
 	return nil
+}
+
+// Obtain lock structures for every queue. If one doesn't exist, create it,
+// mark it depended on, and create a cleanup goroutine for it.
+func (m *EQMem) locksForQueues(qs []string) []*qLock {
+	defer un(lock(m))
+	var locks []*qLock
+	for _, q := range qs {
+		locks = append(locks, m.lockForQueueUnsafe(q))
+	}
+	return locks
+}
+
+// Get a single lock for a queue, creating it with its cleanup goroutine if it
+// doesn't yet exist.
+func (m *EQMem) lockForQueueUnsafe(q string) *qLock {
+	ql := m.locksSuperUnsafe[q]
+	ts := m.queues[q]
+
+	if (ts == nil) != (ql == nil) {
+		log.Fatalf("Queue tasks and lock structures out of step for queue %q: ts=%v, ql=%v", q, ts, ql)
+	}
+
+	if ql != nil {
+		return ql
+	}
+
+	if ts == nil || ql == nil {
+		ts = newTaskQueue(q)
+		m.queues[q] = ts
+
+		ql = &qLock{
+			queue:      q,
+			heap:       newClaimHeap(),
+			tasks:      ts,
+			dependents: 1, // someone asked for it, mark it up.
+		}
+		m.locksSuperUnsafe[q] = ql
+
+		// Since we're creating a new queue lock, we create its goroutine to
+		// clean it up when its dependents have gone to zero. We use only the global lock
+		// here to avoid nested locks (global and local). This means that the
+		// decrement must also be done while holding *only* the global lock.
+		go func() {
+			for {
+				time.Sleep(5 * time.Second)
+				done := func() bool {
+					defer un(lock(m))
+					// Empty queue and nobody leaning on the lock, delete everything.
+					// Then indicate that we're finished so the goroutine can
+					// exit for this queue.
+					if m.queues[q].Len() == 0 && m.locksSuperUnsafe[q].dependents == 0 {
+						delete(m.queues, q)
+						delete(m.locksSuperUnsafe, q)
+						return true
+					}
+					return false
+				}()
+				if done {
+					return
+				}
+			}
+		}()
+	}
+
+	return ql
+}
+
+// lockQueues locks a particular slice of queues in order and returns the lock
+// structures. If the lock doesn't exist, it creates it. It holds the global
+// mutex during the collection operation, markes the queues as depended on,
+// releases the lock, and finally locks the queue locks themselves.
+// It returns a list of locks and a function to unlock them in the proper way.
+func (m *EQMem) lockQueues(qs []string) ([]*qLock, func()) {
+	if len(qs) == 0 {
+		return nil, func() {}
+	}
+	qls := m.locksForQueues(qs)
+	for _, ql := range qls {
+		ql.Lock()
+	}
+
+	return qls, func() {
+		// Unlock in reverse order.
+		for i := len(qls) - 1; i >= 0; i-- {
+			qls[i].Unlock()
+		}
+		// Now that we're unlocked, take the global lock again and reduce
+		// dependents by 1, in reverse order.
+		defer un(lock(m))
+		for i := len(qls) - 1; i >= 0; i-- {
+			qls[i].dependents--
+		}
+	}
 }

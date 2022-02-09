@@ -109,6 +109,28 @@ func SimpleChange(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	queue := path.Join(qPrefix, "simple_worker")
 
+	const numTasks = 10
+
+	showQueue := func() {
+		queues, err := client.Queues(context.Background())
+		if err != nil {
+			t.Fatalf("Error getting queues: %v", err)
+		}
+		log.Printf("Queues: %v", queues)
+		tasks, err := client.Tasks(context.Background(), queue)
+		if err != nil {
+			t.Fatalf("Error getting queue contents: %v", err)
+		}
+		log.Printf("**** Queue %v (%v) ****\n", queue, len(tasks))
+		sort.Slice(tasks, func(i, j int) bool {
+			return tasks[i].ID.String() < tasks[j].ID.String()
+		})
+		for _, t := range tasks {
+			log.Printf("  %v", t)
+		}
+	}
+
+	numConsumed := 0
 	var consumed []*entroq.Task
 	ctx, cancel := context.WithCancel(ctx)
 
@@ -119,6 +141,7 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 			if task.Claims != 1 {
 				return nil, fmt.Errorf("worker claim expected claims to be 1, got %d", task.Claims)
 			}
+			numConsumed++
 			consumed = append(consumed, task)
 			return []entroq.ModifyArg{task.AsDeletion()}, nil
 		})
@@ -131,8 +154,8 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 	}
 
 	var inserted []*entroq.Task
-	for i := 0; i < 10; i++ {
-		ins, _, err := client.Modify(ctx, entroq.InsertingInto(queue))
+	for i := 0; i < numTasks; i++ {
+		ins, _, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue([]byte{byte(i)})))
 		if err != nil {
 			t.Fatalf("Failed to insert task: %v", err)
 		}
@@ -144,19 +167,12 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 		}
 	}
 
-	for {
-		empty, err := client.QueuesEmpty(ctx, entroq.MatchExact(queue))
-		if err != nil {
-			t.Fatalf("Error checking for empty queue: %v", err)
-		}
-		if empty {
-			break
-		}
-		select {
-		case <-ctx.Done():
-			t.Fatalf("Context error waiting for queues to empty: %v", err)
-		default:
-		}
+	if got := len(inserted); got != numTasks {
+		t.Fatalf("Inserted %v tasks, expected %v", got, numTasks)
+	}
+
+	if err := client.WaitQueuesEmpty(ctx, entroq.MatchExact(queue)); err != nil {
+		t.Fatalf("Wait for queue empty: %v", err)
 	}
 
 	cancel()
@@ -165,7 +181,8 @@ func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 	}
 
 	if diff := EqualAllTasksUnorderedSkipTimesAndCounters(inserted, consumed, expectVersionIncr(1)); diff != "" {
-		t.Errorf("Tasks inserted not the same as tasks consumed:\n%v", diff)
+		showQueue()
+		t.Errorf("Tasks inserted not the same as tasks consumed (-want +got):\n%v", diff)
 	}
 }
 
