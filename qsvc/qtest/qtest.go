@@ -109,6 +109,19 @@ func SimpleChange(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	queue := path.Join(qPrefix, "simple_worker")
 
+	attempts := 30
+	if testing.Short() {
+		attempts = 5
+	}
+	for i := 0; i < attempts; i++ {
+		q := fmt.Sprintf("%s_%d", queue, i)
+		simpleWorkerOnce(ctx, t, client, q)
+	}
+}
+
+func simpleWorkerOnce(ctx context.Context, t *testing.T, client *entroq.EntroQ, queue string) {
+	t.Helper()
+
 	const numTasks = 10
 
 	showQueue := func() {

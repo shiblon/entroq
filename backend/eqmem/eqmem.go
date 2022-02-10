@@ -830,59 +830,34 @@ func (m *EQMem) locksForQueues(qs []string) []*qLock {
 	return locks
 }
 
-// Get a single lock for a queue, creating it if it doesn't exist. If newly
-// created, a cleanup goroutine is also launched in the background to handle
-// empty queues. Dependents are incremented here.
-func (m *EQMem) lockForQueueUnsafe(q string) *qLock {
-	ql := m.locksSuperUnsafe[q]
-	ts := m.queues[q]
+// Get a single lock for a queue, creating it if it doesn't exist. Dependents
+// are incremented here.
+func (m *EQMem) lockForQueueUnsafe(q string) (ql *qLock) {
+	// Always increment dependents, whether we exit early from finding a lock,
+	// or late from creating a new queue.
+	defer func() {
+		ql.dependents++
+	}()
 
-	if (ts == nil) != (ql == nil) {
+	ql = m.locksSuperUnsafe[q]
+
+	if ts := m.queues[q]; (ts == nil) != (ql == nil) {
 		log.Fatalf("Queue tasks and lock structures out of step for queue %q: ts=%v, ql=%v", q, ts, ql)
 	}
 
 	if ql != nil {
-		ql.dependents++
 		return ql
 	}
 
-	if ts == nil || ql == nil {
-		ts = newTaskQueue(q)
-		m.queues[q] = ts
+	ts := newTaskQueue(q)
+	m.queues[q] = ts
 
-		ql = &qLock{
-			queue:      q,
-			heap:       newClaimHeap(),
-			tasks:      ts,
-			dependents: 1, // someone asked for it, mark it up.
-		}
-		m.locksSuperUnsafe[q] = ql
-
-		// Since we're creating a new queue lock, we create its goroutine to
-		// clean it up when its dependents have gone to zero. We use only the global lock
-		// here to avoid nested locks (global and local). This means that the
-		// decrement must also be done while holding *only* the global lock.
-		go func() {
-			for {
-				time.Sleep(5 * time.Second)
-				done := func() bool {
-					defer un(lock(m))
-					// Empty queue and nobody leaning on the lock, delete everything.
-					// Then indicate that we're finished so the goroutine can
-					// exit for this queue.
-					if m.queues[q].Len() == 0 && m.locksSuperUnsafe[q].dependents == 0 {
-						delete(m.queues, q)
-						delete(m.locksSuperUnsafe, q)
-						return true
-					}
-					return false
-				}()
-				if done {
-					return
-				}
-			}
-		}()
+	ql = &qLock{
+		queue: q,
+		heap:  newClaimHeap(),
+		tasks: ts,
 	}
+	m.locksSuperUnsafe[q] = ql
 
 	return ql
 }
@@ -908,10 +883,19 @@ func (m *EQMem) lockQueues(qs []string) ([]*qLock, func()) {
 			qls[i].Unlock()
 		}
 		// Now that we're unlocked, take the global lock again and reduce
-		// dependents by 1, in reverse order.
+		// dependents by 1, in reverse order, then try to clean up if
+		// dependents go to zero anywhere with empty queues. If it fails, it
+		// simply exits; something else needed the lock to stay alive betwen
+		// lock acquisitions, so cleanup will occur later.
 		defer un(lock(m))
 		for i := len(qls) - 1; i >= 0; i-- {
-			qls[i].dependents--
+			ql := qls[i]
+			ql.dependents--
+
+			if ts := m.queues[ql.queue]; ql.dependents == 0 && ts.Len() == 0 {
+				delete(m.queues, ql.queue)
+				delete(m.locksSuperUnsafe, ql.queue)
+			}
 		}
 	}
 }

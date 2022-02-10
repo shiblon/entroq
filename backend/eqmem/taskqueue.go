@@ -67,6 +67,9 @@ func (s *taskQueue) Update(id uuid.UUID, f func(*entroq.Task) *entroq.Task) erro
 
 // Len returns the current size of this task store.
 func (s *taskQueue) Len() int {
+	if s == nil {
+		return 0
+	}
 	defer un(lock(s))
 	return s.size
 }
