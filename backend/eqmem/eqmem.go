@@ -237,11 +237,19 @@ func (m *EQMem) makeSnapshot(a wal.ValueAdder) error {
 	return err
 }
 
+func (m *EQMem) queueLen(q string) int {
+	defer un(lock(m))
+	return m.queues[q].Len()
+}
+
 // mustTryClaimOne attempts to make a claim on exactly one queue using the
 // provided indexing lock structure. If there is some kind of error it will be
 // because of an inconsistent state (a bug), and therefore errors are fatal
 // here.
 func (m *EQMem) mustTryClaimOne(q string, now time.Time, cq *entroq.ClaimQuery) *entroq.Task {
+	if m.queueLen(q) == 0 {
+		return nil
+	}
 	qls, unlock := m.lockQueues([]string{q})
 	defer unlock()
 
