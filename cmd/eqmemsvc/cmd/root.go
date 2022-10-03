@@ -79,7 +79,7 @@ var rootCmd = &cobra.Command{
 		}
 
 		if flags.createJournalDir {
-			if err := os.MkdirAll(flags.journal, 0755); err != nil {
+			if err := os.MkdirAll(flags.journal, 0700); err != nil {
 				return fmt.Errorf("can't create journal dir: %w", err)
 			}
 		}
