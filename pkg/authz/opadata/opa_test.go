@@ -60,7 +60,7 @@ func TestRego(t *testing.T) {
 
 	rch, err := tester.NewRunner().
 		SetModules(mods).
-		EnableFailureLine(true).
+		CapturePrintOutput(true).
 		EnableTracing(true).
 		RunTests(ctx, nil)
 	if err != nil {
