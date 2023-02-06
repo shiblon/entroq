@@ -205,7 +205,7 @@ class EntroQ:
                 limit=limit,
                 task_id=task_ids,
                 omit_values=omit_values)):
-            for task in tresp.Tasks:
+            for task in tresp.tasks:
                 yield task
 
     def task_by_id(self, task_id, queue=''):
