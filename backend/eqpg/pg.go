@@ -158,6 +158,7 @@ func Opener(hostPort string, opts ...PGOpt) entroq.BackendOpener {
 
 		params := []string{
 			"sslmode=" + string(options.sslMode),
+			"database=" + options.db,
 		}
 
 		if options.user != "" {
