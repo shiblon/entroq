@@ -232,7 +232,6 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 				if task.Version > renewed.Version {
 					return fmt.Errorf("task updated inside worker body, expected version <= %v, got %v", renewed.Version, task.Version)
 				}
-				log.Printf("Rewriting change version %v => %v", task.Version, renewed.Version)
 				task.Version = renewed.Version
 			}
 		}
@@ -241,7 +240,6 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 				if task.Version > renewed.Version {
 					return fmt.Errorf("task updated inside worker body, expected version <= %v, got %v", renewed.Version, task.Version)
 				}
-				log.Printf("Rewriting depend version %v => %v", task.Version, renewed.Version)
 				id.Version = renewed.Version
 			}
 		}
@@ -250,7 +248,6 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 				if task.Version > renewed.Version {
 					return fmt.Errorf("task updated inside worker body, expected version <= %v, got %v", renewed.Version, task.Version)
 				}
-				log.Printf("Rewriting delete version %v => %v", task.Version, renewed.Version)
 				id.Version = renewed.Version
 			}
 		}
