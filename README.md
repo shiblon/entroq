@@ -16,8 +16,8 @@ robust attempt at the same idea.
 
 It is designed to be as simple and modular as possible, doing one thing well.
 It is not a pubsub system, a database, or a generic RPC mechanism. It is only a
-competing-consumer work queue, and will only ever be that. As such, it has also
-been designed to do that one thing really well.
+competing-consumer unordered work queue manager, and will only ever be that.
+As such, it has also been designed to do that one thing really well.
 
 ## Use
 
@@ -73,6 +73,57 @@ being committed more than once. Some additional detail on this approach is
 given below, but the fundamental principle is this:
 
     Work commits should never be lost or duplicated.
+
+Note that, perhaps counterintuivitely because of naming, *queues are not ordered*.
+Or more accurately stated, they are *not strictly ordered*. There is a loose
+ordering imposed on all queues, but it is basically binary: there are tasks that
+are ready to be claimed, and tasks that are not. Among the tasks that are claimed,
+some implementations may choose to favor older tasks first, but it is important
+that a strict ordering *not* be imposed, as doing so would open the door to
+persistent-task-error system starvation, which is another principle of this
+approach:
+
+    Workers should continue making progress even when some tasks are bad.
+
+Consider a small set of tasks in a queue that cause workers to crash every time
+due, say, to an error in the worker's parser that causes it to die on particular
+characters that are in a few tasks' data.
+
+If you only pull the oldest task first, then the tasks that cause problems will
+eventually be the oldest: newer tasks are coming after them, and because the
+crashy tasks never complete and are never deleted, the worker starts to only
+pick up tasks that cause a crash.
+
+Instead, the EntroQ system selects a *random* available task when claiming from a
+queue, which doesn't *stop* crashes, but does allow the system to *make progress*
+even when a set of tasks cause persistent worker crashes.
+
+Thus, if you are looking for a strict ordering of task execution, EntroQ isn't
+going to help you by itself. It is very typical to couple EntroQ with a
+database of some kind to maintain complex state or to retain order information,
+and there are common idioms and recipes that can make this very simple while
+retaining the important principles of fault tolerance that EntroQ provides.
+
+Doing things in this way also contributes to a principle that is both crucial
+and possibly the most easily understood of all of them:
+
+    You should be able to scale workers without communication.
+
+The entire idea is that once a task is in a queue, that's the only communication
+mechanism needed. If you want to process things faster, just make more workers.
+If you have to scale things down, just kill workers without worry: whatever
+they were working on will be picked up again when one of your now-depleted worker
+fleet is free to work. Scaling is just a matter of creating or killing jobs,
+and no other concurrency primitives are needed.
+
+This opens up very powerful and simple idioms for running systems at all kinds
+of scales.
+
+Obviously, scaling extremely high in a system with a bottleneck process like
+EntroQ can raise some important questions around task granularity or
+task system hierarchy. Check out Google's "Workflow" chapter in the
+"Site Reliability Engineering" book, available online for free, for thoughts
+around massive scaling using a system like EntroQ.
 
 ### Tasks
 
