@@ -26,7 +26,7 @@ setup(name=pkg_name,
       packages=find_packages(),
       install_requires=[
           'setuptools==65.5.1',
-          'grpcio==1.25.0',
+          'grpcio==1.53.0',
           'grpcio-status==1.25.0',
           'grpcio-tools==1.25.0',
           'grpcio_health_checking==1.25.0',
