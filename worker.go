@@ -30,6 +30,7 @@ type DependencyHandler func(err DependencyError) error
 // own worker instance.
 //
 // Example:
+//
 //	w := eqClient.NewWorker("queue_name")
 //	err := w.Run(ctx, func(ctx context.Context, task *Task) ([]ModifyArg, error) {
 //		// Do stuff with the task.
@@ -59,6 +60,7 @@ type Worker struct {
 
 	lease          time.Duration
 	baseRetryDelay time.Duration // put AT into the future when using RetryTaskError.
+	pollTime       time.Duration
 }
 
 // MoveTaskError causes a task to be moved to a specified queue. This can be
@@ -120,6 +122,7 @@ func NewWorker(eq *EntroQ, qs ...string) *Worker {
 		lease: DefaultClaimDuration,
 
 		baseRetryDelay: DefaultRetryDelay,
+		pollTime:       DefaultClaimPollTime,
 	}
 }
 
@@ -179,7 +182,7 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 		default:
 		}
 
-		task, err := w.eqc.Claim(ctx, From(w.Qs...), ClaimFor(w.lease))
+		task, err := w.eqc.Claim(ctx, From(w.Qs...), ClaimFor(w.lease), ClaimPollTime(w.pollTime))
 		if err != nil {
 			return fmt.Errorf("worker claim (%q): %w", w.Qs, err)
 		}
@@ -331,6 +334,19 @@ func WithMaxAttempts(m int32) WorkerOption {
 func WithBaseRetryDelay(d time.Duration) WorkerOption {
 	return func(w *Worker) {
 		w.baseRetryDelay = d
+	}
+}
+
+// WithPollTime sets the time between polling for new tasks.
+// Defaults to DefaultClaimPollTime.
+// If the provided duration is <= 0, the default is used.
+func WithPollTime(d time.Duration) WorkerOption {
+	return func(w *Worker) {
+		if d <= 0 {
+			log.Print("Invalid poll time, using DefaultClaimPollTime")
+			return
+		}
+		w.pollTime = d
 	}
 }
 
