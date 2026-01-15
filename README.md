@@ -4,7 +4,7 @@ A task queue with strong competing-consumer semantics and transactional updates.
 
 See here for an article explaining how this might fit into your system:
 
-https://www.datamachines.io/blog/asynchronous-thinking-for-microservice-system-design
+[Asynchronous Thinking for Microservice System Design](https://github.com/shiblon/entroq/wiki/Asynchronous-Thinking-for-Microservice-System-Design)
 
 The Go components of this package can be found in online documenation for the
 [github.com/shiblon/entroq](https://pkg.go.dev/github.com/shiblon/entroq) Go package.
