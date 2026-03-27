@@ -260,11 +260,6 @@ func (m *EQMem) mustTryClaimOne(q string, now time.Time, cq *entroq.ClaimQuery) 
 		return nil
 	}
 
-	qts, ok := m.queueTasks(ql.queue)
-	if !ok {
-		log.Fatalf("Inconsistent internal state: could not find queue %q after finding a claimable task in it", ql.queue)
-	}
-
 	// Found one - time to modify it for claiming and return it.
 	// We are under the queue lock for this task's queue, so we now have to
 	// - Update the task at+claimant in the corresponding heap.
@@ -273,7 +268,7 @@ func (m *EQMem) mustTryClaimOne(q string, now time.Time, cq *entroq.ClaimQuery) 
 	ql.heap.UpdateItem(item, newAt)
 
 	var found *entroq.Task
-	if err := qts.Update(item.id, func(t *entroq.Task) *entroq.Task {
+	if err := ql.tasks.Update(item.id, func(t *entroq.Task) *entroq.Task {
 		t = t.Copy() // avoid data race, don't change in place
 		t.At = newAt
 		t.Claimant = cq.Claimant
