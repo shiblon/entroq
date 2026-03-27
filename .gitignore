@@ -26,3 +26,6 @@ venv
 __pycache__
 
 tmp
+
+# VSCode
+*.code-workspace
