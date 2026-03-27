@@ -447,20 +447,118 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 	return nil, nil
 }
 
+
+// availableCount returns the number of available (arrived) tasks in the given queue.
+// Uses the (queue, at) index, so this is a fast index-only scan.
+func (b *backend) availableCount(ctx context.Context, q string, now time.Time) (int, error) {
+	var n int
+	err := b.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM tasks WHERE queue = $1 AND at < $2`,
+		q, now,
+	).Scan(&n)
+	return n, err
+}
+
 // tryClaimOne attempts to claim an "arrived" task from the specified queue.
 // Returns an error if something goes wrong, a nil task if there is nothing to
 // claim.
+//
+// For queues with sufficient tasks, uses ID-bucket randomization to avoid a
+// full-table sort while still preventing worker starvation on bad tasks. Falls
+// back to a simple unordered claim for small queues or when the chosen bucket
+// is empty.
+//
+// Use of SKIP LOCKED:
+// - https://dba.stackexchange.com/questions/69471/postgres-update-limit-1
+// - https://blog.2ndquadrant.com/what-is-select-skip-locked-for-in-postgresql-9-5/
 func (b *backend) tryClaimOne(ctx context.Context, q string, cq *entroq.ClaimQuery) (*entroq.Task, error) {
-	task := new(entroq.Task)
 	if cq.Duration == 0 {
 		return nil, fmt.Errorf("no duration set for claim %q", cq.Queues)
 	}
 	now := time.Now()
 
-	// Use of SKIP LOCKED:
-	// - https://dba.stackexchange.com/questions/69471/postgres-update-limit-1
-	// - https://blog.2ndquadrant.com/what-is-select-skip-locked-for-in-postgresql-9-5/
-	if err := b.db.QueryRowContext(ctx, `
+	n, err := b.availableCount(ctx, q, now)
+	if err != nil {
+		return nil, fmt.Errorf("available count: %w", err)
+	}
+	if n == 0 {
+		return nil, nil
+	}
+
+	// Use 1 bucket for a single task (no-op filter), 2 for small queues, 4 otherwise.
+	var buckets int
+	switch {
+	case n <= 1:
+		buckets = 1
+	case n <= 8:
+		buckets = 2
+	default:
+		buckets = 4
+	}
+	task, err := b.tryClaimOneBucket(ctx, q, cq, now, buckets, rand.Intn(buckets))
+	if err != nil {
+		return nil, err
+	}
+	if task != nil {
+		return task, nil
+	}
+	// Bucket was empty (statistical bad luck); fall back to unfiltered claim.
+	return b.tryClaimOneSimple(ctx, q, cq, now)
+}
+
+// tryClaimOneBucket attempts to claim a task in the given bucket, where the
+// bucket is determined by the last byte of the UUID modulo numBuckets. This
+// provides cheap randomization without a full sort. When numBuckets is 1 the
+// filter is a no-op (n%1==0 always), so small queues get unfiltered behavior.
+func (b *backend) tryClaimOneBucket(ctx context.Context, q string, cq *entroq.ClaimQuery, now time.Time, numBuckets, bucket int) (*entroq.Task, error) {
+	task := new(entroq.Task)
+	err := b.db.QueryRowContext(ctx, `
+		UPDATE tasks
+		SET
+			version = version + 1,
+			claims = claims + 1,
+			at = $1,
+			claimant = $2,
+			modified = $3
+		WHERE
+			(id, version) IN (
+				SELECT id, version
+				FROM tasks
+				WHERE
+					queue = $4 AND
+					at < $5 AND
+					get_byte(uuid_send(id), 15) % $6 = $7
+				FOR UPDATE SKIP LOCKED
+				LIMIT 1
+			)
+		RETURNING id, version, queue, at, created, modified, claimant, value, claims, attempt, err
+	`, now.Add(cq.Duration), cq.Claimant, now, q, now, numBuckets, bucket).Scan(
+		&task.ID,
+		&task.Version,
+		&task.Queue,
+		&task.At,
+		&task.Created,
+		&task.Modified,
+		&task.Claimant,
+		&task.Value,
+		&task.Claims,
+		&task.Attempt,
+		&task.Err,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("bucket claim: %w", err)
+	}
+	return task, nil
+}
+
+// tryClaimOneSimple claims any available task from the queue without ordering.
+// Used for small queues and as a fallback when the chosen bucket is empty.
+func (b *backend) tryClaimOneSimple(ctx context.Context, q string, cq *entroq.ClaimQuery, now time.Time) (*entroq.Task, error) {
+	task := new(entroq.Task)
+	err := b.db.QueryRowContext(ctx, `
 		UPDATE tasks
 		SET
 			version = version + 1,
@@ -475,7 +573,6 @@ func (b *backend) tryClaimOne(ctx context.Context, q string, cq *entroq.ClaimQue
 				WHERE
 					queue = $4 AND
 					at < $5
-				ORDER BY random()
 				FOR UPDATE SKIP LOCKED
 				LIMIT 1
 			)
@@ -492,22 +589,24 @@ func (b *backend) tryClaimOne(ctx context.Context, q string, cq *entroq.ClaimQue
 		&task.Claims,
 		&task.Attempt,
 		&task.Err,
-	); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("claim update: %w", err)
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
 	}
-
+	if err != nil {
+		return nil, fmt.Errorf("simple claim: %w", err)
+	}
 	return task, nil
 }
 
-func isSerialization(err error) bool {
+// isRetryable returns true for PostgreSQL errors that indicate a transaction
+// should be retried: serialization failures (40001) and deadlocks (40P01).
+func isRetryable(err error) bool {
 	if err == nil {
 		return false
 	}
 	if pgerr := new(pq.Error); errors.As(err, &pgerr) {
-		return pgerr.Code == "40001"
+		return pgerr.Code == "40001" || pgerr.Code == "40P01"
 	}
 	return false
 }
@@ -530,7 +629,7 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 			// We know what's wrong, no reason to retry.
 			return nil, nil, fmt.Errorf("pg modify dependency: %w", err)
 		}
-		if !isSerialization(err) {
+		if !isRetryable(err) {
 			// We didn't get a retryable serialization error, return.
 			return nil, nil, fmt.Errorf("pg modify unknown: %w", err)
 		}
