@@ -17,7 +17,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/subq"
 )
 
 func escp(p string) string {
@@ -132,7 +131,6 @@ func Opener(hostPort string, opts ...PGOpt) entroq.BackendOpener {
 		user:     "postgres",
 		password: "password",
 		attempts: 1,
-		nw:       subq.New(),
 
 		sslMode: SSLDisable,
 	}
@@ -195,6 +193,11 @@ func Opener(hostPort string, opts ...PGOpt) entroq.BackendOpener {
 		if err != nil {
 			return nil, fmt.Errorf("failed to open postgres DB: %w", err)
 		}
+
+		if options.nw == nil {
+			options.nw = entroq.NotifyWaiter(NewPGNotifyWaiter(ctx, connStr))
+		}
+
 		for i := 0; i < options.attempts; i++ {
 			if err = db.PingContext(ctx); err == nil {
 				return New(ctx, db, options.nw)
@@ -389,18 +392,11 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 }
 
 // TryClaim attempts to claim an "arrived" task from any of the specified
-// queues, attempting to do so fairly across queues. Returns an error if
-// something goes wrong, a nil task if there is nothing to claim.
+// queues, attempting to do so fairly across queues. Returns a nil task (no
+// error) if all queues are empty.
 func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
-	// Note that we loop here instead of just using `= any(queues)` in the
-	// WHERE clause because that cannot guarantee inter-queue fairness. And,
-	// DISTINCT ON doesn't work in FOR UPDATE, etc.
-	//
-	// This is just as good, though, because we poll them all fairly quickly, and it does
-	// not reduce correctness.
 	qs := append(make([]string, 0, len(cq.Queues)), cq.Queues...)
 	rand.Shuffle(len(qs), func(i, j int) { qs[i], qs[j] = qs[j], qs[i] })
-
 	for _, q := range qs {
 		t, err := b.tryClaimOne(ctx, q, cq)
 		if err != nil {
@@ -414,9 +410,7 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 }
 
 // tryClaimOne attempts to claim an "arrived" task from the specified queue.
-// Returns an error if something goes wrong, a nil task if there is nothing to
-// claim. Delegates all bucket selection and fallback logic to the
-// entroq_try_claim_one stored procedure.
+// Returns a nil task (no error) if there is nothing to claim.
 func (b *backend) tryClaimOne(ctx context.Context, q string, cq *entroq.ClaimQuery) (*entroq.Task, error) {
 	if cq.Duration == 0 {
 		return nil, fmt.Errorf("no duration set for claim %q", cq.Queues)
@@ -427,17 +421,9 @@ func (b *backend) tryClaimOne(ctx context.Context, q string, cq *entroq.ClaimQue
 		 FROM entroq_try_claim_one($1, $2, $3)`,
 		q, cq.Claimant, fmt.Sprintf("%d microseconds", cq.Duration/time.Microsecond),
 	).Scan(
-		&task.ID,
-		&task.Version,
-		&task.Queue,
-		&task.At,
-		&task.Created,
-		&task.Modified,
-		&task.Claimant,
-		&task.Value,
-		&task.Claims,
-		&task.Attempt,
-		&task.Err,
+		&task.ID, &task.Version, &task.Queue, &task.At,
+		&task.Created, &task.Modified, &task.Claimant,
+		&task.Value, &task.Claims, &task.Attempt, &task.Err,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -563,7 +549,7 @@ func parseModifyError(err error, mod *entroq.Modification) error {
 	}
 
 	var detail struct {
-		Missing    []struct {
+		Missing []struct {
 			ID      uuid.UUID `json:"id"`
 			Version int32     `json:"version"`
 		} `json:"missing"`
@@ -639,7 +625,7 @@ func insertArrays(inserts []*entroq.TaskData) (ids []string, queues []string, at
 	for i, ins := range inserts {
 		ids[i] = ins.ID.String() // uuid.Nil.String() signals auto-generate
 		queues[i] = ins.Queue
-		ats[i] = ins.At         // zero time signals use now()
+		ats[i] = ins.At // zero time signals use now()
 		values[i] = ins.Value
 		attempts[i] = ins.Attempt
 		errs[i] = ins.Err

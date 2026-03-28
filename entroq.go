@@ -1009,6 +1009,8 @@ func InsertingInto(q string, insertArgs ...InsertArg) ModifyArg {
 type InsertArg func(*Modification, *TaskData)
 
 // WithArrivalTime changes the arrival time to a fixed moment during task insertion.
+// The time is taken as-is from the caller. If tight synchronization with the
+// backend clock is required, use EntroQ.Time to obtain the reference time first.
 func WithArrivalTime(at time.Time) InsertArg {
 	return func(_ *Modification, d *TaskData) {
 		d.At = at
@@ -1020,6 +1022,10 @@ func WithArrivalTime(at time.Time) InsertArg {
 //	cli.Modify(ctx,
 //	  InsertingInto("my queue",
 //	    WithTimeIn(2 * time.Minute)))
+//
+// The duration is added to Go's wall clock time at the point of Modify. If tight
+// synchronization with the backend clock is required, use EntroQ.Time and
+// WithArrivalTime instead.
 func WithArrivalTimeIn(duration time.Duration) InsertArg {
 	return func(m *Modification, d *TaskData) {
 		d.At = m.now.Add(duration)
@@ -1178,6 +1184,9 @@ func ArrivalTimeTo(at time.Time) ChangeArg {
 }
 
 // ArrivalTimeBy sets the arrival time to a time in the future, by the given duration.
+// The duration is added to Go's wall clock time at the point of Modify. If tight
+// synchronization with the backend clock is required, use EntroQ.Time and
+// WithArrivalTime instead.
 func ArrivalTimeBy(d time.Duration) ChangeArg {
 	return func(m *Modification, t *Task) {
 		t.At = m.now.Add(d)

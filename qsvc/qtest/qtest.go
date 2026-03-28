@@ -949,7 +949,10 @@ func InsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 
 // SimpleSequence tests some basic functionality of a task manager, over gRPC.
 func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	now := time.Now()
+	now, err := client.Time(ctx)
+	if err != nil {
+		t.Fatalf("Failed to get backend time: %v", err)
+	}
 
 	queue := path.Join(qPrefix, "simple_sequence")
 
