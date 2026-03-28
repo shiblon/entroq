@@ -5,10 +5,10 @@ package eqpg
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"math/rand"
 	"net/url"
 	"strings"
@@ -252,40 +252,6 @@ func (b *backend) Close() error {
 	return nil
 }
 
-// initDB sets up the database to have the appropriate tables and necessary
-// extensions to work as a task queue backend.
-func (b *backend) initDB(ctx context.Context) error {
-	// Note: ALTER TABLE commands are given to ensure that older versions of EntroQ databases are automatically upgraded.
-	// EntroQ systems were in service before Claims, Attempt, or Err were added to task types, so we attempt to add these
-	// columns to an existing table, then we create the whole thing if it isn't there.
-	_, err := b.db.ExecContext(ctx, `
-		ALTER TABLE IF EXISTS tasks ADD COLUMN IF NOT EXISTS claims INTEGER NOT NULL DEFAULT 0;
-		ALTER TABLE IF EXISTS tasks ADD COLUMN IF NOT EXISTS attempt INTEGER NOT NULL DEFAULT 0;
-		ALTER TABLE IF EXISTS tasks ADD COLUMN IF NOT EXISTS err TEXT NOT NULL DEFAULT '';
-		CREATE TABLE IF NOT EXISTS tasks (
-		  id UUID PRIMARY KEY NOT NULL,
-		  version INTEGER NOT NULL DEFAULT 0,
-		  queue TEXT NOT NULL DEFAULT '',
-		  at TIMESTAMP WITH TIME ZONE NOT NULL,
-		  created TIMESTAMP WITH TIME ZONE,
-		  modified TIMESTAMP WITH TIME ZONE NOT NULL,
-		  claimant UUID,
-		  value BYTEA,
-		  claims INTEGER NOT NULL DEFAULT 0,
-		  attempt INTEGER NOT NULL DEFAULT 0,
-		  err TEXT NOT NULL DEFAULT ''
-		);
-		CREATE INDEX IF NOT EXISTS byID ON tasks (id);
-		CREATE INDEX IF NOT EXISTS byVersion ON tasks (version);
-		CREATE INDEX IF NOT EXISTS byQueue ON tasks (queue);
-		CREATE INDEX IF NOT EXISTS byQueueAt ON tasks (queue, at);
-	`)
-	if err != nil {
-		return fmt.Errorf("initDB: %w", err)
-	}
-	return nil
-}
-
 // Queues returns the queues and their sizes.
 func (b *backend) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[string]int, error) {
 	return entroq.QueuesFromStats(b.QueueStats(ctx, qq))
@@ -447,92 +413,20 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 	return nil, nil
 }
 
-
-// availableCount returns the number of available (arrived) tasks in the given queue.
-// Uses the (queue, at) index, so this is a fast index-only scan.
-func (b *backend) availableCount(ctx context.Context, q string, now time.Time) (int, error) {
-	var n int
-	err := b.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM tasks WHERE queue = $1 AND at < $2`,
-		q, now,
-	).Scan(&n)
-	return n, err
-}
-
 // tryClaimOne attempts to claim an "arrived" task from the specified queue.
 // Returns an error if something goes wrong, a nil task if there is nothing to
-// claim.
-//
-// For queues with sufficient tasks, uses ID-bucket randomization to avoid a
-// full-table sort while still preventing worker starvation on bad tasks. Falls
-// back to a simple unordered claim for small queues or when the chosen bucket
-// is empty.
-//
-// Use of SKIP LOCKED:
-// - https://dba.stackexchange.com/questions/69471/postgres-update-limit-1
-// - https://blog.2ndquadrant.com/what-is-select-skip-locked-for-in-postgresql-9-5/
+// claim. Delegates all bucket selection and fallback logic to the
+// entroq_try_claim_one stored procedure.
 func (b *backend) tryClaimOne(ctx context.Context, q string, cq *entroq.ClaimQuery) (*entroq.Task, error) {
 	if cq.Duration == 0 {
 		return nil, fmt.Errorf("no duration set for claim %q", cq.Queues)
 	}
-	now := time.Now()
-
-	n, err := b.availableCount(ctx, q, now)
-	if err != nil {
-		return nil, fmt.Errorf("available count: %w", err)
-	}
-	if n == 0 {
-		return nil, nil
-	}
-
-	// Use 1 bucket for a single task (no-op filter), 2 for small queues, 4 otherwise.
-	var buckets int
-	switch {
-	case n <= 1:
-		buckets = 1
-	case n <= 8:
-		buckets = 2
-	default:
-		buckets = 4
-	}
-	task, err := b.tryClaimOneBucket(ctx, q, cq, now, buckets, rand.Intn(buckets))
-	if err != nil {
-		return nil, err
-	}
-	if task != nil {
-		return task, nil
-	}
-	// Bucket was empty (statistical bad luck); fall back to unfiltered claim.
-	return b.tryClaimOneSimple(ctx, q, cq, now)
-}
-
-// tryClaimOneBucket attempts to claim a task in the given bucket, where the
-// bucket is determined by the last byte of the UUID modulo numBuckets. This
-// provides cheap randomization without a full sort. When numBuckets is 1 the
-// filter is a no-op (n%1==0 always), so small queues get unfiltered behavior.
-func (b *backend) tryClaimOneBucket(ctx context.Context, q string, cq *entroq.ClaimQuery, now time.Time, numBuckets, bucket int) (*entroq.Task, error) {
 	task := new(entroq.Task)
-	err := b.db.QueryRowContext(ctx, `
-		UPDATE tasks
-		SET
-			version = version + 1,
-			claims = claims + 1,
-			at = $1,
-			claimant = $2,
-			modified = $3
-		WHERE
-			(id, version) IN (
-				SELECT id, version
-				FROM tasks
-				WHERE
-					queue = $4 AND
-					at < $5 AND
-					get_byte(uuid_send(id), 15) % $6 = $7
-				FOR UPDATE SKIP LOCKED
-				LIMIT 1
-			)
-		RETURNING id, version, queue, at, created, modified, claimant, value, claims, attempt, err
-	`, now.Add(cq.Duration), cq.Claimant, now, q, now, numBuckets, bucket).Scan(
+	err := b.db.QueryRowContext(ctx,
+		`SELECT id, version, queue, at, created, modified, claimant, value, claims, attempt, err
+		 FROM entroq_try_claim_one($1, $2, $3)`,
+		q, cq.Claimant, fmt.Sprintf("%d microseconds", cq.Duration/time.Microsecond),
+	).Scan(
 		&task.ID,
 		&task.Version,
 		&task.Queue,
@@ -549,52 +443,7 @@ func (b *backend) tryClaimOneBucket(ctx context.Context, q string, cq *entroq.Cl
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("bucket claim: %w", err)
-	}
-	return task, nil
-}
-
-// tryClaimOneSimple claims any available task from the queue without ordering.
-// Used for small queues and as a fallback when the chosen bucket is empty.
-func (b *backend) tryClaimOneSimple(ctx context.Context, q string, cq *entroq.ClaimQuery, now time.Time) (*entroq.Task, error) {
-	task := new(entroq.Task)
-	err := b.db.QueryRowContext(ctx, `
-		UPDATE tasks
-		SET
-			version = version + 1,
-			claims = claims + 1,
-			at = $1,
-			claimant = $2,
-			modified = $3
-		WHERE
-			(id, version) IN (
-				SELECT id, version
-				FROM tasks
-				WHERE
-					queue = $4 AND
-					at < $5
-				FOR UPDATE SKIP LOCKED
-				LIMIT 1
-			)
-		RETURNING id, version, queue, at, created, modified, claimant, value, claims, attempt, err
-	`, now.Add(cq.Duration), cq.Claimant, now, q, now).Scan(
-		&task.ID,
-		&task.Version,
-		&task.Queue,
-		&task.At,
-		&task.Created,
-		&task.Modified,
-		&task.Claimant,
-		&task.Value,
-		&task.Claims,
-		&task.Attempt,
-		&task.Err,
-	)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("simple claim: %w", err)
+		return nil, fmt.Errorf("try claim one: %w", err)
 	}
 	return task, nil
 }
@@ -614,6 +463,7 @@ func isRetryable(err error) bool {
 // Modify attempts to apply an atomic modification to the task store. Either
 // all succeeds or all fails.
 func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserted, changed []*entroq.Task, err error) {
+	const minBackoff = 10 * time.Millisecond
 	for i := 0; i < 7; i++ {
 		inserted, changed, err = b.modify(ctx, mod)
 		// No error - we're done!
@@ -633,8 +483,16 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 			// We didn't get a retryable serialization error, return.
 			return nil, nil, fmt.Errorf("pg modify unknown: %w", err)
 		}
-		// Serialization error - go around again.
-		time.Sleep(time.Second)
+		// Serialization error — back off randomly with increasing time caps.
+		backoff := time.Duration(float64((1<<i)*minBackoff) * rand.Float64())
+		if backoff > time.Second {
+			backoff = time.Second
+		}
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return nil, nil, fmt.Errorf("pg modify canceled during backoff: %w", ctx.Err())
+		}
 	}
 	// Serialization errors that can't be retried are passed as empty
 	// dependency errors. We don't know what the conflict was, but it was like
@@ -642,132 +500,172 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 	return nil, nil, entroq.DependencyErrorf("retry limit: %v", err)
 }
 
-// modify is a private helper to allow for transaction retries when serialization is violated.
+// modify calls the entroq_modify stored procedure, which atomically locks
+// dependencies, checks versions, and performs all inserts/changes/deletes in
+// one round trip. Returns a DependencyError (SQLSTATE EQ001) if any
+// dependency constraint is violated.
 func (b *backend) modify(ctx context.Context, mod *entroq.Modification) (inserted, changed []*entroq.Task, err error) {
-	now := time.Now()
-	tx, err := b.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	// Build parallel arrays for each operation set.
+	depIDs, depVers := taskIDArrays(mod.Depends)
+	delIDs, delVers := taskIDArrays(mod.Deletes)
+	insIDs, insQueues, insAts, insValues, insAttempts, insErrs := insertArrays(mod.Inserts)
+	chgIDs, chgVers, chgQueues, chgAts, chgValues, chgAttempts, chgErrs := changeArrays(mod.Changes)
+
+	rows, err := b.db.QueryContext(ctx, `
+		SELECT kind, id, version, queue, at, created, modified, claimant, value, claims, attempt, err
+		FROM entroq_modify(
+			$1,
+			$2::uuid[], $3::integer[],
+			$4::uuid[], $5::integer[],
+			$6::uuid[], $7::text[], $8::timestamptz[], $9::bytea[], $10::integer[], $11::text[],
+			$12::uuid[], $13::integer[], $14::text[], $15::timestamptz[], $16::bytea[], $17::integer[], $18::text[]
+		)`,
+		mod.Claimant,
+		pq.Array(depIDs), pq.Array(depVers),
+		pq.Array(delIDs), pq.Array(delVers),
+		pq.Array(insIDs), pq.Array(insQueues), pq.Array(insAts), pq.ByteaArray(insValues), pq.Array(insAttempts), pq.Array(insErrs),
+		pq.Array(chgIDs), pq.Array(chgVers), pq.Array(chgQueues), pq.Array(chgAts), pq.ByteaArray(chgValues), pq.Array(chgAttempts), pq.Array(chgErrs),
+	)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to start transaction: %w", err)
+		return nil, nil, parseModifyError(err, mod)
 	}
-	defer func() {
-		if err != nil {
-			if rerr := tx.Rollback(); rerr != nil {
-				log.Printf("Error rolling back: %v", rerr)
-			}
-		} else {
-			err = tx.Commit()
-		}
-	}()
+	defer rows.Close()
 
-	foundDeps, err := depQuery(ctx, tx, mod)
-	if err != nil {
-		return nil, nil, fmt.Errorf("get deps: %w", err)
-	}
-
-	if err := mod.DependencyError(foundDeps); err != nil {
-		return nil, nil, fmt.Errorf("dependency issue found: %w", err)
-	}
-
-	// Once we get here, we know that all of the dependencies were present.
-	// These should now all succeed.
-
-	for _, tid := range mod.Deletes {
-		q := "DELETE FROM tasks WHERE id = $1 AND version = $2"
-		if _, err := tx.ExecContext(ctx, q, tid.ID, tid.Version); err != nil {
-			return nil, nil, fmt.Errorf("pg modify delete %s: %w", tid, err)
-		}
-	}
-
-	for _, ins := range mod.Inserts {
-		at := ins.At
-		if at.IsZero() {
-			at = now
-		}
-
-		id := ins.ID
-		if id == uuid.Nil {
-			id = uuid.New()
-		}
-
+	for rows.Next() {
 		t := new(entroq.Task)
-		row := tx.QueryRowContext(ctx, `
-			INSERT INTO tasks (id, version, queue, at, claimant, value, created, modified, attempt, err)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-			RETURNING id, version, queue, at, claimant, value, created, modified, attempt, err
-		`, id, 0, ins.Queue, at, mod.Claimant, ins.Value, now, now, ins.Attempt, ins.Err)
-		if err := row.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Claimant, &t.Value, &t.Created, &t.Modified, &t.Attempt, &t.Err); err != nil {
-			return nil, nil, fmt.Errorf("pg modify insert scan: %w", err)
+		var kind string
+		if err := rows.Scan(&kind, &t.ID, &t.Version, &t.Queue, &t.At, &t.Created, &t.Modified, &t.Claimant, &t.Value, &t.Claims, &t.Attempt, &t.Err); err != nil {
+			return nil, nil, fmt.Errorf("pg modify scan: %w", err)
 		}
-		inserted = append(inserted, t)
-	}
-
-	for _, chg := range mod.Changes {
-		t := new(entroq.Task)
-		row := tx.QueryRowContext(ctx, `
-			UPDATE tasks SET version = version + 1, modified = $1, queue = $2, at = $3, value = $4, attempt = $5, err = $6
-			WHERE id = $7 AND version = $8
-			RETURNING id, version, queue, at, claimant, modified, created, value, attempt, err
-		`, now, chg.Queue, chg.At, chg.Value, chg.Attempt, chg.Err, chg.ID, chg.Version)
-		if err := row.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Claimant, &t.Modified, &t.Created, &t.Value, &t.Attempt, &t.Err); err != nil {
-			return nil, nil, fmt.Errorf("pg modify update scan %s: %w", chg.ID, err)
+		switch kind {
+		case "inserted":
+			inserted = append(inserted, t)
+		case "changed":
+			changed = append(changed, t)
 		}
-		changed = append(changed, t)
 	}
-
+	if err := rows.Err(); err != nil {
+		return nil, nil, parseModifyError(err, mod)
+	}
 	return inserted, changed, nil
 }
 
-// depQuery sends a query to the database, within a transaction, that will lock
-// all rows for all dependencies of a modification, allowing updates to be
-// performed on those rows without other transactions getting in the middle of
-// things. Returns a map from ID to version for every dependency that is found,
-// or an error if the query itself fails.
-func depQuery(ctx context.Context, tx *sql.Tx, m *entroq.Modification) (map[uuid.UUID]*entroq.Task, error) {
-	// We must craft a query that ensures that changes, deletes, and depends
-	// all exist with the right versions, and then insert all inserts, delete
-	// all deletes, and update all changes.
-	dependencies, err := m.AllDependencies()
-	if err != nil {
-		return nil, fmt.Errorf("pg dep query: %w", err)
+// parseModifyError converts an EQ001 PostgreSQL error into a DependencyError,
+// categorizing each affected task ID by which operation set it belongs to.
+// Other errors are returned unchanged.
+func parseModifyError(err error, mod *entroq.Modification) error {
+	if err == nil {
+		return nil
+	}
+	pgerr := new(pq.Error)
+	if !errors.As(err, &pgerr) || string(pgerr.Code) != "EQ001" {
+		return err
 	}
 
-	foundDeps := make(map[uuid.UUID]*entroq.Task)
-
-	if len(dependencies) == 0 {
-		return foundDeps, nil
+	var detail struct {
+		Missing    []struct {
+			ID      uuid.UUID `json:"id"`
+			Version int32     `json:"version"`
+		} `json:"missing"`
+		Mismatched []struct {
+			ID      uuid.UUID `json:"id"`
+			Version int32     `json:"version"`
+		} `json:"mismatched"`
+		Collisions []struct {
+			ID      uuid.UUID `json:"id"`
+			Version int32     `json:"version"`
+		} `json:"collisions"`
+	}
+	if jsonErr := json.Unmarshal([]byte(pgerr.Detail), &detail); jsonErr != nil {
+		return fmt.Errorf("pg modify EQ001 with unparseable detail %q: %w", pgerr.Detail, err)
 	}
 
-	// Form a SELECT FOR UPDATE that looks at all of these rows so that we can
-	// touch them all while inserting, deleting, and changing, and so we can
-	// guarantee that dependencies don't disappear while we're at it (we need
-	// to know that the dependencies are there while we work).
-	strIDs := make([]string, 0, len(dependencies))
-	for id := range dependencies {
-		strIDs = append(strIDs, id.String())
+	// Build lookup sets to categorize IDs by operation.
+	dependIDs := make(map[uuid.UUID]bool, len(mod.Depends))
+	for _, t := range mod.Depends {
+		dependIDs[t.ID] = true
 	}
-	rows, err := tx.QueryContext(ctx, `
-		SELECT id, version, queue, at, claimant, value, created, modified, attempt, err FROM tasks
-		WHERE id = any($1) FOR UPDATE
-	`, pq.Array(strIDs))
-	if err != nil {
-		return nil, fmt.Errorf("pg dep query: %w", err)
+	deleteIDs := make(map[uuid.UUID]bool, len(mod.Deletes))
+	for _, t := range mod.Deletes {
+		deleteIDs[t.ID] = true
 	}
-	defer rows.Close()
-	for rows.Next() {
-		t := new(entroq.Task)
-		if err := rows.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Claimant, &t.Value, &t.Created, &t.Modified, &t.Attempt, &t.Err); err != nil {
-			return nil, fmt.Errorf("pg dep scan: %w", err)
+
+	depErr := entroq.DependencyError{}
+
+	categorize := func(id uuid.UUID, version int32) {
+		tid := &entroq.TaskID{ID: id, Version: version}
+		switch {
+		case dependIDs[id]:
+			depErr.Depends = append(depErr.Depends, tid)
+		case deleteIDs[id]:
+			depErr.Deletes = append(depErr.Deletes, tid)
+		default:
+			depErr.Changes = append(depErr.Changes, tid)
 		}
-		if foundDeps[t.ID] != nil {
-			return nil, fmt.Errorf("pg duplicate ID %q found", t.ID)
-		}
-		foundDeps[t.ID] = t
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("pg dep iteration: %w", err)
 	}
 
-	return foundDeps, nil
+	for _, m := range detail.Missing {
+		categorize(m.ID, m.Version)
+	}
+	for _, m := range detail.Mismatched {
+		categorize(m.ID, m.Version)
+	}
+	for _, c := range detail.Collisions {
+		depErr.Inserts = append(depErr.Inserts, &entroq.TaskID{ID: c.ID, Version: c.Version})
+	}
+
+	return depErr
+}
+
+// taskIDArrays splits a slice of TaskIDs into parallel UUID string and version slices.
+func taskIDArrays(tids []*entroq.TaskID) (ids []string, versions []int32) {
+	ids = make([]string, len(tids))
+	versions = make([]int32, len(tids))
+	for i, t := range tids {
+		ids[i] = t.ID.String()
+		versions[i] = t.Version
+	}
+	return
+}
+
+// insertArrays splits a slice of TaskData inserts into parallel arrays for the stored procedure.
+func insertArrays(inserts []*entroq.TaskData) (ids []string, queues []string, ats []time.Time, values [][]byte, attempts []int32, errs []string) {
+	ids = make([]string, len(inserts))
+	queues = make([]string, len(inserts))
+	ats = make([]time.Time, len(inserts))
+	values = make([][]byte, len(inserts))
+	attempts = make([]int32, len(inserts))
+	errs = make([]string, len(inserts))
+	for i, ins := range inserts {
+		ids[i] = ins.ID.String() // uuid.Nil.String() signals auto-generate
+		queues[i] = ins.Queue
+		ats[i] = ins.At         // zero time signals use now()
+		values[i] = ins.Value
+		attempts[i] = ins.Attempt
+		errs[i] = ins.Err
+	}
+	return
+}
+
+// changeArrays splits a slice of Task changes into parallel arrays for the stored procedure.
+func changeArrays(changes []*entroq.Task) (ids []string, versions []int32, queues []string, ats []time.Time, values [][]byte, attempts []int32, errs []string) {
+	ids = make([]string, len(changes))
+	versions = make([]int32, len(changes))
+	queues = make([]string, len(changes))
+	ats = make([]time.Time, len(changes))
+	values = make([][]byte, len(changes))
+	attempts = make([]int32, len(changes))
+	errs = make([]string, len(changes))
+	for i, chg := range changes {
+		ids[i] = chg.ID.String()
+		versions[i] = chg.Version
+		queues[i] = chg.Queue
+		ats[i] = chg.At
+		values[i] = chg.Value
+		attempts[i] = chg.Attempt
+		errs[i] = chg.Err
+	}
+	return
 }
 
 // Time returns the time used in all calculations in this process.
