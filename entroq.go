@@ -175,34 +175,34 @@ func (t *Task) String() string {
 
 // AsDeletion returns a ModifyArg that can be used in the Modify function, e.g.,
 //
-//   cli.Modify(ctx, task1.AsDeletion())
+//	cli.Modify(ctx, task1.AsDeletion())
 //
 // The above would cause the given task to be deleted, if it can be. It is
 // shorthand for
 //
-//   cli.Modify(ctx, Deleting(task1.ID, task1.Version, WithIDQueue(task1.Queue)))
+//	cli.Modify(ctx, Deleting(task1.ID, task1.Version, WithIDQueue(task1.Queue)))
 func (t *Task) AsDeletion() ModifyArg {
 	return Deleting(t.ID, t.Version, WithIDQueue(t.Queue))
 }
 
 // AsChange returns a ModifyArg that can be used in the Modify function, e.g.,
 //
-//   cli.Modify(ctx, task1.AsChange(ArrivalTimeBy(2 * time.Minute)))
+//	cli.Modify(ctx, task1.AsChange(ArrivalTimeBy(2 * time.Minute)))
 //
 // The above is shorthand for
 //
-//   cli.Modify(ctx, Changing(task1, ArrivalTimeBy(2 * time.Minute)))
+//	cli.Modify(ctx, Changing(task1, ArrivalTimeBy(2 * time.Minute)))
 func (t *Task) AsChange(args ...ChangeArg) ModifyArg {
 	return Changing(t, args...)
 }
 
 // AsDependency returns a ModifyArg that can be used to create a Modify dependency, e.g.,
 //
-//   cli.Modify(ctx, task.AsDependency())
+//	cli.Modify(ctx, task.AsDependency())
 //
 // That is shorthand for
 //
-//   cli.Modify(ctx, DependingOn(task.ID, task.Version, WithIDQueue(task.Queue)))
+//	cli.Modify(ctx, DependingOn(task.ID, task.Version, WithIDQueue(task.Queue)))
 func (t *Task) AsDependency() ModifyArg {
 	return DependingOn(t.ID, t.Version, WithIDQueue(t.Queue))
 }
@@ -512,7 +512,7 @@ type BackendOpener func(ctx context.Context) (Backend, error)
 // New creates a new task client with the given backend implementation, for example, to
 // use an in-memory implementation:
 //
-//   cli, err := New(ctx, mem.Opener())
+//	cli, err := New(ctx, mem.Opener())
 func New(ctx context.Context, opener BackendOpener, opts ...Option) (*EntroQ, error) {
 	backend, err := opener(ctx)
 	if err != nil {
@@ -857,6 +857,8 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.D
 	// canceled this to begin with).
 	g, gctx := errgroup.WithContext(ctx)
 	gctx, cancelGroup := context.WithCancel(gctx)
+	// Safe to cancel twice. There is an explicit cancellation below for an error case.
+	defer cancelGroup()
 
 	doneCh := make(chan struct{})
 	g.Go(func() error {
@@ -971,12 +973,12 @@ func ModifyAs(id uuid.UUID) ModifyArg {
 
 // Inserting creates an insert modification from TaskData:
 //
-// 	cli.Modify(ctx,
-// 		Inserting(&TaskData{
-// 			Queue: "myqueue",
-// 			At:    time.Now.Add(1 * time.Minute),
-// 			Value: []byte("hi there"),
-// 		}))
+//	cli.Modify(ctx,
+//		Inserting(&TaskData{
+//			Queue: "myqueue",
+//			At:    time.Now.Add(1 * time.Minute),
+//			Value: []byte("hi there"),
+//		}))
 //
 // Or, better still,
 //
@@ -992,7 +994,7 @@ func Inserting(tds ...*TaskData) ModifyArg {
 
 // InsertingInto creates an insert modification. Use like this:
 //
-//   cli.Modify(InsertingInto("my queue name", WithValue([]byte("hi there"))))
+//	cli.Modify(InsertingInto("my queue name", WithValue([]byte("hi there"))))
 func InsertingInto(q string, insertArgs ...InsertArg) ModifyArg {
 	return func(m *Modification) {
 		data := &TaskData{Queue: q}
@@ -1015,9 +1017,9 @@ func WithArrivalTime(at time.Time) InsertArg {
 
 // WithArrivalTimeIn computes the arrival time based on the duration from now, e.g.,
 //
-//   cli.Modify(ctx,
-//     InsertingInto("my queue",
-//       WithTimeIn(2 * time.Minute)))
+//	cli.Modify(ctx,
+//	  InsertingInto("my queue",
+//	    WithTimeIn(2 * time.Minute)))
 func WithArrivalTimeIn(duration time.Duration) InsertArg {
 	return func(m *Modification, d *TaskData) {
 		d.At = m.now.Add(duration)
@@ -1025,9 +1027,10 @@ func WithArrivalTimeIn(duration time.Duration) InsertArg {
 }
 
 // WithValue sets the task's byte slice value during insertion.
-//   cli.Modify(ctx,
-//     InsertingInto("my queue",
-//       WithValue([]byte("hi there"))))
+//
+//	cli.Modify(ctx,
+//	  InsertingInto("my queue",
+//	    WithValue([]byte("hi there"))))
 func WithValue(value []byte) InsertArg {
 	return func(_ *Modification, d *TaskData) {
 		d.Value = value
@@ -1057,9 +1060,9 @@ func WithErr(value string) InsertArg {
 //
 // For example, a not uncommon need is for a worker to do the following:
 //
-// 	- Claim a task,
-// 	- Make database entries corresponding to downstream work,
-// 	- Insert tasks for the downstream work and delete claimed task.
+//   - Claim a task,
+//   - Make database entries corresponding to downstream work,
+//   - Insert tasks for the downstream work and delete claimed task.
 //
 // If the database entries need to reference the tasks that have not yet been
 // inserted (e.g., if they need to be used to get at the status of a task), it
@@ -1067,10 +1070,10 @@ func WithErr(value string) InsertArg {
 // a race condition. If, for example, the following strategy is employed, then
 // the task IDs may never make it into the database:
 //
-// 	- Claim a task,
-// 	- Make database entries
-// 	- Insert tasks and delete claimed task
-// 	- Update database with new task IDs
+//   - Claim a task,
+//   - Make database entries
+//   - Insert tasks and delete claimed task
+//   - Update database with new task IDs
 //
 // In this event, it is entirely possible to successfully process the incoming
 // task and create the outgoing tasks, then lose network connectivity and fail
@@ -1079,9 +1082,9 @@ func WithErr(value string) InsertArg {
 //
 // Instead, it is safe to do the following:
 //
-// 	- Claim a task
-// 	- Make database entries, including with to-be-created task IDs
-// 	- Insert tasks with those IDs and delete claimed task.
+//   - Claim a task
+//   - Make database entries, including with to-be-created task IDs
+//   - Insert tasks with those IDs and delete claimed task.
 //
 // This avoids the potential data loss condition entirely.
 //
@@ -1109,7 +1112,7 @@ func WithSkipColliding(s bool) InsertArg {
 
 // Deleting adds a deletion to a Modify call, e.g.,
 //
-//   cli.Modify(ctx, Deleting(id, version))
+//	cli.Modify(ctx, Deleting(id, version))
 func Deleting(id uuid.UUID, version int32, opts ...IDOption) ModifyArg {
 	return func(m *Modification) {
 		m.Deletes = append(m.Deletes, NewTaskID(id, version, opts...))
@@ -1120,10 +1123,10 @@ func Deleting(id uuid.UUID, version int32, opts ...IDOption) ModifyArg {
 // "my queue" with data "hey", but only succeeding if a task with anotherID and
 // someVersion exists:
 //
-//   cli.Modify(ctx,
-//     InsertingInto("my queue",
-//       WithValue([]byte("hey"))),
-//       DependingOn(anotherID, someVersion))
+//	cli.Modify(ctx,
+//	  InsertingInto("my queue",
+//	    WithValue([]byte("hey"))),
+//	    DependingOn(anotherID, someVersion))
 func DependingOn(id uuid.UUID, version int32, opts ...IDOption) ModifyArg {
 	return func(m *Modification) {
 		m.Depends = append(m.Depends, NewTaskID(id, version, opts...))
@@ -1133,7 +1136,7 @@ func DependingOn(id uuid.UUID, version int32, opts ...IDOption) ModifyArg {
 // Changing adds a task update to a Modify call, e.g., to modify
 // the queue a task belongs in:
 //
-//   cli.Modify(ctx, Changing(myTask, QueueTo("a different queue name")))
+//	cli.Modify(ctx, Changing(myTask, QueueTo("a different queue name")))
 func Changing(task *Task, changeArgs ...ChangeArg) ModifyArg {
 	return func(m *Modification) {
 		newTask := *task
@@ -1152,10 +1155,10 @@ func Changing(task *Task, changeArgs ...ChangeArg) ModifyArg {
 // for Modify, e.g., to change the queue and set the expiry time of a task to
 // 5 minutes in the future, you would do something like this:
 //
-//   cli.Modify(ctx,
-//     Changing(myTask,
-//       QueueTo("a new queue"),
-//	     ArrivalTimeBy(5 * time.Minute)))
+//	  cli.Modify(ctx,
+//	    Changing(myTask,
+//	      QueueTo("a new queue"),
+//		     ArrivalTimeBy(5 * time.Minute)))
 type ChangeArg func(m *Modification, t *Task)
 
 // QueueTo creates an option to modify a task's queue in the Changing function.
