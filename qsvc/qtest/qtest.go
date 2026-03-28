@@ -686,7 +686,6 @@ func WorkerRenewal(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPr
 		case <-time.After(10 * time.Second): // long enough for 3 renewals.
 			return nil
 		}
-		return nil
 	})
 	if err != nil {
 		t.Fatalf("Error renewing and waiting: %v", err)
