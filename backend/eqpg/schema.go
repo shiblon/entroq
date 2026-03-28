@@ -3,45 +3,7 @@ package eqpg
 import (
 	"context"
 	"fmt"
-	"hash/crc32"
-	"strings"
-	"unicode"
 )
-
-// pgChannelName converts a queue name into a PostgreSQL LISTEN/NOTIFY channel
-// name within the 63-byte identifier limit. Uses the full sanitized name when
-// it fits; otherwise sandwiches a CRC32 of the original name between a prefix
-// and suffix to aid debuggability.
-func pgChannelName(queue string) string {
-	var b strings.Builder
-	for _, r := range queue {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			b.WriteRune(r)
-		} else {
-			b.WriteRune('_')
-		}
-	}
-	sanitized := b.String()
-
-	// If there's room, just use the sanitized name.
-	if 2+len(sanitized) <= 63 { // "q_" prefix = 2 bytes
-		return "q_" + sanitized
-	}
-
-	// If there isn't room, sandwich a CRC32 of the middle into the name, but
-	// keep a prefix and suffix to aid debugging.
-	const (
-		prefixLen = 25
-		suffixLen = 26
-	)
-	crc := fmt.Sprintf("%08x", crc32.ChecksumIEEE([]byte(queue)))
-	runes := []rune(sanitized)
-	return fmt.Sprintf("q_%s_%s_%s",
-		string(runes[:prefixLen]),
-		crc,
-		string(runes[len(runes)-suffixLen:]),
-	)
-}
 
 // schemaSteps are the idempotent DDL statements that initialize (or upgrade)
 // the database. Steps run in order; column migrations must precede the CREATE
@@ -246,6 +208,44 @@ var schemaSteps = []struct {
 			END;
 			$$`,
 	},
+	// entroq_try_claim is not currently used by the Go backend, which performs
+	// the queue shuffle and per-queue claim loop in Go to preserve inter-transaction
+	// interleaving (important for fairness across queues of different sizes).
+	// It is kept here for pure-SQL consumers or future database-side claim
+	// strategies that don't require that interleaving property.
+	//
+	// {
+	// 	name: "function entroq_try_claim",
+	// 	sql: `
+	// 		CREATE OR REPLACE FUNCTION entroq_try_claim(
+	// 			p_queues    text[],
+	// 			p_claimant  uuid,
+	// 			p_duration  interval
+	// 		) RETURNS TABLE(
+	// 			id       uuid,
+	// 			version  integer,
+	// 			queue    text,
+	// 			at       timestamptz,
+	// 			created  timestamptz,
+	// 			modified timestamptz,
+	// 			claimant uuid,
+	// 			value    bytea,
+	// 			claims   integer,
+	// 			attempt  integer,
+	// 			err      text
+	// 		) LANGUAGE plpgsql AS $$
+	// 		DECLARE
+	// 			v_queue text;
+	// 		BEGIN
+	// 			FOR v_queue IN SELECT unnest(p_queues) ORDER BY random() LOOP
+	// 				RETURN QUERY SELECT * FROM entroq_try_claim_one(v_queue, p_claimant, p_duration);
+	// 				IF FOUND THEN
+	// 					RETURN;
+	// 				END IF;
+	// 			END LOOP;
+	// 		END;
+	// 		$$`,
+	// },
 	{
 		// entroq_modify atomically applies inserts, changes, deletes, and
 		// dependency checks. Uses parallel arrays instead of composite type
@@ -434,6 +434,59 @@ BEGIN
 		FROM r;
 END;
 $$`,
+	},
+	{
+		// entroq_channel_name converts a queue name into a valid PostgreSQL
+		// LISTEN/NOTIFY channel identifier within the 63-byte limit.
+		// Uses the full sanitized name when it fits; otherwise sandwiches an
+		// 8-hex-char MD5 of the original name between a prefix and suffix.
+		// Prefix length 25, suffix length 26: 2+25+1+8+1+26 = 63 bytes exactly.
+		//
+		// md5() is used instead of CRC32 because it is a built-in PostgreSQL
+		// function requiring no extension.
+		name: "function entroq_channel_name",
+		sql: `
+CREATE OR REPLACE FUNCTION entroq_channel_name(p_queue text)
+RETURNS text LANGUAGE sql IMMUTABLE STRICT AS $$
+	SELECT CASE
+		WHEN length(regexp_replace(p_queue, '[^a-zA-Z0-9]', '_', 'g')) + 2 <= 63
+		THEN 'q_' || regexp_replace(p_queue, '[^a-zA-Z0-9]', '_', 'g')
+		ELSE 'q_'
+			|| left(regexp_replace(p_queue, '[^a-zA-Z0-9]', '_', 'g'), 25)
+			|| '_' || left(md5(p_queue), 8)
+			|| '_' || right(regexp_replace(p_queue, '[^a-zA-Z0-9]', '_', 'g'), 26)
+	END
+$$`,
+	},
+	{
+		// entroq_notify_task fires pg_notify on the queue's channel for a task
+		// that is immediately available. The WHEN clause on the trigger filters
+		// to NEW.at <= now(), so this function is only called when the task is
+		// already claimable — no conditional needed inside the body.
+		name: "function entroq_notify_task",
+		sql: `
+CREATE OR REPLACE FUNCTION entroq_notify_task()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+	PERFORM pg_notify(entroq_channel_name(NEW.queue), '');
+	RETURN NULL;
+END;
+$$`,
+	},
+	// Trigger must be dropped before recreating because CREATE OR REPLACE
+	// TRIGGER is only available in PostgreSQL 14+.
+	{
+		name: "drop trigger entroq_task_notify",
+		sql:  `DROP TRIGGER IF EXISTS entroq_task_notify ON tasks`,
+	},
+	{
+		name: "trigger entroq_task_notify",
+		sql: `
+CREATE TRIGGER entroq_task_notify
+AFTER INSERT OR UPDATE OF at ON tasks
+FOR EACH ROW
+WHEN (NEW.at <= now())
+EXECUTE FUNCTION entroq_notify_task()`,
 	},
 }
 
