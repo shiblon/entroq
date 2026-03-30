@@ -486,7 +486,7 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 	return nil, nil, entroq.DependencyErrorf("retry limit: %v", err)
 }
 
-// modify calls the entroq_modify stored procedure, which atomically locks
+// modify calls the entroq_modify_arrays stored procedure, which atomically locks
 // dependencies, checks versions, and performs all inserts/changes/deletes in
 // one round trip. Returns a DependencyError (SQLSTATE EQ001) if any
 // dependency constraint is violated.
@@ -499,7 +499,7 @@ func (b *backend) modify(ctx context.Context, mod *entroq.Modification) (inserte
 
 	rows, err := b.db.QueryContext(ctx, `
 		SELECT kind, id, version, queue, at, created, modified, claimant, value, claims, attempt, err
-		FROM entroq_modify(
+		FROM entroq_modify_arrays(
 			$1,
 			$2::uuid[], $3::integer[],
 			$4::uuid[], $5::integer[],

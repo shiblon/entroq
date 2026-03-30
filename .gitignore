@@ -22,9 +22,6 @@ release
 *.out
 vendor
 
-venv
-__pycache__
-
 tmp
 
 # VSCode
