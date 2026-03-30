@@ -12,7 +12,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/contrib/mrtest"
+	"github.com/shiblon/entroq/examples/mrtest"
 	"github.com/shiblon/entroq/qsvc/qtest"
 )
 

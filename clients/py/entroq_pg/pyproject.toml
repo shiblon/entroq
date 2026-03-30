@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "entroq-pg"
+version = "0.1.0"
+description = "Python client for EntroQ using a direct PostgreSQL connection"
+requires-python = ">=3.9"
+dependencies = ["psycopg[binary]>=3.0"]
+
+[project.urls]
+Homepage = "https://github.com/shiblon/entroq"
+
+[tool.setuptools.package-data]
+entroq_pg = ["schema.sql"]

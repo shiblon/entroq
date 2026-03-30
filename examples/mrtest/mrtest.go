@@ -14,7 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shiblon/entroq"
-	. "github.com/shiblon/entroq/contrib/mr"
+	. "github.com/shiblon/entroq/examples/mr"
 )
 
 // MRCheck is a check function that runs a mapreduce using the specified number of mappers and reducers.
