@@ -1,7 +1,7 @@
 # Inspired by https://www.cloudreach.com/blog/containerize-this-golang-dockerfiles/
 
 # Build inside a Go container.
-FROM golang:1.16-alpine3.13 as builder
+FROM golang:1.25-alpine3.23 AS builder
 
 ENV GOBIN /build/bin
 ENV CGO_ENABLED 0
@@ -13,10 +13,11 @@ COPY go.mod go.sum /src/github.com/shiblon/entroq/
 RUN go mod download -x
 
 COPY . /src/github.com/shiblon/entroq/
-RUN go install -v ./...
+RUN go install -v ./cmd/...
+RUN go install -v ./qsvc/...
 
 # Switch to a smaller container without build tools.
-FROM alpine:latest
+FROM alpine:3.23
 
 RUN apk --no-cache add ca-certificates openssl curl bash jq
 RUN mkdir -p /go/bin
@@ -43,7 +44,7 @@ EXPOSE 9100
 
 ENTRYPOINT ["./eqsvc.sh"]
 
-# Defalts to starting up an in-memory queue service on the default port.
+# Defaults to starting up an in-memory queue service on the default port.
 # Other options include "pg" with its associated flags.
 # If flags are left off, or the command is left off, the default in-memory
 # service is started.

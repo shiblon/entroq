@@ -261,7 +261,8 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	}
 
 	g.Go(func() error {
-		waitCtx, _ := context.WithTimeout(ctx, 1*time.Minute)
+		waitCtx, waitCancel := context.WithTimeout(ctx, 1*time.Minute)
+		defer waitCancel()
 		if err := client.WaitQueuesEmpty(waitCtx, entroq.MatchExact(bigQueue, medQueue, smallQueue)); err != nil {
 			return fmt.Errorf("waiting for empty queues: %w", err)
 		}
@@ -467,7 +468,8 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 		if _, _, err := client.Modify(ctx, entroq.InsertingInto(c.input.Queue, entroq.WithID(c.input.ID), entroq.WithValue(c.input.Value))); err != nil {
 			t.Fatalf("Test %q insert task: %v", c.name, err)
 		}
-		waitCtx, _ := context.WithTimeout(ctx, 5*time.Second)
+		waitCtx, waitCancel := context.WithTimeout(ctx, 5*time.Second)
+		defer waitCancel()
 		var changedTask *entroq.Task
 		if c.wantMove {
 			// Expect the queue to become empty, get stuff out of the error queue.
@@ -611,7 +613,8 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 			return
 		}
 
-		waitCtx, _ := context.WithTimeout(ctx, 3*leaseTime)
+		waitCtx, waitCancel := context.WithTimeout(ctx, 3*leaseTime)
+		defer waitCancel()
 		if err := client.WaitQueuesEmpty(waitCtx, entroq.MatchExact(c.input.Queue)); err != nil && !entroq.IsCanceled(err) {
 			t.Fatalf("Test %q: no moved tasks found, task was not expected to die: %v", c.name, err)
 		}
@@ -1022,8 +1025,9 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	}
 
 	// Claim ready task.
-	claimCtx, _ := context.WithTimeout(ctx, 5*time.Second)
+	claimCtx, claimCancel := context.WithTimeout(ctx, 5*time.Second)
 	claimed, err := client.Claim(claimCtx, entroq.From(queue), entroq.ClaimFor(10*time.Second))
+	claimCancel()
 
 	if err != nil {
 		t.Fatalf("Got unexpected error for claiming from a queue with one ready task: %+v", err)
