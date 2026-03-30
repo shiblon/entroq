@@ -25,7 +25,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	homedir "github.com/mitchellh/go-homedir"
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/backend/eqgrpc"
 	"github.com/spf13/cobra"
@@ -161,7 +160,7 @@ func initConfig() {
 		viper.SetConfigFile(rootFlags.cfgFile)
 	} else {
 		// Find home directory.
-		home, err := homedir.Dir()
+		home, err := os.UserHomeDir()
 		if err != nil {
 			log.Print(err)
 			os.Exit(1)

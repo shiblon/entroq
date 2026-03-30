@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"time"
 
-	homedir "github.com/mitchellh/go-homedir"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/shiblon/entroq/backend/eqmem"
 	"github.com/shiblon/entroq/pkg/authz/opahttp"
@@ -205,7 +204,7 @@ func initConfig() {
 		viper.SetConfigFile(flags.cfgFile)
 	} else {
 		// Find home directory.
-		home, err := homedir.Dir()
+		home, err := os.UserHomeDir()
 		if err != nil {
 			fmt.Println(err)
 			os.Exit(1)
