@@ -5,7 +5,7 @@ conftest.py starts a throwaway PostgreSQL container and applies schema.sql
 once per test session. The eq function fixture truncates the tasks table
 before each test.
 
-These tests focus on Python-specific behavior: LISTEN/NOTIFY wakeup, the
+These tests focus on Python+native-PostgreSQL-specific behavior: LISTEN/NOTIFY wakeup, the
 threading inside do_with_renew, and transaction composability with user SQL.
 Protocol-level correctness (insert/claim/delete semantics) is covered by the
 Go qtest suite run against the same stored procedures.

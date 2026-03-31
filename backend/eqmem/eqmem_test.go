@@ -82,6 +82,10 @@ func TestEQMemWorkerRenewal(t *testing.T) {
 	RunQTest(t, qtest.WorkerRenewal)
 }
 
+func TestEQMemClaimUnblocksOnNotify(t *testing.T) {
+	RunQTest(t, qtest.ClaimUnblocksOnNotify)
+}
+
 func TestEQMemQueueMatch(t *testing.T) {
 	RunQTest(t, qtest.QueueMatch)
 }
