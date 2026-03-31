@@ -1,5 +1,0 @@
-grpcio>=1.32
-grpcio-health-checking>=1.32
-grpcio-status>=1.32
-protobuf>=3.12
-click>=7.0

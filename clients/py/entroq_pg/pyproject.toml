@@ -12,5 +12,11 @@ dependencies = ["psycopg[binary]>=3.0"]
 [project.urls]
 Homepage = "https://github.com/shiblon/entroq"
 
+[tool.setuptools.packages.find]
+where = ["../src"]
+
 [tool.setuptools.package-data]
 entroq_pg = ["schema.sql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
