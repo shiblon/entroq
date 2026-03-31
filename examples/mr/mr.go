@@ -23,7 +23,6 @@ import (
 
 const (
 	claimDuration = 5 * time.Second
-	claimWait     = 20 * time.Second
 	shuffleWait   = 5 * time.Second
 )
 
@@ -575,7 +574,7 @@ func reduceSortedKVs(ctx context.Context, reduce Reducer, kvs []*KV) ([]*KV, err
 				}
 				// If we aren't just started, and the current key is
 				// not the same as the last, can't continue.
-				if curr > 0 && bytes.Compare(last.Key, kvs[curr].Key) != 0 {
+				if curr > 0 && !bytes.Equal(last.Key, kvs[curr].Key) {
 					return false
 				}
 				last = kvs[curr]
