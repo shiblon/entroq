@@ -84,16 +84,21 @@ def _run_bench(connstr, num_workers, duration_s, work_ms, poll_only, sample=None
                 task = eq.claim(QUEUE, timeout_s=10, poll_ms=poll_ms, poll_only=poll_only)
                 claim_ms = (time.monotonic() - t0) * 1000
             except TimeoutError:
+                stop_event.set()
                 return
             except Exception as exc:
                 with lock:
                     errors.append(exc)
+                    print(f'\nWorker error: {exc}', flush=True)
+                stop_event.set()
                 return
 
             with lock:
                 latencies.append(claim_ms)
                 if sample and len(latencies) >= sample:
                     stop_event.set()
+                if (len(latencies)+1) % 10 == 0:
+                    print('.', end='', flush=True)
 
             if work_ms:
                 time.sleep(work_ms / 1000)
@@ -103,6 +108,8 @@ def _run_bench(connstr, num_workers, duration_s, work_ms, poll_only, sample=None
             except Exception as exc:
                 with lock:
                     errors.append(exc)
+                    print(f'\nWorker modify error: {exc}', flush=True)
+                stop_event.set()
                 return
 
     threads = [threading.Thread(target=worker, daemon=True) for _ in range(num_workers)]
@@ -153,20 +160,24 @@ def compare(connstr, num_workers, n, work_ms, poll_ms=50):
     """Load n tasks twice and run notify vs poll-only back-to-back."""
     print(f'Comparison: notify vs poll-only, {num_workers} workers, {n:,} tasks each\n')
 
-    # Notify run.
-    load(connstr, n)
-    print(f'\nRunning notify pass...', flush=True)
-    lat_n, err_n, el_n = _run_bench(connstr, num_workers, duration_s=300, work_ms=work_ms,
-                                    poll_only=False, poll_ms=poll_ms)
+    results = []
+    try:
+        load(connstr, n)
+        print(f'\nRunning notify pass...', flush=True)
+        lat_n, err_n, el_n = _run_bench(connstr, num_workers, duration_s=300, work_ms=work_ms,
+                                        poll_only=False, poll_ms=poll_ms)
+        results.append(('notify', lat_n, err_n, el_n))
 
-    # Poll-only run.
-    load(connstr, n)
-    print(f'\nRunning poll-only pass...', flush=True)
-    lat_p, err_p, el_p = _run_bench(connstr, num_workers, duration_s=300, work_ms=work_ms,
-                                    poll_only=True, poll_ms=poll_ms)
+        load(connstr, n)
+        print(f'\nRunning poll-only pass...', flush=True)
+        lat_p, err_p, el_p = _run_bench(connstr, num_workers, duration_s=300, work_ms=work_ms,
+                                        poll_only=True, poll_ms=poll_ms)
+        results.append(('poll-only', lat_p, err_p, el_p))
+    except KeyboardInterrupt:
+        print('\nInterrupted -- printing results so far.')
 
-    _print_results('notify', lat_n, err_n, el_n)
-    _print_results('poll-only', lat_p, err_p, el_p)
+    for label, lat, err, elapsed in results:
+        _print_results(label, lat, err, elapsed)
 
 
 def scale(connstr, num_workers, work_ms, sample=1000, poll_ms=50):
@@ -181,15 +192,18 @@ def scale(connstr, num_workers, work_ms, sample=1000, poll_ms=50):
     print(f'Scale comparison: poll-only, {num_workers} workers, '
           f'{sample:,} claims from each of {[f"{s:,}" for s in sizes]}\n')
     results = []
-    for n in sizes:
-        with psycopg.connect(connstr, autocommit=True) as conn:
-            conn.execute('TRUNCATE tasks')
-        load(connstr, n)
-        print(f'Claiming {sample:,} from {n:,}-task queue...', flush=True)
-        lat, err, elapsed = _run_bench(connstr, num_workers, duration_s=300,
-                                       work_ms=work_ms, poll_only=True, sample=sample,
-                                       poll_ms=poll_ms)
-        results.append((n, lat, err, elapsed))
+    try:
+        for n in sizes:
+            with psycopg.connect(connstr, autocommit=True) as conn:
+                conn.execute('TRUNCATE tasks')
+            load(connstr, n)
+            print(f'Claiming {sample:,} from {n:,}-task queue...', flush=True)
+            lat, err, elapsed = _run_bench(connstr, num_workers, duration_s=300,
+                                           work_ms=work_ms, poll_only=True, sample=sample,
+                                           poll_ms=poll_ms)
+            results.append((n, lat, err, elapsed))
+    except KeyboardInterrupt:
+        print('\nInterrupted -- printing results so far.')
 
     for n, lat, err, elapsed in results:
         _print_results(f'poll-only queue={n:,}', lat, err, elapsed)
