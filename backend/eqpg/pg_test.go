@@ -111,6 +111,10 @@ func TestWorkerRenewal(t *testing.T) {
 	RunQTest(t, qtest.WorkerRenewal)
 }
 
+func TestClaimUnblocksOnNotify(t *testing.T) {
+	RunQTest(t, qtest.ClaimUnblocksOnNotify)
+}
+
 func TestQueueMatch(t *testing.T) {
 	RunQTest(t, qtest.QueueMatch)
 }

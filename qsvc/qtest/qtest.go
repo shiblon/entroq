@@ -693,6 +693,49 @@ func WorkerRenewal(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPr
 	}
 }
 
+// ClaimUnblocksOnNotify verifies that Claim wakes promptly when a task is
+// inserted rather than waiting the full poll interval. Backends that implement
+// a NotifyWaiter (eqpg via LISTEN/NOTIFY, eqmem via in-process signaling)
+// should pass easily; a poll-only backend would time out.
+func ClaimUnblocksOnNotify(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	t.Helper()
+	queue := path.Join(qPrefix, "notify_unblock")
+
+	// Long poll so the test fails obviously if notification doesn't fire.
+	const pollInterval = 1 * time.Minute
+
+	claimCh := make(chan *entroq.Task, 1)
+	ready := make(chan struct{})
+
+	go func() {
+		close(ready)
+		task, err := client.Claim(ctx, entroq.From(queue), entroq.ClaimPollTime(pollInterval))
+		if err != nil {
+			t.Errorf("claim error: %v", err)
+			return
+		}
+		claimCh <- task
+	}()
+
+	<-ready
+	time.Sleep(300 * time.Millisecond) // let Claim reach its wait before inserting
+
+	start := time.Now()
+	if _, _, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue([]byte("ping")))); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	select {
+	case <-claimCh:
+		if elapsed := time.Since(start); elapsed > 3*time.Second {
+			t.Errorf("Claim took %v after insert -- notification may not have fired (poll interval was %v)",
+				elapsed, pollInterval)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Claim did not unblock within 10s after insert")
+	}
+}
+
 // TasksOmitValue exercises the task query where values are not desired.
 func TasksOmitValue(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	queue := path.Join(qPrefix, "tasks_omit_value")
