@@ -5,10 +5,10 @@ conftest.py starts a throwaway PostgreSQL container and applies schema.sql
 once per test session. The eq function fixture truncates the tasks table
 before each test.
 
-These tests focus on Python+native-PostgreSQL-specific behavior: LISTEN/NOTIFY wakeup, the
-threading inside do_with_renew, and transaction composability with user SQL.
-Protocol-level correctness (insert/claim/delete semantics) is covered by the
-Go qtest suite run against the same stored procedures.
+These tests focus on Python+native-PostgreSQL-specific behavior: LISTEN/NOTIFY
+wakeup, the threading inside do_with_renew, and transaction composability with
+user SQL.  Protocol-level correctness (insert/claim/delete semantics) is covered
+by the Go qtest suite run against the same stored procedures.
 """
 
 import threading
@@ -293,6 +293,86 @@ def test_concurrent_workers_multi_queue(eq: EntroQ, pg_connstr: str):
     assert final_count == N, f'expected counter={N}, got {final_count}'
     for q in QUEUES:
         assert eq.tasks(queue=q) == [], f'tasks remain in queue {q}'
+
+
+def test_multi_queue_fairness(eq: EntroQ):
+    """Multi-queue try_claim should drain smaller queues proportionally early.
+
+    With fair random queue selection across 3 queues, the smallest queue (20
+    tasks) should be exhausted well before the first third of total consumption,
+    and the medium queue (60 tasks) before the first three-quarters. A broken
+    implementation that always tries the first queue first would exhaust small
+    and med near the very end.
+    """
+    BIG_SIZE = 300
+    MED_SIZE = 60
+    SMALL_SIZE = 20
+    N_WORKERS = 5
+
+    big_q   = '/test/fairness/big'
+    med_q   = '/test/fairness/med'
+    small_q = '/test/fairness/small'
+    queues  = [big_q, med_q, small_q]
+
+    eq.modify(inserts=(
+        [TaskData(queue=big_q,   value=b'x') for _ in range(BIG_SIZE)] +
+        [TaskData(queue=med_q,   value=b'x') for _ in range(MED_SIZE)] +
+        [TaskData(queue=small_q, value=b'x') for _ in range(SMALL_SIZE)]
+    ))
+
+    consumed = []
+    errors = []
+    lock = threading.Lock()
+
+    def worker():
+        while True:
+            try:
+                task = eq.claim(queues, timeout_s=3)
+            except TimeoutError:
+                with lock:
+                    remaining = sum(1 for q in queues if eq.tasks(queue=q))
+                    if remaining:
+                        errors.append(RuntimeError(
+                            f'claim timed out with {remaining} tasks still in queues '
+                            f'(consumed so far: {len(consumed)})'
+                        ))
+                return
+            with lock:
+                consumed.append(task.queue)
+            try:
+                eq.modify(deletes=[task.as_id()])
+            except Exception as exc:
+                with lock:
+                    errors.append(exc)
+                return
+
+    threads = [threading.Thread(target=worker) for _ in range(N_WORKERS)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+
+    assert sum(1 for t in threads if t.is_alive()) == 0, 'worker threads timed out'
+    assert not errors, f'worker errors: {errors}'
+    assert len(consumed) == BIG_SIZE + MED_SIZE + SMALL_SIZE, (
+        f'expected {BIG_SIZE + MED_SIZE + SMALL_SIZE} tasks consumed, got {len(consumed)}'
+    )
+
+    total = len(consumed)
+    last_small = max((i for i, q in enumerate(consumed) if q == small_q), default=-1)
+    last_med   = max((i for i, q in enumerate(consumed) if q == med_q),   default=-1)
+
+    # Small (20 tasks): expected to drain after ~60 total claims (1/3 of
+    # traffic). Allow up to total//3 as a generous upper bound.
+    assert last_small < total // 3, (
+        f'small queue not exhausted fairly: last task at position {last_small}/{total} '
+        f'(threshold {total // 3})'
+    )
+    # Med (60 tasks): expected to drain after ~140 total claims. Allow 3/4.
+    assert last_med < total * 3 // 4, (
+        f'med queue not exhausted fairly: last task at position {last_med}/{total} '
+        f'(threshold {total * 3 // 4})'
+    )
 
 
 def test_transaction_rollback_on_dependency_error(eq: EntroQ, pg_connstr: str):
