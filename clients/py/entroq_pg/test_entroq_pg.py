@@ -17,7 +17,7 @@ import time
 import psycopg
 import pytest
 
-from entroq_pg import DependencyError, EntroQ, TaskData, TaskID
+from entroq_pg import DependencyError, EntroQ, EQWorker, TaskData, TaskID
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +166,133 @@ def test_transaction_commits_atomically(eq: EntroQ, pg_connstr: str):
         row = conn.execute("SELECT count FROM test_counter WHERE name = 'done'").fetchone()
     assert row[0] == 1
     assert eq.tasks(queue=QUEUE) == []
+
+
+# ---------------------------------------------------------------------------
+# Stress: concurrent workers with renewal and transactional counter
+# ---------------------------------------------------------------------------
+
+def test_concurrent_workers_transactional_counter(eq: EntroQ, pg_connstr: str):
+    """Many concurrent workers claiming, renewing, and committing atomically.
+
+    N tasks are inserted. W workers race to claim and process them, each
+    deleting the task and incrementing a shared counter in a single transaction
+    via do_with_renew. The final counter must equal exactly N -- any
+    double-claim, lost transaction, or renewal bug would produce the wrong value.
+    """
+    N = 50
+    W = 10
+    QUEUE = '/test/stress'
+    DURATION = 2  # seconds; renewer fires at 1s
+
+    eq.modify(inserts=[TaskData(queue=QUEUE, value=str(i).encode()) for i in range(N)])
+
+    errors = []
+    lock = threading.Lock()
+
+    def worker():
+        while True:
+            task = eq.try_claim(QUEUE, duration_ms=DURATION * 1000 * 5)
+            if task is None:
+                return
+
+            def handle(task_fn):
+                # Simulate work long enough to trigger at least one renewal.
+                time.sleep(DURATION * 1.2)
+                # Call task_fn() inside the transaction to get the current
+                # version -- renewal may have bumped it during the sleep.
+                with eq.transaction() as txn:
+                    txn.conn.execute(
+                        "INSERT INTO test_counter (name, count) VALUES ('done', 1)"
+                        " ON CONFLICT (name) DO UPDATE SET count = test_counter.count + 1"
+                    )
+                    txn.modify(deletes=[task_fn().as_id()])
+
+            try:
+                eq.do_with_renew(task, handle, duration=DURATION)
+            except Exception as exc:
+                with lock:
+                    errors.append(exc)
+                return
+
+    threads = [threading.Thread(target=worker) for _ in range(W)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=120)
+
+    still_alive = sum(1 for t in threads if t.is_alive())
+    assert still_alive == 0, f'{still_alive} worker threads still running -- possible deadlock'
+    assert not errors, f'exceptions in worker threads: {errors}'
+
+    with psycopg.connect(pg_connstr) as conn:
+        row = conn.execute("SELECT count FROM test_counter WHERE name = 'done'").fetchone()
+    final_count = row[0] if row else 0
+    assert final_count == N, f'expected counter={N}, got {final_count} -- possible double-claim or lost transaction'
+    assert eq.tasks(queue=QUEUE) == [], 'tasks remain in queue after all workers finished'
+
+
+def test_concurrent_workers_multi_queue(eq: EntroQ, pg_connstr: str):
+    """Workers claiming from multiple queues simultaneously, with renewal and transactional counter.
+
+    Tasks are spread across Q queues. Workers each listen on all queues and
+    race to claim from any of them. Final counter must equal exactly N --
+    verifying that multi-queue claiming, LISTEN/NOTIFY across multiple channels,
+    renewal, and transactional atomicity all work correctly under concurrent load.
+    """
+    N = 50          # total tasks
+    W = 10          # workers
+    Q = 5           # queues
+    DURATION = 2    # seconds; renewer fires at 1s
+    QUEUES = [f'/test/multi/{i}' for i in range(Q)]
+
+    # Spread tasks across queues round-robin.
+    eq.modify(inserts=[
+        TaskData(queue=QUEUES[i % Q], value=str(i).encode())
+        for i in range(N)
+    ])
+
+    errors = []
+    lock = threading.Lock()
+
+    def worker():
+        while True:
+            task = eq.try_claim(QUEUES, duration_ms=DURATION * 1000 * 5)
+            if task is None:
+                return
+
+            def handle(task_fn):
+                time.sleep(DURATION * 1.2)
+                with eq.transaction() as txn:
+                    txn.conn.execute(
+                        "INSERT INTO test_counter (name, count) VALUES ('done', 1)"
+                        " ON CONFLICT (name) DO UPDATE SET count = test_counter.count + 1"
+                    )
+                    txn.modify(deletes=[task_fn().as_id()])
+
+            try:
+                eq.do_with_renew(task, handle, duration=DURATION)
+            except Exception as exc:
+                with lock:
+                    errors.append(exc)
+                return
+
+    threads = [threading.Thread(target=worker) for _ in range(W)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=120)
+
+    still_alive = sum(1 for t in threads if t.is_alive())
+    assert still_alive == 0, f'{still_alive} worker threads still running -- possible deadlock'
+    assert not errors, f'exceptions in worker threads: {errors}'
+
+    with psycopg.connect(pg_connstr) as conn:
+        row = conn.execute("SELECT count FROM test_counter WHERE name = 'done'").fetchone()
+    final_count = row[0] if row else 0
+    assert final_count == N, f'expected counter={N}, got {final_count}'
+    for q in QUEUES:
+        assert eq.tasks(queue=q) == [], f'tasks remain in queue {q}'
 
 
 def test_transaction_rollback_on_dependency_error(eq: EntroQ, pg_connstr: str):

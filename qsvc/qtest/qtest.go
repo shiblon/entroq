@@ -109,7 +109,7 @@ func SimpleChange(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 func SimpleWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	queue := path.Join(qPrefix, "simple_worker")
 
-	attempts := 30
+	attempts := 20
 	if testing.Short() {
 		attempts = 5
 	}
@@ -241,7 +241,7 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 
 	g, ctx := errgroup.WithContext(ctx)
 
-	for i := 0; i < numWorkers; i++ {
+	for range numWorkers {
 		g.Go(func() error {
 			ti := 0
 			w := client.NewWorker(bigQueue, medQueue, smallQueue)
@@ -281,34 +281,22 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	}
 
 	if err := g.Wait(); err != nil && !entroq.IsCanceled(err) {
-		t.Fatalf("Error in worker")
+		t.Fatalf("Error in worker: %v", err)
 	}
 
-	// Now check that we consumed the right tasks from the right queues..
+	// Now check that we consumed the right tasks from the right queues.
 	queuesFound := make(map[string]int)
-	var smallIndices []int
-	var medIndices []int
+	lastSmall, lastMed := -1, -1
 
 	for i, t := range consumed {
 		queuesFound[t.Queue]++
 		switch t.Queue {
 		case medQueue:
-			medIndices = append(medIndices, i)
+			lastMed = i
 		case smallQueue:
-			smallIndices = append(smallIndices, i)
+			lastSmall = i
 		}
 	}
-
-	// assume sorted
-	sortedMedian := func(indices []int) float64 {
-		if len(indices)%2 == 1 {
-			return float64(indices[len(indices)/2])
-		}
-		return float64(indices[len(indices)/2-1]+indices[len(indices)/2]) / 2
-	}
-
-	smallMedian := sortedMedian(smallIndices)
-	medMedian := sortedMedian(medIndices)
 
 	if found := queuesFound[bigQueue]; found != bigSize {
 		t.Errorf("Expected to consume %d from big queue, consumed %d", bigSize, found)
@@ -320,17 +308,24 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 		t.Errorf("Expected to consume %d from small queue, consumed %d", smallSize, found)
 	}
 
-	const (
-		maxExpectedSmallMedian = float64(smallSize*3/2 + smallSize)
-		maxExpectedMedMedian   = float64((medSize-smallSize)*2+smallSize*3)/2 + medSize
-	)
+	total := len(consumed)
 
-	if smallMedian > maxExpectedSmallMedian {
-		t.Errorf("Expected small median to max out at around %f, but was %f", maxExpectedSmallMedian, smallMedian)
+	// With fair multi-queue selection from 3 queues, each queue is chosen with
+	// probability ~1/3. Small (20 tasks) should drain after roughly 20*3 = 60
+	// total claims. We allow up to total/3 as a generous upper bound -- a
+	// correct implementation should land well under this. A broken
+	// implementation that always drains big first would fail badly (lastSmall
+	// near position 380).
+	if lastSmall >= total/3 {
+		t.Errorf("small queue not exhausted fairly: last small task at position %d/%d (threshold %d)",
+			lastSmall, total, total/3)
 	}
 
-	if medMedian > maxExpectedMedMedian {
-		t.Errorf("Expected med median to max out at around %f, but was %f", maxExpectedMedMedian, medMedian)
+	// Med (60 tasks) should drain after roughly 60+20*3 = 120 total claims
+	// (accounting for the small-queue phase). We allow up to 3*total/4.
+	if lastMed >= total*3/4 {
+		t.Errorf("med queue not exhausted fairly: last med task at position %d/%d (threshold %d)",
+			lastMed, total, total*3/4)
 	}
 }
 

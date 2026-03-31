@@ -395,31 +395,14 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 // queues, attempting to do so fairly across queues. Returns a nil task (no
 // error) if all queues are empty.
 func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
-	qs := append(make([]string, 0, len(cq.Queues)), cq.Queues...)
-	rand.Shuffle(len(qs), func(i, j int) { qs[i], qs[j] = qs[j], qs[i] })
-	for _, q := range qs {
-		t, err := b.tryClaimOne(ctx, q, cq)
-		if err != nil {
-			return nil, fmt.Errorf("try claim: %w", err)
-		}
-		if t != nil {
-			return t, nil
-		}
-	}
-	return nil, nil
-}
-
-// tryClaimOne attempts to claim an "arrived" task from the specified queue.
-// Returns a nil task (no error) if there is nothing to claim.
-func (b *backend) tryClaimOne(ctx context.Context, q string, cq *entroq.ClaimQuery) (*entroq.Task, error) {
 	if cq.Duration == 0 {
 		return nil, fmt.Errorf("no duration set for claim %q", cq.Queues)
 	}
 	task := new(entroq.Task)
 	err := b.db.QueryRowContext(ctx,
 		`SELECT id, version, queue, at, created, modified, claimant, value, claims, attempt, err
-		 FROM entroq_try_claim_one($1, $2, $3)`,
-		q, cq.Claimant, fmt.Sprintf("%d microseconds", cq.Duration/time.Microsecond),
+		 FROM entroq_try_claim($1, $2, $3)`,
+		pq.Array(cq.Queues), cq.Claimant, fmt.Sprintf("%d microseconds", cq.Duration/time.Microsecond),
 	).Scan(
 		&task.ID, &task.Version, &task.Queue, &task.At,
 		&task.Created, &task.Modified, &task.Claimant,
