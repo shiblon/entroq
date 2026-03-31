@@ -140,10 +140,14 @@ DECLARE
     v_num_buckets integer;
     v_bucket      integer;
 BEGIN
-    -- Count available tasks; relies on the (queue, at) index.
+    -- Count available tasks up to 9 -- enough to distinguish bucket thresholds
+    -- (1, 8) without scanning the full index for large queues.
     SELECT COUNT(*) INTO v_n_avail
-    FROM tasks t
-    WHERE t.queue = p_queue AND t.at <= v_now;
+    FROM (
+        SELECT t.id FROM tasks t
+        WHERE t.queue = p_queue AND t.at <= v_now
+        LIMIT 9
+    ) sub;
 
     IF v_n_avail = 0 THEN
         RETURN;
