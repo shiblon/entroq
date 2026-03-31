@@ -1,3 +1,0 @@
-psycopg[binary]>=3.0
-pytest>=7.0
-testcontainers[postgres]>=4.0
