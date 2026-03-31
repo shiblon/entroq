@@ -1,5 +1,5 @@
--- EntroQ PostgreSQL schema.
 -- Canonical source: backend/eqpg/schema.sql -- copy this file when the schema changes.
+-- EntroQ PostgreSQL schema.
 -- All statements are idempotent and can be re-run safely against an existing database.
 -- Compatible with PostgreSQL 12+.
 --
@@ -205,9 +205,22 @@ CREATE OR REPLACE FUNCTION entroq_try_claim(
     err      text
 ) LANGUAGE plpgsql AS $$
 DECLARE
-    v_queue text;
+    v_queue  text;
+    v_queues text[] := p_queues;
+    v_n      integer := array_length(p_queues, 1);
+    v_j      integer;
+    v_tmp    text;
 BEGIN
-    FOR v_queue IN SELECT unnest(p_queues) ORDER BY random() LOOP
+    -- Fisher-Yates shuffle. ORDER BY random() in a cursor loop can be
+    -- treated as a constant by the query planner, producing no shuffle.
+    FOR v_i IN REVERSE v_n..2 LOOP
+        v_j := 1 + floor(random() * v_i)::integer;
+        v_tmp       := v_queues[v_i];
+        v_queues[v_i] := v_queues[v_j];
+        v_queues[v_j] := v_tmp;
+    END LOOP;
+
+    FOREACH v_queue IN ARRAY v_queues LOOP
         RETURN QUERY SELECT * FROM entroq_try_claim_one(v_queue, p_claimant, p_duration);
         IF FOUND THEN
             RETURN;
