@@ -94,6 +94,10 @@ func TestEQMemQueueStats(t *testing.T) {
 	RunQTest(t, qtest.QueueStats)
 }
 
+func TestEQMemDeleteMissingTask(t *testing.T) {
+	RunQTest(t, qtest.DeleteMissingTask)
+}
+
 func TestEQMemMapReduce_checkSmall(t *testing.T) {
 	config := &quick.Config{
 		MaxCount: 2,
