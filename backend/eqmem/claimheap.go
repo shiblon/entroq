@@ -4,19 +4,17 @@ import (
 	"container/heap"
 	"math/rand"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 type claimItem struct {
-	id uuid.UUID
+	id string
 	q  string
 	at time.Time
 
 	idx int
 }
 
-func newItem(q string, id uuid.UUID, at time.Time) *claimItem {
+func newItem(q string, id string, at time.Time) *claimItem {
 	return &claimItem{
 		id:  id,
 		at:  at,
@@ -27,12 +25,12 @@ func newItem(q string, id uuid.UUID, at time.Time) *claimItem {
 
 type claimHeap struct {
 	items []*claimItem
-	byID  map[uuid.UUID]*claimItem
+	byID  map[string]*claimItem
 }
 
 func newClaimHeap() *claimHeap {
 	return &claimHeap{
-		byID: make(map[uuid.UUID]*claimItem),
+		byID: make(map[string]*claimItem),
 	}
 }
 
@@ -117,7 +115,7 @@ func (h *claimHeap) Pop() interface{} {
 	return item
 }
 
-func (h *claimHeap) FindItem(id uuid.UUID) (*claimItem, bool) {
+func (h *claimHeap) FindItem(id string) (*claimItem, bool) {
 	i, ok := h.byID[id]
 	return i, ok
 }
@@ -127,7 +125,7 @@ func (h *claimHeap) PushItem(item *claimItem) {
 	h.byID[item.id] = item
 }
 
-func (h *claimHeap) RemoveID(id uuid.UUID) bool {
+func (h *claimHeap) RemoveID(id string) bool {
 	item, ok := h.FindItem(id)
 	if ok {
 		h.RemoveItem(item)
@@ -140,7 +138,7 @@ func (h *claimHeap) RemoveItem(item *claimItem) {
 	delete(h.byID, item.id)
 }
 
-func (h *claimHeap) UpdateID(id uuid.UUID, at time.Time) bool {
+func (h *claimHeap) UpdateID(id string, at time.Time) bool {
 	item, ok := h.FindItem(id)
 	if ok {
 		h.UpdateItem(item, at)

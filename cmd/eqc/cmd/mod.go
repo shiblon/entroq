@@ -18,7 +18,6 @@ import (
 	"context"
 	"log"
 
-	"github.com/google/uuid"
 	"github.com/shiblon/entroq"
 	"github.com/spf13/cobra"
 )
@@ -47,16 +46,12 @@ var modCmd = &cobra.Command{
 	Use:   "mod",
 	Short: "Modify a task by queue and ID.",
 	Run: func(cmd *cobra.Command, args []string) {
-		id, err := uuid.Parse(flagMod.id)
+		tasks, err := eq.Tasks(context.Background(), "", entroq.WithTaskID(flagMod.id))
 		if err != nil {
-			log.Fatalf("Error parsing task ID: %v", err)
-		}
-		tasks, err := eq.Tasks(context.Background(), "", entroq.WithTaskID(id))
-		if err != nil {
-			log.Fatalf("Error getting task ID %q", id)
+			log.Fatalf("Error getting task ID %q", flagMod.id)
 		}
 		if len(tasks) < 1 {
-			log.Fatalf("Could not find task ID %q", id)
+			log.Fatalf("Could not find task ID %q", flagMod.id)
 		}
 		if len(tasks) > 1 {
 			log.Fatalf("Too many tasks returned: %v", tasks)
@@ -81,7 +76,7 @@ var modCmd = &cobra.Command{
 		}
 
 		if _, _, err := eq.Modify(context.Background(), modArgs...); err != nil {
-			log.Fatalf("Could not modify task %q: %v", id, err)
+			log.Fatalf("Could not modify task %q: %v", flagMod.id, err)
 		}
 	},
 }

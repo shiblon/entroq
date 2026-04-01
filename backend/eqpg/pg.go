@@ -14,7 +14,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/lib/pq"
 	"github.com/shiblon/entroq"
 )
@@ -337,15 +336,15 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 		values = append(values, tq.Queue)
 	}
 
-	if tq.Claimant != uuid.Nil {
+	if tq.Claimant != "" {
 		q += fmt.Sprintf(" AND (claimant = $%d OR claimant = $%d OR at < NOW())", len(values)+1, len(values)+2)
-		values = append(values, uuid.Nil.String(), tq.Claimant)
+		values = append(values, "", tq.Claimant)
 	}
 
 	// Add IDs if a set of limiting IDs has been requested.
 	strIDs := make([]string, 0, len(tq.IDs))
 	for _, id := range tq.IDs {
-		strIDs = append(strIDs, id.String())
+		strIDs = append(strIDs, id)
 	}
 	if len(strIDs) != 0 {
 		q += fmt.Sprintf(" AND id = any($%d)", len(values)+1)
@@ -484,10 +483,10 @@ func (b *backend) modify(ctx context.Context, mod *entroq.Modification) (inserte
 		SELECT kind, id, version, queue, at, created, modified, claimant, value, claims, attempt, err
 		FROM entroq_modify_arrays(
 			$1,
-			$2::uuid[], $3::integer[],
-			$4::uuid[], $5::integer[],
-			$6::uuid[], $7::text[], $8::timestamptz[], $9::bytea[], $10::integer[], $11::text[],
-			$12::uuid[], $13::integer[], $14::text[], $15::timestamptz[], $16::bytea[], $17::integer[], $18::text[]
+			$2::text[], $3::integer[],
+			$4::text[], $5::integer[],
+			$6::text[], $7::text[], $8::timestamptz[], $9::bytea[], $10::integer[], $11::text[],
+			$12::text[], $13::integer[], $14::text[], $15::timestamptz[], $16::bytea[], $17::integer[], $18::text[]
 		)`,
 		mod.Claimant,
 		pq.Array(depIDs), pq.Array(depVers),
@@ -533,16 +532,16 @@ func parseModifyError(err error, mod *entroq.Modification) error {
 
 	var detail struct {
 		Missing []struct {
-			ID      uuid.UUID `json:"id"`
-			Version int32     `json:"version"`
+			ID      string `json:"id"`
+			Version int32  `json:"version"`
 		} `json:"missing"`
 		Mismatched []struct {
-			ID      uuid.UUID `json:"id"`
-			Version int32     `json:"version"`
+			ID      string `json:"id"`
+			Version int32  `json:"version"`
 		} `json:"mismatched"`
 		Collisions []struct {
-			ID      uuid.UUID `json:"id"`
-			Version int32     `json:"version"`
+			ID      string `json:"id"`
+			Version int32  `json:"version"`
 		} `json:"collisions"`
 	}
 	if jsonErr := json.Unmarshal([]byte(pgerr.Detail), &detail); jsonErr != nil {
@@ -550,18 +549,18 @@ func parseModifyError(err error, mod *entroq.Modification) error {
 	}
 
 	// Build lookup sets to categorize IDs by operation.
-	dependIDs := make(map[uuid.UUID]bool, len(mod.Depends))
+	dependIDs := make(map[string]bool, len(mod.Depends))
 	for _, t := range mod.Depends {
 		dependIDs[t.ID] = true
 	}
-	deleteIDs := make(map[uuid.UUID]bool, len(mod.Deletes))
+	deleteIDs := make(map[string]bool, len(mod.Deletes))
 	for _, t := range mod.Deletes {
 		deleteIDs[t.ID] = true
 	}
 
 	depErr := entroq.DependencyError{}
 
-	categorize := func(id uuid.UUID, version int32) {
+	categorize := func(id string, version int32) {
 		tid := &entroq.TaskID{ID: id, Version: version}
 		switch {
 		case dependIDs[id]:
@@ -586,12 +585,12 @@ func parseModifyError(err error, mod *entroq.Modification) error {
 	return depErr
 }
 
-// taskIDArrays splits a slice of TaskIDs into parallel UUID string and version slices.
+// taskIDArrays splits a slice of TaskIDs into parallel ID string and version slices.
 func taskIDArrays(tids []*entroq.TaskID) (ids []string, versions []int32) {
 	ids = make([]string, len(tids))
 	versions = make([]int32, len(tids))
 	for i, t := range tids {
-		ids[i] = t.ID.String()
+		ids[i] = t.ID
 		versions[i] = t.Version
 	}
 	return
@@ -606,7 +605,7 @@ func insertArrays(inserts []*entroq.TaskData) (ids []string, queues []string, at
 	attempts = make([]int32, len(inserts))
 	errs = make([]string, len(inserts))
 	for i, ins := range inserts {
-		ids[i] = ins.ID.String() // uuid.Nil.String() signals auto-generate
+		ids[i] = ins.ID // empty signals auto-generate, the common case
 		queues[i] = ins.Queue
 		ats[i] = ins.At // zero time signals use now()
 		values[i] = ins.Value
@@ -626,7 +625,7 @@ func changeArrays(changes []*entroq.Task) (ids []string, versions []int32, queue
 	attempts = make([]int32, len(changes))
 	errs = make([]string, len(changes))
 	for i, chg := range changes {
-		ids[i] = chg.ID.String()
+		ids[i] = chg.ID
 		versions[i] = chg.Version
 		queues[i] = chg.Queue
 		ats[i] = chg.At

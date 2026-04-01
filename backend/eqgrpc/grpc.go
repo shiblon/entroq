@@ -1,34 +1,34 @@
 // Package eqgrpc provides a gRPC backend for EntroQ. This is the backend that is
 // commonly used by clients of an EntroQ task service, set up thus:
 //
-// 	Server:
-// 		qsvc -> entroq library -> some backend (e.g., pg)
+//	Server:
+//		qsvc -> entroq library -> some backend (e.g., pg)
 //
-// 	Client:
-// 		entroq library -> grpc backend
+//	Client:
+//		entroq library -> grpc backend
 //
 // You can start, for example, a postgres-backed QSvc like this (or just use pg/svc):
 //
-// 	ctx := context.Background()
-// 	svc, err := qsvc.New(ctx, pg.Opener(dbHostPort)) // Other options available, too.
-// 	if err != nil {
-// 		log.Fatalf("Can't open PG backend: %v",e rr)
-// 	}
-// 	defer svc.Close()
+//	ctx := context.Background()
+//	svc, err := qsvc.New(ctx, pg.Opener(dbHostPort)) // Other options available, too.
+//	if err != nil {
+//		log.Fatalf("Can't open PG backend: %v",e rr)
+//	}
+//	defer svc.Close()
 //
-// 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", thisPort))
-// 	if err != nil {
-// 		log.Fatalf("Can't start this service")
-// 	}
+//	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", thisPort))
+//	if err != nil {
+//		log.Fatalf("Can't start this service")
+//	}
 //
-// 	s := eqgrpc.NewServer()
-// 	pb.RegisterEntroQServer(s, svc)
-// 	s.Serve(lis)
+//	s := eqgrpc.NewServer()
+//	pb.RegisterEntroQServer(s, svc)
+//	s.Serve(lis)
 //
 // With the server set up this way, the client simply uses the EntroQ library,
 // hands it the eqgrpc Opener, and they're off:
 //
-// 	client, err := entroq.New(ctx, eqgrpc.Opener("myhost:54321", eqgrpc.WithInsecure()))
+//	client, err := entroq.New(ctx, eqgrpc.Opener("myhost:54321", eqgrpc.WithInsecure()))
 //
 // That creates a client library that uses a gRPC connection to do its work.
 // Note that Claim will block on the *client* side doing this instead of
@@ -45,7 +45,6 @@ import (
 	"net"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/authz"
 	"google.golang.org/grpc"
@@ -248,22 +247,12 @@ func toMS(t time.Time) int64 {
 }
 
 func fromTaskProto(t *pb.Task) (*entroq.Task, error) {
-	cid, err := uuid.Parse(t.ClaimantId)
-	if err != nil {
-		return nil, fmt.Errorf("claimant UUID parse failure: %w", err)
-	}
-
-	id, err := uuid.Parse(t.Id)
-	if err != nil {
-		return nil, fmt.Errorf("task UUID parse failure: %w", err)
-	}
-
 	return &entroq.Task{
 		Queue:    t.Queue,
-		ID:       id,
+		ID:       t.Id,
 		Version:  t.Version,
 		At:       fromMS(t.AtMs),
-		Claimant: cid,
+		Claimant: t.ClaimantId,
 		Claims:   t.Claims,
 		Value:    t.Value,
 		Created:  fromMS(t.CreatedMs),
@@ -275,24 +264,20 @@ func fromTaskProto(t *pb.Task) (*entroq.Task, error) {
 }
 
 func protoFromTaskData(td *entroq.TaskData) *pb.TaskData {
-	id := ""
-	if td.ID != uuid.Nil {
-		id = td.ID.String()
-	}
 	return &pb.TaskData{
 		Queue:   td.Queue,
 		AtMs:    toMS(td.At),
 		Value:   td.Value,
 		Attempt: td.Attempt,
 		Err:     td.Err,
-		Id:      id,
+		Id:      td.ID,
 	}
 }
 
 func changeProtoFromTask(t *entroq.Task) *pb.TaskChange {
 	return &pb.TaskChange{
 		OldId: &pb.TaskID{
-			Id:      t.ID.String(),
+			Id:      t.ID,
 			Version: t.Version,
 			Queue:   t.FromQueue, // old queue goes in the ID for changes.
 		},
@@ -301,12 +286,8 @@ func changeProtoFromTask(t *entroq.Task) *pb.TaskChange {
 }
 
 func fromTaskIDProto(tid *pb.TaskID) (*entroq.TaskID, error) {
-	id, err := uuid.Parse(tid.Id)
-	if err != nil {
-		return nil, fmt.Errorf("parse %q: %w", tid.Id, err)
-	}
 	return &entroq.TaskID{
-		ID:      id,
+		ID:      tid.Id,
 		Version: tid.Version,
 		Queue:   tid.Queue,
 	}, nil
@@ -314,16 +295,11 @@ func fromTaskIDProto(tid *pb.TaskID) (*entroq.TaskID, error) {
 
 // Tasks produces a list of tasks in a given queue, possibly limited by claimant.
 func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Task, error) {
-	var ids []string
-	for _, tid := range tq.IDs {
-		ids = append(ids, tid.String())
-	}
-
 	stream, err := pb.NewEntroQClient(b.conn).StreamTasks(ctx, &pb.TasksRequest{
-		ClaimantId: tq.Claimant.String(),
+		ClaimantId: tq.Claimant,
+		TaskId:     tq.IDs,
 		Queue:      tq.Queue,
 		Limit:      int32(tq.Limit),
-		TaskId:     ids,
 		OmitValues: tq.OmitValues,
 	})
 	if err != nil {
@@ -361,7 +337,7 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 		}
 		ctx, _ := context.WithTimeout(ctx, ClaimRetryInterval)
 		resp, err := pb.NewEntroQClient(b.conn).Claim(ctx, &pb.ClaimRequest{
-			ClaimantId: cq.Claimant.String(),
+			ClaimantId: cq.Claimant,
 			Queues:     cq.Queues,
 			DurationMs: int64(cq.Duration / time.Millisecond),
 			PollMs:     int64(cq.PollTime / time.Millisecond),
@@ -387,7 +363,7 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 // nil task and error if nothing is ready.
 func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
 	resp, err := pb.NewEntroQClient(b.conn).TryClaim(ctx, &pb.ClaimRequest{
-		ClaimantId: cq.Claimant.String(),
+		ClaimantId: cq.Claimant,
 		Queues:     cq.Queues,
 		DurationMs: int64(cq.Duration / time.Millisecond),
 	})
@@ -489,7 +465,7 @@ func unpackGRPCError(grpcErr error) error {
 // Modify modifies the task system with the given batch of modifications.
 func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserted []*entroq.Task, changed []*entroq.Task, err error) {
 	req := &pb.ModifyRequest{
-		ClaimantId: mod.Claimant.String(),
+		ClaimantId: mod.Claimant,
 	}
 	for _, ins := range mod.Inserts {
 		req.Inserts = append(req.Inserts, protoFromTaskData(ins))
@@ -499,14 +475,14 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 	}
 	for _, del := range mod.Deletes {
 		req.Deletes = append(req.Deletes, &pb.TaskID{
-			Id:      del.ID.String(),
+			Id:      del.ID,
 			Version: del.Version,
 			Queue:   del.Queue,
 		})
 	}
 	for _, dep := range mod.Depends {
 		req.Depends = append(req.Depends, &pb.TaskID{
-			Id:      dep.ID.String(),
+			Id:      dep.ID,
 			Version: dep.Version,
 			Queue:   dep.Queue,
 		})

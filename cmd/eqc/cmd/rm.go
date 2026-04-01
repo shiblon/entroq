@@ -21,7 +21,6 @@ import (
 	"log"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/shiblon/entroq"
 	"github.com/spf13/cobra"
 )
@@ -47,20 +46,16 @@ var rmCmd = &cobra.Command{
 	Use:   "rm",
 	Short: "Remove a task by queue and ID.",
 	Run: func(cmd *cobra.Command, args []string) {
-		id, err := uuid.Parse(flagRmID)
-		if err != nil {
-			log.Fatalf("Error parsing task ID: %v", err)
-		}
 		ctx := context.Background()
 		var delErr error
 		for i := 0; i < flagRmRetries; i++ {
-			log.Printf("Attempt %d/%d to remove %v", i+1, flagRmRetries, id)
-			tasks, err := eq.Tasks(ctx, "", entroq.WithTaskID(id))
+			log.Printf("Attempt %d/%d to remove %v", i+1, flagRmRetries, flagRmID)
+			tasks, err := eq.Tasks(ctx, "", entroq.WithTaskID(flagRmID))
 			if err != nil {
-				log.Fatalf("Error getting task ID %v", id)
+				log.Fatalf("Error getting task ID %v", flagRmID)
 			}
 			if len(tasks) < 1 {
-				log.Fatalf("Could not find task ID %v", id)
+				log.Fatalf("Could not find task ID %v", flagRmID)
 			}
 			if len(tasks) > 1 {
 				log.Fatalf("Too many tasks returned: %v", tasks)
@@ -75,7 +70,7 @@ var rmCmd = &cobra.Command{
 
 			_, mod, err := eq.Modify(ctx, modArgs...)
 			if err != nil {
-				log.Printf("Try %d/%d - could not remove task %v: %v", i+1, flagRmRetries, id, err)
+				log.Printf("Try %d/%d - could not remove task %v: %v", i+1, flagRmRetries, flagRmID, err)
 				delErr = err
 				time.Sleep(3 * time.Second)
 				continue
@@ -89,6 +84,6 @@ var rmCmd = &cobra.Command{
 			fmt.Println(string(b))
 			return
 		}
-		log.Fatalf("Could not delete task %v: %v", id, delErr)
+		log.Fatalf("Could not delete task %v: %v", flagRmID, delErr)
 	},
 }

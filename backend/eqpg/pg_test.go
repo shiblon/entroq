@@ -15,7 +15,6 @@ import (
 	"testing/quick"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/examples/mrtest"
 	"github.com/shiblon/entroq/qsvc/qtest"
@@ -60,7 +59,7 @@ func RunQTest(t *testing.T, tester qtest.Tester) {
 	}
 	defer client.Close()
 	defer stop()
-	tester(ctx, t, client, "pgtest/"+uuid.New().String())
+	tester(ctx, t, client, "pgtest/"+client.GenID())
 }
 
 func TestTasksWithID(t *testing.T) {
@@ -213,7 +212,7 @@ func run(ctx context.Context, name string, args ...string) error {
 // startPostgres starts up a postgres docker. Use the stop function to stop it.
 func startPostgres(ctx context.Context) (port int, stop func(), err error) {
 	// Run detached. Check error. Detaches only once Postgres is downloaded and initialized.
-	name := fmt.Sprintf("testpg-%s", uuid.New())
+	name := fmt.Sprintf("testpg-%s", entroq.UUIDGenerator())
 
 	log.Printf("Starting postgres container %q...", name)
 	if err := run(ctx, "docker", "run", "-p", "0:5432", "--rm", "-d", "-e", "POSTGRES_PASSWORD=password", "--name", name, "postgres:11"); err != nil {

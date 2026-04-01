@@ -19,7 +19,6 @@ import (
 	"log"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/shiblon/entroq"
 	"github.com/spf13/cobra"
 )
@@ -58,7 +57,7 @@ var clearCmd = &cobra.Command{
 					log.Fatalf("Failed to get tasks from %q: %v", flagClearQueue, err)
 				}
 
-				byClaimant := make(map[uuid.UUID][]entroq.ModifyArg)
+				byClaimant := make(map[string][]entroq.ModifyArg)
 				for _, t := range tasks {
 					byClaimant[t.Claimant] = append(byClaimant[t.Claimant], t.AsDeletion())
 				}

@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/google/uuid"
 	"github.com/shiblon/entroq"
 	"github.com/spf13/cobra"
 )
@@ -49,16 +48,8 @@ var tsCmd = &cobra.Command{
 			log.Print("No queue or task IDs specified.")
 			return
 		}
-		var ids []uuid.UUID
-		for _, tid := range flagTsIDs {
-			uid, err := uuid.Parse(tid)
-			if err != nil {
-				log.Fatalf("Failed to parse ID %q: %v", tid, err)
-			}
-			ids = append(ids, uid)
-		}
 		opts := []entroq.TasksOpt{
-			entroq.WithTaskID(ids...),
+			entroq.WithTaskID(flagTsIDs...),
 			entroq.LimitTasks(flagTsLimit),
 		}
 		if flagTsOmitValues {

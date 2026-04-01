@@ -7,7 +7,6 @@ import (
 	"log"
 	"time"
 
-	"github.com/google/uuid"
 )
 
 // DefaultRetryDelay is the amount by which to advance the arrival time when a
@@ -226,7 +225,7 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 			return fmt.Errorf("worker error: %w", workErr)
 		}
 
-		modification := NewModification(uuid.Nil, args...)
+		modification := NewModification("", args...)
 		for _, task := range modification.Changes {
 			if task.ID == renewed.ID && task.Version != renewed.Version {
 				if task.Version > renewed.Version {
