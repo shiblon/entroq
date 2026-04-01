@@ -809,7 +809,7 @@ func TasksWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	}
 	for _, task := range tasks {
 		if !want[task.ID] {
-			t.Fatalf("Wanted queried task %d to have ID present in task listing, but not found", task.ID)
+			t.Fatalf("Wanted queried task %s to have ID present in task listing, but not found", task.ID)
 		}
 	}
 
@@ -1393,4 +1393,42 @@ func EqualAllTasksOrderedSkipIDAndTime(want, got []*entroq.Task) string {
 // EqualTasksVersionIncr checks for equality, allowing a version increment.
 func EqualTasksVersionIncr(want, got *entroq.Task, versionBump int) string {
 	return EqualAllTasksUnorderedSkipTimesAndCounters([]*entroq.Task{want}, []*entroq.Task{got}, expectVersionIncr(versionBump))
+}
+
+// DeleteMissingTask tests that deleting non-existent tasks or versions results
+// in the right dependency errors.
+func DeleteMissingTask(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	//queue := path.Join(qPrefix, "delete_missing")
+
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	if _, _, err := client.Modify(ctx, entroq.Deleting("fake_task_id", 0)); err != nil {
+		if depErr, ok := entroq.AsDependency(err); !ok {
+			t.Fatalf("Expected dependency error when deleting missing task, got: %v", err)
+		} else {
+			if want, got := 1, len(depErr.Deletes); want != got {
+				t.Fatalf("Expected 1 delete, got: %v", got)
+			}
+		}
+	} else {
+		t.Fatalf("Expected error when deleting missing task, got: %v", err)
+	}
+
+	ins, _, err := client.Modify(ctx, entroq.InsertingInto("my queue", entroq.WithValue([]byte("hi"))))
+	if err != nil {
+		t.Fatalf("Error inserting task for delete missing test: %v", err)
+	}
+
+	if _, _, err := client.Modify(ctx, entroq.Deleting(ins[0].ID, 1 /* wrong version */)); err != nil {
+		if depErr, ok := entroq.AsDependency(err); !ok {
+			t.Fatalf("Expected dependency error when deleting with wrong version, got: %v", err)
+		} else {
+			if want, got := 1, len(depErr.Deletes); want != got {
+				t.Fatalf("Expected 1 delete, got: %v", got)
+			}
+		}
+	} else {
+		t.Fatalf("Expected error when deleting with wrong version, got: %v", err)
+	}
 }

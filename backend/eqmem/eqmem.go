@@ -492,8 +492,16 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 	//
 	// - Modify claimHeaps and actual tasks. Take special care with deletions and insertions.
 	// - Unlock queues.
+
+	// Get queues that are involved in this modification so we can grab locks.
+	// Also find any insertion requests with IDs, where the ID is in a queue
+	// different from the one requested.
 	queues, misplacedInsIDs := m.modPrep(mod)
-	if len(queues) == 0 {
+	// We can short-circuit if there are no known queues to lock.
+	// But we first have to check that there aren't any queue-less deletions, changes, or dependencies.
+	// The client API allows this in some circumstances, particularly for deletions and dependencies.
+	// We assume that modifications are always going to contain a FromQueue.
+	if len(queues) == 0 && len(mod.Deletes) == 0 && len(mod.Depends) == 0 {
 		return nil, nil, nil
 	}
 

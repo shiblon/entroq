@@ -122,6 +122,10 @@ func TestQueueStats(t *testing.T) {
 	RunQTest(t, qtest.QueueStats)
 }
 
+func TestDeleteMissingTask(t *testing.T) {
+	RunQTest(t, qtest.DeleteMissingTask)
+}
+
 func TestMapReduce_checkTiny(t *testing.T) {
 	ctx := context.Background()
 	client, stop, err := pgClient(ctx)
