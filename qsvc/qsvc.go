@@ -1,36 +1,36 @@
 // Package qsvc contains the service implementation for registering with gRPC.
 // This provides the service that can be registered with a grpc.Server:
 //
-// 	import (
-// 		"context"
-// 		"log"
-// 		"net"
+//	import (
+//		"context"
+//		"log"
+//		"net"
 //
-// 		"github.com/shiblon/entroq/backend/eqpg"
-// 		"github.com/shiblon/entroq/qsvc"
+//		"github.com/shiblon/entroq/backend/eqpg"
+//		"github.com/shiblon/entroq/qsvc"
 //
-// 		pb "github.com/shiblon/entroq/proto"
+//		pb "github.com/shiblon/entroq/proto"
 //
-// 		"google.golang.org/grpc"
-// 	)
+//		"google.golang.org/grpc"
+//	)
 //
-// 	func main() {
+//	func main() {
 //		ctx := context.Background()
 //
-// 		listener, err := net.Listen("tcp", "localhost:54321")
-// 		if err != nil {
-// 			log.Fatalf("Failed to listen: %v", err)
-// 		}
+//		listener, err := net.Listen("tcp", "localhost:54321")
+//		if err != nil {
+//			log.Fatalf("Failed to listen: %v", err)
+//		}
 //
 //		svc, err := qsvc.New(ctx, eqpg.Opener("localhost:5432", "postgres", "postgres", false))
 //		if err != nil {
 //			log.Fatalf("Failed to open service backends: %v", err)
 //		}
 //
-// 		s := grpc.NewServer()
-// 		pb.RegisterEntroQServer(s, svc)
-// 		s.Serve(listener)
-// 	}
+//		s := grpc.NewServer()
+//		pb.RegisterEntroQServer(s, svc)
+//		s.Serve(listener)
+//	}
 package qsvc
 
 import (
@@ -41,7 +41,6 @@ import (
 	"time"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/shiblon/entroq"
@@ -251,10 +250,10 @@ func toMS(t time.Time) int64 {
 func protoFromTask(t *entroq.Task) *pb.Task {
 	return &pb.Task{
 		Queue:      t.Queue,
-		Id:         t.ID.String(),
+		Id:         t.ID,
 		Version:    t.Version,
 		AtMs:       toMS(t.At),
-		ClaimantId: t.Claimant.String(),
+		ClaimantId: t.Claimant,
 		Claims:     t.Claims,
 		Value:      t.Value,
 		CreatedMs:  toMS(t.Created),
@@ -370,10 +369,6 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 		return nil, err // don't wrap, has status codes
 	}
 
-	claimant, err := uuid.Parse(req.ClaimantId)
-	if err != nil {
-		return nil, codeErrorf(codes.InvalidArgument, "failed to parse claimant ID: %w", err)
-	}
 	duration := time.Duration(req.DurationMs) * time.Millisecond
 	pollTime := time.Duration(0)
 	if req.PollMs > 0 {
@@ -383,7 +378,7 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 	task, err := s.impl.Claim(ctx,
 		entroq.From(req.Queues...),
 		entroq.ClaimFor(duration),
-		entroq.ClaimAs(claimant),
+		entroq.ClaimAs(req.ClaimantId),
 		entroq.ClaimPollTime(pollTime))
 	if err != nil {
 		return nil, autoCodeErrorf("qsvc claim: %w", err)
@@ -406,15 +401,11 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 		return nil, err // don't wrap, has status codes
 	}
 
-	claimant, err := uuid.Parse(req.ClaimantId)
-	if err != nil {
-		return nil, codeErrorf(codes.InvalidArgument, "failed to parse claimant ID: %w", err)
-	}
 	duration := time.Duration(req.DurationMs) * time.Millisecond
 	task, err := s.impl.TryClaim(ctx,
 		entroq.From(req.Queues...),
 		entroq.ClaimFor(duration),
-		entroq.ClaimAs(claimant))
+		entroq.ClaimAs(req.ClaimantId))
 	if err != nil {
 		return nil, autoCodeErrorf("try claim: %w", err)
 	}
@@ -436,40 +427,23 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 		return nil, err // don't wrap, has status codes
 	}
 
-	claimant, err := uuid.Parse(req.ClaimantId)
-	if err != nil {
-		return nil, codeErrorf(codes.InvalidArgument, "failed to parse claimant ID: %w", err)
-	}
 	modArgs := []entroq.ModifyArg{
-		entroq.ModifyAs(claimant),
+		entroq.ModifyAs(req.ClaimantId),
 	}
 	for _, insert := range req.Inserts {
-		var (
-			id  uuid.UUID
-			err error
-		)
-		if insert.Id != "" {
-			if id, err = uuid.Parse(insert.Id); err != nil {
-				return nil, codeErrorf(codes.InvalidArgument, "failed to parse explicit insertion ID: %w", err)
-			}
-		}
 		modArgs = append(modArgs,
 			entroq.InsertingInto(insert.Queue,
 				entroq.WithArrivalTime(fromMS(insert.AtMs)),
 				entroq.WithValue(insert.Value),
 				entroq.WithAttempt(insert.Attempt),
 				entroq.WithErr(insert.Err),
-				entroq.WithID(id)))
+				entroq.WithID(insert.Id)))
 	}
 	for _, change := range req.Changes {
-		id, err := uuid.Parse(change.GetOldId().Id)
-		if err != nil {
-			return nil, codeErrorf(codes.InvalidArgument, "failed to parse change id: %w", err)
-		}
 		t := &entroq.Task{
-			ID:        id,
+			ID:        change.GetOldId().Id,
 			Version:   change.GetOldId().Version,
-			Claimant:  claimant,
+			Claimant:  req.ClaimantId,
 			Queue:     change.GetNewData().Queue,
 			Value:     change.GetNewData().Value,
 			At:        fromMS(change.GetNewData().AtMs),
@@ -480,18 +454,10 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 		modArgs = append(modArgs, entroq.Changing(t))
 	}
 	for _, del := range req.Deletes {
-		id, err := uuid.Parse(del.Id)
-		if err != nil {
-			return nil, codeErrorf(codes.InvalidArgument, "failed to parse deletion id: %w", err)
-		}
-		modArgs = append(modArgs, entroq.Deleting(id, del.Version, entroq.WithIDQueue(del.Queue)))
+		modArgs = append(modArgs, entroq.Deleting(del.Id, del.Version, entroq.WithIDQueue(del.Queue)))
 	}
 	for _, dep := range req.Depends {
-		id, err := uuid.Parse(dep.Id)
-		if err != nil {
-			return nil, codeErrorf(codes.InvalidArgument, "failed to parse depency id: %w", err)
-		}
-		modArgs = append(modArgs, entroq.DependingOn(id, dep.Version, entroq.WithIDQueue(dep.Queue)))
+		modArgs = append(modArgs, entroq.DependingOn(dep.Id, dep.Version, entroq.WithIDQueue(dep.Queue)))
 	}
 	inserted, changed, err := s.impl.Modify(ctx, modArgs...)
 	if err != nil {
@@ -512,7 +478,7 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 				for _, tid := range dvals {
 					details = append(details, &pb.ModifyDep{
 						Type: dtype,
-						Id:   &pb.TaskID{Id: tid.ID.String(), Version: tid.Version, Queue: tid.Queue},
+						Id:   &pb.TaskID{Id: tid.ID, Version: tid.Version, Queue: tid.Queue},
 					})
 				}
 			}
@@ -541,26 +507,11 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 		return nil, err // don't wrap, has status codes
 	}
 
-	claimant := uuid.Nil
-	if req.ClaimantId != "" {
-		var err error
-		if claimant, err = uuid.Parse(req.ClaimantId); err != nil {
-			return nil, codeErrorf(codes.InvalidArgument, "failed to parse claimant ID: %w", err)
-		}
-	}
 	// Claimant will only really be limited if it is nonzero.
 	// Tasks will only be limited if non-empty.
-	var ids []uuid.UUID
-	for _, sID := range req.TaskId {
-		id, err := uuid.Parse(sID)
-		if err != nil {
-			return nil, codeErrorf(codes.InvalidArgument, "invalid task ID %q: %w", sID, err)
-		}
-		ids = append(ids, id)
-	}
 	opts := []entroq.TasksOpt{
-		entroq.LimitClaimant(claimant),
-		entroq.WithTaskID(ids...),
+		entroq.LimitClaimant(req.ClaimantId),
+		entroq.WithTaskID(req.TaskId...),
 		entroq.LimitTasks(int(req.Limit)),
 	}
 	if req.OmitValues {

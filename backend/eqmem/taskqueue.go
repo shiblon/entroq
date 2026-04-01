@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/google/uuid"
 	"github.com/shiblon/entroq"
 )
 
@@ -36,7 +35,7 @@ func newTaskQueue(name string) *taskQueue {
 }
 
 // Set inserts or changes a value in the store.
-func (s *taskQueue) Set(id uuid.UUID, val *entroq.Task) {
+func (s *taskQueue) Set(id string, val *entroq.Task) {
 	defer un(lock(s))
 	if _, ok := s.byID.Load(id); !ok {
 		s.size++
@@ -45,7 +44,7 @@ func (s *taskQueue) Set(id uuid.UUID, val *entroq.Task) {
 }
 
 // Delete removes the task for the corresponding ID, if present.
-func (s *taskQueue) Delete(id uuid.UUID) {
+func (s *taskQueue) Delete(id string) {
 	defer un(lock(s))
 	if _, ok := s.byID.LoadAndDelete(id); ok {
 		s.size--
@@ -54,7 +53,7 @@ func (s *taskQueue) Delete(id uuid.UUID) {
 
 // Update loads a task and passes it to the given update function, holding the lock meanwhile.
 // If the task does not exist, it will return an error and never call the given function.
-func (s *taskQueue) Update(id uuid.UUID, f func(*entroq.Task) *entroq.Task) error {
+func (s *taskQueue) Update(id string, f func(*entroq.Task) *entroq.Task) error {
 	defer un(lock(s))
 	val, ok := s.byID.Load(id)
 	if !ok {
@@ -75,13 +74,13 @@ func (s *taskQueue) Len() int {
 }
 
 // Has indicates whether a given ID is in this task store.
-func (s *taskQueue) Has(id uuid.UUID) bool {
+func (s *taskQueue) Has(id string) bool {
 	_, ok := s.Get(id)
 	return ok
 }
 
 // Get returns the task for the given ID, or not okay if not found,.
-func (s *taskQueue) Get(id uuid.UUID) (*entroq.Task, bool) {
+func (s *taskQueue) Get(id string) (*entroq.Task, bool) {
 	// No need to lock.
 	t, ok := s.byID.Load(id)
 	if !ok {
@@ -92,9 +91,9 @@ func (s *taskQueue) Get(id uuid.UUID) (*entroq.Task, bool) {
 
 // Range ranges over the keys and values in this task store, calling the
 // provided function for each. It follows the semantics of sync.Map precisely.
-func (s *taskQueue) Range(f func(uuid.UUID, *entroq.Task) bool) {
+func (s *taskQueue) Range(f func(string, *entroq.Task) bool) {
 	// No need to lock.
 	s.byID.Range(func(k, v interface{}) bool {
-		return f(k.(uuid.UUID), v.(*entroq.Task))
+		return f(k.(string), v.(*entroq.Task))
 	})
 }

@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/google/uuid"
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/backend/eqgrpc"
 	"github.com/shiblon/entroq/qsvc"
@@ -136,7 +135,7 @@ func simpleWorkerOnce(ctx context.Context, t *testing.T, client *entroq.EntroQ, 
 		}
 		log.Printf("**** Queue %v (%v) ****\n", queue, len(tasks))
 		sort.Slice(tasks, func(i, j int) bool {
-			return tasks[i].ID.String() < tasks[j].ID.String()
+			return tasks[i].ID < tasks[j].ID
 		})
 		for _, t := range tasks {
 			log.Printf("  %v", t)
@@ -373,7 +372,7 @@ func WorkerDependencyHandler(ctx context.Context, t *testing.T, client *entroq.E
 
 	err := w.Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
 		// Return a modification that will fail because it depends on a non-existent task ID.
-		return []entroq.ModifyArg{task.AsDeletion(), entroq.DependingOn(uuid.New(), 0, entroq.WithIDQueue("no queue"))}, nil
+		return []entroq.ModifyArg{task.AsDeletion(), entroq.DependingOn(client.GenID(), 0, entroq.WithIDQueue("no queue"))}, nil
 	})
 
 	if !errors.Is(err, upgradeError) {
@@ -392,7 +391,7 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 	newTask := func(val string) *entroq.Task {
 		return &entroq.Task{
 			Queue: path.Join(qPrefix, "retry_on_error", val),
-			ID:    uuid.New(),
+			ID:    client.GenID(),
 			Value: []byte(val),
 		}
 	}
@@ -523,9 +522,9 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 	}
 
 	newTask := func(val string) *entroq.Task {
-		id := uuid.New()
+		id := client.GenID()
 		return &entroq.Task{
-			Queue: path.Join(baseQueue, val, id.String()),
+			Queue: path.Join(baseQueue, val, id),
 			ID:    id,
 			Value: []byte(val),
 		}
@@ -552,7 +551,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 	runWorkerOneCase := func(ctx context.Context, c tc) {
 		// Before starting, create a brand new ID for the task in the case.
 		// Otherwise we'll try to reinsert a moved task when we create work.
-		c.input.ID = uuid.New()
+		c.input.ID = client.GenID()
 
 		const leaseTime = 5 * time.Second
 
@@ -770,11 +769,11 @@ func TasksOmitValue(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 func TasksWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	queue := path.Join(qPrefix, "tasks_with_id")
 
-	ids := []uuid.UUID{
-		uuid.New(),
-		uuid.New(),
-		uuid.New(),
-		uuid.New(),
+	ids := []string{
+		client.GenID(),
+		client.GenID(),
+		client.GenID(),
+		client.GenID(),
 	}
 
 	var args []entroq.ModifyArg
@@ -804,7 +803,7 @@ func TasksWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	if want, got := len(ids), len(tasks); want != got {
 		t.Fatalf("Expected %d tasks in 'all' query, got %d", want, got)
 	}
-	want := make(map[uuid.UUID]bool)
+	want := make(map[string]bool)
 	for _, id := range ids {
 		want[id] = true
 	}
@@ -815,7 +814,7 @@ func TasksWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	}
 
 	// Check that specifing a couple of the IDs works.
-	idSubSet := []uuid.UUID{ids[1], ids[3]}
+	idSubSet := []string{ids[1], ids[3]}
 	tasks, err = client.Tasks(ctx, queue, entroq.WithTaskID(idSubSet...))
 	if err != nil {
 		t.Fatalf("Error getting tasks from queue %q: %v", queue, err)
@@ -850,7 +849,7 @@ func TasksWithIDOnly(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 		t.Fatalf("Initial insert failed: %v", err)
 	}
 
-	var ids1, ids2 []uuid.UUID
+	var ids1, ids2 []string
 	var tasks1, tasks2 []*entroq.Task
 	for i, t := range ins {
 		if i < 3 {
@@ -894,7 +893,7 @@ func TasksWithIDOnly(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 func InsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	queue := path.Join(qPrefix, "insert_with_id")
 
-	knownID := uuid.New()
+	knownID := client.GenID()
 
 	// Insert task with an explicit ID.
 	inserted, changed, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithID(knownID)))
@@ -1275,10 +1274,10 @@ func newTaskQueueVersionValue(t *entroq.Task) *taskQueueVersionValue {
 
 type taskIDQueueVersionValue struct {
 	Queue    string
-	ID       uuid.UUID
+	ID       string
 	Version  int32
 	Value    []byte
-	Claimant uuid.UUID
+	Claimant string
 }
 
 func newTaskIDQueueVersionValue(t *entroq.Task) *taskIDQueueVersionValue {
@@ -1339,11 +1338,11 @@ func EqualAllTasksUnorderedSkipTimesAndCounters(want, got []*entroq.Task, opts .
 	}
 
 	sort.Slice(ws, func(i, j int) bool {
-		return ws[i].ID.String() < ws[j].ID.String()
+		return ws[i].ID < ws[j].ID
 	})
 
 	sort.Slice(gs, func(i, j int) bool {
-		return gs[i].ID.String() < gs[j].ID.String()
+		return gs[i].ID < gs[j].ID
 	})
 
 	return cmp.Diff(ws, gs)

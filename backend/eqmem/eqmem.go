@@ -14,7 +14,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/subq"
 	"github.com/shiblon/stuffedio/wal"
@@ -34,7 +33,7 @@ type EQMem struct {
 	// case, since modifications are done on existing tasks, and have
 	// to go through RBAC based on queue names, but it is possible to try to
 	// reinsert a task when it has been moved to another queue.
-	qByID map[uuid.UUID]string
+	qByID map[string]string
 
 	// locksSuperUnsafe contains lockers for each known queue. The locks know
 	// their own queue name, as well. Do not use directly. They require use of the
@@ -134,7 +133,7 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 	m := &EQMem{
 		nw:               subq.New(),
 		queues:           make(map[string]*taskQueue),
-		qByID:            make(map[uuid.UUID]string),
+		qByID:            make(map[string]string),
 		locksSuperUnsafe: make(map[string]*qLock),
 	}
 	for _, opt := range opts {
@@ -221,7 +220,7 @@ func TakeSnapshot(ctx context.Context, journalDir string, cleanup bool) error {
 func (m *EQMem) makeSnapshot(a wal.ValueAdder) error {
 	var err error
 	for _, ts := range m.queues {
-		ts.Range(func(_ uuid.UUID, t *entroq.Task) bool {
+		ts.Range(func(_ string, t *entroq.Task) bool {
 			var b []byte
 			if b, err = json.Marshal(t); err != nil {
 				err = fmt.Errorf("marshal for snapshot: %w", err)
@@ -356,7 +355,7 @@ func (m *EQMem) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Ta
 	return nil, nil
 }
 
-func ensureModQueues(mod *entroq.Modification, qByID map[uuid.UUID]string) {
+func ensureModQueues(mod *entroq.Modification, qByID map[string]string) {
 	for _, d := range mod.Deletes {
 		if d.Queue == "" {
 			d.Queue = qByID[d.ID]
@@ -384,19 +383,19 @@ func ensureModQueues(mod *entroq.Modification, qByID map[uuid.UUID]string) {
 // only IDs will get a queue here if they can be found).
 //
 // Also, if any queue indexes don't have a queue represented, that is fixed here.
-func (m *EQMem) modPrep(mod *entroq.Modification) (sortedQueues []string, misplacedInsIDs map[uuid.UUID]string) {
+func (m *EQMem) modPrep(mod *entroq.Modification) (sortedQueues []string, misplacedInsIDs map[string]string) {
 	// This has to be locked the whole time so that IDs and queues are matched
 	// properly if queues are missing somewhere.
 	defer un(lock(m))
 
-	misplacedInsIDs = make(map[uuid.UUID]string)
+	misplacedInsIDs = make(map[string]string)
 
 	ensureModQueues(mod, m.qByID)
 	queues := make(map[string]bool)
 	for _, ins := range mod.Inserts {
 		// If we have an ID to insert, find the queue for that task to return it.
 		// Also make sure we get the lock for that queue.
-		if ins.ID != uuid.Nil {
+		if ins.ID != "" {
 			if foundQueue, ok := m.qByID[ins.ID]; ok && foundQueue != ins.Queue {
 				misplacedInsIDs[ins.ID] = foundQueue
 				queues[foundQueue] = true
@@ -438,7 +437,7 @@ func (m *EQMem) queueUnsafeInsertTask(ql *qLock, t *entroq.Task) func() {
 
 // queueUnsafeDeleteID performs a queue-level deletion operation, then returns
 // a function to be called under the global lock to finish the job.
-func (m *EQMem) queueUnsafeDeleteID(ql *qLock, id uuid.UUID) func() {
+func (m *EQMem) queueUnsafeDeleteID(ql *qLock, id string) func() {
 	ql.heap.RemoveID(id)
 	ql.tasks.Delete(id)
 	return func() {
@@ -461,11 +460,18 @@ func (m *EQMem) queueUnsafeUpdateTask(ql *qLock, t *entroq.Task) func() {
 // Modify attempts to do an atomic modification on the system, given a
 // particular set of modification information (deletions, changes, insertions,
 // dependencies).
+// Backends do not assign IDs, so all inserts must already have them specified.
 func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted, changed []*entroq.Task, err error) {
 	return m.modifyImpl(ctx, mod, false)
 }
 
 func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignoreClaimant bool) (inserted, changed []*entroq.Task, err error) {
+	// Double check that IDs are assigned.
+	for _, t := range mod.Inserts {
+		if t.ID == "" {
+			return nil, nil, fmt.Errorf("eqmem modify: task to insert is missing ID")
+		}
+	}
 	// Modify does a different locking dance than Claim. Like Claim, it
 	// releases the global lock quickly and leaves a gap between that and the
 	// multi-queue locking that happens. Unlike Claim, it locks *all* of the
@@ -500,9 +506,9 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 	}
 
 	// Find the actual tasks involved. Queues were filled in when obtaining locks.
-	found := make(map[uuid.UUID]*entroq.Task)
-	addFound := func(q string, id uuid.UUID) {
-		if q == "" || id == uuid.Nil {
+	found := make(map[string]*entroq.Task)
+	addFound := func(q string, id string) {
+		if q == "" || id == "" {
 			return
 		}
 		if ql, ok := byQ[q]; ok {
@@ -546,7 +552,7 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 
 	var finalLockedSteps []func()
 
-	deleteID := func(q string, id uuid.UUID) {
+	deleteID := func(q string, id string) {
 		ql := byQ[q]
 		finalLockedSteps = append(finalLockedSteps, m.queueUnsafeDeleteID(ql, id))
 	}
@@ -585,9 +591,6 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 	}
 	for _, td := range mod.Inserts {
 		id := td.ID
-		if id == uuid.Nil {
-			id = uuid.New()
-		}
 		// Restore timings if we're reading from a journal.
 		created := td.Created
 		if created.IsZero() {
@@ -657,7 +660,7 @@ func (m *EQMem) Time(_ context.Context) (time.Time, error) {
 	return entroq.ProcessTime(), nil
 }
 
-func (m *EQMem) queueForID(id uuid.UUID) (string, bool) {
+func (m *EQMem) queueForID(id string) (string, bool) {
 	defer un(lock(m))
 	q, ok := m.qByID[id]
 	return q, ok
@@ -687,7 +690,7 @@ func (m *EQMem) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Tas
 		if tq.Queue != "" && tq.Queue != t.Queue {
 			return false
 		}
-		if tq.Claimant != uuid.Nil && tq.Claimant != t.Claimant && t.At.After(now) {
+		if tq.Claimant != "" && tq.Claimant != t.Claimant && t.At.After(now) {
 			return false
 		}
 		found = append(found, t.CopyWithValue(!tq.OmitValues))
@@ -728,7 +731,7 @@ func (m *EQMem) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Tas
 		return nil, nil
 	}
 
-	qts.Range(func(_ uuid.UUID, t *entroq.Task) bool {
+	qts.Range(func(_ string, t *entroq.Task) bool {
 		if tq.Limit != 0 && tq.Limit <= len(found) {
 			return false
 		}
@@ -791,10 +794,10 @@ func (m *EQMem) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[str
 		stats := &entroq.QueueStat{
 			Name: q,
 		}
-		qts.Range(func(_ uuid.UUID, t *entroq.Task) bool {
+		qts.Range(func(_ string, t *entroq.Task) bool {
 			stats.Size++
 			if t.At.After(now) {
-				if t.Claimant != uuid.Nil {
+				if t.Claimant != "" {
 					stats.Claimed++
 				}
 			} else {
