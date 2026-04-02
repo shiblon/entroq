@@ -6,7 +6,7 @@ once per test session. The eq function fixture truncates the tasks table
 before each test.
 
 These tests focus on Python+native-PostgreSQL-specific behavior: LISTEN/NOTIFY
-wakeup, the threading inside do_with_renew, and transaction composability with
+wakeup, the renewing context manager, and transaction composability with
 user SQL.  Protocol-level correctness (insert/claim/delete semantics) is covered
 by the Go qtest suite run against the same stored procedures.
 """
@@ -17,7 +17,7 @@ import time
 import psycopg
 import pytest
 
-from entroq_pg import DependencyError, EntroQ, EQWorker, TaskData, TaskID
+from entroq_pg import DependencyError, EntroQ, EQWorker, StopWorker, TaskData, TaskID
 
 
 # ---------------------------------------------------------------------------
@@ -66,11 +66,11 @@ def test_claim_unblocks_on_notify(eq: EntroQ):
 
 
 # ---------------------------------------------------------------------------
-# do_with_renew -- renewal correctness
+# renewing -- renewal correctness
 # ---------------------------------------------------------------------------
 
 def test_renewal_updates_task_version(eq: EntroQ):
-    """Renewer thread should bump the task version; task() should return the new version."""
+    """Renewer thread should bump the task version during the renewing block."""
     QUEUE = '/test/renew'
     DURATION = 1  # seconds; renewer fires at 0.5s
 
@@ -79,27 +79,25 @@ def test_renewal_updates_task_version(eq: EntroQ):
     assert task is not None
     initial_version = task.version
 
-    version_mid_handler = []
-
-    def handler(task_fn):
+    with eq.renewing(task, duration=DURATION) as current_task:
         time.sleep(DURATION * 1.5)  # sleep past first renewal window
-        version_mid_handler.append(task_fn().version)
+        version_during = current_task().version
 
-    final_task, _ = eq.do_with_renew(task, handler, duration=DURATION)
-
-    assert version_mid_handler[0] > initial_version, (
+    # After the block, renewal has stopped and the version is stable.
+    final_task = current_task()
+    assert version_during > initial_version, (
         f'version should have increased after renewal '
-        f'(initial={initial_version}, mid={version_mid_handler[0]})'
+        f'(initial={initial_version}, during={version_during})'
     )
-    assert final_task.version >= version_mid_handler[0]
+    assert final_task.version >= version_during
 
 
 # ---------------------------------------------------------------------------
-# do_with_renew -- thread safety
+# renewing -- thread safety
 # ---------------------------------------------------------------------------
 
-def test_concurrent_do_with_renew_no_deadlock(eq: EntroQ):
-    """Many concurrent do_with_renew calls should all complete without deadlocking."""
+def test_concurrent_renewing_no_deadlock(eq: EntroQ):
+    """Many concurrent renewing blocks should all complete without deadlocking."""
     N = 20
     QUEUE = '/test/concurrent_renew'
     DURATION = 1  # renewer fires at 0.5s
@@ -114,13 +112,13 @@ def test_concurrent_do_with_renew_no_deadlock(eq: EntroQ):
         task = eq.try_claim(QUEUE, duration_ms=DURATION * 1000 * 10)
         if task is None:
             return
-        def handler(task_fn):
-            time.sleep(DURATION * 1.5)  # ensure at least one renewal
-            return task_fn().version
         try:
-            final, version = eq.do_with_renew(task, handler, duration=DURATION)
+            with eq.renewing(task, duration=DURATION) as current_task:
+                time.sleep(DURATION * 1.5)  # ensure at least one renewal
+                version_during = current_task().version
+            final_task = current_task()
             with lock:
-                results.append((final.id, version))
+                results.append((final_task.id, version_during))
         except Exception as exc:
             with lock:
                 errors.append(exc)
@@ -177,7 +175,7 @@ def test_concurrent_workers_transactional_counter(eq: EntroQ, pg_connstr: str):
 
     N tasks are inserted. W workers race to claim and process them, each
     deleting the task and incrementing a shared counter in a single transaction
-    via do_with_renew. The final counter must equal exactly N -- any
+    via renewing + transaction. The final counter must equal exactly N -- any
     double-claim, lost transaction, or renewal bug would produce the wrong value.
     """
     N = 50
@@ -195,21 +193,16 @@ def test_concurrent_workers_transactional_counter(eq: EntroQ, pg_connstr: str):
             task = eq.try_claim(QUEUE, duration_ms=DURATION * 1000 * 5)
             if task is None:
                 return
-
-            def handle(task_fn):
-                # Simulate work long enough to trigger at least one renewal.
-                time.sleep(DURATION * 1.2)
-                # Call task_fn() inside the transaction to get the current
-                # version -- renewal may have bumped it during the sleep.
+            try:
+                with eq.renewing(task, duration=DURATION) as current_task:
+                    time.sleep(DURATION * 1.2)  # trigger at least one renewal
+                # Renewal stopped; current_task() is stable.
                 with eq.transaction() as txn:
                     txn.conn.execute(
                         "INSERT INTO test_counter (name, count) VALUES ('done', 1)"
                         " ON CONFLICT (name) DO UPDATE SET count = test_counter.count + 1"
                     )
-                    txn.modify(deletes=[task_fn().as_id()])
-
-            try:
-                eq.do_with_renew(task, handle, duration=DURATION)
+                    txn.modify(deletes=[current_task().as_id()])
             except Exception as exc:
                 with lock:
                     errors.append(exc)
@@ -260,18 +253,16 @@ def test_concurrent_workers_multi_queue(eq: EntroQ, pg_connstr: str):
             task = eq.try_claim(QUEUES, duration_ms=DURATION * 1000 * 5)
             if task is None:
                 return
-
-            def handle(task_fn):
-                time.sleep(DURATION * 1.2)
+            try:
+                with eq.renewing(task, duration=DURATION) as current_task:
+                    time.sleep(DURATION * 1.2)  # trigger at least one renewal
+                # Renewal stopped; current_task() is stable.
                 with eq.transaction() as txn:
                     txn.conn.execute(
                         "INSERT INTO test_counter (name, count) VALUES ('done', 1)"
                         " ON CONFLICT (name) DO UPDATE SET count = test_counter.count + 1"
                     )
-                    txn.modify(deletes=[task_fn().as_id()])
-
-            try:
-                eq.do_with_renew(task, handle, duration=DURATION)
+                    txn.modify(deletes=[current_task().as_id()])
             except Exception as exc:
                 with lock:
                     errors.append(exc)
@@ -395,3 +386,98 @@ def test_transaction_rollback_on_dependency_error(eq: EntroQ, pg_connstr: str):
         row = conn.execute("SELECT count FROM test_counter WHERE name = 'done'").fetchone()
     # Counter increment must have rolled back with the failed modify.
     assert row is None or row[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# EQWorker
+# ---------------------------------------------------------------------------
+
+def test_worker_processes_tasks(eq: EntroQ):
+    """Worker should claim and complete N tasks via renew+finalize."""
+    N = 5
+    QUEUE = '/test/worker/basic'
+
+    eq.modify(inserts=[TaskData(queue=QUEUE, value=str(i).encode()) for i in range(N)])
+
+    completed = []
+
+    def handle(renew, finalize):
+        with renew as task:
+            value = task.value
+        with finalize as stable_task:
+            completed.append(value)
+            eq.modify(deletes=[stable_task.as_id()])
+        if len(completed) >= N:
+            raise StopWorker
+
+    w = EQWorker(eq)
+    t = threading.Thread(target=w.work, args=(QUEUE, handle), daemon=True)
+    t.start()
+    t.join(timeout=10)
+
+    assert not t.is_alive(), 'worker did not stop within timeout'
+    assert len(completed) == N
+    assert eq.tasks(queue=QUEUE) == []
+
+
+def test_worker_stable_version_in_finalize(eq: EntroQ):
+    """Version yielded by finalize should be >= version seen during renew."""
+    QUEUE = '/test/worker/version'
+    DURATION = 1  # renewer fires at 0.5s
+
+    eq.modify(inserts=[TaskData(queue=QUEUE, value=b'work')])
+
+    versions = {}
+
+    def handle(renew, finalize):
+        with renew as task:
+            versions['during'] = task.version
+            time.sleep(DURATION * 1.5)  # trigger at least one renewal
+        with finalize as stable_task:
+            versions['final'] = stable_task.version
+            eq.modify(deletes=[stable_task.as_id()])
+        raise StopWorker
+
+    w = EQWorker(eq)
+    t = threading.Thread(target=w.work, args=(QUEUE, handle),
+                         kwargs={'claim_duration': DURATION}, daemon=True)
+    t.start()
+    t.join(timeout=10)
+
+    assert not t.is_alive(), 'worker did not stop within timeout'
+    assert 'during' in versions and 'final' in versions
+    assert versions['final'] >= versions['during'], (
+        f"final version {versions['final']} should be >= during version {versions['during']}"
+    )
+
+
+def test_worker_continues_after_dependency_error(eq: EntroQ):
+    """Worker should log and continue when do_func raises a DependencyError."""
+    QUEUE = '/test/worker/dep_err'
+
+    eq.modify(inserts=[TaskData(queue=QUEUE, value=b'work')])
+
+    outcomes = []
+    calls = [0]
+
+    def handle(renew, finalize):
+        with renew:
+            pass
+        calls[0] += 1
+        if calls[0] == 1:
+            # Simulate a dependency error on the first attempt.
+            raise DependencyError('simulated')
+        with finalize as stable_task:
+            outcomes.append(stable_task.value)
+            eq.modify(deletes=[stable_task.as_id()])
+        raise StopWorker
+
+    w = EQWorker(eq)
+    t = threading.Thread(target=w.work, args=(QUEUE, handle),
+                         kwargs={'claim_duration': 2}, daemon=True)
+    t.start()
+    t.join(timeout=20)
+
+    assert not t.is_alive(), 'worker did not stop within timeout'
+    assert calls[0] == 2, f'expected 2 calls (1 dep error + 1 success), got {calls[0]}'
+    assert outcomes == [b'work']
