@@ -21,7 +21,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
@@ -36,292 +35,12 @@ const (
 	DefaultClaimDuration = 30 * time.Second
 )
 
-// TaskID contains the identifying parts of a task. If IDs don't match
-// (identifier and version together), then operations fail on those tasks.
-//
-// Also contains the name of the queue in which this task resides. Can be
-// omitted, as it does not effect functionality, but might be required for
-// authorization, which is performed based on queue name. Present whenever
-// using tasks as a source of IDs.
-type TaskID struct {
-	ID      string `json:"id"`
-	Version int32  `json:"version"`
-
-	Queue string `json:"queue,omitempty"`
-}
-
-// NewTaskID creates a new TaskID with given options.
-func NewTaskID(id string, version int32, opts ...IDOption) *TaskID {
-	tID := &TaskID{
-		ID:      id,
-		Version: version,
-	}
-	for _, o := range opts {
-		o(tID)
-	}
-	return tID
-}
-
-// IDOption is an option for things that require task ID information. Allows additional ID-related metadata to be passed.
-type IDOption func(id *TaskID)
-
-// WithIDQueue specifies the queue for a particular task ID.
-func WithIDQueue(q string) IDOption {
-	return func(id *TaskID) {
-		id.Queue = q
-	}
-}
-
-// String produces the id:version string representation.
-func (t TaskID) String() string {
-	return fmt.Sprintf("%s:v%d (in %q)", t.ID, t.Version, t.Queue)
-}
-
-// AsDeletion produces an appropriate ModifyArg to delete the task with this ID.
-func (t TaskID) AsDeletion() ModifyArg {
-	return Deleting(t.ID, t.Version, WithIDQueue(t.Queue))
-}
-
-// AsDependency produces an appropriate ModifyArg to depend on this task ID.
-func (t TaskID) AsDependency() ModifyArg {
-	return DependingOn(t.ID, t.Version, WithIDQueue(t.Queue))
-}
-
-// TaskData contains just the data, not the identifier or metadata. Used for insertions.
-type TaskData struct {
-	Queue string    `json:"queue"`
-	At    time.Time `json:"at"`
-	Value []byte    `json:"value"`
-
-	// Attempt indicates which "attempt number" this task is on. Used by workers.
-	Attempt int32 `json:"attempt"`
-
-	// Err contains error information for this task. Used by workers.
-	Err string `json:"err"`
-
-	// ID is an optional task ID to be used for task insertion.
-	// Default empty causes one to be assigned, and that is
-	// sufficient for many cases. If you desire to make a database entry that
-	// *references* a task, however, in that case it can make sense to specify
-	// an explicit task ID for insertion. This allows a common workflow cycle
-	//
-	// 	consume task -> db update -> insert tasks
-	//
-	// to be done safely, where the database update needs to refer to
-	// to-be-inserted tasks.
-	ID string `json:"id"`
-
-	// skipCollidingID indicates that a collision on insertion is not fatal,
-	// and the insertion can be removed if that happens, and then the
-	// modification can be retried.
-	skipCollidingID bool
-
-	// These timings are here so that journaling can restore full state.
-	// Usually they are blank, and there are no convenience methods to allow
-	// them to be set. Leave them at default values in all cases.
-	Created  time.Time `json:"created"`
-	Modified time.Time `json:"modified"`
-}
-
-// String returns a string representation of the task data, excluding the value.
-func (t *TaskData) String() string {
-	s := fmt.Sprintf("%q::%v", t.Queue, t.At)
-	if t.ID != "" {
-		s += "::" + t.ID
-	}
-	return s
-}
-
-// Task represents a unit of work, with a byte slice value payload.
-// Note that Claims is the number of times a task has successfully been claimed.
-// This is different than the version number, which increments for
-// every modification, not just claims.
-type Task struct {
-	Queue string `json:"queue"`
-
-	ID      string `json:"id"`
-	Version int32  `json:"version"`
-
-	At       time.Time `json:"at"`
-	Claimant string    `json:"claimant"`
-	Claims   int32     `json:"claims"`
-	Value    []byte    `json:"value"`
-
-	Created  time.Time `json:"created"`
-	Modified time.Time `json:"modified"`
-
-	// FromQueue specifies the previous queue for a task that is moving to another queue.
-	// Usually not present, can be used for change authorization (since two queues are in play, there).
-	FromQueue string `json:"fromqueue,omitempty"`
-
-	// Worker retry logic uses these fields when moving tasks and when retrying them.
-	// It is left up to the consumer to determine how many attempts is too many
-	// and to produce a suitable retry or move error.
-	Attempt int32  `json:"attempt"`
-	Err     string `json:"err"`
-}
-
-// String returns a useful representation of this task.
-func (t *Task) String() string {
-	qInfo := fmt.Sprintf("%q", t.Queue)
-	if t.FromQueue != "" && t.FromQueue != t.Queue {
-		qInfo = fmt.Sprintf("%q <- %q", t.Queue, t.FromQueue)
-	}
-	return fmt.Sprintf("Task [%s %s:v%d]\n\t", qInfo, t.ID, t.Version) + strings.Join([]string{
-		fmt.Sprintf("at=%q claimant=%s claims=%d attempt=%d err=%q", t.At, t.Claimant, t.Claims, t.Attempt, t.Err),
-		fmt.Sprintf("val=%q", string(t.Value)),
-	}, "\n\t")
-}
-
-// AsDeletion returns a ModifyArg that can be used in the Modify function, e.g.,
-//
-//	cli.Modify(ctx, task1.AsDeletion())
-//
-// The above would cause the given task to be deleted, if it can be. It is
-// shorthand for
-//
-//	cli.Modify(ctx, Deleting(task1.ID, task1.Version, WithIDQueue(task1.Queue)))
-func (t *Task) AsDeletion() ModifyArg {
-	return Deleting(t.ID, t.Version, WithIDQueue(t.Queue))
-}
-
-// AsChange returns a ModifyArg that can be used in the Modify function, e.g.,
-//
-//	cli.Modify(ctx, task1.AsChange(ArrivalTimeBy(2 * time.Minute)))
-//
-// The above is shorthand for
-//
-//	cli.Modify(ctx, Changing(task1, ArrivalTimeBy(2 * time.Minute)))
-func (t *Task) AsChange(args ...ChangeArg) ModifyArg {
-	return Changing(t, args...)
-}
-
-// AsDependency returns a ModifyArg that can be used to create a Modify dependency, e.g.,
-//
-//	cli.Modify(ctx, task.AsDependency())
-//
-// That is shorthand for
-//
-//	cli.Modify(ctx, DependingOn(task.ID, task.Version, WithIDQueue(task.Queue)))
-func (t *Task) AsDependency() ModifyArg {
-	return DependingOn(t.ID, t.Version, WithIDQueue(t.Queue))
-}
-
-// ID returns a Task ID from this task.
-func (t *Task) IDVersion() *TaskID {
-	return NewTaskID(t.ID, t.Version, WithIDQueue(t.Queue))
-}
-
-// Data returns the data for this task.
-func (t *Task) Data() *TaskData {
-	return &TaskData{
-		Queue:    t.Queue,
-		At:       t.At,
-		Value:    t.Value,
-		ID:       t.ID,
-		Attempt:  t.Attempt,
-		Err:      t.Err,
-		Created:  t.Created,
-		Modified: t.Modified,
-	}
-}
-
-// Copy copies this task's data and everything.
-func (t *Task) Copy() *Task {
-	newT := new(Task)
-	*newT = *t
-	newT.Value = make([]byte, len(t.Value))
-	copy(newT.Value, t.Value)
-	return newT
-}
-
-// CopyOmitValue copies this task but leaves the value blank.
-func (t *Task) CopyOmitValue() *Task {
-	newT := new(Task)
-	*newT = *t
-	newT.Value = nil
-	return newT
-}
-
-// CopyWithValue lets you specify whether the value should be copied.
-func (t *Task) CopyWithValue(ok bool) *Task {
-	if ok {
-		return t.Copy()
-	}
-	return t.CopyOmitValue()
-}
-
 // ClaimQuery contains information necessary to attempt to make a claim on a task in a specific queue.
 type ClaimQuery struct {
 	Queues   []string      // Queues to attempt to claim from. Only one wins.
 	Claimant string        // The ID of the process trying to make the claim.
 	Duration time.Duration // How long the task should be claimed for if successful.
 	PollTime time.Duration // Length of time between (possibly interruptible) sleep and polling.
-}
-
-// TasksQuery holds information for a tasks query.
-type TasksQuery struct {
-	Queue    string
-	Claimant string
-	Limit    int
-	IDs      []string
-
-	// OmitValues specifies that only metadata should be returned.
-	// Backends are not required to honor this flag, though any
-	// service receiving it in a request should ensure that values
-	// are not passed over the wire.
-	OmitValues bool
-}
-
-// QueuesQuery modifies a queue listing request.
-type QueuesQuery struct {
-	// MatchPrefix specifies allowable prefix matches. If empty, limitations
-	// are not set based on prefix matching. All prefix match conditions are ORed.
-	// If both this and MatchExact are empty or nil, no limitations are set on
-	// queue name: all will be returned.
-	MatchPrefix []string
-
-	// MatchExact specifies allowable exact matches. If empty, limitations are
-	// not set on exact queue names.
-	MatchExact []string
-
-	// Limit specifies an upper bound on the number of queue names returned.
-	Limit int
-}
-
-func newQueuesQuery(opts ...QueuesOpt) *QueuesQuery {
-	q := new(QueuesQuery)
-	for _, opt := range opts {
-		opt(q)
-	}
-	return q
-}
-
-// QueueStat holds high-level information about a queue.
-// Note that available + claimed may not add up to size. This is because a task
-// can be unavailable (AT in the future) without being claimed by anyone.
-type QueueStat struct {
-	Name      string `json:"name"`      // The queue name.
-	Size      int    `json:"size"`      // The total number of tasks.
-	Claimed   int    `json:"claimed"`   // The number of currently claimed tasks.
-	Available int    `json:"available"` // The number of available tasks.
-
-	MaxClaims int `json:"maxClaims"` // The maximum number of claims for a task in the queue.
-}
-
-// QueuesFromStats can be used for converting the new QueueStats to the old
-// Queues output, making it easier on backend implementers to just define one
-// function (similar to how WaitTryClaim or PollTryClaim can make implementing
-// Claim in terms of TryClaim easier).
-func QueuesFromStats(stats map[string]*QueueStat, err error) (map[string]int, error) {
-	if err != nil {
-		return nil, err
-	}
-	qs := make(map[string]int)
-	for k, v := range stats {
-		qs[k] = v.Size
-	}
-	return qs, nil
 }
 
 // BackendClaimFunc is a function that can make claims based on a ClaimQuery.
@@ -497,7 +216,7 @@ type IDGenerator func() string
 type EntroQ struct {
 	backend   Backend
 	opener    BackendOpener
-	clientID  string
+	ClientID  string
 	idGenRand IDGenerator
 }
 
@@ -507,7 +226,7 @@ type Option func(*EntroQ)
 // WithClaimantID sets the default claimaint ID for this client.
 func WithClaimantID(id string) Option {
 	return func(eq *EntroQ) {
-		eq.clientID = id
+		eq.ClientID = id
 	}
 }
 
@@ -561,7 +280,7 @@ func New(ctx context.Context, opener BackendOpener, opts ...Option) (*EntroQ, er
 	} else {
 		return nil, fmt.Errorf("no backend or backend opener specified")
 	}
-	eq.clientID = eq.idGenRand()
+	eq.ClientID = eq.idGenRand()
 	return eq, nil
 }
 
@@ -574,137 +293,12 @@ func (c *EntroQ) Close() error {
 // like Modify, Claim, etc. To change the ID per call (usually not needed, and
 // can be dangerous), use the "As" calls, e.g., ModifyAs.
 func (c *EntroQ) ID() string {
-	return c.clientID
+	return c.ClientID
 }
 
 // GenID creates a new ID using the client's ID generator.
 func (c *EntroQ) GenID() string {
 	return c.idGenRand()
-}
-
-// Queues returns a mapping from all queue names to their task counts.
-func (c *EntroQ) Queues(ctx context.Context, opts ...QueuesOpt) (map[string]int, error) {
-	query := newQueuesQuery(opts...)
-	return c.backend.Queues(ctx, query)
-}
-
-// QueueStats returns a mapping from queue names to task stats.
-func (c *EntroQ) QueueStats(ctx context.Context, opts ...QueuesOpt) (map[string]*QueueStat, error) {
-	query := newQueuesQuery(opts...)
-	return c.backend.QueueStats(ctx, query)
-}
-
-// QueuesEmpty indicates whether the specified task queues are all empty. If no
-// options are specified, returns an error.
-func (c *EntroQ) QueuesEmpty(ctx context.Context, opts ...QueuesOpt) (bool, error) {
-	if len(opts) == 0 {
-		return false, fmt.Errorf("empty check: no queue options specified")
-	}
-
-	qs, err := c.Queues(ctx, opts...)
-	if err != nil {
-		return false, fmt.Errorf("empty check: %w", err)
-	}
-	for _, size := range qs {
-		if size > 0 {
-			return false, nil
-		}
-	}
-	return true, nil
-}
-
-// WaitQueuesEmpty does a poll-and-wait strategy to block until the queue query returns empty.
-func (c *EntroQ) WaitQueuesEmpty(ctx context.Context, opts ...QueuesOpt) error {
-	for {
-		empty, err := c.QueuesEmpty(ctx, opts...)
-		if err != nil {
-			return fmt.Errorf("wait empty: %w", err)
-		}
-		if empty {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("wait empty: %w", ctx.Err())
-		case <-time.After(2 * time.Second):
-		}
-	}
-}
-
-// Tasks returns a slice of all tasks in the given queue.
-func (c *EntroQ) Tasks(ctx context.Context, queue string, opts ...TasksOpt) ([]*Task, error) {
-	query := &TasksQuery{
-		Queue: queue,
-	}
-	for _, opt := range opts {
-		opt(c, query)
-	}
-
-	return c.backend.Tasks(ctx, query)
-}
-
-// TasksOpt is an option that can be passed into Tasks to control what it returns.
-type TasksOpt func(*EntroQ, *TasksQuery)
-
-// LimitSelf only returns self-claimed tasks or expired tasks.
-func LimitSelf() TasksOpt {
-	return func(c *EntroQ, q *TasksQuery) {
-		q.Claimant = c.clientID
-	}
-}
-
-// LimitClaimant only returns tasks with the given claimant, or expired tasks.
-func LimitClaimant(id string) TasksOpt {
-	return func(_ *EntroQ, q *TasksQuery) {
-		q.Claimant = id
-	}
-}
-
-// LimitTasks sets the limit on the number of tasks to return. A value <= 0 indicates "no limit".
-func LimitTasks(limit int) TasksOpt {
-	return func(_ *EntroQ, q *TasksQuery) {
-		q.Limit = limit
-	}
-}
-
-// OmitValues tells a tasks query to only return metadata, not values.
-func OmitValues() TasksOpt {
-	return func(_ *EntroQ, q *TasksQuery) {
-		q.OmitValues = true
-	}
-}
-
-// WithTaskID adds a task ID to the set of IDs that can be returned in a task
-// query. The default is "all that match other specs" if no IDs are specified.
-// Note that versions are not part of the ID.
-func WithTaskID(ids ...string) TasksOpt {
-	return func(_ *EntroQ, q *TasksQuery) {
-		q.IDs = append(q.IDs, ids...)
-	}
-}
-
-// QueuesOpt modifies how queue requests are made.
-type QueuesOpt func(*QueuesQuery)
-
-// MatchPrefix adds allowable prefix matches for a queue listing.
-func MatchPrefix(prefixes ...string) QueuesOpt {
-	return func(q *QueuesQuery) {
-		q.MatchPrefix = append(q.MatchPrefix, prefixes...)
-	}
-}
-
-// MatchExact adds an allowable exact match for a queue listing.
-func MatchExact(matches ...string) QueuesOpt {
-	return func(q *QueuesQuery) {
-		q.MatchExact = append(q.MatchExact, matches...)
-	}
-}
-
-// LimitQueues sets the limit on the number of queues that are returned.
-func LimitQueues(limit int) QueuesOpt {
-	return func(q *QueuesQuery) {
-		q.Limit = limit
-	}
 }
 
 // ClaimOpt modifies limits on a task claim.
@@ -811,7 +405,7 @@ func claimQueryFromOpts(claimant string, opts ...ClaimOpt) *ClaimQuery {
 // value given in options, and an arrival time computed from the duration. The
 // default duration if none is given is DefaultClaimDuration.
 func (c *EntroQ) Claim(ctx context.Context, opts ...ClaimOpt) (*Task, error) {
-	query := claimQueryFromOpts(c.clientID, opts...)
+	query := claimQueryFromOpts(c.ClientID, opts...)
 	if len(query.Queues) == 0 {
 		return nil, fmt.Errorf("no queues specified for claim")
 	}
@@ -824,7 +418,7 @@ func (c *EntroQ) Claim(ctx context.Context, opts ...ClaimOpt) (*Task, error) {
 // dependency tasks are not present. This can be used, for example, to ensure
 // that configuration tasks haven't changed.
 func (c *EntroQ) TryClaim(ctx context.Context, opts ...ClaimOpt) (*Task, error) {
-	query := claimQueryFromOpts(c.clientID, opts...)
+	query := claimQueryFromOpts(c.ClientID, opts...)
 	if len(query.Queues) == 0 {
 		return nil, fmt.Errorf("no queues specified for try claim")
 	}
@@ -868,82 +462,100 @@ func (c *EntroQ) RenewAllFor(ctx context.Context, tasks []*Task, duration time.D
 	return changed, nil
 }
 
+// FinalizeRenewAll defines a function that can be called to stop renewal from a worker routine.
+// It returns a slice of tasks that are no longer being renewed, so versions are stable.
+type FinalizeRenewAll func(context.Context) ([]*Task, error)
+
+// FinalizeRenew defines a function that can be called to stop renewal from a worker routine.
+// It returns a single task that is no longer being renewed, so its version is stable.
+type FinalizeRenew func(context.Context) (*Task, error)
+
+// DoWorkAll defines a function that accepts a 'stop' function so that work can be
+// done, renewal can be stopped to get stable task versions, and cleanup can
+// happen. For multiple tasks.
+type DoWorkAll func(ctx context.Context, stop FinalizeRenewAll) error
+
+// DoWork defines a function like WorkAll, but handles only one task.
+type DoWork func(ctx context.Context, stop FinalizeRenew) error
+
 // DoWithRenewAll runs the provided function while keeping all given tasks leases renewed.
-func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.Duration, f func(context.Context) error) ([]*Task, error) {
-	// The use of contexts is subtle, here. There are cases where a gRPC client
-	// context cancelation can result in a delayed call to the server that
-	// actually makes it there. There appears, in other words, to be a race
-	// condition between client cancelation and actual server calls.
-	//
-	// What this means that we can't use two goroutines in this group, one for
-	// each of renewal and user-defined calls, because we can get into a
-	// situation where the following sequence happens:
-	//
-	// - task is renewed
-	// - just before the user function finished (closing doneCh), another renewal is started
-	// - user function finishes before the server call goes out
-	// - context is canceled, client call is canceled
-	// - but the call is already en route to the server
-	//
-	// In this case, the renewed value comes back to us for the first renewal,
-	// but the second is detached and we don't have its version anymore, so we
-	// send back the wrong task version and any attempt to change it fails.
-	//
-	// Thus, we use a special group context that can be canceled after a
-	// blocking renewal loop exits with an error. If it exits cleanly, then it
-	// got a signal from the completion of the user function already.
-	//
-	// This means that the only thing that really cancels the renewal loop is
-	// cancelation of the *parent context*, which will also cancel the user
-	// function and an appropriate error will be returned to the caller (who
-	// canceled this to begin with).
-	g, gctx := errgroup.WithContext(ctx)
-	gctx, cancelGroup := context.WithCancel(gctx)
-	// Safe to cancel twice. There is an explicit cancellation below for an error case.
-	defer cancelGroup()
+func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.Duration, f DoWorkAll) error {
+	taskCh := make(chan []*Task, 1)
 
-	doneCh := make(chan struct{})
+	g, ctx := errgroup.WithContext(ctx)
+
+	// Run the renewer, with a channel for consuming intermediate renewed tasks.
+	stopRenew := make(chan struct{})
 	g.Go(func() error {
-		defer close(doneCh)
-		return f(gctx)
-	})
-
-	renewed := tasks
-	if err := func() error {
+		renewed := tasks
+		var out chan<- []*Task
 		for {
 			select {
-			case <-doneCh:
-				return nil
+			case <-stopRenew:
+				out = taskCh // enable final send
 			case <-ctx.Done():
-				return fmt.Errorf("renew all stopped: %w", ctx.Err())
+				// cancellation shouldn't keep us from returning a value
+				out = taskCh
 			case <-time.After(lease / 2):
 				r, err := c.RenewAllFor(ctx, renewed, lease)
 				if err != nil {
-					return fmt.Errorf("renew all lease: %w", err)
+					if IsCanceled(err) {
+						out = taskCh
+						break
+					} else {
+						return fmt.Errorf("renew all lease: %w", err)
+					}
 				}
 				renewed = r
+			case out <- renewed:
+				return nil
 			}
 		}
-	}(); err != nil && !IsCanceled(err) {
-		cancelGroup() // Terminate the user-provided function early.
-		return nil, fmt.Errorf("renew loop: %w", err)
+	})
+
+	finalize := func(ctx context.Context) ([]*Task, error) {
+		close(stopRenew)
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("renew canceled in stop: %w", ctx.Err())
+		case tasks := <-taskCh:
+			return tasks, nil
+		}
 	}
+
+	g.Go(func() error {
+		if err := f(ctx, finalize); err != nil {
+			return fmt.Errorf("renewed user func: %w", err)
+		}
+		return nil
+	})
 
 	if err := g.Wait(); err != nil {
-		return nil, fmt.Errorf("renew all: %w", err)
+		return fmt.Errorf("do with renew all: %w", err)
 	}
-
-	// The task will have been overwritten with every renewal. Return final task.
-	return renewed, nil
+	return nil
 }
 
 // DoWithRenew runs the provided function while keeping the given task lease renewed.
-func (c *EntroQ) DoWithRenew(ctx context.Context, task *Task, lease time.Duration, f func(context.Context) error) (*Task, error) {
-	finalTasks, err := c.DoWithRenewAll(ctx, []*Task{task}, lease, f)
-	if err != nil {
-		return nil, fmt.Errorf("renew: %w", err)
+func (c *EntroQ) DoWithRenew(ctx context.Context, task *Task, lease time.Duration, f DoWork) error {
+	if err := c.DoWithRenewAll(ctx, []*Task{task}, lease, func(ctx context.Context, finalize FinalizeRenewAll) error {
+		// Wrap the stop function to just get one task.
+		finalizeOne := func(context.Context) (*Task, error) {
+			tasks, err := finalize(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("stop one: %w", err)
+			}
+			return tasks[0], nil
+		}
+		// Call the single-task user function.
+		if err := f(ctx, finalizeOne); err != nil {
+			return fmt.Errorf("do one: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("renew: %w", err)
 	}
-	return finalTasks[0], nil
+	return nil
 }
 
 // Modify allows a batch modification operation to be done, gated on the
@@ -954,7 +566,7 @@ func (c *EntroQ) DoWithRenew(ctx context.Context, task *Task, lease time.Duratio
 // was due to missing dependencies, a *DependencyError is returned, which can be checked for
 // by calling AsDependency(err).
 func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (inserted []*Task, changed []*Task, err error) {
-	mod := NewModification(c.clientID, modArgs...)
+	mod := NewModification(c.ClientID, modArgs...)
 	// Generate IDs for any inserts that don't have them. This is necessary
 	// because the backend does not assign IDs.
 	for _, ins := range mod.Inserts {
@@ -1003,7 +615,6 @@ func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (inserted []*
 			}
 			newInserts = append(newInserts, td)
 		}
-		log.Printf("Trying modification again due to skippable colliding inserts. %v -> %v", mod.Inserts, newInserts)
 		mod.Inserts = newInserts
 	}
 }
@@ -1246,6 +857,22 @@ func ArrivalTimeBy(d time.Duration) ChangeArg {
 func ValueTo(v []byte) ChangeArg {
 	return func(_ *Modification, t *Task) {
 		t.Value = v
+	}
+}
+
+// AppendingErr appends the given error to Err in the task.
+func AppendingErr(e string) ChangeArg {
+	return func(_ *Modification, t *Task) {
+		var strs []string
+		if t.Err != "" {
+			strs = append(strs, t.Err)
+		}
+		if e != "" {
+			strs = append(strs, e)
+		}
+		if len(strs) != 0 {
+			t.Err = strings.Join(strs, "\n")
+		}
 	}
 }
 

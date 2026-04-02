@@ -26,11 +26,10 @@ func RunQTest(t *testing.T, tester qtest.Tester) {
 	defer os.RemoveAll(tmpDir)
 
 	ctx := context.Background()
-	client, stop, err := qtest.ClientService(ctx, Opener(WithJournal(tmpDir)))
+	client, err := entroq.New(ctx, Opener(WithJournal(tmpDir)))
 	if err != nil {
 		t.Fatalf("Get client: %v", err)
 	}
-	defer stop()
 	tester(ctx, t, client, "")
 }
 

@@ -676,19 +676,22 @@ func WorkerRenewal(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPr
 
 	// Task now has version 1.
 
-	renewed, err := client.DoWithRenew(ctx, task, 6*time.Second, func(ctx context.Context) error {
+	if err := client.DoWithRenew(ctx, task, 6*time.Second, func(ctx context.Context, stop entroq.FinalizeRenew) error {
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("worker do with renew: %w", ctx.Err())
 		case <-time.After(10 * time.Second): // long enough for 3 renewals.
-			return nil
 		}
-	})
-	if err != nil {
+		renewed, err := stop(ctx)
+		if err != nil {
+			t.Fatalf("Stop failed: %v", err)
+		}
+		if want, got := task.Version+3, renewed.Version; want != got {
+			t.Fatalf("Expected renewed task to be at version %d, got %d", want, got)
+		}
+		return nil
+	}); err != nil {
 		t.Fatalf("Error renewing and waiting: %v", err)
-	}
-	if want, got := task.Version+3, renewed.Version; want != got {
-		t.Fatalf("Expected renewed task to be at version %d, got %d", want, got)
 	}
 }
 

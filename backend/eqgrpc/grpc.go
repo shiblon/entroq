@@ -335,13 +335,14 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 			return nil, fmt.Errorf("grpc claim: %w", ctx.Err())
 		default:
 		}
-		ctx, _ := context.WithTimeout(ctx, ClaimRetryInterval)
+		ctx, cancel := context.WithTimeout(ctx, ClaimRetryInterval)
 		resp, err := pb.NewEntroQClient(b.conn).Claim(ctx, &pb.ClaimRequest{
 			ClaimantId: cq.Claimant,
 			Queues:     cq.Queues,
 			DurationMs: int64(cq.Duration / time.Millisecond),
 			PollMs:     int64(cq.PollTime / time.Millisecond),
 		})
+		cancel() // cleanup just in case.
 		if err != nil {
 			if entroq.IsTimeout(err) {
 				// If we just timed out on our little request context, then

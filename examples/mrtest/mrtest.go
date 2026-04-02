@@ -1,5 +1,6 @@
-// Package mrtest is a test package tightly tied to the mr package, separated
-// out to avoid import cycles when other tests want to use it.
+// Package mrtest provides test helpers for the mr MapReduce example.
+// It is a separate package (rather than mr_test) because test files are not
+// importable, and other test packages need MRCheck to run MapReduce correctness checks.
 package mrtest
 
 import (
