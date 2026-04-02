@@ -6,12 +6,7 @@ import (
 	"fmt"
 	"log"
 	"time"
-
 )
-
-// DefaultRetryDelay is the amount by which to advance the arrival time when a
-// worker task errors out as retryable.
-const DefaultRetryDelay = 30 * time.Second
 
 // ErrQMap is a function that maps from an inbox name to its "move on error"
 // error box name. If no mapping is found, a suitable default should be
@@ -23,12 +18,17 @@ type ErrQMap func(inbox string) string
 // error.
 type DependencyHandler func(err DependencyError) error
 
+// DefaultRetryDelay is the amount by which to advance the arrival time when a
+// worker task errors out as retryable.
+const DefaultRetryDelay = 30 * time.Second
+
 // Worker creates an iterator-like protocol for processing tasks in a queue,
 // one at a time, in a loop. Each worker should only be accessed from a single
 // goroutine. If multiple goroutines are desired, they should each use their
 // own worker instance.
 //
 // Example:
+//
 //	w := eqClient.NewWorker("queue_name")
 //	err := w.Run(ctx, func(ctx context.Context, task *Task) ([]ModifyArg, error) {
 //		// Do stuff with the task.
@@ -186,31 +186,34 @@ func (w *Worker) Run(ctx context.Context, f Work) (err error) {
 		errQ := w.ErrQMap(task.Queue)
 
 		var args []ModifyArg
-		renewed, workErr := w.eqc.DoWithRenew(ctx, task, w.lease, func(ctx context.Context) error {
-			var err error
+		var renewed *Task
+		if workErr := w.eqc.DoWithRenew(ctx, task, w.lease, func(ctx context.Context, stop FinalizeRenew) (err error) {
+			defer func() {
+				var rerr error
+				renewed, rerr = stop(ctx)
+				if err == nil {
+					err = rerr
+				}
+			}()
 			if args, err = f(ctx, task); err != nil {
 				if e := new(RetryTaskError); errors.As(err, &e) {
-					changeArgs := []ChangeArg{ErrTo(taskErrMsg(e)), AttemptToNext()}
 					if w.MaxAttempts == 0 || task.Attempt+1 < w.MaxAttempts {
 						log.Printf("Worker received retryable error, incrementing attempt: %v", e)
-						changeArgs = append(changeArgs, ArrivalTimeBy(w.baseRetryDelay))
 					} else {
 						log.Printf("Worker max attempts reached, moving to %q instead of retrying: %v", errQ, e)
-						changeArgs = append(changeArgs, QueueTo(errQ))
 					}
-					args = []ModifyArg{task.AsChange(changeArgs...)}
+					args = []ModifyArg{task.AsRetryOrQuarantine(taskErrMsg(e), errQ, w.MaxAttempts, ArrivalTimeBy(w.baseRetryDelay))}
 					return nil
 				}
 				if e := new(MoveTaskError); errors.As(err, &e) {
 					log.Printf("Worker moving to %q: %v", errQ, err)
-					args = []ModifyArg{task.AsChange(QueueTo(errQ), ErrTo(taskErrMsg(e)))}
+					args = []ModifyArg{task.AsQuarantine(taskErrMsg(e), errQ)}
 					return nil
 				}
 				return fmt.Errorf("work (%q): %w", w.Qs, err)
 			}
 			return nil
-		})
-		if workErr != nil {
+		}); workErr != nil {
 			if _, ok := AsDependency(workErr); ok {
 				log.Printf("Worker continuing after dependency (%q)", w.Qs)
 				continue
