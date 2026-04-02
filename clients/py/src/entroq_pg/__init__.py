@@ -455,16 +455,25 @@ class EntroQ:
         _, changed = self.modify(changes=[task.as_change(at=at)])
         return changed[0]
 
-    def do_with_renew(self, task: Task, do_func, duration=30):
-        """Call do_func(task) while renewing the claim in the background.
+    @contextmanager
+    def renewing(self, task: Task, duration=30):
+        """Context manager that renews a task claim in the background.
 
-        do_func receives:
-            task: a callable returning the latest version of the task at any
-                  moment. Safe to call multiple times. Call it just before
-                  committing to ensure you have the current version.
+        Yields a callable that returns the current (most recently renewed)
+        version of the task. On exit, renewal stops and the callable returns
+        the final stable version.
 
-        Returns:
-            (final_task, do_func_result)
+        Inside the `with` block, renewal is running and the task version may
+        advance. After the block, the version is stable and safe to use for
+        modifications up to the expiration of the task's lease, which should be
+        at least half the lease renewal time.
+        
+        Example::
+
+            with eq.renewing(task, duration=30) as current_task:
+                result = do_heavy_work()
+            # renewal stopped; current_task() is now stable
+            eq.modify(deletes=[current_task().as_id()], ...)
         """
         exit_event = threading.Event()
         lock = threading.Lock()
@@ -488,13 +497,10 @@ class EntroQ:
         t = threading.Thread(target=_renewer, daemon=True)
         t.start()
         try:
-            result = do_func(latest)
-            with lock:
-                return current[0], result
+            yield latest
         finally:
             exit_event.set()
             t.join()
-
 
     def pop_all(self, queue, force=False) -> Iterator[Task]:
         """Claim and delete every task in queue, yielding each one.
@@ -521,6 +527,10 @@ class EntroQ:
 # Worker
 # ---------------------------------------------------------------------------
 
+class StopWorker(Exception):
+    """Raise from a work function to stop the worker loop cleanly."""
+
+
 class EQWorker:
     """Claims tasks from a queue and dispatches them to a handler function.
 
@@ -528,38 +538,63 @@ class EQWorker:
 
         eq = EntroQ('host=localhost dbname=entroq')
 
-        def handle(task):
-            result = do_heavy_work(task())
-            with eq.transaction() as txn:
-                txn.conn.execute("UPDATE my_table SET status='done' WHERE id = %s",
-                                 (task().id,))
-                txn.modify(deletes=[task().as_id()],
-                           inserts=[TaskData(queue='/done', value=result)])
+        def handle(renew, finalize):
+            with renew as task:
+                result = do_heavy_work(task)
+
+            with finalize as task:
+                # task now has a stable version, finish up
+                with eq.transaction() as txn:
+                    txn.conn.execute("UPDATE my_table SET status='done' WHERE id = %s",
+                                     (stable_task.id,))
+                    txn.modify(deletes=[stable_task.as_id()],
+                               inserts=[TaskData(queue='/done', value=result)])
 
         w = EQWorker(eq)
         w.work('/jobs', handle)
 
     do_func receives:
-        task: a callable returning the latest version of the task. The claim
-              is renewed in the background while do_func runs; calling task()
-              always returns the current version. Call it just before
-              txn.modify() to ensure you commit with the right version.
+        renew: a context manager that provides the claimed initial task and
+            renews it in the background.
+        finalize: a context manager that provides the final task after
+            background renewal has stopped. This must not be used before renew.
+            Here you can do final modifications to the task and do
+            in-transaction work. It is not required to make use of finalize.
+            Skipping it allows the task to expire and be picked up by another
+            work cycle.
     """
 
     def __init__(self, eq: EntroQ):
         self.eq = eq
 
     def work(self, queue, do_func, claim_duration=30, poll_only=False):
-        """Loop forever: claim a task and call do_func(task) with renewal.
+        """Loop forever: claim a task and call do_func(task, finalize) with renewal.
 
         Args:
             poll_only: passed through to claim(). Set True when running behind
                        a transaction-mode connection pooler.
         """
         while True:
-            task = self.eq.claim(queue, duration_ms=1000 * claim_duration,
-                                 poll_only=poll_only)
             try:
-                self.eq.do_with_renew(task, do_func, duration=claim_duration)
+                task = self.eq.claim(queue, duration_ms=1000 * claim_duration,
+                                     poll_only=poll_only)
+                final_task = [None]
+                @contextmanager
+                def renew():
+                    with self.eq.renewing(task, duration=claim_duration) as current_task:
+                        yield current_task()
+                    final_task[0] = current_task()
+
+                @contextmanager
+                def finalize():
+                    if final_task[0] is None:
+                        raise RuntimeError('finalize called before renew')
+                    yield final_task[0]
+
+                do_func(renew(), finalize())
+            except StopWorker:
+                return
             except DependencyError as e:
                 logging.warning('Worker continuing after dependency error: %s', e)
+            except TimeoutError as e:
+                logging.warning('Worker continuing after timeout: %s', e)
