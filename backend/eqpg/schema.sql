@@ -5,8 +5,9 @@
 -- Steps must run in order: column migrations precede CREATE TABLE so that
 -- existing databases gain new columns before the table creation no-ops on them.
 --
--- ID representation: task IDs and claimant IDs are stored as TEXT. This is
--- compatible with any ID format (UUID strings, integers, custom encodings).
+-- ID representation: task IDs and claimant IDs are stored as TEXT with a
+-- CHECK constraint limiting them to 64 characters. 64 accommodates UUIDs (36),
+-- ULIDs (26), and similar schemes while keeping indexes efficient.
 -- Bucketing uses hashtext(id) & 255 -- a stable 8-bit hash value in [0,255] --
 -- with an index on (queue, at, (hashtext(id) & 255)) for efficient range scans.
 -- hashtext() is IMMUTABLE and available in all supported PostgreSQL versions.
@@ -25,6 +26,12 @@ ALTER TABLE IF EXISTS tasks ADD COLUMN IF NOT EXISTS err     TEXT    NOT NULL DE
 ALTER TABLE IF EXISTS tasks ALTER COLUMN id       TYPE text USING id::text;
 ALTER TABLE IF EXISTS tasks ALTER COLUMN claimant TYPE text USING claimant::text;
 
+-- ID length constraints. Idempotent: drop then re-add.
+ALTER TABLE IF EXISTS tasks DROP CONSTRAINT IF EXISTS id_max_len;
+ALTER TABLE IF EXISTS tasks ADD  CONSTRAINT         id_max_len       CHECK (length(id) <= 64);
+ALTER TABLE IF EXISTS tasks DROP CONSTRAINT IF EXISTS claimant_max_len;
+ALTER TABLE IF EXISTS tasks ADD  CONSTRAINT         claimant_max_len CHECK (claimant IS NULL OR length(claimant) <= 64);
+
 -- Drop old UUID-typed composite types; recreated below with text id fields.
 -- These types are not used in any function signatures, so no CASCADE is needed.
 DROP TYPE IF EXISTS entroq_task_id;
@@ -39,15 +46,16 @@ DROP FUNCTION IF EXISTS entroq_modify_arrays(uuid, uuid[], integer[], uuid[], in
 DROP FUNCTION IF EXISTS entroq_modify(uuid, jsonb, jsonb, jsonb, jsonb);
 DROP FUNCTION IF EXISTS entroq_tasks(text, integer, boolean);
 
--- Core table. id and claimant are text to support any ID format.
+-- Core table. id and claimant are TEXT with CHECK constraints limiting them
+-- to 64 characters -- long enough for UUIDs, ULIDs, and similar schemes.
 CREATE TABLE IF NOT EXISTS tasks (
-    id       TEXT                     PRIMARY KEY NOT NULL,
+    id       TEXT                     PRIMARY KEY NOT NULL CHECK (length(id) <= 64),
     version  INTEGER                  NOT NULL DEFAULT 0,
     queue    TEXT                     NOT NULL DEFAULT '',
     at       TIMESTAMP WITH TIME ZONE NOT NULL,
     created  TIMESTAMP WITH TIME ZONE,
     modified TIMESTAMP WITH TIME ZONE NOT NULL,
-    claimant TEXT,
+    claimant TEXT                     CHECK (claimant IS NULL OR length(claimant) <= 64),
     value    BYTEA,
     claims   INTEGER                  NOT NULL DEFAULT 0,
     attempt  INTEGER                  NOT NULL DEFAULT 0,
