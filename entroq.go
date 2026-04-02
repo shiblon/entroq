@@ -496,6 +496,7 @@ type IDGenerator func() string
 // EntroQ is a client interface for accessing the task queue.
 type EntroQ struct {
 	backend   Backend
+	opener    BackendOpener
 	clientID  string
 	idGenRand IDGenerator
 }
@@ -525,6 +526,14 @@ func WithIDGenerator(gen IDGenerator) Option {
 	}
 }
 
+// WithBackend sets the backend for this client. Note that if WithBackendOpener
+// is also specified, this will be used and the opener will be ignored.
+func WithBackend(backend Backend) Option {
+	return func(eq *EntroQ) {
+		eq.backend = backend
+	}
+}
+
 // BackendOpener is a function that can open a connection to a backend. Creating
 // a client with a specific backend is accomplished by passing one of these functions
 // into New.
@@ -535,16 +544,22 @@ type BackendOpener func(ctx context.Context) (Backend, error)
 //
 //	cli, err := New(ctx, mem.Opener())
 func New(ctx context.Context, opener BackendOpener, opts ...Option) (*EntroQ, error) {
-	backend, err := opener(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("backend connection: %w", err)
-	}
 	eq := &EntroQ{
-		backend:   backend,
 		idGenRand: UUIDGenerator,
 	}
 	for _, o := range opts {
 		o(eq)
+	}
+	if eq.backend != nil {
+		eq.opener = nil
+	} else if opener != nil {
+		eq.opener = opener
+		var err error
+		if eq.backend, err = opener(ctx); err != nil {
+			return nil, fmt.Errorf("backend opener: %w", err)
+		}
+	} else {
+		return nil, fmt.Errorf("no backend or backend opener specified")
 	}
 	eq.clientID = eq.idGenRand()
 	return eq, nil

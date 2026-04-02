@@ -122,8 +122,10 @@ func WithNotifyWaiter(nw entroq.NotifyWaiter) PGOpt {
 	}
 }
 
-// Opener creates an opener function to be used to get a backend.
-func Opener(hostPort string, opts ...PGOpt) entroq.BackendOpener {
+// Open opens a postgres backend with the given host/port and options. This is
+// useful if you want to get at eqpg-specific backend options like
+// in-transaction database updates.
+func Open(ctx context.Context, hostPort string, opts ...PGOpt) (*EQPG, error) {
 	// Set up some defaults, then apply given options.
 	options := &pgOptions{
 		db:       "postgres",
@@ -136,85 +138,91 @@ func Opener(hostPort string, opts ...PGOpt) entroq.BackendOpener {
 	for _, o := range opts {
 		o(options)
 	}
+	u, err := url.Parse("postgres://" + hostPort)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse hostport %q: %w", hostPort, err)
+	}
+	host := u.Hostname()
+	port := u.Port()
 
+	if port != "" && host == "" {
+		host = "::"
+	}
+
+	if host != "" && port == "" {
+		port = "5432"
+	}
+
+	params := []string{
+		"sslmode=" + string(options.sslMode),
+		"database=" + escp(options.db),
+	}
+
+	if options.user != "" {
+		params = append(params, fmt.Sprintf("user=%s", escp(options.user)))
+	}
+
+	if options.password != "" {
+		params = append(params, fmt.Sprintf("password=%s", escp(options.password)))
+	}
+
+	if host != "" {
+		params = append(params, fmt.Sprintf("host=%s", escp(host)))
+	}
+
+	if port != "" {
+		params = append(params, fmt.Sprintf("port=%s", port))
+	}
+
+	if options.sslClientKeyFile != "" {
+		params = append(params, "sslkey="+url.QueryEscape(options.sslClientKeyFile))
+	}
+
+	if options.sslClientCertFile != "" {
+		params = append(params, "sslcert="+url.QueryEscape(options.sslClientCertFile))
+	}
+
+	if options.sslServerCAFile != "" {
+		params = append(params, "sslrootcert="+url.QueryEscape(options.sslServerCAFile))
+	}
+
+	connStr := strings.Join(params, " ")
+
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open postgres DB: %w", err)
+	}
+
+	if options.nw == nil {
+		options.nw = entroq.NotifyWaiter(NewPGNotifyWaiter(ctx, connStr))
+	}
+
+	for i := 0; i < options.attempts; i++ {
+		if err = db.PingContext(ctx); err == nil {
+			return New(ctx, db, options.nw)
+		}
+		if i < options.attempts-1 {
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("pg opener: %w", ctx.Err())
+			case <-time.After(5 * time.Second):
+			}
+		}
+	}
+	return nil, fmt.Errorf("time out postgres init: %w", err)
+}
+
+// Opener creates an opener function to be used to get a backend.
+// If you need some of the database-specific options in this module, use Open
+// instead and pass the resulting backend into entroq.New.
+func Opener(hostPort string, opts ...PGOpt) entroq.BackendOpener {
 	return func(ctx context.Context) (entroq.Backend, error) {
-		u, err := url.Parse("postgres://" + hostPort)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse hostport %q: %w", hostPort, err)
-		}
-		host := u.Hostname()
-		port := u.Port()
-
-		if port != "" && host == "" {
-			host = "::"
-		}
-
-		if host != "" && port == "" {
-			port = "5432"
-		}
-
-		params := []string{
-			"sslmode=" + string(options.sslMode),
-			"database=" + escp(options.db),
-		}
-
-		if options.user != "" {
-			params = append(params, fmt.Sprintf("user=%s", escp(options.user)))
-		}
-
-		if options.password != "" {
-			params = append(params, fmt.Sprintf("password=%s", escp(options.password)))
-		}
-
-		if host != "" {
-			params = append(params, fmt.Sprintf("host=%s", escp(host)))
-		}
-
-		if port != "" {
-			params = append(params, fmt.Sprintf("port=%s", port))
-		}
-
-		if options.sslClientKeyFile != "" {
-			params = append(params, "sslkey="+url.QueryEscape(options.sslClientKeyFile))
-		}
-
-		if options.sslClientCertFile != "" {
-			params = append(params, "sslcert="+url.QueryEscape(options.sslClientCertFile))
-		}
-
-		if options.sslServerCAFile != "" {
-			params = append(params, "sslrootcert="+url.QueryEscape(options.sslServerCAFile))
-		}
-
-		connStr := strings.Join(params, " ")
-
-		db, err := sql.Open("postgres", connStr)
-		if err != nil {
-			return nil, fmt.Errorf("failed to open postgres DB: %w", err)
-		}
-
-		if options.nw == nil {
-			options.nw = entroq.NotifyWaiter(NewPGNotifyWaiter(ctx, connStr))
-		}
-
-		for i := 0; i < options.attempts; i++ {
-			if err = db.PingContext(ctx); err == nil {
-				return New(ctx, db, options.nw)
-			}
-			if i < options.attempts-1 {
-				select {
-				case <-ctx.Done():
-					return nil, fmt.Errorf("pg opener: %w", ctx.Err())
-				case <-time.After(5 * time.Second):
-				}
-			}
-		}
-		return nil, fmt.Errorf("time out postgres init: %w", err)
+		return Open(ctx, hostPort, opts...)
 	}
 }
 
-type backend struct {
-	db *sql.DB
+type EQPG struct {
+	DB *sql.DB
 	nw entroq.NotifyWaiter
 }
 
@@ -230,9 +238,9 @@ type backend struct {
 // objects.
 //
 // If left nil, the default behavior is to poll and sleep.
-func New(ctx context.Context, db *sql.DB, nw entroq.NotifyWaiter) (*backend, error) {
-	b := &backend{
-		db: db,
+func New(ctx context.Context, db *sql.DB, nw entroq.NotifyWaiter) (*EQPG, error) {
+	b := &EQPG{
+		DB: db,
 		nw: nw,
 	}
 
@@ -247,20 +255,20 @@ func New(ctx context.Context, db *sql.DB, nw entroq.NotifyWaiter) (*backend, err
 }
 
 // Close closes the underlying database connection.
-func (b *backend) Close() error {
-	if err := b.db.Close(); err != nil {
+func (b *EQPG) Close() error {
+	if err := b.DB.Close(); err != nil {
 		return fmt.Errorf("pg backend close: %w", err)
 	}
 	return nil
 }
 
 // Queues returns the queues and their sizes.
-func (b *backend) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[string]int, error) {
+func (b *EQPG) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[string]int, error) {
 	return entroq.QueuesFromStats(b.QueueStats(ctx, qq))
 }
 
 // QueueStats returns a mapping from queue names to their statistics.
-func (b *backend) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[string]*entroq.QueueStat, error) {
+func (b *EQPG) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[string]*entroq.QueueStat, error) {
 	q := `SELECT
 			queue,
 			COUNT(*) AS count,
@@ -294,7 +302,7 @@ func (b *backend) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[s
 
 	q += " GROUP BY queue"
 
-	rows, err := b.db.QueryContext(ctx, q, values...)
+	rows, err := b.DB.QueryContext(ctx, q, values...)
 	if err != nil {
 		return nil, fmt.Errorf("queue names: %w", err)
 	}
@@ -327,7 +335,7 @@ func (b *backend) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[s
 }
 
 // Tasks returns a slice of all tasks in the given queue.
-func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Task, error) {
+func (b *EQPG) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Task, error) {
 	q := "SELECT id, version, queue, at, created, modified, claimant, value, claims, attempt, err FROM tasks WHERE true"
 	var values []interface{}
 
@@ -356,7 +364,7 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 		q += fmt.Sprintf(" LIMIT %d", tq.Limit)
 	}
 
-	rows, err := b.db.QueryContext(ctx, q, values...)
+	rows, err := b.DB.QueryContext(ctx, q, values...)
 	if err != nil {
 		return nil, fmt.Errorf("queue tasks %q: %w", tq.Queue, err)
 	}
@@ -383,7 +391,7 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 
 // Claim attempts to claim an arrived task from the queue, and blocks if
 // something goes wrong.
-func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
+func (b *EQPG) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
 	if b.nw != nil {
 		return entroq.WaitTryClaim(ctx, cq, b.TryClaim, b.nw)
 	}
@@ -393,12 +401,12 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 // TryClaim attempts to claim an "arrived" task from any of the specified
 // queues, attempting to do so fairly across queues. Returns a nil task (no
 // error) if all queues are empty.
-func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
+func (b *EQPG) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
 	if cq.Duration == 0 {
 		return nil, fmt.Errorf("no duration set for claim %q", cq.Queues)
 	}
 	task := new(entroq.Task)
-	err := b.db.QueryRowContext(ctx,
+	err := b.DB.QueryRowContext(ctx,
 		`SELECT id, version, queue, at, created, modified, claimant, value, claims, attempt, err
 		 FROM entroq_try_claim($1, $2, $3)`,
 		pq.Array(cq.Queues), cq.Claimant, fmt.Sprintf("%d microseconds", cq.Duration/time.Microsecond),
@@ -428,12 +436,53 @@ func isRetryable(err error) bool {
 	return false
 }
 
+// modifyConfig holds options for how Modify should execute.
+type modifyConfig struct {
+	runInTx func(*sql.Tx) error
+}
+
+// ModifyOption is an option for altering how Modify works for the postgres
+// database. For example, you could specify a specific transaction to use.
+type ModifyOption func(*modifyConfig)
+
+// WithSQLTx specifies a transaction to use for the modification. If the
+// transaction is not nil, the modification is executed within it, and the
+// transaction is committed if the modification succeeds, or rolled back if it
+// fails. If the transaction is nil, the modification is executed in a new
+// transaction.
+//
+// Note: the callback is responsible for managing any rows returned, including
+// closing them before the callback completes.
+func RunningInTx(f func(*sql.Tx) error) ModifyOption {
+	return func(cfg *modifyConfig) {
+		cfg.runInTx = f
+	}
+}
+
+// ModifyOpts is a helper for running a modification with special pg-specific options, like a callback that runs inside a transaction.
+func (b *EQPG) ModifyOpts(ctx context.Context, mod *entroq.Modification, opts ...ModifyOption) (inserted, changed []*entroq.Task, err error) {
+	options := &modifyConfig{}
+	for _, o := range opts {
+		o(options)
+	}
+	return b.modifyHandlingRetriable(ctx, func() (inserted, changed []*entroq.Task, err error) {
+		return b.modify(ctx, mod, options)
+	})
+}
+
 // Modify attempts to apply an atomic modification to the task store. Either
 // all succeeds or all fails.
-func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserted, changed []*entroq.Task, err error) {
+func (b *EQPG) Modify(ctx context.Context, mod *entroq.Modification) (inserted, changed []*entroq.Task, err error) {
+	return b.modifyHandlingRetriable(ctx, func() (inserted, changed []*entroq.Task, err error) {
+		return b.modify(ctx, mod, nil)
+	})
+}
+
+// modifyHandlingRetriable runs a retry loop for handling database retriable errors.
+func (b *EQPG) modifyHandlingRetriable(ctx context.Context, doModify func() (inserted, changed []*entroq.Task, err error)) (inserted, changed []*entroq.Task, err error) {
 	const minBackoff = 10 * time.Millisecond
 	for i := 0; i < 7; i++ {
-		inserted, changed, err = b.modify(ctx, mod)
+		inserted, changed, err = doModify()
 		// No error - we're done!
 		if err == nil {
 			// Notify any waiters of tasks that were just changed/inserted that are
@@ -472,14 +521,42 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 // dependencies, checks versions, and performs all inserts/changes/deletes in
 // one round trip. Returns a DependencyError (SQLSTATE EQ001) if any
 // dependency constraint is violated.
-func (b *backend) modify(ctx context.Context, mod *entroq.Modification) (inserted, changed []*entroq.Task, err error) {
+func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *modifyConfig) (inserted, changed []*entroq.Task, err error) {
 	// Build parallel arrays for each operation set.
 	depIDs, depVers := taskIDArrays(mod.Depends)
 	delIDs, delVers := taskIDArrays(mod.Deletes)
 	insIDs, insQueues, insAts, insValues, insAttempts, insErrs := insertArrays(mod.Inserts)
 	chgIDs, chgVers, chgQueues, chgAts, chgValues, chgAttempts, chgErrs := changeArrays(mod.Changes)
 
-	rows, err := b.db.QueryContext(ctx, `
+	if options == nil {
+		options = &modifyConfig{}
+	}
+
+	tx, err := b.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("pg modify begin tx: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			if rbErr := tx.Rollback(); rbErr != nil {
+				err = fmt.Errorf("pg modify rollback failed: %v (original error: %w)", rbErr, err)
+			}
+		} else {
+			if cmErr := tx.Commit(); cmErr != nil {
+				err = fmt.Errorf("pg modify commit failed: %w", cmErr)
+			}
+		}
+	}()
+
+	// Run caller's DB work first, inside the same transaction, if specified.
+	if options.runInTx != nil {
+		if err := options.runInTx(tx); err != nil {
+			return nil, nil, fmt.Errorf("pg modify caller tx work: %w", err)
+		}
+	}
+
+	// Now perform entroq modification in the same transaction.
+	rows, err := tx.QueryContext(ctx, `
 		SELECT kind, id, version, queue, at, created, modified, claimant, value, claims, attempt, err
 		FROM entroq_modify_arrays(
 			$1,
@@ -637,8 +714,8 @@ func changeArrays(changes []*entroq.Task) (ids []string, versions []int32, queue
 }
 
 // Time returns the time used in all calculations in this process.
-func (b *backend) Time(ctx context.Context) (time.Time, error) {
-	row := b.db.QueryRowContext(ctx, "SELECT now()")
+func (b *EQPG) Time(ctx context.Context) (time.Time, error) {
+	row := b.DB.QueryRowContext(ctx, "SELECT now()")
 	var t time.Time
 	if err := row.Scan(&t); err != nil {
 		return time.Time{}, fmt.Errorf("postgres time: %w", err)
