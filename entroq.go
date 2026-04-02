@@ -210,6 +210,7 @@ type Backend interface {
 // IDGenerator is a function that can generate IDs. Used for generating task IDs
 // and claimant IDs when they are not specified. By default, this is
 // UUIDGenerator, which produces UUIDs as strings.
+// NOTE: any ID generated must be <= 64 characters in length for some backends.
 type IDGenerator func() string
 
 // EntroQ is a client interface for accessing the task queue.
@@ -723,6 +724,8 @@ func WithErr(value string) InsertArg {
 // will assign a new, unique ID for this task if none is specified. There are cases
 // where assigning an explicit insertion ID (always being careful that it is
 // unique) can be useful, however.
+//
+// NOTE: IDs must be <= 64 characters in length for some backends.
 //
 // For example, a not uncommon need is for a worker to do the following:
 //
