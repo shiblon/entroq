@@ -264,6 +264,47 @@ class Transaction:
 
 
 # ---------------------------------------------------------------------------
+# Schema version check
+# ---------------------------------------------------------------------------
+
+# Must match the value in schema.sql and backend/eqpg/schema.go.
+SCHEMA_VERSION = "0.10.0"
+
+
+def _check_schema_version(connstr: str) -> None:
+    """Verify that the database schema version matches SCHEMA_VERSION.
+
+    Raises RuntimeError with a descriptive message on mismatch or if the
+    entroq_meta table is absent (uninitialized or pre-versioning database).
+    """
+    with psycopg.connect(connstr, row_factory=dict_row) as conn:
+        try:
+            row = conn.execute(
+                "SELECT value FROM entroq_meta WHERE key = 'schema_version'"
+            ).fetchone()
+        except psycopg.DatabaseError as e:
+            if e.diag.sqlstate == '42P01':  # undefined_table
+                raise RuntimeError(
+                    "entroq_meta table not found; "
+                    "initialize the database by running schema.sql"
+                ) from e
+            raise
+        if row is None:
+            raise RuntimeError(
+                "schema_version not found in entroq_meta; "
+                "re-run schema.sql to initialize"
+            )
+        stored = row['value']
+        if stored != SCHEMA_VERSION:
+            raise RuntimeError(
+                f"schema version mismatch: database has {stored!r}, "
+                f"code expects {SCHEMA_VERSION!r}; apply schema.sql to migrate, "
+                f"then: UPDATE entroq_meta SET value = '{SCHEMA_VERSION}' "
+                f"WHERE key = 'schema_version'"
+            )
+
+
+# ---------------------------------------------------------------------------
 # Main client
 # ---------------------------------------------------------------------------
 
@@ -278,6 +319,7 @@ class EntroQ:
     def __init__(self, connstr: str):
         self._connstr = connstr
         self._claimant = str(uuid.uuid4())
+        _check_schema_version(connstr)
 
     def time(self) -> datetime:
         """Return the current time according to the database."""

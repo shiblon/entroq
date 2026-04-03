@@ -625,3 +625,20 @@ AFTER INSERT OR UPDATE OF at ON tasks
 FOR EACH ROW
 WHEN (NEW.at <= now())
 EXECUTE FUNCTION entroq_notify_task();
+
+-- Schema version tracking. Set once on first initialization; never overwritten
+-- by subsequent re-runs of this script (ON CONFLICT DO NOTHING). The backend
+-- reads this on startup and refuses to operate if it does not match the
+-- compiled-in SchemaVersion constant, protecting against accidental use of a
+-- mismatched schema.
+--
+-- To migrate to a new version: apply the updated schema.sql, then manually
+-- bump the stored version:
+--   UPDATE entroq_meta SET value = '<new-version>' WHERE key = 'schema_version';
+CREATE TABLE IF NOT EXISTS entroq_meta (
+    key   TEXT PRIMARY KEY NOT NULL,
+    value TEXT NOT NULL
+);
+
+INSERT INTO entroq_meta (key, value) VALUES ('schema_version', '0.10.0')
+    ON CONFLICT (key) DO NOTHING;
