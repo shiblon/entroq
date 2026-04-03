@@ -347,21 +347,27 @@ func NewMapWorker(eq *entroq.EntroQ, inQueue string, newEmitter func() MapEmitte
 //
 // Runs until the context is canceled or an unrecoverable error is encountered.
 func (w *MapWorker) Run(ctx context.Context) error {
-	return w.client.NewWorker(w.InputQueue).Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
-		emitter := w.newEmitter()
-		if w.EarlyReduce != nil {
-			emitter = newReducingProxyMapEmitter(emitter, w.EarlyReduce)
-		}
-		kv := new(KV)
-		if err := json.Unmarshal(task.Value, kv); err != nil {
-			return nil, fmt.Errorf("map run json: %w", err)
-		}
-		if err := w.Map(ctx, kv.Key, kv.Value, emitter.Emit); err != nil {
-			return nil, fmt.Errorf("map run map: %w", err)
-		}
-
-		return emitter.AsModifyArgs(w.OutputPrefix, task.AsDeletion())
-	})
+	return w.client.NewWorker(
+		entroq.CompactHandler(w.client,
+			func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
+				emitter := w.newEmitter()
+				if w.EarlyReduce != nil {
+					emitter = newReducingProxyMapEmitter(emitter, w.EarlyReduce)
+				}
+				kv := new(KV)
+				if err := json.Unmarshal(task.Value, kv); err != nil {
+					return nil, fmt.Errorf("map run json: %w", err)
+				}
+				if err := w.Map(ctx, kv.Key, kv.Value, emitter.Emit); err != nil {
+					return nil, fmt.Errorf("map run map: %w", err)
+				}
+				emitArgs, err := emitter.AsModifyArgs(w.OutputPrefix)
+				if err != nil {
+					return nil, fmt.Errorf("mr run mod args: %v", err)
+				}
+				return append(emitArgs, task.AsDeletion()), nil
+			}),
+	).Run(ctx, w.InputQueue)
 }
 
 // ReducerInput provides a streaming interface for getting values during reduction.
@@ -533,7 +539,7 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 		}
 
 		// Stop to get stable version tasks (no longer renewed in the background).
-		updatedTasks, err := stop(ctx)
+		updatedTasks := stop()
 
 		var modArgs []entroq.ModifyArg
 		modArgs = append(modArgs, entroq.InsertingInto(w.InputQueue, entroq.WithValue(combined)))
@@ -618,10 +624,7 @@ func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error 
 			return fmt.Errorf("reduce to json: %w", err)
 		}
 
-		updatedTask, err := stop(ctx)
-		if err != nil {
-			return fmt.Errorf("stop in reduce: %w", err)
-		}
+		updatedTask := stop()
 
 		if _, _, err := w.client.Modify(ctx, updatedTask.AsDeletion(), entroq.InsertingInto(w.OutputQueue, entroq.WithValue(outputValue))); err != nil {
 			return fmt.Errorf("reduce output: %w", err)
@@ -821,7 +824,7 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 			WithEarlyReducer(mr.EarlyReduce))
 
 		g.Go(func() error {
-			if err := worker.Run(ctx); !entroq.IsCanceled(err) {
+			if err := worker.Run(ctx); err != nil && !entroq.IsCanceled(err) {
 				return fmt.Errorf("map worker: %w", err)
 			}
 			return nil

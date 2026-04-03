@@ -4,7 +4,6 @@ package qtest
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -142,21 +141,25 @@ func simpleWorkerOnce(ctx context.Context, t *testing.T, client *entroq.EntroQ, 
 		}
 	}
 
-	numConsumed := 0
-	var consumed []*entroq.Task
 	ctx, cancel := context.WithCancel(ctx)
 
 	g, ctx := errgroup.WithContext(ctx)
 
+	var consumed []*entroq.Task
 	g.Go(func() error {
-		return client.NewWorker(queue).Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
-			if task.Claims != 1 {
-				return nil, fmt.Errorf("worker claim expected claims to be 1, got %d", task.Claims)
-			}
-			numConsumed++
-			consumed = append(consumed, task)
-			return []entroq.ModifyArg{task.AsDeletion()}, nil
-		})
+		return client.NewWorker(entroq.FuncHandler(
+			func(ctx context.Context, task *entroq.Task) error {
+				if task.Claims != 1 {
+					return fmt.Errorf("worker claim expected claims to be 1, got %d", task.Claims)
+				}
+				consumed = append(consumed, task)
+				return nil
+			},
+			func(ctx context.Context, task *entroq.Task) error {
+				_, _, err := client.Modify(ctx, task.AsDeletion())
+				return err
+			}),
+		).Run(ctx, queue)
 	})
 
 	select {
@@ -243,15 +246,21 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	for range numWorkers {
 		g.Go(func() error {
 			ti := 0
-			w := client.NewWorker(bigQueue, medQueue, smallQueue)
-			err := w.Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
-				ti++
-				if task.Claims != 1 {
-					return nil, fmt.Errorf("worker claim expected to be 1, was %d", task.Claims)
-				}
-				consumedCh <- task
-				return []entroq.ModifyArg{task.AsDeletion()}, nil
-			})
+			w := client.NewWorker(entroq.FuncHandler(
+				func(ctx context.Context, task *entroq.Task) error {
+					ti++
+					if task.Claims != 1 {
+						return fmt.Errorf("worker claim expected to be 1, was %d", task.Claims)
+					}
+					consumedCh <- task
+					return nil
+				},
+				func(ctx context.Context, task *entroq.Task) error {
+					_, _, err := client.Modify(ctx, task.AsDeletion())
+					return err
+				}),
+			)
+			err := w.Run(ctx, bigQueue, medQueue, smallQueue)
 			if entroq.IsCanceled(err) {
 				return nil
 			}
@@ -328,62 +337,6 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	}
 }
 
-// WorkerDependencyHandler tests that workers with specified dependency
-// handlers get called on dependency errors, and that upgrades to fatal errors
-// happen appropriately.
-func WorkerDependencyHandler(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	queue := path.Join(qPrefix, "dep-handler-queue")
-
-	timesHandled := make(chan int, 1)
-	timesHandled <- 0
-
-	upgradeError := errors.New("upgraded")
-
-	leaseTime := 3 * time.Second
-
-	onDep := func(err entroq.DependencyError) error {
-		h := <-timesHandled
-		defer func() {
-			timesHandled <- h + 1
-			// Also give the task time to expire before the loop tries again,
-			// otherwise it waits for a long time (no notification for tasks
-			// becoming available).
-			time.Sleep(leaseTime)
-		}()
-		switch h {
-		case 0:
-			return nil // first time through, we ignore it, don't upgrade it.
-		case 1:
-			return upgradeError // second time through upgrade it.
-		default:
-			t.Fatalf("Called dependency handler too many times: %v", timesHandled)
-			return nil
-		}
-	}
-
-	if _, _, err := client.Modify(ctx, entroq.InsertingInto(queue)); err != nil {
-		t.Fatalf("Failed to insert task: %v", err)
-	}
-
-	w := client.NewWorker(queue).WithOpts(entroq.WithDependencyHandler(onDep), entroq.WithLease(leaseTime))
-
-	ctx, cancel := context.WithTimeout(ctx, 3*leaseTime)
-	defer cancel()
-
-	err := w.Run(ctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
-		// Return a modification that will fail because it depends on a non-existent task ID.
-		return []entroq.ModifyArg{task.AsDeletion(), entroq.DependingOn(client.GenID(), 0, entroq.WithIDQueue("no queue"))}, nil
-	})
-
-	if !errors.Is(err, upgradeError) {
-		t.Fatalf("Expected upgrade error, got %v", err)
-	}
-
-	if h := <-timesHandled; h != 2 {
-		t.Fatalf("Expected to have a safe error, then a fatal error, only ran %v times", h)
-	}
-}
-
 // WorkerRetryOnError test that workers that have RetryTaskError results
 // increment attempts and set the error properly. It also checks that after max
 // attempts, things get moved.
@@ -435,27 +388,35 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 	runWorkerOneCase := func(ctx context.Context, c tc) {
 		t.Helper()
 
-		w := client.NewWorker(c.input.Queue).WithOpts(entroq.WithBaseRetryDelay(0), entroq.WithMaxAttempts(c.maxAttempt))
-
-		ctx, cancel := context.WithCancel(ctx)
-		defer cancel()
-
 		// Keep track of the retried task - after we get past attempt 0, we
 		// store it here. Then, if the task was not meant to be moved, we can
 		// see what happened without a separate claim section.
 		retriedTaskCh := make(chan *entroq.Task, 1)
 
-		g, gctx := errgroup.WithContext(ctx)
-		g.Go(func() error {
-			return w.Run(gctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
+		w := client.NewWorker(entroq.FuncHandler(
+			func(ctx context.Context, task *entroq.Task) error {
 				// Only attempt this again if it's the first time.
 				if task.Attempt == 0 {
-					return nil, entroq.RetryTaskErrorf("retry error: %s", string(task.Value))
+					return entroq.RetryTaskErrorf("retry error: %s", string(task.Value))
 				}
-				// Save it so we know what happened with the retry error, and clean up.
+				// Save it so we know what happened with the retry error.
 				retriedTaskCh <- task
-				return []entroq.ModifyArg{task.AsDeletion()}, nil
-			})
+				return nil
+			},
+			func(ctx context.Context, task *entroq.Task) error {
+				_, _, err := client.Modify(ctx, task.AsDeletion())
+				return err
+			}),
+			entroq.WithBaseRetryDelay(0),
+			entroq.WithMaxAttempts(c.maxAttempt),
+		)
+
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		g, gctx := errgroup.WithContext(ctx)
+		g.Go(func() error {
+			return w.Run(gctx, c.input.Queue)
 		})
 
 		// Now stick our task in. The worker is ready and waiting.
@@ -555,7 +516,27 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 
 		const leaseTime = 5 * time.Second
 
-		w := client.NewWorker(c.input.Queue).WithOpts(
+		w := client.NewWorker(entroq.FuncHandler(
+			func(ctx context.Context, task *entroq.Task) error {
+				switch string(task.Value) {
+				case "die":
+					return fmt.Errorf("task asked to die")
+				case "move":
+					return entroq.MoveTaskErrorf("task asked to move")
+				case "move-wait":
+					select {
+					case <-time.After(leaseTime):
+						return entroq.MoveTaskErrorf("task asked to move after renewal")
+					case <-ctx.Done():
+						return fmt.Errorf("oops - test %q took too long, gave up before finishing: %w", c.name, ctx.Err())
+					}
+				}
+				return nil
+			},
+			func(ctx context.Context, task *entroq.Task) error {
+				_, _, err := client.Modify(ctx, task.AsDeletion())
+				return err
+			}),
 			entroq.WithLease(leaseTime),
 		)
 
@@ -563,23 +544,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		defer cancel()
 		g, gctx := errgroup.WithContext(ctx)
 		g.Go(func() error {
-			if err := w.Run(gctx, func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
-				switch string(task.Value) {
-				case "die":
-					return nil, fmt.Errorf("task asked to die")
-				case "move":
-					return nil, entroq.MoveTaskErrorf("task asked to move")
-				case "move-wait":
-					select {
-					case <-time.After(leaseTime):
-						return nil, entroq.MoveTaskErrorf("task asked to move after renewal")
-					case <-ctx.Done():
-						return nil, fmt.Errorf("oops - test %q took too long, gave up before finishing: %w", c.name, ctx.Err())
-					}
-				default:
-					return []entroq.ModifyArg{task.AsDeletion()}, nil
-				}
-			}); err != nil && !entroq.IsCanceled(err) {
+			if err := w.Run(gctx, c.input.Queue); err != nil && !entroq.IsCanceled(err) {
 				// Log quickly so we can see it before waits fail below.
 				log.Printf("Worker Run error: %v", err)
 				return err
@@ -682,10 +647,7 @@ func WorkerRenewal(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPr
 			return fmt.Errorf("worker do with renew: %w", ctx.Err())
 		case <-time.After(10 * time.Second): // long enough for 3 renewals.
 		}
-		renewed, err := stop(ctx)
-		if err != nil {
-			t.Fatalf("Stop failed: %v", err)
-		}
+		renewed := stop()
 		if want, got := task.Version+3, renewed.Version; want != got {
 			t.Fatalf("Expected renewed task to be at version %d, got %d", want, got)
 		}

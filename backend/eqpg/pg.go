@@ -186,6 +186,8 @@ func Open(ctx context.Context, hostPort string, opts ...PGOpt) (*EQPG, error) {
 		params = append(params, "sslrootcert="+url.QueryEscape(options.sslServerCAFile))
 	}
 
+	params = append(params, "search_path=entroq,public")
+
 	connStr := strings.Join(params, " ")
 
 	db, err := sql.Open("postgres", connStr)
@@ -408,7 +410,7 @@ func (b *EQPG) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 	task := new(entroq.Task)
 	err := b.DB.QueryRowContext(ctx,
 		`SELECT id, version, queue, at, created, modified, claimant, value, claims, attempt, err
-		 FROM entroq_try_claim($1, $2, $3)`,
+		 FROM try_claim($1, $2, $3)`,
 		pq.Array(cq.Queues), cq.Claimant, fmt.Sprintf("%d microseconds", cq.Duration/time.Microsecond),
 	).Scan(
 		&task.ID, &task.Version, &task.Queue, &task.At,
@@ -517,7 +519,7 @@ func (b *EQPG) modifyHandlingRetriable(ctx context.Context, doModify func() (ins
 	return nil, nil, entroq.DependencyErrorf("retry limit: %v", err)
 }
 
-// modify calls the entroq_modify_arrays stored procedure, which atomically locks
+// modify calls the modify_arrays stored procedure, which atomically locks
 // dependencies, checks versions, and performs all inserts/changes/deletes in
 // one round trip. Returns a DependencyError (SQLSTATE EQ001) if any
 // dependency constraint is violated.
@@ -558,7 +560,7 @@ func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *mo
 	// Now perform entroq modification in the same transaction.
 	rows, err := tx.QueryContext(ctx, `
 		SELECT kind, id, version, queue, at, created, modified, claimant, value, claims, attempt, err
-		FROM entroq_modify_arrays(
+		FROM _modify_arrays(
 			$1,
 			$2::text[], $3::integer[],
 			$4::text[], $5::integer[],

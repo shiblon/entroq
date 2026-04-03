@@ -115,7 +115,7 @@ func TestRun(t *testing.T) {
 	g, ctx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
-		return eq.NewWorker(inbox).Run(ctx, Run)
+		return eq.NewWorker(entroq.CompactHandler(eq, Run)).Run(ctx, inbox)
 	})
 
 	// Insert tasks one at a time, check that we get the expected output in the expected place.

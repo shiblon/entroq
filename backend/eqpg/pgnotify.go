@@ -150,7 +150,7 @@ func un(f func()) {
 var nonAlphanumericRE = regexp.MustCompile(`[^a-zA-Z0-9]`)
 
 // pgChannelName returns the PostgreSQL notification channel name for a queue.
-// This mirrors entroq_channel_name() in the schema — the two must stay in sync.
+// This mirrors channel_name() in the schema — the two must stay in sync.
 // Channel names are capped at 63 bytes (PostgreSQL identifier limit).
 func pgChannelName(queue string) string {
 	sanitized := nonAlphanumericRE.ReplaceAllString(queue, "_")

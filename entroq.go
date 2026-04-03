@@ -1,3 +1,34 @@
+// Package entroq defines an atomic task lease manager as described in depth at
+// https://github.com/shiblon/entroq and associated wiki pages.
+// You can get the docker image at https://hub.docker.com/shiblon/entroq.
+//
+// The gist: if you have a bunch of stuff that needs to get done and you don't
+// want to lose any of it to failures, and you don't want to commit any of it
+// twice, you want this. It's fault-tolerant, it won't ever repeat itself, and
+// it makes progress even when some task data causes persistent issues; other
+// tasks will still progress.
+//
+// In other words, it's a fault-tolerant competing consumer workqueue system
+// with exactly-once semantics, progress guarantees, and strong atomicity.
+// Inspired by Google's Spanner Queues, but free and very cheap to run yourself.
+// The in-memory implementation uses a journal that replays extremely quickly,
+// so failures are really just fast-recovery events. I've literally had network
+// switch lose power in a data center cage, have power restored, and everything
+// just started right up again, with no work lost.
+//
+// The PostgreSQL implementation is pure stored procedures and LISTEN/NOTIFY, so
+// if you want, you don't even need all of this. You can do everything with the
+// schema file and some scripting. No additional server protocols, just use
+// PostgreSQL native privileges, connection pooling, etc. Or you can use the
+// nicer client approaches here, with workers, etc. In any case, see the Python
+// client implementation for a thin wrapper around Postgres for inspiration.
+//
+// Using the Go implementation opens up possibilities of, among other things, an
+// in-memory backend served via gRPC. To use GRPC as a service protocol, see
+// cmd/eqpgsvc or cmd/eqmemsvc to start it up, and use cmd/eqc as a client to
+// play with it.
+package entroq
+
 // Copyright 2019 Chris Monson <shiblon@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -11,11 +42,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-//
-// Package entroq contains the main task queue client and data definitions. The
-// client relies on a backend to implement the actual transactional
-// functionality, the interface for which is also defined here.
-package entroq
 
 import (
 	"context"
@@ -465,11 +491,11 @@ func (c *EntroQ) RenewAllFor(ctx context.Context, tasks []*Task, duration time.D
 
 // FinalizeRenewAll defines a function that can be called to stop renewal from a worker routine.
 // It returns a slice of tasks that are no longer being renewed, so versions are stable.
-type FinalizeRenewAll func(context.Context) ([]*Task, error)
+type FinalizeRenewAll func() []*Task
 
 // FinalizeRenew defines a function that can be called to stop renewal from a worker routine.
 // It returns a single task that is no longer being renewed, so its version is stable.
-type FinalizeRenew func(context.Context) (*Task, error)
+type FinalizeRenew func() *Task
 
 // DoWorkAll defines a function that accepts a 'stop' function so that work can be
 // done, renewal can be stopped to get stable task versions, and cleanup can
@@ -481,51 +507,78 @@ type DoWork func(ctx context.Context, stop FinalizeRenew) error
 
 // DoWithRenewAll runs the provided function while keeping all given tasks leases renewed.
 func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.Duration, f DoWorkAll) error {
-	taskCh := make(chan []*Task, 1)
+	type outVal struct {
+		tasks []*Task
+		err   error
+	}
+	taskCh := make(chan outVal, 1)
 
 	g, ctx := errgroup.WithContext(ctx)
+
+	fctx, fcancel := context.WithCancelCause(ctx)
+	defer fcancel(nil)
 
 	// Run the renewer, with a channel for consuming intermediate renewed tasks.
 	stopRenew := make(chan struct{})
 	g.Go(func() error {
 		renewed := tasks
-		var out chan<- []*Task
+		var out chan<- outVal
+		var stopErr error
+		doneCh := ctx.Done()
 		for {
 			select {
 			case <-stopRenew:
 				out = taskCh // enable final send
-			case <-ctx.Done():
+				stopRenew = nil
+			case <-doneCh:
 				// cancellation shouldn't keep us from returning a value
 				out = taskCh
+				doneCh = nil
 			case <-time.After(lease / 2):
 				r, err := c.RenewAllFor(ctx, renewed, lease)
 				if err != nil {
-					if IsCanceled(err) {
-						out = taskCh
-						break
-					} else {
-						return fmt.Errorf("renew all lease: %w", err)
+					if !IsCanceled(err) {
+						// Never error out of renewal, so that we don't have to pass
+						// an error out of the finalize function.
+						// We're guaranteed to have a list of tasks anyway.
+						stopErr = fmt.Errorf("renew all lease: %w", err)
 					}
+					out = taskCh
 				}
 				renewed = r
-			case out <- renewed:
+			case out <- outVal{renewed, stopErr}:
 				return nil
 			}
 		}
 	})
 
-	finalize := func(ctx context.Context) ([]*Task, error) {
+	finalize := func() []*Task {
+		// NOTE: we don't worry about contexts in this function because.
+		// 1. The renewal loop always sends valid tasks. There are no
+		// short-circuit or error cases, even on context cancellation, so
+		// closing stopRenew guarantees that there will be a value on taskCh.
+		// 2. If there is an error returned from the renewer, we can cancel
+		// the user function context with a cause, which will cause subsequent
+		// things to fail. So long as we log the error here, that failure will
+		// make sense.
+		// 3. Since we can tell what happened in the user function, we can get
+		// the cause in this outer scope and make a real error out of it, too.
 		close(stopRenew)
-		select {
-		case <-ctx.Done():
-			return nil, fmt.Errorf("renew canceled in stop: %w", ctx.Err())
-		case tasks := <-taskCh:
-			return tasks, nil
+		out := <-taskCh
+		if out.err != nil {
+			fcancel(out.err)
 		}
+		return out.tasks
 	}
 
 	g.Go(func() error {
-		if err := f(ctx, finalize); err != nil {
+		if err := f(fctx, finalize); err != nil {
+			if errors.Is(err, context.Canceled) {
+				if causeErr := context.Cause(fctx); causeErr != nil {
+					return fmt.Errorf("work func canceled with error: %w", causeErr)
+				}
+				return nil
+			}
 			return fmt.Errorf("renewed user func: %w", err)
 		}
 		return nil
@@ -540,16 +593,8 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.D
 // DoWithRenew runs the provided function while keeping the given task lease renewed.
 func (c *EntroQ) DoWithRenew(ctx context.Context, task *Task, lease time.Duration, f DoWork) error {
 	if err := c.DoWithRenewAll(ctx, []*Task{task}, lease, func(ctx context.Context, finalize FinalizeRenewAll) error {
-		// Wrap the stop function to just get one task.
-		finalizeOne := func(context.Context) (*Task, error) {
-			tasks, err := finalize(ctx)
-			if err != nil {
-				return nil, fmt.Errorf("stop one: %w", err)
-			}
-			return tasks[0], nil
-		}
 		// Call the single-task user function.
-		if err := f(ctx, finalizeOne); err != nil {
+		if err := f(ctx, func() *Task { return finalize()[0] }); err != nil {
 			return fmt.Errorf("do one: %w", err)
 		}
 		return nil

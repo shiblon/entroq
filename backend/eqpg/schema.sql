@@ -2,52 +2,63 @@
 -- All statements are idempotent and can be re-run safely against an existing database.
 -- Compatible with PostgreSQL 12+.
 --
--- Steps must run in order: column migrations precede CREATE TABLE so that
--- existing databases gain new columns before the table creation no-ops on them.
+-- Public API (intended for direct use):
+--   entroq.modify        -- atomically insert/change/delete/depend on tasks (JSONB)
+--   entroq.try_claim     -- claim a task from one of several queues (pure SQL)
+--   entroq.queues        -- queue statistics
+--   entroq.tasks         -- task listing
+--   entroq.channel_name  -- convert a queue name to a LISTEN/NOTIFY channel identifier
 --
+-- Internal functions (prefixed with _; used by Go backend or by public functions):
+--   entroq._modify_arrays   -- parallel-array form of modify, called by Go backend
+--   entroq._try_claim_one   -- claim from a single queue with bucket randomization
+--   entroq._try_claim_bucket -- claim from a specific hash bucket range
+--   entroq._notify_task     -- trigger function for LISTEN/NOTIFY
+
+CREATE SCHEMA IF NOT EXISTS entroq;
+
+-- pgcrypto provides gen_random_uuid() on PostgreSQL < 13.
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+-- Column additions for databases predating the claims/attempt/err fields.
+ALTER TABLE IF EXISTS entroq.tasks ADD COLUMN IF NOT EXISTS claims  INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE IF EXISTS entroq.tasks ADD COLUMN IF NOT EXISTS attempt INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE IF EXISTS entroq.tasks ADD COLUMN IF NOT EXISTS err     TEXT    NOT NULL DEFAULT '';
+
+-- Column type migration: uuid -> text for id and claimant.
+-- Every UUID has a canonical text representation so this cast is safe.
+-- No-ops if the columns are already text.
+ALTER TABLE IF EXISTS entroq.tasks ALTER COLUMN id       TYPE text USING id::text;
+ALTER TABLE IF EXISTS entroq.tasks ALTER COLUMN claimant TYPE text USING claimant::text;
+
+-- ID length constraints. Idempotent: drop then re-add.
+ALTER TABLE IF EXISTS entroq.tasks DROP CONSTRAINT IF EXISTS id_max_len;
+ALTER TABLE IF EXISTS entroq.tasks ADD  CONSTRAINT         id_max_len       CHECK (length(id) <= 64);
+ALTER TABLE IF EXISTS entroq.tasks DROP CONSTRAINT IF EXISTS claimant_max_len;
+ALTER TABLE IF EXISTS entroq.tasks ADD  CONSTRAINT         claimant_max_len CHECK (claimant IS NULL OR length(claimant) <= 64);
+
+-- Drop old UUID-typed composite types; recreated below with text id fields.
+-- These types are not used in any function signatures, so no CASCADE is needed.
+DROP TYPE IF EXISTS entroq.task_id;
+DROP TYPE IF EXISTS entroq.task_arg;
+
+-- Drop any stored procedures incompatible with current table schema. Recreating them is non-disruptive.
+DROP FUNCTION IF EXISTS entroq._try_claim_bucket(text, uuid, interval, timestamptz, integer, integer);
+DROP FUNCTION IF EXISTS entroq._try_claim_one(text, uuid, interval);
+DROP FUNCTION IF EXISTS entroq.try_claim(text[], uuid, interval);
+DROP FUNCTION IF EXISTS entroq._modify_arrays(uuid, uuid[], integer[], uuid[], integer[], uuid[], text[], timestamptz[], bytea[], integer[], text[], uuid[], integer[], text[], timestamptz[], bytea[], integer[], text[]);
+DROP FUNCTION IF EXISTS entroq.modify(uuid, jsonb, jsonb, jsonb, jsonb);
+DROP FUNCTION IF EXISTS entroq.tasks(text, integer, boolean);
+
+-- Core table. id and claimant are TEXT with CHECK constraints limiting them
+-- to 64 characters -- long enough for UUIDs, ULIDs, etc.
 -- ID representation: task IDs and claimant IDs are stored as TEXT with a
 -- CHECK constraint limiting them to 64 characters. 64 accommodates UUIDs (36),
 -- ULIDs (26), and similar schemes while keeping indexes efficient.
 -- Bucketing uses hashtext(id) & 255 -- a stable 8-bit hash value in [0,255] --
 -- with an index on (queue, at, (hashtext(id) & 255)) for efficient range scans.
 -- hashtext() is IMMUTABLE and available in all supported PostgreSQL versions.
-
--- pgcrypto provides gen_random_uuid() on PostgreSQL < 13.
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
-
--- Column additions for databases predating the claims/attempt/err fields.
-ALTER TABLE IF EXISTS tasks ADD COLUMN IF NOT EXISTS claims  INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE IF EXISTS tasks ADD COLUMN IF NOT EXISTS attempt INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE IF EXISTS tasks ADD COLUMN IF NOT EXISTS err     TEXT    NOT NULL DEFAULT '';
-
--- Column type migration: uuid -> text for id and claimant.
--- Every UUID has a canonical text representation so this cast is safe.
--- No-ops if the columns are already text.
-ALTER TABLE IF EXISTS tasks ALTER COLUMN id       TYPE text USING id::text;
-ALTER TABLE IF EXISTS tasks ALTER COLUMN claimant TYPE text USING claimant::text;
-
--- ID length constraints. Idempotent: drop then re-add.
-ALTER TABLE IF EXISTS tasks DROP CONSTRAINT IF EXISTS id_max_len;
-ALTER TABLE IF EXISTS tasks ADD  CONSTRAINT         id_max_len       CHECK (length(id) <= 64);
-ALTER TABLE IF EXISTS tasks DROP CONSTRAINT IF EXISTS claimant_max_len;
-ALTER TABLE IF EXISTS tasks ADD  CONSTRAINT         claimant_max_len CHECK (claimant IS NULL OR length(claimant) <= 64);
-
--- Drop old UUID-typed composite types; recreated below with text id fields.
--- These types are not used in any function signatures, so no CASCADE is needed.
-DROP TYPE IF EXISTS entroq_task_id;
-DROP TYPE IF EXISTS entroq_task_arg;
-
--- Drop any stored procedures incompatible with current table schema. Recreating them is non-disruptive.
-DROP FUNCTION IF EXISTS entroq_try_claim_bucket(text, uuid, interval, timestamptz, integer, integer);
-DROP FUNCTION IF EXISTS entroq_try_claim_one(text, uuid, interval);
-DROP FUNCTION IF EXISTS entroq_try_claim(text[], uuid, interval);
-DROP FUNCTION IF EXISTS entroq_modify_arrays(uuid, uuid[], integer[], uuid[], integer[], uuid[], text[], timestamptz[], bytea[], integer[], text[], uuid[], integer[], text[], timestamptz[], bytea[], integer[], text[]);
-DROP FUNCTION IF EXISTS entroq_modify(uuid, jsonb, jsonb, jsonb, jsonb);
-DROP FUNCTION IF EXISTS entroq_tasks(text, integer, boolean);
-
--- Core table. id and claimant are TEXT with CHECK constraints limiting them
--- to 64 characters -- long enough for UUIDs, ULIDs, etc.
-CREATE TABLE IF NOT EXISTS tasks (
+CREATE TABLE IF NOT EXISTS entroq.tasks (
     id       TEXT                     PRIMARY KEY NOT NULL CHECK (length(id) <= 64),
     version  INTEGER                  NOT NULL DEFAULT 0,
     queue    TEXT                     NOT NULL DEFAULT '',
@@ -62,32 +73,32 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 
 -- Indexes.
-CREATE INDEX IF NOT EXISTS byID        ON tasks (id);
-CREATE INDEX IF NOT EXISTS byVersion   ON tasks (version);
-CREATE INDEX IF NOT EXISTS byQueue     ON tasks (queue);
-CREATE INDEX IF NOT EXISTS byQueueAt   ON tasks (queue, at);
+CREATE INDEX IF NOT EXISTS byID        ON entroq.tasks (id);
+CREATE INDEX IF NOT EXISTS byVersion   ON entroq.tasks (version);
+CREATE INDEX IF NOT EXISTS byQueue     ON entroq.tasks (queue);
+CREATE INDEX IF NOT EXISTS byQueueAt   ON entroq.tasks (queue, at);
 
--- Bucket index: supports range-based bucket selection in entroq_try_claim_bucket.
+-- Bucket index: supports range-based bucket selection in _try_claim_bucket.
 -- hashtext(id) & 255 gives a stable value in [0, 255] for any text ID.
 -- The BETWEEN predicate in the claim function uses this index for range scans,
 -- avoiding a full-queue scan while preserving dynamic bucket count selection.
-CREATE INDEX IF NOT EXISTS byQueueAtBucket ON tasks (queue, at, (hashtext(id) & 255));
+CREATE INDEX IF NOT EXISTS byQueueAtBucket ON entroq.tasks (queue, at, (hashtext(id) & 255));
 
 -- Composite types used by stored procedures.
 -- PostgreSQL has no CREATE TYPE IF NOT EXISTS, so we use DO/EXCEPTION blocks.
 DO $$ BEGIN
-    CREATE TYPE entroq_task_id AS (
+    CREATE TYPE entroq.task_id AS (
         id      text,
         version integer
     );
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 
--- entroq_task_arg is used for both inserts and changes. For inserts, the
+-- task_arg is used for both inserts and changes. For inserts, the
 -- version field is ignored. Empty id means auto-generate; NULL at means use
 -- the current transaction time.
 DO $$ BEGIN
-    CREATE TYPE entroq_task_arg AS (
+    CREATE TYPE entroq.task_arg AS (
         id      text,
         version integer,
         queue   text,
@@ -99,7 +110,7 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 
--- entroq_try_claim_bucket claims one available task whose ID hashes into the
+-- entroq._try_claim_bucket claims one available task whose ID hashes into the
 -- given bucket range. The bucket is selected by:
 --
 --   (hashtext(id) & 255) BETWEEN lo AND hi
@@ -108,7 +119,7 @@ END $$;
 -- When p_num_buckets=1 the range is [0, 255], matching every task (no-op filter).
 -- The byQueueAtBucket index covers (queue, at, hashtext(id) & 255), so this
 -- resolves as a range scan rather than a full queue scan.
-CREATE OR REPLACE FUNCTION entroq_try_claim_bucket(
+CREATE OR REPLACE FUNCTION entroq._try_claim_bucket(
     p_queue       text,
     p_claimant    text,
     p_duration    interval,
@@ -133,16 +144,16 @@ DECLARE
     v_hi integer := (p_bucket + 1) * (256 / p_num_buckets) - 1;
 BEGIN
     RETURN QUERY
-        UPDATE tasks
+        UPDATE entroq.tasks
         SET
-            version  = tasks.version + 1,
-            claims   = tasks.claims + 1,
+            version  = entroq.tasks.version + 1,
+            claims   = entroq.tasks.claims + 1,
             at       = p_now + p_duration,
             claimant = p_claimant,
             modified = p_now
-        WHERE (tasks.id, tasks.version) IN (
+        WHERE (entroq.tasks.id, entroq.tasks.version) IN (
             SELECT t2.id, t2.version
-            FROM tasks t2
+            FROM entroq.tasks t2
             WHERE
                 t2.queue = p_queue AND
                 t2.at <= p_now AND
@@ -151,20 +162,20 @@ BEGIN
             LIMIT 1
         )
         RETURNING
-            tasks.id, tasks.version, tasks.queue, tasks.at,
-            tasks.created, tasks.modified, tasks.claimant,
-            tasks.value, tasks.claims, tasks.attempt, tasks.err;
+            entroq.tasks.id, entroq.tasks.version, entroq.tasks.queue, entroq.tasks.at,
+            entroq.tasks.created, entroq.tasks.modified, entroq.tasks.claimant,
+            entroq.tasks.value, entroq.tasks.claims, entroq.tasks.attempt, entroq.tasks.err;
 END;
 $$;
 
--- entroq_try_claim_one selects a bucket based on available task count and
--- calls entroq_try_claim_bucket. Falls back to an unfiltered claim
+-- entroq._try_claim_one selects a bucket based on available task count and
+-- calls _try_claim_bucket. Falls back to an unfiltered claim
 -- (p_num_buckets=1, range [0,255]) if the chosen bucket is empty.
 --
 -- See also:
 --   https://dba.stackexchange.com/questions/69471/postgres-update-limit-1
 --   https://blog.2ndquadrant.com/what-is-select-skip-locked-for-in-postgresql-9-5/
-CREATE OR REPLACE FUNCTION entroq_try_claim_one(
+CREATE OR REPLACE FUNCTION entroq._try_claim_one(
     p_queue     text,
     p_claimant  text,
     p_duration  interval
@@ -191,7 +202,7 @@ BEGIN
     -- (1, 8) without scanning the full index for large queues.
     SELECT COUNT(*) INTO v_n_avail
     FROM (
-        SELECT t.id FROM tasks t
+        SELECT t.id FROM entroq.tasks t
         WHERE t.queue = p_queue AND t.at <= v_now
         LIMIT 9
     ) sub;
@@ -213,7 +224,7 @@ BEGIN
     v_bucket := floor(random() * v_num_buckets)::integer;
 
     RETURN QUERY
-        SELECT * FROM entroq_try_claim_bucket(
+        SELECT * FROM entroq._try_claim_bucket(
             p_queue, p_claimant, p_duration, v_now, v_num_buckets, v_bucket
         );
 
@@ -224,19 +235,18 @@ BEGIN
 
     -- Fallback: bucket was empty; retry with full range (num_buckets=1).
     RETURN QUERY
-        SELECT * FROM entroq_try_claim_bucket(
+        SELECT * FROM entroq._try_claim_bucket(
             p_queue, p_claimant, p_duration, v_now, 1, 0
         );
 END;
 $$;
 
--- entroq_try_claim is NOT used by the Go backend, which performs the queue
+-- entroq.try_claim is NOT used by the Go backend, which performs the queue
 -- shuffle and per-queue claim loop in Go to preserve inter-transaction
 -- interleaving (important for fairness across queues of different sizes).
 -- It is provided here for pure-SQL consumers or future database-side claim
 -- strategies that do not require that interleaving property.
---
-CREATE OR REPLACE FUNCTION entroq_try_claim(
+CREATE OR REPLACE FUNCTION entroq.try_claim(
     p_queues    text[],
     p_claimant  text,
     p_duration  interval
@@ -270,13 +280,13 @@ BEGIN
     END LOOP;
 
     FOREACH v_queue IN ARRAY v_queues LOOP
-        RETURN QUERY SELECT * FROM entroq_try_claim_one(v_queue, p_claimant, p_duration);
+        RETURN QUERY SELECT * FROM entroq._try_claim_one(v_queue, p_claimant, p_duration);
         IF FOUND THEN RETURN; END IF;
     END LOOP;
 END;
 $$;
 
--- entroq_modify_arrays atomically applies inserts, changes, deletes, and
+-- entroq._modify_arrays atomically applies inserts, changes, deletes, and
 -- dependency checks. Uses parallel arrays for efficiency from the Go caller,
 -- which avoids composite literal encoding complexity (especially bytea).
 --
@@ -293,8 +303,8 @@ $$;
 -- Insert sentinel: empty string in p_ins_ids means auto-generate.
 -- Timestamp sentinel: Go's zero time ('0001-01-01 00:00:00+00') means use now().
 --
--- For a more ergonomic SQL interface, use entroq_modify (JSONB).
-CREATE OR REPLACE FUNCTION entroq_modify_arrays(
+-- For a more ergonomic SQL interface, use entroq.modify (JSONB).
+CREATE OR REPLACE FUNCTION entroq._modify_arrays(
     p_claimant     text,
     -- depends: must exist at the given version
     p_dep_ids      text[],
@@ -354,8 +364,8 @@ BEGIN
         SELECT * FROM unnest(coalesce(p_chg_ids, '{}'::text[]), coalesce(p_chg_vers, '{}'::integer[]))
     ),
     locked AS (
-        SELECT tasks.id AS lck_id, tasks.version AS lck_ver FROM tasks
-        WHERE tasks.id = ANY(ARRAY(SELECT dep_id FROM all_deps))
+        SELECT t.id AS lck_id, t.version AS lck_ver FROM entroq.tasks t
+        WHERE t.id = ANY(ARRAY(SELECT dep_id FROM all_deps))
         FOR UPDATE
     )
     SELECT
@@ -381,7 +391,7 @@ BEGIN
     )
     INTO v_collisions
     FROM unnest(coalesce(p_ins_ids, '{}'::text[])) AS i(chk_id)
-    JOIN tasks t ON t.id = i.chk_id
+    JOIN entroq.tasks t ON t.id = i.chk_id
     WHERE i.chk_id != '';
 
     -- Report all problems at once.
@@ -396,16 +406,16 @@ BEGIN
     END IF;
 
     -- Deletes: versions already verified; delete by id+version for safety.
-    DELETE FROM tasks
+    DELETE FROM entroq.tasks
     USING unnest(coalesce(p_del_ids, '{}'::text[]), coalesce(p_del_vers, '{}'::integer[])) AS d(del_id, del_ver)
-    WHERE tasks.id = d.del_id AND tasks.version = d.del_ver;
+    WHERE entroq.tasks.id = d.del_id AND entroq.tasks.version = d.del_ver;
 
     -- Inserts: empty string = auto-generate; Go zero time = use v_now.
     -- CTE wraps the INSERT so RETURNING * is unambiguous; the outer SELECT
     -- uses alias r.col to avoid RETURNS TABLE OUT-parameter shadowing.
     RETURN QUERY
         WITH r AS (
-            INSERT INTO tasks (id, version, queue, at, claimant, value, created, modified, attempt, err)
+            INSERT INTO entroq.tasks (id, version, queue, at, claimant, value, created, modified, attempt, err)
             SELECT
                 CASE WHEN ins_id = '' THEN gen_random_uuid()::text ELSE ins_id END,
                 0,
@@ -434,9 +444,9 @@ BEGIN
     -- CTE for the same reason as inserts: avoid RETURNS TABLE OUT-parameter shadowing.
     RETURN QUERY
         WITH r AS (
-            UPDATE tasks
+            UPDATE entroq.tasks
             SET
-                version  = tasks.version + 1,
+                version  = entroq.tasks.version + 1,
                 modified = v_now,
                 queue    = c.chg_queue,
                 at       = c.chg_at,
@@ -452,7 +462,7 @@ BEGIN
                 coalesce(p_chg_attempts, '{}'::integer[]),
                 coalesce(p_chg_errs,     '{}'::text[])
             ) AS c(chg_id, chg_version, chg_queue, chg_at, chg_value, chg_attempt, chg_err)
-            WHERE tasks.id = c.chg_id AND tasks.version = c.chg_version
+            WHERE entroq.tasks.id = c.chg_id AND entroq.tasks.version = c.chg_version
             RETURNING *
         )
         SELECT 'changed'::text, r.id, r.version, r.queue, r.at,
@@ -462,8 +472,8 @@ BEGIN
 END;
 $$;
 
--- entroq_modify is the ergonomic public SQL API: accepts JSONB arrays of task
--- objects and delegates to entroq_modify_arrays.
+-- entroq.modify is the ergonomic public SQL API: accepts JSONB arrays of task
+-- objects and delegates to _modify_arrays.
 --
 -- Each JSONB array element is an object with fields matching the operation:
 --
@@ -478,9 +488,9 @@ $$;
 -- All parameters default to '[]' so callers only need to supply the operations
 -- they actually want.
 --
--- Returns the same tagged rows as entroq_modify_arrays:
+-- Returns the same tagged rows as _modify_arrays:
 --   kind='inserted' or kind='changed', followed by all task fields.
-CREATE OR REPLACE FUNCTION entroq_modify(
+CREATE OR REPLACE FUNCTION entroq.modify(
     p_claimant text,
     p_depends  jsonb DEFAULT '[]',
     p_deletes  jsonb DEFAULT '[]',
@@ -500,7 +510,7 @@ CREATE OR REPLACE FUNCTION entroq_modify(
     attempt  integer,
     err      text
 ) LANGUAGE sql AS $$
-    SELECT * FROM entroq_modify_arrays(
+    SELECT * FROM entroq._modify_arrays(
         p_claimant,
         -- depends
         ARRAY(SELECT e->>'id'                 FROM jsonb_array_elements(p_depends) e),
@@ -508,7 +518,7 @@ CREATE OR REPLACE FUNCTION entroq_modify(
         -- deletes
         ARRAY(SELECT e->>'id'                 FROM jsonb_array_elements(p_deletes) e),
         ARRAY(SELECT (e->>'version')::integer  FROM jsonb_array_elements(p_deletes) e),
-        -- inserts: empty string triggers auto-generate in entroq_modify_arrays
+        -- inserts: empty string triggers auto-generate in _modify_arrays
         ARRAY(SELECT coalesce(e->>'id', '')   FROM jsonb_array_elements(p_inserts) e),
         ARRAY(SELECT e->>'queue'              FROM jsonb_array_elements(p_inserts) e),
         ARRAY(SELECT coalesce((e->>'at')::timestamptz, '0001-01-01 00:00:00+00')
@@ -533,9 +543,9 @@ CREATE OR REPLACE FUNCTION entroq_modify(
     )
 $$;
 
--- entroq_queues returns queue statistics. If p_exact is non-empty it takes
+-- entroq.queues returns queue statistics. If p_exact is non-empty it takes
 -- precedence over p_prefix. p_limit=0 means no limit.
-CREATE OR REPLACE FUNCTION entroq_queues(
+CREATE OR REPLACE FUNCTION entroq.queues(
     p_prefix text    DEFAULT '',
     p_exact  text[]  DEFAULT '{}',
     p_limit  integer DEFAULT 0
@@ -544,7 +554,7 @@ CREATE OR REPLACE FUNCTION entroq_queues(
     num_tasks bigint
 ) LANGUAGE sql AS $$
     SELECT queue AS name, COUNT(*) AS num_tasks
-    FROM tasks
+    FROM entroq.tasks
     WHERE CASE
         WHEN cardinality(p_exact) > 0 THEN queue = ANY(p_exact)
         WHEN p_prefix != ''           THEN queue LIKE p_prefix || '%'
@@ -555,10 +565,10 @@ CREATE OR REPLACE FUNCTION entroq_queues(
     LIMIT NULLIF(p_limit, 0)
 $$;
 
--- entroq_tasks returns tasks ordered by at. p_queue='' means all queues.
+-- entroq.tasks returns tasks ordered by at. p_queue='' means all queues.
 -- p_omit_values=true returns empty bytea for the value column.
 -- p_limit=0 means no limit.
-CREATE OR REPLACE FUNCTION entroq_tasks(
+CREATE OR REPLACE FUNCTION entroq.tasks(
     p_queue        text    DEFAULT '',
     p_limit        integer DEFAULT 0,
     p_omit_values  boolean DEFAULT false
@@ -579,13 +589,13 @@ CREATE OR REPLACE FUNCTION entroq_tasks(
         id, version, queue, at, created, modified, claimant,
         CASE WHEN p_omit_values THEN ''::bytea ELSE value END AS value,
         claims, attempt, err
-    FROM tasks
+    FROM entroq.tasks
     WHERE p_queue = '' OR queue = p_queue
     ORDER BY at
     LIMIT NULLIF(p_limit, 0)
 $$;
 
--- entroq_channel_name converts a queue name into a valid PostgreSQL
+-- entroq.channel_name converts a queue name into a valid PostgreSQL
 -- LISTEN/NOTIFY channel identifier within the 63-byte limit.
 -- Uses the full sanitized name when it fits; otherwise sandwiches an
 -- 8-hex-char MD5 of the original name between a prefix and suffix.
@@ -593,7 +603,10 @@ $$;
 --
 -- md5() is used instead of CRC32 because it is a built-in PostgreSQL
 -- function requiring no extension.
-CREATE OR REPLACE FUNCTION entroq_channel_name(p_queue text)
+--
+-- This function is part of the public API: use it when setting up your own
+-- LISTEN subscriptions on entroq queues.
+CREATE OR REPLACE FUNCTION entroq.channel_name(p_queue text)
 RETURNS text LANGUAGE sql IMMUTABLE STRICT AS $$
     SELECT CASE
         WHEN length(regexp_replace(p_queue, '[^a-zA-Z0-9]', '_', 'g')) + 2 <= 63
@@ -605,26 +618,26 @@ RETURNS text LANGUAGE sql IMMUTABLE STRICT AS $$
     END
 $$;
 
--- entroq_notify_task fires pg_notify on the queue's channel for a task that
+-- entroq._notify_task fires pg_notify on the queue's channel for a task that
 -- is immediately available. The WHEN clause on the trigger filters to
 -- NEW.at <= now(), so this function is only called when the task is already
 -- claimable - no conditional needed inside the body.
-CREATE OR REPLACE FUNCTION entroq_notify_task()
+CREATE OR REPLACE FUNCTION entroq._notify_task()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
-    PERFORM pg_notify(entroq_channel_name(NEW.queue), '');
+    PERFORM pg_notify(entroq.channel_name(NEW.queue), '');
     RETURN NULL;
 END;
 $$;
 
 -- Trigger must be dropped before recreating because CREATE OR REPLACE TRIGGER
 -- is only available in PostgreSQL 14+.
-DROP TRIGGER IF EXISTS entroq_task_notify ON tasks;
-CREATE TRIGGER entroq_task_notify
-AFTER INSERT OR UPDATE OF at ON tasks
+DROP TRIGGER IF EXISTS task_notify ON entroq.tasks;
+CREATE TRIGGER task_notify
+AFTER INSERT OR UPDATE OF at ON entroq.tasks
 FOR EACH ROW
 WHEN (NEW.at <= now())
-EXECUTE FUNCTION entroq_notify_task();
+EXECUTE FUNCTION entroq._notify_task();
 
 -- Schema version tracking. Set once on first initialization; never overwritten
 -- by subsequent re-runs of this script (ON CONFLICT DO NOTHING). The backend
@@ -634,11 +647,11 @@ EXECUTE FUNCTION entroq_notify_task();
 --
 -- To migrate to a new version: apply the updated schema.sql, then manually
 -- bump the stored version:
---   UPDATE entroq_meta SET value = '<new-version>' WHERE key = 'schema_version';
-CREATE TABLE IF NOT EXISTS entroq_meta (
+--   UPDATE entroq.meta SET value = '<new-version>' WHERE key = 'schema_version';
+CREATE TABLE IF NOT EXISTS entroq.meta (
     key   TEXT PRIMARY KEY NOT NULL,
     value TEXT NOT NULL
 );
 
-INSERT INTO entroq_meta (key, value) VALUES ('schema_version', '0.10.0')
+INSERT INTO entroq.meta (key, value) VALUES ('schema_version', '0.10.0')
     ON CONFLICT (key) DO NOTHING;
