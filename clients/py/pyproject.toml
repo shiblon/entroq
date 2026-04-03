@@ -12,7 +12,8 @@ description = "Python client for the EntroQ task queue."
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = [
-    "psycopg>=3.1.8"
+    "psycopg>=3.1.8",
+    "requests"
 ]
 classifiers = [
     "Programming Language :: Python :: 3",

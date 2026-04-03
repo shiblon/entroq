@@ -1,5 +1,6 @@
 venv
 .venv
+build/
 __pycache__
 *.pyc
 *.egg-info/
