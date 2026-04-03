@@ -535,6 +535,9 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.D
 				out = taskCh
 				doneCh = nil
 			case <-time.After(lease / 2):
+				if stopErr != nil {
+					break
+				}
 				r, err := c.RenewAllFor(ctx, renewed, lease)
 				if err != nil {
 					if !IsCanceled(err) {

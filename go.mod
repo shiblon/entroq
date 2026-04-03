@@ -3,6 +3,8 @@ module github.com/shiblon/entroq
 go 1.25.0
 
 require (
+	connectrpc.com/connect v1.19.1
+	connectrpc.com/vanguard v0.4.0
 	github.com/golang-jwt/jwt/v4 v4.3.0
 	github.com/golang/protobuf v1.5.4
 	github.com/google/go-cmp v0.7.0
@@ -16,6 +18,7 @@ require (
 	github.com/spf13/viper v1.7.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.41.0
 	golang.org/x/sync v0.19.0
+	google.golang.org/genproto v0.0.0-20230110181048-76db0878b65f
 	google.golang.org/grpc v1.80.0
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v2 v2.4.0
@@ -97,7 +100,6 @@ require (
 	golang.org/x/net v0.49.0 // indirect
 	golang.org/x/sys v0.41.0 // indirect
 	golang.org/x/text v0.34.0 // indirect
-	google.golang.org/genproto v0.0.0-20230110181048-76db0878b65f // indirect
 	gopkg.in/ini.v1 v1.51.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
