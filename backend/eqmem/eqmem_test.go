@@ -65,10 +65,6 @@ func TestEQMemMultiWorker(t *testing.T) {
 	RunQTest(t, qtest.MultiWorker)
 }
 
-func TestEQMemWorkerDependencyHandler(t *testing.T) {
-	RunQTest(t, qtest.WorkerDependencyHandler)
-}
-
 func TestEQMemWorkerMoveOnError(t *testing.T) {
 	RunQTest(t, qtest.WorkerMoveOnError)
 }

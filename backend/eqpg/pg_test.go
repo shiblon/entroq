@@ -95,10 +95,7 @@ func Example() {
 		fmt.Println(string(task.Value))
 
 		// Stop renewal, get final task version.
-		renewed, err := finalize(ctx)
-		if err != nil {
-			return fmt.Errorf("Failed to finalize task: %w", err)
-		}
+		renewed := finalize()
 
 		// Delete the task to "commit" the work.
 		// At this point, you can also call directly into eqpg.ModifyOpts and
@@ -161,10 +158,6 @@ func TestSimpleWorker(t *testing.T) {
 
 func TestMultiWorker(t *testing.T) {
 	RunQTest(t, qtest.MultiWorker)
-}
-
-func TestWorkerDependencyHandler(t *testing.T) {
-	RunQTest(t, qtest.WorkerDependencyHandler)
 }
 
 func TestWorkerMoveOnError(t *testing.T) {

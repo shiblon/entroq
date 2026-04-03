@@ -25,24 +25,24 @@ const SchemaVersion = "0.10.0"
 // Three cases:
 //   - Version matches SchemaVersion: return nil (no SQL needed).
 //   - Version exists but mismatches: return a descriptive error; the caller
-//     must apply schema.sql and bump entroq_meta manually before retrying.
+//     must apply schema.sql and bump meta manually before retrying.
 //   - No version stored (fresh database or pre-versioning schema): run the
 //     full idempotent schema.sql to initialize.
 func (b *EQPG) initDB(ctx context.Context) error {
 	var stored string
 	err := b.DB.QueryRowContext(ctx,
-		`SELECT value FROM entroq_meta WHERE key = 'schema_version'`,
+		`SELECT value FROM meta WHERE key = 'schema_version'`,
 	).Scan(&stored)
 
 	switch {
 	case err == nil && stored == SchemaVersion:
 		return nil
 	case err == nil:
-		return fmt.Errorf("schema version mismatch: database has %q, code expects %q; apply schema.sql to migrate, then: UPDATE entroq_meta SET value = %q WHERE key = 'schema_version'", stored, SchemaVersion, SchemaVersion)
+		return fmt.Errorf("schema version mismatch: database has %q, code expects %q; apply schema.sql to migrate, then: UPDATE meta SET value = %q WHERE key = 'schema_version'", stored, SchemaVersion, SchemaVersion)
 	case errors.Is(err, sql.ErrNoRows):
-		// entroq_meta exists but has no version row -- run schema to insert it.
+		// meta exists but has no version row -- run schema to insert it.
 	default:
-		// entroq_meta table does not exist (or other error): fresh database.
+		// meta table does not exist (or other error): fresh database.
 	}
 
 	if _, err := b.DB.ExecContext(ctx, SchemaSQL); err != nil {

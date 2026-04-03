@@ -53,10 +53,6 @@ func TestGRPCMultiWorker(t *testing.T) {
 	RunQTest(t, qtest.MultiWorker)
 }
 
-func TestGRPCWorkerDependencyHandler(t *testing.T) {
-	RunQTest(t, qtest.WorkerDependencyHandler)
-}
-
 func TestGRPCWorkerMoveOnError(t *testing.T) {
 	RunQTest(t, qtest.WorkerMoveOnError)
 }

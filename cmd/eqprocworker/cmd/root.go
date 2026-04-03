@@ -93,7 +93,7 @@ var rootCmd = &cobra.Command{
 		defer eq.Close()
 
 		log.Printf("Starting worker for %q on inbox %q", eqaddr, inbox)
-		if err := eq.NewWorker(inbox).Run(ctx, procworker.Run); err != nil {
+		if err := eq.NewWorker(entroq.CompactHandler(eq, procworker.Run)).Run(ctx, inbox); err != nil {
 			log.Fatalf("Error executing worker: %v", err)
 		}
 	},
