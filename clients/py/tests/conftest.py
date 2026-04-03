@@ -7,9 +7,9 @@ import psycopg
 import pytest
 from testcontainers.postgres import PostgresContainer
 
-from entroq_pg import EntroQ
+from entroq.pg import EntroQ
 
-_SCHEMA_SQL = importlib.resources.files('entroq_pg').joinpath('schema.sql')
+_SCHEMA_SQL = importlib.resources.files('entroq.pg').joinpath('schema.sql')
 
 _PG_IMAGE    = 'postgres:11'
 _PG_PASSWORD = 'password'
@@ -64,6 +64,6 @@ def pg_connstr():
 def eq(pg_connstr):
     """Yield a fresh EntroQ client; truncate all test tables before each test."""
     with psycopg.connect(pg_connstr, autocommit=True) as conn:
-        conn.execute('TRUNCATE tasks')
+        conn.execute('TRUNCATE entroq.tasks')
         conn.execute('TRUNCATE test_counter')
     yield EntroQ(pg_connstr)

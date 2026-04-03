@@ -24,5 +24,12 @@ classifiers = [
 "Homepage" = "https://github.com/shiblon/entroq"
 "Bug Tracker" = "https://github.com/shiblon/entroq/issues"
 
+[project.optional-dependencies]
+dev = [
+    "psycopg[binary]",
+    "pytest",
+    "testcontainers[postgres]",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
