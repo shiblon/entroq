@@ -9,7 +9,7 @@
 //		"github.com/shiblon/entroq/backend/eqpg"
 //		"github.com/shiblon/entroq/qsvc"
 //
-//		pb "github.com/shiblon/entroq/proto"
+//		pb "github.com/shiblon/entroq/api"
 //
 //		"google.golang.org/grpc"
 //	)
@@ -49,7 +49,7 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
-	pb "github.com/shiblon/entroq/proto"
+	pb "github.com/shiblon/entroq/api"
 )
 
 const (

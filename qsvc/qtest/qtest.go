@@ -22,7 +22,7 @@ import (
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/test/bufconn"
 
-	pb "github.com/shiblon/entroq/proto"
+	pb "github.com/shiblon/entroq/api"
 	hpb "google.golang.org/grpc/health/grpc_health_v1"
 )
 

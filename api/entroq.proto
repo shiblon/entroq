@@ -1,8 +1,10 @@
 syntax = "proto3";
 
-package proto;
+package api;
 
-option go_package = ".;proto";
+import "google/api/annotations.proto";
+
+option go_package = "github.com/shiblon/entroq/api;api";
 
 // TaskID contains the ID and version of a task. Together these make a unique
 // identifier for that task.
@@ -228,16 +230,51 @@ message TimeResponse {
 
 // EntroQ is a service that allows for access to a task queue.
 service EntroQ {
-  rpc TryClaim(ClaimRequest) returns (ClaimResponse);
-  rpc Claim(ClaimRequest) returns (ClaimResponse);
-  rpc Modify(ModifyRequest) returns (ModifyResponse);
-  rpc Tasks(TasksRequest) returns (TasksResponse);
-  rpc Queues(QueuesRequest) returns (QueuesResponse);
-  rpc QueueStats(QueuesRequest) returns (QueuesResponse);
-  rpc Time(TimeRequest) returns (TimeResponse);
+  rpc TryClaim(ClaimRequest) returns (ClaimResponse) {
+    option (google.api.http) = {
+      post: "/api/v0/claim"
+      body: "*"
+    };
+  }
+  rpc Claim(ClaimRequest) returns (ClaimResponse) {
+    option (google.api.http) = {
+      post: "/api/v0/claim/wait"
+      body: "*"
+    };
+  }
+  rpc Modify(ModifyRequest) returns (ModifyResponse) {
+    option (google.api.http) = {
+      post: "/api/v0/modify"
+      body: "*"
+    };
+  }
+  rpc Tasks(TasksRequest) returns (TasksResponse) {
+    option (google.api.http) = {
+      get: "/api/v0/queues/{queue}/tasks"
+    };
+  }
+  rpc Queues(QueuesRequest) returns (QueuesResponse) {
+    option (google.api.http) = {
+      get: "/api/v0/queues"
+    };
+  }
+  rpc QueueStats(QueuesRequest) returns (QueuesResponse) {
+    option (google.api.http) = {
+      get: "/api/v0/queues/stats"
+    };
+  }
+  rpc Time(TimeRequest) returns (TimeResponse) {
+    option (google.api.http) = {
+      get: "/api/v0/time"
+    };
+  }
 
   // This is set to stream TasksResponse instead of just sending all tasks in a
   // single one. Typically this will have one task per response, but it is best
   // for the client to consume however many there are.
-  rpc StreamTasks(TasksRequest) returns (stream TasksResponse);
+  rpc StreamTasks(TasksRequest) returns (stream TasksResponse) {
+    option (google.api.http) = {
+      get: "/api/v0/queues/{queue}/tasks/stream"
+    };
+  }
 }

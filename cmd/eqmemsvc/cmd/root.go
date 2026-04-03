@@ -15,12 +15,13 @@ import (
 	"github.com/shiblon/entroq/backend/eqmem"
 	"github.com/shiblon/entroq/pkg/authz/opahttp"
 	"github.com/shiblon/entroq/qsvc"
+	"github.com/shiblon/entroq/qsvcjson"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 
-	pb "github.com/shiblon/entroq/proto"
+	pb "github.com/shiblon/entroq/api"
 	hpb "google.golang.org/grpc/health/grpc_health_v1"
 )
 
@@ -143,6 +144,13 @@ var rootCmd = &cobra.Command{
 
 		go func() {
 			http.Handle("/metrics", promhttp.Handler())
+			
+			path, handler, err := qsvcjson.New(svc)
+			if err != nil {
+				log.Fatalf("failed to create JSON/Connect handler: %v", err)
+			}
+			http.Handle(path, handler)
+			
 			log.Fatalf("http and metric server: %v", http.ListenAndServe(fmt.Sprintf(":%d", flags.httpPort), nil))
 		}()
 
