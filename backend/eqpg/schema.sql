@@ -37,8 +37,7 @@ ALTER TABLE IF EXISTS tasks ADD  CONSTRAINT         claimant_max_len CHECK (clai
 DROP TYPE IF EXISTS entroq_task_id;
 DROP TYPE IF EXISTS entroq_task_arg;
 
--- Drop old UUID-typed stored procedures so they can be recreated with text
--- parameters and return types. IF EXISTS makes these safe on a fresh database.
+-- Drop any stored procedures incompatible with current table schema. Recreating them is non-disruptive.
 DROP FUNCTION IF EXISTS entroq_try_claim_bucket(text, uuid, interval, timestamptz, integer, integer);
 DROP FUNCTION IF EXISTS entroq_try_claim_one(text, uuid, interval);
 DROP FUNCTION IF EXISTS entroq_try_claim(text[], uuid, interval);
@@ -47,7 +46,7 @@ DROP FUNCTION IF EXISTS entroq_modify(uuid, jsonb, jsonb, jsonb, jsonb);
 DROP FUNCTION IF EXISTS entroq_tasks(text, integer, boolean);
 
 -- Core table. id and claimant are TEXT with CHECK constraints limiting them
--- to 64 characters -- long enough for UUIDs, ULIDs, and similar schemes.
+-- to 64 characters -- long enough for UUIDs, ULIDs, etc.
 CREATE TABLE IF NOT EXISTS tasks (
     id       TEXT                     PRIMARY KEY NOT NULL CHECK (length(id) <= 64),
     version  INTEGER                  NOT NULL DEFAULT 0,
