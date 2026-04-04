@@ -39,8 +39,9 @@ type pgOptions struct {
 	user     string
 	password string
 
-	attempts int
-	nw       entroq.NotifyWaiter
+	attempts   int
+	initSchema bool
+	nw         entroq.NotifyWaiter
 
 	sslMode SSLMode
 
@@ -106,6 +107,17 @@ func WithConnectAttempts(num int) PGOpt {
 	}
 	return func(opts *pgOptions) {
 		opts.attempts = num
+	}
+}
+
+// WithInitSchema causes Open to initialize the database schema before opening
+// the backend. Equivalent to calling InitSchema separately, but convenient for
+// tests and single-binary deployments where a separate init step is unwanted.
+// The schema DDL is idempotent, so this is safe to use on an already-initialized
+// database.
+func WithInitSchema() PGOpt {
+	return func(opts *pgOptions) {
+		opts.initSchema = true
 	}
 }
 
@@ -201,6 +213,11 @@ func Open(ctx context.Context, hostPort string, opts ...PGOpt) (*EQPG, error) {
 
 	for i := 0; i < options.attempts; i++ {
 		if err = db.PingContext(ctx); err == nil {
+			if options.initSchema {
+				if err := InitSchema(ctx, db); err != nil {
+					return nil, fmt.Errorf("pg open init schema: %w", err)
+				}
+			}
 			return New(ctx, db, options.nw)
 		}
 		if i < options.attempts-1 {
