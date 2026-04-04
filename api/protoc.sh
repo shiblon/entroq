@@ -14,4 +14,5 @@ docker run --rm -v "$PWD":/src "$imgname" \
     --go_out=/src --go_opt=paths=source_relative \
     --go-grpc_out=/src --go-grpc_opt=paths=source_relative \
     --connect-go_out=/src --connect-go_opt=paths=source_relative \
+    --openapi_out=/src \
     /src/*.proto"

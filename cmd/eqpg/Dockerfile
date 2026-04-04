@@ -1,5 +1,5 @@
-# Build inside a Go container.
-FROM golang:1.25-alpine3.23 AS builder
+# 1. Build inside a modern Go container.
+FROM golang:1.24-bookworm AS builder
 
 ENV CGO_ENABLED=0
 
@@ -10,16 +10,16 @@ RUN go mod download -x
 COPY . .
 RUN go build -o /bin/eqpg ./cmd/eqpg
 
-# Switch to a smaller runtime container.
-FROM alpine:3.23
+# 2. Switch to a secure, minimal runtime container.
+# The ":debug" version includes a busybox shell for easier "docker exec" debugging.
+FROM gcr.io/distroless/static-debian12:debug
 
-RUN apk --no-cache add ca-certificates openssl curl bash jq
-RUN mkdir -p /data/entroq
+# Note: Distroless images already include CA bundles and common timezone data.
+# The distroless "nonroot" user ID is 65532.
+# However, the "static" image doesn't define a default USER, so we can set it.
+USER 65532:65532
 
 COPY --from=builder /bin/eqpg /bin/eqpg
-
-RUN adduser -S -D -H -h /src -u 100 appuser
-USER appuser
 
 # gRPC endpoint
 EXPOSE 37706

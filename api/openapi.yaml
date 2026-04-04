@@ -1,0 +1,523 @@
+# Generated with protoc-gen-openapi
+# https://github.com/google/gnostic/tree/master/cmd/protoc-gen-openapi
+
+openapi: 3.0.3
+info:
+    title: EntroQ API
+    description: EntroQ is a service that allows for access to a task queue.
+    version: 0.0.1
+paths:
+    /api/v0/claim:
+        post:
+            tags:
+                - EntroQ
+            operationId: EntroQ_TryClaim
+            requestBody:
+                content:
+                    application/json:
+                        schema:
+                            $ref: '#/components/schemas/ClaimRequest'
+                required: true
+            responses:
+                "200":
+                    description: OK
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ClaimResponse'
+                default:
+                    description: Default error response
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/Status'
+    /api/v0/claim/wait:
+        post:
+            tags:
+                - EntroQ
+            operationId: EntroQ_Claim
+            requestBody:
+                content:
+                    application/json:
+                        schema:
+                            $ref: '#/components/schemas/ClaimRequest'
+                required: true
+            responses:
+                "200":
+                    description: OK
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ClaimResponse'
+                default:
+                    description: Default error response
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/Status'
+    /api/v0/modify:
+        post:
+            tags:
+                - EntroQ
+            operationId: EntroQ_Modify
+            requestBody:
+                content:
+                    application/json:
+                        schema:
+                            $ref: '#/components/schemas/ModifyRequest'
+                required: true
+            responses:
+                "200":
+                    description: OK
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ModifyResponse'
+                default:
+                    description: Default error response
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/Status'
+    /api/v0/queues:
+        get:
+            tags:
+                - EntroQ
+            operationId: EntroQ_Queues
+            parameters:
+                - name: matchPrefix
+                  in: query
+                  schema:
+                    type: array
+                    items:
+                        type: string
+                - name: matchExact
+                  in: query
+                  schema:
+                    type: array
+                    items:
+                        type: string
+                - name: limit
+                  in: query
+                  schema:
+                    type: integer
+                    format: int32
+            responses:
+                "200":
+                    description: OK
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/QueuesResponse'
+                default:
+                    description: Default error response
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/Status'
+    /api/v0/queues/stats:
+        get:
+            tags:
+                - EntroQ
+            operationId: EntroQ_QueueStats
+            parameters:
+                - name: matchPrefix
+                  in: query
+                  schema:
+                    type: array
+                    items:
+                        type: string
+                - name: matchExact
+                  in: query
+                  schema:
+                    type: array
+                    items:
+                        type: string
+                - name: limit
+                  in: query
+                  schema:
+                    type: integer
+                    format: int32
+            responses:
+                "200":
+                    description: OK
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/QueuesResponse'
+                default:
+                    description: Default error response
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/Status'
+    /api/v0/queues/{queue}/tasks:
+        get:
+            tags:
+                - EntroQ
+            operationId: EntroQ_Tasks
+            parameters:
+                - name: queue
+                  in: path
+                  required: true
+                  schema:
+                    type: string
+                - name: claimantId
+                  in: query
+                  schema:
+                    type: string
+                - name: limit
+                  in: query
+                  schema:
+                    type: integer
+                    format: int32
+                - name: taskId
+                  in: query
+                  description: |-
+                    If IDs are specified here, then any task which matches any of these IDs,
+                     and simultaneously fits other specifications, will be returned.
+                     If empty, all tasks that fit other specifications will be returned.
+                  schema:
+                    type: array
+                    items:
+                        type: string
+                - name: omitValues
+                  in: query
+                  description: If omit_values is true, then only metadata will be returned, no actual values.
+                  schema:
+                    type: boolean
+            responses:
+                "200":
+                    description: OK
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/TasksResponse'
+                default:
+                    description: Default error response
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/Status'
+    /api/v0/queues/{queue}/tasks/stream:
+        get:
+            tags:
+                - EntroQ
+            description: |-
+                This is set to stream TasksResponse instead of just sending all tasks in a
+                 single one. Typically this will have one task per response, but it is best
+                 for the client to consume however many there are.
+            operationId: EntroQ_StreamTasks
+            parameters:
+                - name: queue
+                  in: path
+                  required: true
+                  schema:
+                    type: string
+                - name: claimantId
+                  in: query
+                  schema:
+                    type: string
+                - name: limit
+                  in: query
+                  schema:
+                    type: integer
+                    format: int32
+                - name: taskId
+                  in: query
+                  description: |-
+                    If IDs are specified here, then any task which matches any of these IDs,
+                     and simultaneously fits other specifications, will be returned.
+                     If empty, all tasks that fit other specifications will be returned.
+                  schema:
+                    type: array
+                    items:
+                        type: string
+                - name: omitValues
+                  in: query
+                  description: If omit_values is true, then only metadata will be returned, no actual values.
+                  schema:
+                    type: boolean
+            responses:
+                "200":
+                    description: OK
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/TasksResponse'
+                default:
+                    description: Default error response
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/Status'
+    /api/v0/time:
+        get:
+            tags:
+                - EntroQ
+            operationId: EntroQ_Time
+            responses:
+                "200":
+                    description: OK
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/TimeResponse'
+                default:
+                    description: Default error response
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/Status'
+components:
+    schemas:
+        ClaimRequest:
+            type: object
+            properties:
+                claimantId:
+                    type: string
+                    description: The party requesting a task.
+                queues:
+                    type: array
+                    items:
+                        type: string
+                    description: The queue names to claim a task from.
+                durationMs:
+                    type: string
+                    description: The duration of the claim, if/once successful.
+                pollMs:
+                    type: string
+                    description: How long to sleep for a claim (not try claim) between polls. The sleep may be interruptible depending on the backend implementation.
+            description: |-
+                ClaimRequest is sent to attempt to claim a task from a queue. The claimant ID
+                 should be unique to the requesting worker (e.g., if multiple workers are in
+                 the same process, they should all have different claimant IDs assigned).
+        ClaimResponse:
+            type: object
+            properties:
+                task:
+                    $ref: '#/components/schemas/Task'
+            description: |-
+                ClaimResponse is returned when a claim is fulfilled or becomes obviously impossible.
+
+                 For TryClaim calls, if no task is available, the task will be empty and the
+                 status code sent to the client will be OK.
+
+                 For Claim calls, the lack of a task is an error, usually a timeout or
+                 cancelation.
+        GoogleProtobufAny:
+            type: object
+            properties:
+                '@type':
+                    type: string
+                    description: The type of the serialized message.
+            additionalProperties: true
+            description: Contains an arbitrary serialized message along with a @type that describes the type of the serialized message.
+        ModifyRequest:
+            type: object
+            properties:
+                claimantId:
+                    type: string
+                inserts:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/TaskData'
+                changes:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/TaskChange'
+                deletes:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/TaskID'
+                depends:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/TaskID'
+            description: |-
+                ModifyRequest sends a request to modify a set of tasks with given
+                 dependencies. It is performed in a transaction, in which either all
+                 suggested modifications succeed and all dependencies are satisfied, or
+                 nothing is committed at all. A failure due to dependencies (in any
+                 of changes, deletes, or inserts) will be permanent.
+
+                 All successful changes will cause the requester to become the claimant.
+        ModifyResponse:
+            type: object
+            properties:
+                inserted:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/Task'
+                changed:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/Task'
+            description: |-
+                ModifyResponse returns inserted and updated tasks when successful.
+                 A dependency error (which is permanent) comes through as gRPC's NOT_FOUND code.
+        QueueStats:
+            type: object
+            properties:
+                name:
+                    type: string
+                numTasks:
+                    type: integer
+                    format: int32
+                numClaimed:
+                    type: integer
+                    format: int32
+                numAvailable:
+                    type: integer
+                    format: int32
+                maxClaims:
+                    type: integer
+                    description: |-
+                        Maximum claims value for any task in the queue
+                         (can help detect tasks that are causing crashes, etc.)
+                    format: int32
+            description: QueueStats contains the name of the queue and the number of tasks within it.
+        QueuesResponse:
+            type: object
+            properties:
+                queues:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/QueueStats'
+            description: QueuesResponse contains the requested list of queue statistics.
+        Status:
+            type: object
+            properties:
+                code:
+                    type: integer
+                    description: The status code, which should be an enum value of [google.rpc.Code][google.rpc.Code].
+                    format: int32
+                message:
+                    type: string
+                    description: A developer-facing error message, which should be in English. Any user-facing error message should be localized and sent in the [google.rpc.Status.details][google.rpc.Status.details] field, or localized by the client.
+                details:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/GoogleProtobufAny'
+                    description: A list of messages that carry the error details.  There is a common set of message types for APIs to use.
+            description: 'The `Status` type defines a logical error model that is suitable for different programming environments, including REST APIs and RPC APIs. It is used by [gRPC](https://github.com/grpc). Each `Status` message contains three pieces of data: error code, error message, and error details. You can find out more about this error model and how to work with it in the [API Design Guide](https://cloud.google.com/apis/design/errors).'
+        Task:
+            type: object
+            properties:
+                queue:
+                    type: string
+                    description: The name of the queue for this task.
+                id:
+                    type: string
+                version:
+                    type: integer
+                    format: int32
+                atMs:
+                    type: string
+                    description: The epoch time in millis when this task becomes available.
+                claimantId:
+                    type: string
+                    description: The UUID representing the claimant (owner) for this task.
+                value:
+                    type: string
+                    description: The task's opaque payload.
+                    format: bytes
+                createdMs:
+                    type: string
+                    description: Epoch times in millis for creation and update of this task.
+                modifiedMs:
+                    type: string
+                claims:
+                    type: integer
+                    description: The number of times this has been successfully claimed.
+                    format: int32
+                attempt:
+                    type: integer
+                    description: |-
+                        Attempt and Err are used to indicate a "retryable error" with a number of
+                         times attempted. This is used by the worker, and can be changed during
+                         task modification.
+                    format: int32
+                err:
+                    type: string
+            description: Task is a complete task object, containing IDs, data, and metadata.
+        TaskChange:
+            type: object
+            properties:
+                oldId:
+                    $ref: '#/components/schemas/TaskID'
+                newData:
+                    $ref: '#/components/schemas/TaskData'
+            description: |-
+                TaskChange identifies a task by ID and specifies the new data it should contain.
+                 All fields should be filled in. Empty fields result in deleting data from that field.
+        TaskData:
+            type: object
+            properties:
+                queue:
+                    type: string
+                    description: The name of the queue for this task.
+                atMs:
+                    type: string
+                    description: The epoch time in millis when this task becomes available.
+                value:
+                    type: string
+                    description: The task's opaque payload.
+                    format: bytes
+                id:
+                    type: string
+                    description: |-
+                        An optional ID (UUID) for an inserted task to use.
+                         Default is for the backend to assign one, and that is sufficient for many
+                         cases. If you desire to make a database entry that *references* a task,
+                         however, in that case it can make sense to specify an explicit task ID for
+                         insertion (allowing "consume -> db update -> modify" worker cycles to
+                         safely update a database entry that references to-be-inserted tasks).
+                attempt:
+                    type: integer
+                    description: |-
+                        Attempt and Err are used to indicate a "retryable error" with a number of
+                         times attempted. This is used by the worker, and can be changed during
+                         task modification.
+                    format: int32
+                err:
+                    type: string
+            description: TaskData contains only the data portion of a task. Useful for insertion and for modifying tasks.
+        TaskID:
+            type: object
+            properties:
+                id:
+                    type: string
+                version:
+                    type: integer
+                    format: int32
+                queue:
+                    type: string
+                    description: |-
+                        Optional queue name. This usually comes from the task itself, so it will
+                         be present in most use cases. There are some cases where it will be empty,
+                         like when using admin tools with special privileges. Usually you should
+                         set this, as Authorization policies will be looking for it to ensure that
+                         you are allowed to change, delete, or depend on this ID based on the queue
+                         name.
+            description: |-
+                TaskID contains the ID and version of a task. Together these make a unique
+                 identifier for that task.
+        TasksResponse:
+            type: object
+            properties:
+                tasks:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/Task'
+            description: TasksReqponse contains the tasks requested.
+        TimeResponse:
+            type: object
+            properties:
+                timeMs:
+                    type: string
+            description: |-
+                TimeResponse contains the server's idea of the current time in milliseconds
+                 since the epoch.
+tags:
+    - name: EntroQ
