@@ -40,6 +40,12 @@ func StoredSchemaVersion(ctx context.Context, db *sql.DB) (string, error) {
 	return v, nil
 }
 
+// InitSchema applies the full idempotent EntroQ DDL to this backend's database.
+// Convenience wrapper around the package-level InitSchema.
+func (b *EQPG) InitSchema(ctx context.Context) error {
+	return InitSchema(ctx, b.DB)
+}
+
 // initDB checks the stored schema version and either confirms compatibility or
 // returns an actionable error.
 //

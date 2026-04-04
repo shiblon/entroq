@@ -38,6 +38,17 @@ func TestMain(m *testing.M) {
 		log.Fatalf("Postgres endpoint: %v", err)
 	}
 
+	backend, err := Open(ctx, pgHostPort,
+		WithDB("postgres"),
+		WithUsername("postgres"),
+		WithPassword("password"),
+		WithConnectAttempts(10),
+		WithInitSchema())
+	if err != nil {
+		log.Fatalf("Postgres open: %v", err)
+	}
+	backend.Close()
+
 	os.Exit(m.Run())
 }
 
@@ -88,27 +99,27 @@ func Example() {
 		cancel()
 	}()
 
-	// Start a worker, process the tasks.
-	worker := NewPGWorker(client, "queue 1", "queue 2")
-	if err := worker.Run(ctx, func(ctx context.Context, task *entroq.Task, finalize entroq.FinalizeRenew) error {
-		// Do the work
-		fmt.Println(string(task.Value))
-
-		// Stop renewal, get final task version.
-		renewed := finalize()
-
-		// Delete the task to "commit" the work.
-		// At this point, you can also call directly into eqpg.ModifyOpts and
-		// hand it a function to call that has a transaction. That transaction
-		// is what Modify uses to commit task changes, and you can do other
-		// database operations in it for fully atomic commits. This is a good
-		// pattern for updating state data while handling tasks, to ensure that
-		// it all happens at once.
-		if _, _, err := client.Modify(ctx, renewed.AsDeletion()); err != nil {
-			return fmt.Errorf("Failed to delete/commit task: %w", err)
-		}
-		return nil
-	}); err != nil {
+	worker := entroq.NewWorker(client, entroq.FuncHandler(
+		func(ctx context.Context, claimed *entroq.Task) error {
+			// Do work with the task.
+			fmt.Println(string(claimed.Value))
+			return nil
+		},
+		func(ctx context.Context, final *entroq.Task) error {
+			// Delete the task to "commit" the work.
+			// At this point, you can also call directly into eqpg.ModifyOpts and
+			// hand it a function to call that has a transaction. That transaction
+			// is what Modify uses to commit task changes, and you can do other
+			// database operations in it for fully atomic commits. This is a good
+			// pattern for updating state data while handling tasks, to ensure that
+			// it all happens at once.
+			if _, _, err := client.Modify(ctx, final.AsDeletion()); err != nil {
+				return fmt.Errorf("Failed to delete/commit task: %w", err)
+			}
+			return nil
+		},
+	))
+	if err := worker.Run(ctx, "queue 1", "queue 2"); err != nil {
 		log.Fatal(err)
 	}
 
