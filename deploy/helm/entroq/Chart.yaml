@@ -1,0 +1,6 @@
+apiVersion: v2
+name: entroq
+description: A task queue with strong competing-consumer semantics and transactional updates.
+type: application
+version: 0.1.0
+appVersion: "v0.4.4"

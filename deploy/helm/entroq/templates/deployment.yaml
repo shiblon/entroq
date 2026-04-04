@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "entroq.fullname" . }}
+  labels:
+    {{- include "entroq.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "entroq.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "entroq.selectorLabels" . | nindent 8 }}
+    spec:
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+            - name: http
+              containerPort: {{ .Values.service.httpPort }}
+              protocol: TCP
+          env:
+            {{- if eq .Values.backend "pg" }}
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.postgresql.existingSecret | default (include "entroq.fullname" .) }}
+                  key: {{ .Values.postgresql.secretKey | default "password" }}
+            {{- end }}
+          command:
+            {{- if eq .Values.backend "pg" }}
+            - "/bin/eqpg"
+            - "serve"
+            - "--dbaddr={{ .Values.postgresql.host }}:{{ .Values.postgresql.port }}"
+            - "--dbname={{ .Values.postgresql.database }}"
+            - "--dbuser={{ .Values.postgresql.username }}"
+            {{- else }}
+            - "/bin/eqmemsvc"
+            - "--journal={{ .Values.mem.journal }}"
+            - "--mkdir={{ .Values.mem.mkdir }}"
+            - "--periodic_snapshot={{ .Values.mem.periodicSnapshot }}"
+            - "--journal_cleanup={{ .Values.mem.journalCleanup }}"
+            {{- end }}
+            - "--port={{ .Values.service.port }}"
+            - "--http_port={{ .Values.service.httpPort }}"
+            - "--authz={{ .Values.authz.strategy }}"
+            {{- if ne .Values.authz.strategy "none" }}
+            - "--opa_url={{ .Values.authz.opaUrl }}"
+            - "--opa_path={{ .Values.authz.opaPath }}"
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          {{- if eq .Values.backend "mem" }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ dir .Values.mem.journal }}
+          {{- end }}
+      {{- if eq .Values.backend "mem" }}
+      volumes:
+        - name: data
+          emptyDir: {}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

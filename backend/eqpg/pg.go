@@ -137,22 +137,11 @@ func WithNotifyWaiter(nw entroq.NotifyWaiter) PGOpt {
 // Open opens a postgres backend with the given host/port and options. This is
 // useful if you want to get at eqpg-specific backend options like
 // in-transaction database updates.
-func Open(ctx context.Context, hostPort string, opts ...PGOpt) (*EQPG, error) {
-	// Set up some defaults, then apply given options.
-	options := &pgOptions{
-		db:       "postgres",
-		user:     "postgres",
-		password: "password",
-		attempts: 1,
-
-		sslMode: SSLDisable,
-	}
-	for _, o := range opts {
-		o(options)
-	}
+// buildConnStr constructs a libpq connection string from a host:port and options.
+func buildConnStr(hostPort string, options *pgOptions) (string, error) {
 	u, err := url.Parse("postgres://" + hostPort)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse hostport %q: %w", hostPort, err)
+		return "", fmt.Errorf("failed to parse hostport %q: %w", hostPort, err)
 	}
 	host := u.Hostname()
 	port := u.Port()
@@ -160,7 +149,6 @@ func Open(ctx context.Context, hostPort string, opts ...PGOpt) (*EQPG, error) {
 	if port != "" && host == "" {
 		host = "::"
 	}
-
 	if host != "" && port == "" {
 		port = "5432"
 	}
@@ -169,40 +157,75 @@ func Open(ctx context.Context, hostPort string, opts ...PGOpt) (*EQPG, error) {
 		"sslmode=" + string(options.sslMode),
 		"database=" + escp(options.db),
 	}
-
 	if options.user != "" {
 		params = append(params, fmt.Sprintf("user=%s", escp(options.user)))
 	}
-
 	if options.password != "" {
 		params = append(params, fmt.Sprintf("password=%s", escp(options.password)))
 	}
-
 	if host != "" {
 		params = append(params, fmt.Sprintf("host=%s", escp(host)))
 	}
-
 	if port != "" {
 		params = append(params, fmt.Sprintf("port=%s", port))
 	}
-
 	if options.sslClientKeyFile != "" {
 		params = append(params, "sslkey="+url.QueryEscape(options.sslClientKeyFile))
 	}
-
 	if options.sslClientCertFile != "" {
 		params = append(params, "sslcert="+url.QueryEscape(options.sslClientCertFile))
 	}
-
 	if options.sslServerCAFile != "" {
 		params = append(params, "sslrootcert="+url.QueryEscape(options.sslServerCAFile))
 	}
-
 	params = append(params, "search_path=entroq,public")
+	return strings.Join(params, " "), nil
+}
 
-	connStr := strings.Join(params, " ")
+// defaultOptions returns a pgOptions with the standard defaults applied.
+func defaultOptions(opts []PGOpt) *pgOptions {
+	options := &pgOptions{
+		db:       "postgres",
+		user:     "postgres",
+		password: "password",
+		attempts: 1,
+		sslMode:  SSLDisable,
+	}
+	for _, o := range opts {
+		o(options)
+	}
+	return options
+}
 
+// OpenDB opens a *sql.DB using the given connection parameters without
+// performing any schema version check. Use this when the schema may not yet
+// exist or may be in a legacy state -- e.g. for schema init, upgrade, or
+// version commands. Open is the right choice for normal service use.
+func OpenDB(hostPort string, opts ...PGOpt) (*sql.DB, error) {
+	options := defaultOptions(opts)
+	connStr, err := buildConnStr(hostPort, options)
+	if err != nil {
+		return nil, err
+	}
 	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		return nil, fmt.Errorf("open db: %w", err)
+	}
+	return db, nil
+}
+
+// Open opens a fully operational *EQPG backend, verifying that the database
+// schema is present and at the expected version. Fails loudly if the schema is
+// uninitialized or at the wrong version; run "eqpg schema init" or
+// "eqpg schema upgrade" first.
+func Open(ctx context.Context, hostPort string, opts ...PGOpt) (*EQPG, error) {
+	options := defaultOptions(opts)
+	connStr, err := buildConnStr(hostPort, options)
+	if err != nil {
+		return nil, err
+	}
+
+	db, err := OpenDB(hostPort, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open postgres DB: %w", err)
 	}

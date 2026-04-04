@@ -33,6 +33,7 @@ var (
 	authzStrategy string
 	opaURL        string
 	opaPath       string
+	disableNotify bool
 )
 
 var serveCmd = &cobra.Command{
@@ -56,12 +57,18 @@ var serveCmd = &cobra.Command{
 
 		resolveDBFlags()
 
-		opener := eqpg.Opener(dbAddr,
+		openerOptions := []eqpg.PGOpt{
 			eqpg.WithDB(dbName),
 			eqpg.WithUsername(dbUser),
 			eqpg.WithPassword(dbPass),
 			eqpg.WithConnectAttempts(attempts),
-		)
+		}
+
+		if disableNotify {
+			openerOptions = append(openerOptions, eqpg.WithNotifyWaiter(nil))
+		}
+
+		opener := eqpg.Opener(dbAddr, openerOptions...)
 
 		svc, err := qsvc.New(ctx, opener, authzOpt)
 		if err != nil {
@@ -106,6 +113,7 @@ func init() {
 	flags.StringVar(&authzStrategy, "authz", "none", "Authorization strategy: none, opahttp.")
 	flags.StringVar(&opaURL, "opa_url", "", fmt.Sprintf("OPA base URL (scheme://host:port). Default: %s.", opahttp.DefaultHostURL))
 	flags.StringVar(&opaPath, "opa_path", "", fmt.Sprintf("OPA API path. Default: %s.", opahttp.DefaultAPIPath))
+	flags.BoolVar(&disableNotify, "disable_notify_waiter", false, "Disable PostgreSQL LISTEN/NOTIFY completely. Required when using PgBouncer in transaction mode.")
 
 	rootCmd.AddCommand(serveCmd)
 }

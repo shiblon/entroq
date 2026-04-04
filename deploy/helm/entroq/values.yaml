@@ -1,0 +1,54 @@
+# Default values for entroq.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+replicaCount: 1
+
+image:
+  repository: shiblon/entroq
+  pullPolicy: IfNotPresent
+  # Overrides the image tag whose default is the chart appVersion.
+  tag: ""
+
+# Backend type: "pg" or "mem"
+backend: pg
+
+# PostgreSQL configuration (only used if backend is "pg")
+postgresql:
+  host: "postgres-host"
+  port: 5432
+  database: "entroq"
+  username: "entroq"
+  # existingSecret: "entroq-db-secret"
+  # secretKey: "password"
+  password: "entroq" # Better to use existingSecret in production.
+
+# Memory backend configuration (only used if backend is "mem")
+mem:
+  journal: "/data/entroq/journal"
+  mkdir: true
+  periodicSnapshot: "1h"
+  journalCleanup: false
+
+# Authorization configuration
+authz:
+  strategy: "none" # none or opahttp
+  opaUrl: ""
+  opaPath: ""
+
+service:
+  type: ClusterIP
+  port: 37706
+  httpPort: 9100
+
+resources: {}
+  # limits:
+  #   cpu: 100m
+  #   memory: 128Mi
+  # requests:
+  #   cpu: 100m
+  #   memory: 128Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

@@ -1,5 +1,5 @@
-# Build inside a Go container.
-FROM golang:1.25-alpine3.23 AS builder
+# 1. Build inside a Go container.
+FROM golang:1.24-bookworm AS builder
 
 ENV CGO_ENABLED=0
 
@@ -10,16 +10,18 @@ RUN go mod download -x
 COPY . .
 RUN go build -o /bin/eqmemsvc ./cmd/eqmemsvc
 
-# Switch to a smaller runtime container.
-FROM alpine:3.23
+# Create data directory for persistency with correct non-root permissions
+RUN mkdir -p /data/entroq/journal && chown -R 65532:65532 /data
 
-RUN apk --no-cache add ca-certificates openssl curl bash jq
-RUN mkdir -p /data/entroq/journal && chmod -R a+rwx /data/entroq
+# 2. Switch to a secure, minimal runtime container.
+FROM gcr.io/distroless/static-debian12:debug
 
+# Non-root user ID 65532:65532 (default nonroot)
+USER 65532:65532
+
+# Copy data directory with correct ownership
+COPY --from=builder --chown=65532:65532 /data /data
 COPY --from=builder /bin/eqmemsvc /bin/eqmemsvc
-
-RUN adduser -S -D -H -h /src -u 100 appuser
-USER appuser
 
 # Journal location
 VOLUME /data/entroq
