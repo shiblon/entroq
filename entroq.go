@@ -623,6 +623,11 @@ func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (inserted []*
 			ins.ID = c.GenID()
 		}
 	}
+	for _, opt := range mod.Options() {
+		if err := opt.IsModifyBackend(c.backend); err != nil {
+			return nil, nil, fmt.Errorf("modify option incompatible with backend %T: %w", c.backend, err)
+		}
+	}
 	for {
 		ins, chg, err := c.backend.Modify(ctx, mod)
 		if err == nil {
@@ -711,6 +716,25 @@ func InsertingInto(q string, insertArgs ...InsertArg) ModifyArg {
 			arg(m, data)
 		}
 		m.Inserts = append(m.Inserts, data)
+	}
+}
+
+// ModifyOption is an option that can be passed through to a backend's Modify
+// implementation. Backend-specific options use IsModifyBackend to validate that
+// the correct backend is in use; generic options return nil unconditionally.
+type ModifyOption interface {
+	// IsModifyBackend returns nil if the given backend supports this option, or a
+	// descriptive error if not. Returning non-nil causes Modify to fail before
+	// the backend is called. Generic options always return nil.
+	IsModifyBackend(Backend) error
+}
+
+// WithModifyOption allows an option the backend understands to be added.
+// These are accessible in the backend if additional modification settings
+// are needed (example: modifying inside an SQL transaction).
+func WithModifyOption(opt ModifyOption) ModifyArg {
+	return func(m *Modification) {
+		m.options = append(m.options, opt)
 	}
 }
 
@@ -966,7 +990,8 @@ func WithModification(src *Modification) ModifyArg {
 
 // Modification contains all of the information for a single batch modification in the task store.
 type Modification struct {
-	now time.Time
+	now     time.Time
+	options []ModifyOption
 
 	Claimant string `json:"claimant"`
 
@@ -1006,6 +1031,12 @@ func NewModification(claimant string, modArgs ...ModifyArg) *Modification {
 		arg(m)
 	}
 	return m
+}
+
+// Options returns a slice of ModifyOption, which backends can use to
+// change how an individual call to Modify operates.
+func (m *Modification) Options() []ModifyOption {
+	return m.options
 }
 
 // modDependencies returns a dependency map for all modified dependencies

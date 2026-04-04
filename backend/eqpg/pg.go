@@ -457,43 +457,45 @@ func isRetryable(err error) bool {
 
 // modifyConfig holds options for how Modify should execute.
 type modifyConfig struct {
-	runInTx func(*sql.Tx) error
+	runInTx func(context.Context, *sql.Tx) error
 }
 
-// ModifyOption is an option for altering how Modify works for the postgres
-// database. For example, you could specify a specific transaction to use.
-type ModifyOption func(*modifyConfig)
+// modOpt is a private type for options that only this backend understands.
+// It satisfies the entroq.ModifyOption interface so that it can be passed
+// there.
+type modOpt func(c *modifyConfig)
 
-// WithSQLTx specifies a transaction to use for the modification. If the
-// transaction is not nil, the modification is executed within it, and the
-// transaction is committed if the modification succeeds, or rolled back if it
-// fails. If the transaction is nil, the modification is executed in a new
-// transaction.
+// IsModifyBackend returns nil if b is an *EQPG, or a descriptive error otherwise.
+// Its presence also causes modOpt to satisfy the entroq.ModifyOption interface.
+func (modOpt) IsModifyBackend(b entroq.Backend) error {
+	if _, ok := b.(*EQPG); !ok {
+		return fmt.Errorf("requires a PostgreSQL (*eqpg.EQPG) backend, got %T", b)
+	}
+	return nil
+}
+
+// RunningInTx returns an entroq.ModifyOption that signals to this backend
+// to run f inside the Modify transaction.
 //
-// Note: the callback is responsible for managing any rows returned, including
-// closing them before the callback completes.
-func RunningInTx(f func(*sql.Tx) error) ModifyOption {
-	return func(cfg *modifyConfig) {
-		cfg.runInTx = f
-	}
-}
-
-// ModifyOpts is a helper for running a modification with special pg-specific options, like a callback that runs inside a transaction.
-func (b *EQPG) ModifyOpts(ctx context.Context, mod *entroq.Modification, opts ...ModifyOption) (inserted, changed []*entroq.Task, err error) {
-	options := &modifyConfig{}
-	for _, o := range opts {
-		o(options)
-	}
-	return b.modifyHandlingRetriable(ctx, func() (inserted, changed []*entroq.Task, err error) {
-		return b.modify(ctx, mod, options)
+// Important: the callback is responsible for managing any rows returned,
+// including closing them before the callback completes.
+func RunningInTx(f func(context.Context, *sql.Tx) error) entroq.ModifyOption {
+	return modOpt(func(c *modifyConfig) {
+		c.runInTx = f
 	})
 }
 
 // Modify attempts to apply an atomic modification to the task store. Either
 // all succeeds or all fails.
 func (b *EQPG) Modify(ctx context.Context, mod *entroq.Modification) (inserted, changed []*entroq.Task, err error) {
+	options := &modifyConfig{}
+	for _, o := range mod.Options() {
+		if pgOpt, ok := o.(modOpt); ok {
+			pgOpt(options)
+		}
+	}
 	return b.modifyHandlingRetriable(ctx, func() (inserted, changed []*entroq.Task, err error) {
-		return b.modify(ctx, mod, nil)
+		return b.modify(ctx, mod, options)
 	})
 }
 
@@ -569,7 +571,7 @@ func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *mo
 
 	// Run caller's DB work first, inside the same transaction, if specified.
 	if options.runInTx != nil {
-		if err := options.runInTx(tx); err != nil {
+		if err := options.runInTx(ctx, tx); err != nil {
 			return nil, nil, fmt.Errorf("pg modify caller tx work: %w", err)
 		}
 	}
