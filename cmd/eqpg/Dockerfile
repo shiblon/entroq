@@ -8,7 +8,7 @@ COPY go.mod go.sum ./
 RUN go mod download -x
 
 COPY . .
-RUN go build -o /bin/eqpgsvc ./cmd/eqpgsvc
+RUN go build -o /bin/eqpg ./cmd/eqpg
 
 # Switch to a smaller runtime container.
 FROM alpine:3.23
@@ -16,7 +16,7 @@ FROM alpine:3.23
 RUN apk --no-cache add ca-certificates openssl curl bash jq
 RUN mkdir -p /data/entroq
 
-COPY --from=builder /bin/eqpgsvc /bin/eqpgsvc
+COPY --from=builder /bin/eqpg /bin/eqpg
 
 RUN adduser -S -D -H -h /src -u 100 appuser
 USER appuser
@@ -26,4 +26,4 @@ EXPOSE 37706
 # Prometheus endpoint
 EXPOSE 9100
 
-ENTRYPOINT ["/bin/eqpgsvc"]
+ENTRYPOINT ["/bin/eqpg"]
