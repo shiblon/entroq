@@ -12,7 +12,9 @@ import (
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/qsvc/qtest"
-	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go/wait"
 
 	_ "github.com/lib/pq"
 )
@@ -22,9 +24,12 @@ var pgHostPort string
 func TestMain(m *testing.M) {
 	ctx := context.Background()
 
-	ctr, err := tcpostgres.Run(ctx, "postgres:11",
-		tcpostgres.WithPassword("password"),
-		tcpostgres.BasicWaitStrategies(),
+	ctr, err := postgres.Run(ctx, "postgres:11",
+		postgres.WithPassword("password"),
+		testcontainers.WithWaitStrategy(
+			wait.ForLog("database system is ready to accept connections").
+				WithOccurrence(2).
+				WithStartupTimeout(2*time.Minute)),
 	)
 	if err != nil {
 		log.Fatalf("Postgres start: %v", err)
@@ -54,12 +59,85 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+func TestReadinessTicker(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	client, err := pgClient(ctx)
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	queue := fmt.Sprintf("/test/readiness/%d", time.Now().UnixNano())
+
+	// Insert a task that becomes ready in 2 seconds.
+	// The immediate trigger won't fire for this one.
+	at := time.Now().Add(2 * time.Second)
+	if _, _, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithArrivalTime(at))); err != nil {
+		t.Fatalf("Failed to insert delayed task: %v", err)
+	}
+
+	t.Logf("Task inserted for %v, waiting for ticker (5s) to wake us up...", at)
+
+	// Claim should block until notified or timeout.
+	// We expect the ticker to fire around the 5s mark.
+	claimCtx, claimCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer claimCancel()
+
+	task, err := client.Claim(claimCtx, entroq.From(queue), entroq.ClaimFor(time.Second))
+	if err != nil {
+		t.Fatalf("Failed to claim task: %v", err)
+	}
+
+	t.Logf("Successfully claimed delayed task: %v", task.ID)
+}
+
+func TestReadinessTicker_LocalOnly(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Create a client with Local-Only notifications. No LISTEN/NOTIFY.
+	client, err := entroq.New(ctx, Opener(pgHostPort,
+		WithDB("postgres"),
+		WithUsername("postgres"),
+		WithPassword("password"),
+		WithConnectAttempts(10),
+		WithHeartbeat(5*time.Second),
+		WithNoListen()))
+	if err != nil {
+		t.Fatalf("Failed to create local-only client: %v", err)
+	}
+	defer client.Close()
+
+	queue := fmt.Sprintf("/test/readiness-local/%d", time.Now().UnixNano())
+
+	// Insert a delayed task.
+	if _, _, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithArrivalTimeIn(2*time.Second))); err != nil {
+		t.Fatalf("Failed to insert delayed task: %v", err)
+	}
+
+	t.Logf("Task inserted, waiting for ticker to notify...")
+
+	// Claim should block until notified by the ticker (since no PG notify is being listened to).
+	claimCtx, claimCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer claimCancel()
+
+	task, err := client.Claim(claimCtx, entroq.From(queue), entroq.ClaimFor(time.Second))
+	if err != nil {
+		t.Fatalf("Failed to claim task: %v", err)
+	}
+
+	t.Logf("Successfully claimed delayed task: %v", task.ID)
+}
+
 func pgClient(ctx context.Context) (client *entroq.EntroQ, err error) {
 	return entroq.New(ctx, Opener(pgHostPort,
 		WithDB("postgres"),
 		WithUsername("postgres"),
 		WithPassword("password"),
-		WithConnectAttempts(10)))
+		WithConnectAttempts(10),
+		WithHeartbeat(5*time.Second)))
 }
 
 func Example() {
@@ -69,7 +147,8 @@ func Example() {
 		WithDB("postgres"),
 		WithUsername("postgres"),
 		WithPassword("password"),
-		WithConnectAttempts(2)))
+		WithConnectAttempts(2),
+		WithHeartbeat(5*time.Second)))
 	if err != nil {
 		log.Fatalf("Entroq init error: %v", err)
 	}
@@ -304,5 +383,3 @@ func Example_disableListenNotify() {
 	// Then, in your worker, rely entirely on polling instead of waiting for pushes:
 	// client.Claim(ctx, entroq.From("/example/my_queue"), entroq.ClaimPollTime(5 * time.Second))
 }
-
-

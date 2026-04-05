@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/shiblon/entroq/backend/eqpg"
@@ -33,7 +34,8 @@ var (
 	authzStrategy string
 	opaURL        string
 	opaPath       string
-	disableNotify bool
+	heartbeat     time.Duration
+	noListen      bool
 )
 
 var serveCmd = &cobra.Command{
@@ -62,10 +64,11 @@ var serveCmd = &cobra.Command{
 			eqpg.WithUsername(dbUser),
 			eqpg.WithPassword(dbPass),
 			eqpg.WithConnectAttempts(attempts),
+			eqpg.WithHeartbeat(heartbeat),
 		}
 
-		if disableNotify {
-			openerOptions = append(openerOptions, eqpg.WithNotifyWaiter(nil))
+		if noListen {
+			openerOptions = append(openerOptions, eqpg.WithNoListen())
 		}
 
 		opener := eqpg.Opener(dbAddr, openerOptions...)
@@ -113,7 +116,8 @@ func init() {
 	flags.StringVar(&authzStrategy, "authz", "none", "Authorization strategy: none, opahttp.")
 	flags.StringVar(&opaURL, "opa_url", "", fmt.Sprintf("OPA base URL (scheme://host:port). Default: %s.", opahttp.DefaultHostURL))
 	flags.StringVar(&opaPath, "opa_path", "", fmt.Sprintf("OPA API path. Default: %s.", opahttp.DefaultAPIPath))
-	flags.BoolVar(&disableNotify, "disable_notify_waiter", false, "Disable PostgreSQL LISTEN/NOTIFY completely. Required when using PgBouncer in transaction mode.")
+	flags.DurationVar(&heartbeat, "heartbeat", 5*time.Second, "Heartbeat interval for this service. Non-zero values designate this node as a cluster Leader.")
+	flags.BoolVar(&noListen, "no_listen", true, "Disable the persistent PostgreSQL LISTEN connection. Optimizes singleton deployments.")
 
 	rootCmd.AddCommand(serveCmd)
 }

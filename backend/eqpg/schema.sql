@@ -13,7 +13,7 @@
 --   entroq._modify_arrays   -- parallel-array form of modify, called by Go backend
 --   entroq._try_claim_one   -- claim from a single queue with bucket randomization
 --   entroq._try_claim_bucket -- claim from a specific hash bucket range
---   entroq._notify_task     -- trigger function for LISTEN/NOTIFY
+--   entroq.notify_ready_queues -- trigger notifications for tasks that reached their 'at' time
 
 CREATE SCHEMA IF NOT EXISTS entroq;
 
@@ -83,6 +83,12 @@ CREATE INDEX IF NOT EXISTS byQueueAt   ON entroq.tasks (queue, at);
 -- The BETWEEN predicate in the claim function uses this index for range scans,
 -- avoiding a full-queue scan while preserving dynamic bucket count selection.
 CREATE INDEX IF NOT EXISTS byQueueAtBucket ON entroq.tasks (queue, at, (hashtext(id) & 255));
+
+-- Readiness index: supports global range scans for future-bound tasks becoming ready.
+CREATE INDEX IF NOT EXISTS byAt ON entroq.tasks (at, queue);
+
+-- Peak claims index: supports O(1) peak detection in QueueStats.
+CREATE INDEX IF NOT EXISTS byQueueClaims ON entroq.tasks (queue, claims DESC);
 
 -- Composite types used by stored procedures.
 -- PostgreSQL has no CREATE TYPE IF NOT EXISTS, so we use DO/EXCEPTION blocks.
@@ -346,6 +352,8 @@ DECLARE
     v_missing      jsonb;
     v_mismatched   jsonb;
     v_collisions   jsonb;
+    v_qset         text[];
+    v_queue        text;
 BEGIN
     -- Lock all must-exist dependency rows and check their versions.
     -- all_deps covers depends, deletes, and changes.
@@ -469,6 +477,22 @@ BEGIN
             r.created, r.modified, r.claimant, r.value,
             r.claims, r.attempt, r.err
         FROM r;
+
+    -- Batch Notifications.
+    -- Fires once per unique queue in the transaction, instead of once per row.
+    -- This deduplicates notifications and eliminates row-trigger overhead.
+    FOR v_queue IN
+        SELECT DISTINCT q FROM (
+            SELECT unnest(coalesce(p_ins_queues, '{}'::text[])) as q, 
+                   unnest(coalesce(p_ins_ats,    '{}'::timestamptz[])) as a
+            UNION ALL
+            SELECT unnest(coalesce(p_chg_queues, '{}'::text[])) as q,
+                   unnest(coalesce(p_chg_ats,    '{}'::timestamptz[])) as a
+        ) sub
+        WHERE sub.a <= v_now
+    LOOP
+        PERFORM pg_notify(entroq.channel_name(v_queue), '');
+    END LOOP;
 END;
 $$;
 
@@ -618,26 +642,56 @@ RETURNS text LANGUAGE sql IMMUTABLE STRICT AS $$
     END
 $$;
 
--- entroq._notify_task fires pg_notify on the queue's channel for a task that
--- is immediately available. The WHEN clause on the trigger filters to
--- NEW.at <= now(), so this function is only called when the task is already
--- claimable - no conditional needed inside the body.
-CREATE OR REPLACE FUNCTION entroq._notify_task()
-RETURNS TRIGGER LANGUAGE plpgsql AS $$
+-- Global state for readiness notifications. last_at tracks the watermark of
+-- tasks that have already been processed for "silent readiness."
+CREATE TABLE IF NOT EXISTS entroq.notification_state (
+    id      INTEGER     PRIMARY KEY CHECK (id = 1),
+    last_at TIMESTAMPTZ NOT NULL
+);
+
+-- Initialize the watermark if it doesn't exist.
+INSERT INTO entroq.notification_state (id, last_at)
+VALUES (1, now())
+ON CONFLICT (id) DO NOTHING;
+
+
+
+-- entroq.notify_ready_queues atomizes the "Check and Notify" logic by maintaining
+-- a high-watermark of processed 'at' times. This makes the notification system
+-- immune to ticker jitter, overlapping runs, or service restarts.
+--
+-- If p_min_interval is specified, the function only proceeds if the 
+-- watermark has stagnated for at least that long. This prevents distributed 
+-- tickers from flooding the database with redundant updates and signals.
+CREATE OR REPLACE FUNCTION entroq.notify_ready_queues(p_min_interval interval DEFAULT '0 seconds')
+RETURNS SETOF text LANGUAGE plpgsql AS $$
+DECLARE
+    v_old_last_at timestamptz;
+    v_new_last_at timestamptz := now();
+    v_queue       text;
 BEGIN
-    PERFORM pg_notify(entroq.channel_name(NEW.queue), '');
-    RETURN NULL;
+    -- Locked Clock: Only move the watermark if it has stagnated long enough.
+    -- This prevents chatter in clusters with many active tickers.
+    UPDATE entroq.notification_state 
+    SET last_at = v_new_last_at
+    WHERE id = 1 AND now() - last_at >= p_min_interval
+    RETURNING (SELECT last_at FROM entroq.notification_state WHERE id = 1) INTO v_old_last_at;
+
+    -- If the threshold wasn't met, v_old_last_at will be NULL.
+    IF v_old_last_at IS NULL THEN
+        RETURN;
+    END IF;
+    
+    FOR v_queue IN
+        SELECT DISTINCT queue 
+        FROM entroq.tasks 
+        WHERE at > v_old_last_at AND at <= v_new_last_at
+    LOOP
+        PERFORM pg_notify(entroq.channel_name(v_queue), '');
+        RETURN NEXT v_queue;
+    END LOOP;
 END;
 $$;
-
--- Trigger must be dropped before recreating because CREATE OR REPLACE TRIGGER
--- is only available in PostgreSQL 14+.
-DROP TRIGGER IF EXISTS task_notify ON entroq.tasks;
-CREATE TRIGGER task_notify
-AFTER INSERT OR UPDATE OF at ON entroq.tasks
-FOR EACH ROW
-WHEN (NEW.at <= now())
-EXECUTE FUNCTION entroq._notify_task();
 
 -- Schema version tracking. Set once on first initialization; never overwritten
 -- by subsequent re-runs of this script (ON CONFLICT DO NOTHING). The backend

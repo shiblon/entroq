@@ -79,7 +79,8 @@ var clearCmd = &cobra.Command{
 			if empty {
 				break
 			}
-			tctx, _ := context.WithTimeout(ctx, 10*time.Second)
+			tctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
 			task, err := eq.Claim(tctx, entroq.From(flagClearQueue))
 			if err != nil {
 				if entroq.IsTimeout(err) {

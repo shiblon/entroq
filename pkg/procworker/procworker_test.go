@@ -99,13 +99,13 @@ func TestRun(t *testing.T) {
 		{
 			in: &SubprocessInput{
 				Cmd:    []string{"pwd"},
-				Dir:    "/tmp",
+				Dir:    mustCleanPath(os.TempDir()),
 				Outbox: "/special/outbox",
 			},
 			expect: &SubprocessOutput{
 				Cmd:    []string{"pwd"},
-				Dir:    "/tmp",
-				Stdout: mustCleanPath("/tmp") + "\n",
+				Dir:    mustCleanPath(os.TempDir()),
+				Stdout: mustCleanPath(os.TempDir()) + "\n",
 			},
 		},
 	}

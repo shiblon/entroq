@@ -25,10 +25,12 @@ import (
 	"path/filepath"
 	"strings"
 
+	"time"
+
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/backend/eqgrpc"
+	"github.com/shiblon/entroq/backend/eqpg"
 	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -41,6 +43,8 @@ var rootFlags struct {
 	secure       bool
 	authzToken   string
 	maxMsgSizeMB int
+	pgURL        string
+	pgHeartbeat  string
 }
 
 var eq *entroq.EntroQ
@@ -76,7 +80,17 @@ queue listings, individual task information, etc.`,
 		}
 
 		var err error
-		eq, err = entroq.New(context.Background(), eqgrpc.Opener(rootFlags.svcAddr, opts...))
+		if rootFlags.pgURL != "" {
+			var hb time.Duration
+			if rootFlags.pgHeartbeat != "" {
+				if hb, err = time.ParseDuration(rootFlags.pgHeartbeat); err != nil {
+					return fmt.Errorf("pg heartbeat duration Parse: %w", err)
+				}
+			}
+			eq, err = entroq.New(context.Background(), eqpg.Opener(rootFlags.pgURL, eqpg.WithHeartbeat(hb)))
+		} else {
+			eq, err = entroq.New(context.Background(), eqgrpc.Opener(rootFlags.svcAddr, opts...))
+		}
 		if err != nil {
 			return fmt.Errorf("entroq client open: %w", err)
 		}
@@ -109,13 +123,20 @@ func init() {
 	// will be global for your application.
 	rootCmd.PersistentFlags().StringVar(&rootFlags.cfgFile, "config", "", "config file (default is $HOME/.config/eqc.yaml)")
 
+	rootCmd.PersistentFlags().IntVar(&rootFlags.maxMsgSizeMB, "max_msg_size_mb", 10, "Maximum gRPC message size in megabytes.")
+
 	rootCmd.PersistentFlags().StringVarP(&rootFlags.svcAddr, "svcaddr", "s", ":37706", "address of service, uses port 37706 if none is specified")
 	rootCmd.PersistentFlags().BoolVarP(&rootFlags.jsonValue, "json", "j", false, "Display task values as JSON.")
 	rootCmd.PersistentFlags().BoolVarP(&rootFlags.secure, "secure", "S", false, "Use secure connection.")
 	rootCmd.PersistentFlags().StringVar(&rootFlags.authzToken, "authz_token", "", "Pass an Authorization token.")
-	rootCmd.PersistentFlags().IntVar(&rootFlags.maxMsgSizeMB, "max_msg_size_mb", 10, "Maximum gRPC message size in megabytes.")
+	rootCmd.PersistentFlags().StringVar(&rootFlags.pgURL, "pg_url", "", "PostgreSQL URL for direct backend connection.")
+	rootCmd.PersistentFlags().StringVar(&rootFlags.pgHeartbeat, "pg_heartbeat", "", "Heartbeat interval for direct PG connection (e.g. 5s).")
 
-	viper.BindPFlag("authz_token", pflag.Lookup("authz_token"))
+	viper.BindPFlag("svcaddr", rootCmd.PersistentFlags().Lookup("svcaddr"))
+	viper.BindPFlag("authz_token", rootCmd.PersistentFlags().Lookup("authz_token"))
+	viper.BindPFlag("max_msg_size_mb", rootCmd.PersistentFlags().Lookup("max_msg_size_mb"))
+	viper.BindPFlag("pg_url", rootCmd.PersistentFlags().Lookup("pg_url"))
+	viper.BindPFlag("pg_heartbeat", rootCmd.PersistentFlags().Lookup("pg_heartbeat"))
 }
 
 func mustTaskString(t *entroq.Task) string {
@@ -176,6 +197,13 @@ func initConfig() {
 	}
 
 	viper.AutomaticEnv() // read in environment variables that match
+
+	// Update core flags from viper (handles env vars).
+	rootFlags.svcAddr = viper.GetString("svcaddr")
+	rootFlags.authzToken = viper.GetString("authz_token")
+	rootFlags.maxMsgSizeMB = viper.GetInt("max_msg_size_mb")
+	rootFlags.pgURL = viper.GetString("pg_url")
+	rootFlags.pgHeartbeat = viper.GetString("pg_heartbeat")
 
 	// If a config file is found, read it in.
 	if err := viper.ReadInConfig(); err == nil {

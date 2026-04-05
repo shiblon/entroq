@@ -34,6 +34,8 @@ services:
       - "--dbaddr=postgres:5432"
       - "--dbname=entroq"
       - "--dbuser=entroq"
+      - "--heartbeat=5s"
+      - "--no_listen=true"
 
   prometheus:
     image: prom/prometheus:latest
