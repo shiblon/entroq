@@ -6,34 +6,40 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/lib/pq"
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/subq"
+	"golang.org/x/sync/errgroup"
 )
 
 // PGNotifyWaiter implements entroq.NotifyWaiter using PostgreSQL LISTEN/NOTIFY.
 //
 // A single dedicated connection (via pq.Listener) handles all PG subscriptions.
-// We can't rely on the connection pool for this because pg_notify only wakes
-// listeners on the same connection.
+// If you are using a connection pool proxy, this won't work for you, you will
+// just fall back to polling. If you are set up with Postgres as a backend for
+// the gRPC service, you can just use the standard in-memory implementation
+// anyway.
 //
-// Postgres triggers fire NOTIFY automatically when tasks are inserted or
-// updated, so the Go-side Notify method is a no-op. The embedded SubQ handles
-// all Go-side wait/notify fanout; PGNotifyWaiter adds only the PG LISTEN
-// lifecycle and the dispatch goroutine that bridges PG notifications into SubQ.
+// If you are direct-connected to Postgres, then the stored procedures will
+// fire NOTIFY during Modify events, and a heartbeat can cause it to trigger
+// for tasks becoming available due to the passage of time.
+//
+// This is implemented in terms of SubQ, the normal in-memory implementation,
+// which gracefully handles claim subscriptions, etc.
 type PGNotifyWaiter struct {
 	*subq.SubQ
 	sync.Mutex
 
 	listener *pq.Listener
 
-	chRefs  map[string]int    // PG channel name → active Wait count
-	chQueue map[string]string // PG channel name → queue name (for dispatch)
+	chRefs  map[string]int    // PG channel name -> active Wait count
+	chQueue map[string]string // PG channel name -> queue name (for dispatch)
 
-	cancel context.CancelFunc
+	cancel func() error
 }
 
 // Compile-time interface check.
@@ -41,47 +47,58 @@ var _ entroq.NotifyWaiter = (*PGNotifyWaiter)(nil)
 
 // NewPGNotifyWaiter creates a PGNotifyWaiter. connStr is used for the
 // dedicated LISTEN connection (same connection string as the main pool).
-func NewPGNotifyWaiter(ctx context.Context, connStr string) *PGNotifyWaiter {
-	ctx, cancel := context.WithCancel(ctx)
+func NewPGNotifyWaiter(connStr string) *PGNotifyWaiter {
 	w := &PGNotifyWaiter{
 		SubQ:    subq.New(),
 		chRefs:  make(map[string]int),
 		chQueue: make(map[string]string),
-		cancel:  cancel,
 	}
 	w.listener = pq.NewListener(connStr,
 		10*time.Second, // min reconnect interval
 		time.Minute,    // max reconnect interval
 		nil,            // event callback (nil = silent)
 	)
-	go w.dispatch(ctx)
+	// The notification loop runs in a goroutine and its lifecycle is tied to
+	// Close. Background context is correct, here.
+	g, ctx := errgroup.WithContext(context.Background())
+	ctx, cancel := context.WithCancel(ctx)
+	g.Go(func() error {
+		for {
+			select {
+			case n := <-w.listener.Notify:
+				if n == nil {
+					// nil means the listener reconnected; pq.Listener automatically
+					// re-subscribes to all channels, so no action needed here.
+					continue
+				}
+				if queue := w.queueForChannel(n.Channel); queue != "" {
+					w.SubQ.Notify(queue)
+				}
+			case <-ctx.Done():
+				return nil
+			}
+		}
+	})
+	w.cancel = func() error {
+		cancel()
+		return g.Wait()
+	}
 	return w
 }
 
 // Close shuts down the waiter and its dedicated listener connection.
 func (w *PGNotifyWaiter) Close() error {
-	w.cancel()
-	return w.listener.Close()
-}
-
-// dispatch is the background goroutine that reads PG notifications and wakes
-// a waiter subscribed to the notified queue via SubQ.
-func (w *PGNotifyWaiter) dispatch(ctx context.Context) {
-	for {
-		select {
-		case n := <-w.listener.Notify:
-			if n == nil {
-				// nil means the listener reconnected; pq.Listener automatically
-				// re-subscribes to all channels, so no action needed here.
-				continue
-			}
-			if queue := w.queueForChannel(n.Channel); queue != "" {
-				w.SubQ.Notify(queue)
-			}
-		case <-ctx.Done():
-			return
-		}
+	var msgs []string
+	if err := w.cancel(); err != nil {
+		msgs = append(msgs, fmt.Sprintf("pg listener goroutine cancel: %v", err))
 	}
+	if err := w.listener.Close(); err != nil {
+		msgs = append(msgs, fmt.Sprintf("pg listener conn close: %v", err))
+	}
+	if len(msgs) != 0 {
+		return fmt.Errorf("close errors: $%v", strings.Join(msgs, " :: "))
+	}
+	return nil
 }
 
 // queueForChannel returns the queue name registered for the given PG channel,
@@ -91,8 +108,11 @@ func (w *PGNotifyWaiter) queueForChannel(pgCh string) string {
 	return w.chQueue[pgCh]
 }
 
-// Notify is a no-op because the database trigger handles all notifications.
-func (w *PGNotifyWaiter) Notify(string) {}
+// Notify provides immediate local intuition for workers sharing this gateway.
+// Global workers are notified via the database's batch-broadcast notification.
+func (w *PGNotifyWaiter) Notify(queue string) {
+	w.SubQ.Notify(queue)
+}
 
 // subscribe sets up listeners on postgres channels for given EntroQ queue names.
 // It maintains a mapping from more restrictive postgres channel names to queues,
@@ -150,7 +170,7 @@ func un(f func()) {
 var nonAlphanumericRE = regexp.MustCompile(`[^a-zA-Z0-9]`)
 
 // pgChannelName returns the PostgreSQL notification channel name for a queue.
-// This mirrors channel_name() in the schema — the two must stay in sync.
+// This mirrors channel_name() in the schema -- the two must stay in sync.
 // Channel names are capped at 63 bytes (PostgreSQL identifier limit).
 func pgChannelName(queue string) string {
 	sanitized := nonAlphanumericRE.ReplaceAllString(queue, "_")

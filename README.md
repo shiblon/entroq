@@ -14,28 +14,28 @@ It is designed to be as simple and modular as possible, doing one thing well. It
 
 ## Core Concepts
 
-EntroQ supports precisely two atomic mutating operations:
+EntroQ simplifies distributed task management by narrowing the entire mutating
+interface down to two atomic operations: **Claiming** an available task and
+**Modifying** (inserting, deleting, or changing) a set of tasks. Every one of
+these operations is wrapped in a version-locked transaction. The moment a task
+is claimed or modified, its version increments, which ensures that if one
+worker succeeds in a mutation, all other workers holding an older version will
+naturally fail. This "Commit Once" semantic eliminates the risk of work getting
+dropped after delivery or, more dangerously, being committed to a downstream
+system more than once.
 
-- Claim an available task from one of possibly several queues, or
-- Update a set of tasks (delete, change, insert), optionally depending on the passive existence of other task versions.
+Progress in EntroQ is counterintuitive in its simplicity. While many systems
+favor strict FIFO ordering, EntroQ selects available tasks **randomly**. This
+prevents "poison pill" tasks from rising to the head of the line and starving
+the entire cluster; if a task causes a worker to crash, it eventually times out
+and is returned to the pool where it is likely to be picked up by another
+worker while others continue making progress on "good" work. This design allows
+you to scale your processing power simply by adding more workers--once a task
+is in a queue, no further communication between nodes is required.
 
-Both `Claim` and `Modify` change the version number of every task they affect. Any time any task is mutated, its version increments. Thus, if one process manages to mutate a task, any other process that was working on it will find that it is not available, and will fail. This is the key concept behind the "commit once" semantics of EntroQ.
-
-Unlike many pub/sub systems used as competing consumer queues, this eliminates the possibility of work getting dropped after delivery, or work being committed more than once:
-
-> Work commits should never be lost or duplicated.
-
-### Non-Starvation via Random Selection
-
-Perhaps counterintuitively given the name, *queues are not strictly ordered*. While there is a loose ordering (ready vs. not ready), EntroQ selects a **random** available task when claiming. This prevents a small set of "bad" tasks (e.g., those that cause a worker to crash) from rising to the top and starving the entire system. In EntroQ:
-
-> Workers should continue making progress even when some tasks are bad.
-
-### Scaling without Communication
-
-Once a task is in a queue, that is the only communication mechanism needed. To process things faster, just add more workers. If a worker dies, its task arrival time will eventually pass, and another worker will pick it up automatically.
-
-> You should be able to scale workers without communication.
+Workers can set configuration options that automatically quarantine tasks if
+they have failed too many times, where they can be inspected manually, fixed,
+and reintroduced to their work queue as needed.
 
 ## Evaluation & Getting Started
 
@@ -104,7 +104,7 @@ def handle(renew, finalize):
     with renew as task:
         # Task is automatically renewed in the background here
         print(f"Processing: {task.value}")
-    
+
     with finalize as task:
         # Renewal has stopped; task version is now stable
         client.modify(deletes=[task.as_id()])
@@ -146,24 +146,25 @@ A task is defined by a Queue Name, a Globally Unique ID, a Version, an Arrival T
 Queues are not first-class entities; they exist only as long as tasks are assigned to them. If a queue has no tasks, it effectively does not exist. This allows for dynamic, ad-hoc queue creation.
 
 ### Claims
-A `Claim` atomically increments a task's version and advances its arrival time into the future. This "locks" the task for a specific duration. Best practice is to keep initial claim times low and rely on background renewal for long-running work.
+## Technical Protocol and Safe Work
 
-### Modify
-The `Modify` call is a single atomic transaction that can include:
-- **Insert**: Adding new tasks.
-- **Delete**: Removing completed tasks.
-- **Change**: Moving tasks between queues or updating values.
-- **Depend**: Requiring that certain task versions exist without changing them.
+At its heart, an EntroQ task is a state machine defined by its Queue, a
+globally unique ID, a version, and an arrival time. Queues themselves are not
+first-class entities; they spring into existence only when tasks are assigned
+to them and vanish when empty, allowing for highly dynamic, ad-hoc workflows.
+When a worker issues a `Claim`, it atomically increments the task's version and
+pushes its arrival time into the future, "locking" it for a specific duration.
+For long-running work, the best practice is to keep these initial claim times
+low and rely on background renewal to maintain the lock.
 
-If any part of the modification fails (e.g., a version mismatch), the entire operation rolls back.
-
-### Workers & "Commit Once"
-Because EntroQ uses a `claim -> modify` lifecycle, a task can only be acknowledged **once**. If two workers attempt to finish the same task, only the one holding the latest version will succeed. The other will receive a dependency error and should discard its work. Idempotent work is your friend, here. For example, if you are writing to files, write to a unique filename based on a timestamp, then pass that to another task to copy it to its final destination.
-
-### Safe Work Principles
-- **Idempotence**: Outside mutations should be idempotent (e.g., setting a DB value instead of incrementing it).
-- **Unique Outputs**: Any files written should be uniquely named to avoid corruption during retries.
-- **Claim First**: Only mutate tasks that you have successfully claimed.
+Any finalization or downstream update is handled by the `Modify` call, which
+can include any combination of insertions, deletions, or value changes. If any
+single part of the modification fails--perhaps because a task's version has
+drifted or a dependency was not met--the entire operation rolls back. This
+requires a shift in how you think about "Safe Work": you should aim for
+idempotence, perhaps by writing results to unique, timestamped files before
+committing the final task deletion. The rule is simple: only mutate tasks you
+have successfully claimed, and always assume your work might be retried.
 
 ## Backends
 

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"net/url"
 	"strings"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/lib/pq"
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/subq"
 )
 
 func escp(p string) string {
@@ -35,15 +37,15 @@ const (
 )
 
 type pgOptions struct {
-	db       string
-	user     string
-	password string
-
-	attempts   int
-	initSchema bool
-	nw         entroq.NotifyWaiter
-
-	sslMode SSLMode
+	db                string
+	user              string
+	password          string
+	sslMode           string
+	attempts          int
+	readinessInterval time.Duration
+	noListen          bool
+	initSchema        bool
+	nw                entroq.NotifyWaiter
 
 	sslClientKeyFile  string
 	sslClientCertFile string
@@ -77,7 +79,7 @@ func WithDB(db string) PGOpt {
 // WithSSL provides SSL-specific options to the database connection.
 func WithSSL(mode SSLMode, sslOpts ...PGOpt) PGOpt {
 	return func(opts *pgOptions) {
-		opts.sslMode = mode
+		opts.sslMode = string(mode)
 		for _, o := range sslOpts {
 			o(opts)
 		}
@@ -134,6 +136,41 @@ func WithNotifyWaiter(nw entroq.NotifyWaiter) PGOpt {
 	}
 }
 
+// WithHeartbeat, when given a non-zero interval, pings a stored prcedure that
+// triggers a notification for any queues containing recently-available tasks
+// due to the passage of time. This can trigger some duplicate notifications,
+// particularly for task modification, but these are generally harmless.
+//
+// In large clusters where multiple workers connect directly to postgres, it
+// can be best to minimize the number of workers that emit heartbeats. Note that this
+// does not work at all with connection pool proxies, so should be disabled by
+// setting interval = 0.
+func WithHeartbeat(interval time.Duration) PGOpt {
+	return func(opts *pgOptions) {
+		opts.readinessInterval = interval
+	}
+}
+
+// WithNoListen disables the dedicated PostgreSQL LISTEN connection.
+// This means that the only notifications received will be in-process. This
+// works very well for a singleton service that is basically the only thing
+// talking to the Postgres backend. No need for a network round trip.
+//
+// If, however, there are multiple things talking to a postgres backend, the
+// NOTIFY/LISTEN approach in postgres can notify all of them. WithNoListen turns
+// that off, so multiple clients of postgres can't wake up if another client
+// does something to a queue they are watching.
+//
+// The gist is that in single-server scenarios, where PostgreSQL is an
+// implementation detail behind an RPC service, you can use this to turn off
+// the listener. In situations where this is one of several clients of
+// PostgreSQL, leave it on.
+func WithNoListen() PGOpt {
+	return func(opts *pgOptions) {
+		opts.noListen = true
+	}
+}
+
 // Open opens a postgres backend with the given host/port and options. This is
 // useful if you want to get at eqpg-specific backend options like
 // in-transaction database updates.
@@ -154,7 +191,7 @@ func buildConnStr(hostPort string, options *pgOptions) (string, error) {
 	}
 
 	params := []string{
-		"sslmode=" + string(options.sslMode),
+		"sslmode=" + options.sslMode,
 		"database=" + escp(options.db),
 	}
 	if options.user != "" {
@@ -185,11 +222,13 @@ func buildConnStr(hostPort string, options *pgOptions) (string, error) {
 // defaultOptions returns a pgOptions with the standard defaults applied.
 func defaultOptions(opts []PGOpt) *pgOptions {
 	options := &pgOptions{
-		db:       "postgres",
-		user:     "postgres",
-		password: "password",
-		attempts: 1,
-		sslMode:  SSLDisable,
+		db:                "postgres",
+		user:              "postgres",
+		password:          "password",
+		attempts:          1,
+		sslMode:           string(SSLDisable),
+		readinessInterval: 0, // 0 == no heartbeat
+		noListen:          false,
 	}
 	for _, o := range opts {
 		o(options)
@@ -231,7 +270,13 @@ func Open(ctx context.Context, hostPort string, opts ...PGOpt) (*EQPG, error) {
 	}
 
 	if options.nw == nil {
-		options.nw = entroq.NotifyWaiter(NewPGNotifyWaiter(ctx, connStr))
+		if options.noListen {
+			// Don't rely on database notify/listen, use internal one instead.
+			options.nw = subq.New()
+		} else {
+			// Otherwise use the PG-aware mechanism.
+			options.nw = NewPGNotifyWaiter(connStr)
+		}
 	}
 
 	for i := 0; i < options.attempts; i++ {
@@ -241,7 +286,7 @@ func Open(ctx context.Context, hostPort string, opts ...PGOpt) (*EQPG, error) {
 					return nil, fmt.Errorf("pg open init schema: %w", err)
 				}
 			}
-			return New(ctx, db, options.nw)
+			return New(ctx, db, options.nw, options)
 		}
 		if i < options.attempts-1 {
 			select {
@@ -266,6 +311,8 @@ func Opener(hostPort string, opts ...PGOpt) entroq.BackendOpener {
 type EQPG struct {
 	DB *sql.DB
 	nw entroq.NotifyWaiter
+
+	stopTicker func()
 }
 
 // New creates a new postgres backend that attaches to the given database.
@@ -280,7 +327,7 @@ type EQPG struct {
 // objects.
 //
 // If left nil, the default behavior is to poll and sleep.
-func New(ctx context.Context, db *sql.DB, nw entroq.NotifyWaiter) (*EQPG, error) {
+func New(ctx context.Context, db *sql.DB, nw entroq.NotifyWaiter, opts *pgOptions) (*EQPG, error) {
 	b := &EQPG{
 		DB: db,
 		nw: nw,
@@ -293,15 +340,61 @@ func New(ctx context.Context, db *sql.DB, nw entroq.NotifyWaiter) (*EQPG, error)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize database: %w", err)
 	}
+
+	if opts.readinessInterval > 0 {
+		tickerCtx, stop := context.WithCancel(ctx)
+		b.stopTicker = stop
+		go b.runReadinessTicker(tickerCtx, opts.readinessInterval)
+	}
+
 	return b, nil
 }
 
 // Close closes the underlying database connection.
 func (b *EQPG) Close() error {
+	if b.stopTicker != nil {
+		b.stopTicker()
+	}
 	if err := b.DB.Close(); err != nil {
 		return fmt.Errorf("pg backend close: %w", err)
 	}
 	return nil
+}
+
+// runReadinessTicker examines the task table to see what queues had tasks
+// become recently available to notify on them for the passage of time.
+func (b *EQPG) runReadinessTicker(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// notify_ready_queues atomically updates its own watermark state.
+			// We use a safety interval of half the ticker interval to prevent
+			// accidental double-flushing if tickers drift.
+			rows, err := b.DB.QueryContext(ctx, "SELECT entroq.notify_ready_queues($1)", fmt.Sprintf("%d microseconds", interval/(2*time.Microsecond)))
+			if err != nil {
+				log.Printf("pg readiness ticker: %v", err)
+				continue
+			}
+
+			// Bridge: Forward global ready-event to the local waiter.
+			for rows.Next() {
+				var q string
+				if err := rows.Scan(&q); err != nil {
+					log.Printf("pg readiness scan: %v", err)
+					continue
+				}
+				if b.nw != nil {
+					b.nw.Notify(q)
+				}
+			}
+			rows.Close()
+		}
+	}
 }
 
 // Queues returns the queues and their sizes.
@@ -311,13 +404,19 @@ func (b *EQPG) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[string]i
 
 // QueueStats returns a mapping from queue names to their statistics.
 func (b *EQPG) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[string]*entroq.QueueStat, error) {
+	// Hybrid Strategy:
+	// We use Index-Only Scans for all metrics. These are read-only and non-blocking.
+	// 1. Total: O(N) index-only scan (fast but scale-dependent).
+	// 2. Claimed: Fast index-only range scan (at > now AND claimant != '').
+	// 3. Available: Fast index-only range scan (at <= now AND claimant = '').
+	// 4. MaxClaims: O(1) index-seek per queue via byQueueClaims index.
 	q := `SELECT
 			queue,
 			COUNT(*) AS count,
-			COUNT(*) FILTER(WHERE at > NOW() AND claimant != '00000000-0000-0000-0000-000000000000') AS claimed,
+			COUNT(*) FILTER(WHERE at > NOW() AND claimant != '') AS claimed,
 			COUNT(*) FILTER(WHERE at <= NOW()) as available,
-			MAX(claims) AS max_claims
-		FROM tasks`
+			COALESCE(MAX(claims), 0) AS max_claims
+		FROM entroq.tasks`
 	var values []interface{}
 
 	if len(qq.MatchPrefix) != 0 || len(qq.MatchExact) != 0 {
@@ -544,7 +643,7 @@ func (b *EQPG) modifyHandlingRetriable(ctx context.Context, doModify func() (ins
 			// We didn't get a retryable serialization error, return.
 			return nil, nil, fmt.Errorf("pg modify unknown: %w", err)
 		}
-		// Serialization error — back off randomly with increasing time caps.
+		// Serialization error -- back off randomly with increasing time caps.
 		backoff := time.Duration(float64((1<<i)*minBackoff) * rand.Float64())
 		if backoff > time.Second {
 			backoff = time.Second
