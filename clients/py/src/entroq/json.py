@@ -1,5 +1,5 @@
 import requests
-import uuid
+import secrets
 import base64
 from datetime import datetime, timezone, timedelta
 from typing import List, Tuple, Optional, Union
@@ -38,7 +38,7 @@ class EntroQJSON(EntroQBase):
 
     def __init__(self, base_url: str, claimant_id: str = None):
         self.base_url = base_url.rstrip('/')
-        self.claimant_id = claimant_id or str(uuid.uuid4())
+        self.claimant_id = claimant_id or secrets.token_hex(8)
         self.session = requests.Session()
 
     def _request(self, method: str, path: str, json_data=None, params=None):

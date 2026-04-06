@@ -425,7 +425,7 @@ BEGIN
         WITH r AS (
             INSERT INTO entroq.tasks (id, version, queue, at, claimant, value, created, modified, attempt, err)
             SELECT
-                CASE WHEN ins_id = '' THEN gen_random_uuid()::text ELSE ins_id END,
+                CASE WHEN ins_id = '' THEN encode(gen_random_bytes(8), 'hex') ELSE ins_id END,
                 0,
                 ins_queue,
                 CASE WHEN ins_at = '0001-01-01 00:00:00+00'::timestamptz THEN v_now ELSE ins_at END,
