@@ -59,7 +59,7 @@ var clearCmd = &cobra.Command{
 
 				byClaimant := make(map[string][]entroq.ModifyArg)
 				for _, t := range tasks {
-					byClaimant[t.Claimant] = append(byClaimant[t.Claimant], t.AsDeletion())
+					byClaimant[t.Claimant] = append(byClaimant[t.Claimant], t.Delete())
 				}
 				for cid, args := range byClaimant {
 					forceArgs := append(args, entroq.ModifyAs(cid))
@@ -88,7 +88,7 @@ var clearCmd = &cobra.Command{
 				}
 				log.Fatalf("Error claiming: %v", err)
 			}
-			if _, _, err := eq.Modify(ctx, task.AsDeletion()); err != nil {
+			if _, _, err := eq.Modify(ctx, task.Delete()); err != nil {
 				log.Fatalf("Error deleting: %v", err)
 			}
 		}

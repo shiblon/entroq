@@ -54,7 +54,7 @@ func Example() {
 		// making it safe to use it in modification transactions.
 		func(ctx context.Context, final *entroq.Task) error {
 			log.Printf("Deleting task %s", final)
-			_, _, err := eq.Modify(ctx, final.AsDeletion())
+			_, _, err := eq.Modify(ctx, final.Delete())
 			if err != nil {
 				return err
 			}
@@ -108,10 +108,7 @@ func Example_dependencies() {
 				return fmt.Errorf("config missing during finalize")
 			}
 
-			_, _, err := eq.Modify(ctx,
-				final.AsDeletion(),
-				config.AsDependency(),
-			)
+			_, _, err := eq.Modify(ctx, final.Delete(), config.Depend())
 			if err != nil {
 				if depErr, ok := entroq.AsDependency(err); ok {
 					// Check if our config task is the one that caused the dependency collision.
@@ -171,7 +168,7 @@ func Example_manualClaimAndRenew() {
 		finalTask := stop()
 
 		// 4. Commit the work (by deleting the task or mutating it).
-		if _, _, err := eq.Modify(ctx, finalTask.AsDeletion()); err != nil {
+		if _, _, err := eq.Modify(ctx, finalTask.Delete()); err != nil {
 			return fmt.Errorf("failed to commit: %w", err)
 		}
 		return nil

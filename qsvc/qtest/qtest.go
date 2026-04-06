@@ -88,7 +88,7 @@ func SimpleChange(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 	if err != nil {
 		t.Fatalf("Error inserting: %v", err)
 	}
-	_, changed, err := client.Modify(ctx, inserted[0].AsChange(entroq.QueueTo(outQueue)))
+	_, changed, err := client.Modify(ctx, inserted[0].Change(entroq.QueueTo(outQueue)))
 	if err != nil {
 		t.Fatalf("Error changing: %v", err)
 	}
@@ -156,7 +156,7 @@ func simpleWorkerOnce(ctx context.Context, t *testing.T, client *entroq.EntroQ, 
 				return nil
 			},
 			func(ctx context.Context, task *entroq.Task) error {
-				_, _, err := client.Modify(ctx, task.AsDeletion())
+				_, _, err := client.Modify(ctx, task.Delete())
 				return err
 			}),
 		).Run(ctx, queue)
@@ -256,7 +256,7 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 					return nil
 				},
 				func(ctx context.Context, task *entroq.Task) error {
-					_, _, err := client.Modify(ctx, task.AsDeletion())
+					_, _, err := client.Modify(ctx, task.Delete())
 					return err
 				}),
 			)
@@ -404,7 +404,7 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 				return nil
 			},
 			func(ctx context.Context, task *entroq.Task) error {
-				_, _, err := client.Modify(ctx, task.AsDeletion())
+				_, _, err := client.Modify(ctx, task.Delete())
 				return err
 			}),
 			entroq.WithBaseRetryDelay(0),
@@ -534,7 +534,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 				return nil
 			},
 			func(ctx context.Context, task *entroq.Task) error {
-				_, _, err := client.Modify(ctx, task.AsDeletion())
+				_, _, err := client.Modify(ctx, task.Delete())
 				return err
 			}),
 			entroq.WithLease(leaseTime),
@@ -566,7 +566,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 			// Delete the dead task, will always be version 1.
 			// Note: don't overwrite like this in real use.
 			c.input.Version = 1
-			if _, _, err := client.Modify(ctx, c.input.AsDeletion()); err != nil {
+			if _, _, err := client.Modify(ctx, c.input.Delete()); err != nil {
 				t.Fatalf("Test %q tried to clean up dead task: %v", c.name, err)
 			}
 			return
@@ -935,7 +935,7 @@ func InsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 		entroq.InsertingInto(queue,
 			entroq.WithID(knownID),
 			entroq.WithSkipColliding(true)),
-		inserted[0].AsDeletion()); err != nil {
+		inserted[0].Delete()); err != nil {
 		t.Fatalf("Expected no error inserting skippable and deleting, got: %v", err)
 	}
 

@@ -305,7 +305,7 @@ func stressJournalStats(t *testing.T) {
 			}
 			expectQueues[q].Claimed++
 			expectQueues[q].Available--
-			if _, _, err := eq.Modify(ctx, task.AsChange(entroq.QueueTo(newQ))); err != nil {
+			if _, _, err := eq.Modify(ctx, task.Change(entroq.QueueTo(newQ))); err != nil {
 				t.Fatalf("Error moving from %q to %q: %v", q, newQ, err)
 			}
 			expectQueues[q].Size--
@@ -435,7 +435,7 @@ func TestEQMem_journalInsClaimClaimDel(t *testing.T) {
 		t.Fatalf("Error claiming 2: %v", err)
 	}
 
-	if _, _, err := eq2.Modify(ctx, task.AsDeletion()); err != nil {
+	if _, _, err := eq2.Modify(ctx, task.Delete()); err != nil {
 		t.Fatalf("Error deleting 2: %v", err)
 	}
 	eq2.Close()

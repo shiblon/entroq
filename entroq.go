@@ -51,7 +51,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -236,8 +235,8 @@ type Backend interface {
 
 // IDGenerator is a function that can generate IDs. Used for generating task IDs
 // and claimant IDs when they are not specified. By default, this is
-// UUIDGenerator, which produces UUIDs as strings.
-// NOTE: any ID generated must be <= 64 characters in length for some backends.
+// Hex16Generator NOTE: any ID generated must be <= 64 characters in length for
+// some backends.
 type IDGenerator func() string
 
 // EntroQ is a client interface for accessing the task queue.
@@ -261,12 +260,7 @@ func WithClaimantID(id string) Option {
 // Hex16Generator is an ID generator that produces 16-character random
 // hex strings. It is the default for New clients.
 func Hex16Generator() string {
-	return fmt.Sprintf("%x%x", rand.Uint64(), rand.Uint64())
-}
-
-// UUIDGenerator is an ID generator that produces UUIDs as strings.
-func UUIDGenerator() string {
-	return uuid.New().String()
+	return fmt.Sprintf("%016x", rand.Uint64())
 }
 
 // WithIDGenerator sets the default ID generator, which affects task IDs and

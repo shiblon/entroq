@@ -182,7 +182,7 @@ func Example() {
 			// database operations in it for fully atomic commits. This is a good
 			// pattern for updating state data while handling tasks, to ensure that
 			// it all happens at once.
-			if _, _, err := client.Modify(ctx, final.AsDeletion()); err != nil {
+			if _, _, err := client.Modify(ctx, final.Delete()); err != nil {
 				return fmt.Errorf("Failed to delete/commit task: %w", err)
 			}
 			return nil
@@ -258,10 +258,7 @@ func Example_inTransaction() {
 				_, err := tx.ExecContext(ctx, "UPDATE exampleCounter SET id = id + 1")
 				return err
 			}
-			if _, _, err := client.Modify(ctx,
-				final.AsDeletion(),
-				entroq.WithModifyOption(RunningInTx(inTx)),
-			); err != nil {
+			if _, _, err := client.Modify(ctx, final.Delete(), entroq.WithModifyOption(RunningInTx(inTx))); err != nil {
 				return fmt.Errorf("Failed to delete/commit task: %w", err)
 			}
 			return nil

@@ -63,7 +63,7 @@ var rmCmd = &cobra.Command{
 
 			task := tasks[0]
 
-			modArgs := []entroq.ModifyArg{task.AsDeletion()}
+			modArgs := []entroq.ModifyArg{task.Delete()}
 			if flagRmForce {
 				modArgs = append(modArgs, entroq.ModifyAs(task.Claimant))
 			}

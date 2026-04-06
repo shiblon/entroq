@@ -47,13 +47,13 @@ func (t TaskID) String() string {
 	return fmt.Sprintf("%s:v%d (in %q)", t.ID, t.Version, t.Queue)
 }
 
-// AsDeletion produces an appropriate ModifyArg to delete the task with this ID.
-func (t TaskID) AsDeletion() ModifyArg {
+// Delete produces an appropriate ModifyArg to delete the task with this ID.
+func (t TaskID) Delete() ModifyArg {
 	return Deleting(t.ID, t.Version, WithIDQueue(t.Queue))
 }
 
-// AsDependency produces an appropriate ModifyArg to depend on this task ID.
-func (t TaskID) AsDependency() ModifyArg {
+// Depend produces an appropriate ModifyArg to depend on this task ID.
+func (t TaskID) Depend() ModifyArg {
 	return DependingOn(t.ID, t.Version, WithIDQueue(t.Queue))
 }
 
@@ -102,6 +102,11 @@ func (t *TaskData) String() string {
 	return s
 }
 
+// Insert returns a ModifyArg that can be used in the Modify function to insert this task data.
+func (t *TaskData) Insert() ModifyArg {
+	return Inserting(t)
+}
+
 // Task represents a unit of work, with a byte slice value payload.
 // Note that Claims is the number of times a task has successfully been claimed.
 // This is different than the version number, which increments for
@@ -143,47 +148,47 @@ func (t *Task) String() string {
 	}, "\n\t")
 }
 
-// AsDeletion returns a ModifyArg that can be used in the Modify function, e.g.,
+// Delete returns a ModifyArg that can be used in the Modify function, e.g.,
 //
-//	cli.Modify(ctx, task1.AsDeletion())
+//	cli.Modify(ctx, task1.Delete())
 //
 // The above would cause the given task to be deleted, if it can be. It is
 // shorthand for
 //
 //	cli.Modify(ctx, Deleting(task1.ID, task1.Version, WithIDQueue(task1.Queue)))
-func (t *Task) AsDeletion() ModifyArg {
+func (t *Task) Delete() ModifyArg {
 	return Deleting(t.ID, t.Version, WithIDQueue(t.Queue))
 }
 
-// AsChange returns a ModifyArg that can be used in the Modify function, e.g.,
+// Change returns a ModifyArg that can be used in the Modify function, e.g.,
 //
-//	cli.Modify(ctx, task1.AsChange(ArrivalTimeBy(2 * time.Minute)))
+//	cli.Modify(ctx, task1.Change(ArrivalTimeBy(2 * time.Minute)))
 //
 // The above is shorthand for
 //
 //	cli.Modify(ctx, Changing(task1, ArrivalTimeBy(2 * time.Minute)))
-func (t *Task) AsChange(args ...ChangeArg) ModifyArg {
+func (t *Task) Change(args ...ChangeArg) ModifyArg {
 	return Changing(t, args...)
 }
 
-// AsDependency returns a ModifyArg that can be used to create a Modify dependency, e.g.,
+// Depend returns a ModifyArg that can be used to create a Modify dependency, e.g.,
 //
-//	cli.Modify(ctx, task.AsDependency())
+//	cli.Modify(ctx, task.Depend())
 //
 // That is shorthand for
 //
 //	cli.Modify(ctx, DependingOn(task.ID, task.Version, WithIDQueue(task.Queue)))
-func (t *Task) AsDependency() ModifyArg {
+func (t *Task) Depend() ModifyArg {
 	return DependingOn(t.ID, t.Version, WithIDQueue(t.Queue))
 }
 
-// AsRetryOrQuarantine returns a ModifyArg for cases where a task has an error that seems retriable.
+// RetryOrQuarantine returns a ModifyArg for cases where a task has an error that seems retriable.
 // It increments attempts, sets the latest error message on the task, and
 // compares against a maximum number of attempts to determine whether to move it
 // to a "quarantine" queue so that it can be analyzed later.
 // If afterMaxAttempts is 0, both it and the quarantineTo queue are ignored and
 // this will only retry.
-func (t *Task) AsRetryOrQuarantine(errMsg, quarantineTo string, afterMaxAttempts int32, overrides ...ChangeArg) ModifyArg {
+func (t *Task) RetryOrQuarantine(errMsg, quarantineTo string, afterMaxAttempts int32, overrides ...ChangeArg) ModifyArg {
 	args := []ChangeArg{AttemptToNext(), AppendingErr(errMsg)}
 	if quarantineTo != "" && afterMaxAttempts != 0 && t.Attempt+1 >= afterMaxAttempts {
 		args = append(args, QueueTo(quarantineTo))
@@ -192,17 +197,17 @@ func (t *Task) AsRetryOrQuarantine(errMsg, quarantineTo string, afterMaxAttempts
 	return Changing(t, args...)
 }
 
-// AsRetry adds an error and increments attempts while adding time to At.
-func (t *Task) AsRetry(errMsg string, overrides ...ChangeArg) ModifyArg {
-	return t.AsRetryOrQuarantine(errMsg, "", 0, overrides...)
+// Retry adds an error and increments attempts while adding time to At.
+func (t *Task) Retry(errMsg string, overrides ...ChangeArg) ModifyArg {
+	return t.RetryOrQuarantine(errMsg, "", 0, overrides...)
 }
 
-// AsQuarantine adds an error and shuffles this off to a quarantine queue.
+// Quarantine adds an error and shuffles this off to a quarantine queue.
 // Quarantine queues are just queues. They aren't special. What makes this a
 // quarantine is the fact that Attempt is incremented and an error message is
 // present.
-func (t *Task) AsQuarantine(errMsg, toQ string, overrides ...ChangeArg) ModifyArg {
-	return t.AsRetryOrQuarantine(errMsg, toQ, 1, overrides...)
+func (t *Task) Quarantine(errMsg, toQ string, overrides ...ChangeArg) ModifyArg {
+	return t.RetryOrQuarantine(errMsg, toQ, 1, overrides...)
 }
 
 // ID returns a Task ID from this task.

@@ -141,7 +141,7 @@ func Run(ctx context.Context, t *entroq.Task) ([]entroq.ModifyArg, error) {
 	if err := json.Unmarshal(t.Value, input); err != nil {
 		log.Printf("Error unmarshaling value: %v", err)
 		return []entroq.ModifyArg{
-			t.AsChange(entroq.QueueTo(t.Queue + "/failed-parse")),
+			t.Change(entroq.QueueTo(t.Queue + "/failed-parse")),
 		}, nil
 	}
 
@@ -158,7 +158,7 @@ func Run(ctx context.Context, t *entroq.Task) ([]entroq.ModifyArg, error) {
 	if len(input.Cmd) == 0 {
 		log.Print("Empty command")
 		return []entroq.ModifyArg{
-			t.AsDeletion(),
+			t.Delete(),
 			entroq.InsertingInto(outbox, entroq.WithValue(input.AsOutput().JSON())),
 		}, nil
 	}
@@ -221,7 +221,7 @@ func Run(ctx context.Context, t *entroq.Task) ([]entroq.ModifyArg, error) {
 		if !ok {
 			log.Printf("Non-exit error: %v", err)
 			return []entroq.ModifyArg{
-				t.AsDeletion(),
+				t.Delete(),
 				entroq.InsertingInto(errbox+"/failed-start", entroq.WithValue(output.JSON())),
 			}, nil
 		}
@@ -241,7 +241,7 @@ func Run(ctx context.Context, t *entroq.Task) ([]entroq.ModifyArg, error) {
 	}
 
 	return []entroq.ModifyArg{
-		t.AsDeletion(),
+		t.Delete(),
 		entroq.InsertingInto(destQueue, entroq.WithValue(output.JSON())),
 	}, nil
 }

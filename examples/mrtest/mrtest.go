@@ -13,7 +13,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/google/uuid"
+
 	"github.com/shiblon/entroq"
 	. "github.com/shiblon/entroq/examples/mr"
 )
@@ -81,7 +81,7 @@ func MRCheck(ctx context.Context, eq *entroq.EntroQ, numDocs, numMappers, numRed
 		return bytes.Compare(expected[i].Key, expected[j].Key) < 0
 	})
 
-	queuePrefix := "/mrtest/" + uuid.New().String()
+	queuePrefix := "/mrtest/" + entroq.Hex16Generator()
 
 	mr := NewMapReduce(eq, queuePrefix,
 		WithNumMappers(numMappers),

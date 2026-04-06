@@ -156,7 +156,7 @@ func CompactHandler(eqc *EntroQ, compactRun CompactRun) *funcHandler {
 //	        return err
 //	    },
 //	    func(ctx context.Context, task *Task) error {
-//	        _, _, err := eqClient.Modify(ctx, task.AsDeletion())
+//	        _, _, err := eqClient.Modify(ctx, task.Delete())
 //	        return err
 //	    },
 //	)
@@ -332,9 +332,9 @@ func (w *Worker) runOne(ctx context.Context, qs []string) error {
 	if handleErr != nil {
 		var args ModifyArg
 		if e := new(RetryTaskError); errors.As(handleErr, &e) {
-			args = stable.AsRetryOrQuarantine(taskErrMsg(e), errQ, w.MaxAttempts, ArrivalTimeBy(w.baseRetryDelay))
+			args = stable.RetryOrQuarantine(taskErrMsg(e), errQ, w.MaxAttempts, ArrivalTimeBy(w.baseRetryDelay))
 		} else if e := new(MoveTaskError); errors.As(handleErr, &e) {
-			args = stable.AsQuarantine(taskErrMsg(e), errQ)
+			args = stable.Quarantine(taskErrMsg(e), errQ)
 		}
 		if _, _, err := w.eqc.Modify(ctx, args); err != nil {
 			if _, ok := AsDependency(err); ok {

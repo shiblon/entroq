@@ -365,7 +365,7 @@ func (w *MapWorker) Run(ctx context.Context) error {
 				if err != nil {
 					return nil, fmt.Errorf("mr run mod args: %v", err)
 				}
-				return append(emitArgs, task.AsDeletion()), nil
+				return append(emitArgs, task.Delete()), nil
 			}),
 	).Run(ctx, w.InputQueue)
 }
@@ -544,7 +544,7 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 		var modArgs []entroq.ModifyArg
 		modArgs = append(modArgs, entroq.InsertingInto(w.InputQueue, entroq.WithValue(combined)))
 		for _, t := range updatedTasks {
-			modArgs = append(modArgs, t.AsDeletion())
+			modArgs = append(modArgs, t.Delete())
 		}
 		if _, _, err := w.client.Modify(ctx, modArgs...); err != nil {
 			return fmt.Errorf("merge output: %w", err)
@@ -626,7 +626,7 @@ func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error 
 
 		updatedTask := stop()
 
-		if _, _, err := w.client.Modify(ctx, updatedTask.AsDeletion(), entroq.InsertingInto(w.OutputQueue, entroq.WithValue(outputValue))); err != nil {
+		if _, _, err := w.client.Modify(ctx, updatedTask.Delete(), entroq.InsertingInto(w.OutputQueue, entroq.WithValue(outputValue))); err != nil {
 			return fmt.Errorf("reduce output: %w", err)
 		}
 		return nil
