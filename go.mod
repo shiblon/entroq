@@ -8,7 +8,6 @@ require (
 	github.com/golang-jwt/jwt/v4 v4.3.0
 	github.com/golang/protobuf v1.5.4
 	github.com/google/go-cmp v0.7.0
-	github.com/google/uuid v1.6.0
 	github.com/lib/pq v1.12.1
 	github.com/open-policy-agent/opa v0.43.1
 	github.com/prometheus/client_golang v1.12.2
@@ -51,6 +50,7 @@ require (
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-ole/go-ole v1.2.6 // indirect
 	github.com/gobwas/glob v0.2.3 // indirect
+	github.com/google/uuid v1.6.0 // indirect
 	github.com/hashicorp/hcl v1.0.0 // indirect
 	github.com/inconshreveable/mousetrap v1.0.0 // indirect
 	github.com/klauspost/compress v1.18.2 // indirect

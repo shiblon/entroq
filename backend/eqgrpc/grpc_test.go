@@ -18,7 +18,7 @@ func RunQTest(t *testing.T, tester qtest.Tester) {
 	}
 	defer client.Close()
 	defer stop()
-	tester(ctx, t, client, "grpctest/"+entroq.UUIDGenerator())
+	tester(ctx, t, client, "grpctest/"+entroq.Hex16Generator())
 }
 
 func TestGRPCTasksWithID(t *testing.T) {

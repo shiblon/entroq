@@ -33,7 +33,7 @@ func Example_journal() {
 	}
 
 	// Change the queue for the first insertion.
-	if _, _, err := eq.Modify(ctx, inserted[0].AsChange(entroq.QueueTo("/queue/of/something"))); err != nil {
+	if _, _, err := eq.Modify(ctx, inserted[0].Change(entroq.QueueTo("/queue/of/something"))); err != nil {
 		log.Fatalf("Error modifying task: %v", err)
 	}
 

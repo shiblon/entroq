@@ -70,7 +70,7 @@ var modCmd = &cobra.Command{
 			chgArgs = append(chgArgs, entroq.AttemptToZero(), entroq.ErrToZero())
 		}
 
-		modArgs := []entroq.ModifyArg{task.AsChange(chgArgs...)}
+		modArgs := []entroq.ModifyArg{task.Change(chgArgs...)}
 		if flagMod.force {
 			modArgs = append(modArgs, entroq.ModifyAs(task.Claimant))
 		}
