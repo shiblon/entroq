@@ -422,16 +422,27 @@ func Example_disableListenNotify() {
 	//    a standard polling interval. However, allowing the broken LISTEN attempts to
 	//    run will unnecessarily hold open dedicated pool connections, potentially
 	//    starving your pool.
-	// 3. To safely run behind a transaction mode pooler, you should disable the
+	// 3. To efficiently run behind a transaction mode pooler, you can disable the
 	//    notification strategy entirely by setting the NotifyWaiter to nil.
 	//
-	// You must disable the NotifyWaiter when opening the backend (you can also
-	// use eqpg.Opener in entroq.New if you don't need eqpg-specific options):
+	// Note: there are no really good ways to get cross-client notifications for queue
+	// updates when using a connection pooling proxy with postgres. The good news is,
+	// if you need a connection pool in the first, place, it's likely you're
+	// trying to run with many workers (i.e., more than 50), and if you don't
+	// have a ton of queues that they're working on, the default polling
+	// interval (which only applies to each individual worker) won't be noticed
+	// as much. If you have 30 workers on a single queue, a 30-second polling
+	// interval feels like a 1-second interval on average.
+	//
+	// All that said, if you really want reliable cross-client notifications,
+	// you can also use a service like the provided gRPC service that connects
+	// to postgres and exposes gRPC and JSON endpoints. Connect to that and
+	// notifications work fine.
 	ctx := context.Background()
 	backend, err := Open(ctx,
 		pgHostPort,
 		WithConnectAttempts(2),
-		WithNotifyWaiter(nil), // <--- Critical for PgBouncer Transaction Mode!
+		WithNotifyWaiter(nil), // disables notifications
 	)
 	if err != nil {
 		log.Fatalf("pg open failed: %v", err)

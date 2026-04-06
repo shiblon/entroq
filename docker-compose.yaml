@@ -45,3 +45,13 @@ services:
       - ./contrib/prometheus.yaml:/etc/prometheus/prometheus.yml
     depends_on:
       - entroq
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning
+      - ./deploy/grafana/entroq-dashboard.json:/var/lib/grafana/dashboards/entroq-dashboard.json
+    depends_on:
+      - prometheus

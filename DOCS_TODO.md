@@ -42,7 +42,7 @@ In all cases, if there is no heartbeat, you will likely be fine regardless. Thin
 | **Singleton Gateway** | Optimized Solo | HYBRID (Ticker Bridge) | Sub-Second |
 
 ## 1. The Heart Hub (Leader/Gateway)
-For most deployments, the gRPC gateway (`eqpg serve`) should be the designated **Heart Hub**. 
+For most deployments, the gRPC gateway (`eqpg serve`) is a natural candidate for enabling a heartbeat if periodic readiness updates are desired. 
 
 - **Efficient Leadership**: The gateway emits a heartbeat every 5s to move the database watermark and broadcast readiness notifications to the cluster.
 - **Connection Optimization**: Since the gateway holds its own "Ticker-to-Local Bridge," it can safely use `--no_listen=true` to save a persistent PostgreSQL connection while still maintaining sub-millisecond local wake-ups for work it inserts itself.
@@ -84,7 +84,7 @@ TODO: flesh out a recipe for heartbeats. A single config task in a single queue.
 
 # Architectural Recipe: The Sidecar Heartbeat
 
-In a large EntroQ cluster, you often face the challenge of keeping the database "Quiet-by-Default" while still maintaining sub-second responsiveness for scheduled work. While every worker *could* be a heartbeat node, doing so creates unnecessary background noise as hundreds of nodes redundanty move the database watermark. The solution is to designate a single **Sidecar Heartbeat**—a lightweight process that handles the cluster's "ticking" and can simultaneously act as a dynamic control plane.
+In a large EntroQ cluster, you often face the challenge of keeping the database "Quiet-by-Default" while still maintaining sub-second responsiveness for scheduled work. While every worker *could* be a heartbeat node, doing so creates unnecessary background noise as hundreds of nodes redundanty move the database watermark. A common solution is to designate a single **Sidecar Heartbeat**—a lightweight process that handles the cluster's "ticking" and can simultaneously act as a dynamic control plane.
 
 ## The Control Task Pattern
 
@@ -189,4 +189,4 @@ The `eqc` binary is a command-line tool that can be used to do nearly everything
 - **Client Transparency**: Standard gRPC load balancers (Envoy, Nginx, K8s Service) can distribute traffic across $N$ servers.
 - **Failover**: `pq.Listener` automatically re-establishes `LISTEN` connections if a server reboots or the network blips.
 - **Horizontal Scaling**: Scale up to ~10 servers comfortably before hitting Postgres connection limits or "thundering herd" overhead on notifications.
-- **Designated Hearts**: Mention the requirement to only enable `--heartbeat` on 1 or 2 nodes in the balanced cluster to keep DB noise low.
+- **Designated Hearts**: Mention the recommendation to only enable `--heartbeat` on 1 or 2 nodes in the balanced cluster to keep DB noise low.

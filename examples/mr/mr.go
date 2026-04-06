@@ -659,6 +659,13 @@ func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error 
 func (w *ReduceWorker) Run(ctx context.Context) error {
 	// First, merge until there is no more mapping work to do.
 	for {
+		// IMPORTANT! In general it's a very bad idea to use Tasks to grab tasks
+		// and operate on them. That's an "optimisic modify", and will generally
+		// result in system chaos. The thing that makes it safe here is unique
+		// to this workload: there is exactly one reducer created on each
+		// reducer shard queue. Were that not the case, the right way to go
+		// about this would be to use TryClaim in a loop until it returns no
+		// tasks.
 		mergeTasks, err := w.client.Tasks(ctx, w.InputQueue, entroq.LimitTasks(200))
 		if err != nil {
 			return fmt.Errorf("reduce get tasks: %w", err)

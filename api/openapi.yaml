@@ -151,18 +151,17 @@ paths:
                         application/json:
                             schema:
                                 $ref: '#/components/schemas/Status'
-    /api/v0/queues/{queue}/tasks:
+    /api/v0/tasks:
         get:
             tags:
                 - EntroQ
             operationId: EntroQ_Tasks
             parameters:
-                - name: queue
-                  in: path
-                  required: true
+                - name: claimantId
+                  in: query
                   schema:
                     type: string
-                - name: claimantId
+                - name: queue
                   in: query
                   schema:
                     type: string
@@ -199,7 +198,7 @@ paths:
                         application/json:
                             schema:
                                 $ref: '#/components/schemas/Status'
-    /api/v0/queues/{queue}/tasks/stream:
+    /api/v0/tasks/stream:
         get:
             tags:
                 - EntroQ
@@ -209,12 +208,11 @@ paths:
                  for the client to consume however many there are.
             operationId: EntroQ_StreamTasks
             parameters:
-                - name: queue
-                  in: path
-                  required: true
+                - name: claimantId
+                  in: query
                   schema:
                     type: string
-                - name: claimantId
+                - name: queue
                   in: query
                   schema:
                     type: string

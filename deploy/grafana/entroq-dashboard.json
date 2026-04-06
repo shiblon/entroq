@@ -98,7 +98,7 @@
             "uid": "P1809FD0E3A201658"
           },
           "editorMode": "code",
-          "expr": "entroq_queue_size{type=\"total\"}",
+          "expr": "entroq_queue_size{l1=~\"$l1\", l2=~\"$l2\", l3=~\"$l3\", type=\"total\"}",
           "legendFormat": "{{name}}",
           "range": true,
           "refId": "A"
@@ -141,7 +141,7 @@
             "spanNulls": false,
             "stacking": {
               "group": "A",
-              "mode": "normal"
+              "mode": "none"
             },
             "thresholdsStyle": {
               "mode": "off"
@@ -186,26 +186,104 @@
             "uid": "P1809FD0E3A201658"
           },
           "editorMode": "code",
-          "expr": "entroq_queue_size{type=\"claimed\"}",
-          "legendFormat": "{{name}} (Claimed)",
+          "expr": "entroq_queue_size{l1=~\"$l1\", l2=~\"$l2\", l3=~\"$l3\", type=\"claimed\"}",
+          "legendFormat": "{{name}}",
           "range": true,
           "refId": "A"
+        }
+      ],
+      "title": "Claimed Tasks",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "P1809FD0E3A201658"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
         },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "id": 4,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "P1809FD0E3A201658"
           },
           "editorMode": "code",
-          "expr": "entroq_queue_size{type=\"available\"}",
-          "legendFormat": "{{name}} (Available)",
+          "expr": "entroq_queue_size{l1=~\"$l1\", l2=~\"$l2\", l3=~\"$l3\", type=\"available\"}",
+          "legendFormat": "{{name}}",
           "range": true,
-          "refId": "B"
+          "refId": "A"
         }
       ],
-      "title": "Claimed vs Available (Stacked)",
+      "title": "Available Tasks",
       "type": "timeseries"
     },
+
     {
       "datasource": {
         "type": "prometheus",
@@ -241,7 +319,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 8
+        "y": 16
       },
       "id": 3,
       "options": {
@@ -263,13 +341,101 @@
             "uid": "P1809FD0E3A201658"
           },
           "editorMode": "code",
-          "expr": "entroq_queue_size{type=\"maxClaims\"}",
+          "expr": "entroq_queue_size{l1=~\"$l1\", l2=~\"$l2\", l3=~\"$l3\", type=\"maxClaims\"}",
           "legendFormat": "{{name}}",
           "range": true,
           "refId": "A"
         }
       ],
       "title": "Stalled Tasks (Max Claims per Queue)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "P1809FD0E3A201658"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 24
+      },
+      "id": 5,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "P1809FD0E3A201658"
+          },
+          "editorMode": "code",
+          "expr": "sum(entroq_queue_size{l1=~\"$l1\", type=\"total\"}) by (l1)",
+          "legendFormat": "{{l1}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Theme Rollup (Total Tasks per L1)",
       "type": "timeseries"
     }
   ],
@@ -278,7 +444,77 @@
   "style": "dark",
   "tags": ["entroq", "monitoring"],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "current": {},
+        "datasource": {
+          "type": "prometheus",
+          "uid": "P1809FD0E3A201658"
+        },
+        "definition": "label_values(entroq_queue_size, l1)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "L1",
+        "multi": true,
+        "name": "l1",
+        "options": [],
+        "query": {
+          "query": "label_values(entroq_queue_size, l1)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": {},
+        "datasource": {
+          "type": "prometheus",
+          "uid": "P1809FD0E3A201658"
+        },
+        "definition": "label_values(entroq_queue_size{l1=~\"$l1\"}, l2)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "L2",
+        "multi": true,
+        "name": "l2",
+        "options": [],
+        "query": {
+          "query": "label_values(entroq_queue_size{l1=~\"$l1\"}, l2)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": {},
+        "datasource": {
+          "type": "prometheus",
+          "uid": "P1809FD0E3A201658"
+        },
+        "definition": "label_values(entroq_queue_size{l2=~\"$l2\"}, l3)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "L3",
+        "multi": true,
+        "name": "l3",
+        "options": [],
+        "query": {
+          "query": "label_values(entroq_queue_size{l2=~\"$l2\"}, l3)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
   },
   "time": {
     "from": "now-1h",

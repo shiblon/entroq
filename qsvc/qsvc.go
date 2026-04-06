@@ -38,6 +38,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/golang/protobuf/proto"
@@ -65,7 +66,7 @@ var (
 			Name:      "size",
 			Help:      "Number of tasks in named queue.",
 		},
-		[]string{"name", "type"},
+		[]string{"name", "type", "l1", "l2", "l3"},
 	)
 )
 
@@ -86,13 +87,17 @@ type QSvc struct {
 // Option allows QSvc creation options to be defined.
 type Option func(*QSvc)
 
-// WithMetricInterval sets the interval between (potentially expensive) queue
-// stats requests for the purpose of providing metrics. It cannot be set to
-// less than 1 minute.
+// WithMetricInterval sets the interval between queue stats requests for the
+// purpose of providing metrics. It should usually be set reasonably high to
+// ensure that queue operation is not interfered with by requests for
+// statistics, but backends should endeavor to make this cheap. Postgres uses
+// index-only scans, for example, and the in-memory implementation uses
+// lock-free reads.
+// Capped from below at 5 seconds.
 func WithMetricInterval(d time.Duration) Option {
 	return func(s *QSvc) {
-		if d < time.Minute {
-			d = time.Minute
+		if d < 5*time.Second {
+			d = 5 * time.Second
 		}
 		s.metricInterval = d
 	}
@@ -230,10 +235,29 @@ func (s *QSvc) RefreshMetrics(ctx context.Context) error {
 	// Clear it out, then repopulate.
 	metricQueueSize.Reset()
 	for name, stat := range stats {
-		metricQueueSize.WithLabelValues(name, "total").Set(float64(stat.Size))
-		metricQueueSize.WithLabelValues(name, "claimed").Set(float64(stat.Claimed))
-		metricQueueSize.WithLabelValues(name, "available").Set(float64(stat.Available))
-		metricQueueSize.WithLabelValues(name, "maxClaims").Set(float64(stat.MaxClaims))
+		// Calculate hierarchy levels: /test/mr/map/input -> l1="/test", l2="/test/mr", l3="/test/mr/map"
+		segments := strings.Split(strings.TrimPrefix(name, "/"), "/")
+		l1, l2, l3 := "", "", ""
+		if len(segments) > 0 {
+			l1 = "/" + segments[0]
+		}
+		if len(segments) > 1 {
+			l2 = l1 + "/" + segments[1]
+		}
+		if len(segments) > 2 {
+			l3 = l2 + "/" + segments[2]
+		}
+
+		vals := map[string]int32{
+			"total":     int32(stat.Size),
+			"claimed":   int32(stat.Claimed),
+			"available": int32(stat.Available),
+			"maxClaims": int32(stat.MaxClaims),
+		}
+
+		for t, val := range vals {
+			metricQueueSize.WithLabelValues(name, t, l1, l2, l3).Set(float64(val))
+		}
 	}
 
 	return nil

@@ -71,13 +71,24 @@ class EntroQJSON(EntroQBase):
         if exact: params['matchExact'] = list(exact)
         if limit: params['limit'] = limit
         data = self._request("GET", "/api/v0/queues", params=params)
-        return data.get("queues", [])
+        # Normalize: API returns numTasks (camelCase), PG client returns num_tasks.
+        return [
+            {
+                "name": q.get("name", ""),
+                "num_tasks": q.get("numTasks", 0),
+                "num_claimed": q.get("numClaimed", 0),
+                "num_available": q.get("numAvailable", 0),
+                "num_future": q.get("numFuture", 0)
+            }
+            for q in data.get("queues", [])
+        ]
 
     def tasks(self, queue: str = '', limit: int = 0, omit_values: bool = False) -> List[Task]:
         params = {}
+        if queue: params['queue'] = queue
         if limit: params['limit'] = limit
         if omit_values: params['omitValues'] = 'true'
-        path = f"/api/v0/queues/{requests.utils.quote(queue)}/tasks"
+        path = "/api/v0/tasks"
         data = self._request("GET", path, params=params)
         return [_json_to_task(t) for t in data.get("tasks", [])]
 
