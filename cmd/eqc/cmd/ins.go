@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/shiblon/entroq"
 	"github.com/spf13/cobra"
@@ -26,6 +27,7 @@ import (
 var (
 	flagInsQueue string
 	flagInsVal   []string
+	flagInsIn    string
 )
 
 func init() {
@@ -35,6 +37,8 @@ func init() {
 	insCmd.MarkFlagRequired("queue")
 
 	insCmd.Flags().StringArrayVarP(&flagInsVal, "val", "v", nil, "Value to insert, can be specified more than once to insert more than one task. Specify an empty value to insert a task with no value.")
+
+	insCmd.Flags().StringVarP(&flagInsIn, "in", "i", "", "Duration string (e.g. 1m, 5h) to add to 'now' for the arrival time.")
 }
 
 // insCmd represents the ins command
@@ -45,12 +49,27 @@ var insCmd = &cobra.Command{
 		if len(flagInsVal) == 0 {
 			flagInsVal = append(flagInsVal, "")
 		}
-		var insArgs []entroq.InsertArg
-		for _, v := range flagInsVal {
-			insArgs = append(insArgs, entroq.WithValue([]byte(v)))
+
+		var dur time.Duration
+		if flagInsIn != "" {
+			d, err := time.ParseDuration(flagInsIn)
+			if err != nil {
+				return fmt.Errorf("parse duration %q: %w", flagInsIn, err)
+			}
+			dur = d
 		}
 
-		ins, _, err := eq.Modify(context.Background(), entroq.InsertingInto(flagInsQueue, insArgs...))
+		var modArgs []entroq.ModifyArg
+		for _, v := range flagInsVal {
+			var insArgs []entroq.InsertArg
+			insArgs = append(insArgs, entroq.WithValue([]byte(v)))
+			if dur != 0 {
+				insArgs = append(insArgs, entroq.WithArrivalTimeIn(dur))
+			}
+			modArgs = append(modArgs, entroq.InsertingInto(flagInsQueue, insArgs...))
+		}
+
+		ins, _, err := eq.Modify(context.Background(), modArgs...)
 		if err != nil {
 			return fmt.Errorf("insert tasks: %w", err)
 		}

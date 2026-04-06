@@ -413,7 +413,8 @@ func (b *EQPG) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[stri
 	q := `SELECT
 			queue,
 			COUNT(*) AS count,
-			COUNT(*) FILTER(WHERE at > NOW() AND claimant != '') AS claimed,
+			COUNT(*) FILTER(WHERE at > NOW() AND claims > 0) AS claimed,
+			COUNT(*) FILTER(WHERE at > NOW() AND claims = 0) AS future,
 			COUNT(*) FILTER(WHERE at <= NOW()) as available,
 			COALESCE(MAX(claims), 0) AS max_claims
 		FROM entroq.tasks`
@@ -455,16 +456,18 @@ func (b *EQPG) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[stri
 			q         string
 			count     int
 			claimed   int
+			future    int
 			available int
 			maxClaims int
 		)
-		if err := rows.Scan(&q, &count, &claimed, &available, &maxClaims); err != nil {
-			return nil, fmt.Errorf("row scan: %w", err)
+		if err := rows.Scan(&q, &count, &claimed, &future, &available, &maxClaims); err != nil {
+			return nil, fmt.Errorf("queue names scan: %w", err)
 		}
 		queues[q] = &entroq.QueueStat{
 			Name:      q,
 			Size:      count,
 			Claimed:   claimed,
+			Future:    future,
 			Available: available,
 			MaxClaims: maxClaims,
 		}

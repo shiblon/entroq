@@ -580,6 +580,7 @@ func (s *QSvc) QueueStats(ctx context.Context, req *pb.QueuesRequest) (*pb.Queue
 			NumTasks:     int32(stat.Size),
 			NumClaimed:   int32(stat.Claimed),
 			NumAvailable: int32(stat.Available),
+			NumFuture:    int32(stat.Future),
 			MaxClaims:    int32(stat.MaxClaims),
 		})
 	}
