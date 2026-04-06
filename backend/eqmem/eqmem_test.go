@@ -371,7 +371,7 @@ func TestEQMem_journalClaimModClaim(t *testing.T) {
 		t.Fatalf("Error claiming: %v", err)
 	}
 
-	if _, _, err := eq.Modify(ctx, task.AsChange(entroq.QueueTo("/queue/2"))); err != nil {
+	if _, _, err := eq.Modify(ctx, task.Change(entroq.QueueTo(task.Queue+"/failed-parse"))); err != nil {
 		t.Fatalf("Error changing: %v", err)
 	}
 
