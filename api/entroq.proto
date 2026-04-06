@@ -253,7 +253,7 @@ service EntroQ {
   }
   rpc Tasks(TasksRequest) returns (TasksResponse) {
     option (google.api.http) = {
-      get: "/api/v0/queues/{queue}/tasks"
+      get: "/api/v0/tasks"
     };
   }
   rpc Queues(QueuesRequest) returns (QueuesResponse) {
@@ -277,7 +277,7 @@ service EntroQ {
   // for the client to consume however many there are.
   rpc StreamTasks(TasksRequest) returns (stream TasksResponse) {
     option (google.api.http) = {
-      get: "/api/v0/queues/{queue}/tasks/stream"
+      get: "/api/v0/tasks/stream"
     };
   }
 }

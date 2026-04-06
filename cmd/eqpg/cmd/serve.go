@@ -73,9 +73,9 @@ var serveCmd = &cobra.Command{
 
 		opener := eqpg.Opener(dbAddr, openerOptions...)
 
-		svc, err := qsvc.New(ctx, opener, authzOpt)
+		svc, err := qsvc.New(ctx, opener, authzOpt, qsvc.WithMetricInterval(5*time.Second))
 		if err != nil {
-			return fmt.Errorf("failed to open pg backend: %w", err)
+			return fmt.Errorf("failed to create qsvc: %w", err)
 		}
 		defer svc.Close()
 
