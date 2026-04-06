@@ -89,6 +89,10 @@ func TestEQMemQueueStats(t *testing.T) {
 	RunQTest(t, qtest.QueueStats)
 }
 
+func TestEQMemQueueStatsLimit(t *testing.T) {
+	RunQTest(t, qtest.QueueStatsLimit)
+}
+
 func TestEQMemDeleteMissingTask(t *testing.T) {
 	RunQTest(t, qtest.DeleteMissingTask)
 }

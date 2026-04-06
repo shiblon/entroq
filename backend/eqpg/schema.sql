@@ -670,17 +670,18 @@ DECLARE
     v_new_last_at timestamptz := now();
     v_queue       text;
 BEGIN
-    -- Locked Clock: Only move the watermark if it has stagnated long enough.
-    -- This prevents chatter in clusters with many active tickers.
-    UPDATE entroq.notification_state 
-    SET last_at = v_new_last_at
-    WHERE id = 1 AND now() - last_at >= p_min_interval
-    RETURNING (SELECT last_at FROM entroq.notification_state WHERE id = 1) INTO v_old_last_at;
+    -- Lock the row and read the current watermark atomically.
+    -- FOR UPDATE ensures concurrent callers serialize here; the second caller
+    -- will see the updated last_at and bail out via the interval check below.
+    SELECT last_at INTO v_old_last_at FROM entroq.notification_state WHERE id = 1 FOR UPDATE;
 
-    -- If the threshold wasn't met, v_old_last_at will be NULL.
-    IF v_old_last_at IS NULL THEN
+    -- Rate limit: skip if the watermark moved recently enough.
+    -- This prevents distributed tickers from flooding notifications.
+    IF now() - v_old_last_at < p_min_interval THEN
         RETURN;
     END IF;
+
+    UPDATE entroq.notification_state SET last_at = v_new_last_at WHERE id = 1;
     
     FOR v_queue IN
         SELECT DISTINCT queue 

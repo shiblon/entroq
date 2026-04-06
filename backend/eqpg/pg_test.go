@@ -59,6 +59,63 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// TestNotifyReadyQueues directly invokes notify_ready_queues() and asserts
+// that it returns the expected queue when a task's arrival time has passed.
+// This pins the watermark logic in SQL independently of any polling fallback.
+func TestNotifyReadyQueues(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	backend, err := Open(ctx, pgHostPort,
+		WithDB("postgres"),
+		WithUsername("postgres"),
+		WithPassword("password"),
+		WithConnectAttempts(10))
+	if err != nil {
+		t.Fatalf("Open backend: %v", err)
+	}
+	defer backend.Close()
+
+	client, err := entroq.New(ctx, nil, entroq.WithBackend(backend))
+	if err != nil {
+		t.Fatalf("New client: %v", err)
+	}
+
+	queue := fmt.Sprintf("/test/notify-ready/%d", time.Now().UnixNano())
+	if _, _, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithArrivalTimeIn(500*time.Millisecond))); err != nil {
+		t.Fatalf("Insert delayed task: %v", err)
+	}
+
+	// Wait for the task to become ready.
+	time.Sleep(600 * time.Millisecond)
+
+	// Directly call notify_ready_queues with no minimum interval.
+	rows, err := backend.DB.QueryContext(ctx, "SELECT entroq.notify_ready_queues('0 seconds'::interval)")
+	if err != nil {
+		t.Fatalf("notify_ready_queues: %v", err)
+	}
+	defer rows.Close()
+
+	var notified []string
+	for rows.Next() {
+		var q string
+		if err := rows.Scan(&q); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		notified = append(notified, q)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+
+	for _, q := range notified {
+		if q == queue {
+			return
+		}
+	}
+	t.Fatalf("notify_ready_queues did not return %q; got %v", queue, notified)
+}
+
 func TestReadinessTicker(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -347,6 +404,10 @@ func TestQueueMatch(t *testing.T) {
 
 func TestQueueStats(t *testing.T) {
 	RunQTest(t, qtest.QueueStats)
+}
+
+func TestQueueStatsLimit(t *testing.T) {
+	RunQTest(t, qtest.QueueStatsLimit)
 }
 
 func TestDeleteMissingTask(t *testing.T) {
