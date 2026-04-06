@@ -437,12 +437,12 @@ func (b *EQPG) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[stri
 		q += strings.Join(matchFragments, " OR ")
 	}
 
+	q += " GROUP BY queue"
+
 	if qq.Limit > 0 {
 		q += fmt.Sprintf(" LIMIT $%d", len(values)+1)
 		values = append(values, qq.Limit)
 	}
-
-	q += " GROUP BY queue"
 
 	rows, err := b.DB.QueryContext(ctx, q, values...)
 	if err != nil {

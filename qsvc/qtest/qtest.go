@@ -1221,6 +1221,26 @@ func QueueStats(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefi
 	}
 }
 
+// QueueStatsLimit verifies that the Limit option restricts the number of queues
+// returned by QueueStats. Regression test for a LIMIT/GROUP BY ordering bug.
+func QueueStatsLimit(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	t.Helper()
+	for i := 0; i < 3; i++ {
+		q := path.Join(qPrefix, fmt.Sprintf("queue-%d", i))
+		if _, _, err := client.Modify(ctx, entroq.InsertingInto(q)); err != nil {
+			t.Fatalf("Insert into %v: %v", q, err)
+		}
+	}
+
+	got, err := client.QueueStats(ctx, entroq.MatchPrefix(qPrefix), entroq.LimitQueues(2))
+	if err != nil {
+		t.Fatalf("QueueStats with limit: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("QueueStats with limit=2: got %d queues, want 2", len(got))
+	}
+}
+
 type taskQueueVersionValue struct {
 	Queue   string
 	Version int32
