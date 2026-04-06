@@ -52,6 +52,7 @@ type QueueStat struct {
 	Size      int    `json:"size"`      // The total number of tasks.
 	Claimed   int    `json:"claimed"`   // The number of currently claimed tasks.
 	Available int    `json:"available"` // The number of available tasks.
+	Future    int    `json:"future"`    // The number of tasks with a future arrival time and 0 claims.
 
 	MaxClaims int `json:"maxClaims"` // The maximum number of claims for a task in the queue.
 }

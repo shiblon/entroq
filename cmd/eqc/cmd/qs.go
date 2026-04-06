@@ -18,6 +18,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"sort"
+	"text/tabwriter"
 
 	"github.com/shiblon/entroq"
 	"github.com/spf13/cobra"
@@ -27,6 +30,7 @@ var (
 	flagQsPrefix []string
 	flagQsExact  []string
 	flagQsLimit  int
+	flagQsJSON   bool
 )
 
 func init() {
@@ -37,12 +41,15 @@ func init() {
 	qsCmd.Flags().StringArrayVarP(&flagQsExact, "queue", "q", nil, "Exact match, if any. May be specified more than once.")
 
 	qsCmd.Flags().IntVarP(&flagQsLimit, "limit", "n", 0, "Limit number of queues returned.")
+
+	qsCmd.Flags().BoolVarP(&flagQsJSON, "json", "j", false, "Output as JSON instead of a table.")
 }
 
 // qsCmd represents the qs command
 var qsCmd = &cobra.Command{
-	Use:   "qs",
-	Short: "Return a list of (matching, if specified) queues",
+	Use:     "qs",
+	Aliases: []string{"stats"},
+	Short:   "Return a list of (matching, if specified) queues",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		var opts []entroq.QueuesOpt
 		for _, p := range flagQsPrefix {
@@ -60,12 +67,34 @@ var qsCmd = &cobra.Command{
 			return fmt.Errorf("get queues: %w", err)
 		}
 
-		b, err := json.MarshalIndent(qs, "", "\t")
-		if err != nil {
-			return fmt.Errorf("queues json: %w", err)
+		showJSON := flagQsJSON
+		if !cmd.Flags().Changed("json") && cmd.CalledAs() == "qs" {
+			showJSON = true
 		}
-		fmt.Println(string(b))
 
+		if showJSON {
+			b, err := json.MarshalIndent(qs, "", "\t")
+			if err != nil {
+				return fmt.Errorf("queues json: %w", err)
+			}
+			fmt.Println(string(b))
+			return nil
+		}
+
+		// Sort by name for stability.
+		var names []string
+		for k := range qs {
+			names = append(names, k)
+		}
+		sort.Strings(names)
+
+		tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "QUEUE\tSIZE\tFUTURE\tAVAILABLE\tCLAIMED\tMAX CLAIMS")
+		for _, name := range names {
+			q := qs[name]
+			fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%d\t%d\n", q.Name, q.Size, q.Future, q.Available, q.Claimed, q.MaxClaims)
+		}
+		tw.Flush()
 		return nil
 	},
 }

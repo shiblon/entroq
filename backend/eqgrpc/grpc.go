@@ -232,6 +232,7 @@ func (b *backend) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[s
 			Size:      int(q.NumTasks),
 			Claimed:   int(q.NumClaimed),
 			Available: int(q.NumAvailable),
+			Future:    int(q.NumFuture),
 			MaxClaims: int(q.MaxClaims),
 		}
 	}

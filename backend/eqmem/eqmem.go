@@ -805,8 +805,10 @@ func (m *EQMem) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[str
 		qts.Range(func(_ string, t *entroq.Task) bool {
 			stats.Size++
 			if t.At.After(now) {
-				if t.Claimant != "" {
+				if t.Claims > 0 {
 					stats.Claimed++
+				} else {
+					stats.Future++
 				}
 			} else {
 				stats.Available++

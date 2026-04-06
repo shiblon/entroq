@@ -376,6 +376,10 @@ components:
                         Maximum claims value for any task in the queue
                          (can help detect tasks that are causing crashes, etc.)
                     format: int32
+                numFuture:
+                    type: integer
+                    description: Number of tasks with a future arrival time and 0 claims.
+                    format: int32
             description: QueueStats contains the name of the queue and the number of tasks within it.
         QueuesResponse:
             type: object
