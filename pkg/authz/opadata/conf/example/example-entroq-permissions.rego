@@ -22,10 +22,10 @@ user_queues contains qs if {
 	qs := this_user.queues[_]
 }
 
-# Add a special /ns=user/<username> queue prefix to everyone, that they can do what they want with.
+# Auto-grant every authenticated user full access to their personal /users/<username>/ prefix.
 user_queues contains q if {
 	q := {
-		"prefix": concat("", ["/ns=user/", equser.username, "/"]),
+		"prefix": concat("", ["/users/", equser.username, "/"]),
 		"actions": ["ALL"],
 	}
 }
