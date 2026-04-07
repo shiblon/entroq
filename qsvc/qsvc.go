@@ -474,7 +474,7 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 		modArgs = append(modArgs,
 			entroq.InsertingInto(insert.Queue,
 				entroq.WithArrivalTime(fromMS(insert.AtMs)),
-				entroq.WithValue(iv),
+				entroq.WithRawValue(iv),
 				entroq.WithAttempt(insert.Attempt),
 				entroq.WithErr(insert.Err),
 				entroq.WithID(insert.Id)))

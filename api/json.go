@@ -11,7 +11,7 @@ import (
 // A nil or empty raw message produces structpb.NullValue.
 func JSONToProto(raw json.RawMessage) (*structpb.Value, error) {
 	if len(raw) == 0 {
-		return structpb.NewNullValue(), nil
+		return nil, nil
 	}
 	var v any
 	if err := json.Unmarshal(raw, &v); err != nil {

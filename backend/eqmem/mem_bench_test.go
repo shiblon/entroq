@@ -18,7 +18,7 @@ func BatchPopulate(ctx context.Context, c *entroq.EntroQ, n int, queues []string
 		var ins []entroq.ModifyArg
 		for j := i; j < i+batchSize && j < n; j++ {
 			q := queues[(i+j)%len(queues)]
-			ins = append(ins, entroq.InsertingInto(q, entroq.WithArrivalTime(now), entroq.WithValue(entroq.JSONStr("bench-value"))))
+			ins = append(ins, entroq.InsertingInto(q, entroq.WithArrivalTime(now), entroq.WithValue("bench-value")))
 		}
 		if _, _, err := c.Modify(ctx, ins...); err != nil {
 			return fmt.Errorf("populate batch: %w", err)

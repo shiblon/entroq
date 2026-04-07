@@ -19,7 +19,7 @@ func TestDoWithRenewAll_ImmediateCancellationOnLeaseLoss(t *testing.T) {
 	defer eq.Close()
 
 	queue := "/test/cancel"
-	_, _, err = eq.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue(entroq.JSONStr("work"))))
+	_, _, err = eq.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue("work")))
 	if err != nil {
 		t.Fatalf("failed to insert: %v", err)
 	}

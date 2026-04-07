@@ -13,7 +13,7 @@ export interface TaskID {
 export interface TaskData {
   queue: string;
   atMs: string; // int64 -> string
-  value: string; // bytes -> base64 string
+  value: any; // bytes -> JSON value
   id?: string;
   attempt?: number;
   err?: string;
@@ -36,7 +36,7 @@ export interface Task {
   version: number;
   atMs: string; // int64 -> string
   claimantId: string;
-  value: string; // bytes -> base64 string
+  value: any; // bytes -> JSON value
   createdMs: string; // int64 -> string
   modifiedMs: string; // int64 -> string
   claims: number;

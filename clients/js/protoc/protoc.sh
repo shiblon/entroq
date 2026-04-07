@@ -13,7 +13,7 @@ cd ../../..
 
 echo "Running js/ts docker protoc build in $PWD"
 
-protos=$(ls proto/*.proto)
-docker run --rm -it -v "$PWD":/src "$imgname" pbjs -t static-module -p proto -w commonjs -o contrib/js/entroqpb.js $protos
-docker run --rm -it -v "$PWD":/src "$imgname" pbts -o contrib/js/entroqpb.d.ts contrib/js/entroqpb.js
+protos=$(ls api/*.proto)
+docker run --rm -v "$PWD":/src "$imgname" pbjs -t static-module -p /src/api -w commonjs -o /src/clients/js/entroqpb.js $protos
+docker run --rm -v "$PWD":/src "$imgname" pbts -o /src/clients/js/entroqpb.d.ts /src/clients/js/entroqpb.js
 

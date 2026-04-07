@@ -136,9 +136,9 @@ func (w *TeeWriter) Write(data []byte) (int, error) {
 // information from its input task, including which outbox to write results to.
 // If no outbox is specified, the input task's queue name is suffixed with
 // "/done" to produce one.
-func Run(ctx context.Context, t *entroq.Task) ([]entroq.ModifyArg, error) {
+func Run(ctx context.Context, t *entroq.Task, value json.RawMessage) ([]entroq.ModifyArg, error) {
 	input := new(SubprocessInput)
-	if err := json.Unmarshal(t.Value, input); err != nil {
+	if err := json.Unmarshal(value, input); err != nil {
 		log.Printf("Error unmarshaling value: %v", err)
 		return []entroq.ModifyArg{
 			t.Change(entroq.QueueTo(t.Queue + "/failed-parse")),
@@ -159,7 +159,7 @@ func Run(ctx context.Context, t *entroq.Task) ([]entroq.ModifyArg, error) {
 		log.Print("Empty command")
 		return []entroq.ModifyArg{
 			t.Delete(),
-			entroq.InsertingInto(outbox, entroq.WithValue(input.AsOutput().JSON())),
+			entroq.InsertingInto(outbox, entroq.WithRawValue(input.AsOutput().JSON())),
 		}, nil
 	}
 
@@ -222,7 +222,7 @@ func Run(ctx context.Context, t *entroq.Task) ([]entroq.ModifyArg, error) {
 			log.Printf("Non-exit error: %v", err)
 			return []entroq.ModifyArg{
 				t.Delete(),
-				entroq.InsertingInto(errbox+"/failed-start", entroq.WithValue(output.JSON())),
+				entroq.InsertingInto(errbox+"/failed-start", entroq.WithRawValue(output.JSON())),
 			}, nil
 		}
 	}
@@ -242,6 +242,6 @@ func Run(ctx context.Context, t *entroq.Task) ([]entroq.ModifyArg, error) {
 
 	return []entroq.ModifyArg{
 		t.Delete(),
-		entroq.InsertingInto(destQueue, entroq.WithValue(output.JSON())),
+		entroq.InsertingInto(destQueue, entroq.WithRawValue(output.JSON())),
 	}, nil
 }

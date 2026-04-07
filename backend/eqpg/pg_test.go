@@ -215,8 +215,8 @@ func Example() {
 
 	// Insert some tasks.
 	_, _, err = client.Modify(ctx,
-		entroq.InsertingInto("/example/queue 1", entroq.WithValue(entroq.JSONStr("hello"))),
-		entroq.InsertingInto("/example/queue 2", entroq.WithValue(entroq.JSONStr("hello"))),
+		entroq.InsertingInto("/example/queue 1", entroq.WithValue("hello")),
+		entroq.InsertingInto("/example/queue 2", entroq.WithValue("hello")),
 	)
 	if err != nil {
 		log.Fatalf("insertion failed: %v", err)
@@ -229,12 +229,12 @@ func Example() {
 	go func() { time.Sleep(2 * time.Second); cancel() }()
 
 	w := worker.New(client,
-		worker.WithDo(func(ctx context.Context, claimed *entroq.Task) error {
+		worker.WithDo(func(ctx context.Context, claimed *entroq.Task, s string) error {
 			// Do work with the task.
-			fmt.Println(string(claimed.Value))
+			fmt.Println(s)
 			return nil
 		}),
-		worker.WithFinish(func(ctx context.Context, final *entroq.Task) error {
+		worker.WithFinish(func(ctx context.Context, final *entroq.Task, _ string) error {
 			// Delete the task to "commit" the work.
 			// At this point, you can also call directly into eqpg.ModifyOpts and
 			// hand it a function to call that has a transaction. That transaction
@@ -286,9 +286,9 @@ func Example_inTransaction() {
 
 	// Insert some tasks.
 	_, _, err = client.Modify(ctx,
-		entroq.InsertingInto("/example/queue 1", entroq.WithValue(entroq.JSONStr("hello"))),
-		entroq.InsertingInto("/example/queue 2", entroq.WithValue(entroq.JSONStr("hello"))),
-		entroq.InsertingInto("/example/queue 2", entroq.WithValue(entroq.JSONStr("hello"))),
+		entroq.InsertingInto("/example/queue 1", entroq.WithValue("hello")),
+		entroq.InsertingInto("/example/queue 2", entroq.WithValue("hello")),
+		entroq.InsertingInto("/example/queue 2", entroq.WithValue("hello")),
 	)
 	if err != nil {
 		log.Fatalf("insertion failed: %v", err)
@@ -304,12 +304,12 @@ func Example_inTransaction() {
 	// when the task version is finalized (background renewal is stopped),
 	// updates the counter table.
 	w := worker.New(client,
-		worker.WithDo(func(ctx context.Context, claimed *entroq.Task) error {
+		worker.WithDo(func(ctx context.Context, claimed *entroq.Task, s string) error {
 			// Do work with the task.
-			fmt.Println(string(claimed.Value))
+			fmt.Println(s)
 			return nil
 		}),
-		worker.WithFinish(func(ctx context.Context, final *entroq.Task) error {
+		worker.WithFinish(func(ctx context.Context, final *entroq.Task, _ string) error {
 			// Delete the task to "commit" the work.
 
 			// The counter is updated in the same transaction as the entroq modification.

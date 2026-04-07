@@ -150,14 +150,14 @@ func simpleWorkerOnce(ctx context.Context, t *testing.T, client *entroq.EntroQ, 
 	var consumed []*entroq.Task
 	g.Go(func() error {
 		return worker.New(client,
-			worker.WithDo(func(ctx context.Context, task *entroq.Task) error {
+			worker.WithDo(func(ctx context.Context, task *entroq.Task, _ json.RawMessage) error {
 				if task.Claims != 1 {
 					return fmt.Errorf("worker claim expected claims to be 1, got %d", task.Claims)
 				}
 				consumed = append(consumed, task)
 				return nil
 			}),
-			worker.WithFinish(func(ctx context.Context, task *entroq.Task) error {
+			worker.WithFinish(func(ctx context.Context, task *entroq.Task, _ json.RawMessage) error {
 				_, _, err := client.Modify(ctx, task.Delete())
 				return err
 			}),
@@ -176,7 +176,7 @@ func simpleWorkerOnce(ctx context.Context, t *testing.T, client *entroq.EntroQ, 
 
 	var inserted []*entroq.Task
 	for i := 0; i < numTasks; i++ {
-		ins, _, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue(json.RawMessage(fmt.Sprintf("%d", i)))))
+		ins, _, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithRawValue(json.RawMessage(fmt.Sprintf("%d", i)))))
 		if err != nil {
 			t.Fatalf("Failed to insert task: %v", err)
 		}
@@ -223,16 +223,16 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	// Populate all of the queues, most in the big one, least in the small one.
 	for i := 0; i < bigSize; i++ {
 		args := []entroq.ModifyArg{
-			entroq.InsertingInto(bigQueue, entroq.WithValue(entroq.JSONStr("big value"))),
+			entroq.InsertingInto(bigQueue, entroq.WithValue("big value")),
 		}
 		if i < medSize {
 			args = append(args, entroq.ModifyArg(
-				entroq.InsertingInto(medQueue, entroq.WithValue(entroq.JSONStr("med value"))),
+				entroq.InsertingInto(medQueue, entroq.WithValue("med value")),
 			))
 		}
 		if i < smallSize {
 			args = append(args, entroq.ModifyArg(
-				entroq.InsertingInto(smallQueue, entroq.WithValue(entroq.JSONStr("smallvalue"))),
+				entroq.InsertingInto(smallQueue, entroq.WithValue("smallvalue")),
 			))
 		}
 		if _, _, err := client.Modify(ctx, args...); err != nil {
@@ -253,7 +253,7 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 		g.Go(func() error {
 			ti := 0
 			w := worker.New(client,
-				worker.WithDo(func(ctx context.Context, task *entroq.Task) error {
+				worker.WithDo(func(ctx context.Context, task *entroq.Task, _ json.RawMessage) error {
 					ti++
 					if task.Claims != 1 {
 						return fmt.Errorf("worker claim expected to be 1, was %d", task.Claims)
@@ -261,7 +261,7 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 					consumedCh <- task
 					return nil
 				}),
-				worker.WithFinish(func(ctx context.Context, task *entroq.Task) error {
+				worker.WithFinish(func(ctx context.Context, task *entroq.Task, _ json.RawMessage) error {
 					_, _, err := client.Modify(ctx, task.Delete())
 					return err
 				}),
@@ -348,10 +348,11 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 // attempts, things get moved.
 func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	newTask := func(val string) *entroq.Task {
+		b, _ := json.Marshal(val)
 		return &entroq.Task{
 			Queue: path.Join(qPrefix, "retry_on_error", val),
 			ID:    client.GenID(),
-			Value: entroq.JSONStr(val),
+			Value: b,
 		}
 	}
 
@@ -400,23 +401,21 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 		retriedTaskCh := make(chan *entroq.Task, 1)
 
 		w := worker.New(client,
-			worker.WithDo(func(ctx context.Context, task *entroq.Task) error {
+			worker.WithDo(func(ctx context.Context, task *entroq.Task, s string) error {
 				// Only attempt this again if it's the first time.
 				if task.Attempt == 0 {
-					var s string
-					json.Unmarshal(task.Value, &s)
 					return worker.RetryErrorf("retry error: %s", s)
 				}
 				// Save it so we know what happened with the retry error.
 				retriedTaskCh <- task
 				return nil
 			}),
-			worker.WithFinish(func(ctx context.Context, task *entroq.Task) error {
+			worker.WithFinish(func(ctx context.Context, task *entroq.Task, _ string) error {
 				_, _, err := client.Modify(ctx, task.Delete())
 				return err
 			}),
-			worker.WithBaseRetryDelay(0),
-			worker.WithMaxAttempts(c.maxAttempt),
+			worker.WithBaseRetryDelay[string](0),
+			worker.WithMaxAttempts[string](c.maxAttempt),
 		)
 
 		ctx, cancel := context.WithCancel(ctx)
@@ -428,7 +427,7 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 		})
 
 		// Now stick our task in. The worker is ready and waiting.
-		if _, _, err := client.Modify(ctx, entroq.InsertingInto(c.input.Queue, entroq.WithID(c.input.ID), entroq.WithValue(c.input.Value))); err != nil {
+		if _, _, err := client.Modify(ctx, entroq.InsertingInto(c.input.Queue, entroq.WithID(c.input.ID), entroq.WithRawValue(c.input.Value))); err != nil {
 			t.Fatalf("Test %q insert task: %v", c.name, err)
 		}
 		waitCtx, waitCancel := context.WithTimeout(ctx, 5*time.Second)
@@ -492,10 +491,11 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 
 	newTask := func(val string) *entroq.Task {
 		id := client.GenID()
+		b, _ := json.Marshal(val)
 		return &entroq.Task{
 			Queue: path.Join(baseQueue, val, id),
 			ID:    id,
-			Value: entroq.JSONStr(val),
+			Value: b,
 		}
 	}
 
@@ -525,9 +525,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		const leaseTime = 5 * time.Second
 
 		w := worker.New(client,
-			worker.WithDo(func(ctx context.Context, task *entroq.Task) error {
-				var cmd string
-				json.Unmarshal(task.Value, &cmd)
+			worker.WithDo(func(ctx context.Context, task *entroq.Task, cmd string) error {
 				switch cmd {
 				case "die":
 					return fmt.Errorf("task asked to die")
@@ -543,11 +541,11 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 				}
 				return nil
 			}),
-			worker.WithFinish(func(ctx context.Context, task *entroq.Task) error {
+			worker.WithFinish(func(ctx context.Context, task *entroq.Task, _ string) error {
 				_, _, err := client.Modify(ctx, task.Delete())
 				return err
 			}),
-			worker.WithLease(leaseTime),
+			worker.WithLease[string](leaseTime),
 		)
 
 		ctx, cancel := context.WithCancel(ctx)
@@ -564,7 +562,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 
 		if _, _, err := client.Modify(ctx, entroq.InsertingInto(c.input.Queue,
 			entroq.WithID(c.input.ID),
-			entroq.WithValue(c.input.Value),
+			entroq.WithRawValue(c.input.Value),
 		)); err != nil {
 			t.Fatalf("Test %q insert task work: %v", c.name, err)
 		}
@@ -695,7 +693,7 @@ func ClaimUnblocksOnNotify(ctx context.Context, t *testing.T, client *entroq.Ent
 	time.Sleep(300 * time.Millisecond) // let Claim reach its wait before inserting
 
 	start := time.Now()
-	if _, _, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue(entroq.JSONStr("ping")))); err != nil {
+	if _, _, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue("ping"))); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
 
@@ -715,9 +713,9 @@ func TasksOmitValue(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	queue := path.Join(qPrefix, "tasks_omit_value")
 
 	inserted, _, err := client.Modify(ctx,
-		entroq.InsertingInto(queue, entroq.WithValue(entroq.JSONStr("t1"))),
-		entroq.InsertingInto(queue, entroq.WithValue(entroq.JSONStr("t2"))),
-		entroq.InsertingInto(queue, entroq.WithValue(entroq.JSONStr("t3"))),
+		entroq.InsertingInto(queue, entroq.WithValue("t1")),
+		entroq.InsertingInto(queue, entroq.WithValue("t2")),
+		entroq.InsertingInto(queue, entroq.WithValue("t3")),
 	)
 	if err != nil {
 		t.Fatalf("Failed to insert tasks: %v", err)
@@ -815,8 +813,7 @@ func TasksWithIDOnly(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 		if i%2 == 0 {
 			q = q2
 		}
-		val := entroq.JSONStr(fmt.Sprintf("val %d", i))
-		modArgs = append(modArgs, entroq.InsertingInto(q, entroq.WithValue(val)))
+		modArgs = append(modArgs, entroq.InsertingInto(q, entroq.WithValue(fmt.Sprintf("val %d", i))))
 	}
 
 	ins, _, err := client.Modify(ctx, modArgs...)
@@ -983,17 +980,19 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	const futureTaskDuration = 2 * time.Second
 	futureTime := now.Add(futureTaskDuration)
 
+	helloVal, _ := json.Marshal("hello")
+	thereVal, _ := json.Marshal("there")
 	insWant := []*entroq.Task{
 		{
 			Queue:    queue,
 			At:       now,
-			Value:    entroq.JSONStr("hello"),
+			Value:    helloVal,
 			Claimant: client.ID(),
 		},
 		{
 			Queue:    queue,
 			At:       futureTime,
-			Value:    entroq.JSONStr("there"),
+			Value:    thereVal,
 			Claimant: client.ID(),
 		},
 	}
@@ -1404,7 +1403,7 @@ func DeleteMissingTask(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		t.Fatalf("Expected error when deleting missing task, got: %v", err)
 	}
 
-	ins, _, err := client.Modify(ctx, entroq.InsertingInto("my queue", entroq.WithValue(entroq.JSONStr("hi"))))
+	ins, _, err := client.Modify(ctx, entroq.InsertingInto("my queue", entroq.WithValue("hi")))
 	if err != nil {
 		t.Fatalf("Error inserting task for delete missing test: %v", err)
 	}

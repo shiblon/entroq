@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -26,126 +27,104 @@ const DefaultRetryDelay = 30 * time.Second
 // transient backend outages.
 const DefaultBackoff = 10 * time.Second
 
-// Handler is an interface that can be implemented to define work to be done.
-type Handler interface {
+// Handler[T] is an interface that can be implemented to define work to be done.
+// The value T is the pre-unmarshaled task value. Use T = json.RawMessage to
+// receive raw bytes without any type-level unmarshaling.
+type Handler[T any] interface {
 	// TaskDo is called by Worker.Run for each claimed task. The task is renewed
-	// in the background while this function runs.
+	// in the background while this function runs. value holds the result of
+	// unmarshaling task.Value into T.
 	//
-	// On nil return, renewal is stopped and TaskFinish (if set) is called with the
-	// stable task version.
+	// On nil return, renewal is stopped and TaskFinish (if set) is called with
+	// the stable task version.
 	//
-	// On RetryError or MoveError, the task is retried or moved
-	// respectively and TaskFinish is skipped.
+	// On RetryError or MoveError, the task is retried or moved respectively and
+	// TaskFinish is skipped.
 	//
 	// On any other error, TaskFinish is skipped and the error is treated as a
 	// fundamental error subject to backoff.
-	TaskDo(context.Context, *entroq.Task) error
+	TaskDo(context.Context, *entroq.Task, T) error
 
 	// TaskFinish is called after TaskDo returns nil and renewal has stopped.
-	// It receives the stable (final renewed) task version. Use it to apply task
-	// modifications -- deletion, requeueing, etc. -- and any associated cleanup.
-	// TaskFinish is skipped when TaskDo returns a non-nil error.
-	TaskFinish(context.Context, *entroq.Task) error
+	// It receives the stable (final renewed) task version and the same value
+	// that was passed to TaskDo. Use it to apply task modifications --
+	// deletion, requeueing, etc. -- and any associated cleanup. TaskFinish is
+	// skipped when TaskDo returns a non-nil error.
+	TaskFinish(context.Context, *entroq.Task, T) error
 }
 
-// DoModifyRun is a function type that allows a work handler to be defined, and
-// that handler passes modifications out instead of making those modifications
-// itself. It's a convenience for folks that don't need special finalization.
-type DoModifyRun func(context.Context, *entroq.Task) ([]entroq.ModifyArg, error)
+// DoModifyRun[T] is a function type that allows a work handler to be defined
+// that passes modifications out instead of making those modifications itself.
+// It's a convenience for callers that don't need special finalization.
+type DoModifyRun[T any] func(context.Context, *entroq.Task, T) ([]entroq.ModifyArg, error)
 
-// funcHandler is an implementation for Handler that accepts functions.
-type funcHandler struct {
-	do     func(context.Context, *entroq.Task) error
-	finish func(context.Context, *entroq.Task) error
+// funcHandler[T] is a Handler[T] backed by plain functions.
+type funcHandler[T any] struct {
+	do     func(context.Context, *entroq.Task, T) error
+	finish func(context.Context, *entroq.Task, T) error
 }
 
 // TaskDo runs the specified "do" function.
-func (h *funcHandler) TaskDo(ctx context.Context, task *entroq.Task) error {
+func (h *funcHandler[T]) TaskDo(ctx context.Context, task *entroq.Task, value T) error {
 	if h.do == nil {
 		return fmt.Errorf("no work function specified")
 	}
-	return h.do(ctx, task)
+	return h.do(ctx, task, value)
 }
 
 // TaskFinish runs the specified "finish" function if it has been defined.
-func (h *funcHandler) TaskFinish(ctx context.Context, task *entroq.Task) error {
+func (h *funcHandler[T]) TaskFinish(ctx context.Context, task *entroq.Task, value T) error {
 	if h.finish == nil {
 		return nil
 	}
-	return h.finish(ctx, task)
+	return h.finish(ctx, task, value)
 }
 
-// compactHandler is an implementation for Handler that manages DoModify logic.
-type compactHandler struct {
+// Worker[T] defines a looping protocol that processes tasks in a queue. It
+// goes through a claim/unmarshal/work/finalize cycle, where the work section
+// has background task auto-renewal happening to allow the worker to maintain
+// ownership of the task while it does its job.
+//
+// The type parameter T is the Go type of the task value. The worker
+// unmarshals task.Value into T before calling TaskDo/TaskFinish, so handlers
+// always receive a ready-to-use value. Use T = json.RawMessage to opt out of
+// typed unmarshaling and receive the raw bytes directly.
+//
+// The finalization phase stops the renewal, freezes the task version, and
+// allows the task to be deleted or modified safely.
+//
+// A Worker[T] may be used from multiple goroutines concurrently (e.g., two
+// calls to Run in separate goroutines). Per-task state is allocated on the
+// stack of each runOne invocation, so concurrent runs do not share mutable
+// state.
+type Worker[T any] struct {
 	eqc *entroq.EntroQ
-	run DoModifyRun
 
-	// State for a single task execution.
-	mods    []entroq.ModifyArg
-	initial *entroq.Task
+	lease          time.Duration
+	baseRetryDelay time.Duration
+	backoff        time.Duration
+
+	handler  Handler[T]
+	doModify DoModifyRun[T] // set by WithDoModify; per-task state lives in runOne
+
+	// ErrQMap maps an inbox to the queue tasks are moved to if a MoveError
+	// is returned from a worker's run function, or if the task value cannot
+	// be decoded into T.
+	ErrQMap ErrQMap
+
+	// MaxAttempts indicates how many attempts are too many before a retryable
+	// error becomes permanent and the task is moved to an error queue.
+	MaxAttempts int32
 }
 
-// TaskDo runs the "run" function and stores resulting modifications.
-func (h *compactHandler) TaskDo(ctx context.Context, task *entroq.Task) error {
-	var err error
-	h.initial = task
-	if h.mods, err = h.run(ctx, task); err != nil {
-		return fmt.Errorf("do modify: %w", err)
-	}
-	return nil
-}
-
-// TaskFinish applies the modifications captured in TaskDo.
-func (h *compactHandler) TaskFinish(ctx context.Context, renewed *entroq.Task) error {
-	modification := entroq.NewModification("", h.mods...)
-
-	// Handle version surprises and renewals.
-	switch {
-	case h.initial.Version > renewed.Version:
-		return fmt.Errorf("task updated inside worker body, expected version <= %v, got %v", renewed.Version, h.initial.Version)
-	case h.initial.Version < renewed.Version:
-		// Update it wherever we find it.
-		for _, task := range modification.Changes {
-			if task.ID == renewed.ID {
-				task.Version = renewed.Version
-			}
-		}
-		for _, id := range modification.Depends {
-			if id.ID == renewed.ID {
-				id.Version = renewed.Version
-			}
-		}
-		for _, id := range modification.Deletes {
-			if id.ID == renewed.ID {
-				id.Version = renewed.Version
-			}
-		}
-	}
-
-	// Perform the modification.
-	if _, _, err := h.eqc.Modify(ctx, entroq.WithModification(modification)); err != nil {
-		if _, ok := entroq.AsDependency(err); ok {
-			log.Printf("Worker ack failed, throwing away: %v", err)
-			return nil
-		}
-		if entroq.IsTimeout(err) {
-			log.Printf("Worker continuing after ack timeout: %v", err)
-			return nil
-		}
-		if entroq.IsCanceled(err) {
-			log.Printf("Worker exiting cleanly instead of acking: %v", err)
-			return fmt.Errorf("canceled in compact finish: %w", err)
-		}
-		return fmt.Errorf("worker ack: %w", err)
-	}
-	return nil
-}
-
-// New creates a new worker that makes it easy to claim and operate on
-// tasks in an endless loop. Define its logic using options like WithDo,
-// WithFinish, or WithDoModify.
-func New(eq *entroq.EntroQ, opts ...Option) *Worker {
-	w := &Worker{
+// New creates a new Worker[T] that claims tasks from the given queues and
+// presents pre-unmarshaled values of type T to the work handler. Configure
+// the worker with options like WithDo, WithFinish, or WithDoModify.
+//
+// Use T = json.RawMessage for untyped operation (raw JSON bytes passed
+// through as-is).
+func New[T any](eq *entroq.EntroQ, opts ...Option[T]) *Worker[T] {
+	w := &Worker[T]{
 		ErrQMap: DefaultErrQMap,
 
 		eqc:   eq,
@@ -160,150 +139,107 @@ func New(eq *entroq.EntroQ, opts ...Option) *Worker {
 	return w
 }
 
-// WithDo sets the primary work function for a worker. Overwrites any previous
-// DoModify configuration.
-func WithDo(f func(context.Context, *entroq.Task) error) Option {
-	return func(w *Worker) {
-		if fh, ok := w.handler.(*funcHandler); ok {
+// Option[T] can be passed to New to modify worker parameters.
+type Option[T any] func(*Worker[T])
+
+// WithDo sets the primary work function for a worker. The function receives
+// the claimed task and its value pre-unmarshaled into T. Overwrites any
+// previous handler configuration.
+func WithDo[T any](f func(context.Context, *entroq.Task, T) error) Option[T] {
+	return func(w *Worker[T]) {
+		switch fh := w.handler.(type) {
+		case *funcHandler[T]:
 			fh.do = f
-		} else {
-			// Overwrite previous handler type entirely.
-			w.handler = &funcHandler{do: f}
+		default:
+			w.handler = &funcHandler[T]{do: f}
 		}
 	}
 }
 
-// WithFinish sets the finalization/ack function for a worker, which is called
-// after Do completes successfully and renewal has stopped. Overwrites any
-// previous DoModify configuration.
-func WithFinish(f func(context.Context, *entroq.Task) error) Option {
-	return func(w *Worker) {
-		if fh, ok := w.handler.(*funcHandler); ok {
+// WithFinish sets the finalization function for a worker, called after Do
+// completes successfully and renewal has stopped. The function receives the
+// stable (finally-renewed) task and the original unmarshaled value. Overwrites
+// any previous handler configuration.
+func WithFinish[T any](f func(context.Context, *entroq.Task, T) error) Option[T] {
+	return func(w *Worker[T]) {
+		if fh, ok := w.handler.(*funcHandler[T]); ok {
 			fh.finish = f
 		} else {
-			// Overwrite previous handler type entirely.
-			w.handler = &funcHandler{finish: f}
+			w.handler = &funcHandler[T]{finish: f}
 		}
 	}
 }
 
-// WithDoModify sets a combined work and modification function. It returns a
-// list of modifications to be applied after the work is complete. Overwrites
-// any previous configuration.
-func WithDoModify(f DoModifyRun) Option {
-	return func(w *Worker) {
-		w.handler = &compactHandler{
-			eqc: w.eqc,
-			run: f,
-		}
+// WithDoModify sets a combined work and modification function that returns
+// the list of modifications to apply after work is complete. Per-task state
+// is stack-allocated in each runOne call, so concurrent Run goroutines are
+// safe. Overwrites any previous configuration.
+func WithDoModify[T any](f DoModifyRun[T]) Option[T] {
+	return func(w *Worker[T]) {
+		w.handler = nil
+		w.doModify = f
 	}
 }
 
-// WithHandler sets a custom task handler for a worker. Only one handler can be
-// active.
-func WithHandler(h Handler) Option {
-	return func(w *Worker) {
+// WithHandler sets a custom task handler for a worker.
+func WithHandler[T any](h Handler[T]) Option[T] {
+	return func(w *Worker[T]) {
 		w.handler = h
 	}
 }
 
-// Worker defines a looping protocol, setting up Run to process tasks in a
-// queue. It goes through a claim/work/finalize cycle, where the work section
-// has background task auto-renewal happening to allow the worker to maintain
-// ownership of the task while it does its job.
-//
-// The finalization phase stops the renewal, freezes the task version, and
-// allows it to be deleted or modified safely.
-type Worker struct {
-	eqc *entroq.EntroQ
-
-	lease          time.Duration
-	baseRetryDelay time.Duration // put AT into the future when using RetryError.
-	backoff        time.Duration // sleep duration after infrastructure errors before retrying.
-
-	handler Handler
-
-	// ErrQMap maps an inbox to the queue tasks are moved to if a MoveError
-	// is returned from a worker's run function.
-	ErrQMap ErrQMap
-
-	// MaxAttempts indicates how many attempts are too many before a retryable
-	// error becomes permanent and the task is moved to an error queue.
-	MaxAttempts int32
+// WithLease sets the frequency of task renewal.
+func WithLease[T any](d time.Duration) Option[T] {
+	return func(w *Worker[T]) {
+		w.lease = d
+	}
 }
 
-// MoveError causes a task to be moved to a specified queue. This can be
-// useful when non-fatal task-specific errors happen in a worker and we want to
-// stash them somewhere instead of just causing the worker to crash, but allows
-// us to handle that as an early error return. The error is added to the task.
-type MoveError struct {
-	Err error
+// WithErrQMap sets a function that maps from inbox queue names to error queue
+// names. Defaults to DefaultErrQMap.
+func WithErrQMap[T any](f ErrQMap) Option[T] {
+	return func(w *Worker[T]) {
+		w.ErrQMap = f
+	}
 }
 
-// NewMoveError creates a new MoveError from the given error.
-func NewMoveError(err error) *MoveError {
-	return &MoveError{Err: err}
+// WithMaxAttempts sets the maximum attempts allowed before a RetryError turns
+// into a MoveError. If 0 (the default), there is no maximum.
+func WithMaxAttempts[T any](m int32) Option[T] {
+	return func(w *Worker[T]) {
+		w.MaxAttempts = m
+	}
 }
 
-// MoveErrorf creates a MoveError given a format string and values,
-// just like fmt.Errorf.
-func MoveErrorf(format string, values ...any) *MoveError {
-	return NewMoveError(fmt.Errorf(format, values...))
+// WithBaseRetryDelay sets the base delay for a retried task.
+func WithBaseRetryDelay[T any](d time.Duration) Option[T] {
+	return func(w *Worker[T]) {
+		w.baseRetryDelay = d
+	}
 }
 
-// Error produces an error string.
-func (e *MoveError) Error() string {
-	return e.Err.Error()
+// WithBackoff sets how long the worker sleeps after an infrastructure error
+// before attempting to claim again. Defaults to DefaultBackoff.
+func WithBackoff[T any](d time.Duration) Option[T] {
+	return func(w *Worker[T]) {
+		w.backoff = d
+	}
 }
 
-// Unwrap allows errors.Is and errors.As to see through this error.
-func (e *MoveError) Unwrap() error {
-	return e.Err
+// DefaultErrQMap appends "/err" to the inbox.
+func DefaultErrQMap(inbox string) string {
+	return inbox + "/err"
 }
 
-// RetryError causes a task to be retried, incrementing its Attempt field
-// and setting its Err to the text of the error. If MaxAttempts is positive and
-// nonzero, and has been reached, then this behaves in the same ways as a
-// MoveError.
-type RetryError struct {
-	Err error
-}
-
-// NewRetryError creates a new RetryError from the given error.
-func NewRetryError(err error) *RetryError {
-	return &RetryError{Err: err}
-}
-
-// RetryErrorf creates a RetryError in the same way that you would
-// create an error with fmt.Errorf.
-func RetryErrorf(format string, values ...any) *RetryError {
-	return NewRetryError(fmt.Errorf(format, values...))
-}
-
-// Error produces an error string.
-func (e *RetryError) Error() string {
-	return e.Err.Error()
-}
-
-// Unwrap allows errors.Is and errors.As to see through this error.
-func (e *RetryError) Unwrap() error {
-	return e.Err
-}
-
-// Logic is now injected via functional options.
-
-// runOne claims one task, runs the work function with renewal, and applies
-// any resulting modification. Returns nil on success and on handled task-level
-// errors (dependency errors and timeouts are logged and swallowed). Returns a
-// non-nil error on work failures or context cancellation.
-func (w *Worker) runOne(ctx context.Context, qs []string) error {
+// runOne claims one task, unmarshals its value into T, runs the work function
+// with renewal, and applies any resulting modification. All per-task state is
+// local to this call, making concurrent Run goroutines safe.
+func (w *Worker[T]) runOne(ctx context.Context, qs []string) error {
 	task, err := w.eqc.Claim(ctx, entroq.From(qs...), entroq.ClaimFor(w.lease))
 	if err != nil {
 		if entroq.IsCanceled(err) {
 			return err
 		}
-		// Claim failures are likely transient -- back off before returning so
-		// the loop doesn't spin tightly under a network partition.
 		log.Printf("Worker claim failed (%q), backing off %v: %v", qs, w.backoff, err)
 		select {
 		case <-ctx.Done():
@@ -315,14 +251,87 @@ func (w *Worker) runOne(ctx context.Context, qs []string) error {
 
 	errQ := w.ErrQMap(task.Queue)
 
-	// handleErr is set when run returns a RetryError or MoveError.
-	// It is applied after renewal stops using the stable task version.
+	// Decode task.Value into T. When T is json.RawMessage, skip unmarshaling
+	// entirely and alias the slice directly -- no copy, no allocation. This is
+	// the fast path for callers that want raw bytes without typed decoding.
+	// Note: value and task.Value share the same backing array in that case, so
+	// in-place byte mutation of either would affect both. Appending is safe.
+	var value T
+	if task.Value != nil {
+		switch raw := any(&value).(type) {
+		case *json.RawMessage:
+			*raw = task.Value
+		default:
+			if err := json.Unmarshal(task.Value, &value); err != nil {
+				log.Printf("Worker decode error, moving task %v to %q: %v", task.ID, errQ, err)
+				if _, _, merr := w.eqc.Modify(ctx, task.Quarantine(err.Error(), errQ)); merr != nil {
+					log.Printf("Worker failed to quarantine malformed task %v: %v", task.ID, merr)
+				}
+				return nil
+			}
+		}
+	}
+
+	// Build a per-invocation handler. For doModify, state lives here on the
+	// stack so concurrent Run goroutines never share mutable handler fields.
+	handler := w.handler
+	if w.doModify != nil {
+		var mods []entroq.ModifyArg
+		initial := task
+		handler = &funcHandler[T]{
+			do: func(ctx context.Context, task *entroq.Task, value T) error {
+				var err error
+				mods, err = w.doModify(ctx, task, value)
+				return err
+			},
+			finish: func(ctx context.Context, renewed *entroq.Task, _ T) error {
+				modification := entroq.NewModification("", mods...)
+				switch {
+				case initial.Version > renewed.Version:
+					return fmt.Errorf("task updated inside worker body, expected version <= %v, got %v", renewed.Version, initial.Version)
+				case initial.Version < renewed.Version:
+					for _, t := range modification.Changes {
+						if t.ID == renewed.ID {
+							t.Version = renewed.Version
+						}
+					}
+					for _, id := range modification.Depends {
+						if id.ID == renewed.ID {
+							id.Version = renewed.Version
+						}
+					}
+					for _, id := range modification.Deletes {
+						if id.ID == renewed.ID {
+							id.Version = renewed.Version
+						}
+					}
+				}
+				if _, _, err := w.eqc.Modify(ctx, entroq.WithModification(modification)); err != nil {
+					if _, ok := entroq.AsDependency(err); ok {
+						log.Printf("Worker ack failed, throwing away: %v", err)
+						return nil
+					}
+					if entroq.IsTimeout(err) {
+						log.Printf("Worker continuing after ack timeout: %v", err)
+						return nil
+					}
+					if entroq.IsCanceled(err) {
+						log.Printf("Worker exiting cleanly instead of acking: %v", err)
+						return fmt.Errorf("canceled in compact finish: %w", err)
+					}
+					return fmt.Errorf("worker ack: %w", err)
+				}
+				return nil
+			},
+		}
+	}
+
 	var stable *entroq.Task
 	var handleErr error
 
 	if err := DoWithRenew(ctx, w.eqc, task, w.lease, func(ctx context.Context, stop FinalizeRenew) error {
 		defer func() { stable = stop() }()
-		if err := w.handler.TaskDo(ctx, task); err != nil {
+		if err := handler.TaskDo(ctx, task, value); err != nil {
 			if e := new(RetryError); errors.As(err, &e) {
 				if w.MaxAttempts == 0 || task.Attempt+1 < w.MaxAttempts {
 					log.Printf("Worker received retryable error, incrementing attempt: %v", e)
@@ -349,11 +358,9 @@ func (w *Worker) runOne(ctx context.Context, qs []string) error {
 			log.Printf("Worker continuing after timeout (%q)", qs)
 			return nil
 		}
-		return err // including canceled - Run handles that
+		return err
 	}
 
-	// Renewal has stopped; stable holds the final task version.
-	// Apply retry/move modification if run signaled one.
 	if handleErr != nil {
 		var args entroq.ModifyArg
 		if e := new(RetryError); errors.As(handleErr, &e) {
@@ -375,8 +382,7 @@ func (w *Worker) runOne(ctx context.Context, qs []string) error {
 		return nil
 	}
 
-	// Success: call task finish with the stable task.
-	if err := w.handler.TaskFinish(ctx, stable); err != nil {
+	if err := handler.TaskFinish(ctx, stable, value); err != nil {
 		if _, ok := entroq.AsDependency(err); ok {
 			log.Printf("Worker ack failed (%q), throwing away: %v", qs, err)
 			return nil
@@ -396,7 +402,7 @@ func (w *Worker) runOne(ctx context.Context, qs []string) error {
 
 // Run claims tasks from the given queues and processes them in a loop until
 // the context is canceled or an unrecoverable error is encountered.
-func (w *Worker) Run(ctx context.Context, qs ...string) error {
+func (w *Worker[T]) Run(ctx context.Context, qs ...string) error {
 	if len(qs) == 0 {
 		return fmt.Errorf("no queues specified to work on")
 	}
@@ -417,74 +423,67 @@ func (w *Worker) Run(ctx context.Context, qs ...string) error {
 	}
 }
 
-// Option can be passed to New to modify parameters.
-type Option func(*Worker)
-
-// WithLease sets the frequency of task renewal. Tasks will be claimed
-// for an amount of time slightly longer than this so that they have a chance
-// of being renewed before expiring.
-func WithLease(d time.Duration) Option {
-	return func(w *Worker) {
-		w.lease = d
-	}
+// MoveError causes a task to be moved to a specified queue.
+type MoveError struct {
+	Err error
 }
 
-// WithErrQMap sets a function that maps from inbox queue names to error queue names.
-// Defaults to DefaultErrQMap.
-func WithErrQMap(f ErrQMap) Option {
-	return func(w *Worker) {
-		w.ErrQMap = f
-	}
+// NewMoveError creates a new MoveError from the given error.
+func NewMoveError(err error) *MoveError {
+	return &MoveError{Err: err}
 }
 
-// WithMaxAttempts sets the maximum attempts that are allowed before a
-// RetryError turns into a MoveError (transparently). If this value is
-// 0 (the default), then there is no maximum.
-func WithMaxAttempts(m int32) Option {
-	return func(w *Worker) {
-		w.MaxAttempts = m
-	}
+// MoveErrorf creates a MoveError given a format string and values.
+func MoveErrorf(format string, values ...any) *MoveError {
+	return NewMoveError(fmt.Errorf(format, values...))
 }
 
-// WithBaseRetryDelay sets the base delay for a retried task.
-func WithBaseRetryDelay(d time.Duration) Option {
-	return func(w *Worker) {
-		w.baseRetryDelay = d
-	}
+func (e *MoveError) Error() string { return e.Err.Error() }
+func (e *MoveError) Unwrap() error { return e.Err }
+
+// RetryError causes a task to be retried, incrementing its Attempt field.
+// If MaxAttempts is positive and nonzero, and has been reached, then this
+// behaves the same as a MoveError.
+type RetryError struct {
+	Err error
 }
 
-// WithBackoff sets how long the worker sleeps after an infrastructure
-// error before attempting to claim again. Defaults to DefaultBackoff.
-func WithBackoff(d time.Duration) Option {
-	return func(w *Worker) {
-		w.backoff = d
-	}
+// NewRetryError creates a new RetryError from the given error.
+func NewRetryError(err error) *RetryError {
+	return &RetryError{Err: err}
 }
 
-// DefaultErrQMap appends "/err" to the inbox.
-func DefaultErrQMap(inbox string) string {
-	return inbox + "/err"
+// RetryErrorf creates a RetryError in the same way you would create an error
+// with fmt.Errorf.
+func RetryErrorf(format string, values ...any) *RetryError {
+	return NewRetryError(fmt.Errorf(format, values...))
 }
+
+func (e *RetryError) Error() string { return e.Err.Error() }
+func (e *RetryError) Unwrap() error { return e.Err }
 
 // Renewal Machinery
 
-// FinalizeRenewAll defines a function that can be called to stop renewal from a worker routine.
-// It returns a slice of tasks that are no longer being renewed, so versions are stable.
+// FinalizeRenewAll defines a function that can be called to stop renewal from
+// a worker routine. It returns a slice of tasks that are no longer being
+// renewed, so versions are stable.
 type FinalizeRenewAll func() []*entroq.Task
 
-// FinalizeRenew defines a function that can be called to stop renewal from a worker routine.
-// It returns a single task that is no longer being renewed, so its version is stable.
+// FinalizeRenew defines a function that can be called to stop renewal from a
+// worker routine. It returns a single task that is no longer being renewed, so
+// its version is stable.
 type FinalizeRenew func() *entroq.Task
 
-// DoWorkAll defines a function that accepts a 'stop' function so that work can be
-// done, renewal can be stopped to get stable task versions, and cleanup can
-// happen. For multiple tasks.
+// DoWorkAll defines a function that accepts a 'stop' function so that work
+// can be done, renewal can be stopped to get stable task versions, and cleanup
+// can happen. For multiple tasks.
 type DoWorkAll func(ctx context.Context, stop FinalizeRenewAll) error
 
 // DoWork defines a function like WorkAll, but handles only one task.
 type DoWork func(ctx context.Context, stop FinalizeRenew) error
 
-// DoWithRenewAll runs the provided function while keeping all given tasks leases renewed.
+// DoWithRenewAll runs the provided function while keeping all given task
+// leases renewed.
 func DoWithRenewAll(ctx context.Context, c *entroq.EntroQ, tasks []*entroq.Task, lease time.Duration, f DoWorkAll) error {
 	type outVal struct {
 		tasks []*entroq.Task
@@ -497,7 +496,6 @@ func DoWithRenewAll(ctx context.Context, c *entroq.EntroQ, tasks []*entroq.Task,
 	fctx, fcancel := context.WithCancelCause(ctx)
 	defer fcancel(nil)
 
-	// Run the renewer, with a channel for consuming intermediate renewed tasks.
 	stopRenew := make(chan struct{})
 	g.Go(func() error {
 		renewed := tasks
@@ -507,10 +505,9 @@ func DoWithRenewAll(ctx context.Context, c *entroq.EntroQ, tasks []*entroq.Task,
 		for {
 			select {
 			case <-stopRenew:
-				out = taskCh // enable final send
+				out = taskCh
 				stopRenew = nil
 			case <-doneCh:
-				// cancellation shouldn't keep us from returning a value
 				out = taskCh
 				doneCh = nil
 			case <-time.After(lease / 2):
@@ -524,13 +521,11 @@ func DoWithRenewAll(ctx context.Context, c *entroq.EntroQ, tasks []*entroq.Task,
 						break
 					}
 					if depErr, ok := entroq.AsDependency(err); ok {
-						// Lease lost. Fail fast.
 						fcancel(depErr)
 						stopErr = depErr
 						out = taskCh
 						break
 					}
-					// Transient error. Log and retry at next interval.
 					log.Printf("Transient renewal error: %v", err)
 					continue
 				}
@@ -569,10 +564,10 @@ func DoWithRenewAll(ctx context.Context, c *entroq.EntroQ, tasks []*entroq.Task,
 	return nil
 }
 
-// DoWithRenew runs the provided function while keeping the given task lease renewed.
+// DoWithRenew runs the provided function while keeping the given task lease
+// renewed.
 func DoWithRenew(ctx context.Context, c *entroq.EntroQ, task *entroq.Task, lease time.Duration, f DoWork) error {
 	if err := DoWithRenewAll(ctx, c, []*entroq.Task{task}, lease, func(ctx context.Context, finalize FinalizeRenewAll) error {
-		// Call the single-task user function.
 		if err := f(ctx, func() *entroq.Task { return finalize()[0] }); err != nil {
 			return fmt.Errorf("do one: %w", err)
 		}

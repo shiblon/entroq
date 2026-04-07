@@ -8,7 +8,7 @@ def test_worker_fail_fast_on_lease_loss(eq):
     due to TaskProxy health checks.
     """
     queue = '/test/fail-fast'
-    eq.modify(inserts=[TaskData(queue=queue, value=b'work')])
+    eq.modify(inserts=[TaskData(queue=queue, value='work')])
     
     worker_stopped = threading.Event()
     
