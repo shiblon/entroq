@@ -10,7 +10,7 @@ test_this_user_found if {
 			"actions": ["ALL"],
 		}],
 	}
-	with input.authz as {"testuser": "auser"}
+	with data.entroq.user.username as "auser"
 	with data.entroq.policy.users as [{
 		"name": "auser",
 		"queues": [{
@@ -22,7 +22,7 @@ test_this_user_found if {
 
 test_this_user_not_found if {
 	not this_user
-	with input.authz as {"testuser": "auser"}
+	with data.entroq.user.username as "auser"
 	with data.entroq.policy.users as [{
 		"name": "buser",
 	}]
@@ -30,7 +30,7 @@ test_this_user_not_found if {
 
 test_only_match_wildcard_role_queues if {
 	count(role_queues) == 2
-	with input.authz as {"testuser": "blah"}
+	with data.entroq.user.username as "blah"
 	with input.queues as [{
 		"exact": "/ns=global/inbox",
 		"actions": ["CLAIM"],
@@ -53,7 +53,7 @@ test_only_match_wildcard_role_queues if {
 
 test_only_match_wildcard_role_queues_single if {
 	count(role_queues) == 1
-	with input.authz as {"testuser": "auser"}
+	with data.entroq.user.username as "auser"
 	with input.queues as [{
 		"exact": "aqueue",
 		"actions": ["CLAIM"],
@@ -70,7 +70,7 @@ test_only_match_wildcard_role_queues_single if {
 
 test_only_extra_user_queues if {
 	user_queues == {{"prefix": "/ns=user/blah/", "actions": ["ALL"]}}
-	with input.authz as {"testuser": "blah"}
+	with data.entroq.user.username as "blah"
 	with data.entroq.policy.users as []
 	with data.entroq.policy.roles as []
 }
@@ -81,7 +81,7 @@ test_user_with_queues if {
 		{"exact": "q1", "actions": ["READ"]},
 		{"exact": "q2", "actions": ["CLAIM"]},
 	}
-	with input.authz as {"testuser": "blah"}
+	with data.entroq.user.username as "blah"
 	with data.entroq.policy.users as [{
 		"name": "blah",
 		"queues": [
@@ -99,7 +99,7 @@ test_user_with_queues if {
 
 test_no_matching_user_queues if {
 	user_queues == {{"prefix": "/ns=user/auser/", "actions": ["ALL"]}}
-	with input.authz as {"testuser": "auser"}
+	with data.entroq.user.username as "auser"
 	with input.queues as [{
 		"exact": "aqueue",
 		"actions": ["CLAIM"],
