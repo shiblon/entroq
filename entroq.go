@@ -53,8 +53,6 @@ import (
 	"time"
 
 	"golang.org/x/sync/errgroup"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 const (
@@ -370,47 +368,18 @@ func From(qs ...string) ClaimOpt {
 	}
 }
 
-func asStatusCode(err error) (codes.Code, bool) {
-	// We have to sequentially unwrap errors to find the underlying cause,
-	// since the status package does not expose its error type and the
-	// GRPCStatus interface is ephemeral and clearly meant to be an
-	// implementation detail in that package.
-	for e := err; e != nil; e = errors.Unwrap(e) {
-		if code := status.Code(e); code != codes.Unknown {
-			return code, true
-		}
-	}
-	return codes.OK, false
-}
-
 // IsCanceled indicates whether the error is a canceled error.
+// gRPC backends translate codes.Canceled to context.Canceled at the boundary,
+// so this only needs to check native Go errors.
 func IsCanceled(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, context.Canceled) {
-		return true
-	}
-	if code, ok := asStatusCode(err); ok {
-		return code == codes.Canceled
-	}
-
-	return false
+	return errors.Is(err, context.Canceled)
 }
 
 // IsTimeout indicates whether the error is a timeout error.
+// gRPC backends translate codes.DeadlineExceeded to context.DeadlineExceeded
+// at the boundary, so this only needs to check native Go errors.
 func IsTimeout(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		return true
-	}
-	if code, ok := asStatusCode(err); ok {
-		return code == codes.DeadlineExceeded
-	}
-
-	return false
+	return errors.Is(err, context.DeadlineExceeded)
 }
 
 // claimQueryFromOpts processes ClaimOpt values and produces a claim query.
@@ -1170,7 +1139,7 @@ func (m *Modification) DependencyError(found map[string]*Task) error {
 	missingDepends := m.missingDepends(found)
 
 	if len(presentInserts) > 0 || len(missingChanges) > 0 || len(claimedChanges) > 0 || len(missingDeletes) > 0 || len(claimedDeletes) > 0 || len(missingDepends) > 0 {
-		return DependencyError{
+		return &DependencyError{
 			Inserts: presentInserts,
 			Changes: missingChanges,
 			Deletes: missingDeletes,
@@ -1194,13 +1163,13 @@ type DependencyError struct {
 }
 
 // DependencyErrorf creates a new dependency error with the given message.
-func DependencyErrorf(msg string, vals ...interface{}) DependencyError {
-	return DependencyError{Message: fmt.Sprintf(msg, vals...)}
+func DependencyErrorf(msg string, vals ...interface{}) *DependencyError {
+	return &DependencyError{Message: fmt.Sprintf(msg, vals...)}
 }
 
-// Copy produces a new deep copy of this error type.
-func (m DependencyError) Copy() DependencyError {
-	e := DependencyError{
+// Copy produces a new deep copy of this error.
+func (m *DependencyError) Copy() *DependencyError {
+	e := &DependencyError{
 		Inserts: make([]*TaskID, len(m.Inserts)),
 		Depends: make([]*TaskID, len(m.Depends)),
 		Deletes: make([]*TaskID, len(m.Deletes)),
@@ -1217,29 +1186,29 @@ func (m DependencyError) Copy() DependencyError {
 }
 
 // HasMissing indicates whether there was anything missing in this error.
-func (m DependencyError) HasMissing() bool {
+func (m *DependencyError) HasMissing() bool {
 	return len(m.Depends) > 0 || len(m.Deletes) > 0 || len(m.Changes) > 0
 }
 
 // HasClaims indicates whether any of the tasks were claimed by another claimant and unexpired.
-func (m DependencyError) HasClaims() bool {
+func (m *DependencyError) HasClaims() bool {
 	return len(m.Claims) > 0
 }
 
 // HasCollisions indicates whether any of the inserted tasks collided with existing IDs.
-func (m DependencyError) HasCollisions() bool {
+func (m *DependencyError) HasCollisions() bool {
 	return len(m.Inserts) > 0
 }
 
 // OnlyClaims indicates that the error was only related to claimants. Useful
 // for backends to do "force" operations, making it easy to ignore this
 // particular error.
-func (m DependencyError) OnlyClaims() bool {
+func (m *DependencyError) OnlyClaims() bool {
 	return !m.HasMissing() && !m.HasCollisions()
 }
 
 // Error produces a helpful error string indicating what was missing.
-func (m DependencyError) Error() string {
+func (m *DependencyError) Error() string {
 	lines := []string{
 		fmt.Sprintf("DependencyError: %v", m.Message),
 	}
@@ -1276,14 +1245,14 @@ func (m DependencyError) Error() string {
 	return strings.Join(lines, "\n")
 }
 
-// AsDependency indicates whether the given error is a dependency error.
-func AsDependency(err error) (DependencyError, bool) {
-	derr := DependencyError{}
+// AsDependency returns the *DependencyError within err (if any), unwrapping
+// through the error chain. Returns nil and false if err is not a DependencyError.
+func AsDependency(err error) (*DependencyError, bool) {
+	var derr *DependencyError
 	if ok := errors.As(err, &derr); ok {
 		return derr, true
 	}
-
-	return DependencyError{}, false
+	return nil, false
 }
 
 // Time gets the time as the backend understands it, in UTC. Default is just

@@ -203,6 +203,11 @@ func (e *MoveTaskError) Error() string {
 	return e.Err.Error()
 }
 
+// Unwrap allows errors.Is and errors.As to see through this error.
+func (e *MoveTaskError) Unwrap() error {
+	return e.Err
+}
+
 // RetryTaskError causes a task to be retried, incrementing its Attempt field
 // and setting its Err to the text of the error. If MaxAttempts is positive and
 // nonzero, and has been reached, then this behaves in the same ways as a
@@ -225,6 +230,11 @@ func RetryTaskErrorf(format string, values ...interface{}) *RetryTaskError {
 // Error produces an error string.
 func (e *RetryTaskError) Error() string {
 	return e.Err.Error()
+}
+
+// Unwrap allows errors.Is and errors.As to see through this error.
+func (e *RetryTaskError) Unwrap() error {
+	return e.Err
 }
 
 // NewWorker creates a new worker that makes it easy to claim and operate on
@@ -252,17 +262,6 @@ func (c *EntroQ) NewWorker(handler WorkHandler, opts ...WorkerOption) *Worker {
 	return NewWorker(c, handler, opts...)
 }
 
-// taskErrMsg gets the error message from a special task error.
-func taskErrMsg(err error) string {
-	if err == nil {
-		return ""
-	}
-	var firstErr error
-	for e := err; e != nil; e = errors.Unwrap(e) {
-		firstErr = e
-	}
-	return firstErr.Error()
-}
 
 // runOne claims one task, runs the work function with renewal, and applies
 // any resulting modification. Returns nil on success and on handled task-level
@@ -332,9 +331,9 @@ func (w *Worker) runOne(ctx context.Context, qs []string) error {
 	if handleErr != nil {
 		var args ModifyArg
 		if e := new(RetryTaskError); errors.As(handleErr, &e) {
-			args = stable.RetryOrQuarantine(taskErrMsg(e), errQ, w.MaxAttempts, ArrivalTimeBy(w.baseRetryDelay))
+			args = stable.RetryOrQuarantine(e.Error(), errQ, w.MaxAttempts, ArrivalTimeBy(w.baseRetryDelay))
 		} else if e := new(MoveTaskError); errors.As(handleErr, &e) {
-			args = stable.Quarantine(taskErrMsg(e), errQ)
+			args = stable.Quarantine(e.Error(), errQ)
 		}
 		if _, _, err := w.eqc.Modify(ctx, args); err != nil {
 			if _, ok := AsDependency(err); ok {
