@@ -47,6 +47,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"strings"
 	"time"
@@ -539,13 +540,21 @@ func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.D
 				}
 				r, err := c.RenewAllFor(ctx, renewed, lease)
 				if err != nil {
-					if !IsCanceled(err) {
-						// Never error out of renewal, so that we don't have to pass
-						// an error out of the finalize function.
-						// We're guaranteed to have a list of tasks anyway.
-						stopErr = fmt.Errorf("renew all lease: %w", err)
+					if IsCanceled(err) {
+						out = taskCh
+						break
 					}
-					out = taskCh
+					if depErr, ok := AsDependency(err); ok {
+						// Lease lost. Fail fast.
+						fcancel(depErr)
+						stopErr = depErr
+						out = taskCh
+						break
+					}
+					// Transient error. Log and retry at next interval.
+					// Note: we don't 'break' or 'set stopErr' here, allowing retries.
+					log.Printf("Transient renewal error: %v", err)
+					continue
 				}
 				renewed = r
 			case out <- outVal{renewed, stopErr}:

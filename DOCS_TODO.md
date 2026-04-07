@@ -4,7 +4,6 @@ This is a master tracking document for the upcoming documentation polish pass. T
 
 ## Status Checklist
 - [ ] Refine Operator's Guide
-- [ ] Refine Architectural Recipe: The Sidecar Heartbeat
 - [ ] Refine Notification Principles
 - [ ] **NEW**: Document gRPC Load Balancing Capabilities
 - [ ] Finalize README integration
@@ -80,64 +79,7 @@ TODO: flesh out a recipe for heartbeats. A single config task in a single queue.
 
 ---
 
-## 2. Sidecar Recipe (Source: deploy/sidecar_recipe.md)
-
-# Architectural Recipe: The Sidecar Heartbeat
-
-In a large EntroQ cluster, you often face the challenge of keeping the database "Quiet-by-Default" while still maintaining sub-second responsiveness for scheduled work. While every worker *could* be a heartbeat node, doing so creates unnecessary background noise as hundreds of nodes redundanty move the database watermark. A common solution is to designate a single **Sidecar Heartbeat**—a lightweight process that handles the cluster's "ticking" and can simultaneously act as a dynamic control plane.
-
-## The Control Task Pattern
-
-The most robust way to implement this is through a **Control Task**. You create a single, persistent task in a dedicated queue, such as `/entroq/control`. The sidecar process is a simple loop that repeatedly claims this task, performs a minor internal state check, and then modifies the task to advance its arrival time by a few seconds. This simple act of modification—when combined with the `--heartbeat` flag on the `eqc` CLI—triggers the database's internal notification logic and broadcasts a readiness signal to the entire cluster.
-
-One might worry about what happens if the sidecar dies. In EntroQ, this is gracefully handled by the system's core invariants: since the control task is version-locked, another instance of the sidecar can safely pick up the work once the arrival time passes. More importantly, the sidecar can use the task's JSON value to store dynamic configuration. If a developer needs to change the cluster's global poll interval or heartbeat frequency, they simply update the value of the control task, and the sidecar picks up the new instructions on its next claim check.
-
-## Recipe: Bash Sidecar with eqc
-
-With the direct-to-PostgreSQL support in `eqc`, a sidecar becomes a trivial but powerful Bash script. By leveraging the `--pg_url` and `--heartbeat` flags, we gain all the performance of the Go-based backend with the operational simplicity of a shell loop.
-
-```bash
-#!/bin/bash
-# sidecar.sh: A simple EntroQ heartbeat and control sidecar.
-
-PG_URL="postgres://user:pass@localhost:5432/entroq?sslmode=disable"
-CONTROL_QUEUE="/entroq/control"
-PG_HEARTBEAT="5s"
-
-echo "Starting EntroQ Sidecar Heartbeat for ${PG_URL}"
-
-# The loop ensures that even if a network hiccup kills a single eqc call,
-# the sidecar continues to attempt to move the cluster's watermark.
-while true; do
-    # 1. Claim the control task. This blocks until the task is ready.
-    # 2. Use the --pg_heartbeat flag to move the global watermark.
-    TASK_JSON=$(eqc --pg_url="${PG_URL}" --pg_heartbeat="${PG_HEARTBEAT}" \
-                   claim -q "${CONTROL_QUEUE}" -d 30)
-
-    if [ -z "$TASK_JSON" ]; then
-        echo "No control task found. Initializing..."
-        eqc --pg_url="${PG_URL}" ins -q "${CONTROL_QUEUE}" -v '{"poll_s": 30}'
-        continue
-    fi
-
-    # (Optional) Here you could parse TASK_JSON with jq to read config.
-    # For now, we simply advance the task to "tick" the cluster.
-    TASK_ID=$(echo "${TASK_JSON}" | jq -r '.id')
-    TASK_VER=$(echo "${TASK_JSON}" | jq -r '.version')
-
-    eqc --pg_url="${PG_URL}" mod --delete "${TASK_ID}:${TASK_VER}" \
-                                 --insert "${CONTROL_QUEUE}:$(echo ${TASK_JSON} | jq -c .value)"
-
-    # A small sleep to prevent tight-looping if claims are instantaneous.
-    sleep 5
-done
-```
-
-This "plain vanilla" script provides everything a cluster needs: a high-precision global clock, dynamic configuration storage, and zero overhead for the hundreds of "Quiet" workers processing your primary business logic.
-
----
-
-## 3. Notification Principles (Source: notification_principles.md)
+## 2. Notification Principles (Source: notification_principles.md)
 
 # EntroQ Principles: Invariants and Notifications
 
@@ -146,7 +88,7 @@ EntroQ defines a set of **Fundamental Invariants** that are guaranteed regardles
 1.  **Safety**: Every `Claim` and `Modify` is an atomic, version-locked SQL transaction. It is mathematically impossible to double-claim a task or drop a commit once the transaction succeeds.
 2.  **Liveness**: Every client maintains a polling safety net. Even if the notification bus is completely silent, progress will always be made.
 
-The notification system described below is a **Progressive Enhancement**. It primarily leverages PostgreSQL's `LISTEN/NOTIFY` to reduce latency for high-performance distributed workloads without compromising the system's core reliability.
+The notification system described below is a **Progressive Enhancement**. It primarily leverages PostgreSQL's `LISTEN/NOTIFY` to reduce latency for high-precision distributed workloads without compromising the system's core reliability.
 
 ## 1. User Intuition and Expectations
 
@@ -182,7 +124,7 @@ The `eqc` binary is a command-line tool that can be used to do nearly everything
 
 ---
 
-## 4. NEW: gRPC Load Balancing (To be written)
+## 3. NEW: gRPC Load Balancing (To be written)
 
 ### Key Points to Include:
 - **Architectural Unlock**: With the `PGNotifyWaiter` and unified heartbeat/flusher logic, multiple gRPC server instances can now listen to the same Postgres backend efficiently.
