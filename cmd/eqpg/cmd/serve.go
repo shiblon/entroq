@@ -36,6 +36,7 @@ var (
 	opaPath       string
 	heartbeat     time.Duration
 	noListen      bool
+	initSchema    bool
 )
 
 var serveCmd = &cobra.Command{
@@ -58,6 +59,23 @@ var serveCmd = &cobra.Command{
 		}
 
 		resolveDBFlags()
+
+		if initSchema {
+			db, err := eqpg.OpenDB(dbAddr,
+				eqpg.WithDB(dbName),
+				eqpg.WithUsername(dbUser),
+				eqpg.WithPassword(dbPass),
+			)
+			if err != nil {
+				return fmt.Errorf("schema init: open db: %w", err)
+			}
+			if err := eqpg.InitSchema(ctx, db); err != nil {
+				db.Close()
+				return fmt.Errorf("schema init: %w", err)
+			}
+			db.Close()
+			log.Printf("Schema initialized at version %s.", eqpg.SchemaVersion)
+		}
 
 		openerOptions := []eqpg.PGOpt{
 			eqpg.WithDB(dbName),
@@ -118,6 +136,7 @@ func init() {
 	flags.StringVar(&opaPath, "opa_path", "", fmt.Sprintf("OPA API path. Default: %s.", opahttp.DefaultAPIPath))
 	flags.DurationVar(&heartbeat, "heartbeat", 5*time.Second, "Heartbeat interval for this service. Non-zero values designate this node as a cluster Leader.")
 	flags.BoolVar(&noListen, "no_listen", true, "Disable the persistent PostgreSQL LISTEN connection. Optimizes singleton deployments.")
+	flags.BoolVar(&initSchema, "init_schema", false, "Initialize the EntroQ schema before serving (idempotent; safe to always set).")
 
 	rootCmd.AddCommand(serveCmd)
 }

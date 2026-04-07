@@ -1,0 +1,61 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_DB=entroq
+      - POSTGRES_USER=entroq
+      - POSTGRES_PASSWORD=entroq
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U entroq -d entroq"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  entroq:
+    build:
+      context: ../..
+      dockerfile: ./cmd/eqpg/Dockerfile
+    environment:
+      - PGPASSWORD=entroq
+    ports:
+      - "37706:37706"
+      - "9100:9100"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      opa:
+        condition: service_started
+    command:
+      - "serve"
+      - "--dbaddr=postgres:5432"
+      - "--dbname=entroq"
+      - "--dbuser=entroq"
+      - "--heartbeat=5s"
+      - "--init_schema"
+      - "--authz=opahttp"
+      - "--opa_url=http://opa:8181"
+
+  opa:
+    image: openpolicyagent/opa:latest
+    command:
+      - "run"
+      - "--addr=:8181"
+      - "--server"
+      - "--watch"
+      - "--log-level=info"
+      - "/etc/opa/core"
+      - "/etc/opa/example"
+      - "/etc/opa/local"
+    ports:
+      - "8181:8181"
+    volumes:
+      # Core entroq Rego -- queue matching and authz logic.
+      - ../../pkg/authz/opadata/conf/core:/etc/opa/core
+      # Example permissions implementation -- maps users/roles to queues.
+      - ../../pkg/authz/opadata/conf/example:/etc/opa/example
+      # Local overrides -- inline JWKS user.rego + data.json with key material
+      # and policy. Replace user.rego with the reference implementation and
+      # add a jwks_url to data.json when using a real IDP.
+      - ./opa:/etc/opa/local

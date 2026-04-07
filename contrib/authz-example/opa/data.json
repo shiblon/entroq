@@ -1,0 +1,54 @@
+{
+  "entroq": {
+    "idp": {
+      "audience": "entroq-example",
+      "issuer": "entroq-example-issuer",
+      "jwks": "{\"keys\":[{\"alg\":\"RS256\",\"e\":\"AQAB\",\"kid\":\"example-key\",\"kty\":\"RSA\",\"n\":\"xXTB4UZC6foWs8fF_zQwe1bgcO0NZwd8r2zsjC6KElonHCCK6CCO6g8uhiPRhrd5Beg4ZWR69VTspSupvPk93iT4TClXKGAzKq3ckV84rZieRZpImr2U1aMMEv2iRq4Uxnhrco9PzL2WWtu0cw-1JUiqtDVM5K1j1ieFpy2eLrjiT5VgOawm--I3Ez-m9R0LcXfb_ERP4u8c_chHxm2ZFq224--bf3Yq5ZLruF-nvjuGsWCFKuG9gKn3TA9qb7UOPkx1krp_AXTxA5RDGlBc0WKl6kGRR3WPPLzD8v-J7KLLkhTXT4NGMgZ6101or7Ecjri9SEZpdaJXc0d4XB2LyQ\",\"use\":\"sig\"}]}"
+    },
+    "policy": {
+      "roles": [
+        {
+          "name": "writers",
+          "queues": [
+            {
+              "actions": [
+                "INSERT",
+                "READ"
+              ],
+              "prefix": "/shared/"
+            }
+          ]
+        }
+      ],
+      "users": [
+        {
+          "name": "alice",
+          "queues": [
+            {
+              "actions": [
+                "*"
+              ],
+              "prefix": "/users/alice/"
+            }
+          ],
+          "roles": [
+            "writers"
+          ]
+        },
+        {
+          "name": "bob",
+          "queues": [
+            {
+              "actions": [
+                "READ",
+                "CLAIM"
+              ],
+              "exact": "/shared/inbox"
+            }
+          ],
+          "roles": []
+        }
+      ]
+    }
+  }
+}
