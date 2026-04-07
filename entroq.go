@@ -1163,7 +1163,7 @@ type DependencyError struct {
 }
 
 // DependencyErrorf creates a new dependency error with the given message.
-func DependencyErrorf(msg string, vals ...interface{}) *DependencyError {
+func DependencyErrorf(msg string, vals ...any) *DependencyError {
 	return &DependencyError{Message: fmt.Sprintf(msg, vals...)}
 }
 
