@@ -379,7 +379,8 @@ func TestEQMem_journalClaimModClaim(t *testing.T) {
 		t.Fatalf("Error changing: %v", err)
 	}
 
-	if _, err := eq.Claim(ctx, entroq.From("/queue/2")); err != nil {
+	// /queue/2 is empty; TryClaim exercises the journal path without blocking.
+	if _, err := eq.TryClaim(ctx, entroq.From("/queue/2")); err != nil {
 		t.Fatalf("Error claiming again: %v", err)
 	}
 
