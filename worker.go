@@ -194,7 +194,7 @@ func NewMoveTaskError(err error) *MoveTaskError {
 
 // MoveTaskErrorf creates a MoveTaskError given a format string and values,
 // just like fmt.Errorf.
-func MoveTaskErrorf(format string, values ...interface{}) *MoveTaskError {
+func MoveTaskErrorf(format string, values ...any) *MoveTaskError {
 	return NewMoveTaskError(fmt.Errorf(format, values...))
 }
 
@@ -223,7 +223,7 @@ func NewRetryTaskError(err error) *RetryTaskError {
 
 // RetryTaskErrorf creates a RetryTaskError in the same way that you would
 // create an error with fmt.Errorf.
-func RetryTaskErrorf(format string, values ...interface{}) *RetryTaskError {
+func RetryTaskErrorf(format string, values ...any) *RetryTaskError {
 	return NewRetryTaskError(fmt.Errorf(format, values...))
 }
 

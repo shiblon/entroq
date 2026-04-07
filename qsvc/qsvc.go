@@ -287,7 +287,7 @@ func protoFromTask(t *entroq.Task) *pb.Task {
 	}
 }
 
-func autoCodeErrorf(format string, vals ...interface{}) error {
+func autoCodeErrorf(format string, vals ...any) error {
 	err := fmt.Errorf(format, vals...)
 	if entroq.IsTimeout(err) {
 		return status.New(codes.DeadlineExceeded, err.Error()).Err()
@@ -298,7 +298,7 @@ func autoCodeErrorf(format string, vals ...interface{}) error {
 	return err
 }
 
-func codeErrorf(code codes.Code, format string, vals ...interface{}) error {
+func codeErrorf(code codes.Code, format string, vals ...any) error {
 	return status.New(code, fmt.Errorf(format, vals...).Error()).Err()
 }
 
