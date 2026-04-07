@@ -7,7 +7,6 @@ try_claim_one, etc.).
 Requires psycopg >= 3.
 """
 
-import base64
 import hashlib
 import json
 import logging
@@ -57,7 +56,7 @@ def _encode_inserts(items) -> str:
     for it in items:
         obj = {
             'queue': it.queue,
-            'value': base64.standard_b64encode(it.value or b'').decode(),
+            'value': it.value,
         }
         if it.id:
             obj['id'] = str(it.id)
@@ -78,7 +77,7 @@ def _encode_changes(items) -> str:
             'id': str(c.id),
             'version': c.version,
             'queue': c.queue,
-            'value': base64.standard_b64encode(c.value or b'').decode(),
+            'value': c.value,
         }
         if c.at is not None:
             obj['at'] = c.at.isoformat()
@@ -99,7 +98,7 @@ def _row_to_task(row: dict) -> Task:
         created=row['created'],
         modified=row['modified'],
         claimant=str(row['claimant']) if row['claimant'] is not None else '',
-        value=bytes(row['value']) if row['value'] is not None else b'',
+        value=row['value'],
         claims=row['claims'],
         attempt=row['attempt'],
         err=row['err'],

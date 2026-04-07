@@ -516,9 +516,11 @@ func (b *EQPG) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Task
 	var tasks []*entroq.Task
 	for rows.Next() {
 		t := &entroq.Task{}
-		if err := rows.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Created, &t.Modified, &t.Claimant, &t.Value, &t.Claims, &t.Attempt, &t.Err); err != nil {
+		var val []byte
+		if err := rows.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Created, &t.Modified, &t.Claimant, &val, &t.Claims, &t.Attempt, &t.Err); err != nil {
 			return nil, fmt.Errorf("task scan: %w", err)
 		}
+		t.Value = val
 		// NOTE: we can make this more efficient by not even asking for the
 		// value, but it complicates the code a lot and may not be worth the
 		// maintainability hit.
@@ -550,6 +552,7 @@ func (b *EQPG) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 		return nil, fmt.Errorf("no duration set for claim %q", cq.Queues)
 	}
 	task := new(entroq.Task)
+	var val []byte
 	err := b.DB.QueryRowContext(ctx,
 		`SELECT id, version, queue, at, created, modified, claimant, value, claims, attempt, err
 		 FROM try_claim($1, $2, $3)`,
@@ -557,8 +560,9 @@ func (b *EQPG) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 	).Scan(
 		&task.ID, &task.Version, &task.Queue, &task.At,
 		&task.Created, &task.Modified, &task.Claimant,
-		&task.Value, &task.Claims, &task.Attempt, &task.Err,
+		&val, &task.Claims, &task.Attempt, &task.Err,
 	)
+	task.Value = val
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -725,9 +729,11 @@ func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *mo
 	for rows.Next() {
 		t := new(entroq.Task)
 		var kind string
-		if err := rows.Scan(&kind, &t.ID, &t.Version, &t.Queue, &t.At, &t.Created, &t.Modified, &t.Claimant, &t.Value, &t.Claims, &t.Attempt, &t.Err); err != nil {
+		var val []byte
+		if err := rows.Scan(&kind, &t.ID, &t.Version, &t.Queue, &t.At, &t.Created, &t.Modified, &t.Claimant, &val, &t.Claims, &t.Attempt, &t.Err); err != nil {
 			return nil, nil, fmt.Errorf("pg modify scan: %w", err)
 		}
+		t.Value = val
 		switch kind {
 		case "inserted":
 			inserted = append(inserted, t)

@@ -30,8 +30,8 @@ func Example() {
 
 	// Insert a few tasks:
 	ins, _, err := eq.Modify(ctx,
-		entroq.InsertingInto("q1", entroq.WithValue(entroq.JSONStr("hello 1"))),
-		entroq.InsertingInto("q2", entroq.WithValue(entroq.JSONStr("hello 2"))))
+		entroq.InsertingInto("q1", entroq.WithValue("hello 1")),
+		entroq.InsertingInto("q2", entroq.WithValue("hello 2")))
 	if err != nil {
 		log.Fatalf("Error inserting tasks: %v", err)
 	}
@@ -49,7 +49,7 @@ func Example() {
 	w := worker.New(eq,
 		// Workers claim a task and pass it to your handler functions. In the
 		// background, the task's lease is renewed while the first function runs.
-		worker.WithDo(func(ctx context.Context, initial *entroq.Task) error {
+		worker.WithDo(func(ctx context.Context, initial *entroq.Task, _ json.RawMessage) error {
 			log.Printf("Worker handling task %s", initial)
 			// Do work with it here.
 			return nil
@@ -57,7 +57,7 @@ func Example() {
 		// When ready to commit changes to the task (including deletion), the second
 		// function passes the version-stable task after the renewer is stopped,
 		// making it safe to use it in modification transactions.
-		worker.WithFinish(func(ctx context.Context, final *entroq.Task) error {
+		worker.WithFinish(func(ctx context.Context, final *entroq.Task, _ json.RawMessage) error {
 			log.Printf("Deleting task %s", final)
 			_, _, err := eq.Modify(ctx, final.Delete())
 			if err != nil {
@@ -86,8 +86,8 @@ func Example_dependencies() {
 
 	// 1. Insert a configuration task and a worker task.
 	_, _, err = eq.Modify(ctx,
-		entroq.InsertingInto("config", entroq.WithValue(json.RawMessage(`{"max_retries": 5}`))),
-		entroq.InsertingInto("worker", entroq.WithValue(entroq.JSONStr("do work"))),
+		entroq.InsertingInto("config", entroq.WithRawValue(json.RawMessage(`{"max_retries": 5}`))),
+		entroq.InsertingInto("worker", entroq.WithValue("do work")),
 	)
 	if err != nil {
 		log.Fatalf("insert failed: %v", err)
@@ -98,7 +98,7 @@ func Example_dependencies() {
 	var config *entroq.Task
 
 	w := worker.New(eq,
-		worker.WithDo(func(ctx context.Context, initial *entroq.Task) error {
+		worker.WithDo(func(ctx context.Context, initial *entroq.Task, _ json.RawMessage) error {
 			if config == nil {
 				tasks, err := eq.Tasks(ctx, "config")
 				if err != nil || len(tasks) == 0 {
@@ -109,7 +109,7 @@ func Example_dependencies() {
 			// ... do work with initial and config ...
 			return nil
 		}),
-		worker.WithFinish(func(ctx context.Context, final *entroq.Task) error {
+		worker.WithFinish(func(ctx context.Context, final *entroq.Task, _ json.RawMessage) error {
 			if config == nil {
 				return fmt.Errorf("config missing during finalize")
 			}
@@ -156,7 +156,7 @@ func Example_manualClaimAndRenew() {
 	// claim and renew tasks for custom daemon implementations.
 
 	// Insert a task to work on.
-	if _, _, err := eq.Modify(ctx, entroq.InsertingInto("manual_queue", entroq.WithValue(entroq.JSONStr("work")))); err != nil {
+	if _, _, err := eq.Modify(ctx, entroq.InsertingInto("manual_queue", entroq.WithValue("work"))); err != nil {
 		log.Fatalf("insert failed: %v", err)
 	}
 

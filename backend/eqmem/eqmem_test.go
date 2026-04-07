@@ -190,8 +190,8 @@ func TestEQMemJournalClaim(t *testing.T) {
 	defer eq.Close()
 
 	if _, _, err := eq.Modify(ctx,
-		entroq.InsertingInto("/queue/of/tasks", entroq.WithValue(entroq.JSONStr("hey"))),
-		entroq.InsertingInto("/queue/of/others", entroq.WithValue(entroq.JSONStr("other"))),
+		entroq.InsertingInto("/queue/of/tasks", entroq.WithValue("hey")),
+		entroq.InsertingInto("/queue/of/others", entroq.WithValue("other")),
 	); err != nil {
 		t.Fatalf("Error adding task: %v", err)
 	}
@@ -268,7 +268,7 @@ func stressJournalStats(t *testing.T) {
 	for q, s := range expectQueues {
 		s.Name = q
 		for i, n := 0, rand.Intn(maxQueueTasks); i < n; i++ {
-			if _, _, err := eq.Modify(ctx, entroq.InsertingInto(q, entroq.WithValue(entroq.JSONStr(fmt.Sprintf("value %d", i))))); err != nil {
+			if _, _, err := eq.Modify(ctx, entroq.InsertingInto(q, entroq.WithValue(fmt.Sprintf("value %d", i)))); err != nil {
 				t.Fatalf("Error inserting into %q: %v", q, err)
 			}
 			s.Size++
@@ -428,7 +428,7 @@ func TestEQMem_journalInsClaimClaimDel(t *testing.T) {
 	}
 	defer eq1.Close()
 
-	if _, _, err := eq1.Modify(ctx, entroq.InsertingInto("hello", entroq.WithValue(entroq.JSONStr("hello")))); err != nil {
+	if _, _, err := eq1.Modify(ctx, entroq.InsertingInto("hello", entroq.WithValue("hello"))); err != nil {
 		t.Fatalf("Error inserting: %v", err)
 	}
 

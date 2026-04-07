@@ -1,7 +1,7 @@
 import json
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Any
 
 @dataclass
 class TaskID:
@@ -15,7 +15,7 @@ class TaskData:
     """Input spec for a new task insert."""
     queue: str
     at: Optional[datetime] = None   # None -> use backend current time
-    value: bytes = b''
+    value: Any = None
     attempt: int = 0
     err: str = ''
     id: Optional[str] = None        # None -> auto-generate UUID
@@ -27,7 +27,7 @@ class TaskChange:
     version: int
     queue: str
     at: Optional[datetime]          # required - set explicitly or copy from Task
-    value: bytes = b''
+    value: Any = None
     attempt: int = 0
     err: str = ''
 
@@ -39,7 +39,7 @@ class Task:
     queue: str
     at: datetime
     claimant: str
-    value: bytes
+    value: Any
     created: Optional[datetime] = None
     modified: Optional[datetime] = None
     claims: int = 0

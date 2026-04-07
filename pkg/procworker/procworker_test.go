@@ -121,7 +121,7 @@ func TestRun(t *testing.T) {
 
 	// Insert tasks one at a time, check that we get the expected output in the expected place.
 	for _, test := range cases {
-		if _, _, err := eq.Modify(ctx, entroq.InsertingInto(inbox, entroq.WithValue(test.in.JSON()))); err != nil {
+		if _, _, err := eq.Modify(ctx, entroq.InsertingInto(inbox, entroq.WithRawValue(test.in.JSON()))); err != nil {
 			t.Fatalf("Error inserting task into %q: %v", inbox, err)
 		}
 		if err := waitEmpty(ctx, eq, inbox); err != nil {

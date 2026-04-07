@@ -26,8 +26,8 @@ func Example_journal() {
 	defer eq.Close()
 
 	inserted, _, err := eq.Modify(ctx,
-		entroq.InsertingInto("/queue/of/tasks", entroq.WithValue(entroq.JSONStr("hey"))),
-		entroq.InsertingInto("/queue/of/others", entroq.WithValue(entroq.JSONStr("other"))),
+		entroq.InsertingInto("/queue/of/tasks", entroq.WithValue("hey")),
+		entroq.InsertingInto("/queue/of/others", entroq.WithValue("other")),
 	)
 	if err != nil {
 		log.Fatalf("Error adding task: %v", err)

@@ -253,3 +253,21 @@ func (t *Task) CopyWithValue(ok bool) *Task {
 	}
 	return t.CopyOmitValue()
 }
+
+// ValueAs unmarshals the task value into v. Same semantics as json.Unmarshal.
+// For one-shot unmarshaling into a new value of a known type, prefer the
+// package-level ValueAs[T] generic function.
+func (t *Task) ValueAs(v any) error {
+	return json.Unmarshal(t.Value, v)
+}
+
+// ValueAs unmarshals raw into a new value of type T and returns it.
+//
+//	spec, err := entroq.ValueAs[JobSpec](task.Value)
+func ValueAs[T any](raw json.RawMessage) (T, error) {
+	var v T
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return v, err
+	}
+	return v, nil
+}

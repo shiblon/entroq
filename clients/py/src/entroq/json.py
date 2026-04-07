@@ -1,6 +1,5 @@
 import requests
 import secrets
-import base64
 from datetime import datetime, timezone, timedelta
 from typing import List, Tuple, Optional, Union
 
@@ -25,7 +24,7 @@ def _json_to_task(obj: dict) -> Task:
         queue=obj.get("queue", ""),
         at=_parse_time(obj.get("atMs", "0")),
         claimant=obj.get("claimantId", ""),
-        value=base64.b64decode(obj.get("value", "")),
+        value=obj.get("value"),
         created=_parse_time(obj.get("createdMs", "0")),
         modified=_parse_time(obj.get("modifiedMs", "0")),
         claims=int(obj.get("claims", 0)),
@@ -160,7 +159,7 @@ class EntroQJSON(EntroQBase):
                 {
                     "queue": i.queue,
                     "atMs": _to_ms_str(i.at),
-                    "value": base64.b64encode(i.value).decode(),
+                    "value": i.value,
                     "id": i.id,
                     "attempt": i.attempt,
                     "err": i.err
@@ -172,7 +171,7 @@ class EntroQJSON(EntroQBase):
                     "newData": {
                         "queue": c.queue,
                         "atMs": _to_ms_str(c.at),
-                        "value": base64.b64encode(c.value).decode(),
+                        "value": c.value,
                         "attempt": c.attempt,
                         "err": c.err
                     }

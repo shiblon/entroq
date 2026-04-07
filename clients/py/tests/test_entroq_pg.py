@@ -55,7 +55,7 @@ def test_claim_unblocks_on_notify(eq: EntroQ):
     time.sleep(0.3)  # let claim() reach lconn.notifies()
 
     insert_time = time.monotonic()
-    eq.modify(inserts=[TaskData(queue=QUEUE, value=b'ping')])
+    eq.modify(inserts=[TaskData(queue=QUEUE, value='ping')])
     t.join(timeout=5.0)
     elapsed = time.monotonic() - insert_time
 
@@ -74,7 +74,7 @@ def test_renewal_updates_task_version(eq: EntroQ):
     QUEUE = '/test/renew'
     DURATION = 1  # seconds; renewer fires at 0.5s
 
-    eq.modify(inserts=[TaskData(queue=QUEUE, value=b'work')])
+    eq.modify(inserts=[TaskData(queue=QUEUE, value='work')])
     task = eq.try_claim(QUEUE, duration_ms=DURATION * 1000)
     assert task is not None
     initial_version = task.version
@@ -102,7 +102,7 @@ def test_concurrent_renewing_no_deadlock(eq: EntroQ):
     QUEUE = '/test/concurrent_renew'
     DURATION = 1  # renewer fires at 0.5s
 
-    eq.modify(inserts=[TaskData(queue=QUEUE, value=str(i).encode()) for i in range(N)])
+    eq.modify(inserts=[TaskData(queue=QUEUE, value=str(i)) for i in range(N)])
 
     errors = []
     results = []
@@ -149,7 +149,7 @@ def test_concurrent_renewing_no_deadlock(eq: EntroQ):
 def test_transaction_commits_atomically(eq: EntroQ, pg_connstr: str):
     """txn.modify() and user SQL in the same transaction should commit together."""
     QUEUE = '/test/txn'
-    eq.modify(inserts=[TaskData(queue=QUEUE, value=b'item')])
+    eq.modify(inserts=[TaskData(queue=QUEUE, value='item')])
     task = eq.try_claim(QUEUE)
     assert task is not None
 
@@ -183,7 +183,7 @@ def test_concurrent_workers_transactional_counter(eq: EntroQ, pg_connstr: str):
     QUEUE = '/test/stress'
     DURATION = 2  # seconds; renewer fires at 1s
 
-    eq.modify(inserts=[TaskData(queue=QUEUE, value=str(i).encode()) for i in range(N)])
+    eq.modify(inserts=[TaskData(queue=QUEUE, value=str(i)) for i in range(N)])
 
     errors = []
     lock = threading.Lock()
@@ -241,7 +241,7 @@ def test_concurrent_workers_multi_queue(eq: EntroQ, pg_connstr: str):
 
     # Spread tasks across queues round-robin.
     eq.modify(inserts=[
-        TaskData(queue=QUEUES[i % Q], value=str(i).encode())
+        TaskData(queue=QUEUES[i % Q], value=str(i))
         for i in range(N)
     ])
 
@@ -306,9 +306,9 @@ def test_multi_queue_fairness(eq: EntroQ):
     queues  = [big_q, med_q, small_q]
 
     eq.modify(inserts=(
-        [TaskData(queue=big_q,   value=b'x') for _ in range(BIG_SIZE)] +
-        [TaskData(queue=med_q,   value=b'x') for _ in range(MED_SIZE)] +
-        [TaskData(queue=small_q, value=b'x') for _ in range(SMALL_SIZE)]
+        [TaskData(queue=big_q,   value='x') for _ in range(BIG_SIZE)] +
+        [TaskData(queue=med_q,   value='x') for _ in range(MED_SIZE)] +
+        [TaskData(queue=small_q, value='x') for _ in range(SMALL_SIZE)]
     ))
 
     consumed = []
@@ -369,7 +369,7 @@ def test_multi_queue_fairness(eq: EntroQ):
 def test_transaction_rollback_on_dependency_error(eq: EntroQ, pg_connstr: str):
     """A DependencyError inside a transaction should roll back user SQL too."""
     QUEUE = '/test/txn_rollback'
-    eq.modify(inserts=[TaskData(queue=QUEUE, value=b'item')])
+    eq.modify(inserts=[TaskData(queue=QUEUE, value='item')])
     task = eq.try_claim(QUEUE)
     assert task is not None
 
@@ -397,7 +397,7 @@ def test_worker_processes_tasks(eq: EntroQ):
     N = 5
     QUEUE = '/test/worker/basic'
 
-    eq.modify(inserts=[TaskData(queue=QUEUE, value=str(i).encode()) for i in range(N)])
+    eq.modify(inserts=[TaskData(queue=QUEUE, value=str(i)) for i in range(N)])
 
     completed = []
 
@@ -425,7 +425,7 @@ def test_worker_stable_version_in_finalize(eq: EntroQ):
     QUEUE = '/test/worker/version'
     DURATION = 1  # renewer fires at 0.5s
 
-    eq.modify(inserts=[TaskData(queue=QUEUE, value=b'work')])
+    eq.modify(inserts=[TaskData(queue=QUEUE, value='work')])
 
     versions = {}
 
@@ -455,7 +455,7 @@ def test_worker_continues_after_dependency_error(eq: EntroQ):
     """Worker should log and continue when do_func raises a DependencyError."""
     QUEUE = '/test/worker/dep_err'
 
-    eq.modify(inserts=[TaskData(queue=QUEUE, value=b'work')])
+    eq.modify(inserts=[TaskData(queue=QUEUE, value='work')])
 
     outcomes = []
     calls = [0]
@@ -480,4 +480,4 @@ def test_worker_continues_after_dependency_error(eq: EntroQ):
 
     assert not t.is_alive(), 'worker did not stop within timeout'
     assert calls[0] == 2, f'expected 2 calls (1 dep error + 1 success), got {calls[0]}'
-    assert outcomes == [b'work']
+    assert outcomes == ['work']

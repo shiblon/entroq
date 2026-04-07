@@ -46,7 +46,7 @@ DROP TYPE IF EXISTS entroq.task_arg;
 DROP FUNCTION IF EXISTS entroq._try_claim_bucket(text, uuid, interval, timestamptz, integer, integer);
 DROP FUNCTION IF EXISTS entroq._try_claim_one(text, uuid, interval);
 DROP FUNCTION IF EXISTS entroq.try_claim(text[], uuid, interval);
-DROP FUNCTION IF EXISTS entroq._modify_arrays(uuid, uuid[], integer[], uuid[], integer[], uuid[], text[], timestamptz[], bytea[], integer[], text[], uuid[], integer[], text[], timestamptz[], bytea[], integer[], text[]);
+DROP FUNCTION IF EXISTS entroq._modify_arrays(uuid, uuid[], integer[], uuid[], integer[], uuid[], text[], timestamptz[], jsonb[], integer[], text[], uuid[], integer[], text[], timestamptz[], jsonb[], integer[], text[]);
 DROP FUNCTION IF EXISTS entroq.modify(uuid, jsonb, jsonb, jsonb, jsonb);
 DROP FUNCTION IF EXISTS entroq.tasks(text, integer, boolean);
 
@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS entroq.tasks (
     created  TIMESTAMP WITH TIME ZONE,
     modified TIMESTAMP WITH TIME ZONE NOT NULL,
     claimant TEXT                     CHECK (claimant IS NULL OR length(claimant) <= 64),
-    value    BYTEA,
+    value    JSONB,
     claims   INTEGER                  NOT NULL DEFAULT 0,
     attempt  INTEGER                  NOT NULL DEFAULT 0,
     err      TEXT                     NOT NULL DEFAULT ''
@@ -103,7 +103,7 @@ DO $$ BEGIN
         version integer,
         queue   text,
         at      timestamptz,
-        value   bytea,
+        value   jsonb,
         attempt integer,
         err     text
     );
@@ -134,7 +134,7 @@ CREATE OR REPLACE FUNCTION entroq._try_claim_bucket(
     created  timestamptz,
     modified timestamptz,
     claimant text,
-    value    bytea,
+    value    jsonb,
     claims   integer,
     attempt  integer,
     err      text
@@ -187,7 +187,7 @@ CREATE OR REPLACE FUNCTION entroq._try_claim_one(
     created  timestamptz,
     modified timestamptz,
     claimant text,
-    value    bytea,
+    value    jsonb,
     claims   integer,
     attempt  integer,
     err      text
@@ -258,7 +258,7 @@ CREATE OR REPLACE FUNCTION entroq.try_claim(
     created  timestamptz,
     modified timestamptz,
     claimant text,
-    value    bytea,
+    value    jsonb,
     claims   integer,
     attempt  integer,
     err      text
@@ -288,7 +288,7 @@ $$;
 
 -- entroq._modify_arrays atomically applies inserts, changes, deletes, and
 -- dependency checks. Uses parallel arrays for efficiency from the Go caller,
--- which avoids composite literal encoding complexity (especially bytea).
+-- which avoids composite literal encoding complexity (especially jsonb).
 --
 -- Raises SQLSTATE EQ001 with a JSON detail on any dependency problem.
 -- The detail has three arrays:
@@ -316,7 +316,7 @@ CREATE OR REPLACE FUNCTION entroq._modify_arrays(
     p_ins_ids      text[],
     p_ins_queues   text[],
     p_ins_ats      timestamptz[],
-    p_ins_values   bytea[],
+    p_ins_values   jsonb[],
     p_ins_attempts integer[],
     p_ins_errs     text[],
     -- changes: must exist at the given version, then updated
@@ -324,7 +324,7 @@ CREATE OR REPLACE FUNCTION entroq._modify_arrays(
     p_chg_vers     integer[],
     p_chg_queues   text[],
     p_chg_ats      timestamptz[],
-    p_chg_values   bytea[],
+    p_chg_values   jsonb[],
     p_chg_attempts integer[],
     p_chg_errs     text[]
 ) RETURNS TABLE(
@@ -336,7 +336,7 @@ CREATE OR REPLACE FUNCTION entroq._modify_arrays(
     created  timestamptz,
     modified timestamptz,
     claimant text,
-    value    bytea,
+    value    jsonb,
     claims   integer,
     attempt  integer,
     err      text
@@ -429,7 +429,7 @@ BEGIN
                 coalesce(p_ins_ids,      '{}'::text[]),
                 coalesce(p_ins_queues,   '{}'::text[]),
                 coalesce(p_ins_ats,      '{}'::timestamptz[]),
-                coalesce(p_ins_values,   '{}'::bytea[]),
+                coalesce(p_ins_values,   '{}'::jsonb[]),
                 coalesce(p_ins_attempts, '{}'::integer[]),
                 coalesce(p_ins_errs,     '{}'::text[])
             ) AS ins(ins_id, ins_queue, ins_at, ins_value, ins_attempt, ins_err)
@@ -458,7 +458,7 @@ BEGIN
                 coalesce(p_chg_vers,     '{}'::integer[]),
                 coalesce(p_chg_queues,   '{}'::text[]),
                 coalesce(p_chg_ats,      '{}'::timestamptz[]),
-                coalesce(p_chg_values,   '{}'::bytea[]),
+                coalesce(p_chg_values,   '{}'::jsonb[]),
                 coalesce(p_chg_attempts, '{}'::integer[]),
                 coalesce(p_chg_errs,     '{}'::text[])
             ) AS c(chg_id, chg_version, chg_queue, chg_at, chg_value, chg_attempt, chg_err)
@@ -505,7 +505,7 @@ CREATE OR REPLACE FUNCTION entroq.modify(
     created  timestamptz,
     modified timestamptz,
     claimant text,
-    value    bytea,
+    value    jsonb,
     claims   integer,
     attempt  integer,
     err      text
@@ -523,7 +523,7 @@ CREATE OR REPLACE FUNCTION entroq.modify(
         ARRAY(SELECT e->>'queue'              FROM jsonb_array_elements(p_inserts) e),
         ARRAY(SELECT coalesce((e->>'at')::timestamptz, '0001-01-01 00:00:00+00')
               FROM jsonb_array_elements(p_inserts) e),
-        ARRAY(SELECT decode(coalesce(e->>'value', ''), 'base64')
+        ARRAY(SELECT e->'value'
               FROM jsonb_array_elements(p_inserts) e),
         ARRAY(SELECT coalesce((e->>'attempt')::integer, 0)
               FROM jsonb_array_elements(p_inserts) e),
@@ -534,7 +534,7 @@ CREATE OR REPLACE FUNCTION entroq.modify(
         ARRAY(SELECT (e->>'version')::integer  FROM jsonb_array_elements(p_changes) e),
         ARRAY(SELECT e->>'queue'              FROM jsonb_array_elements(p_changes) e),
         ARRAY(SELECT (e->>'at')::timestamptz  FROM jsonb_array_elements(p_changes) e),
-        ARRAY(SELECT decode(coalesce(e->>'value', ''), 'base64')
+        ARRAY(SELECT e->'value'
               FROM jsonb_array_elements(p_changes) e),
         ARRAY(SELECT coalesce((e->>'attempt')::integer, 0)
               FROM jsonb_array_elements(p_changes) e),
@@ -566,7 +566,7 @@ CREATE OR REPLACE FUNCTION entroq.queues(
 $$;
 
 -- entroq.tasks returns tasks ordered by at. p_queue='' means all queues.
--- p_omit_values=true returns empty bytea for the value column.
+-- p_omit_values=true returns empty jsonb for the value column.
 -- p_limit=0 means no limit.
 CREATE OR REPLACE FUNCTION entroq.tasks(
     p_queue        text    DEFAULT '',
@@ -580,14 +580,14 @@ CREATE OR REPLACE FUNCTION entroq.tasks(
     created  timestamptz,
     modified timestamptz,
     claimant text,
-    value    bytea,
+    value    jsonb,
     claims   integer,
     attempt  integer,
     err      text
 ) LANGUAGE sql AS $$
     SELECT
         id, version, queue, at, created, modified, claimant,
-        CASE WHEN p_omit_values THEN ''::bytea ELSE value END AS value,
+        CASE WHEN p_omit_values THEN NULL::jsonb ELSE value END AS value,
         claims, attempt, err
     FROM entroq.tasks
     WHERE p_queue = '' OR queue = p_queue

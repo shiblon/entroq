@@ -62,7 +62,7 @@ var insCmd = &cobra.Command{
 		var modArgs []entroq.ModifyArg
 		for _, v := range flagInsVal {
 			var insArgs []entroq.InsertArg
-			insArgs = append(insArgs, entroq.WithValue(cliJSON(v)))
+			insArgs = append(insArgs, entroq.WithRawValue(cliJSON(v)))
 			if dur != 0 {
 				insArgs = append(insArgs, entroq.WithArrivalTimeIn(dur))
 			}

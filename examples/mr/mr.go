@@ -93,12 +93,8 @@ func (e *CollectingMapEmitter) AsModifyArgs(qPrefix string, additional ...entroq
 			continue
 		}
 		sort.Sort(byKey(kvs))
-		value, err := json.Marshal(kvs)
-		if err != nil {
-			return nil, fmt.Errorf("emit to modify args: %w", err)
-		}
 		queue := path.Join(qPrefix, fmt.Sprint(shard))
-		args = append(args, entroq.InsertingInto(queue, entroq.WithValue(value)))
+		args = append(args, entroq.InsertingInto(queue, entroq.WithValue(kvs)))
 	}
 	return append(args, additional...), nil
 }
@@ -349,14 +345,10 @@ func NewMapWorker(eq *entroq.EntroQ, inQueue string, newEmitter func() MapEmitte
 // Runs until the context is canceled or an unrecoverable error is encountered.
 func (w *MapWorker) Run(ctx context.Context) error {
 	return worker.New(w.client,
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
+		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, kv *KV) ([]entroq.ModifyArg, error) {
 			emitter := w.newEmitter()
 			if w.EarlyReduce != nil {
 				emitter = newReducingProxyMapEmitter(emitter, w.EarlyReduce)
-			}
-			kv := new(KV)
-			if err := json.Unmarshal(task.Value, kv); err != nil {
-				return nil, fmt.Errorf("map run json: %w", err)
 			}
 			if err := w.Map(ctx, kv.Key, kv.Value, emitter.Emit); err != nil {
 				return nil, fmt.Errorf("map run map: %w", err)
@@ -533,16 +525,11 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 		})
 
 		// Now all key/value pairs are merged into a single sorted list. Create a new task and delete the others.
-		combined, err := json.Marshal(kvs)
-		if err != nil {
-			return fmt.Errorf("merge to json: %w", err)
-		}
-
 		// Stop to get stable version tasks (no longer renewed in the background).
 		updatedTasks := stop()
 
 		var modArgs []entroq.ModifyArg
-		modArgs = append(modArgs, entroq.InsertingInto(w.InputQueue, entroq.WithValue(combined)))
+		modArgs = append(modArgs, entroq.InsertingInto(w.InputQueue, entroq.WithValue(kvs)))
 		for _, t := range updatedTasks {
 			modArgs = append(modArgs, t.Delete())
 		}
@@ -619,14 +606,9 @@ func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error 
 		if err != nil {
 			return fmt.Errorf("reduce sorted: %w", err)
 		}
-		outputValue, err := json.Marshal(outputs)
-		if err != nil {
-			return fmt.Errorf("reduce to json: %w", err)
-		}
-
 		updatedTask := stop()
 
-		if _, _, err := w.client.Modify(ctx, updatedTask.Delete(), entroq.InsertingInto(w.OutputQueue, entroq.WithValue(outputValue))); err != nil {
+		if _, _, err := w.client.Modify(ctx, updatedTask.Delete(), entroq.InsertingInto(w.OutputQueue, entroq.WithValue(outputs))); err != nil {
 			return fmt.Errorf("reduce output: %w", err)
 		}
 		return nil
@@ -807,11 +789,7 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 
 	// First create map tasks for all of the data.
 	for _, kv := range mr.Data {
-		b, err := json.Marshal(kv)
-		if err != nil {
-			return "", fmt.Errorf("marshal input: %w", err)
-		}
-		if _, _, err := mr.client.Modify(ctx, entroq.InsertingInto(qMapInput, entroq.WithValue(b))); err != nil {
+		if _, _, err := mr.client.Modify(ctx, entroq.InsertingInto(qMapInput, entroq.WithValue(kv))); err != nil {
 			return "", fmt.Errorf("insert map input: %w", err)
 		}
 	}

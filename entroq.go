@@ -55,6 +55,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"strings"
 	"time"
@@ -631,25 +632,34 @@ func WithArrivalTimeIn(duration time.Duration) InsertArg {
 	}
 }
 
-// JSONStr converts a Go string to a JSON string value, suitable for use as a
-// task value. For example:
-//
-//	entroq.JSONStr("hello") == json.RawMessage(`"hello"`)
-func JSONStr(s string) json.RawMessage {
-	b, _ := json.Marshal(s)
-	return b
-}
-
-// WithValue sets the task's JSON value during insertion. The value must be
-// valid JSON; nil is allowed and represents an absent value.
+// WithRawValue sets the task's JSON value during insertion from pre-marshaled
+// bytes. The value must be valid JSON; nil is allowed and represents an absent
+// value. Use WithValue to marshal a Go value on the fly.
 //
 //	cli.Modify(ctx,
 //	  InsertingInto("my queue",
-//	    WithValue(json.RawMessage(`"hi there"`))))
-func WithValue(value json.RawMessage) InsertArg {
+//	    WithRawValue(json.RawMessage(`"hi there"`))))
+func WithRawValue(value json.RawMessage) InsertArg {
 	return func(_ *Modification, d *TaskData) {
 		d.Value = value
 	}
+}
+
+// WithValue marshals v as JSON and uses it as the task value. It is a
+// "Must"-style function: if v cannot be marshaled (channels, functions,
+// cycles), it calls log.Fatal. These are programmer errors, not runtime
+// conditions -- the type being marshaled is known at compile time. Use
+// WithRawValue for pre-marshaled data.
+//
+//	cli.Modify(ctx,
+//	  InsertingInto("my queue",
+//	    WithValue(MyStruct{Field: "hello"})))
+func WithValue(v any) InsertArg {
+	b, err := json.Marshal(v)
+	if err != nil {
+		log.Fatalf("entroq: WithValue: %v", err)
+	}
+	return WithRawValue(b)
 }
 
 // WithAttempt sets the number of attempts for this task. Usually not needed,
@@ -804,9 +814,9 @@ func ArrivalTimeBy(d time.Duration) ChangeArg {
 	}
 }
 
-// ValueTo sets the changing task's JSON value. The value must be valid JSON;
-// nil is allowed and represents an absent value.
-func ValueTo(v json.RawMessage) ChangeArg {
+// RawValueTo sets the changing task's JSON value from pre-marshaled bytes.
+// The value must be valid JSON; nil is allowed and represents an absent value.
+func RawValueTo(v json.RawMessage) ChangeArg {
 	return func(_ *Modification, t *Task) {
 		t.Value = v
 	}
