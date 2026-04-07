@@ -60,19 +60,17 @@ func NewYAMLRequest(y string) (*Request, error) {
 	return req, nil
 }
 
-// AUthorization represents per-request authz information. It can ideally come in many
-// forms. The first supported form is a "token", such as from an Authorization
-// header.
+// Authorization represents per-request auth information extracted from the
+// incoming request headers. The Type and Credentials fields correspond to the
+// two parts of a standard HTTP Authorization header, e.g.:
+//
+//	Authorization: Bearer <jwt>
+//	-> Type="Bearer", Credentials="<jwt>"
 type Authorization struct {
-	// An HTTP Authorization header is split into its type and credentials and
-	// included here when available.
-	Type        string `json:"type,omitempty"`
+	// Type is the scheme portion of the Authorization header (e.g. "Bearer").
+	Type string `json:"type,omitempty"`
+	// Credentials is the token or credentials portion of the Authorization header.
 	Credentials string `json:"credentials,omitempty"`
-
-	// Never use this in practice. This allows the user to be set directly for testing.
-	// The code checks for this and creates an error if present, unless
-	// specifically allowed for testing.
-	TestUser string `json:"testuser,omitempty"`
 }
 
 // NewHeaderAuthorization creates an authorization structure from a header value.
@@ -154,7 +152,8 @@ func (e *AuthzError) Error() string {
 	return fmt.Sprintf("authorization failed: %s", strings.Join(vals, "; "))
 }
 
-// IsAuthz determines whether an error is an authorization error.
+// IsAuthz reports whether err is (or wraps) an *AuthzError.
 func IsAuthz(err error) bool {
-	return errors.Is(err, new(AuthzError))
+	var e *AuthzError
+	return errors.As(err, &e)
 }

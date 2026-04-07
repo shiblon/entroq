@@ -18,28 +18,17 @@ const (
 	DefaultAPIPath = "/v1/data/entroq/authz"
 )
 
-// OPA is a client-like object for interacting with OPA authorization policies.
-// It adheres to the authz.Authorizer interface.
+// OPA is a client for interacting with a running OPA sidecar.
+// It implements authz.Authorizer.
 type OPA struct {
-	hostURL       string
-	apiPath       string
-	allowTestUser bool
+	hostURL string
+	apiPath string
 }
 
-// Option defines a setting for creating an OPA authorizer.
+// Option configures an OPA authorizer.
 type Option func(*OPA)
 
-// WithInsecureTestUser must be set when doing testing and the use of the
-// Authz.TestUser (instead of a signed token, for example) is desired. Without
-// this option, the presence of the TestUser field causes an error.
-func WithInsecureTestUser() Option {
-	return func(a *OPA) {
-		a.allowTestUser = true
-	}
-}
-
-// WithHostURL sets the host OPA URL for a query authorization request, such as
-// its default value given in DefaultURL.
+// WithHostURL sets the base URL of the OPA HTTP API.
 func WithHostURL(u string) Option {
 	return func(a *OPA) {
 		if u != "" {
@@ -48,7 +37,7 @@ func WithHostURL(u string) Option {
 	}
 }
 
-// WithAPIPath sets the API path to request for authorization.
+// WithAPIPath sets the policy path to query for authorization decisions.
 func WithAPIPath(p string) Option {
 	return func(a *OPA) {
 		if p != "" {
@@ -57,7 +46,7 @@ func WithAPIPath(p string) Option {
 	}
 }
 
-// New creates a new OPA client with the given options.
+// New creates a new OPA authorizer.
 func New(opts ...Option) *OPA {
 	a := &OPA{
 		hostURL: DefaultHostURL,
@@ -66,7 +55,6 @@ func New(opts ...Option) *OPA {
 	for _, opt := range opts {
 		opt(a)
 	}
-
 	return a
 }
 
@@ -81,14 +69,10 @@ func (a *OPA) fullURL() string {
 	return strings.TrimRight(h, "/") + "/" + strings.TrimLeft(p, "/")
 }
 
-// Authorize checks for unmatched queues and actions. A nil error means authorized.
-// If the error satisfies errors.Is on a *authz.AuthzError, it can be unpacked to find
-// which queues and actions were not satisfied.
+// Authorize sends an authorization request to OPA. A nil error means allowed.
+// If the error is an *authz.AuthzError it can be unpacked for details on which
+// queues and actions were denied.
 func (a *OPA) Authorize(ctx context.Context, req *authz.Request) error {
-	if !a.allowTestUser && req.Authz.TestUser != "" {
-		return fmt.Errorf("insecure test user present, but not allowed")
-	}
-
 	body := map[string]*authz.Request{
 		"input": req,
 	}
@@ -102,8 +86,7 @@ func (a *OPA) Authorize(ctx context.Context, req *authz.Request) error {
 	if err != nil {
 		return fmt.Errorf("authorize: %w", err)
 	}
-	httpReq.Header.Add("Content-Type", "application/json")
-	httpReq.Header.Add("Authorization", req.Authz.String())
+	httpReq.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(httpReq)
 	if err != nil {
@@ -113,7 +96,7 @@ func (a *OPA) Authorize(ctx context.Context, req *authz.Request) error {
 
 	respBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("no read: %w", err)
+		return fmt.Errorf("authorize read response: %w", err)
 	}
 
 	type authzResp struct {
@@ -121,19 +104,17 @@ func (a *OPA) Authorize(ctx context.Context, req *authz.Request) error {
 	}
 	result := new(authzResp)
 	if err := json.NewDecoder(bytes.NewBuffer(respBytes)).Decode(result); err != nil {
-		return fmt.Errorf("authorize: %w", err)
+		return fmt.Errorf("authorize decode response: %w", err)
 	}
 
-	// Check result value.
 	if e := result.Result; !e.Allow {
-		// We got an error with information about missing queue/actions.
 		return e
 	}
 
 	return nil
 }
 
-// Close cleans up any resources used.
+// Close cleans up any resources used by this authorizer.
 func (a *OPA) Close() error {
 	return nil
 }
