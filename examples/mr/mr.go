@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/worker"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -347,26 +348,25 @@ func NewMapWorker(eq *entroq.EntroQ, inQueue string, newEmitter func() MapEmitte
 //
 // Runs until the context is canceled or an unrecoverable error is encountered.
 func (w *MapWorker) Run(ctx context.Context) error {
-	return w.client.NewWorker(
-		entroq.CompactHandler(w.client,
-			func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
-				emitter := w.newEmitter()
-				if w.EarlyReduce != nil {
-					emitter = newReducingProxyMapEmitter(emitter, w.EarlyReduce)
-				}
-				kv := new(KV)
-				if err := json.Unmarshal(task.Value, kv); err != nil {
-					return nil, fmt.Errorf("map run json: %w", err)
-				}
-				if err := w.Map(ctx, kv.Key, kv.Value, emitter.Emit); err != nil {
-					return nil, fmt.Errorf("map run map: %w", err)
-				}
-				emitArgs, err := emitter.AsModifyArgs(w.OutputPrefix)
-				if err != nil {
-					return nil, fmt.Errorf("mr run mod args: %v", err)
-				}
-				return append(emitArgs, task.Delete()), nil
-			}),
+	return worker.New(w.client,
+		worker.WithDoModify(func(ctx context.Context, task *entroq.Task) ([]entroq.ModifyArg, error) {
+			emitter := w.newEmitter()
+			if w.EarlyReduce != nil {
+				emitter = newReducingProxyMapEmitter(emitter, w.EarlyReduce)
+			}
+			kv := new(KV)
+			if err := json.Unmarshal(task.Value, kv); err != nil {
+				return nil, fmt.Errorf("map run json: %w", err)
+			}
+			if err := w.Map(ctx, kv.Key, kv.Value, emitter.Emit); err != nil {
+				return nil, fmt.Errorf("map run map: %w", err)
+			}
+			emitArgs, err := emitter.AsModifyArgs(w.OutputPrefix)
+			if err != nil {
+				return nil, fmt.Errorf("mr run mod args: %v", err)
+			}
+			return append(emitArgs, task.Delete()), nil
+		}),
 	).Run(ctx, w.InputQueue)
 }
 
@@ -514,7 +514,7 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 	if len(tasks) <= 1 {
 		return nil
 	}
-	err := w.client.DoWithRenewAll(ctx, tasks, claimDuration, func(ctx context.Context, stop entroq.FinalizeRenewAll) error {
+	err := worker.DoWithRenewAll(ctx, w.client, tasks, claimDuration, func(ctx context.Context, stop worker.FinalizeRenewAll) error {
 		// Append and sort. Note that in real life with real scale, we would
 		// want to do an on-disk merge sort (since individual components would
 		// already be sorted).
@@ -609,7 +609,7 @@ func reduceSortedKVs(ctx context.Context, reduce Reducer, kvs []*KV) ([]*KV, err
 // and runs a reduce function on each set corresponding to a unique key,
 // writing them out in the order they appear (to maintain sorting).
 func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error {
-	if err := w.client.DoWithRenew(ctx, task, claimDuration, func(ctx context.Context, stop entroq.FinalizeRenew) error {
+	if err := worker.DoWithRenew(ctx, w.client, task, claimDuration, func(ctx context.Context, stop worker.FinalizeRenew) error {
 		var kvs []*KV
 		if err := json.Unmarshal(task.Value, &kvs); err != nil {
 			return fmt.Errorf("reduce from json: %w", err)

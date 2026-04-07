@@ -77,17 +77,17 @@ The Go client is the reference implementation and supports automatic background 
 svc, _ := entroq.New(ctx, eqgrpc.Opener("localhost:37706"))
 defer svc.Close()
 
-worker := svc.NewWorker(entroq.FuncHandler(
-    func(ctx context.Context, task *entroq.Task) error {
+w := worker.New(svc,
+    worker.WithDo(func(ctx context.Context, task *entroq.Task) error {
         log.Printf("Processing: %s", string(task.Value))
         return nil // success
-    },
-    func(ctx context.Context, task *entroq.Task) error {
-        _, _, err := svc.Modify(ctx, task.AsDeletion())
-        return err // finalize
-    },
-))
-worker.Run(ctx, "/my/queue")
+    }),
+    worker.WithFinish(func(ctx context.Context, task *entroq.Task) error {
+        _, _, err := svc.Modify(ctx, task.Delete())
+        return err // finish
+    }),
+)
+w.Run(ctx, "/my/queue")
 ```
 
 ### Python

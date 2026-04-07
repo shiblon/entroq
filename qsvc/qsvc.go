@@ -271,7 +271,11 @@ func toMS(t time.Time) int64 {
 	return t.Truncate(time.Millisecond).UnixNano() / 1000000
 }
 
-func protoFromTask(t *entroq.Task) *pb.Task {
+func protoFromTask(t *entroq.Task) (*pb.Task, error) {
+	pv, err := pb.JSONToProto(t.Value)
+	if err != nil {
+		return nil, fmt.Errorf("task %s value: %w", t.ID, err)
+	}
 	return &pb.Task{
 		Queue:      t.Queue,
 		Id:         t.ID,
@@ -279,12 +283,12 @@ func protoFromTask(t *entroq.Task) *pb.Task {
 		AtMs:       toMS(t.At),
 		ClaimantId: t.Claimant,
 		Claims:     t.Claims,
-		Value:      t.Value,
+		Value:      pv,
 		CreatedMs:  toMS(t.Created),
 		ModifiedMs: toMS(t.Modified),
 		Attempt:    t.Attempt,
 		Err:        t.Err,
-	}
+	}, nil
 }
 
 func autoCodeErrorf(format string, vals ...any) error {
@@ -410,7 +414,11 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 	if task == nil {
 		return new(pb.ClaimResponse), nil
 	}
-	return &pb.ClaimResponse{Task: protoFromTask(task)}, nil
+	pt, err := protoFromTask(task)
+	if err != nil {
+		return nil, autoCodeErrorf("claim task proto: %w", err)
+	}
+	return &pb.ClaimResponse{Task: pt}, nil
 }
 
 // TryClaim attempts to claim a task, returning immediately. If no tasks are
@@ -436,7 +444,11 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 	if task == nil {
 		return new(pb.ClaimResponse), nil
 	}
-	return &pb.ClaimResponse{Task: protoFromTask(task)}, nil
+	pt, err := protoFromTask(task)
+	if err != nil {
+		return nil, autoCodeErrorf("try-claim task proto: %w", err)
+	}
+	return &pb.ClaimResponse{Task: pt}, nil
 }
 
 // Modify attempts to make the specified modification from the given
@@ -455,21 +467,29 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 		entroq.ModifyAs(req.ClaimantId),
 	}
 	for _, insert := range req.Inserts {
+		iv, err := pb.ProtoToJSON(insert.Value)
+		if err != nil {
+			return nil, autoCodeErrorf("modify insert value: %w", err)
+		}
 		modArgs = append(modArgs,
 			entroq.InsertingInto(insert.Queue,
 				entroq.WithArrivalTime(fromMS(insert.AtMs)),
-				entroq.WithValue(insert.Value),
+				entroq.WithValue(iv),
 				entroq.WithAttempt(insert.Attempt),
 				entroq.WithErr(insert.Err),
 				entroq.WithID(insert.Id)))
 	}
 	for _, change := range req.Changes {
+		cv, err := pb.ProtoToJSON(change.GetNewData().Value)
+		if err != nil {
+			return nil, autoCodeErrorf("modify change value: %w", err)
+		}
 		t := &entroq.Task{
 			ID:        change.GetOldId().Id,
 			Version:   change.GetOldId().Version,
 			Claimant:  req.ClaimantId,
 			Queue:     change.GetNewData().Queue,
-			Value:     change.GetNewData().Value,
+			Value:     cv,
 			At:        fromMS(change.GetNewData().AtMs),
 			Attempt:   change.GetNewData().Attempt,
 			Err:       change.GetNewData().Err,
@@ -518,10 +538,18 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 	// Assemble the response.
 	resp := new(pb.ModifyResponse)
 	for _, task := range inserted {
-		resp.Inserted = append(resp.Inserted, protoFromTask(task))
+		pt, err := protoFromTask(task)
+		if err != nil {
+			return nil, autoCodeErrorf("modify inserted task proto: %w", err)
+		}
+		resp.Inserted = append(resp.Inserted, pt)
 	}
 	for _, task := range changed {
-		resp.Changed = append(resp.Changed, protoFromTask(task))
+		pt, err := protoFromTask(task)
+		if err != nil {
+			return nil, autoCodeErrorf("modify changed task proto: %w", err)
+		}
+		resp.Changed = append(resp.Changed, pt)
 	}
 	return resp, nil
 }
@@ -547,7 +575,11 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 	}
 	resp := new(pb.TasksResponse)
 	for _, task := range tasks {
-		resp.Tasks = append(resp.Tasks, protoFromTask(task))
+		pt, err := protoFromTask(task)
+		if err != nil {
+			return nil, autoCodeErrorf("tasks task proto: %w", err)
+		}
+		resp.Tasks = append(resp.Tasks, pt)
 	}
 	return resp, nil
 }

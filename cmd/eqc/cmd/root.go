@@ -49,6 +49,20 @@ var rootFlags struct {
 
 var eq *entroq.EntroQ
 
+// cliJSON converts a CLI string value to a json.RawMessage. If the string is
+// already valid JSON it is used as-is; otherwise it is marshaled as a JSON
+// string. An empty string becomes null.
+func cliJSON(s string) json.RawMessage {
+	if s == "" {
+		return nil
+	}
+	if json.Valid([]byte(s)) {
+		return json.RawMessage(s)
+	}
+	b, _ := json.Marshal(s)
+	return b
+}
+
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
 	Use:   "eqc [options] <command>",

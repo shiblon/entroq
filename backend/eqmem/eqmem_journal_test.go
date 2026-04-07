@@ -23,10 +23,11 @@ func Example_journal() {
 	if err != nil {
 		log.Fatalf("Error opening client at dir %q: %v", journalDir, err)
 	}
+	defer eq.Close()
 
 	inserted, _, err := eq.Modify(ctx,
-		entroq.InsertingInto("/queue/of/tasks", entroq.WithValue([]byte("hey"))),
-		entroq.InsertingInto("/queue/of/others", entroq.WithValue([]byte("other"))),
+		entroq.InsertingInto("/queue/of/tasks", entroq.WithValue(entroq.JSONStr("hey"))),
+		entroq.InsertingInto("/queue/of/others", entroq.WithValue(entroq.JSONStr("other"))),
 	)
 	if err != nil {
 		log.Fatalf("Error adding task: %v", err)
@@ -44,6 +45,7 @@ func Example_journal() {
 	if eq, err = entroq.New(ctx, eqmem.Opener(eqmem.WithJournal(journalDir))); err != nil {
 		log.Fatalf("Error reopening client at dir %q: %v", journalDir, err)
 	}
+	defer eq.Close()
 
 	empty, err := eq.QueuesEmpty(ctx, entroq.MatchExact("/queue/of/tasks"))
 	if err != nil {
