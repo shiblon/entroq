@@ -23,12 +23,14 @@
 #   }
 package entroq.user
 
+import rego.v1
+
 # Fetch the JWKS from the IDP. OPA caches this response automatically.
 jwks_response := http.send({
-    "method": "GET",
-    "url": data.entroq.idp.jwks_url,
-    "cache": true,
-    "tls_use_system_certs": true,
+	"method": "GET",
+	"url": data.entroq.idp.jwks_url,
+	"cache": true,
+	"tls_use_system_certs": true,
 })
 
 # Verify the JWT and extract the subject claim as the username.
@@ -37,14 +39,14 @@ jwks_response := http.send({
 #   - the token signature is invalid
 #   - the audience or issuer does not match
 #   - the token is expired
-username = u {
-    input.authz.type == "Bearer"
-    token := input.authz.credentials
-    [valid, _, payload] := io.jwt.decode_verify(token, {
-        "jwks": json.marshal(jwks_response.body),
-        "aud": data.entroq.idp.audience,
-        "iss": data.entroq.idp.issuer,
-    })
-    valid
-    u := payload.sub
+username := u if {
+	input.authz.type == "Bearer"
+	token := input.authz.credentials
+	[valid, _, payload] := io.jwt.decode_verify(token, {
+		"jwks": json.marshal(jwks_response.body),
+		"aud": data.entroq.idp.audience,
+		"iss": data.entroq.idp.issuer,
+	})
+	valid
+	u := payload.sub
 }

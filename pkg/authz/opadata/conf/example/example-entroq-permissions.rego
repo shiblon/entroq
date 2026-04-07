@@ -1,5 +1,7 @@
 package entroq.permissions
 
+import rego.v1
+
 import data.entroq.user as equser
 
 # Here we're using the policy package as "user and role data".
@@ -11,28 +13,29 @@ import data.entroq.user as equser
 import data.entroq.policy
 
 # The user with this username. Rego will error out if there is more than one.
-this_user = u {
-  u := policy.users[_]
-  u.name == equser.username
+this_user := u if {
+	u := policy.users[_]
+	u.name == equser.username
 }
 
-user_queues[qs] {
-  qs := this_user.queues[_]
+user_queues contains qs if {
+	qs := this_user.queues[_]
 }
 
 # Add a special /ns=user/<username> queue prefix to everyone, that they can do what they want with.
-user_queues[q] {
-  q := {
-    "prefix": concat("", ["/ns=user/", equser.username, "/"]),
-    "actions": ["ALL"]
-  }
+user_queues contains q if {
+	q := {
+		"prefix": concat("", ["/ns=user/", equser.username, "/"]),
+		"actions": ["ALL"],
+	}
 }
 
-role_queues[r.queues[_]] {
-  r := policy.roles[_]
-  ({x | x := this_user.roles[_]} | {"*"})[r.name]
+role_queues contains q if {
+	r := policy.roles[_]
+	({x | x := this_user.roles[_]} | {"*"})[r.name]
+	q := r.queues[_]
 }
 
-allowed_queues[q] {
-  q := (user_queues | role_queues)[_]
+allowed_queues contains q if {
+	q := (user_queues | role_queues)[_]
 }
