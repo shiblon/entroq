@@ -17,7 +17,6 @@ package cmd
 import (
 	"context"
 	"crypto/x509"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -39,7 +38,6 @@ import (
 var rootFlags struct {
 	cfgFile      string
 	svcAddr      string
-	jsonValue    bool
 	secure       bool
 	authzToken   string
 	maxMsgSizeMB int
@@ -49,18 +47,16 @@ var rootFlags struct {
 
 var eq *entroq.EntroQ
 
-// cliJSON converts a CLI string value to a json.RawMessage. If the string is
-// already valid JSON it is used as-is; otherwise it is marshaled as a JSON
-// string. An empty string becomes null.
-func cliJSON(s string) json.RawMessage {
+// cliJSON converts a CLI string value to a json.RawMessage. The string must
+// be valid JSON; an empty string becomes null.
+func cliJSON(s string) (json.RawMessage, error) {
 	if s == "" {
-		return nil
+		return nil, nil
 	}
-	if json.Valid([]byte(s)) {
-		return json.RawMessage(s)
+	if !json.Valid([]byte(s)) {
+		return nil, fmt.Errorf("value is not valid JSON: %q", s)
 	}
-	b, _ := json.Marshal(s)
-	return b
+	return json.RawMessage(s), nil
 }
 
 // rootCmd represents the base command when called without any subcommands
@@ -140,7 +136,6 @@ func init() {
 	rootCmd.PersistentFlags().IntVar(&rootFlags.maxMsgSizeMB, "max_msg_size_mb", 10, "Maximum gRPC message size in megabytes.")
 
 	rootCmd.PersistentFlags().StringVarP(&rootFlags.svcAddr, "svcaddr", "s", ":37706", "address of service, uses port 37706 if none is specified")
-	rootCmd.PersistentFlags().BoolVarP(&rootFlags.jsonValue, "json", "j", false, "Display task values as JSON.")
 	rootCmd.PersistentFlags().BoolVarP(&rootFlags.secure, "secure", "S", false, "Use secure connection.")
 	rootCmd.PersistentFlags().StringVar(&rootFlags.authzToken, "authz_token", "", "Pass an Authorization token.")
 	rootCmd.PersistentFlags().StringVar(&rootFlags.pgURL, "pg_url", "", "PostgreSQL URL for direct backend connection.")
@@ -157,33 +152,6 @@ func mustTaskString(t *entroq.Task) string {
 	b, err := json.Marshal(t)
 	if err != nil {
 		log.Fatalf("Failed to marshal to JSON: %v", err)
-	}
-
-	if !rootFlags.jsonValue {
-		return string(b)
-	}
-
-	// Unmarshal into a map so we can insert the value where we want it (as we want it).
-	var tm map[string]interface{}
-	var vm interface{}
-	if err := json.Unmarshal(b, &tm); err != nil {
-		log.Fatalf("Error creating map from JSON: %v", err)
-	}
-	if val, ok := tm["value"]; !ok || val == nil {
-		return string(b)
-	}
-	v, err := base64.StdEncoding.DecodeString(tm["value"].(string))
-	if err != nil {
-		log.Fatalf("Failed to b64 deserialize byte value: %v", err)
-	}
-	if err := json.Unmarshal(v, &vm); err != nil {
-		log.Fatalf("Failed to unmarshal JSON value: %v", err)
-	}
-	tm["value"] = vm
-
-	b, err = json.Marshal(tm)
-	if err != nil {
-		log.Fatalf("Error marshaling unnested task: %v", err)
 	}
 	return string(b)
 }

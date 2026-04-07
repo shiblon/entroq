@@ -61,8 +61,12 @@ var insCmd = &cobra.Command{
 
 		var modArgs []entroq.ModifyArg
 		for _, v := range flagInsVal {
+			raw, err := cliJSON(v)
+			if err != nil {
+				return err
+			}
 			var insArgs []entroq.InsertArg
-			insArgs = append(insArgs, entroq.WithRawValue(cliJSON(v)))
+			insArgs = append(insArgs, entroq.WithRawValue(raw))
 			if dur != 0 {
 				insArgs = append(insArgs, entroq.WithArrivalTimeIn(dur))
 			}
@@ -74,7 +78,7 @@ var insCmd = &cobra.Command{
 			return fmt.Errorf("insert tasks: %w", err)
 		}
 
-		b, err := json.MarshalIndent(ins, "", "\t")
+		b, err := json.Marshal(ins)
 		if err != nil {
 			return fmt.Errorf("insert json: %w", err)
 		}

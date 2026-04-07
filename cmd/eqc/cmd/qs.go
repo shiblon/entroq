@@ -73,7 +73,7 @@ var qsCmd = &cobra.Command{
 		}
 
 		if showJSON {
-			b, err := json.MarshalIndent(qs, "", "\t")
+			b, err := json.Marshal(qs)
 			if err != nil {
 				return fmt.Errorf("queues json: %w", err)
 			}

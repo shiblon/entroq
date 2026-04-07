@@ -16,7 +16,7 @@ package cmd
 
 import (
 	"context"
-	"log"
+	"fmt"
 
 	"github.com/shiblon/entroq"
 	"github.com/spf13/cobra"
@@ -45,23 +45,27 @@ func init() {
 var modCmd = &cobra.Command{
 	Use:   "mod",
 	Short: "Modify a task by queue and ID.",
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		tasks, err := eq.Tasks(context.Background(), "", entroq.WithTaskID(flagMod.id))
 		if err != nil {
-			log.Fatalf("Error getting task ID %q", flagMod.id)
+			return fmt.Errorf("get task %q: %w", flagMod.id, err)
 		}
 		if len(tasks) < 1 {
-			log.Fatalf("Could not find task ID %q", flagMod.id)
+			return fmt.Errorf("task not found: %q", flagMod.id)
 		}
 		if len(tasks) > 1 {
-			log.Fatalf("Too many tasks returned: %v", tasks)
+			return fmt.Errorf("too many tasks returned: %v", tasks)
 		}
 
 		task := tasks[0]
 
 		var chgArgs []entroq.ChangeArg
 		if flagMod.val != "" {
-			chgArgs = append(chgArgs, entroq.RawValueTo(cliJSON(flagMod.val)))
+			raw, err := cliJSON(flagMod.val)
+			if err != nil {
+				return err
+			}
+			chgArgs = append(chgArgs, entroq.RawValueTo(raw))
 		}
 		if flagMod.queueTo != "" {
 			chgArgs = append(chgArgs, entroq.QueueTo(flagMod.queueTo))
@@ -76,7 +80,8 @@ var modCmd = &cobra.Command{
 		}
 
 		if _, _, err := eq.Modify(context.Background(), modArgs...); err != nil {
-			log.Fatalf("Could not modify task %q: %v", flagMod.id, err)
+			return fmt.Errorf("modify task %q: %w", flagMod.id, err)
 		}
+		return nil
 	},
 }
