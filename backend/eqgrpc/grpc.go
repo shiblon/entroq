@@ -409,7 +409,7 @@ func depErrorFromStat(stat *status.Status) error {
 		return fmt.Errorf("expected NotFound, got something else: %w", stat.Err())
 	}
 	// Dependency error, should have details.
-	depErr := entroq.DependencyError{
+	depErr := &entroq.DependencyError{
 		Message: stat.Err().Error(),
 	}
 	for _, det := range stat.Details() {
@@ -455,6 +455,10 @@ func unpackGRPCError(grpcErr error) error {
 		return grpcErr
 	}
 	switch stat.Code() {
+	case codes.Canceled:
+		return fmt.Errorf("%w", context.Canceled)
+	case codes.DeadlineExceeded:
+		return fmt.Errorf("%w", context.DeadlineExceeded)
 	case codes.NotFound:
 		return depErrorFromStat(stat)
 	case codes.PermissionDenied:

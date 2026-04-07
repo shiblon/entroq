@@ -781,7 +781,7 @@ func parseModifyError(err error, mod *entroq.Modification) error {
 		deleteIDs[t.ID] = true
 	}
 
-	depErr := entroq.DependencyError{}
+	depErr := new(entroq.DependencyError)
 
 	categorize := func(id string, version int32) {
 		tid := &entroq.TaskID{ID: id, Version: version}
