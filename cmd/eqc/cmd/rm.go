@@ -76,7 +76,7 @@ var rmCmd = &cobra.Command{
 				continue
 			}
 
-			b, err := json.MarshalIndent(mod, "", "\t")
+			b, err := json.Marshal(mod)
 			if err != nil {
 				log.Fatalf("JSON marshal: %v", err)
 			}
