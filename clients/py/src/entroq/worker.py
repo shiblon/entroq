@@ -12,6 +12,15 @@ class StopWorker(Exception):
     """Raise from a work function to stop the worker loop cleanly."""
     pass
 
+class TaskProxy:
+    """Proxies attribute access to a task getter, ensuring health checks."""
+    def __init__(self, getter):
+        self._getter = getter
+    def __getattr__(self, name):
+        return getattr(self._getter(), name)
+    def __repr__(self):
+        return repr(self._getter())
+
 @contextmanager
 def renewing(client: EntroQBase, task: Task, duration_s: int = 30) -> Iterator[Callable[[], Task]]:
     """Context manager that renews a task claim in the background.
@@ -20,11 +29,14 @@ def renewing(client: EntroQBase, task: Task, duration_s: int = 30) -> Iterator[C
     version of the task.
     """
     exit_event = threading.Event()
+    failure_err = [None]
     lock = threading.Lock()
     current = [task]
 
     def latest() -> Task:
         with lock:
+            if failure_err[0] is not None:
+                raise failure_err[0]
             return current[0]
 
     def _renewer():
@@ -36,8 +48,13 @@ def renewing(client: EntroQBase, task: Task, duration_s: int = 30) -> Iterator[C
                 _, changed = client.modify(changes=[latest().as_change(at=at)])
                 with lock:
                     current[0] = changed[0]
-            except Exception:
-                logging.exception("renew_for failed")
+            except DependencyError as e:
+                logging.error("Lease lost for task %s, stopping worker: %s", task.id, e)
+                with lock:
+                    failure_err[0] = e
+                return  # Stop the renewer thread if lease is lost.
+            except Exception as e:
+                logging.warning("Transient renewal error for task %s (will retry): %s", task.id, e)
             exit_event.wait(duration_s / 2)
 
     t = threading.Thread(target=_renewer, daemon=True)
@@ -80,7 +97,7 @@ class EntroQWorker:
                 @contextmanager
                 def renew():
                     with renewing(self.client, task, duration_s=claim_duration) as current_task:
-                        yield current_task()
+                        yield TaskProxy(current_task)
                     final_task[0] = current_task()
 
                 @contextmanager

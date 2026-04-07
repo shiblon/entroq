@@ -49,10 +49,30 @@ class EntroQJSON(EntroQBase):
             try:
                 err_detail = resp.json()
                 # Vanguard transcode might wrap errors or return them in a specific field.
-                # For now, we look for dependency error markers.
-                if resp.status_code == 404 and ("missing" in str(err_detail) or "mismatched" in str(err_detail)):
-                    # This is a simplified check for DependencyError.
-                    raise DependencyError()
+                # We look for dependency error markers.
+                msg = str(err_detail).lower()
+                if (resp.status_code == 404 and ("missing" in msg or "mismatched" in msg)) or \
+                   (resp.status_code == 500 and "modification dependency error" in msg):
+                    kwargs = {'message': err_detail.get('message', '')}
+                    for d in err_detail.get('details', []):
+                        dtype = d.get('type')
+                        tid_raw = d.get('id')
+                        tid = None
+                        if tid_raw:
+                            tid = TaskID(id=tid_raw.get('id'), version=int(tid_raw.get('version', 0)), queue=tid_raw.get('queue', ''))
+                        
+                        if dtype == 'INSERT': kwargs.setdefault('inserts', []).append(tid)
+                        elif dtype == 'CHANGE': kwargs.setdefault('changes', []).append(tid)
+                        elif dtype == 'DELETE': kwargs.setdefault('deletes', []).append(tid)
+                        elif dtype == 'DEPEND': kwargs.setdefault('depends', []).append(tid)
+                        elif dtype == 'CLAIM': kwargs.setdefault('claims', []).append(tid)
+                        elif dtype == 'DETAIL': kwargs['message'] = d.get('msg', kwargs['message'])
+                    
+                    # Backwards compatibility Mapping
+                    kwargs['missing'] = kwargs.get('depends', []) + kwargs.get('deletes', [])
+                    kwargs['collisions'] = kwargs.get('inserts', [])
+                    
+                    raise DependencyError(**kwargs)
             except (ValueError, KeyError):
                 pass
             resp.raise_for_status()

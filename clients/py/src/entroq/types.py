@@ -63,14 +63,27 @@ class Task:
 
 class DependencyError(Exception):
     """Raised when a modify call fails due to dependency constraints."""
-    def __init__(self, missing=(), mismatched=(), collisions=()):
+    def __init__(self, message="", missing=(), mismatched=(), collisions=(), inserts=(), depends=(), deletes=(), changes=(), claims=()):
+        super().__init__(message)
+        self.message = message
         self.missing = list(missing)
         self.mismatched = list(mismatched)
         self.collisions = list(collisions)
+        self.inserts = list(inserts)
+        self.depends = list(depends)
+        self.deletes = list(deletes)
+        self.changes = list(changes)
+        self.claims = list(claims)
 
     def __str__(self):
         return json.dumps({
-            'missing': self.missing,
-            'mismatched': self.mismatched,
-            'collisions': self.collisions,
+            'message': self.message,
+            'missing': [str(t) for t in self.missing],
+            'mismatched': [str(t) for t in self.mismatched],
+            'collisions': [str(t) for t in self.collisions],
+            'inserts': [str(t) for t in self.inserts],
+            'depends': [str(t) for t in self.depends],
+            'deletes': [str(t) for t in self.deletes],
+            'changes': [str(t) for t in self.changes],
+            'claims': [str(t) for t in self.claims],
         })

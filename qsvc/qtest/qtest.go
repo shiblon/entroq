@@ -162,8 +162,12 @@ func simpleWorkerOnce(ctx context.Context, t *testing.T, client *entroq.EntroQ, 
 		).Run(ctx, queue)
 	})
 
+	// Brief pause to let the worker goroutine reach its Claim call before we
+	// insert tasks. This exercises the notify-on-insert wakeup path. 10ms is
+	// ample for an in-process backend; it was previously 1s (20s total for
+	// 20 iterations).
 	select {
-	case <-time.After(1 * time.Second):
+	case <-time.After(10 * time.Millisecond):
 	case <-ctx.Done():
 		t.Fatalf("Sleep: %v", ctx.Err())
 	}
