@@ -43,7 +43,7 @@ username := u if {
 	input.authz.type == "Bearer"
 	token := input.authz.credentials
 	[valid, _, payload] := io.jwt.decode_verify(token, {
-		"jwks": json.marshal(jwks_response.body),
+		"cert": json.marshal(jwks_response.body),
 		"aud": data.entroq.idp.audience,
 		"iss": data.entroq.idp.issuer,
 	})

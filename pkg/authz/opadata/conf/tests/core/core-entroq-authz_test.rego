@@ -130,3 +130,46 @@ test_prefix_prefix_nomatch if {
 		"actions": ["CLAIM"],
 	}]
 }
+
+test_allow_true if {
+	allow
+	with data.entroq.user.username as "auser"
+	with data.entroq.permissions.allowed_queues as [{
+		"exact": "/users/auser/inbox",
+		"actions": ["CLAIM", "DELETE"],
+	}]
+	with input.queues as [{
+		"exact": "/users/auser/inbox",
+		"actions": ["CLAIM", "DELETE"],
+	}]
+}
+
+test_allow_false_no_matching_queues if {
+	not allow
+	with data.entroq.user.username as "auser"
+	with data.entroq.permissions.allowed_queues as set()
+	with input.queues as [{
+		"exact": "/users/auser/inbox",
+		"actions": ["CLAIM"],
+	}]
+}
+
+test_allow_false_missing_actions if {
+	not allow
+	with data.entroq.user.username as "auser"
+	with data.entroq.permissions.allowed_queues as [{
+		"exact": "/users/auser/inbox",
+		"actions": ["READ"],
+	}]
+	with input.queues as [{
+		"exact": "/users/auser/inbox",
+		"actions": ["CLAIM", "READ"],
+	}]
+}
+
+test_allow_false_empty_allowed_queues if {
+	not allow
+	with data.entroq.user.username as "auser"
+	with data.entroq.permissions.allowed_queues as set()
+	with input.queues as []
+}
