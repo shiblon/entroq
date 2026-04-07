@@ -5,7 +5,6 @@ go 1.25.0
 require (
 	connectrpc.com/connect v1.19.1
 	connectrpc.com/vanguard v0.4.0
-	github.com/golang-jwt/jwt/v4 v4.3.0
 	github.com/golang/protobuf v1.5.4
 	github.com/google/go-cmp v0.7.0
 	github.com/lib/pq v1.12.1
