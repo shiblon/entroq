@@ -1,6 +1,7 @@
 package entroq
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -61,7 +62,7 @@ func (t TaskID) Depend() ModifyArg {
 type TaskData struct {
 	Queue string    `json:"queue"`
 	At    time.Time `json:"at"`
-	Value []byte    `json:"value"`
+	Value json.RawMessage `json:"value"`
 
 	// Attempt indicates which "attempt number" this task is on. Used by workers.
 	Attempt int32 `json:"attempt"`
@@ -120,7 +121,7 @@ type Task struct {
 	At       time.Time `json:"at"`
 	Claimant string    `json:"claimant"`
 	Claims   int32     `json:"claims"`
-	Value    []byte    `json:"value"`
+	Value    json.RawMessage `json:"value"`
 
 	Created  time.Time `json:"created"`
 	Modified time.Time `json:"modified"`
@@ -233,8 +234,7 @@ func (t *Task) Data() *TaskData {
 func (t *Task) Copy() *Task {
 	newT := new(Task)
 	*newT = *t
-	newT.Value = make([]byte, len(t.Value))
-	copy(newT.Value, t.Value)
+	newT.Value = append(json.RawMessage(nil), t.Value...)
 	return newT
 }
 

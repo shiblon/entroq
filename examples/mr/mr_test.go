@@ -92,6 +92,7 @@ func TestMapReduce_check(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open mem client: %v", err)
 		}
+		defer client.Close()
 		return mrtest.MRCheck(ctx, client, ndocs, nm, nr)
 	}
 	if err := quick.Check(check, config); err != nil {

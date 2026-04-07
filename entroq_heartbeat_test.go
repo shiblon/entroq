@@ -7,6 +7,7 @@ import (
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/backend/eqmem"
+	"github.com/shiblon/entroq/worker"
 )
 
 func TestDoWithRenewAll_ImmediateCancellationOnLeaseLoss(t *testing.T) {
@@ -15,9 +16,10 @@ func TestDoWithRenewAll_ImmediateCancellationOnLeaseLoss(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create eq: %v", err)
 	}
+	defer eq.Close()
 
 	queue := "/test/cancel"
-	_, _, err = eq.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue([]byte("work"))))
+	_, _, err = eq.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue(entroq.JSONStr("work"))))
 	if err != nil {
 		t.Fatalf("failed to insert: %v", err)
 	}
@@ -34,7 +36,7 @@ func TestDoWithRenewAll_ImmediateCancellationOnLeaseLoss(t *testing.T) {
 
 	go func() {
 		// Use a short renewal interval to speed up the test.
-		errChan <- eq.DoWithRenewAll(ctx, []*entroq.Task{claimed}, 100*time.Millisecond, func(ctx context.Context, stop entroq.FinalizeRenewAll) error {
+		errChan <- worker.DoWithRenewAll(ctx, eq, []*entroq.Task{claimed}, 100*time.Millisecond, func(ctx context.Context, stop worker.FinalizeRenewAll) error {
 			// Wait for the context to be canceled from the outside.
 			<-ctx.Done()
 			return ctx.Err()

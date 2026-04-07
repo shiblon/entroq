@@ -12,6 +12,7 @@ import (
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/qsvc/qtest"
+	"github.com/shiblon/entroq/worker"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -80,6 +81,7 @@ func TestNotifyReadyQueues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New client: %v", err)
 	}
+	defer client.Close()
 
 	queue := fmt.Sprintf("/test/notify-ready/%d", time.Now().UnixNano())
 	if _, _, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithArrivalTimeIn(500*time.Millisecond))); err != nil {
@@ -209,11 +211,12 @@ func Example() {
 	if err != nil {
 		log.Fatalf("Entroq init error: %v", err)
 	}
+	defer client.Close()
 
 	// Insert some tasks.
 	_, _, err = client.Modify(ctx,
-		entroq.InsertingInto("/example/queue 1", entroq.WithValue([]byte("hello"))),
-		entroq.InsertingInto("/example/queue 2", entroq.WithValue([]byte("hello"))),
+		entroq.InsertingInto("/example/queue 1", entroq.WithValue(entroq.JSONStr("hello"))),
+		entroq.InsertingInto("/example/queue 2", entroq.WithValue(entroq.JSONStr("hello"))),
 	)
 	if err != nil {
 		log.Fatalf("insertion failed: %v", err)
@@ -225,13 +228,13 @@ func Example() {
 	defer cancel()
 	go func() { time.Sleep(2 * time.Second); cancel() }()
 
-	worker := entroq.NewWorker(client, entroq.FuncHandler(
-		func(ctx context.Context, claimed *entroq.Task) error {
+	w := worker.New(client,
+		worker.WithDo(func(ctx context.Context, claimed *entroq.Task) error {
 			// Do work with the task.
 			fmt.Println(string(claimed.Value))
 			return nil
-		},
-		func(ctx context.Context, final *entroq.Task) error {
+		}),
+		worker.WithFinish(func(ctx context.Context, final *entroq.Task) error {
 			// Delete the task to "commit" the work.
 			// At this point, you can also call directly into eqpg.ModifyOpts and
 			// hand it a function to call that has a transaction. That transaction
@@ -243,9 +246,9 @@ func Example() {
 				return fmt.Errorf("Failed to delete/commit task: %w", err)
 			}
 			return nil
-		},
-	))
-	if err := worker.Run(ctx, "/example/queue 1", "/example/queue 2"); err != nil {
+		}),
+	)
+	if err := w.Run(ctx, "/example/queue 1", "/example/queue 2"); err != nil {
 		log.Fatal(err)
 	}
 
@@ -270,6 +273,7 @@ func Example_inTransaction() {
 	if err != nil {
 		log.Fatalf("Entroq init error: %v", err)
 	}
+	defer client.Close()
 
 	// Prep a simple database table. We'll update it inside the Modify transaction.
 	if _, err := backend.DB.ExecContext(ctx,
@@ -282,9 +286,9 @@ func Example_inTransaction() {
 
 	// Insert some tasks.
 	_, _, err = client.Modify(ctx,
-		entroq.InsertingInto("/example/queue 1", entroq.WithValue([]byte("hello"))),
-		entroq.InsertingInto("/example/queue 2", entroq.WithValue([]byte("hello"))),
-		entroq.InsertingInto("/example/queue 2", entroq.WithValue([]byte("hello"))),
+		entroq.InsertingInto("/example/queue 1", entroq.WithValue(entroq.JSONStr("hello"))),
+		entroq.InsertingInto("/example/queue 2", entroq.WithValue(entroq.JSONStr("hello"))),
+		entroq.InsertingInto("/example/queue 2", entroq.WithValue(entroq.JSONStr("hello"))),
 	)
 	if err != nil {
 		log.Fatalf("insertion failed: %v", err)
@@ -299,13 +303,13 @@ func Example_inTransaction() {
 	// Create a worker that just prints the task value, then in finalization,
 	// when the task version is finalized (background renewal is stopped),
 	// updates the counter table.
-	worker := entroq.NewWorker(client, entroq.FuncHandler(
-		func(ctx context.Context, claimed *entroq.Task) error {
+	w := worker.New(client,
+		worker.WithDo(func(ctx context.Context, claimed *entroq.Task) error {
 			// Do work with the task.
 			fmt.Println(string(claimed.Value))
 			return nil
-		},
-		func(ctx context.Context, final *entroq.Task) error {
+		}),
+		worker.WithFinish(func(ctx context.Context, final *entroq.Task) error {
 			// Delete the task to "commit" the work.
 
 			// The counter is updated in the same transaction as the entroq modification.
@@ -319,9 +323,9 @@ func Example_inTransaction() {
 				return fmt.Errorf("Failed to delete/commit task: %w", err)
 			}
 			return nil
-		},
-	))
-	if err := worker.Run(workerCtx, "/example/queue 1", "/example/queue 2"); err != nil && !errors.Is(err, context.Canceled) {
+		}),
+	)
+	if err := w.Run(workerCtx, "/example/queue 1", "/example/queue 2"); err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatalf("worker run failed: %v", err)
 	}
 

@@ -61,7 +61,7 @@ var modCmd = &cobra.Command{
 
 		var chgArgs []entroq.ChangeArg
 		if flagMod.val != "" {
-			chgArgs = append(chgArgs, entroq.ValueTo([]byte(flagMod.val)))
+			chgArgs = append(chgArgs, entroq.ValueTo(cliJSON(flagMod.val)))
 		}
 		if flagMod.queueTo != "" {
 			chgArgs = append(chgArgs, entroq.QueueTo(flagMod.queueTo))

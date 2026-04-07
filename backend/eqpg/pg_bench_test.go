@@ -62,6 +62,7 @@ func BenchmarkStatsContention_1M(b *testing.B) {
 	if err != nil {
 		b.Fatalf("Failed to create client: %v", err)
 	}
+	defer client.Close()
 
 	eqtest.RunContentionBenchmark(b, client, queues, 20)
 }
@@ -88,6 +89,7 @@ func BenchmarkStatsContention_1M_PollOnly(b *testing.B) {
 	if err != nil {
 		b.Fatalf("Failed to create client: %v", err)
 	}
+	defer client.Close()
 
 	eqtest.RunContentionBenchmark(b, client, queues, 20)
 }

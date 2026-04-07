@@ -791,7 +791,7 @@ func (m *EQMem) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[str
 		if !queueMatches(q, qq) {
 			continue
 		}
-		if qq.Limit > 0 && len(qs) > qq.Limit {
+		if qq.Limit > 0 && len(qs) >= qq.Limit {
 			break
 		}
 		qts, ok := m.queueTasks(q)

@@ -13,20 +13,27 @@
 // Inspired by Google's Spanner Queues, but free and very cheap to run yourself.
 // The in-memory implementation uses a journal that replays extremely quickly,
 // so failures are really just fast-recovery events. I've literally had network
-// switch lose power in a data center cage, have power restored, and everything
-// just started right up again, with no work lost.
+// switch lose power in a data center cage, causing all the workers to start
+// crash-looping; then with power restored and no other intervention,
+// everything just started moving again with no work lost or repeated.
 //
 // The PostgreSQL implementation is pure stored procedures and LISTEN/NOTIFY, so
 // if you want, you don't even need all of this. You can do everything with the
 // schema file and some scripting. No additional server protocols, just use
-// PostgreSQL native privileges, connection pooling, etc. Or you can use the
-// nicer client approaches here, with workers, etc. In any case, see the Python
+// PostgreSQL native privileges and connections. Or you can use the nicer
+// client approaches here, with workers, etc. In any case, see the Python pg
 // client implementation for a thin wrapper around Postgres for inspiration.
 //
 // Using the Go implementation opens up possibilities of, among other things, an
-// in-memory backend served via gRPC. To use GRPC as a service protocol, see
-// cmd/eqpgsvc or cmd/eqmemsvc to start it up, and use cmd/eqc as a client to
-// play with it.
+// in-memory backend served via gRPC with queue-level authorization. To use
+// GRPC as a service protocol, see cmd/eqpgsvc or cmd/eqmemsvc to start it up,
+// and use cmd/eqc as a client to play with it.
+//
+// All of this is very lightweight. You can run it on a laptop or a cluster, it
+// scales effortlessly. If you want to work faster, just start more workers.
+// There's no configuration to fiddle with; the service just adapts because
+// that's fundamental to the nature of a true competing consumer workflow
+// system.
 package entroq
 
 // Copyright 2019 Chris Monson <shiblon@gmail.com>
@@ -45,14 +52,12 @@ package entroq
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"math/rand"
 	"strings"
 	"time"
-
-	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -458,132 +463,6 @@ func (c *EntroQ) RenewAllFor(ctx context.Context, tasks []*Task, duration time.D
 	return changed, nil
 }
 
-// FinalizeRenewAll defines a function that can be called to stop renewal from a worker routine.
-// It returns a slice of tasks that are no longer being renewed, so versions are stable.
-type FinalizeRenewAll func() []*Task
-
-// FinalizeRenew defines a function that can be called to stop renewal from a worker routine.
-// It returns a single task that is no longer being renewed, so its version is stable.
-type FinalizeRenew func() *Task
-
-// DoWorkAll defines a function that accepts a 'stop' function so that work can be
-// done, renewal can be stopped to get stable task versions, and cleanup can
-// happen. For multiple tasks.
-type DoWorkAll func(ctx context.Context, stop FinalizeRenewAll) error
-
-// DoWork defines a function like WorkAll, but handles only one task.
-type DoWork func(ctx context.Context, stop FinalizeRenew) error
-
-// DoWithRenewAll runs the provided function while keeping all given tasks leases renewed.
-func (c *EntroQ) DoWithRenewAll(ctx context.Context, tasks []*Task, lease time.Duration, f DoWorkAll) error {
-	type outVal struct {
-		tasks []*Task
-		err   error
-	}
-	taskCh := make(chan outVal, 1)
-
-	g, ctx := errgroup.WithContext(ctx)
-
-	fctx, fcancel := context.WithCancelCause(ctx)
-	defer fcancel(nil)
-
-	// Run the renewer, with a channel for consuming intermediate renewed tasks.
-	stopRenew := make(chan struct{})
-	g.Go(func() error {
-		renewed := tasks
-		var out chan<- outVal
-		var stopErr error
-		doneCh := ctx.Done()
-		for {
-			select {
-			case <-stopRenew:
-				out = taskCh // enable final send
-				stopRenew = nil
-			case <-doneCh:
-				// cancellation shouldn't keep us from returning a value
-				out = taskCh
-				doneCh = nil
-			case <-time.After(lease / 2):
-				if stopErr != nil {
-					break
-				}
-				r, err := c.RenewAllFor(ctx, renewed, lease)
-				if err != nil {
-					if IsCanceled(err) {
-						out = taskCh
-						break
-					}
-					if depErr, ok := AsDependency(err); ok {
-						// Lease lost. Fail fast.
-						fcancel(depErr)
-						stopErr = depErr
-						out = taskCh
-						break
-					}
-					// Transient error. Log and retry at next interval.
-					// Note: we don't 'break' or 'set stopErr' here, allowing retries.
-					log.Printf("Transient renewal error: %v", err)
-					continue
-				}
-				renewed = r
-			case out <- outVal{renewed, stopErr}:
-				return nil
-			}
-		}
-	})
-
-	finalize := func() []*Task {
-		// NOTE: we don't worry about contexts in this function because.
-		// 1. The renewal loop always sends valid tasks. There are no
-		// short-circuit or error cases, even on context cancellation, so
-		// closing stopRenew guarantees that there will be a value on taskCh.
-		// 2. If there is an error returned from the renewer, we can cancel
-		// the user function context with a cause, which will cause subsequent
-		// things to fail. So long as we log the error here, that failure will
-		// make sense.
-		// 3. Since we can tell what happened in the user function, we can get
-		// the cause in this outer scope and make a real error out of it, too.
-		close(stopRenew)
-		out := <-taskCh
-		if out.err != nil {
-			fcancel(out.err)
-		}
-		return out.tasks
-	}
-
-	g.Go(func() error {
-		if err := f(fctx, finalize); err != nil {
-			if errors.Is(err, context.Canceled) {
-				if causeErr := context.Cause(fctx); causeErr != nil {
-					return fmt.Errorf("work func canceled with error: %w", causeErr)
-				}
-				return nil
-			}
-			return fmt.Errorf("renewed user func: %w", err)
-		}
-		return nil
-	})
-
-	if err := g.Wait(); err != nil {
-		return fmt.Errorf("do with renew all: %w", err)
-	}
-	return nil
-}
-
-// DoWithRenew runs the provided function while keeping the given task lease renewed.
-func (c *EntroQ) DoWithRenew(ctx context.Context, task *Task, lease time.Duration, f DoWork) error {
-	if err := c.DoWithRenewAll(ctx, []*Task{task}, lease, func(ctx context.Context, finalize FinalizeRenewAll) error {
-		// Call the single-task user function.
-		if err := f(ctx, func() *Task { return finalize()[0] }); err != nil {
-			return fmt.Errorf("do one: %w", err)
-		}
-		return nil
-	}); err != nil {
-		return fmt.Errorf("renew: %w", err)
-	}
-	return nil
-}
-
 // Modify allows a batch modification operation to be done, gated on the
 // existence of all task IDs and versions specified. Deletions, Updates, and
 // Dependencies must be present. The transaction all fails or all succeeds.
@@ -603,6 +482,16 @@ func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (inserted []*
 	for _, opt := range mod.Options() {
 		if err := opt.IsModifyBackend(c.backend); err != nil {
 			return nil, nil, fmt.Errorf("modify option incompatible with backend %T: %w", c.backend, err)
+		}
+	}
+	for _, ins := range mod.Inserts {
+		if ins.Value != nil && !json.Valid(ins.Value) {
+			return nil, nil, fmt.Errorf("modify insert %q: value is not valid JSON", ins.Queue)
+		}
+	}
+	for _, chg := range mod.Changes {
+		if chg.Value != nil && !json.Valid(chg.Value) {
+			return nil, nil, fmt.Errorf("modify change %s: value is not valid JSON", chg.ID)
 		}
 	}
 	for {
@@ -668,7 +557,7 @@ func ModifyAs(id string) ModifyArg {
 //		Inserting(&TaskData{
 //			Queue: "myqueue",
 //			At:    time.Now.Add(1 * time.Minute),
-//			Value: []byte("hi there"),
+//			Value: json.RawMessage(`"hi there"`),
 //		}))
 //
 // Or, better still,
@@ -676,7 +565,7 @@ func ModifyAs(id string) ModifyArg {
 //	cli.Modify(ctx,
 //		InsertingInto("myqueue",
 //		    WithArrivalTimeIn(1 * time.Minute),
-//		    WithValue([]byte("hi there"))))
+//		    WithValue(json.RawMessage(`"hi there"`))))
 func Inserting(tds ...*TaskData) ModifyArg {
 	return func(m *Modification) {
 		m.Inserts = append(m.Inserts, tds...)
@@ -685,7 +574,7 @@ func Inserting(tds ...*TaskData) ModifyArg {
 
 // InsertingInto creates an insert modification. Use like this:
 //
-//	cli.Modify(InsertingInto("my queue name", WithValue([]byte("hi there"))))
+//	cli.Modify(InsertingInto("my queue name", WithValue(json.RawMessage(`"hi there"`))))
 func InsertingInto(q string, insertArgs ...InsertArg) ModifyArg {
 	return func(m *Modification) {
 		data := &TaskData{Queue: q}
@@ -742,12 +631,22 @@ func WithArrivalTimeIn(duration time.Duration) InsertArg {
 	}
 }
 
-// WithValue sets the task's byte slice value during insertion.
+// JSONStr converts a Go string to a JSON string value, suitable for use as a
+// task value. For example:
+//
+//	entroq.JSONStr("hello") == json.RawMessage(`"hello"`)
+func JSONStr(s string) json.RawMessage {
+	b, _ := json.Marshal(s)
+	return b
+}
+
+// WithValue sets the task's JSON value during insertion. The value must be
+// valid JSON; nil is allowed and represents an absent value.
 //
 //	cli.Modify(ctx,
 //	  InsertingInto("my queue",
-//	    WithValue([]byte("hi there"))))
-func WithValue(value []byte) InsertArg {
+//	    WithValue(json.RawMessage(`"hi there"`))))
+func WithValue(value json.RawMessage) InsertArg {
 	return func(_ *Modification, d *TaskData) {
 		d.Value = value
 	}
@@ -843,7 +742,7 @@ func Deleting(id string, version int32, opts ...IDOption) ModifyArg {
 //
 //	cli.Modify(ctx,
 //	  InsertingInto("my queue",
-//	    WithValue([]byte("hey"))),
+//	    WithValue(json.RawMessage(`"hey"`))),
 //	    DependingOn(anotherID, someVersion))
 func DependingOn(id string, version int32, opts ...IDOption) ModifyArg {
 	return func(m *Modification) {
@@ -905,8 +804,9 @@ func ArrivalTimeBy(d time.Duration) ChangeArg {
 	}
 }
 
-// ValueTo sets the changing task's value to the given byte slice.
-func ValueTo(v []byte) ChangeArg {
+// ValueTo sets the changing task's JSON value. The value must be valid JSON;
+// nil is allowed and represents an absent value.
+func ValueTo(v json.RawMessage) ChangeArg {
 	return func(_ *Modification, t *Task) {
 		t.Value = v
 	}

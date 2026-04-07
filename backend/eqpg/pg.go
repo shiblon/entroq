@@ -708,14 +708,14 @@ func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *mo
 			$1,
 			$2::text[], $3::integer[],
 			$4::text[], $5::integer[],
-			$6::text[], $7::text[], $8::timestamptz[], $9::bytea[], $10::integer[], $11::text[],
-			$12::text[], $13::integer[], $14::text[], $15::timestamptz[], $16::bytea[], $17::integer[], $18::text[]
+			$6::text[], $7::text[], $8::timestamptz[], $9::text[], $10::integer[], $11::text[],
+			$12::text[], $13::integer[], $14::text[], $15::timestamptz[], $16::text[], $17::integer[], $18::text[]
 		)`,
 		mod.Claimant,
 		pq.Array(depIDs), pq.Array(depVers),
 		pq.Array(delIDs), pq.Array(delVers),
-		pq.Array(insIDs), pq.Array(insQueues), pq.Array(insAts), pq.ByteaArray(insValues), pq.Array(insAttempts), pq.Array(insErrs),
-		pq.Array(chgIDs), pq.Array(chgVers), pq.Array(chgQueues), pq.Array(chgAts), pq.ByteaArray(chgValues), pq.Array(chgAttempts), pq.Array(chgErrs),
+		pq.Array(insIDs), pq.Array(insQueues), pq.Array(insAts), pq.Array(insValues), pq.Array(insAttempts), pq.Array(insErrs),
+		pq.Array(chgIDs), pq.Array(chgVers), pq.Array(chgQueues), pq.Array(chgAts), pq.Array(chgValues), pq.Array(chgAttempts), pq.Array(chgErrs),
 	)
 	if err != nil {
 		return nil, nil, parseModifyError(err, mod)
@@ -819,19 +819,29 @@ func taskIDArrays(tids []*entroq.TaskID) (ids []string, versions []int32) {
 	return
 }
 
+// jsonTextVal converts a json.RawMessage to a *string for use in a text[] SQL
+// parameter. nil produces nil (SQL NULL); non-nil produces the JSON text.
+func jsonTextVal(v json.RawMessage) *string {
+	if v == nil {
+		return nil
+	}
+	s := string(v)
+	return &s
+}
+
 // insertArrays splits a slice of TaskData inserts into parallel arrays for the stored procedure.
-func insertArrays(inserts []*entroq.TaskData) (ids []string, queues []string, ats []time.Time, values [][]byte, attempts []int32, errs []string) {
+func insertArrays(inserts []*entroq.TaskData) (ids []string, queues []string, ats []time.Time, values []*string, attempts []int32, errs []string) {
 	ids = make([]string, len(inserts))
 	queues = make([]string, len(inserts))
 	ats = make([]time.Time, len(inserts))
-	values = make([][]byte, len(inserts))
+	values = make([]*string, len(inserts))
 	attempts = make([]int32, len(inserts))
 	errs = make([]string, len(inserts))
 	for i, ins := range inserts {
 		ids[i] = ins.ID // empty signals auto-generate, the common case
 		queues[i] = ins.Queue
 		ats[i] = ins.At // zero time signals use now()
-		values[i] = ins.Value
+		values[i] = jsonTextVal(ins.Value)
 		attempts[i] = ins.Attempt
 		errs[i] = ins.Err
 	}
@@ -839,12 +849,12 @@ func insertArrays(inserts []*entroq.TaskData) (ids []string, queues []string, at
 }
 
 // changeArrays splits a slice of Task changes into parallel arrays for the stored procedure.
-func changeArrays(changes []*entroq.Task) (ids []string, versions []int32, queues []string, ats []time.Time, values [][]byte, attempts []int32, errs []string) {
+func changeArrays(changes []*entroq.Task) (ids []string, versions []int32, queues []string, ats []time.Time, values []*string, attempts []int32, errs []string) {
 	ids = make([]string, len(changes))
 	versions = make([]int32, len(changes))
 	queues = make([]string, len(changes))
 	ats = make([]time.Time, len(changes))
-	values = make([][]byte, len(changes))
+	values = make([]*string, len(changes))
 	attempts = make([]int32, len(changes))
 	errs = make([]string, len(changes))
 	for i, chg := range changes {
@@ -852,7 +862,7 @@ func changeArrays(changes []*entroq.Task) (ids []string, versions []int32, queue
 		versions[i] = chg.Version
 		queues[i] = chg.Queue
 		ats[i] = chg.At
-		values[i] = chg.Value
+		values[i] = jsonTextVal(chg.Value)
 		attempts[i] = chg.Attempt
 		errs[i] = chg.Err
 	}

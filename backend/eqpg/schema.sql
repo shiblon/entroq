@@ -25,6 +25,13 @@ ALTER TABLE IF EXISTS entroq.tasks ADD COLUMN IF NOT EXISTS claims  INTEGER NOT 
 ALTER TABLE IF EXISTS entroq.tasks ADD COLUMN IF NOT EXISTS attempt INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE IF EXISTS entroq.tasks ADD COLUMN IF NOT EXISTS err     TEXT    NOT NULL DEFAULT '';
 
+-- Column type migration: bytea -> jsonb for value.
+-- encode(..., 'escape') converts bytea to text using escape format, which is
+-- transparent for valid UTF-8 content (i.e., all valid JSON). Fails loudly if
+-- value is not parseable as JSON, which is the correct behavior for a migration.
+ALTER TABLE IF EXISTS entroq.tasks ALTER COLUMN value TYPE jsonb
+    USING CASE WHEN value IS NULL THEN NULL ELSE encode(value, 'escape')::jsonb END;
+
 -- Column type migration: uuid -> text for id and claimant.
 -- Every UUID has a canonical text representation so this cast is safe.
 -- No-ops if the columns are already text.
@@ -43,11 +50,18 @@ DROP TYPE IF EXISTS entroq.task_id;
 DROP TYPE IF EXISTS entroq.task_arg;
 
 -- Drop any stored procedures incompatible with current table schema. Recreating them is non-disruptive.
+-- UUID-era signatures (pre-text migration):
 DROP FUNCTION IF EXISTS entroq._try_claim_bucket(text, uuid, interval, timestamptz, integer, integer);
 DROP FUNCTION IF EXISTS entroq._try_claim_one(text, uuid, interval);
 DROP FUNCTION IF EXISTS entroq.try_claim(text[], uuid, interval);
 DROP FUNCTION IF EXISTS entroq._modify_arrays(uuid, uuid[], integer[], uuid[], integer[], uuid[], text[], timestamptz[], bytea[], integer[], text[], uuid[], integer[], text[], timestamptz[], bytea[], integer[], text[]);
 DROP FUNCTION IF EXISTS entroq.modify(uuid, jsonb, jsonb, jsonb, jsonb);
+-- Text-era signatures (pre-jsonb migration): return type changed, must drop and recreate.
+DROP FUNCTION IF EXISTS entroq._try_claim_bucket(text, text, interval, timestamptz, integer, integer);
+DROP FUNCTION IF EXISTS entroq._try_claim_one(text, text, interval);
+DROP FUNCTION IF EXISTS entroq.try_claim(text[], text, interval);
+DROP FUNCTION IF EXISTS entroq._modify_arrays(text, text[], integer[], text[], integer[], text[], text[], timestamptz[], bytea[], integer[], text[], text[], integer[], text[], timestamptz[], bytea[], integer[], text[]);
+DROP FUNCTION IF EXISTS entroq.modify(text, jsonb, jsonb, jsonb, jsonb);
 DROP FUNCTION IF EXISTS entroq.tasks(text, integer, boolean);
 
 -- Core table. id and claimant are TEXT with CHECK constraints limiting them
@@ -66,7 +80,7 @@ CREATE TABLE IF NOT EXISTS entroq.tasks (
     created  TIMESTAMP WITH TIME ZONE,
     modified TIMESTAMP WITH TIME ZONE NOT NULL,
     claimant TEXT                     CHECK (claimant IS NULL OR length(claimant) <= 64),
-    value    BYTEA,
+    value    JSONB,
     claims   INTEGER                  NOT NULL DEFAULT 0,
     attempt  INTEGER                  NOT NULL DEFAULT 0,
     err      TEXT                     NOT NULL DEFAULT ''
@@ -109,7 +123,7 @@ DO $$ BEGIN
         version integer,
         queue   text,
         at      timestamptz,
-        value   bytea,
+        value   jsonb,
         attempt integer,
         err     text
     );
@@ -140,7 +154,7 @@ CREATE OR REPLACE FUNCTION entroq._try_claim_bucket(
     created  timestamptz,
     modified timestamptz,
     claimant text,
-    value    bytea,
+    value    jsonb,
     claims   integer,
     attempt  integer,
     err      text
@@ -193,7 +207,7 @@ CREATE OR REPLACE FUNCTION entroq._try_claim_one(
     created  timestamptz,
     modified timestamptz,
     claimant text,
-    value    bytea,
+    value    jsonb,
     claims   integer,
     attempt  integer,
     err      text
@@ -264,7 +278,7 @@ CREATE OR REPLACE FUNCTION entroq.try_claim(
     created  timestamptz,
     modified timestamptz,
     claimant text,
-    value    bytea,
+    value    jsonb,
     claims   integer,
     attempt  integer,
     err      text
@@ -322,7 +336,7 @@ CREATE OR REPLACE FUNCTION entroq._modify_arrays(
     p_ins_ids      text[],
     p_ins_queues   text[],
     p_ins_ats      timestamptz[],
-    p_ins_values   bytea[],
+    p_ins_values   text[],
     p_ins_attempts integer[],
     p_ins_errs     text[],
     -- changes: must exist at the given version, then updated
@@ -330,7 +344,7 @@ CREATE OR REPLACE FUNCTION entroq._modify_arrays(
     p_chg_vers     integer[],
     p_chg_queues   text[],
     p_chg_ats      timestamptz[],
-    p_chg_values   bytea[],
+    p_chg_values   text[],
     p_chg_attempts integer[],
     p_chg_errs     text[]
 ) RETURNS TABLE(
@@ -342,7 +356,7 @@ CREATE OR REPLACE FUNCTION entroq._modify_arrays(
     created  timestamptz,
     modified timestamptz,
     claimant text,
-    value    bytea,
+    value    jsonb,
     claims   integer,
     attempt  integer,
     err      text
@@ -430,14 +444,14 @@ BEGIN
                 ins_queue,
                 CASE WHEN ins_at = '0001-01-01 00:00:00+00'::timestamptz THEN v_now ELSE ins_at END,
                 p_claimant,
-                ins_value,
+                ins_value::jsonb,
                 v_now, v_now,
                 ins_attempt, ins_err
             FROM unnest(
                 coalesce(p_ins_ids,      '{}'::text[]),
                 coalesce(p_ins_queues,   '{}'::text[]),
                 coalesce(p_ins_ats,      '{}'::timestamptz[]),
-                coalesce(p_ins_values,   '{}'::bytea[]),
+                coalesce(p_ins_values,   '{}'::text[]),
                 coalesce(p_ins_attempts, '{}'::integer[]),
                 coalesce(p_ins_errs,     '{}'::text[])
             ) AS ins(ins_id, ins_queue, ins_at, ins_value, ins_attempt, ins_err)
@@ -458,7 +472,7 @@ BEGIN
                 modified = v_now,
                 queue    = c.chg_queue,
                 at       = c.chg_at,
-                value    = c.chg_value,
+                value    = c.chg_value::jsonb,
                 attempt  = c.chg_attempt,
                 err      = c.chg_err
             FROM unnest(
@@ -466,7 +480,7 @@ BEGIN
                 coalesce(p_chg_vers,     '{}'::integer[]),
                 coalesce(p_chg_queues,   '{}'::text[]),
                 coalesce(p_chg_ats,      '{}'::timestamptz[]),
-                coalesce(p_chg_values,   '{}'::bytea[]),
+                coalesce(p_chg_values,   '{}'::text[]),
                 coalesce(p_chg_attempts, '{}'::integer[]),
                 coalesce(p_chg_errs,     '{}'::text[])
             ) AS c(chg_id, chg_version, chg_queue, chg_at, chg_value, chg_attempt, chg_err)
@@ -529,7 +543,7 @@ CREATE OR REPLACE FUNCTION entroq.modify(
     created  timestamptz,
     modified timestamptz,
     claimant text,
-    value    bytea,
+    value    jsonb,
     claims   integer,
     attempt  integer,
     err      text
@@ -547,7 +561,7 @@ CREATE OR REPLACE FUNCTION entroq.modify(
         ARRAY(SELECT e->>'queue'              FROM jsonb_array_elements(p_inserts) e),
         ARRAY(SELECT coalesce((e->>'at')::timestamptz, '0001-01-01 00:00:00+00')
               FROM jsonb_array_elements(p_inserts) e),
-        ARRAY(SELECT decode(coalesce(e->>'value', ''), 'base64')
+        ARRAY(SELECT CASE WHEN e ? 'value' THEN (e->'value')::text ELSE NULL END
               FROM jsonb_array_elements(p_inserts) e),
         ARRAY(SELECT coalesce((e->>'attempt')::integer, 0)
               FROM jsonb_array_elements(p_inserts) e),
@@ -558,7 +572,7 @@ CREATE OR REPLACE FUNCTION entroq.modify(
         ARRAY(SELECT (e->>'version')::integer  FROM jsonb_array_elements(p_changes) e),
         ARRAY(SELECT e->>'queue'              FROM jsonb_array_elements(p_changes) e),
         ARRAY(SELECT (e->>'at')::timestamptz  FROM jsonb_array_elements(p_changes) e),
-        ARRAY(SELECT decode(coalesce(e->>'value', ''), 'base64')
+        ARRAY(SELECT CASE WHEN e ? 'value' THEN (e->'value')::text ELSE NULL END
               FROM jsonb_array_elements(p_changes) e),
         ARRAY(SELECT coalesce((e->>'attempt')::integer, 0)
               FROM jsonb_array_elements(p_changes) e),
@@ -604,14 +618,14 @@ CREATE OR REPLACE FUNCTION entroq.tasks(
     created  timestamptz,
     modified timestamptz,
     claimant text,
-    value    bytea,
+    value    jsonb,
     claims   integer,
     attempt  integer,
     err      text
 ) LANGUAGE sql AS $$
     SELECT
         id, version, queue, at, created, modified, claimant,
-        CASE WHEN p_omit_values THEN ''::bytea ELSE value END AS value,
+        CASE WHEN p_omit_values THEN NULL::jsonb ELSE value END AS value,
         claims, attempt, err
     FROM entroq.tasks
     WHERE p_queue = '' OR queue = p_queue

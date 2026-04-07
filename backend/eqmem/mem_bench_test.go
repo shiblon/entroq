@@ -18,7 +18,7 @@ func BatchPopulate(ctx context.Context, c *entroq.EntroQ, n int, queues []string
 		var ins []entroq.ModifyArg
 		for j := i; j < i+batchSize && j < n; j++ {
 			q := queues[(i+j)%len(queues)]
-			ins = append(ins, entroq.InsertingInto(q, entroq.WithArrivalTime(now), entroq.WithValue([]byte("bench-value"))))
+			ins = append(ins, entroq.InsertingInto(q, entroq.WithArrivalTime(now), entroq.WithValue(entroq.JSONStr("bench-value"))))
 		}
 		if _, _, err := c.Modify(ctx, ins...); err != nil {
 			return fmt.Errorf("populate batch: %w", err)
@@ -33,8 +33,9 @@ func BenchmarkStatsContention_1M(b *testing.B) {
 
 	client, err := entroq.New(ctx, Opener())
 	if err != nil {
-		b.Fatalf("Failed to create client: %v", err)
+		b.Fatalf("failed to open client: %v", err)
 	}
+	defer client.Close()
 
 	if err := BatchPopulate(ctx, client, 1000000, queues); err != nil {
 		b.Fatalf("Populate failed: %v", err)

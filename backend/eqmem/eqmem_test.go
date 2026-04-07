@@ -30,6 +30,7 @@ func RunQTest(t *testing.T, tester qtest.Tester) {
 	if err != nil {
 		t.Fatalf("Get client: %v", err)
 	}
+	defer client.Close()
 	tester(ctx, t, client, "")
 }
 
@@ -113,6 +114,7 @@ func TestEQMemMapReduce_checkSmall(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open mem client: %v", err)
 		}
+		defer client.Close()
 		return mrtest.MRCheck(ctx, client, ndocs, nm, nr)
 	}
 	if err := quick.Check(check, config); err != nil {
@@ -136,6 +138,7 @@ func TestEQMemMapReduce_checkLarge(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open mem client: %v", err)
 		}
+		defer client.Close()
 		return mrtest.MRCheck(ctx, client, ndocs, nm, nr)
 	}
 	if err := quick.Check(check, config); err != nil {
@@ -162,6 +165,7 @@ func TestEQMemMapReduce_checkHuge(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open mem client: %v", err)
 		}
+		defer client.Close()
 		return mrtest.MRCheck(ctx, client, ndocs, nm, nr)
 	}
 	if err := quick.Check(check, config); err != nil {
@@ -183,10 +187,11 @@ func TestEQMemJournalClaim(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error opening client at dir %q: %v", journalDir, err)
 	}
+	defer eq.Close()
 
 	if _, _, err := eq.Modify(ctx,
-		entroq.InsertingInto("/queue/of/tasks", entroq.WithValue([]byte("hey"))),
-		entroq.InsertingInto("/queue/of/others", entroq.WithValue([]byte("other"))),
+		entroq.InsertingInto("/queue/of/tasks", entroq.WithValue(entroq.JSONStr("hey"))),
+		entroq.InsertingInto("/queue/of/others", entroq.WithValue(entroq.JSONStr("other"))),
 	); err != nil {
 		t.Fatalf("Error adding task: %v", err)
 	}
@@ -202,6 +207,7 @@ func TestEQMemJournalClaim(t *testing.T) {
 	if eq, err = entroq.New(ctx, Opener(WithJournal(journalDir))); err != nil {
 		t.Fatalf("Error reopening client at dir %q: %v", journalDir, err)
 	}
+	defer eq.Close()
 
 	expect := map[string]*entroq.QueueStat{
 		"/queue/of/tasks": {
@@ -250,6 +256,7 @@ func stressJournalStats(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error creating client: %v", err)
 	}
+	defer eq.Close()
 
 	expectQueues := map[string]*entroq.QueueStat{
 		"/queue/1": new(entroq.QueueStat),
@@ -261,7 +268,7 @@ func stressJournalStats(t *testing.T) {
 	for q, s := range expectQueues {
 		s.Name = q
 		for i, n := 0, rand.Intn(maxQueueTasks); i < n; i++ {
-			if _, _, err := eq.Modify(ctx, entroq.InsertingInto(q, entroq.WithValue([]byte(fmt.Sprintf("value %d", i))))); err != nil {
+			if _, _, err := eq.Modify(ctx, entroq.InsertingInto(q, entroq.WithValue(entroq.JSONStr(fmt.Sprintf("value %d", i))))); err != nil {
 				t.Fatalf("Error inserting into %q: %v", q, err)
 			}
 			s.Size++
@@ -276,6 +283,7 @@ func stressJournalStats(t *testing.T) {
 	if eq, err = entroq.New(ctx, opener); err != nil {
 		t.Fatalf("Error opening client a second time: %v", err)
 	}
+	defer eq.Close()
 
 	var statOpts []entroq.QueuesOpt
 	for q := range expectQueues {
@@ -365,6 +373,7 @@ func TestEQMem_journalClaimModClaim(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error opening: %v", err)
 	}
+	defer eq.Close()
 
 	if _, _, err := eq.Modify(ctx, entroq.InsertingInto("/queue/1")); err != nil {
 		t.Fatalf("Error inserting: %v", err)
@@ -417,8 +426,9 @@ func TestEQMem_journalInsClaimClaimDel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error opening 1: %v", err)
 	}
+	defer eq1.Close()
 
-	if _, _, err := eq1.Modify(ctx, entroq.InsertingInto("hello", entroq.WithValue([]byte("hello")))); err != nil {
+	if _, _, err := eq1.Modify(ctx, entroq.InsertingInto("hello", entroq.WithValue(entroq.JSONStr("hello")))); err != nil {
 		t.Fatalf("Error inserting: %v", err)
 	}
 
@@ -434,6 +444,7 @@ func TestEQMem_journalInsClaimClaimDel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error opening 2: %v", err)
 	}
+	defer eq2.Close()
 
 	task, err := eq2.Claim(ctx, entroq.From("hello"))
 	if err != nil {
@@ -449,5 +460,6 @@ func TestEQMem_journalInsClaimClaimDel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to open 3: %v", err)
 	}
+	defer eq3.Close()
 	eq3.Close()
 }

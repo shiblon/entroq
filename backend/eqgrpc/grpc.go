@@ -248,6 +248,10 @@ func toMS(t time.Time) int64 {
 }
 
 func fromTaskProto(t *pb.Task) (*entroq.Task, error) {
+	val, err := pb.ProtoToJSON(t.Value)
+	if err != nil {
+		return nil, fmt.Errorf("task %s value: %w", t.Id, err)
+	}
 	return &entroq.Task{
 		Queue:    t.Queue,
 		ID:       t.Id,
@@ -255,7 +259,7 @@ func fromTaskProto(t *pb.Task) (*entroq.Task, error) {
 		At:       fromMS(t.AtMs),
 		Claimant: t.ClaimantId,
 		Claims:   t.Claims,
-		Value:    t.Value,
+		Value:    val,
 		Created:  fromMS(t.CreatedMs),
 		Modified: fromMS(t.ModifiedMs),
 		// Omit FromQueue - not needed here.
@@ -264,26 +268,34 @@ func fromTaskProto(t *pb.Task) (*entroq.Task, error) {
 	}, nil
 }
 
-func protoFromTaskData(td *entroq.TaskData) *pb.TaskData {
+func protoFromTaskData(td *entroq.TaskData) (*pb.TaskData, error) {
+	pv, err := pb.JSONToProto(td.Value)
+	if err != nil {
+		return nil, fmt.Errorf("task data value: %w", err)
+	}
 	return &pb.TaskData{
 		Queue:   td.Queue,
 		AtMs:    toMS(td.At),
-		Value:   td.Value,
+		Value:   pv,
 		Attempt: td.Attempt,
 		Err:     td.Err,
 		Id:      td.ID,
-	}
+	}, nil
 }
 
-func changeProtoFromTask(t *entroq.Task) *pb.TaskChange {
+func changeProtoFromTask(t *entroq.Task) (*pb.TaskChange, error) {
+	nd, err := protoFromTaskData(t.Data())
+	if err != nil {
+		return nil, fmt.Errorf("change task %s: %w", t.ID, err)
+	}
 	return &pb.TaskChange{
 		OldId: &pb.TaskID{
 			Id:      t.ID,
 			Version: t.Version,
 			Queue:   t.FromQueue, // old queue goes in the ID for changes.
 		},
-		NewData: protoFromTaskData(t.Data()),
-	}
+		NewData: nd,
+	}, nil
 }
 
 func fromTaskIDProto(tid *pb.TaskID) (*entroq.TaskID, error) {
@@ -474,10 +486,18 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 		ClaimantId: mod.Claimant,
 	}
 	for _, ins := range mod.Inserts {
-		req.Inserts = append(req.Inserts, protoFromTaskData(ins))
+		pd, err := protoFromTaskData(ins)
+		if err != nil {
+			return nil, nil, fmt.Errorf("grpc modify insert value: %w", err)
+		}
+		req.Inserts = append(req.Inserts, pd)
 	}
 	for _, task := range mod.Changes {
-		req.Changes = append(req.Changes, changeProtoFromTask(task))
+		pc, err := changeProtoFromTask(task)
+		if err != nil {
+			return nil, nil, fmt.Errorf("grpc modify change value: %w", err)
+		}
+		req.Changes = append(req.Changes, pc)
 	}
 	for _, del := range mod.Deletes {
 		req.Deletes = append(req.Deletes, &pb.TaskID{
