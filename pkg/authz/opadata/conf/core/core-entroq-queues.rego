@@ -1,5 +1,7 @@
 package entroq.queues
 
+import rego.v1
+
 # This package operates on queues and sets of queue specs.
 # Queue specs are expected to look like this:
 # {
@@ -25,20 +27,23 @@ package entroq.queues
 # - can: a queue spec representing a queue or pattern the data allows.
 #
 # Use this to find out which "allowed" queue specs pertain to a given user queue request.
-name_match(want, can) {
-  want.exact == can.exact
+name_match(want, can) if {
+	want.exact == can.exact
 }
-name_match(want, can) {
-  startswith(want.exact, can.prefix)
+
+name_match(want, can) if {
+	startswith(want.exact, can.prefix)
 }
-name_match(want, can) {
-  startswith(want.prefix, can.prefix)
+
+name_match(want, can) if {
+	startswith(want.prefix, can.prefix)
 }
 
 # has_wildcard indicates whether a set contains a wildcard, like ALL, ANY, or *.
-has_wildcard(actions) {
-  actions[["*", "ALL", "ANY"][_]]
+has_wildcard(actions) if {
+	actions[["*", "ALL", "ANY"][_]]
 }
+
 # actions_left returns actions in "want" that are not covered by actions in "can".
 #
 # Use this on the actions of a particular user queue request and a matching
@@ -48,8 +53,8 @@ has_wildcard(actions) {
 #
 # - want: a set of action strings that the user wishes to perform.
 # - can: a set of action strings that might be allowed.
-actions_left(want, can) = x {
-  x := {y | y := (want - can)[_]; not has_wildcard(can)}
+actions_left(want, can) := x if {
+	x := {y | y := (want - can)[_]; not has_wildcard(can)}
 }
 
 # disallowed returns a set of queue specs, with actions filled in
@@ -57,17 +62,17 @@ actions_left(want, can) = x {
 #
 # - want: a set of queue specs that the user wants to authorize.
 # - can: a set of queue specs that are allowed for this user.
-disallowed(want, can) = results {
-  results := {q |
-    want_q := want[_]
-    want_actions := {a | a := want_q.actions[_]}
-    can_actions := {aq.actions[_] | aq := can[_]; name_match(want_q, aq)}
+disallowed(want, can) := results if {
+	results := {q |
+		want_q := want[_]
+		want_actions := {a | a := want_q.actions[_]}
+		can_actions := {aq.actions[_] | aq := can[_]; name_match(want_q, aq)}
 
-    left := actions_left(want_actions, can_actions)
-    count(left) > 0
+		left := actions_left(want_actions, can_actions)
+		count(left) > 0
 
-    q := object.union(
-      object.remove(want_q, ["actions"]), {"actions": left}
-    )
-  }
+		q := object.union(
+			object.remove(want_q, ["actions"]), {"actions": left},
+		)
+	}
 }
