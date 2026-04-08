@@ -30,8 +30,8 @@ func Example() {
 
 	// Insert a few tasks:
 	ins, _, err := eq.Modify(ctx,
-		entroq.InsertingInto("q1", entroq.WithValue("hello 1")),
-		entroq.InsertingInto("q2", entroq.WithValue("hello 2")))
+		entroq.InsertingInto("q1", entroq.WithValue("hello")),
+		entroq.InsertingInto("q2", entroq.WithValue("hello")))
 	if err != nil {
 		log.Fatalf("Error inserting tasks: %v", err)
 	}
@@ -49,16 +49,16 @@ func Example() {
 	w := worker.New(eq,
 		// Workers claim a task and pass it to your handler functions. In the
 		// background, the task's lease is renewed while the first function runs.
-		worker.WithDo(func(ctx context.Context, initial *entroq.Task, _ json.RawMessage) error {
-			log.Printf("Worker handling task %s", initial)
+		worker.WithDo(func(ctx context.Context, initial *entroq.Task, v string) error {
+			fmt.Printf("Worker handling task %q\n", v)
 			// Do work with it here.
 			return nil
 		}),
 		// When ready to commit changes to the task (including deletion), the second
 		// function passes the version-stable task after the renewer is stopped,
 		// making it safe to use it in modification transactions.
-		worker.WithFinish(func(ctx context.Context, final *entroq.Task, _ json.RawMessage) error {
-			log.Printf("Deleting task %s", final)
+		worker.WithFinish(func(ctx context.Context, final *entroq.Task, v string) error {
+			fmt.Printf("Deleting task %q\n", v)
 			_, _, err := eq.Modify(ctx, final.Delete())
 			if err != nil {
 				return err
@@ -67,13 +67,20 @@ func Example() {
 		}),
 	)
 
-	// The worker runs forever, so for the sake of this example we pass it a context
-	// and cancel it. Other errors typicall just cause a retry (including timeouts).
-	ctx, cancel := context.WithCancel(ctx)
+	// The worker runs forever, so for the sake of this example we cancel it
+	// pretty quickly. Other errors typically just cause a retry.
+	ctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
-	go func() { time.Sleep(2 * time.Second); cancel() }()
 
-	log.Fatal(w.Run(ctx, "q1", "q2"))
+	if err := w.Run(ctx, "q1", "q2"); err != nil {
+		log.Fatal(err)
+	}
+
+	// Output:
+	// Worker handling task "hello"
+	// Deleting task "hello"
+	// Worker handling task "hello"
+	// Deleting task "hello"
 }
 
 func Example_dependencies() {
@@ -86,7 +93,7 @@ func Example_dependencies() {
 
 	// 1. Insert a configuration task and a worker task.
 	_, _, err = eq.Modify(ctx,
-		entroq.InsertingInto("config", entroq.WithRawValue(json.RawMessage(`{"max_retries": 5}`))),
+		entroq.InsertingInto("config", entroq.WithRawValue(json.RawMessage(`{"max_retries": 5}`))), // []byte() also works
 		entroq.InsertingInto("worker", entroq.WithValue("do work")),
 	)
 	if err != nil {
@@ -117,13 +124,18 @@ func Example_dependencies() {
 			_, _, err := eq.Modify(ctx, final.Delete(), config.Depend())
 			if err != nil {
 				if depErr, ok := entroq.AsDependency(err); ok {
-					// Check if our config task is the one that caused the dependency collision.
-					// If so, we clear it and return a retry error so the worker loop
-					// starts over and fetches the new config.
-					for _, depTask := range depErr.Depends {
-						if depTask.ID == config.ID {
-							config = nil
-							return worker.RetryErrorf("config changed during work, retrying")
+					if len(depErr.Depends) > 0 {
+						// It was our config task that caused the failed commit.
+						// Something changed it out from under us, so we can't
+						// trust that the work we did was done with the right
+						// config. We could just fall off the end and the task will
+						// be picked up again after its arrival time expires.
+						// Or we could force a retry and increment it's attempts
+						// (return RetryError). But there's nothing wrong with the task
+						// so far as we know, so make it immediately available.
+						if _, _, err := eq.Modify(ctx, final.Change(entroq.ArrivalTimeBy(0))); err != nil {
+							// NOW it's our task that's the problem. Just bail.
+							return fmt.Errorf("task reset after config change: %w", err)
 						}
 					}
 				}
@@ -135,9 +147,8 @@ func Example_dependencies() {
 
 	// For the sake of the example: cancel the worker after 2 seconds.
 	// You won't actually do this in production.
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
 	defer cancel()
-	go func() { time.Sleep(2 * time.Second); cancel() }()
 
 	if err := w.Run(ctx, "worker"); err != nil && !entroq.IsCanceled(err) {
 		log.Fatalf("worker failed: %v", err)

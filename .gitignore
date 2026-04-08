@@ -28,6 +28,11 @@ vendor
 
 tmp
 
+# Python
+venv/
+__pycache__/
+*.pyc
+
 # VSCode
 *.code-workspace
 

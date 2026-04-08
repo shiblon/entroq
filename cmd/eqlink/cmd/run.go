@@ -1,6 +1,12 @@
 package cmd
 
 import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/shiblon/entroq"
@@ -17,6 +23,7 @@ var (
 	upstream       string
 	concurrency    int
 	requestTimeout time.Duration
+	drainTimeout   time.Duration
 )
 
 var runCmd = &cobra.Command{
@@ -26,9 +33,24 @@ var runCmd = &cobra.Command{
 
   Sender:   listens on --addr, proxies outgoing HTTP calls into queues.
   Receiver: claims tasks from --queue, forwards them to --upstream.
-  GC:       scans for stale response queues under --queue and cleans them up.`,
+  GC:       scans for stale response queues under --queue and cleans them up.
+
+Graceful shutdown on SIGINT/SIGTERM:
+  1. Receiver workers stop claiming new tasks and finish any in-progress handler.
+  2. Sender drains: waits for all in-flight requests to complete.
+  3. GC shuts down.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		ctx := cmd.Context()
+		ctx := context.Background()
+
+		sigs := make(chan os.Signal, 1)
+		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+		defer signal.Stop(sigs)
+
+		_, stopMetrics, err := setupMetrics(ctx)
+		if err != nil {
+			return fmt.Errorf("metrics: %w", err)
+		}
+		defer stopMetrics()
 
 		eq, err := entroq.New(ctx, eqgrpc.Opener(entroqAddr, eqgrpc.WithInsecure()))
 		if err != nil {
@@ -40,23 +62,56 @@ var runCmd = &cobra.Command{
 			async.WithRequestTimeout(requestTimeout),
 		)
 
+		g, _ := errgroup.WithContext(ctx)
+
+		g.Go(func() error {
+			return sender.Run(ctx)
+		})
+
+		rcvCtx, rcvCancel := context.WithCancel(ctx)
+		defer rcvCancel()
 		recvWorker := worker.New(eq,
 			worker.WithDoModify(async.ReceiverHandler(upstream)),
 		)
-
-		g, ctx := errgroup.WithContext(ctx)
-
-		g.Go(func() error { return sender.Run(ctx) })
-
 		for range concurrency {
-			g.Go(func() error { return recvWorker.Run(ctx, myQueue) })
+			g.Go(func() error {
+				return recvWorker.Run(rcvCtx, myQueue)
+			})
 		}
 
+		gcCtx, gcCancel := context.WithCancel(ctx)
+		defer gcCancel()
 		g.Go(func() error {
-			return async.RunGCLoop(ctx, eq, myQueue,
+			return async.RunGCLoop(gcCtx, eq, myQueue,
 				async.WithGCInterval(gcInterval),
 				async.WithGCGrace(gcGrace),
 			)
+		})
+
+		// Signal handler: staged shutdown.
+		g.Go(func() error {
+			select {
+			case <-ctx.Done():
+				return nil
+			case sig := <-sigs:
+				log.Printf("received %v: stopping receivers", sig)
+			}
+
+			rcvCancel()
+			log.Printf("receivers stopped")
+
+			// Stage 2: drain and close the sender. srv.Shutdown waits for
+			// active HTTP handlers to return, which includes the full
+			// EntroQ round-trip for each in-flight request.
+			log.Printf("draining sender (timeout: %v)...", drainTimeout)
+			drainCtx, cancel := context.WithTimeout(ctx, drainTimeout)
+			defer cancel()
+			if err := sender.Close(drainCtx); err != nil {
+				log.Printf("sender close: %v", err)
+			}
+
+			gcCancel()
+			return nil
 		})
 
 		return g.Wait()
@@ -70,6 +125,7 @@ func init() {
 	flags.StringVar(&upstream, "upstream", "http://localhost:8000", "Upstream service address for the receiver.")
 	flags.IntVar(&concurrency, "concurrency", 1, "Number of concurrent receiver goroutines.")
 	flags.DurationVar(&requestTimeout, "request_timeout", 30*time.Second, "Sender request timeout.")
+	flags.DurationVar(&drainTimeout, "drain_timeout", 35*time.Second, "How long to wait for in-flight requests to finish on shutdown.")
 	flags.DurationVar(&gcInterval, "gc_interval", 10*time.Minute, "How often to run the GC scan.")
 	flags.DurationVar(&gcGrace, "gc_grace", 15*time.Second, "Extra time after expiry before GC deletes a response queue.")
 	runCmd.MarkFlagRequired("queue")

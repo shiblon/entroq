@@ -5,16 +5,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"path"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/shiblon/entroq"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/noop"
 )
 
 const defaultRequestTimeout = 30 * time.Second
@@ -28,13 +30,20 @@ const defaultRequestTimeout = 30 * time.Second
 // forwarded as the request path. For example, a request to /svc-b/process
 // enqueues a task on queue "svc-b" with forwarded path "/process".
 type Sender struct {
+	sync.Mutex
+
 	eq             *entroq.EntroQ
 	myQueue        string
 	requestTimeout time.Duration
 	addr           string
+	mp             metric.MeterProvider
 
-	handled  atomic.Int64
-	inFlight atomic.Int64
+	srv *http.Server // set by Serve; Close uses it for shutdown
+
+	// OTel instruments, initialized in Serve.
+	metricInflight metric.Int64UpDownCounter
+	metricHandled  metric.Int64Counter
+	metricDuration metric.Float64Histogram
 }
 
 // SenderOption configures a Sender.
@@ -49,14 +58,23 @@ func WithRequestTimeout(d time.Duration) SenderOption {
 	}
 }
 
+// WithMeterProvider sets the OTel MeterProvider used to create instruments.
+// Defaults to metric.NewNoopMeterProvider() if not set.
+func WithMeterProvider(mp metric.MeterProvider) SenderOption {
+	return func(s *Sender) {
+		s.mp = mp
+	}
+}
+
 // NewSender creates a Sender that listens on addr and uses myQueue as the
-// namespace for response and cleanup queues.
+// namespace for response queues.
 func NewSender(eq *entroq.EntroQ, addr, myQueue string, opts ...SenderOption) *Sender {
 	s := &Sender{
 		eq:             eq,
 		addr:           addr,
 		myQueue:        myQueue,
 		requestTimeout: defaultRequestTimeout,
+		mp:             noop.NewMeterProvider(),
 	}
 	for _, o := range opts {
 		o(s)
@@ -64,10 +82,48 @@ func NewSender(eq *entroq.EntroQ, addr, myQueue string, opts ...SenderOption) *S
 	return s
 }
 
-const statusInterval = 10 * time.Minute
+// initMetrics creates OTel instruments from the configured MeterProvider.
+func (s *Sender) initMetrics() error {
+	m := s.mp.Meter("entroq/async/sender")
+	var err error
+	if s.metricInflight, err = m.Int64UpDownCounter("sender.inflight",
+		metric.WithDescription("Number of in-flight requests currently being processed."),
+	); err != nil {
+		return fmt.Errorf("sender inflight counter: %w", err)
+	}
+	if s.metricHandled, err = m.Int64Counter("sender.handled_total",
+		metric.WithDescription("Total number of requests handled by the sender."),
+	); err != nil {
+		return fmt.Errorf("sender handled counter: %w", err)
+	}
+	if s.metricDuration, err = m.Float64Histogram("sender.duration_seconds",
+		metric.WithDescription("Request round-trip duration in seconds."),
+		metric.WithUnit("s"),
+	); err != nil {
+		return fmt.Errorf("sender duration histogram: %w", err)
+	}
+	return nil
+}
+
+// Close gracefully shuts down the sender. It waits for all in-flight requests
+// to complete (or ctx to expire), then shuts down the HTTP server.
+//
+// After Close returns, Run or Serve will also return.
+func (s *Sender) Close(ctx context.Context) error {
+	s.Lock()
+	srv := s.srv
+	s.Unlock()
+
+	// Sequence: stop accepting new connections, then drain existing responses
+	// from the queue (finish them out if possible).
+	if err := srv.Shutdown(ctx); err != nil {
+		return fmt.Errorf("sender shutdown: %w", err)
+	}
+	return nil
+}
 
 // Run starts the HTTP server on the address provided to NewSender and blocks
-// until ctx is cancelled.
+// until Close is called.
 func (s *Sender) Run(ctx context.Context) error {
 	lis, err := net.Listen("tcp", s.addr)
 	if err != nil {
@@ -77,27 +133,18 @@ func (s *Sender) Run(ctx context.Context) error {
 }
 
 // Serve starts the HTTP server on an already-open listener and blocks until
-// ctx is cancelled. Useful when the caller needs to know the bound address
+// Close is called. Useful when the caller needs to know the bound address
 // before starting (e.g. when using ":0" for a random port in tests).
 func (s *Sender) Serve(ctx context.Context, lis net.Listener) error {
-	srv := &http.Server{Handler: s}
-	go func() {
-		<-ctx.Done()
-		srv.Shutdown(context.Background())
-	}()
-	go func() {
-		t := time.NewTicker(statusInterval)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				log.Printf("Still happy: sender %s: %d handled, %d in-flight",
-					s.myQueue, s.handled.Load(), s.inFlight.Load())
-			}
-		}
-	}()
+	if err := s.initMetrics(); err != nil {
+		return err
+	}
+
+	s.Lock()
+	s.srv = &http.Server{Handler: s}
+	srv := s.srv
+	s.Unlock()
+
 	if err := srv.Serve(lis); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("sender serve: %w", err)
 	}
@@ -105,13 +152,16 @@ func (s *Sender) Serve(ctx context.Context, lis net.Listener) error {
 }
 
 // ServeHTTP handles an outgoing request from the local service. It translates
-// it into an Envelope task, atomically enqueues the task and a cleanup task,
-// then blocks until a Response task arrives on the response queue.
+// it into an Envelope task, enqueues it, then blocks until a Response task
+// arrives on the ephemeral per-request response queue.
 func (s *Sender) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.inFlight.Add(1)
+	start := time.Now()
+
+	s.metricInflight.Add(r.Context(), 1)
 	defer func() {
-		s.inFlight.Add(-1)
-		s.handled.Add(1)
+		s.metricInflight.Add(r.Context(), -1)
+		s.metricHandled.Add(r.Context(), 1)
+		s.metricDuration.Record(r.Context(), time.Since(start).Seconds())
 	}()
 
 	ctx := r.Context()

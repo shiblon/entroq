@@ -92,11 +92,6 @@ func (h *funcHandler[T]) TaskFinish(ctx context.Context, task *entroq.Task, valu
 //
 // The finalization phase stops the renewal, freezes the task version, and
 // allows the task to be deleted or modified safely.
-//
-// A Worker[T] may be used from multiple goroutines concurrently (e.g., two
-// calls to Run in separate goroutines). Per-task state is allocated on the
-// stack of each runOne invocation, so concurrent runs do not share mutable
-// state.
 type Worker[T any] struct {
 	eqc *entroq.EntroQ
 
@@ -400,22 +395,18 @@ func (w *Worker[T]) runOne(ctx context.Context, qs []string) error {
 	return nil
 }
 
-// Run claims tasks from the given queues and processes them in a loop until
-// the context is canceled or an unrecoverable error is encountered.
+// Run claims tasks from the worker queues and processes them in a loop until
+// its context is canceled or an unrecoverable error is encountered.
+// You may call Run multiple times on the same worker.
 func (w *Worker[T]) Run(ctx context.Context, qs ...string) error {
 	if len(qs) == 0 {
 		return fmt.Errorf("no queues specified to work on")
 	}
 
 	for {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("worker quit: %w", ctx.Err())
-		default:
-		}
-
 		if err := w.runOne(ctx, qs); err != nil {
-			if entroq.IsCanceled(err) {
+			if entroq.IsCanceled(err) || entroq.IsTimeout(err) {
+				log.Printf("worker was asked to quit: %v", ctx.Err())
 				return nil
 			}
 			return fmt.Errorf("worker (%q): %w", qs, err)
