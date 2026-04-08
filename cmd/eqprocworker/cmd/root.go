@@ -24,7 +24,7 @@ import (
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/backend/eqgrpc"
-	"github.com/shiblon/entroq/pkg/procworker"
+	"github.com/shiblon/entroq/pkg/workers/proc"
 	"github.com/shiblon/entroq/pkg/worker"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
