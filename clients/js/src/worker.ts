@@ -23,34 +23,46 @@ export class EntroQMoveError extends Error {
 
 export interface WorkerOptions {
   /**
-   * How long to claim the task for initially (in milliseconds).
+   * How long to claim the task for initially, and each renewal (in milliseconds).
    * Default is 30,000 (30 seconds).
    */
   leaseMs?: number;
   /**
-   * How long to wait between polls (in milliseconds).
+   * How long to wait between polls when no task is available (in milliseconds).
    * Default is 5,000 (5 seconds).
    */
   pollMs?: number;
   /**
-   * How long to wait after a network or infrastructure error before retrying (in milliseconds).
+   * How long to wait after an infrastructure error before retrying (in milliseconds).
    * Default is 10,000 (10 seconds).
    */
   backoffMs?: number;
 }
 
+/**
+ * WorkHandler receives the claimed task and a stop function.
+ *
+ * The worker renews the task's claim in the background automatically.
+ * When heavy work is done, call stop() to halt renewal and get back
+ * the stable task version -- the one to use for any modify (delete,
+ * change, depend, etc.).
+ *
+ * Example:
+ *
+ *   worker.run(['my-queue'], async (task, stop) => {
+ *     const result = await doHeavyWork(task.value);
+ *     const stable = await stop();
+ *     return { deletes: [toTaskID(stable)] };
+ *   });
+ */
 export type WorkHandler = (
-  task: Task
-) => Promise<void | ModifyRequest | "delete">;
+  task: Task,
+  stop: () => Promise<Task>
+) => Promise<Omit<ModifyRequest, "claimantId"> | "delete" | void>;
 
 /**
- * EntroQWorker provides a high-level looping protocol for processing tasks.
- * 
- * NOTE ON AUTO-RENEWAL:
- * This worker implementation currently OMITs automatic task renewal (heartbeating).
- * Task starvation is a real concern if a worker hangs or crashes while holding a 
- * "forever-renewing" lease. Users should ensure their leaseMs is sufficient for the 
- * handler's execution time, or manually renew tasks if needed.
+ * EntroQWorker claims tasks from one or more queues and dispatches them
+ * to a handler, with automatic claim renewal in the background.
  */
 export class EntroQWorker {
   private client: EntroQClient;
@@ -60,9 +72,9 @@ export class EntroQWorker {
   constructor(client: EntroQClient, options: WorkerOptions = {}) {
     this.client = client;
     this.options = {
-      leaseMs: options.leaseMs || 30000,
-      pollMs: options.pollMs || 5000,
-      backoffMs: options.backoffMs || 10000,
+      leaseMs: options.leaseMs ?? 30000,
+      pollMs: options.pollMs ?? 5000,
+      backoffMs: options.backoffMs ?? 10000,
     };
   }
 
@@ -88,107 +100,159 @@ export class EntroQWorker {
           continue;
         }
 
-        const task = resp.task;
-
-        try {
-          const result = await handler(task);
-          await this.finalize(task, result);
-        } catch (err) {
-          await this.handleTaskError(task, err);
-        }
+        await this.dispatch(resp.task, handler);
       } catch (err) {
-        // Infrastructure error (network, server down, etc.)
-        console.error("EntroQ Worker infrastructure error, backing off:", err);
-        await new Promise((resolve) =>
-          setTimeout(resolve, this.options.backoffMs)
-        );
+        console.error("EntroQ worker infrastructure error, backing off:", err);
+        await sleep(this.options.backoffMs);
       }
     }
   }
 
   /**
-   * stop signals the worker to stop processing new tasks after the current one finishes.
+   * stop signals the worker to stop after the current task finishes.
    */
   stop(): void {
     this.running = false;
   }
 
-  private async finalize(
-    task: Task,
-    result: void | ModifyRequest | "delete"
-  ): Promise<void> {
-    if (result === "delete") {
-      await this.client.modify({
-        deletes: [this.toTaskID(task)],
-      });
+  private async dispatch(task: Task, handler: WorkHandler): Promise<void> {
+    const leaseMs = this.options.leaseMs;
+
+    // current holds the most recently renewed version of the task.
+    let current = task;
+    // renewalPromise tracks any in-flight renewal so stop() can wait for it.
+    let renewalPromise: Promise<void> = Promise.resolve();
+
+    const ac = new AbortController();
+    let renewTimeout: ReturnType<typeof setTimeout> | null = null;
+    let stopped = false;
+
+    const scheduleRenew = (): void => {
+      if (ac.signal.aborted) {
+        return;
+      }
+      renewTimeout = setTimeout(() => {
+        if (ac.signal.aborted) {
+          return;
+        }
+        renewalPromise = (async () => {
+          try {
+            const atMs = (Date.now() + leaseMs).toString();
+            const resp = await this.client.modify({
+              changes: [{
+                oldId: toTaskID(current),
+                newData: {
+                  queue: current.queue,
+                  atMs,
+                  value: current.value,
+                  attempt: current.attempt,
+                  err: current.err || undefined,
+                },
+              }],
+            });
+            if (resp.changed && resp.changed.length > 0) {
+              current = resp.changed[0];
+            }
+            scheduleRenew();
+          } catch (e) {
+            // Renewal failed -- abort so stop() knows not to wait.
+            ac.abort();
+          }
+        })();
+      }, leaseMs / 2);
+    };
+
+    // stop halts the renewal loop and waits for any in-flight renewal to
+    // settle before returning the stable task version.
+    const stop = async (): Promise<Task> => {
+      if (!stopped) {
+        stopped = true;
+        if (renewTimeout !== null) {
+          clearTimeout(renewTimeout);
+          renewTimeout = null;
+        }
+        ac.abort();
+        await renewalPromise;
+      }
+      return current;
+    };
+
+    scheduleRenew();
+
+    let result: Omit<ModifyRequest, "claimantId"> | "delete" | void = undefined;
+    let handlerErr: unknown;
+
+    try {
+      result = await handler(task, stop);
+    } catch (err) {
+      handlerErr = err;
+    } finally {
+      // Always stop renewal, whether handler succeeded or threw.
+      await stop();
+    }
+
+    if (handlerErr !== undefined) {
+      await this.handleTaskError(current, handlerErr);
       return;
     }
 
-    if (this.isModifyRequest(result)) {
-      await this.client.modify(result);
-      return;
-    }
-
-    // Default: If handler returns void, we assume it's done and should be deleted.
-    // This matches the common use case.
-    await this.client.modify({
-      deletes: [this.toTaskID(task)],
-    });
+    await this.finalize(current, result);
   }
 
-  private async handleTaskError(task: Task, err: any): Promise<void> {
+  private async finalize(
+    task: Task,
+    result: Omit<ModifyRequest, "claimantId"> | "delete" | void
+  ): Promise<void> {
+    if (result === "delete" || result === undefined) {
+      await this.client.modify({ deletes: [toTaskID(task)] });
+      return;
+    }
+    await this.client.modify(result);
+  }
+
+  private async handleTaskError(task: Task, err: unknown): Promise<void> {
     if (err instanceof EntroQRetryError) {
-      const atMs = Date.now() + (err.delayMs || 30000);
+      const atMs = (Date.now() + (err.delayMs ?? 30000)).toString();
       await this.client.modify({
-        changes: [
-          {
-            oldId: this.toTaskID(task),
-            newData: {
-              queue: task.queue,
-              atMs: atMs.toString(),
-              value: task.value,
-              attempt: (task.attempt || 0) + 1,
-              err: err.message,
-            },
+        changes: [{
+          oldId: toTaskID(task),
+          newData: {
+            queue: task.queue,
+            atMs,
+            value: task.value,
+            attempt: (task.attempt ?? 0) + 1,
+            err: err.message,
           },
-        ],
+        }],
       });
       return;
     }
 
     if (err instanceof EntroQMoveError) {
       await this.client.modify({
-        changes: [
-          {
-            oldId: this.toTaskID(task),
-            newData: {
-              queue: err.queue,
-              atMs: "0",
-              value: task.value,
-              attempt: task.attempt,
-              err: err.message,
-            },
+        changes: [{
+          oldId: toTaskID(task),
+          newData: {
+            queue: err.queue,
+            atMs: "0",
+            value: task.value,
+            attempt: task.attempt,
+            err: err.message,
           },
-        ],
+        }],
       });
       return;
     }
 
-    // Unhandled error: just log it and let the lease expire 
-    // or we could move it to an error queue automatically.
-    // For now, we take the "fail safe" approach of letting it expire.
+    // Unhandled error: log and let the lease expire naturally.
     console.error(`Task ${task.id} failed with unhandled error:`, err);
   }
+}
 
-  private toTaskID(task: Task): TaskID {
-    return {
-      id: task.id,
-      version: task.version,
-      queue: task.queue,
-    };
-  }
+function toTaskID(task: Task): TaskID {
+  return { id: task.id, version: task.version, queue: task.queue };
+}
 
-  private isModifyRequest(res: any): res is ModifyRequest {
-    return res && typeof res === "object" && !Array.isArray(res);
-  }
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
