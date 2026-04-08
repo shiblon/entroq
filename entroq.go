@@ -785,7 +785,7 @@ func Changing(task *Task, changeArgs ...ChangeArg) ModifyArg {
 //	  cli.Modify(ctx,
 //	    Changing(myTask,
 //	      QueueTo("a new queue"),
-//		     ArrivalTimeBy(5 * time.Minute)))
+//		  ArrivalTimeBy(5 * time.Minute)))
 type ChangeArg func(m *Modification, t *Task)
 
 // QueueTo creates an option to modify a task's queue in the Changing function.
@@ -807,7 +807,7 @@ func ArrivalTimeTo(at time.Time) ChangeArg {
 // ArrivalTimeBy sets the arrival time to a time in the future, by the given duration.
 // The duration is added to Go's wall clock time at the point of Modify. If tight
 // synchronization with the backend clock is required, use EntroQ.Time and
-// WithArrivalTime instead.
+// WithArrivalTime instead. Send a duration of 0 for immediate availability.
 func ArrivalTimeBy(d time.Duration) ChangeArg {
 	return func(m *Modification, t *Task) {
 		t.At = m.now.Add(d)
