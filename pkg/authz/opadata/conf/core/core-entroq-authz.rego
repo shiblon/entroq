@@ -19,23 +19,24 @@
 # How these are obtained is up to the deployer of the service. A default
 # configuration is given in default-permissions.rego. Comments there indicate
 # the shape of the data that it works with.
+# regal ignore:directory-package-mismatch
 package entroq.authz
 
 import rego.v1
 
+import data.entroq.permissions
 import data.entroq.queues
-import data.entroq.user.username
-import data.entroq.permissions.allowed_queues
+import data.entroq.user
 
 failed contains q if {
-	q := queues.disallowed(input.queues, allowed_queues)[_]
+	some q in queues.disallowed(input.queues, permissions.allowed_queues)
 }
 
 # Add a message containing user information if there are queue mismatches.
 errors contains msg if {
 	count(failed) > 0
-	username
-	msg := concat("User: ", username)
+	user.name
+	msg := concat("User: ", user.name)
 }
 
 default allow := false
@@ -44,7 +45,7 @@ allow if {
 	# It is possible to have allowed queues for non-authorized users.
 	# We only say "allow" if there are, in fact, some queues that _could_ be
 	# allowed.
-	count(allowed_queues) > 0
+	count(permissions.allowed_queues) > 0
 
 	# Only allow if none of the allowed queues failed.
 	count(failed) == 0

@@ -1,3 +1,4 @@
+# regal ignore:directory-package-mismatch
 package entroq.queues
 
 import rego.v1
@@ -41,7 +42,8 @@ name_match(want, can) if {
 
 # has_wildcard indicates whether a set contains a wildcard, like ALL, ANY, or *.
 has_wildcard(actions) if {
-	actions[["*", "ALL", "ANY"][_]]
+	some wildcard in ["*", "ALL", "ANY"]
+	actions[wildcard]
 }
 
 # actions_left returns actions in "want" that are not covered by actions in "can".
@@ -53,26 +55,20 @@ has_wildcard(actions) if {
 #
 # - want: a set of action strings that the user wishes to perform.
 # - can: a set of action strings that might be allowed.
-actions_left(want, can) := x if {
-	x := {y | y := (want - can)[_]; not has_wildcard(can)}
-}
+actions_left(want, can) := {y | y := (want - can)[_]; not has_wildcard(can)}
 
 # disallowed returns a set of queue specs, with actions filled in
 # that are not covered by any of the given allowances.
 #
 # - want: a set of queue specs that the user wants to authorize.
 # - can: a set of queue specs that are allowed for this user.
-disallowed(want, can) := results if {
-	results := {q |
-		want_q := want[_]
-		want_actions := {a | a := want_q.actions[_]}
-		can_actions := {aq.actions[_] | aq := can[_]; name_match(want_q, aq)}
+disallowed(want, can) := {q |
+	some want_q in want
+	want_actions := {a | some a in want_q.actions}
+	can_actions := {a | some aq in can; name_match(want_q, aq); some a in aq.actions}
 
-		left := actions_left(want_actions, can_actions)
-		count(left) > 0
+	left := actions_left(want_actions, can_actions)
+	count(left) > 0
 
-		q := object.union(
-			object.remove(want_q, ["actions"]), {"actions": left},
-		)
-	}
+	q := object.union(object.remove(want_q, ["actions"]), {"actions": left})
 }

@@ -49,18 +49,18 @@ type Sender struct {
 // SenderOption configures a Sender.
 type SenderOption func(*Sender)
 
-// WithRequestTimeout sets how long ServeHTTP waits for a response task before
+// WithSenderRequestTimeout sets how long ServeHTTP waits for a response task before
 // returning 504. Also used as the exp= value in the response queue name.
 // Defaults to 30 seconds.
-func WithRequestTimeout(d time.Duration) SenderOption {
+func WithSenderRequestTimeout(d time.Duration) SenderOption {
 	return func(s *Sender) {
 		s.requestTimeout = d
 	}
 }
 
-// WithMeterProvider sets the OTel MeterProvider used to create instruments.
+// WithSenderMeterProvider sets the OTel MeterProvider used to create instruments.
 // Defaults to metric.NewNoopMeterProvider() if not set.
-func WithMeterProvider(mp metric.MeterProvider) SenderOption {
+func WithSenderMeterProvider(mp metric.MeterProvider) SenderOption {
 	return func(s *Sender) {
 		s.mp = mp
 	}

@@ -7,11 +7,8 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	otelprom "go.opentelemetry.io/otel/exporters/prometheus"
+	"github.com/shiblon/entroq/pkg/otel"
 	"go.opentelemetry.io/otel/metric"
-	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 )
 
 var metricsAddr string
@@ -21,17 +18,13 @@ var metricsAddr string
 // should be passed to Sender and ReceiverHandler. The stop function shuts down
 // the metrics server and flushes the provider; call it on exit.
 func setupMetrics(ctx context.Context) (metric.MeterProvider, func(), error) {
-	registry := prometheus.NewRegistry()
-
-	exporter, err := otelprom.New(otelprom.WithRegisterer(registry))
+	mp, metricsHandler, stopProvider, err := otel.NewPrometheusProvider()
 	if err != nil {
-		return nil, nil, fmt.Errorf("prometheus exporter: %w", err)
+		return nil, nil, fmt.Errorf("otel setup: %w", err)
 	}
 
-	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(exporter))
-
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+	mux.Handle("/metrics", metricsHandler)
 	srv := &http.Server{
 		Addr:    metricsAddr,
 		Handler: mux,
@@ -46,7 +39,7 @@ func setupMetrics(ctx context.Context) (metric.MeterProvider, func(), error) {
 
 	stop := func() {
 		srv.Shutdown(ctx)
-		mp.Shutdown(ctx)
+		stopProvider()
 	}
 
 	return mp, stop, nil

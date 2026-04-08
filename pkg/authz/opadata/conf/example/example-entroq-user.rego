@@ -21,6 +21,7 @@
 #       }
 #     }
 #   }
+# regal ignore:directory-package-mismatch
 package entroq.user
 
 import rego.v1
@@ -39,7 +40,7 @@ jwks_response := http.send({
 #   - the token signature is invalid
 #   - the audience or issuer does not match
 #   - the token is expired
-username := u if {
+name := u if {
 	input.authz.type == "Bearer"
 	token := input.authz.credentials
 	[valid, _, payload] := io.jwt.decode_verify(token, {

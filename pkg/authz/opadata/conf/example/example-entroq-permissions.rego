@@ -1,3 +1,4 @@
+# regal ignore:directory-package-mismatch
 package entroq.permissions
 
 import rego.v1
@@ -14,28 +15,23 @@ import data.entroq.policy
 
 # The user with this username. Rego will error out if there is more than one.
 this_user := u if {
-	u := policy.users[_]
-	u.name == equser.username
+	some u in policy.users
+	u.name == equser.name
 }
 
 user_queues contains qs if {
-	qs := this_user.queues[_]
+	some qs in this_user.queues
 }
 
-# Auto-grant every authenticated user full access to their personal /users/<username>/ prefix.
-user_queues contains q if {
-	q := {
-		"prefix": concat("", ["/users/", equser.username, "/"]),
-		"actions": ["ALL"],
-	}
-}
+# Auto-grant every authenticated user full access to their personal /users/<name>/ prefix.
+user_queues contains {"prefix": concat("", ["/users/", equser.name, "/"]), "actions": ["ALL"]}
 
 role_queues contains q if {
-	r := policy.roles[_]
-	({x | x := this_user.roles[_]} | {"*"})[r.name]
-	q := r.queues[_]
+	some r in policy.roles
+	({x | some x in this_user.roles} | {"*"})[r.name]
+	some q in r.queues
 }
 
 allowed_queues contains q if {
-	q := (user_queues | role_queues)[_]
+	some q in (user_queues | role_queues)
 }

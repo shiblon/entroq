@@ -1,0 +1,13 @@
+rules:
+  imports:
+    unresolved-reference:
+      ignore:
+        files:
+          # These files reference data.entroq.idp.* (jwks, audience, issuer),
+          # which is provided as external OPA bundle data, not defined in Rego.
+          - examples/authz/opa/user.rego
+          - pkg/authz/opadata/conf/example/example-entroq-user.rego
+          # Test files mock data.entroq.user.name via `with` -- the linter
+          # can't resolve cross-package refs in test contexts.
+          - pkg/authz/opadata/conf/tests/core/core-entroq-authz_test.rego
+          - pkg/authz/opadata/conf/tests/example/example-entroq-permissions_test.rego

@@ -8,11 +8,11 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/shiblon/entroq/pkg/backend/eqpg"
 	"github.com/shiblon/entroq/pkg/authz/opahttp"
+	"github.com/shiblon/entroq/pkg/backend/eqpg"
 	"github.com/shiblon/entroq/pkg/eqsvcgrpc"
 	"github.com/shiblon/entroq/pkg/eqsvcjson"
+	"github.com/shiblon/entroq/pkg/otel"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
@@ -77,12 +77,19 @@ var serveCmd = &cobra.Command{
 			log.Printf("Schema initialized at version %s.", eqpg.SchemaVersion)
 		}
 
+		mp, metricsHandler, stopMetrics, err := otel.NewPrometheusProvider()
+		if err != nil {
+			return fmt.Errorf("otel setup: %w", err)
+		}
+		defer stopMetrics()
+
 		openerOptions := []eqpg.PGOpt{
 			eqpg.WithDB(dbName),
 			eqpg.WithUsername(dbUser),
 			eqpg.WithPassword(dbPass),
 			eqpg.WithConnectAttempts(attempts),
 			eqpg.WithHeartbeat(heartbeat),
+			eqpg.WithMeterProvider(mp),
 		}
 
 		if noListen {
@@ -91,22 +98,26 @@ var serveCmd = &cobra.Command{
 
 		opener := eqpg.Opener(dbAddr, openerOptions...)
 
-		svc, err := eqsvcgrpc.New(ctx, opener, authzOpt, eqsvcgrpc.WithMetricInterval(5*time.Second))
+		svc, err := eqsvcgrpc.New(ctx, opener, authzOpt,
+			eqsvcgrpc.WithMetricInterval(5*time.Second),
+			eqsvcgrpc.WithMeterProvider(mp),
+		)
 		if err != nil {
 			return fmt.Errorf("failed to create eqsvcgrpc service: %w", err)
 		}
 		defer svc.Close()
 
 		go func() {
-			http.Handle("/metrics", promhttp.Handler())
+			mux := http.NewServeMux()
+			mux.Handle("/metrics", metricsHandler)
 
 			path, handler, err := eqsvcjson.New(svc)
 			if err != nil {
 				log.Fatalf("failed to create JSON/Connect handler: %v", err)
 			}
-			http.Handle(path, handler)
+			mux.Handle(path, handler)
 
-			log.Fatalf("http and metric server: %v", http.ListenAndServe(fmt.Sprintf(":%d", httpPort), nil))
+			log.Fatalf("http and metric server: %v", http.ListenAndServe(fmt.Sprintf(":%d", httpPort), mux))
 		}()
 
 		lis, err := net.Listen("tcp", fmt.Sprintf("[::]:%d", port))
