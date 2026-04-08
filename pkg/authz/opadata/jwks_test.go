@@ -137,7 +137,7 @@ func TestJWKSAllow(t *testing.T) {
 						"roles": []any{},
 						"queues": []any{
 							map[string]any{
-								"exact":   "/users/auser/inbox",
+								"exact":   "/shared/inbox",
 								"actions": []any{"CLAIM", "DELETE"},
 							},
 						},
@@ -157,7 +157,7 @@ func TestJWKSAllow(t *testing.T) {
 			},
 			"queues": []any{
 				map[string]any{
-					"exact":   "/users/auser/inbox",
+					"exact":   "/shared/inbox",
 					"actions": []any{"CLAIM"},
 				},
 			},
@@ -176,8 +176,9 @@ func TestJWKSAllow(t *testing.T) {
 			},
 			"queues": []any{
 				map[string]any{
-					"exact":   "/users/auser/inbox",
-					"actions": []any{"INSERT"}, // not in policy
+					// INSERT is not in the explicit policy for /shared/inbox.
+					"exact":   "/shared/inbox",
+					"actions": []any{"INSERT"},
 				},
 			},
 		}
@@ -195,7 +196,8 @@ func TestJWKSAllow(t *testing.T) {
 			},
 			"queues": []any{
 				map[string]any{
-					"exact":   "/users/auser/secret",
+					// /shared/secret is not in any policy.
+					"exact":   "/shared/secret",
 					"actions": []any{"CLAIM"},
 				},
 			},
@@ -214,7 +216,7 @@ func TestJWKSAllow(t *testing.T) {
 			},
 			"queues": []any{
 				map[string]any{
-					"exact":   "/users/auser/inbox",
+					"exact":   "/shared/inbox",
 					"actions": []any{"CLAIM"},
 				},
 			},
@@ -233,7 +235,7 @@ func TestJWKSAllow(t *testing.T) {
 			},
 			"queues": []any{
 				map[string]any{
-					"exact":   "/users/auser/inbox",
+					"exact":   "/shared/inbox",
 					"actions": []any{"CLAIM"},
 				},
 			},
@@ -252,8 +254,8 @@ func TestJWKSAllow(t *testing.T) {
 			},
 			"queues": []any{
 				map[string]any{
-					// /ns=user/<username>/ prefix is auto-granted to everyone.
-					"exact":   "/ns=user/auser/anything",
+					// /users/<username>/ prefix is auto-granted to everyone.
+					"exact":   "/users/auser/anything",
 					"actions": []any{"CLAIM", "INSERT", "DELETE"},
 				},
 			},

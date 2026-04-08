@@ -11,8 +11,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/shiblon/entroq/backend/eqpg"
 	"github.com/shiblon/entroq/pkg/authz/opahttp"
-	"github.com/shiblon/entroq/qsvc"
-	"github.com/shiblon/entroq/qsvcjson"
+	"github.com/shiblon/entroq/pkg/eqsvcgrpc"
+	"github.com/shiblon/entroq/pkg/eqsvcjson"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
@@ -45,15 +45,15 @@ var serveCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := context.Background()
 
-		var authzOpt qsvc.Option
+		var authzOpt eqsvcgrpc.Option
 		switch authzStrategy {
 		case "opahttp":
-			authzOpt = qsvc.WithAuthorizer(opahttp.New(
+			authzOpt = eqsvcgrpc.WithAuthorizer(opahttp.New(
 				opahttp.WithHostURL(opaURL),
 				opahttp.WithAPIPath(opaPath),
 			))
 		case "", "none":
-			authzOpt = qsvc.WithAuthorizer(nil)
+			authzOpt = eqsvcgrpc.WithAuthorizer(nil)
 		default:
 			return fmt.Errorf("unknown authz strategy: %q", authzStrategy)
 		}
@@ -91,16 +91,16 @@ var serveCmd = &cobra.Command{
 
 		opener := eqpg.Opener(dbAddr, openerOptions...)
 
-		svc, err := qsvc.New(ctx, opener, authzOpt, qsvc.WithMetricInterval(5*time.Second))
+		svc, err := eqsvcgrpc.New(ctx, opener, authzOpt, eqsvcgrpc.WithMetricInterval(5*time.Second))
 		if err != nil {
-			return fmt.Errorf("failed to create qsvc: %w", err)
+			return fmt.Errorf("failed to create eqsvcgrpc service: %w", err)
 		}
 		defer svc.Close()
 
 		go func() {
 			http.Handle("/metrics", promhttp.Handler())
 
-			path, handler, err := qsvcjson.New(svc)
+			path, handler, err := eqsvcjson.New(svc)
 			if err != nil {
 				log.Fatalf("failed to create JSON/Connect handler: %v", err)
 			}

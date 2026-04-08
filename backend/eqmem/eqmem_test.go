@@ -13,10 +13,10 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/examples/mrtest"
-	"github.com/shiblon/entroq/qsvc/qtest"
+	"github.com/shiblon/entroq/pkg/testing/eqtest"
 )
 
-func RunQTest(t *testing.T, tester qtest.Tester) {
+func RunQTest(t *testing.T, tester eqtest.Tester) {
 	t.Helper()
 
 	tmpDir, err := os.MkdirTemp("", "memtest-")
@@ -35,67 +35,67 @@ func RunQTest(t *testing.T, tester qtest.Tester) {
 }
 
 func TestEQMemSimpleSequence(t *testing.T) {
-	RunQTest(t, qtest.SimpleSequence)
+	RunQTest(t, eqtest.SimpleSequence)
 }
 
 func TestEQMemTasksWithID(t *testing.T) {
-	RunQTest(t, qtest.TasksWithID)
+	RunQTest(t, eqtest.TasksWithID)
 }
 
 func TestEQMemTasksOmitValue(t *testing.T) {
-	RunQTest(t, qtest.TasksOmitValue)
+	RunQTest(t, eqtest.TasksOmitValue)
 }
 
 func TestEQMemTasksWithIDOnly(t *testing.T) {
-	RunQTest(t, qtest.TasksWithIDOnly)
+	RunQTest(t, eqtest.TasksWithIDOnly)
 }
 
 func TestEQMemInsertWithID(t *testing.T) {
-	RunQTest(t, qtest.InsertWithID)
+	RunQTest(t, eqtest.InsertWithID)
 }
 
 func TestEQMemSimpleChange(t *testing.T) {
-	RunQTest(t, qtest.SimpleChange)
+	RunQTest(t, eqtest.SimpleChange)
 }
 
 func TestEQMemSimpleWorker(t *testing.T) {
-	RunQTest(t, qtest.SimpleWorker)
+	RunQTest(t, eqtest.SimpleWorker)
 }
 
 func TestEQMemMultiWorker(t *testing.T) {
-	RunQTest(t, qtest.MultiWorker)
+	RunQTest(t, eqtest.MultiWorker)
 }
 
 func TestEQMemWorkerMoveOnError(t *testing.T) {
-	RunQTest(t, qtest.WorkerMoveOnError)
+	RunQTest(t, eqtest.WorkerMoveOnError)
 }
 
 func TestEQMemWorkerRetryOnError(t *testing.T) {
-	RunQTest(t, qtest.WorkerRetryOnError)
+	RunQTest(t, eqtest.WorkerRetryOnError)
 }
 
 func TestEQMemWorkerRenewal(t *testing.T) {
-	RunQTest(t, qtest.WorkerRenewal)
+	RunQTest(t, eqtest.WorkerRenewal)
 }
 
 func TestEQMemClaimUnblocksOnNotify(t *testing.T) {
-	RunQTest(t, qtest.ClaimUnblocksOnNotify)
+	RunQTest(t, eqtest.ClaimUnblocksOnNotify)
 }
 
 func TestEQMemQueueMatch(t *testing.T) {
-	RunQTest(t, qtest.QueueMatch)
+	RunQTest(t, eqtest.QueueMatch)
 }
 
 func TestEQMemQueueStats(t *testing.T) {
-	RunQTest(t, qtest.QueueStats)
+	RunQTest(t, eqtest.QueueStats)
 }
 
 func TestEQMemQueueStatsLimit(t *testing.T) {
-	RunQTest(t, qtest.QueueStatsLimit)
+	RunQTest(t, eqtest.QueueStatsLimit)
 }
 
 func TestEQMemDeleteMissingTask(t *testing.T) {
-	RunQTest(t, qtest.DeleteMissingTask)
+	RunQTest(t, eqtest.DeleteMissingTask)
 }
 
 func TestEQMemMapReduce_checkSmall(t *testing.T) {

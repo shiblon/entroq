@@ -17,7 +17,7 @@ import (
 
 	"github.com/lib/pq"
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/subq"
+	"github.com/shiblon/entroq/pkg/subq"
 )
 
 func escp(p string) string {

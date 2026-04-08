@@ -1,6 +1,6 @@
-// Package qsvcjson provides an HTTP handler that wraps the gRPC QSvc
+// Package eqsvcjson provides an HTTP handler that wraps the gRPC eqsvcgrpc.QSvc
 // to serve EntroQ requests over JSON and gRPC-Web using ConnectRPC.
-package qsvcjson
+package eqsvcjson
 
 import (
 	"context"
@@ -11,19 +11,19 @@ import (
 	"connectrpc.com/vanguard"
 	pb "github.com/shiblon/entroq/api"
 	"github.com/shiblon/entroq/api/apiconnect"
-	"github.com/shiblon/entroq/qsvc"
+	"github.com/shiblon/entroq/pkg/eqsvcgrpc"
 	"google.golang.org/grpc/metadata"
 )
 
-// Handler implements protoconnect.EntroQHandler by wrapping qsvc.QSvc.
-// Handler implements apiconnect.EntroQHandler by wrapping qsvc.QSvc.
+// Handler implements protoconnect.EntroQHandler by wrapping eqsvcgrpc.QSvc.
+// Handler implements apiconnect.EntroQHandler by wrapping eqsvcgrpc.QSvc.
 type Handler struct {
-	svc *qsvc.QSvc
+	svc *eqsvcgrpc.QSvc
 }
 
 // New creates a new HTTP handler for the EntroQ JSON/Connect endpoints.
 // It uses Vanguard to provide RESTful transcoding under /api/v0.
-func New(svc *qsvc.QSvc, opts ...connect.HandlerOption) (string, http.Handler, error) {
+func New(svc *eqsvcgrpc.QSvc, opts ...connect.HandlerOption) (string, http.Handler, error) {
 	h := &Handler{svc: svc}
 	_, connectHandler := apiconnect.NewEntroQHandler(h, opts...)
 
@@ -103,7 +103,7 @@ func (h *Handler) Time(ctx context.Context, req *connect.Request[pb.TimeRequest]
 	return connect.NewResponse(resp), nil
 }
 
-// streamAdapter wraps a Connect server stream so it implements the grpc.ServerStream expected by qsvc.
+// streamAdapter wraps a Connect server stream so it implements the grpc.ServerStream expected by eqsvcgrpc.
 type streamAdapter struct {
 	ctx    context.Context
 	stream *connect.ServerStream[pb.TasksResponse]

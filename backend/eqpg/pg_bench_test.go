@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/backend/eqtest"
+	"github.com/shiblon/entroq/pkg/testing/benchmark"
 )
 
 // populateRaw handles high-speed setup using PostgreSQL's generate_series.
@@ -64,7 +64,7 @@ func BenchmarkStatsContention_1M(b *testing.B) {
 	}
 	defer client.Close()
 
-	eqtest.RunContentionBenchmark(b, client, queues, 20)
+	benchmark.RunContentionBenchmark(b, client, queues, 20)
 }
 
 func BenchmarkStatsContention_1M_PollOnly(b *testing.B) {
@@ -91,5 +91,5 @@ func BenchmarkStatsContention_1M_PollOnly(b *testing.B) {
 	}
 	defer client.Close()
 
-	eqtest.RunContentionBenchmark(b, client, queues, 20)
+	benchmark.RunContentionBenchmark(b, client, queues, 20)
 }

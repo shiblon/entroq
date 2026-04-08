@@ -116,9 +116,8 @@ export class EntroQClient {
    * tasks lists tasks in a particular queue.
    */
   async tasks(request: Omit<TasksRequest, "claimantId">): Promise<TasksResponse> {
-    const { queue, ...rest } = request;
-    const query = new URLSearchParams(rest as any).toString();
-    const path = `/api/v0/queues/${encodeURIComponent(queue)}/tasks${query ? "?" + query : ""}`;
+    const query = new URLSearchParams(request as any).toString();
+    const path = `/api/v0/tasks${query ? "?" + query : ""}`;
     return this.request<TasksResponse>(path, "GET");
   }
 
@@ -167,9 +166,8 @@ export class EntroQClient {
    * This uses HTTP Chunked Transfer Encoding to provide real-time updates.
    */
   async *streamTasks(request: Omit<TasksRequest, "claimantId">): AsyncIterable<Task> {
-    const { queue, ...rest } = request;
-    const query = new URLSearchParams(rest as any).toString();
-    const url = `${this.baseUrl}/api/v0/queues/${encodeURIComponent(queue)}/tasks/stream${query ? "?" + query : ""}`;
+    const query = new URLSearchParams(request as any).toString();
+    const url = `${this.baseUrl}/api/v0/tasks/stream${query ? "?" + query : ""}`;
 
     const response = await fetch(url, {
       method: "GET",

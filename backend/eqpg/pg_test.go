@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/qsvc/qtest"
-	"github.com/shiblon/entroq/worker"
+	"github.com/shiblon/entroq/pkg/testing/eqtest"
+	"github.com/shiblon/entroq/pkg/worker"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -137,8 +137,6 @@ func TestReadinessTicker(t *testing.T) {
 		t.Fatalf("Failed to insert delayed task: %v", err)
 	}
 
-	t.Logf("Task inserted for %v, waiting for ticker (5s) to wake us up...", at)
-
 	// Claim should block until notified or timeout.
 	// We expect the ticker to fire around the 5s mark.
 	claimCtx, claimCancel := context.WithTimeout(ctx, 10*time.Second)
@@ -175,8 +173,6 @@ func TestReadinessTicker_LocalOnly(t *testing.T) {
 	if _, _, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithArrivalTimeIn(2*time.Second))); err != nil {
 		t.Fatalf("Failed to insert delayed task: %v", err)
 	}
-
-	t.Logf("Task inserted, waiting for ticker to notify...")
 
 	// Claim should block until notified by the ticker (since no PG notify is being listened to).
 	claimCtx, claimCancel := context.WithTimeout(ctx, 10*time.Second)
@@ -343,7 +339,7 @@ func Example_inTransaction() {
 	// Count: 3
 }
 
-func RunQTest(t *testing.T, tester qtest.Tester) {
+func RunQTest(t *testing.T, tester eqtest.Tester) {
 	t.Helper()
 	ctx := context.Background()
 	client, err := pgClient(ctx)
@@ -355,67 +351,67 @@ func RunQTest(t *testing.T, tester qtest.Tester) {
 }
 
 func TestTasksWithID(t *testing.T) {
-	RunQTest(t, qtest.TasksWithID)
+	RunQTest(t, eqtest.TasksWithID)
 }
 
 func TestTasksOmitValue(t *testing.T) {
-	RunQTest(t, qtest.TasksOmitValue)
+	RunQTest(t, eqtest.TasksOmitValue)
 }
 
 func TestTasksWithIDOnly(t *testing.T) {
-	RunQTest(t, qtest.TasksWithIDOnly)
+	RunQTest(t, eqtest.TasksWithIDOnly)
 }
 
 func TestInsertWithID(t *testing.T) {
-	RunQTest(t, qtest.InsertWithID)
+	RunQTest(t, eqtest.InsertWithID)
 }
 
 func TestSimpleSequence(t *testing.T) {
-	RunQTest(t, qtest.SimpleSequence)
+	RunQTest(t, eqtest.SimpleSequence)
 }
 
 func TestSimpleChange(t *testing.T) {
-	RunQTest(t, qtest.SimpleChange)
+	RunQTest(t, eqtest.SimpleChange)
 }
 
 func TestSimpleWorker(t *testing.T) {
-	RunQTest(t, qtest.SimpleWorker)
+	RunQTest(t, eqtest.SimpleWorker)
 }
 
 func TestMultiWorker(t *testing.T) {
-	RunQTest(t, qtest.MultiWorker)
+	RunQTest(t, eqtest.MultiWorker)
 }
 
 func TestWorkerMoveOnError(t *testing.T) {
-	RunQTest(t, qtest.WorkerMoveOnError)
+	RunQTest(t, eqtest.WorkerMoveOnError)
 }
 
 func TestWorkerRetryOnError(t *testing.T) {
-	RunQTest(t, qtest.WorkerRetryOnError)
+	RunQTest(t, eqtest.WorkerRetryOnError)
 }
 
 func TestWorkerRenewal(t *testing.T) {
-	RunQTest(t, qtest.WorkerRenewal)
+	RunQTest(t, eqtest.WorkerRenewal)
 }
 
 func TestClaimUnblocksOnNotify(t *testing.T) {
-	RunQTest(t, qtest.ClaimUnblocksOnNotify)
+	RunQTest(t, eqtest.ClaimUnblocksOnNotify)
 }
 
 func TestQueueMatch(t *testing.T) {
-	RunQTest(t, qtest.QueueMatch)
+	RunQTest(t, eqtest.QueueMatch)
 }
 
 func TestQueueStats(t *testing.T) {
-	RunQTest(t, qtest.QueueStats)
+	RunQTest(t, eqtest.QueueStats)
 }
 
 func TestQueueStatsLimit(t *testing.T) {
-	RunQTest(t, qtest.QueueStatsLimit)
+	RunQTest(t, eqtest.QueueStatsLimit)
 }
 
 func TestDeleteMissingTask(t *testing.T) {
-	RunQTest(t, qtest.DeleteMissingTask)
+	RunQTest(t, eqtest.DeleteMissingTask)
 }
 
 func Example_disableListenNotify() {
