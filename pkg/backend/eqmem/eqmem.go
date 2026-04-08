@@ -17,6 +17,8 @@ import (
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/subq"
 	"github.com/shiblon/stuffedio/wal"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/noop"
 )
 
 type EQMem struct {
@@ -53,6 +55,9 @@ type EQMem struct {
 	// outputSnapshot, if true, indicates tha the system should start up, read
 	// journals, and dump a snapshot before closing itself down.
 	outputSnapshot bool
+
+	claimDuration  metric.Float64Histogram
+	modifyDuration metric.Float64Histogram
 }
 
 type qLock struct {
@@ -128,13 +133,34 @@ func withOutputSnapshot() Option {
 	}
 }
 
+// WithMeterProvider sets the OTel MeterProvider for claim and modify duration
+// histograms. Defaults to a noop provider.
+func WithMeterProvider(mp metric.MeterProvider) Option {
+	return func(m *EQMem) {
+		m.claimDuration, _ = mp.Meter("entroq.mem").Float64Histogram("entroq.claim.duration",
+			metric.WithDescription("Duration of TryClaim calls in the in-memory backend."),
+			metric.WithUnit("s"),
+		)
+		m.modifyDuration, _ = mp.Meter("entroq.mem").Float64Histogram("entroq.modify.duration",
+			metric.WithDescription("Duration of Modify calls in the in-memory backend."),
+			metric.WithUnit("s"),
+		)
+	}
+}
+
 // New returns a new in-memory implementation, ready to be used.
 func New(ctx context.Context, opts ...Option) (*EQMem, error) {
+	noopMeter := noop.NewMeterProvider().Meter("entroq.mem")
+	claimDuration, _ := noopMeter.Float64Histogram("entroq.claim.duration")
+	modifyDuration, _ := noopMeter.Float64Histogram("entroq.modify.duration")
+
 	m := &EQMem{
 		nw:               subq.New(),
 		queues:           make(map[string]*taskQueue),
 		qByID:            make(map[string]string),
 		locksSuperUnsafe: make(map[string]*qLock),
+		claimDuration:    claimDuration,
+		modifyDuration:   modifyDuration,
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -310,6 +336,10 @@ func (m *EQMem) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task,
 // TryClaim attempts to claim a task from the given queue query. If no task is
 // available, returns nil (not an error).
 func (m *EQMem) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
+	start := time.Now()
+	defer func() {
+		m.claimDuration.Record(ctx, time.Since(start).Seconds())
+	}()
 	// To ensure that claims, modifications, and read operations coexist
 	// peacefully with minimal contention, the actual task data is in the
 	// queueTasks sync.Map structure and is only edited when a lock for a
@@ -462,6 +492,10 @@ func (m *EQMem) queueUnsafeUpdateTask(ql *qLock, t *entroq.Task) func() {
 // dependencies).
 // Backends do not assign IDs, so all inserts must already have them specified.
 func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted, changed []*entroq.Task, err error) {
+	start := time.Now()
+	defer func() {
+		m.modifyDuration.Record(ctx, time.Since(start).Seconds())
+	}()
 	return m.modifyImpl(ctx, mod, false)
 }
 

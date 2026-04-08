@@ -11,11 +11,11 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/shiblon/entroq/pkg/backend/eqmem"
 	"github.com/shiblon/entroq/pkg/authz/opahttp"
+	"github.com/shiblon/entroq/pkg/backend/eqmem"
 	"github.com/shiblon/entroq/pkg/eqsvcgrpc"
 	"github.com/shiblon/entroq/pkg/eqsvcjson"
+	"github.com/shiblon/entroq/pkg/otel"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
@@ -132,26 +132,34 @@ var rootCmd = &cobra.Command{
 			return fmt.Errorf("Unknown Authz strategy: %q", flags.authzStrategy)
 		}
 
+		mp, metricsHandler, stopMetrics, err := otel.NewPrometheusProvider()
+		if err != nil {
+			return fmt.Errorf("otel setup: %w", err)
+		}
+		defer stopMetrics()
+
 		svc, err := eqsvcgrpc.New(ctx, eqmem.Opener(
 			eqmem.WithJournal(flags.journal),
 			eqmem.WithMaxJournalBytes(int64(flags.journalMaxBytes)),
 			eqmem.WithMaxJournalItems(flags.journalMaxItems),
-		), authzOpt)
+			eqmem.WithMeterProvider(mp),
+		), authzOpt, eqsvcgrpc.WithMeterProvider(mp))
 		if err != nil {
 			return fmt.Errorf("failed to open eqmem backend for eqsvcgrpc: %w", err)
 		}
 		defer svc.Close()
 
 		go func() {
-			http.Handle("/metrics", promhttp.Handler())
-			
+			mux := http.NewServeMux()
+			mux.Handle("/metrics", metricsHandler)
+
 			path, handler, err := eqsvcjson.New(svc)
 			if err != nil {
 				log.Fatalf("failed to create JSON/Connect handler: %v", err)
 			}
-			http.Handle(path, handler)
-			
-			log.Fatalf("http and metric server: %v", http.ListenAndServe(fmt.Sprintf(":%d", flags.httpPort), nil))
+			mux.Handle(path, handler)
+
+			log.Fatalf("http and metric server: %v", http.ListenAndServe(fmt.Sprintf(":%d", flags.httpPort), mux))
 		}()
 
 		s := grpc.NewServer(

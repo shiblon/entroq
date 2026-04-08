@@ -39,35 +39,20 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/authz"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/noop"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/shiblon/entroq/api"
-)
-
-const (
-	// MetricNS is the prometheus namespace for all metrics for this module.
-	MetricNS = "entroq"
-)
-
-var (
-	metricQueueSize = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: MetricNS,
-			Subsystem: "queue",
-			Name:      "size",
-			Help:      "Number of tasks in named queue.",
-		},
-		[]string{"name", "type", "l1", "l2", "l3"},
-	)
 )
 
 // QSvc is an EntroQServer.
@@ -76,9 +61,13 @@ type QSvc struct {
 
 	impl *entroq.EntroQ
 
-	metricCancel    context.CancelFunc
-	metricNamespace string
-	metricInterval  time.Duration
+	mp             metric.MeterProvider
+	metricInterval time.Duration
+
+	// guards lastRefresh and lastStats for the observable gauge callback.
+	mu          sync.Mutex
+	lastRefresh time.Time
+	lastStats   map[string]*entroq.QueueStat
 
 	authzHeader string
 	az          authz.Authorizer
@@ -87,12 +76,17 @@ type QSvc struct {
 // Option allows QSvc creation options to be defined.
 type Option func(*QSvc)
 
-// WithMetricInterval sets the interval between queue stats requests for the
-// purpose of providing metrics. It should usually be set reasonably high to
-// ensure that queue operation is not interfered with by requests for
-// statistics, but backends should endeavor to make this cheap. Postgres uses
-// index-only scans, for example, and the in-memory implementation uses
-// lock-free reads.
+// WithMeterProvider sets the OTel MeterProvider used to emit queue size metrics.
+// Defaults to a noop provider.
+func WithMeterProvider(mp metric.MeterProvider) Option {
+	return func(s *QSvc) {
+		s.mp = mp
+	}
+}
+
+// WithMetricInterval sets the minimum time between database queries for queue
+// stats. The observable gauge callback caches results for this duration, so
+// frequent Prometheus scrapes do not hammer the database.
 // Capped from below at 5 seconds.
 func WithMetricInterval(d time.Duration) Option {
 	return func(s *QSvc) {
@@ -124,14 +118,9 @@ func New(ctx context.Context, opener entroq.BackendOpener, opts ...Option) (*QSv
 		return nil, fmt.Errorf("eqsvcgrpc backend client: %w", err)
 	}
 
-	// Note that you should *never* use a background context like this unless
-	// it is guaranteed to be exclusively used for a background process. That
-	// is the (rare) case here.
-	mctx, mcancel := context.WithCancel(context.Background())
-
 	svc := &QSvc{
 		impl:           impl,
-		metricCancel:   mcancel,
+		mp:             noop.NewMeterProvider(),
 		metricInterval: time.Minute,
 		authzHeader:    "authorization",
 	}
@@ -140,25 +129,87 @@ func New(ctx context.Context, opener entroq.BackendOpener, opts ...Option) (*QSv
 		o(svc)
 	}
 
-	go func() {
-		for {
-			if err := svc.RefreshMetrics(mctx); err != nil {
-				log.Printf("Error refreshing metrics: %v", err)
-			}
-			select {
-			case <-mctx.Done():
-				return
-			case <-time.After(svc.metricInterval):
-			}
-		}
-	}()
+	if err := svc.initMetrics(); err != nil {
+		return nil, fmt.Errorf("eqsvcgrpc init metrics: %w", err)
+	}
 
 	return svc, nil
 }
 
-// Close closes the backend connections and flushes the connection free.
+// initMetrics registers an observable gauge that queries queue stats on each
+// collection cycle, caching results for metricInterval to avoid hammering the
+// database on every Prometheus scrape.
+func (s *QSvc) initMetrics() error {
+	meter := s.mp.Meter("entroq.svc")
+
+	gauge, err := meter.Float64ObservableGauge("entroq.queue.size",
+		metric.WithDescription("Number of tasks in a named queue, by type."),
+	)
+	if err != nil {
+		return fmt.Errorf("queue size gauge: %w", err)
+	}
+
+	_, err = meter.RegisterCallback(func(ctx context.Context, o metric.Observer) error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		if time.Since(s.lastRefresh) < s.metricInterval && s.lastStats != nil {
+			s.observeStats(o, gauge, s.lastStats)
+			return nil
+		}
+
+		stats, err := s.impl.QueueStats(ctx)
+		if err != nil {
+			log.Printf("eqsvcgrpc: queue stats for metrics: %v", err)
+			return nil
+		}
+
+		s.lastStats = stats
+		s.lastRefresh = time.Now()
+		s.observeStats(o, gauge, stats)
+		return nil
+	}, gauge)
+
+	return err
+}
+
+// observeStats reports queue stat values to the OTel observer. Must be called
+// with s.mu held.
+func (s *QSvc) observeStats(o metric.Observer, gauge metric.Float64ObservableGauge, stats map[string]*entroq.QueueStat) {
+	for name, stat := range stats {
+		segments := strings.Split(strings.TrimPrefix(name, "/"), "/")
+		l1, l2, l3 := "", "", ""
+		if len(segments) > 0 {
+			l1 = "/" + segments[0]
+		}
+		if len(segments) > 1 {
+			l2 = l1 + "/" + segments[1]
+		}
+		if len(segments) > 2 {
+			l3 = l2 + "/" + segments[2]
+		}
+
+		base := []attribute.KeyValue{
+			attribute.String("queue", name),
+			attribute.String("l1", l1),
+			attribute.String("l2", l2),
+			attribute.String("l3", l3),
+		}
+
+		for typ, val := range map[string]int32{
+			"total":     int32(stat.Size),
+			"claimed":   int32(stat.Claimed),
+			"available": int32(stat.Available),
+			"maxClaims": int32(stat.MaxClaims),
+		} {
+			attrs := append(base, attribute.String("type", typ))
+			o.ObserveFloat64(gauge, float64(val), metric.WithAttributes(attrs...))
+		}
+	}
+}
+
+// Close closes the backend connections.
 func (s *QSvc) Close() error {
-	s.metricCancel() // Don't bother waiting for it
 	if err := s.impl.Close(); err != nil {
 		return fmt.Errorf("eqsvcgrpc close: %w", err)
 	}
@@ -223,45 +274,6 @@ func (s *QSvc) Authorize(ctx context.Context, req *authz.Request) error {
 	return nil
 }
 
-// RefreshMetrics collects stats and exports them as prometheus metrics.
-// Intended to be called periodically in the background. Beware of calling too
-// frequently, as this may deny service to users.
-func (s *QSvc) RefreshMetrics(ctx context.Context) error {
-	stats, err := s.impl.QueueStats(ctx)
-	if err != nil {
-		return fmt.Errorf("refresh metrics: %w", err)
-	}
-
-	// Clear it out, then repopulate.
-	metricQueueSize.Reset()
-	for name, stat := range stats {
-		// Calculate hierarchy levels: /test/mr/map/input -> l1="/test", l2="/test/mr", l3="/test/mr/map"
-		segments := strings.Split(strings.TrimPrefix(name, "/"), "/")
-		l1, l2, l3 := "", "", ""
-		if len(segments) > 0 {
-			l1 = "/" + segments[0]
-		}
-		if len(segments) > 1 {
-			l2 = l1 + "/" + segments[1]
-		}
-		if len(segments) > 2 {
-			l3 = l2 + "/" + segments[2]
-		}
-
-		vals := map[string]int32{
-			"total":     int32(stat.Size),
-			"claimed":   int32(stat.Claimed),
-			"available": int32(stat.Available),
-			"maxClaims": int32(stat.MaxClaims),
-		}
-
-		for t, val := range vals {
-			metricQueueSize.WithLabelValues(name, t, l1, l2, l3).Set(float64(val))
-		}
-	}
-
-	return nil
-}
 
 func fromMS(ms int64) time.Time {
 	return time.Unix(0, ms*int64(time.Millisecond))

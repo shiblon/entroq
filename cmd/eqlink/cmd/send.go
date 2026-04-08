@@ -25,7 +25,7 @@ Use "eqlink run" to start the full sidecar (sender + receiver + GC).`,
 		defer eq.Close()
 
 		sender := async.NewSender(eq, senderAddr, myQueue,
-			async.WithRequestTimeout(requestTimeout),
+			async.WithSenderRequestTimeout(requestTimeout),
 		)
 		return sender.Run(ctx)
 	},

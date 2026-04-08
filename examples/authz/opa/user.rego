@@ -1,4 +1,4 @@
-# Package entroq.user resolves a username from the incoming request.
+# Package entroq.user resolves the caller's name from the incoming request.
 #
 # This is the EXAMPLE variant that reads JWKS key material inline from OPA
 # bundle data (data.entroq.idp.jwks), rather than fetching from a live URL.
@@ -15,19 +15,21 @@
 #   jwks     - JSON string of the JWKS document (inline public key material)
 #   audience - expected "aud" claim in the JWT
 #   issuer   - expected "iss" claim in the JWT
+# regal ignore:directory-package-mismatch,unresolved-reference
 package entroq.user
 
 import rego.v1
 
-# Verify the JWT and extract the subject claim as the username.
+# Verify the JWT and extract the subject claim as the caller's name.
 # This rule is undefined (fails closed) if:
 #   - the Authorization type is not "Bearer"
 #   - the token signature is invalid against the inline JWKS
 #   - the audience or issuer does not match
 #   - the token is expired
-username := u if {
+name := u if {
 	input.authz.type == "Bearer"
 	token := input.authz.credentials
+
 	[valid, _, payload] := io.jwt.decode_verify(token, {
 		"cert": data.entroq.idp.jwks,
 		"aud": data.entroq.idp.audience,
