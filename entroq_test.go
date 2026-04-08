@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/backend/eqmem"
+	"github.com/shiblon/entroq/pkg/backend/eqmem"
 	"github.com/shiblon/entroq/pkg/worker"
 )
 

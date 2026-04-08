@@ -3,18 +3,36 @@
   "version": "0.10.0",
   "description": "EntroQ Task Queue Node Client",
   "main": "dist/index.js",
+  "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist/"
+  ],
   "scripts": {
-    "build": "tsc"
+    "build": "tsup",
+    "prepublishOnly": "npm run build"
   },
   "keywords": [
     "entroq",
     "task",
     "queue"
   ],
-  "author": "Chris",
+  "author": "Chris Monson <shiblon@gmail.com>",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/shiblon/entroq.git",
+    "directory": "clients/js"
+  },
   "devDependencies": {
+    "tsup": "^8.0.0",
     "typescript": "^5.0.0"
   }
 }

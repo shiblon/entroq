@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/shiblon/entroq/backend/eqmem"
+	"github.com/shiblon/entroq/pkg/backend/eqmem"
 	"github.com/shiblon/entroq/pkg/authz/opahttp"
 	"github.com/shiblon/entroq/pkg/eqsvcgrpc"
 	"github.com/shiblon/entroq/pkg/eqsvcjson"

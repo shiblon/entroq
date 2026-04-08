@@ -9,8 +9,8 @@ import (
 	"testing"
 
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/backend/eqgrpc"
-	"github.com/shiblon/entroq/backend/eqmem"
+	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
+	"github.com/shiblon/entroq/pkg/backend/eqmem"
 	"github.com/shiblon/entroq/pkg/async"
 	"github.com/shiblon/entroq/pkg/eqsvcgrpc"
 	"github.com/shiblon/entroq/pkg/worker"
