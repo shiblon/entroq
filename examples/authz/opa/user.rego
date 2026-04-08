@@ -30,8 +30,8 @@ username := u if {
 	token := input.authz.credentials
 	[valid, _, payload] := io.jwt.decode_verify(token, {
 		"cert": data.entroq.idp.jwks,
-		"aud":  data.entroq.idp.audience,
-		"iss":  data.entroq.idp.issuer,
+		"aud": data.entroq.idp.audience,
+		"iss": data.entroq.idp.issuer,
 	})
 	valid
 	u := payload.sub

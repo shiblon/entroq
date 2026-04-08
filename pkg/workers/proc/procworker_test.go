@@ -14,7 +14,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/backend/eqmem"
+	"github.com/shiblon/entroq/pkg/backend/eqmem"
 	"github.com/shiblon/entroq/pkg/worker"
 	"golang.org/x/sync/errgroup"
 )

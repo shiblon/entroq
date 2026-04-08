@@ -6,7 +6,7 @@
 //		"log"
 //		"net"
 //
-//		"github.com/shiblon/entroq/backend/eqpg"
+//		"github.com/shiblon/entroq/pkg/backend/eqpg"
 //		"github.com/shiblon/entroq/pkg/eqsvcgrpc"
 //
 //		pb "github.com/shiblon/entroq/api"

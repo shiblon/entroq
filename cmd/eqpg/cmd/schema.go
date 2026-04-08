@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/shiblon/entroq/backend/eqpg"
+	"github.com/shiblon/entroq/pkg/backend/eqpg"
 	"github.com/spf13/cobra"
 
 	_ "github.com/lib/pq"
