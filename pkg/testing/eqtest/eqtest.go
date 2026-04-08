@@ -1,5 +1,5 @@
-// Package qtest contains standard testing routines for exercising various backends in similar ways.
-package qtest
+// Package eqtest contains standard testing routines for exercising various backends in similar ways.
+package eqtest
 
 import (
 	"bytes"
@@ -17,8 +17,8 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/backend/eqgrpc"
-	"github.com/shiblon/entroq/worker"
-	"github.com/shiblon/entroq/qsvc"
+	"github.com/shiblon/entroq/pkg/worker"
+	"github.com/shiblon/entroq/pkg/eqsvcgrpc"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
@@ -69,7 +69,7 @@ func ClientService(ctx context.Context, opener entroq.BackendOpener) (client *en
 // StartService starts an in-memory gRPC network service and returns a function for creating client connections to it.
 func StartService(ctx context.Context, opener entroq.BackendOpener) (*grpc.Server, Dialer, error) {
 	lis := bufconn.Listen(bufSize)
-	svc, err := qsvc.New(ctx, opener)
+	svc, err := eqsvcgrpc.New(ctx, opener)
 	if err != nil {
 		return nil, nil, fmt.Errorf("start service: %w", err)
 	}

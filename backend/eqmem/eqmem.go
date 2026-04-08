@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/subq"
+	"github.com/shiblon/entroq/pkg/subq"
 	"github.com/shiblon/stuffedio/wal"
 )
 

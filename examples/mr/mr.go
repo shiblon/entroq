@@ -18,7 +18,7 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/worker"
+	"github.com/shiblon/entroq/pkg/worker"
 	"golang.org/x/sync/errgroup"
 )
 

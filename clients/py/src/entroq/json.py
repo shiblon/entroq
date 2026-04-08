@@ -156,14 +156,14 @@ class EntroQJSON(EntroQBase):
         body = {
             "claimantId": unsafe_claimant_id or self.claimant_id,
             "inserts": [
-                {
+                {k: v for k, v in {
                     "queue": i.queue,
                     "atMs": _to_ms_str(i.at),
                     "value": i.value,
-                    "id": i.id,
-                    "attempt": i.attempt,
-                    "err": i.err
-                } for i in inserts
+                    "id": i.id or None,
+                    "attempt": i.attempt or None,
+                    "err": i.err or None,
+                }.items() if v is not None} for i in inserts
             ],
             "changes": [
                 {

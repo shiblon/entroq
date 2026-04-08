@@ -14,8 +14,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/shiblon/entroq/backend/eqmem"
 	"github.com/shiblon/entroq/pkg/authz/opahttp"
-	"github.com/shiblon/entroq/qsvc"
-	"github.com/shiblon/entroq/qsvcjson"
+	"github.com/shiblon/entroq/pkg/eqsvcgrpc"
+	"github.com/shiblon/entroq/pkg/eqsvcjson"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
@@ -119,33 +119,33 @@ var rootCmd = &cobra.Command{
 
 		// Not taking a snapshot - start up a system.
 
-		var authzOpt qsvc.Option
+		var authzOpt eqsvcgrpc.Option
 		switch flags.authzStrategy {
 		case "opahttp":
-			authzOpt = qsvc.WithAuthorizer(opahttp.New(
+			authzOpt = eqsvcgrpc.WithAuthorizer(opahttp.New(
 				opahttp.WithHostURL(flags.opaURL),
 				opahttp.WithAPIPath(flags.opaPath),
 			))
 		case "", "none":
-			authzOpt = qsvc.WithAuthorizer(nil)
+			authzOpt = eqsvcgrpc.WithAuthorizer(nil)
 		default:
 			return fmt.Errorf("Unknown Authz strategy: %q", flags.authzStrategy)
 		}
 
-		svc, err := qsvc.New(ctx, eqmem.Opener(
+		svc, err := eqsvcgrpc.New(ctx, eqmem.Opener(
 			eqmem.WithJournal(flags.journal),
 			eqmem.WithMaxJournalBytes(int64(flags.journalMaxBytes)),
 			eqmem.WithMaxJournalItems(flags.journalMaxItems),
 		), authzOpt)
 		if err != nil {
-			return fmt.Errorf("failed to open eqmem backend for qsvc: %w", err)
+			return fmt.Errorf("failed to open eqmem backend for eqsvcgrpc: %w", err)
 		}
 		defer svc.Close()
 
 		go func() {
 			http.Handle("/metrics", promhttp.Handler())
 			
-			path, handler, err := qsvcjson.New(svc)
+			path, handler, err := eqsvcjson.New(svc)
 			if err != nil {
 				log.Fatalf("failed to create JSON/Connect handler: %v", err)
 			}

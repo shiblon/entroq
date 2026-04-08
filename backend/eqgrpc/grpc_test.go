@@ -6,13 +6,13 @@ import (
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/backend/eqmem"
-	"github.com/shiblon/entroq/qsvc/qtest"
+	"github.com/shiblon/entroq/pkg/testing/eqtest"
 )
 
-func RunQTest(t *testing.T, tester qtest.Tester) {
+func RunQTest(t *testing.T, tester eqtest.Tester) {
 	t.Helper()
 	ctx := context.Background()
-	client, stop, err := qtest.ClientService(ctx, eqmem.Opener())
+	client, stop, err := eqtest.ClientService(ctx, eqmem.Opener())
 	if err != nil {
 		t.Fatalf("Get client: %v", err)
 	}
@@ -22,61 +22,61 @@ func RunQTest(t *testing.T, tester qtest.Tester) {
 }
 
 func TestGRPCTasksWithID(t *testing.T) {
-	RunQTest(t, qtest.TasksWithID)
+	RunQTest(t, eqtest.TasksWithID)
 }
 
 func TestGRPCTasksOmitValue(t *testing.T) {
-	RunQTest(t, qtest.TasksOmitValue)
+	RunQTest(t, eqtest.TasksOmitValue)
 }
 
 func TestGRPCTasksWithIDOnly(t *testing.T) {
-	RunQTest(t, qtest.TasksWithIDOnly)
+	RunQTest(t, eqtest.TasksWithIDOnly)
 }
 
 func TestGRPCInsertWithID(t *testing.T) {
-	RunQTest(t, qtest.InsertWithID)
+	RunQTest(t, eqtest.InsertWithID)
 }
 
 func TestGRPCSimpleSequence(t *testing.T) {
-	RunQTest(t, qtest.SimpleSequence)
+	RunQTest(t, eqtest.SimpleSequence)
 }
 
 func TestGRPCSimpleChange(t *testing.T) {
-	RunQTest(t, qtest.SimpleChange)
+	RunQTest(t, eqtest.SimpleChange)
 }
 
 func TestGRPCSimpleWorker(t *testing.T) {
-	RunQTest(t, qtest.SimpleWorker)
+	RunQTest(t, eqtest.SimpleWorker)
 }
 
 func TestGRPCMultiWorker(t *testing.T) {
-	RunQTest(t, qtest.MultiWorker)
+	RunQTest(t, eqtest.MultiWorker)
 }
 
 func TestGRPCWorkerMoveOnError(t *testing.T) {
-	RunQTest(t, qtest.WorkerMoveOnError)
+	RunQTest(t, eqtest.WorkerMoveOnError)
 }
 
 func TestGRPCWorkerRetryOnError(t *testing.T) {
-	RunQTest(t, qtest.WorkerRetryOnError)
+	RunQTest(t, eqtest.WorkerRetryOnError)
 }
 
 func TestGRPCWorkerRenewal(t *testing.T) {
-	RunQTest(t, qtest.WorkerRenewal)
+	RunQTest(t, eqtest.WorkerRenewal)
 }
 
 func TestGRPCClaimUnblocksOnNotify(t *testing.T) {
-	RunQTest(t, qtest.ClaimUnblocksOnNotify)
+	RunQTest(t, eqtest.ClaimUnblocksOnNotify)
 }
 
 func TestGRPCQueueMatch(t *testing.T) {
-	RunQTest(t, qtest.QueueMatch)
+	RunQTest(t, eqtest.QueueMatch)
 }
 
 func TestGRPCQueueStats(t *testing.T) {
-	RunQTest(t, qtest.QueueStats)
+	RunQTest(t, eqtest.QueueStats)
 }
 
 func TestGRPCDeleteMissingTask(t *testing.T) {
-	RunQTest(t, qtest.DeleteMissingTask)
+	RunQTest(t, eqtest.DeleteMissingTask)
 }

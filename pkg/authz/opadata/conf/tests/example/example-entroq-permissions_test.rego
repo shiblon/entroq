@@ -69,7 +69,7 @@ test_only_match_wildcard_role_queues_single if {
 }
 
 test_only_extra_user_queues if {
-	user_queues == {{"prefix": "/ns=user/blah/", "actions": ["ALL"]}}
+	user_queues == {{"prefix": "/users/blah/", "actions": ["ALL"]}}
 	with data.entroq.user.username as "blah"
 	with data.entroq.policy.users as []
 	with data.entroq.policy.roles as []
@@ -77,7 +77,7 @@ test_only_extra_user_queues if {
 
 test_user_with_queues if {
 	user_queues == {
-		{"prefix": "/ns=user/blah/", "actions": ["ALL"]},
+		{"prefix": "/users/blah/", "actions": ["ALL"]},
 		{"exact": "q1", "actions": ["READ"]},
 		{"exact": "q2", "actions": ["CLAIM"]},
 	}
@@ -98,7 +98,7 @@ test_user_with_queues if {
 }
 
 test_no_matching_user_queues if {
-	user_queues == {{"prefix": "/ns=user/auser/", "actions": ["ALL"]}}
+	user_queues == {{"prefix": "/users/auser/", "actions": ["ALL"]}}
 	with data.entroq.user.username as "auser"
 	with input.queues as [{
 		"exact": "aqueue",

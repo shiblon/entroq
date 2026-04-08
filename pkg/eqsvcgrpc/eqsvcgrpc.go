@@ -1,4 +1,4 @@
-// Package qsvc contains the service implementation for registering with gRPC.
+// Package eqsvcgrpc contains the service implementation for registering with gRPC.
 // This provides the service that can be registered with a grpc.Server:
 //
 //	import (
@@ -7,7 +7,7 @@
 //		"net"
 //
 //		"github.com/shiblon/entroq/backend/eqpg"
-//		"github.com/shiblon/entroq/qsvc"
+//		"github.com/shiblon/entroq/pkg/eqsvcgrpc"
 //
 //		pb "github.com/shiblon/entroq/api"
 //
@@ -22,7 +22,7 @@
 //			log.Fatalf("Failed to listen: %v", err)
 //		}
 //
-//		svc, err := qsvc.New(ctx, eqpg.Opener("localhost:5432", "postgres", "postgres", false))
+//		svc, err := eqsvcgrpc.New(ctx, eqpg.Opener("localhost:5432", "postgres", "postgres", false))
 //		if err != nil {
 //			log.Fatalf("Failed to open service backends: %v", err)
 //		}
@@ -31,7 +31,7 @@
 //		pb.RegisterEntroQServer(s, svc)
 //		s.Serve(listener)
 //	}
-package qsvc
+package eqsvcgrpc
 
 import (
 	"context"
@@ -121,7 +121,7 @@ func WithAuthorizer(az authz.Authorizer) Option {
 func New(ctx context.Context, opener entroq.BackendOpener, opts ...Option) (*QSvc, error) {
 	impl, err := entroq.New(ctx, opener)
 	if err != nil {
-		return nil, fmt.Errorf("qsvc backend client: %w", err)
+		return nil, fmt.Errorf("eqsvcgrpc backend client: %w", err)
 	}
 
 	// Note that you should *never* use a background context like this unless
@@ -160,7 +160,7 @@ func New(ctx context.Context, opener entroq.BackendOpener, opts ...Option) (*QSv
 func (s *QSvc) Close() error {
 	s.metricCancel() // Don't bother waiting for it
 	if err := s.impl.Close(); err != nil {
-		return fmt.Errorf("qsvc close: %w", err)
+		return fmt.Errorf("eqsvcgrpc close: %w", err)
 	}
 	return nil
 }
@@ -409,7 +409,7 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 		entroq.ClaimAs(req.ClaimantId),
 		entroq.ClaimPollTime(pollTime))
 	if err != nil {
-		return nil, autoCodeErrorf("qsvc claim: %w", err)
+		return nil, autoCodeErrorf("eqsvcgrpc claim: %w", err)
 	}
 	if task == nil {
 		return new(pb.ClaimResponse), nil

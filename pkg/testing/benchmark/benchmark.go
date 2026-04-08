@@ -1,4 +1,4 @@
-package eqtest
+package benchmark
 
 import (
 	"context"

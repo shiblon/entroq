@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/backend/eqtest"
+	"github.com/shiblon/entroq/pkg/testing/benchmark"
 )
 
 // BatchPopulate fills the backend with n tasks spread evenly across multiple queues.
@@ -41,5 +41,5 @@ func BenchmarkStatsContention_1M(b *testing.B) {
 		b.Fatalf("Populate failed: %v", err)
 	}
 
-	eqtest.RunContentionBenchmark(b, client, queues, 20)
+	benchmark.RunContentionBenchmark(b, client, queues, 20)
 }

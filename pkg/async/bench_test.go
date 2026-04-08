@@ -12,8 +12,8 @@ import (
 	"github.com/shiblon/entroq/backend/eqgrpc"
 	"github.com/shiblon/entroq/backend/eqmem"
 	"github.com/shiblon/entroq/pkg/async"
-	"github.com/shiblon/entroq/qsvc"
-	"github.com/shiblon/entroq/worker"
+	"github.com/shiblon/entroq/pkg/eqsvcgrpc"
+	"github.com/shiblon/entroq/pkg/worker"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -34,10 +34,10 @@ func mustStartEntroQ(ctx context.Context, t testing.TB, opener entroq.BackendOpe
 		t.Fatalf("listen: %v", err)
 	}
 
-	svc, err := qsvc.New(ctx, opener)
+	svc, err := eqsvcgrpc.New(ctx, opener)
 	if err != nil {
 		lis.Close()
-		t.Fatalf("qsvc: %v", err)
+		t.Fatalf("eqsvcgrpc: %v", err)
 	}
 
 	srv := grpc.NewServer()

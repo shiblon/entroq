@@ -2,7 +2,7 @@
 // commonly used by clients of an EntroQ task service, set up thus:
 //
 //	Server:
-//		qsvc -> entroq library -> some backend (e.g., pg)
+//		eqsvcgrpc -> entroq library -> some backend (e.g., pg)
 //
 //	Client:
 //		entroq library -> grpc backend
@@ -10,7 +10,7 @@
 // You can start, for example, a postgres-backed QSvc like this (or just use pg/svc):
 //
 //	ctx := context.Background()
-//	svc, err := qsvc.New(ctx, pg.Opener(dbHostPort)) // Other options available, too.
+//	svc, err := eqsvcgrpc.New(ctx, pg.Opener(dbHostPort)) // Other options available, too.
 //	if err != nil {
 //		log.Fatalf("Can't open PG backend: %v",e rr)
 //	}
