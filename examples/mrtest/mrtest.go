@@ -108,8 +108,8 @@ func MRCheck(ctx context.Context, eq *entroq.EntroQ, numDocs, numMappers, numRed
 		log.Printf("Expected between 1 and %d output tasks, got %d", numReducers, len(tasks))
 		good = false
 		for i, t := range tasks {
-			var kvs []*KV
-			if err := json.Unmarshal(t.Value, &kvs); err != nil {
+			kvs, err := entroq.GetValue[[]*KV](t)
+			if err != nil {
 				log.Printf("Failed to unmarshal task %v on queue %q: %v", t.IDVersion(), t.Queue, err)
 				return false
 			}
@@ -129,8 +129,8 @@ func MRCheck(ctx context.Context, eq *entroq.EntroQ, numDocs, numMappers, numRed
 	// Check that each task's values are already in key-sorted order.
 	var allKVs []*KV
 	for i, task := range tasks {
-		var got []*KV
-		if err := json.Unmarshal(task.Value, &got); err != nil {
+		got, err := entroq.GetValue[[]*KV](task)
+		if err != nil {
 			log.Print(err)
 			return false
 		}

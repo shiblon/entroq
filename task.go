@@ -266,6 +266,13 @@ func (t *Task) ValueAs(v any) error {
 //	spec, err := entroq.ValueAs[JobSpec](task.Value)
 func ValueAs[T any](raw json.RawMessage) (T, error) {
 	var v T
+	if raw == nil {
+		return v, nil
+	}
+	if rawV, ok := any(&v).(*json.RawMessage); ok {
+		*rawV = raw
+		return v, nil
+	}
 	if err := json.Unmarshal(raw, &v); err != nil {
 		return v, err
 	}

@@ -26,7 +26,6 @@ package worker
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -480,16 +479,9 @@ func ClaimWithRenew[T any](ctx context.Context, eq *entroq.EntroQ, qs []string, 
 		return nil, fmt.Errorf("claim with renew: %w", err)
 	}
 
-	var value T
-	if task.Value != nil {
-		switch raw := any(&value).(type) {
-		case *json.RawMessage:
-			*raw = task.Value
-		default:
-			if err := json.Unmarshal(task.Value, &value); err != nil {
-				return nil, fmt.Errorf("unmarshal: %w", err)
-			}
-		}
+	value, err := entroq.GetValue[T](task)
+	if err != nil {
+		return nil, fmt.Errorf("unmarshal: %w", err)
 	}
 
 	g, ctx := errgroup.WithContext(ctx)

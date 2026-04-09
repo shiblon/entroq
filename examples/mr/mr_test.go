@@ -5,7 +5,6 @@ package mr_test
 
 import (
 	"context"
-	"encoding/json"
 	"math/rand"
 	"reflect"
 	"testing"
@@ -64,8 +63,8 @@ func TestMapReduce_inMemorySmall(t *testing.T) {
 
 	task := tasks[0]
 
-	var kvs []*KV
-	if err := json.Unmarshal(task.Value, &kvs); err != nil {
+	kvs, err := entroq.GetValue[[]*KV](task)
+	if err != nil {
 		t.Fatal(err)
 	}
 

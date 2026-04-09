@@ -223,8 +223,8 @@ func (s *Sender) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.deleteTask(ctx, task)
 
-	var resp Response
-	if err := json.Unmarshal(task.Value, &resp); err != nil {
+	resp, err := entroq.GetValue[Response](task)
+	if err != nil {
 		http.Error(w, fmt.Sprintf("unmarshal response: %v", err), http.StatusBadGateway)
 		return
 	}

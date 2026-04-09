@@ -513,8 +513,8 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 		var kvs []*KV
 
 		for _, task := range tasks {
-			var vals []*KV
-			if err := json.Unmarshal(task.Value, &vals); err != nil {
+			vals, err := entroq.GetValue[[]*KV](task)
+			if err != nil {
 				return fmt.Errorf("merge from json: %w", err)
 			}
 			kvs = append(kvs, vals...)
@@ -597,8 +597,8 @@ func reduceSortedKVs(ctx context.Context, reduce Reducer, kvs []*KV) ([]*KV, err
 // writing them out in the order they appear (to maintain sorting).
 func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error {
 	if err := worker.DoWithRenew(ctx, w.client, task, claimDuration, func(ctx context.Context, stop worker.FinalizeRenew) error {
-		var kvs []*KV
-		if err := json.Unmarshal(task.Value, &kvs); err != nil {
+		kvs, err := entroq.GetValue[[]*KV](task)
+		if err != nil {
 			return fmt.Errorf("reduce from json: %w", err)
 		}
 
