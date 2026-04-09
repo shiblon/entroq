@@ -2,9 +2,7 @@ package procworker
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
@@ -56,7 +54,7 @@ func TestRun(t *testing.T) {
 	const inbox = "/subproctest/inbox"
 	const implicitOutbox = inbox + "/done"
 
-	outdir, err := ioutil.TempDir("", "procworker-test-")
+	outdir, err := os.MkdirTemp("", "procworker-test-")
 	if err != nil {
 		t.Fatalf("Could not create temp dir: %v", err)
 	}
@@ -138,8 +136,8 @@ func TestRun(t *testing.T) {
 			t.Fatalf("Claim from outbox %q: %v", outbox, err)
 		}
 
-		output := new(SubprocessOutput)
-		if err := json.Unmarshal(task.Value, output); err != nil {
+		output, err := entroq.GetValue[*SubprocessOutput](task)
+		if err != nil {
 			t.Fatalf("Unmarshal output task: %v", err)
 		}
 
@@ -153,7 +151,7 @@ func TestRun(t *testing.T) {
 			if !strings.HasSuffix(output.Outfile, ".STDOUT") {
 				t.Errorf("Expected output file to have STDOUT extension, but got this: %q", output.Outfile)
 			}
-			val, err := ioutil.ReadFile(output.Outfile)
+			val, err := os.ReadFile(output.Outfile)
 			if err != nil {
 				t.Fatalf("Error opening output file: %v", err)
 			}
@@ -178,7 +176,7 @@ func TestRun(t *testing.T) {
 			if !strings.HasSuffix(output.Errfile, ".STDERR") {
 				t.Errorf("Expected error file to have STDERR extension, but got this: %q", output.Errfile)
 			}
-			val, err := ioutil.ReadFile(output.Errfile)
+			val, err := os.ReadFile(output.Errfile)
 			if err != nil {
 				t.Fatalf("Error opening output file: %v", err)
 			}
