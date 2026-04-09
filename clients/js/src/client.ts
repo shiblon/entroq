@@ -118,7 +118,10 @@ export class EntroQClient {
   async tasks(request: Omit<TasksRequest, "claimantId">): Promise<TasksResponse> {
     const query = new URLSearchParams(request as any).toString();
     const path = `/api/v0/tasks${query ? "?" + query : ""}`;
-    return this.request<TasksResponse>(path, "GET");
+    const resp = await this.request<any>(path, "GET");
+    return {
+      tasks: resp.tasks || [],
+    };
   }
 
   /**
@@ -134,7 +137,10 @@ export class EntroQClient {
 
     const qs = query.toString();
     const path = `/api/v0/queues${qs ? "?" + qs : ""}`;
-    return this.request<QueuesResponse>(path, "GET");
+    const resp = await this.request<any>(path, "GET");
+    return {
+      queues: resp.queues || [],
+    };
   }
 
   /**
@@ -150,7 +156,10 @@ export class EntroQClient {
 
     const qs = query.toString();
     const path = `/api/v0/queues/stats${qs ? "?" + qs : ""}`;
-    return this.request<QueuesResponse>(path, "GET");
+    const resp = await this.request<any>(path, "GET");
+    return {
+      queues: resp.queues || [],
+    };
   }
 
   /**
@@ -166,14 +175,28 @@ export class EntroQClient {
    * This uses HTTP Chunked Transfer Encoding to provide real-time updates.
    */
   async *streamTasks(request: Omit<TasksRequest, "claimantId">): AsyncIterable<Task> {
-    const query = new URLSearchParams(request as any).toString();
-    const url = `${this.baseUrl}/api/v0/tasks/stream${query ? "?" + query : ""}`;
+    const url = `${this.baseUrl}/api.EntroQ/StreamTasks`;
+
+    const jsonBody = JSON.stringify({
+      ...request,
+    });
+    const jsonBytes = new TextEncoder().encode(jsonBody);
+    
+    // Connect envelope: 1-byte flags + 4-byte big-endian length + data
+    const envelope = new Uint8Array(5 + jsonBytes.length);
+    envelope[0] = 0; // flags
+    new DataView(envelope.buffer).setUint32(1, jsonBytes.length, false);
+    envelope.set(jsonBytes, 5);
 
     const response = await fetch(url, {
-      method: "GET",
+      method: "POST",
       headers: {
+        "Content-Type": "application/connect+json",
+        "Accept": "application/connect+json",
+        "Connect-Protocol-Version": "1",
         ...this.headers,
       },
+      body: envelope,
     });
 
     if (!response.ok) {
@@ -186,39 +209,48 @@ export class EntroQClient {
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
-    let buffer = "";
+    let buffer = new Uint8Array(0);
+
+    const appendToBuffer = (newBytes: Uint8Array) => {
+        const combined = new Uint8Array(buffer.length + newBytes.length);
+        combined.set(buffer);
+        combined.set(newBytes, buffer.length);
+        buffer = combined;
+    };
 
     try {
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
+        if (value) appendToBuffer(value);
         
-        // Simple streaming JSON parser for the TasksResponse sequence.
-        let start = 0;
-        let depth = 0;
-        for (let i = 0; i < buffer.length; i++) {
-          if (buffer[i] === '{') depth++;
-          else if (buffer[i] === '}') {
-            depth--;
-            if (depth === 0) {
-              const jsonStr = buffer.substring(start, i + 1);
-              try {
-                const obj = JSON.parse(jsonStr);
-                if (obj.tasks && Array.isArray(obj.tasks)) {
-                  for (const t of obj.tasks) {
-                    yield t;
-                  }
-                }
-              } catch (e) {
-                // Ignore partial JSON or structural errors within a chunk.
+        while (buffer.length >= 5) {
+          const flags = buffer[0];
+          const len = new DataView(buffer.buffer, buffer.byteOffset, 5).getUint32(1, false);
+          
+          if (buffer.length < 5 + len) break;
+
+          const data = buffer.slice(5, 5 + len);
+          buffer = buffer.slice(5 + len);
+
+          if ((flags & 0x02) !== 0) {
+            // End of stream trailer
+            return;
+          }
+
+          const jsonStr = decoder.decode(data);
+          try {
+            const obj = JSON.parse(jsonStr);
+            if (obj.tasks && Array.isArray(obj.tasks)) {
+              for (const t of obj.tasks) {
+                yield t;
               }
-              start = i + 1;
             }
+          } catch (e) {
+            // Ignore parse errors
           }
         }
-        buffer = buffer.substring(start);
+
+        if (done) break;
       }
     } finally {
       reader.releaseLock();

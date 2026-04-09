@@ -244,7 +244,8 @@ type Backend interface {
 // some backends.
 type IDGenerator func() string
 
-// EntroQ is a client interface for accessing the task queue.
+// EntroQ is the primary client interface for interacting with the task queue backend.
+// It manages task IDs, claimant IDs, and the underlying storage connection.
 type EntroQ struct {
 	backend   Backend
 	opener    BackendOpener
@@ -289,10 +290,29 @@ func WithBackend(backend Backend) Option {
 // into New.
 type BackendOpener func(ctx context.Context) (Backend, error)
 
-// New creates a new task client with the given backend implementation, for example, to
-// use an in-memory implementation:
+// New creates a new task client with the given backend implementation.
 //
-//	cli, err := New(ctx, mem.Opener())
+// By default, it uses Hex16Generator for task and claimant IDs and assigns
+// a unique random claimant ID to this client instance.
+//
+// Example using an in-memory implementation:
+//
+//	cli, err := New(ctx, eqmem.Opener())
+//
+// This opens a new EntroQ instance using the in-memory backend. Each backend
+// has its own set of options that can be passed to its opener. For example, the
+// in-memory backend can be configured to use a fault-tolerant fast journal for
+// durable storage and fault recovery.
+//
+// Backends available are
+//   - eqmem: in-memory, optionally journal-backed (recommended) - fast and lean
+//   - eqpg: PostgreSQL-backed - persistent, robust, supports mixing database operations
+//     with EntroQ operations in the same transaction. Clients limited by PG connections.
+//   - eqgrpc: gRPC client backend - connects to a remote EntroQ service that is
+//     backed by eqmem or eqpg (or similar direct stores). Requires you to start or
+//     point to a service. Can be started with cmd/eqpg
+//
+// Valid backends will be in pkg/backend
 func New(ctx context.Context, opener BackendOpener, opts ...Option) (*EntroQ, error) {
 	eq := &EntroQ{
 		idGenRand: Hex16Generator,
@@ -464,13 +484,22 @@ func (c *EntroQ) RenewAllFor(ctx context.Context, tasks []*Task, duration time.D
 	return changed, nil
 }
 
-// Modify allows a batch modification operation to be done, gated on the
-// existence of all task IDs and versions specified. Deletions, Updates, and
-// Dependencies must be present. The transaction all fails or all succeeds.
+// Modify allows a batch of mutations to be applied atomically to the task store.
 //
-// Returns all inserted task IDs, and an error if it could not proceed. If the error
-// was due to missing dependencies, a *DependencyError is returned, which can be checked for
-// by calling AsDependency(err).
+// Every operation in a Modify call — whether it is an insertion, deletion,
+// update, or dependency check — is gated on the existence and version of the
+// specified tasks. If any part of the modification fails (e.g., a task has been
+// claimed by another worker and its version has changed), the entire batch
+// rolls back and a DependencyError is returned.
+//
+// This method is the foundation of EntroQ's "Exactly Once" semantics. By
+// including a task deletion in the same Modify call as a result insertion,
+// you ensure that work is never lost or committed twice.
+//
+// Returns:
+//   - inserted: The tasks that were successfully created.
+//   - changed: The tasks that were successfully updated.
+//   - err: A *DependencyError if any version check failed.
 func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (inserted []*Task, changed []*Task, err error) {
 	mod := NewModification(c.ClientID, modArgs...)
 	// Generate IDs for any inserts that don't have them. This is necessary

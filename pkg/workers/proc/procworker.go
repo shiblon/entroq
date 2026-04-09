@@ -1,15 +1,15 @@
-// Package procworker implements a worker that reads a subprocess specification
-// task, executes it, and puts results into an outbox.
+// Package procworker implements a worker that executes subprocesses described by tasks.
 //
-// Basically, it runs what you ask it to run, and pushes results where you
-// want them.
+// IT IS EXTREMELY DANGEROUS and should be used with extreme caution.
+// Because it executes arbitrary commands as the process user, a malicious actor
+// who can push tasks into your queue can gain full control over the worker's
+// environment.
 //
-// Because of this, YOU SHOULD NEVER USE THIS. Really. Just don't. It's super
-// dangerous - anyone that has access to push tasks into your queue can make
-// you run arbitrary things as your process user. That's horrible and bad and
-// scary, even in a controlled environment.
-//
-// Containers do not make this better, at least not better enough.
+// Security Best Practices:
+// 1. Run in an isolated container or dedicated VM.
+// 2. Use a restricted user with no sudo privileges.
+// 3. Use EntroQ's OPA authorization to limit who can write to the procworker inbox.
+// 4. Use for tightly controlled orchestration tasks only.
 package procworker
 
 import (

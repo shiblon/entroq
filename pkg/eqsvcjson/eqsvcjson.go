@@ -25,7 +25,7 @@ type Handler struct {
 // It uses Vanguard to provide RESTful transcoding under /api/v0.
 func New(svc *eqsvcgrpc.QSvc, opts ...connect.HandlerOption) (string, http.Handler, error) {
 	h := &Handler{svc: svc}
-	_, connectHandler := apiconnect.NewEntroQHandler(h, opts...)
+	connectPath, connectHandler := apiconnect.NewEntroQHandler(h, opts...)
 
 	services := []*vanguard.Service{
 		vanguard.NewService(apiconnect.EntroQName, connectHandler),
@@ -36,7 +36,11 @@ func New(svc *eqsvcgrpc.QSvc, opts ...connect.HandlerOption) (string, http.Handl
 		return "", nil, err
 	}
 
-	return "/", transcoder, nil
+	mux := http.NewServeMux()
+	mux.Handle(connectPath, connectHandler)
+	mux.Handle("/", transcoder)
+
+	return "/", mux, nil
 }
 
 func ctxWithMD(ctx context.Context, headers http.Header) context.Context {
