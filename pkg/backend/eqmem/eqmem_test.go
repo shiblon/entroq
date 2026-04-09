@@ -463,3 +463,15 @@ func TestEQMem_journalInsClaimClaimDel(t *testing.T) {
 	defer eq3.Close()
 	eq3.Close()
 }
+
+func TestEQMemWorkerDependencyHandler(t *testing.T) {
+	RunQTest(t, eqtest.WorkerDependencyHandler)
+}
+
+func TestEQMemWorkerCompactDependencyHandler(t *testing.T) {
+	RunQTest(t, eqtest.WorkerCompactDependencyHandler)
+}
+
+func TestEQMemWorkerRenewalNoDependencyHandler(t *testing.T) {
+	RunQTest(t, eqtest.WorkerRenewalNoDependencyHandler)
+}

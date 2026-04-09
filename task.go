@@ -60,8 +60,8 @@ func (t TaskID) Depend() ModifyArg {
 
 // TaskData contains just the data, not the identifier or metadata. Used for insertions.
 type TaskData struct {
-	Queue string    `json:"queue"`
-	At    time.Time `json:"at"`
+	Queue string          `json:"queue"`
+	At    time.Time       `json:"at"`
 	Value json.RawMessage `json:"value"`
 
 	// Attempt indicates which "attempt number" this task is on. Used by workers.
@@ -118,9 +118,9 @@ type Task struct {
 	ID      string `json:"id"`
 	Version int32  `json:"version"`
 
-	At       time.Time `json:"at"`
-	Claimant string    `json:"claimant"`
-	Claims   int32     `json:"claims"`
+	At       time.Time       `json:"at"`
+	Claimant string          `json:"claimant"`
+	Claims   int32           `json:"claims"`
 	Value    json.RawMessage `json:"value"`
 
 	Created  time.Time `json:"created"`
@@ -270,4 +270,14 @@ func ValueAs[T any](raw json.RawMessage) (T, error) {
 		return v, err
 	}
 	return v, nil
+}
+
+// GetValue unmarshals the task's value into a new value of type T and returns it.
+// It is a convenience wrapper around ValueAs[T](task.Value).
+func GetValue[T any](t *Task) (T, error) {
+	if t == nil {
+		var v T
+		return v, fmt.Errorf("GetValue on nil task")
+	}
+	return ValueAs[T](t.Value)
 }

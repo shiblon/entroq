@@ -58,7 +58,7 @@ func Example_journal() {
 		log.Fatalf("Error getting tasks for 'others': %v", err)
 	}
 	for _, t := range ts1 {
-		fmt.Printf("%v: %q\n", t.Queue, t.Value)
+		fmt.Printf("%v: %s\n", t.Queue, t.Value)
 	}
 
 	ts2, err := eq.Tasks(ctx, "/queue/of/something")
@@ -66,7 +66,7 @@ func Example_journal() {
 		log.Fatalf("Error getting tasks for 'something': %v", err)
 	}
 	for _, t := range ts2 {
-		fmt.Printf("%v: %q\n", t.Queue, t.Value)
+		fmt.Printf("%v: %s\n", t.Queue, t.Value)
 	}
 
 	// Output:

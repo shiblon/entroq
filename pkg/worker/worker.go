@@ -1,3 +1,27 @@
+// Package worker provides a high-level looping protocol for processing tasks.
+//
+// It handles the "Claim -> Work -> Renew -> Modify" lifecycle, ensuring that:
+// 1. Tasks are renewed in the background while work is ongoing.
+// 2. Renewal stops before finalization to ensure a stable task version.
+// 3. Failures are handled through retry or quarantine to an error queue.
+// 4. Concurrency is safe and easy to manage via context cancellation.
+//
+// # Quick Start
+//
+// A worker is typically created with a set of options that define its behavior.
+// Below is a minimal example using a "DoModify" pattern, which accepts a single
+// function to run, and that function does work and returns modifications it
+// wants to make:
+//
+//	client, _ := entroq.New(ctx, mem.Opener()) // Open an in-memory EntroQ backend.
+//	workFunc := func(ctx context.Context, task *entroq.Task, value json.RawMessage) ([]entroq.ModifyArg, error) {
+//	    log.Printf("Working on task %v", task.ID)
+//	    return []entroq.ModifyArg{task.Delete()}, nil
+//	}
+//	w := worker.New(client, worker.WithDoModify(workFunc))
+//	if err := w.Run(ctx, "/my/inbox"); err != nil {
+//	    log.Fatalf("Worker failed: %v", err)
+//	}
 package worker
 
 import (
@@ -18,13 +42,12 @@ import (
 type ErrQMap func(inbox string) string
 
 // DefaultRetryDelay is the amount by which to advance the arrival time when a
-// worker task errors out as retryable.
+// worker task errors out as retryable. This is an exponential backoff baseline.
 const DefaultRetryDelay = 30 * time.Second
 
-// DefaultBackoff is the default time a worker sleeps after a fundamental
-// error (renewal failure, connection error, etc.) before attempting to claim
-// again. This prevents tight restart loops under network partitions or
-// transient backend outages.
+// DefaultBackoff is the time a worker sleeps after a fundamental error
+// (renewal failure, connection error, etc.) before attempting to claim again.
+// It prevents "thundering herd" or "tight loop" failures during outages.
 const DefaultBackoff = 10 * time.Second
 
 // Handler[T] is an interface that can be implemented to define work to be done.
@@ -110,6 +133,10 @@ type Worker[T any] struct {
 	// MaxAttempts indicates how many attempts are too many before a retryable
 	// error becomes permanent and the task is moved to an error queue.
 	MaxAttempts int32
+
+	// depHandler is called when a Modify operation fails due to a dependency
+	// failure (e.g., version mismatch).
+	depHandler func(context.Context, *entroq.Task, *entroq.DependencyError) error
 }
 
 // New creates a new Worker[T] that claims tasks from the given queues and
@@ -221,176 +248,172 @@ func WithBackoff[T any](d time.Duration) Option[T] {
 	}
 }
 
+// WithDependencyHandler sets a hook that is called when a task modification
+// fails due to a dependency error. This is useful for reactive state
+// management, such as refreshing a cached configuration. If the hook returns
+// a non-nil error, the worker will stop.
+func WithDependencyHandler[T any](f func(context.Context, *entroq.Task, *entroq.DependencyError) error) Option[T] {
+	return func(w *Worker[T]) {
+		w.depHandler = f
+	}
+}
+
 // DefaultErrQMap appends "/err" to the inbox.
 func DefaultErrQMap(inbox string) string {
 	return inbox + "/err"
+}
+
+func isSentinelError(sentinel error) bool {
+	return errors.Is(sentinel, RetryError) || errors.Is(sentinel, MoveError)
+}
+
+func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, task *entroq.Task, errQ string) (isSentinel bool, err error) {
+	if errors.Is(sentinel, RetryError) {
+		_, _, err := w.eqc.Modify(ctx, task.RetryOrQuarantine(sentinel.Error(), errQ, w.MaxAttempts, entroq.ArrivalTimeBy(w.baseRetryDelay)))
+		if err != nil {
+			return true, fmt.Errorf("retry or quarantine modify: %w", err)
+		}
+		return true, nil
+	}
+	if errors.Is(sentinel, MoveError) {
+		_, _, err := w.eqc.Modify(ctx, task.Quarantine(sentinel.Error(), errQ))
+		if err != nil {
+			return true, fmt.Errorf("quarantine modify: %w", err)
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+func renewModVersions(mod *entroq.Modification, renewed *entroq.TaskID) {
+	for _, t := range mod.Changes {
+		if t.ID == renewed.ID {
+			t.Version = renewed.Version
+		}
+	}
+	for _, t := range mod.Depends {
+		if t.ID == renewed.ID {
+			t.Version = renewed.Version
+		}
+	}
+	for _, t := range mod.Deletes {
+		if t.ID == renewed.ID {
+			t.Version = renewed.Version
+		}
+	}
 }
 
 // runOne claims one task, unmarshals its value into T, runs the work function
 // with renewal, and applies any resulting modification. All per-task state is
 // local to this call, making concurrent Run goroutines safe.
 func (w *Worker[T]) runOne(ctx context.Context, qs []string) error {
-	task, err := w.eqc.Claim(ctx, entroq.From(qs...), entroq.ClaimFor(w.lease))
-	if err != nil {
-		if entroq.IsCanceled(err) {
+	// Set up the first (work) handler function, and track doModify args.
+	var taskDo DoTaskWork[T]
+	var returnedModArgs []entroq.ModifyArg // save these for later if it's a doModify handler
+	if w.doModify == nil {
+		taskDo = w.handler.TaskDo
+	} else {
+		taskDo = func(ctx context.Context, task *entroq.Task, value T) (err error) {
+			returnedModArgs, err = w.doModify(ctx, task, value)
 			return err
 		}
-		log.Printf("Worker claim failed (%q), backing off %v: %v", qs, w.backoff, err)
+	}
+
+	// Run ClaimWithRenew, capture initial and final tasks, react to sentinel errors
+	rCtx, rCancel := context.WithCancel(ctx)
+	defer rCancel()
+	var (
+		initialTask  *entroq.Task
+		initialValue T
+		sentinelErr  error
+	)
+	finalTask, handleErr := ClaimWithRenew(rCtx, w.eqc, qs, w.lease, func(ctx context.Context, task *entroq.Task, value T) error {
+		initialTask = task
+		initialValue = value
+		defer rCancel()
+		if err := taskDo(ctx, task, value); err != nil {
+			// Check for sentinel errors, pass them out if they are, otherwise
+			// run it up the chain.
+			if isSentinelError(err) {
+				sentinelErr = err
+				return nil // retry and move errors will be handled outside with the final task.
+			}
+			return fmt.Errorf("task do: %v", err)
+		}
+		return nil
+	})
+
+	// Sentinel errors are special - handle and exit.
+	if sentinelErr != nil {
+		// Figure out the error queue, handle sentinel errors.
+		errQ := w.ErrQMap(initialTask.Queue)
+
+		if _, err := w.handleSentinelErrors(ctx, sentinelErr, finalTask, errQ); err != nil {
+			// Something went wrong trying to handle the error itself.
+			// Includes cancellation and timeouts.
+			return fmt.Errorf("handle sentinel error: %w", err)
+		}
+		return nil
+	}
+
+	if handleErr != nil {
+		// Not a sentinel, institute backoff in case the worker jUst loops
+		// really fast on a broken network connection or similar.
+		log.Printf("Worker claim failed (%q), backing off %v: %v", qs, w.backoff, handleErr)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(w.backoff):
 		}
-		return nil
+		return fmt.Errorf("worker claim failed (%q), backed off %v: %w", qs, w.backoff, handleErr)
 	}
 
-	errQ := w.ErrQMap(task.Queue)
-
-	// Decode task.Value into T. When T is json.RawMessage, skip unmarshaling
-	// entirely and alias the slice directly -- no copy, no allocation. This is
-	// the fast path for callers that want raw bytes without typed decoding.
-	// Note: value and task.Value share the same backing array in that case, so
-	// in-place byte mutation of either would affect both. Appending is safe.
-	var value T
-	if task.Value != nil {
-		switch raw := any(&value).(type) {
-		case *json.RawMessage:
-			*raw = task.Value
-		default:
-			if err := json.Unmarshal(task.Value, &value); err != nil {
-				log.Printf("Worker decode error, moving task %v to %q: %v", task.ID, errQ, err)
-				if _, _, merr := w.eqc.Modify(ctx, task.Quarantine(err.Error(), errQ)); merr != nil {
-					log.Printf("Worker failed to quarantine malformed task %v: %v", task.ID, merr)
-				}
-				return nil
+	// Define the finalizer function, we'll call it below.
+	var taskFinish DoTaskWork[T]
+	if w.doModify == nil {
+		taskFinish = w.handler.TaskFinish
+	} else {
+		taskFinish = func(ctx context.Context, task *entroq.Task, value T) error {
+			modification := entroq.NewModification("", returnedModArgs...)
+			switch {
+			case initialTask.Version > finalTask.Version:
+				return fmt.Errorf("task updated inside worker body, expected version <= %v, got %v", finalTask.Version, initialTask.Version)
+			case initialTask.Version < finalTask.Version:
+				renewModVersions(modification, finalTask.IDVersion())
 			}
-		}
-	}
-
-	// Build a per-invocation handler. For doModify, state lives here on the
-	// stack so concurrent Run goroutines never share mutable handler fields.
-	handler := w.handler
-	if w.doModify != nil {
-		var mods []entroq.ModifyArg
-		initial := task
-		handler = &funcHandler[T]{
-			do: func(ctx context.Context, task *entroq.Task, value T) error {
-				var err error
-				mods, err = w.doModify(ctx, task, value)
-				return err
-			},
-			finish: func(ctx context.Context, renewed *entroq.Task, _ T) error {
-				modification := entroq.NewModification("", mods...)
-				switch {
-				case initial.Version > renewed.Version:
-					return fmt.Errorf("task updated inside worker body, expected version <= %v, got %v", renewed.Version, initial.Version)
-				case initial.Version < renewed.Version:
-					for _, t := range modification.Changes {
-						if t.ID == renewed.ID {
-							t.Version = renewed.Version
-						}
-					}
-					for _, id := range modification.Depends {
-						if id.ID == renewed.ID {
-							id.Version = renewed.Version
-						}
-					}
-					for _, id := range modification.Deletes {
-						if id.ID == renewed.ID {
-							id.Version = renewed.Version
-						}
-					}
+			if _, _, err := w.eqc.Modify(ctx, entroq.WithModification(modification)); err != nil {
+				if _, ok := entroq.AsDependency(err); ok {
+					log.Printf("Worker ack failed, throwing away: %v", err)
+					return fmt.Errorf("worker dependency: %w", err)
 				}
-				if _, _, err := w.eqc.Modify(ctx, entroq.WithModification(modification)); err != nil {
-					if _, ok := entroq.AsDependency(err); ok {
-						log.Printf("Worker ack failed, throwing away: %v", err)
-						return nil
-					}
-					if entroq.IsTimeout(err) {
-						log.Printf("Worker continuing after ack timeout: %v", err)
-						return nil
-					}
-					if entroq.IsCanceled(err) {
-						log.Printf("Worker exiting cleanly instead of acking: %v", err)
-						return fmt.Errorf("canceled in compact finish: %w", err)
-					}
-					return fmt.Errorf("worker ack: %w", err)
+				if entroq.IsCanceled(err) || entroq.IsTimeout(err) {
+					log.Printf("Worker exiting cleanly instead of acking: %v", err)
+					return fmt.Errorf("canceled in compact finish: %w", err)
 				}
-				return nil
-			},
-		}
-	}
-
-	var stable *entroq.Task
-	var handleErr error
-
-	if err := DoWithRenew(ctx, w.eqc, task, w.lease, func(ctx context.Context, stop FinalizeRenew) error {
-		defer func() { stable = stop() }()
-		if err := handler.TaskDo(ctx, task, value); err != nil {
-			if e := new(RetryError); errors.As(err, &e) {
-				if w.MaxAttempts == 0 || task.Attempt+1 < w.MaxAttempts {
-					log.Printf("Worker received retryable error, incrementing attempt: %v", e)
-				} else {
-					log.Printf("Worker max attempts reached, moving to %q instead of retrying: %v", errQ, e)
-				}
-				handleErr = err
-				return nil
+				return fmt.Errorf("worker doModify finish: %w", err)
 			}
-			if e := new(MoveError); errors.As(err, &e) {
-				log.Printf("Worker moving to %q: %v", errQ, err)
-				handleErr = err
-				return nil
-			}
-			return fmt.Errorf("work (%q): %w", qs, err)
-		}
-		return nil
-	}); err != nil {
-		if _, ok := entroq.AsDependency(err); ok {
-			log.Printf("Worker continuing after dependency (%q)", qs)
 			return nil
 		}
-		if entroq.IsTimeout(err) {
-			log.Printf("Worker continuing after timeout (%q)", qs)
-			return nil
-		}
-		return err
 	}
 
-	if handleErr != nil {
-		var args entroq.ModifyArg
-		if e := new(RetryError); errors.As(handleErr, &e) {
-			args = stable.RetryOrQuarantine(e.Error(), errQ, w.MaxAttempts, entroq.ArrivalTimeBy(w.baseRetryDelay))
-		} else if e := new(MoveError); errors.As(handleErr, &e) {
-			args = stable.Quarantine(e.Error(), errQ)
-		}
-		if _, _, err := w.eqc.Modify(ctx, args); err != nil {
-			if _, ok := entroq.AsDependency(err); ok {
-				log.Printf("Worker error ack failed (%q), throwing away: %v", qs, err)
-				return nil
+	// Finally call the finish function, handle any errors.
+	if err := taskFinish(ctx, finalTask, initialValue); err != nil {
+		// Too late to get sentinel errors - we don't know what task we have to
+		// move or retry it.
+		if de, ok := entroq.AsDependency(err); ok {
+			if w.depHandler != nil {
+				if err := w.depHandler(ctx, finalTask, de); err != nil {
+					return fmt.Errorf("on dependency handler: %w", err)
+				}
 			}
-			if entroq.IsTimeout(err) {
-				log.Printf("Worker continuing (%q) after error ack timeout: %v", qs, err)
-				return nil
-			}
-			return err
-		}
-		return nil
-	}
-
-	if err := handler.TaskFinish(ctx, stable, value); err != nil {
-		if _, ok := entroq.AsDependency(err); ok {
-			log.Printf("Worker ack failed (%q), throwing away: %v", qs, err)
+			log.Printf("Worker finish failed (%q), throwing away: %v", qs, de)
 			return nil
 		}
-		if entroq.IsTimeout(err) {
-			log.Printf("Worker continuing (%q) after ack timeout: %v", qs, err)
-			return nil
-		}
-		if entroq.IsCanceled(err) {
-			log.Printf("Worker exiting cleanly instead of acking: %v", err)
+		if entroq.IsTimeout(err) || entroq.IsCanceled(err) {
+			log.Printf("Worker exiting cleanly: %v", err)
 			return fmt.Errorf("canceled in finish: %w", err)
 		}
-		return fmt.Errorf("worker ack (%q): %w", qs, err)
+		return fmt.Errorf("worker finish (%q): %w", qs, err)
 	}
 	return nil
 }
@@ -414,44 +437,17 @@ func (w *Worker[T]) Run(ctx context.Context, qs ...string) error {
 	}
 }
 
-// MoveError causes a task to be moved to a specified queue.
-type MoveError struct {
-	Err error
-}
+var (
+	// RetryError can be returned from a worker to cause its claimed task to be
+	// marked as attempted again, and to cause its At to be at a time in the
+	// future. Convenient for work that fails due to likely transient causes.
+	RetryError = errors.New("worker retry")
 
-// NewMoveError creates a new MoveError from the given error.
-func NewMoveError(err error) *MoveError {
-	return &MoveError{Err: err}
-}
-
-// MoveErrorf creates a MoveError given a format string and values.
-func MoveErrorf(format string, values ...any) *MoveError {
-	return NewMoveError(fmt.Errorf(format, values...))
-}
-
-func (e *MoveError) Error() string { return e.Err.Error() }
-func (e *MoveError) Unwrap() error { return e.Err }
-
-// RetryError causes a task to be retried, incrementing its Attempt field.
-// If MaxAttempts is positive and nonzero, and has been reached, then this
-// behaves the same as a MoveError.
-type RetryError struct {
-	Err error
-}
-
-// NewRetryError creates a new RetryError from the given error.
-func NewRetryError(err error) *RetryError {
-	return &RetryError{Err: err}
-}
-
-// RetryErrorf creates a RetryError in the same way you would create an error
-// with fmt.Errorf.
-func RetryErrorf(format string, values ...any) *RetryError {
-	return NewRetryError(fmt.Errorf(format, values...))
-}
-
-func (e *RetryError) Error() string { return e.Err.Error() }
-func (e *RetryError) Unwrap() error { return e.Err }
+	// MoveError can be returned from a worker to cause its claimed task to
+	// move, e.g., to a quarantine queue for inspection. Helpful if operating
+	// on a task seems to have non-retriable errors, but the task is important.
+	MoveError = errors.New("worker move")
+)
 
 // Renewal Machinery
 
@@ -472,6 +468,69 @@ type DoWorkAll func(ctx context.Context, stop FinalizeRenewAll) error
 
 // DoWork defines a function like WorkAll, but handles only one task.
 type DoWork func(ctx context.Context, stop FinalizeRenew) error
+
+// DoTaskWork defines a function that can be called to do work on a task and its value.
+// Used in ClaimWithRenew.
+type DoTaskWork[T any] func(ctx context.Context, task *entroq.Task, value T) error
+
+// ClaimWithRenew claims a task from the given queues (blocking)
+func ClaimWithRenew[T any](ctx context.Context, eq *entroq.EntroQ, qs []string, lease time.Duration, f DoTaskWork[T]) (*entroq.Task, error) {
+	task, err := eq.Claim(ctx, entroq.From(qs...), entroq.ClaimFor(lease))
+	if err != nil {
+		return nil, fmt.Errorf("claim with renew: %w", err)
+	}
+
+	var value T
+	if task.Value != nil {
+		switch raw := any(&value).(type) {
+		case *json.RawMessage:
+			*raw = task.Value
+		default:
+			if err := json.Unmarshal(task.Value, &value); err != nil {
+				return nil, fmt.Errorf("unmarshal: %w", err)
+			}
+		}
+	}
+
+	g, ctx := errgroup.WithContext(ctx)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	g.Go(func() error {
+		if err := f(ctx, task, value); err != nil {
+			return fmt.Errorf("worker (%q): %w", qs, err)
+		}
+		cancel()
+		return nil
+	})
+
+	renewTask := task
+	g.Go(func() error {
+		for {
+			select {
+			case <-time.After(lease / 2):
+				_, mods, err := eq.Modify(ctx, renewTask.Change(entroq.ArrivalTimeBy(lease)))
+				if err != nil {
+					return fmt.Errorf("renew for: %w", err)
+				}
+				renewTask = mods[0]
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	})
+
+	if err := g.Wait(); err != nil {
+		if entroq.IsCanceled(err) || entroq.IsTimeout(err) {
+			// Clean exit, return current task.
+			return renewTask, nil
+		}
+		return nil, fmt.Errorf("worker stopped (%q): %w", qs, err)
+	}
+	// A successful renewal function *always* returns at least a context.Canceled
+	// error, so we should never get here.
+	return nil, fmt.Errorf("worker exited unexpectedly early (%q)", qs)
+}
 
 // DoWithRenewAll runs the provided function while keeping all given task
 // leases renewed.
@@ -559,7 +618,9 @@ func DoWithRenewAll(ctx context.Context, c *entroq.EntroQ, tasks []*entroq.Task,
 // renewed.
 func DoWithRenew(ctx context.Context, c *entroq.EntroQ, task *entroq.Task, lease time.Duration, f DoWork) error {
 	if err := DoWithRenewAll(ctx, c, []*entroq.Task{task}, lease, func(ctx context.Context, finalize FinalizeRenewAll) error {
-		if err := f(ctx, func() *entroq.Task { return finalize()[0] }); err != nil {
+		if err := f(ctx, func() *entroq.Task {
+			return finalize()[0]
+		}); err != nil {
 			return fmt.Errorf("do one: %w", err)
 		}
 		return nil
