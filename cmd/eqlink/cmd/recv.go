@@ -1,9 +1,11 @@
 package cmd
 
 import (
+	"fmt"
+
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
 	"github.com/shiblon/entroq/pkg/async"
+	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
 	"github.com/shiblon/entroq/pkg/worker"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
@@ -32,7 +34,12 @@ Use "eqlink run" to start the full sidecar (sender + receiver + GC).`,
 
 		g, ctx := errgroup.WithContext(ctx)
 		for range concurrency {
-			g.Go(func() error { return recvWorker.Run(ctx, myQueue) })
+			g.Go(func() error {
+				if err := recvWorker.Run(ctx, worker.Watching(myQueue)); err != nil {
+					return fmt.Errorf("run worker: %w", err)
+				}
+				return nil
+			})
 		}
 		return g.Wait()
 	},

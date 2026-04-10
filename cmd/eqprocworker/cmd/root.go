@@ -24,8 +24,7 @@ import (
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
-	"github.com/shiblon/entroq/pkg/workers/proc"
-	"github.com/shiblon/entroq/pkg/worker"
+	"github.com/shiblon/entroq/pkg/workers/procworker"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
@@ -94,7 +93,7 @@ var rootCmd = &cobra.Command{
 		defer eq.Close()
 
 		log.Printf("Starting worker for %q on inbox %q", eqaddr, inbox)
-		if err := worker.New(eq, worker.WithDoModify(procworker.Run)).Run(ctx, inbox); err != nil {
+		if err := procworker.Run(ctx, eq, procworker.WithQueues(inbox)); err != nil {
 			log.Fatalf("Error executing worker: %v", err)
 		}
 	},

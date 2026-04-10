@@ -13,7 +13,6 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/backend/eqmem"
-	"github.com/shiblon/entroq/pkg/worker"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -28,7 +27,7 @@ func waitEmpty(ctx context.Context, eq *entroq.EntroQ, q string) error {
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("queue empty: %w", err)
+			return ctx.Err()
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
@@ -61,16 +60,16 @@ func TestRun(t *testing.T) {
 	defer os.RemoveAll(outdir)
 
 	cases := []struct {
-		in     *SubprocessInput
-		expect *SubprocessOutput
+		in     *Input
+		expect *Output
 	}{
 		{
-			in: &SubprocessInput{
+			in: &Input{
 				Cmd: []string{"/bin/bash", "-c", `echo "output here, var=${VAR}"; echo 1>&2 'error here'`},
 				Env: []string{"VAR=my value"},
 				// Implicit outbox.
 			},
-			expect: &SubprocessOutput{
+			expect: &Output{
 				Cmd:    []string{"/bin/bash", "-c", `echo "output here, var=${VAR}"; echo 1>&2 'error here'`},
 				Env:    []string{"VAR=my value"},
 				Stdout: "output here, var=my value\n",
@@ -78,13 +77,13 @@ func TestRun(t *testing.T) {
 			},
 		},
 		{
-			in: &SubprocessInput{
+			in: &Input{
 				Cmd:    []string{"/bin/bash", "-c", `echo "output here, var=${VAR}"; echo 1>&2 'error here'`},
 				Env:    []string{"VAR=my value"},
 				Outdir: outdir,
 				Errdir: outdir,
 			},
-			expect: &SubprocessOutput{
+			expect: &Output{
 				Cmd:     []string{"/bin/bash", "-c", `echo "output here, var=${VAR}"; echo 1>&2 'error here'`},
 				Env:     []string{"VAR=my value"},
 				Outfile: "output here, var=my value\n", // use contents here even though that's wrong in practice.
@@ -96,12 +95,12 @@ func TestRun(t *testing.T) {
 			},
 		},
 		{
-			in: &SubprocessInput{
+			in: &Input{
 				Cmd:    []string{"pwd"},
 				Dir:    mustCleanPath(os.TempDir()),
 				Outbox: "/special/outbox",
 			},
-			expect: &SubprocessOutput{
+			expect: &Output{
 				Cmd:    []string{"pwd"},
 				Dir:    mustCleanPath(os.TempDir()),
 				Stdout: mustCleanPath(os.TempDir()) + "\n",
@@ -114,7 +113,7 @@ func TestRun(t *testing.T) {
 	g, ctx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
-		return worker.New(eq, worker.WithDoModify(Run)).Run(ctx, inbox)
+		return Run(ctx, eq, WithQueues(inbox))
 	})
 
 	// Insert tasks one at a time, check that we get the expected output in the expected place.
@@ -136,7 +135,7 @@ func TestRun(t *testing.T) {
 			t.Fatalf("Claim from outbox %q: %v", outbox, err)
 		}
 
-		output, err := entroq.GetValue[*SubprocessOutput](task)
+		output, err := entroq.GetValue[*Output](task)
 		if err != nil {
 			t.Fatalf("Unmarshal output task: %v", err)
 		}

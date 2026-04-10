@@ -248,10 +248,6 @@ func toMS(t time.Time) int64 {
 }
 
 func fromTaskProto(t *pb.Task) (*entroq.Task, error) {
-	val, err := pb.ProtoToJSON(t.Value)
-	if err != nil {
-		return nil, fmt.Errorf("task %s value: %w", t.Id, err)
-	}
 	return &entroq.Task{
 		Queue:    t.Queue,
 		ID:       t.Id,
@@ -259,7 +255,7 @@ func fromTaskProto(t *pb.Task) (*entroq.Task, error) {
 		At:       fromMS(t.AtMs),
 		Claimant: t.ClaimantId,
 		Claims:   t.Claims,
-		Value:    val,
+		Value:    t.Value,
 		Created:  fromMS(t.CreatedMs),
 		Modified: fromMS(t.ModifiedMs),
 		// Omit FromQueue - not needed here.
@@ -269,14 +265,10 @@ func fromTaskProto(t *pb.Task) (*entroq.Task, error) {
 }
 
 func protoFromTaskData(td *entroq.TaskData) (*pb.TaskData, error) {
-	pv, err := pb.JSONToProto(td.Value)
-	if err != nil {
-		return nil, fmt.Errorf("task data value: %w", err)
-	}
 	return &pb.TaskData{
 		Queue:   td.Queue,
 		AtMs:    toMS(td.At),
-		Value:   pv,
+		Value:   td.Value,
 		Attempt: td.Attempt,
 		Err:     td.Err,
 		Id:      td.ID,

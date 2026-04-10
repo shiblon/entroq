@@ -359,7 +359,7 @@ func (w *MapWorker) Run(ctx context.Context) error {
 			}
 			return append(emitArgs, task.Delete()), nil
 		}),
-	).Run(ctx, w.InputQueue)
+	).Run(ctx, worker.Watching(w.InputQueue))
 }
 
 // ReducerInput provides a streaming interface for getting values during reduction.

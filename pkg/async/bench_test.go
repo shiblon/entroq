@@ -84,7 +84,7 @@ func mustStartReceivers(ctx context.Context, t testing.TB, eq *entroq.EntroQ, qu
 
 	g, gctx := errgroup.WithContext(ctx)
 	for range concurrency {
-		g.Go(func() error { return recvWorker.Run(gctx, queue) })
+		g.Go(func() error { return recvWorker.Run(gctx, worker.Watching(queue)) })
 	}
 
 	return func() {

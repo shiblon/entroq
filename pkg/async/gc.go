@@ -54,7 +54,7 @@ func WithGCGrace(d time.Duration) GCOption {
 	}
 }
 
-// RunGCLoop runs RunGC periodically until ctx is cancelled. Scan errors are
+// RunGCLoop runs RunGC periodically until ctx is canceled. Scan errors are
 // logged and do not stop the loop.
 func RunGCLoop(ctx context.Context, eq *entroq.EntroQ, root string, opts ...GCOption) error {
 	c := newGCConfig(opts)

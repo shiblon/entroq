@@ -71,7 +71,7 @@ func simpleWorkerOnce(ctx context.Context, t *testing.T, client *entroq.EntroQ, 
 				_, _, err := client.Modify(ctx, task.Delete())
 				return err
 			}),
-		).Run(ctx, queue)
+		).Run(ctx, worker.Watching(queue))
 	})
 
 	// Brief pause to let the worker goroutine reach its Claim call before we
@@ -176,7 +176,7 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 					return err
 				}),
 			)
-			err := w.Run(ctx, bigQueue, medQueue, smallQueue)
+			err := w.Run(ctx, worker.Watching(bigQueue, medQueue, smallQueue))
 			if entroq.IsCanceled(err) {
 				return nil
 			}
@@ -324,8 +324,6 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 				_, _, err := client.Modify(ctx, task.Delete())
 				return err
 			}),
-			worker.WithBaseRetryDelay[string](0),
-			worker.WithMaxAttempts[string](c.maxAttempt),
 		)
 
 		ctx, cancel := context.WithCancel(ctx)
@@ -333,7 +331,10 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 
 		g, gctx := errgroup.WithContext(ctx)
 		g.Go(func() error {
-			return w.Run(gctx, c.input.Queue)
+			return w.Run(gctx, worker.Watching(c.input.Queue),
+				worker.WithBaseRetryDelay(0),
+				worker.WithMaxAttempts(c.maxAttempt),
+			)
 		})
 
 		// Now stick our task in. The worker is ready and waiting.
@@ -349,7 +350,7 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 				t.Fatalf("Test %q expected queue %q to become empty, didn't happen: %v", c.name, c.input.Queue, err)
 			}
 			// Now check that it's in the error queue and looks okay.
-			errTasks, err := client.Tasks(ctx, w.ErrQMap(c.input.Queue))
+			errTasks, err := client.Tasks(ctx, w.ErrorQueueFor(c.input.Queue))
 			if err != nil {
 				t.Fatalf("Test %q can't get tasks from error queue: %v", c.name, err)
 			}
@@ -438,7 +439,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 			worker.WithDo(func(ctx context.Context, task *entroq.Task, cmd string) error {
 				switch cmd {
 				case "die":
-					return fmt.Errorf("task asked to die")
+					return fmt.Errorf("task asked to die: %w", worker.FatalError)
 				case "move":
 					return fmt.Errorf("task asked to move: %w", worker.MoveError)
 				case "move-wait":
@@ -455,14 +456,13 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 				_, _, err := client.Modify(ctx, task.Delete())
 				return err
 			}),
-			worker.WithLease[string](leaseTime),
 		)
 
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 		g, gctx := errgroup.WithContext(ctx)
 		g.Go(func() error {
-			if err := w.Run(gctx, c.input.Queue); err != nil && !entroq.IsCanceled(err) {
+			if err := w.Run(gctx, worker.Watching(c.input.Queue), worker.WithLease(leaseTime), worker.WithBackoff(100*time.Millisecond)); err != nil && !entroq.IsCanceled(err) {
 				// Log quickly so we can see it before waits fail below.
 				log.Printf("Worker Run error: %v", err)
 				return err
@@ -495,7 +495,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		if err := client.WaitQueuesEmpty(waitCtx, entroq.MatchExact(c.input.Queue)); err != nil && !entroq.IsCanceled(err) {
 			t.Fatalf("Test %q: no moved tasks found, task was not expected to die: %v", c.name, err)
 		}
-		errTasks, err := client.Tasks(ctx, w.ErrQMap(c.input.Queue))
+			errTasks, err := client.Tasks(ctx, w.ErrorQueueFor(c.input.Queue))
 		if err != nil {
 			t.Fatalf("Test %q find in error queue: %v", c.name, err)
 		}
@@ -510,9 +510,9 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 			}
 		}
 		if c.moved && foundTask == nil {
-			t.Errorf("Test %q expected task to be moved, but is not found in %q", c.name, w.ErrQMap(c.input.Queue))
+			t.Errorf("Test %q expected task to be moved, but is not found in %q", c.name, w.ErrorQueueFor(c.input.Queue))
 		} else if !c.moved && foundTask != nil {
-			t.Errorf("Test %q expected task to be deleted, but showed up in %q", c.name, w.ErrQMap(c.input.Queue))
+			t.Errorf("Test %q expected task to be deleted, but showed up in %q", c.name, w.ErrorQueueFor(c.input.Queue))
 		}
 
 		cancel()
@@ -610,10 +610,6 @@ func WorkerDependencyHandler(ctx context.Context, t *testing.T, client *entroq.E
 			_, _, err := client.Modify(ctx, task.Delete(), confTask.Depend())
 			return err
 		}),
-		worker.WithDependencyHandler[string](func(ctx context.Context, task *entroq.Task, de *entroq.DependencyError) error {
-			handlerCalled <- true
-			return nil
-		}),
 	)
 
 	runCtx, runCancel := context.WithCancel(ctx)
@@ -621,7 +617,11 @@ func WorkerDependencyHandler(ctx context.Context, t *testing.T, client *entroq.E
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- w.Run(runCtx, queue)
+		errCh <- w.Run(runCtx, worker.Watching(queue),
+			worker.WithDependencyHandler(func(ctx context.Context, task *entroq.Task, de *entroq.DependencyError) error {
+				handlerCalled <- true
+				return nil
+			}))
 	}()
 
 	// Wait for worker to be in work.
@@ -677,10 +677,6 @@ func WorkerCompactDependencyHandler(ctx context.Context, t *testing.T, client *e
 			<-letFinish
 			return []entroq.ModifyArg{task.Delete(), confTask.Depend()}, nil
 		}),
-		worker.WithDependencyHandler[string](func(ctx context.Context, task *entroq.Task, de *entroq.DependencyError) error {
-			handlerCalled <- true
-			return nil
-		}),
 	)
 
 	runCtx, runCancel := context.WithCancel(ctx)
@@ -688,7 +684,11 @@ func WorkerCompactDependencyHandler(ctx context.Context, t *testing.T, client *e
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- w.Run(runCtx, queue)
+		errCh <- w.Run(runCtx, worker.Watching(queue),
+			worker.WithDependencyHandler(func(ctx context.Context, task *entroq.Task, de *entroq.DependencyError) error {
+				handlerCalled <- true
+				return nil
+			}))
 	}()
 
 	select {
@@ -730,7 +730,6 @@ func WorkerRenewalNoDependencyHandler(ctx context.Context, t *testing.T, client 
 	const lease = 2 * time.Second
 
 	w := worker.New(client,
-		worker.WithLease[string](lease),
 		worker.WithDo(func(ctx context.Context, task *entroq.Task, val string) error {
 			inWork <- true
 			select {
@@ -740,10 +739,6 @@ func WorkerRenewalNoDependencyHandler(ctx context.Context, t *testing.T, client 
 			}
 			return nil
 		}),
-		worker.WithDependencyHandler[string](func(ctx context.Context, task *entroq.Task, de *entroq.DependencyError) error {
-			handlerCalled <- true
-			return nil
-		}),
 	)
 
 	runCtx, runCancel := context.WithCancel(ctx)
@@ -751,7 +746,12 @@ func WorkerRenewalNoDependencyHandler(ctx context.Context, t *testing.T, client 
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- w.Run(runCtx, queue)
+		errCh <- w.Run(runCtx, worker.Watching(queue),
+			worker.WithDependencyHandler(func(ctx context.Context, task *entroq.Task, de *entroq.DependencyError) error {
+				t.Errorf("Dependency handler should NOT be called for renewal failure!")
+				handlerCalled <- true
+				return nil
+			}))
 	}()
 
 	select {

@@ -73,7 +73,7 @@ func Example() {
 	ctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
 
-	if err := w.Run(ctx, "q1", "q2"); err != nil {
+	if err := w.Run(ctx, worker.Watching("q1", "q2")); err != nil {
 		log.Fatal(err)
 	}
 
@@ -151,7 +151,7 @@ func Example_dependencies() {
 	ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
 	defer cancel()
 
-	if err := w.Run(ctx, "worker"); err != nil && !entroq.IsCanceled(err) {
+	if err := w.Run(ctx, worker.Watching("worker")); err != nil && !entroq.IsCanceled(err) {
 		log.Fatalf("worker failed: %v", err)
 	}
 }
