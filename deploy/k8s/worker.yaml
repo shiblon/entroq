@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: entroq-worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: entroq-worker
+  template:
+    metadata:
+      labels:
+        app: entroq-worker
+    spec:
+      containers:
+        - name: worker
+          image: shiblon/entroq:latest
+          command:
+            - "/bin/eqprocworker"
+            - "--eqaddr=entroq:37706"
+            - "--inbox=/subprocworker/inbox"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
