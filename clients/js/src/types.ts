@@ -131,3 +131,17 @@ export interface QueuesResponse {
 export interface TimeResponse {
   timeMs: string; // int64 -> string
 }
+
+/**
+ * EntroQClientInterface defines the methods required by a worker.
+ */
+export interface EntroQClientInterface {
+  claim(
+    queues: string[],
+    durationMs?: number,
+    pollMs?: number
+  ): Promise<ClaimResponse>;
+  modify(
+    request: Omit<ModifyRequest, "claimantId">
+  ): Promise<ModifyResponse>;
+}
