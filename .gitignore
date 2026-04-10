@@ -28,6 +28,11 @@ vendor
 
 tmp
 
+# JS
+node_modules
+package.json
+package-lock.json
+
 # Python
 venv/
 __pycache__/
@@ -38,3 +43,6 @@ __pycache__/
 
 # Configs
 .gemini/
+
+# AI Stuff
+QUBIT.md
