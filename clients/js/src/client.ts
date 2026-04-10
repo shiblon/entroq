@@ -9,6 +9,7 @@ import {
   QueuesRequest,
   QueuesResponse,
   TimeResponse,
+  EntroQClientInterface,
 } from "./types";
 
 export interface ClientOptions {
@@ -17,25 +18,25 @@ export interface ClientOptions {
   headers?: Record<string, string>;
 }
 
-export class EntroQClient {
+export function generateClaimantId(): string {
+  // Generate a 16-character hex string (8 random bytes).
+  // We use a manual Math.random() implementation to ensure absolute
+  // portability across all JS environments without requiring Node-specific
+  // modules or modern web crypto globals.
+  return "xxxxxxxxxxxxxxxx".replace(/x/g, () =>
+    ((Math.random() * 16) | 0).toString(16)
+  );
+}
+
+export class EntroQClient implements EntroQClientInterface {
   private baseUrl: string;
   private claimantId: string;
   private headers: Record<string, string>;
 
   constructor(options: ClientOptions) {
     this.baseUrl = options.baseUrl.replace(/\/$/, "");
-    this.claimantId = options.claimantId || this.generateClaimantId();
+    this.claimantId = options.claimantId || generateClaimantId();
     this.headers = options.headers || {};
-  }
-
-  private generateClaimantId(): string {
-    // Generate a 16-character hex string (8 random bytes).
-    // We use a manual Math.random() implementation to ensure absolute
-    // portability across all JS environments without requiring Node-specific
-    // modules or modern web crypto globals.
-    return "xxxxxxxxxxxxxxxx".replace(/x/g, () =>
-      ((Math.random() * 16) | 0).toString(16)
-    );
   }
 
   private async request<T>(

@@ -1,5 +1,4 @@
-import { EntroQClient } from "./client";
-import { Task, ModifyRequest, TaskID } from "./types";
+import { Task, ModifyRequest, TaskID, EntroQClientInterface } from "./types";
 
 /**
  * EntroQRetryError indicates that the task should be retried after a delay.
@@ -65,11 +64,11 @@ export type WorkHandler = (
  * to a handler, with automatic claim renewal in the background.
  */
 export class EntroQWorker {
-  private client: EntroQClient;
+  private client: EntroQClientInterface;
   private options: Required<WorkerOptions>;
   private running: boolean = false;
 
-  constructor(client: EntroQClient, options: WorkerOptions = {}) {
+  constructor(client: EntroQClientInterface, options: WorkerOptions = {}) {
     this.client = client;
     this.options = {
       leaseMs: options.leaseMs ?? 30000,
