@@ -13,15 +13,16 @@
 // function to run, and that function does work and returns modifications it
 // wants to make:
 //
-//	client, _ := entroq.New(ctx, mem.Opener()) // Open an in-memory EntroQ backend.
-//	workFunc := func(ctx context.Context, task *entroq.Task, value json.RawMessage) ([]entroq.ModifyArg, error) {
-//	    log.Printf("Working on task %v", task.ID)
-//	    return []entroq.ModifyArg{task.Delete()}, nil
-//	}
-//	w := worker.New(client, worker.WithDoModify(workFunc))
-//	if err := w.Run(ctx, "/my/inbox"); err != nil {
-//	    log.Fatalf("Worker failed: %v", err)
-//	}
+//		client, _ := entroq.New(ctx, mem.Opener()) // Open an in-memory EntroQ backend.
+//		if err := worker.Run(ctx,
+//	 		WithQueues("/my/inbox"),
+//			WithDoModify(func(ctx context.Context, task *entroq.Task, value json.RawMessage) ([]entroq.ModifyArg, error) {
+//		    	log.Printf("Working on task %v", task.ID)
+//		    	return []entroq.ModifyArg{task.Delete()}, nil
+//			}),
+//		); err != nil {
+//		    log.Fatalf("Worker failed: %v", err)
+//		}
 package worker
 
 import (
@@ -117,42 +118,17 @@ func (h *funcHandler[T]) TaskFinish(ctx context.Context, task *entroq.Task, valu
 type Worker[T any] struct {
 	eqc *entroq.EntroQ
 
-	lease          time.Duration
-	baseRetryDelay time.Duration
-	backoff        time.Duration
+	errQMap ErrQMap
 
 	handler  Handler[T]
 	doModify DoModifyRun[T] // set by WithDoModify; per-task state lives in runOne
-
-	// ErrQMap maps an inbox to the queue tasks are moved to if a MoveError
-	// is returned from a worker's run function, or if the task value cannot
-	// be decoded into T.
-	ErrQMap ErrQMap
-
-	// MaxAttempts indicates how many attempts are too many before a retryable
-	// error becomes permanent and the task is moved to an error queue.
-	MaxAttempts int32
-
-	// depHandler is called when a Modify operation fails due to a dependency
-	// failure (e.g., version mismatch).
-	depHandler func(context.Context, *entroq.Task, *entroq.DependencyError) error
 }
 
-// New creates a new Worker[T] that claims tasks from the given queues and
-// presents pre-unmarshaled values of type T to the work handler. Configure
-// the worker with options like WithDo, WithFinish, or WithDoModify.
-//
-// Use T = json.RawMessage for untyped operation (raw JSON bytes passed
-// through as-is).
+// New creates a new Worker[T] that claims tasks from its configured queues and
+// presents pre-unmarshaled values of type T to the work handler.
 func New[T any](eq *entroq.EntroQ, opts ...Option[T]) *Worker[T] {
 	w := &Worker[T]{
-		ErrQMap: DefaultErrQMap,
-
-		eqc:   eq,
-		lease: entroq.DefaultClaimDuration,
-
-		baseRetryDelay: DefaultRetryDelay,
-		backoff:        DefaultBackoff,
+		eqc: eq,
 	}
 	for _, opt := range opts {
 		opt(w)
@@ -163,8 +139,22 @@ func New[T any](eq *entroq.EntroQ, opts ...Option[T]) *Worker[T] {
 // Option[T] can be passed to New to modify worker parameters.
 type Option[T any] func(*Worker[T])
 
-// WithDo sets the primary work function for a worker. The function receives
-// the claimed task and its value pre-unmarshaled into T. Overwrites any
+// ErrorQueueFor returns the error queue for the given inbox, using the worker's
+// configured mapping or the default if none is set.
+func (w *Worker[T]) ErrorQueueFor(inbox string) string {
+	if w.errQMap != nil {
+		return w.errQMap(inbox)
+	}
+	return DefaultErrQMap(inbox)
+}
+
+// DefaultErrQMap is the default error queue mapping function. It appends
+// "/err" to the inbox name.
+func DefaultErrQMap(inbox string) string {
+	return inbox + "/err"
+}
+
+// WithDo sets the primary work function for a worker. Overwrites any
 // previous handler configuration.
 func WithDo[T any](f func(context.Context, *entroq.Task, T) error) Option[T] {
 	return func(w *Worker[T]) {
@@ -193,8 +183,8 @@ func WithFinish[T any](f func(context.Context, *entroq.Task, T) error) Option[T]
 
 // WithDoModify sets a combined work and modification function that returns
 // the list of modifications to apply after work is complete. Per-task state
-// is stack-allocated in each runOne call, so concurrent Run goroutines are
-// safe. Overwrites any previous configuration.
+// is stack-allocated in each pass through the worker loop, so concurrent Run
+// goroutines are safe. Overwrites any previous configuration.
 func WithDoModify[T any](f DoModifyRun[T]) Option[T] {
 	return func(w *Worker[T]) {
 		w.handler = nil
@@ -209,66 +199,16 @@ func WithHandler[T any](h Handler[T]) Option[T] {
 	}
 }
 
-// WithLease sets the frequency of task renewal.
-func WithLease[T any](d time.Duration) Option[T] {
-	return func(w *Worker[T]) {
-		w.lease = d
-	}
-}
-
-// WithErrQMap sets a function that maps from inbox queue names to error queue
-// names. Defaults to DefaultErrQMap.
+// WithErrQMap sets the error queue mapping function for a worker.
 func WithErrQMap[T any](f ErrQMap) Option[T] {
 	return func(w *Worker[T]) {
-		w.ErrQMap = f
+		w.errQMap = f
 	}
 }
 
-// WithMaxAttempts sets the maximum attempts allowed before a RetryError turns
-// into a MoveError. If 0 (the default), there is no maximum.
-func WithMaxAttempts[T any](m int32) Option[T] {
-	return func(w *Worker[T]) {
-		w.MaxAttempts = m
-	}
-}
-
-// WithBaseRetryDelay sets the base delay for a retried task.
-func WithBaseRetryDelay[T any](d time.Duration) Option[T] {
-	return func(w *Worker[T]) {
-		w.baseRetryDelay = d
-	}
-}
-
-// WithBackoff sets how long the worker sleeps after an infrastructure error
-// before attempting to claim again. Defaults to DefaultBackoff.
-func WithBackoff[T any](d time.Duration) Option[T] {
-	return func(w *Worker[T]) {
-		w.backoff = d
-	}
-}
-
-// WithDependencyHandler sets a hook that is called when a task modification
-// fails due to a dependency error. This is useful for reactive state
-// management, such as refreshing a cached configuration. If the hook returns
-// a non-nil error, the worker will stop.
-func WithDependencyHandler[T any](f func(context.Context, *entroq.Task, *entroq.DependencyError) error) Option[T] {
-	return func(w *Worker[T]) {
-		w.depHandler = f
-	}
-}
-
-// DefaultErrQMap appends "/err" to the inbox.
-func DefaultErrQMap(inbox string) string {
-	return inbox + "/err"
-}
-
-func isSentinelError(sentinel error) bool {
-	return errors.Is(sentinel, RetryError) || errors.Is(sentinel, MoveError)
-}
-
-func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, task *entroq.Task, errQ string) (isSentinel bool, err error) {
+func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, task *entroq.Task, errQ string, opts *runOpt) (isSentinel bool, err error) {
 	if errors.Is(sentinel, RetryError) {
-		_, _, err := w.eqc.Modify(ctx, task.RetryOrQuarantine(sentinel.Error(), errQ, w.MaxAttempts, entroq.ArrivalTimeBy(w.baseRetryDelay)))
+		_, _, err := w.eqc.Modify(ctx, task.RetryOrQuarantine(sentinel.Error(), errQ, opts.maxAttempts, entroq.ArrivalTimeBy(opts.baseRetryDelay)))
 		if err != nil {
 			return true, fmt.Errorf("retry or quarantine modify: %w", err)
 		}
@@ -280,6 +220,9 @@ func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, ta
 			return true, fmt.Errorf("quarantine modify: %w", err)
 		}
 		return true, nil
+	}
+	if errors.Is(sentinel, FatalError) {
+		return true, sentinel
 	}
 	return false, nil
 }
@@ -303,9 +246,8 @@ func renewModVersions(mod *entroq.Modification, renewed *entroq.TaskID) {
 }
 
 // runOne claims one task, unmarshals its value into T, runs the work function
-// with renewal, and applies any resulting modification. All per-task state is
-// local to this call, making concurrent Run goroutines safe.
-func (w *Worker[T]) runOne(ctx context.Context, qs []string) error {
+// with renewal, and applies any resulting modification.
+func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt) error {
 	// Set up the first (work) handler function, and track doModify args.
 	var taskDo DoTaskWork[T]
 	var returnedModArgs []entroq.ModifyArg // save these for later if it's a doModify handler
@@ -326,7 +268,7 @@ func (w *Worker[T]) runOne(ctx context.Context, qs []string) error {
 		initialValue T
 		sentinelErr  error
 	)
-	finalTask, handleErr := ClaimWithRenew(rCtx, w.eqc, qs, w.lease, func(ctx context.Context, task *entroq.Task, value T) error {
+	finalTask, handleErr := ClaimWithRenew(rCtx, w.eqc, opts.qs, opts.lease, func(ctx context.Context, task *entroq.Task, value T) error {
 		initialTask = task
 		initialValue = value
 		defer rCancel()
@@ -345,9 +287,8 @@ func (w *Worker[T]) runOne(ctx context.Context, qs []string) error {
 	// Sentinel errors are special - handle and exit.
 	if sentinelErr != nil {
 		// Figure out the error queue, handle sentinel errors.
-		errQ := w.ErrQMap(initialTask.Queue)
-
-		if _, err := w.handleSentinelErrors(ctx, sentinelErr, finalTask, errQ); err != nil {
+		errQ := w.ErrorQueueFor(initialTask.Queue)
+		if _, err := w.handleSentinelErrors(ctx, sentinelErr, finalTask, errQ, opts); err != nil {
 			// Something went wrong trying to handle the error itself.
 			// Includes cancellation and timeouts.
 			return fmt.Errorf("handle sentinel error: %w", err)
@@ -358,13 +299,13 @@ func (w *Worker[T]) runOne(ctx context.Context, qs []string) error {
 	if handleErr != nil {
 		// Not a sentinel, institute backoff in case the worker jUst loops
 		// really fast on a broken network connection or similar.
-		log.Printf("Worker claim failed (%q), backing off %v: %v", qs, w.backoff, handleErr)
+		log.Printf("Worker claim failed (%q), backing off %v: %v", opts.qs, opts.backoff, handleErr)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(w.backoff):
+		case <-time.After(opts.backoff):
 		}
-		return fmt.Errorf("worker claim failed (%q), backed off %v: %w", qs, w.backoff, handleErr)
+		return fmt.Errorf("worker claim failed (%q), backed off %v: %w", opts.qs, opts.backoff, handleErr)
 	}
 
 	// Define the finalizer function, we'll call it below.
@@ -400,38 +341,111 @@ func (w *Worker[T]) runOne(ctx context.Context, qs []string) error {
 		// Too late to get sentinel errors - we don't know what task we have to
 		// move or retry it.
 		if de, ok := entroq.AsDependency(err); ok {
-			if w.depHandler != nil {
-				if err := w.depHandler(ctx, finalTask, de); err != nil {
+			if opts.onDepError != nil {
+				if err := opts.onDepError(ctx, finalTask, de); err != nil {
 					return fmt.Errorf("on dependency handler: %w", err)
 				}
 			}
-			log.Printf("Worker finish failed (%q), throwing away: %v", qs, de)
+			log.Printf("Worker finish failed (%q), throwing away: %v", opts.qs, de)
 			return nil
 		}
 		if entroq.IsTimeout(err) || entroq.IsCanceled(err) {
 			log.Printf("Worker exiting cleanly: %v", err)
 			return fmt.Errorf("canceled in finish: %w", err)
 		}
-		return fmt.Errorf("worker finish (%q): %w", qs, err)
+		return fmt.Errorf("worker finish (%q): %w", opts.qs, err)
 	}
 	return nil
 }
 
+// RunOption is an option for a run call.
+type RunOption func(*runOpt)
+
+type runOpt struct {
+	qs             []string
+	baseRetryDelay time.Duration
+	maxAttempts    int32
+	lease          time.Duration
+	onDepError     func(context.Context, *entroq.Task, *entroq.DependencyError) error
+	backoff        time.Duration
+}
+
+// Watching specifies the queues Run will watch.
+func Watching(qs ...string) RunOption {
+	return func(ro *runOpt) {
+		ro.qs = qs
+	}
+}
+
+// WithDependencyHandler specifies the function to call when a task dependency
+// fails. Use to, for example, reload stale config tasks.
+func WithDependencyHandler(f func(ctx context.Context, task *entroq.Task, de *entroq.DependencyError) error) RunOption {
+	return func(ro *runOpt) {
+		ro.onDepError = f
+	}
+}
+
+// WithLease sets the frequency of task renewal.
+func WithLease(d time.Duration) RunOption {
+	return func(ro *runOpt) {
+		ro.lease = d
+	}
+}
+
+// WithMaxAttempts sets the maximum attempts allowed before a RetryError turns
+// into a MoveError. If 0 (the default), there is no maximum.
+func WithMaxAttempts(m int32) RunOption {
+	return func(ro *runOpt) {
+		ro.maxAttempts = m
+	}
+}
+
+// WithBaseRetryDelay sets the base delay for a retried task.
+func WithBaseRetryDelay(d time.Duration) RunOption {
+	return func(ro *runOpt) {
+		ro.baseRetryDelay = d
+	}
+}
+
+// WithBackoff sets how long the worker sleeps after an infrastructure error
+// before attempting to claim again. Defaults to DefaultBackoff.
+func WithBackoff(d time.Duration) RunOption {
+	return func(ro *runOpt) {
+		ro.backoff = d
+	}
+}
+
+func isSentinelError(sentinel error) bool {
+	return errors.Is(sentinel, RetryError) || errors.Is(sentinel, MoveError) || errors.Is(sentinel, FatalError)
+}
+
 // Run claims tasks from the worker queues and processes them in a loop until
 // its context is canceled or an unrecoverable error is encountered.
-// You may call Run multiple times on the same worker.
-func (w *Worker[T]) Run(ctx context.Context, qs ...string) error {
-	if len(qs) == 0 {
+func (w *Worker[T]) Run(ctx context.Context, opts ...RunOption) error {
+	ro := &runOpt{
+		lease:          entroq.DefaultClaimDuration,
+		baseRetryDelay: DefaultRetryDelay,
+		backoff:        DefaultBackoff,
+	}
+	for _, opt := range opts {
+		opt(ro)
+	}
+
+	if len(ro.qs) == 0 {
 		return fmt.Errorf("no queues specified to work on")
 	}
 
+	if w.handler == nil && w.doModify == nil {
+		return fmt.Errorf("no work handler specified")
+	}
+
 	for {
-		if err := w.runOne(ctx, qs); err != nil {
+		if err := w.runOne(ctx, ro); err != nil {
 			if entroq.IsCanceled(err) || entroq.IsTimeout(err) {
 				log.Printf("worker was asked to quit: %v", ctx.Err())
 				return nil
 			}
-			return fmt.Errorf("worker (%q): %w", qs, err)
+			return fmt.Errorf("worker (%q): %w", ro.qs, err)
 		}
 	}
 }
@@ -446,6 +460,11 @@ var (
 	// move, e.g., to a quarantine queue for inspection. Helpful if operating
 	// on a task seems to have non-retriable errors, but the task is important.
 	MoveError = errors.New("worker move")
+
+	// FatalError can be returned from a worker to cause it to stop immediately.
+	// This is useful if a task handler determines that the worker cannot or
+	// should not continue processing tasks.
+	FatalError = errors.New("worker fatal")
 )
 
 // Renewal Machinery

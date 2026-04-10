@@ -1,15 +1,3 @@
-// Package procworker implements a worker that executes subprocesses described by tasks.
-//
-// IT IS EXTREMELY DANGEROUS and should be used with extreme caution.
-// Because it executes arbitrary commands as the process user, a malicious actor
-// who can push tasks into your queue can gain full control over the worker's
-// environment.
-//
-// Security Best Practices:
-// 1. Run in an isolated container or dedicated VM.
-// 2. Use a restricted user with no sudo privileges.
-// 3. Use EntroQ's OPA authorization to limit who can write to the procworker inbox.
-// 4. Use for tightly controlled orchestration tasks only.
 package procworker
 
 import (
@@ -26,13 +14,14 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/worker"
 )
 
 const MaxStdOutSize = 1024 * 1024
 
-// SubprocessInput contains information about the subprocess to run. Task
+// Input contains information about the subprocess to run. Task
 // values should be JSON-encoded versions of this structure.
-type SubprocessInput struct {
+type Input struct {
 	Cmd    []string `json:"cmd"`
 	Dir    string   `json:"dir"`
 	Env    []string `json:"env"`
@@ -51,7 +40,7 @@ type SubprocessInput struct {
 }
 
 // JSON creates JSON from the input.
-func (p *SubprocessInput) JSON() []byte {
+func (p *Input) JSON() []byte {
 	out, err := json.Marshal(p)
 	if err != nil {
 		log.Fatalf("Failed to marshal: %v", err)
@@ -60,8 +49,8 @@ func (p *SubprocessInput) JSON() []byte {
 }
 
 // AsOutput creates an output structure from the input, for filling in results.
-func (p *SubprocessInput) AsOutput() *SubprocessOutput {
-	out := &SubprocessOutput{
+func (p *Input) AsOutput() *Output {
+	out := &Output{
 		Cmd:    p.Cmd,
 		Env:    p.Env,
 		Dir:    p.Dir,
@@ -82,9 +71,9 @@ func (p *SubprocessInput) AsOutput() *SubprocessOutput {
 	return out
 }
 
-// SubprocessOutput contains results from the subprocess that was run. Task
+// Output contains results from the subprocess that was run. Task
 // values pushed to the outbox will contain this as a JSON-encoded string.
-type SubprocessOutput struct {
+type Output struct {
 	Cmd    []string `json:"cmd"`
 	Dir    string   `json:"dir"`
 	Env    []string `json:"env"`
@@ -98,11 +87,10 @@ type SubprocessOutput struct {
 	// the final full pathnames of those files.
 	Outfile string `json:"outfile"`
 	Errfile string `json:"errfile"`
-	// TODO: use the input and fill these outputs.
 }
 
-// JSON creates JSON from the input.
-func (p *SubprocessOutput) JSON() []byte {
+// JSON creates JSON from the output.
+func (p *Output) JSON() []byte {
 	out, err := json.Marshal(p)
 	if err != nil {
 		log.Fatalf("Failed to marshal: %v", err)
@@ -131,20 +119,43 @@ func (w *TeeWriter) Write(data []byte) (int, error) {
 	return len(data), nil
 }
 
-// Run is a function that can be passed to a worker's Run method. The worker
-// will call this for each task it wishes to process. It pulls subprocess call
-// information from its input task, including which outbox to write results to.
-// If no outbox is specified, the input task's queue name is suffixed with
-// "/done" to produce one.
-func Run(ctx context.Context, t *entroq.Task, value json.RawMessage) ([]entroq.ModifyArg, error) {
-	input := new(SubprocessInput)
-	if err := json.Unmarshal(value, input); err != nil {
-		log.Printf("Error unmarshaling value: %v", err)
-		return []entroq.ModifyArg{
-			t.Change(entroq.QueueTo(t.Queue + "/failed-parse")),
-		}, nil
-	}
+// Worker provides the execution logic.
+type Worker struct {
+}
 
+// Option defines options that can be passed to Run.
+type Option func(*Worker, *[]worker.Option[Input], *[]worker.RunOption)
+
+// WithQueues sets the queues to collect tasks from.
+func WithQueues(qs ...string) Option {
+	return func(pw *Worker, wo *[]worker.Option[Input], ro *[]worker.RunOption) {
+		*ro = append(*ro, worker.Watching(qs...))
+	}
+}
+
+// WithLease sets the lease duration for claimed tasks.
+func WithLease(lease time.Duration) Option {
+	return func(pw *Worker, wo *[]worker.Option[Input], ro *[]worker.RunOption) {
+		*ro = append(*ro, worker.WithLease(lease))
+	}
+}
+
+// WithWorkerOption allows passing core worker options directly.
+func WithWorkerOption(opt worker.Option[Input]) Option {
+	return func(pw *Worker, wo *[]worker.Option[Input], ro *[]worker.RunOption) {
+		*wo = append(*wo, opt)
+	}
+}
+
+// WithRunOption allows passing core run options directly.
+func WithRunOption(opt worker.RunOption) Option {
+	return func(pw *Worker, wo *[]worker.Option[Input], ro *[]worker.RunOption) {
+		*ro = append(*ro, opt)
+	}
+}
+
+// doWork is the internal handler that matches worker.DoModifyRun.
+func (pw *Worker) doWork(ctx context.Context, t *entroq.Task, input Input) ([]entroq.ModifyArg, error) {
 	outbox := input.Outbox
 	if outbox == "" {
 		outbox = t.Queue + "/done"
@@ -244,4 +255,26 @@ func Run(ctx context.Context, t *entroq.Task, value json.RawMessage) ([]entroq.M
 		t.Delete(),
 		entroq.InsertingInto(destQueue, entroq.WithRawValue(output.JSON())),
 	}, nil
+}
+
+// New creates a new proc worker ready to be configured.
+func New(opts ...Option) *Worker {
+	pw := &Worker{}
+	return pw
+}
+
+// Run creates and runs a proc worker in a single one-shot call.
+func Run(ctx context.Context, eq *entroq.EntroQ, opts ...Option) error {
+	pw := New()
+	var workerOpts []worker.Option[Input]
+	var runOpts []worker.RunOption
+
+	// Default: use the struct's doWork method.
+	workerOpts = append(workerOpts, worker.WithDoModify[Input](pw.doWork))
+
+	for _, opt := range opts {
+		opt(pw, &workerOpts, &runOpts)
+	}
+
+	return worker.New(eq, workerOpts...).Run(ctx, runOpts...)
 }

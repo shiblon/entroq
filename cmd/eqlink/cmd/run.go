@@ -75,7 +75,7 @@ Graceful shutdown on SIGINT/SIGTERM:
 		)
 		for range concurrency {
 			g.Go(func() error {
-				return recvWorker.Run(rcvCtx, myQueue)
+				return recvWorker.Run(rcvCtx, worker.Watching(myQueue))
 			})
 		}
 

@@ -25,6 +25,10 @@ type Handler struct {
 // It uses Vanguard to provide RESTful transcoding under /api/v0.
 func New(svc *eqsvcgrpc.QSvc, opts ...connect.HandlerOption) (string, http.Handler, error) {
 	h := &Handler{svc: svc}
+
+	// Add our custom splicing codec to the options.
+	opts = append(opts, connect.WithCodec(newSplicingCodec()))
+
 	connectPath, connectHandler := apiconnect.NewEntroQHandler(h, opts...)
 
 	services := []*vanguard.Service{

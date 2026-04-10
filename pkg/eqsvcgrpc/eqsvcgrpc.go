@@ -284,10 +284,6 @@ func toMS(t time.Time) int64 {
 }
 
 func protoFromTask(t *entroq.Task) (*pb.Task, error) {
-	pv, err := pb.JSONToProto(t.Value)
-	if err != nil {
-		return nil, fmt.Errorf("task %s value: %w", t.ID, err)
-	}
 	return &pb.Task{
 		Queue:      t.Queue,
 		Id:         t.ID,
@@ -295,7 +291,7 @@ func protoFromTask(t *entroq.Task) (*pb.Task, error) {
 		AtMs:       toMS(t.At),
 		ClaimantId: t.Claimant,
 		Claims:     t.Claims,
-		Value:      pv,
+		Value:      t.Value,
 		CreatedMs:  toMS(t.Created),
 		ModifiedMs: toMS(t.Modified),
 		Attempt:    t.Attempt,
@@ -479,29 +475,21 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 		entroq.ModifyAs(req.ClaimantId),
 	}
 	for _, insert := range req.Inserts {
-		iv, err := pb.ProtoToJSON(insert.Value)
-		if err != nil {
-			return nil, autoCodeErrorf("modify insert value: %w", err)
-		}
 		modArgs = append(modArgs,
 			entroq.InsertingInto(insert.Queue,
 				entroq.WithArrivalTime(fromMS(insert.AtMs)),
-				entroq.WithRawValue(iv),
+				entroq.WithRawValue(insert.Value),
 				entroq.WithAttempt(insert.Attempt),
 				entroq.WithErr(insert.Err),
 				entroq.WithID(insert.Id)))
 	}
 	for _, change := range req.Changes {
-		cv, err := pb.ProtoToJSON(change.GetNewData().Value)
-		if err != nil {
-			return nil, autoCodeErrorf("modify change value: %w", err)
-		}
 		t := &entroq.Task{
 			ID:        change.GetOldId().Id,
 			Version:   change.GetOldId().Version,
 			Claimant:  req.ClaimantId,
 			Queue:     change.GetNewData().Queue,
-			Value:     cv,
+			Value:     change.GetNewData().Value,
 			At:        fromMS(change.GetNewData().AtMs),
 			Attempt:   change.GetNewData().Attempt,
 			Err:       change.GetNewData().Err,

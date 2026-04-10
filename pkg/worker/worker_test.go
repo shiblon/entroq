@@ -25,27 +25,26 @@ func TestWorker_Basic(t *testing.T) {
 	}
 
 	done := make(chan bool, 1)
-	w := New(client,
-		WithDo(func(ctx context.Context, task *entroq.Task, s string) error {
-			if s != "hi" {
-				return errors.New("wrong value")
-			}
-			return nil
-		}),
-		WithFinish(func(ctx context.Context, task *entroq.Task, _ string) error {
-			if _, _, err := client.Modify(ctx, task.Delete()); err != nil {
-				return err
-			}
-			done <- true
-			return nil
-		}),
-	)
-
 	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
 
 	go func() {
-		if err := w.Run(runCtx, "test_q"); err != nil && !errors.Is(err, context.Canceled) {
+		w := New(client,
+			WithDo(func(ctx context.Context, task *entroq.Task, s string) error {
+				if s != "hi" {
+					return errors.New("wrong value")
+				}
+				return nil
+			}),
+			WithFinish(func(ctx context.Context, task *entroq.Task, _ string) error {
+				if _, _, err := client.Modify(ctx, task.Delete()); err != nil {
+					return err
+				}
+				done <- true
+				return nil
+			}),
+		)
+		if err := w.Run(runCtx, Watching("test_q")); err != nil && !errors.Is(err, context.Canceled) {
 			t.Errorf("Worker run: %v", err)
 		}
 	}()

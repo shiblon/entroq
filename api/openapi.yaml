@@ -311,8 +311,6 @@ components:
                     description: The type of the serialized message.
             additionalProperties: true
             description: Contains an arbitrary serialized message along with a @type that describes the type of the serialized message.
-        GoogleProtobufValue:
-            description: Represents a dynamically typed value which can be either null, a number, a string, a boolean, a recursive struct value, or a list of values.
         ModifyRequest:
             type: object
             properties:
@@ -423,9 +421,9 @@ components:
                     type: string
                     description: The UUID representing the claimant (owner) for this task.
                 value:
-                    allOf:
-                        - $ref: '#/components/schemas/GoogleProtobufValue'
-                    description: The task's JSON payload.
+                    type: string
+                    description: The task's JSON payload (opaque bytes).
+                    format: bytes
                 createdMs:
                     type: string
                     description: Epoch times in millis for creation and update of this task.
@@ -465,9 +463,9 @@ components:
                     type: string
                     description: The epoch time in millis when this task becomes available.
                 value:
-                    allOf:
-                        - $ref: '#/components/schemas/GoogleProtobufValue'
-                    description: The task's JSON payload.
+                    type: string
+                    description: The task's JSON payload (opaque bytes).
+                    format: bytes
                 id:
                     type: string
                     description: |-
