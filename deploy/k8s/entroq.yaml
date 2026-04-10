@@ -1,0 +1,66 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: entroq
+spec:
+  ports:
+    - name: grpc
+      port: 37706
+      targetPort: 37706
+    - name: http
+      port: 9100
+      targetPort: 9100
+  selector:
+    app: entroq
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: entroq
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: entroq
+  template:
+    metadata:
+      labels:
+        app: entroq
+    spec:
+      initContainers:
+        - name: init-schema
+          image: shiblon/entroq:latest
+          command: ["/bin/eqpg", "serve", "--init_schema", "--dbaddr=postgres:5432", "--dbuser=entroq", "--dbname=entroq"]
+          env:
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: postgres-password
+      containers:
+        - name: entroq
+          image: shiblon/entroq:latest
+          command:
+            - "/bin/eqpg"
+            - "serve"
+            - "--dbaddr=postgres:5432"
+            - "--dbuser=entroq"
+            - "--dbname=entroq"
+            - "--heartbeat=5s"
+            - "--no_listen=false"
+          ports:
+            - containerPort: 37706
+              name: grpc
+            - containerPort: 9100
+              name: http
+          env:
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: postgres-password
+          readinessProbe:
+            tcpSocket:
+              port: 37706
+            initialDelaySeconds: 5
+            periodSeconds: 10
