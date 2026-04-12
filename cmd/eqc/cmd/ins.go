@@ -73,12 +73,12 @@ var insCmd = &cobra.Command{
 			modArgs = append(modArgs, entroq.InsertingInto(flagInsQueue, insArgs...))
 		}
 
-		ins, _, err := eq.Modify(context.Background(), modArgs...)
+		resp, err := eq.Modify(context.Background(), modArgs...)
 		if err != nil {
 			return fmt.Errorf("insert tasks: %w", err)
 		}
 
-		b, err := json.Marshal(ins)
+		b, err := json.Marshal(resp.InsertedTasks)
 		if err != nil {
 			return fmt.Errorf("insert json: %w", err)
 		}

@@ -55,6 +55,70 @@ paths:
                         application/json:
                             schema:
                                 $ref: '#/components/schemas/Status'
+    /api/v0/docs:
+        get:
+            tags:
+                - EntroQ
+            operationId: EntroQ_Docs
+            parameters:
+                - name: query.namespace
+                  in: query
+                  schema:
+                    type: string
+                - name: query.keyStart
+                  in: query
+                  schema:
+                    type: string
+                - name: query.keyEnd
+                  in: query
+                  schema:
+                    type: string
+                - name: query.limit
+                  in: query
+                  schema:
+                    type: integer
+                    format: int32
+                - name: query.omitValues
+                  in: query
+                  schema:
+                    type: boolean
+            responses:
+                "200":
+                    description: OK
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/DocsResponse'
+                default:
+                    description: Default error response
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/Status'
+    /api/v0/docs/claim:
+        post:
+            tags:
+                - EntroQ
+            operationId: EntroQ_ClaimDocs
+            requestBody:
+                content:
+                    application/json:
+                        schema:
+                            $ref: '#/components/schemas/ClaimDocsRequest'
+                required: true
+            responses:
+                "200":
+                    description: OK
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ClaimDocsResponse'
+                default:
+                    description: Default error response
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/Status'
     /api/v0/modify:
         post:
             tags:
@@ -269,6 +333,23 @@ paths:
                                 $ref: '#/components/schemas/Status'
 components:
     schemas:
+        ClaimDocsRequest:
+            type: object
+            properties:
+                claimQuery:
+                    $ref: '#/components/schemas/DocClaimQuery'
+            description: ClaimDocsRequest asks to atomically claim a set of docs.
+        ClaimDocsResponse:
+            type: object
+            properties:
+                docs:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/Doc'
+            description: |-
+                ClaimDocsResponse contains the docs claimed by a ClaimDocs call.
+                 A dependency error (missing or already-claimed docs) comes through as
+                 gRPC's NOT_FOUND code with ModifyDep details carrying doc_id fields.
         ClaimRequest:
             type: object
             properties:
@@ -303,6 +384,111 @@ components:
 
                  For Claim calls, the lack of a task is an error, usually a timeout or
                  cancelation.
+        Doc:
+            type: object
+            properties:
+                namespace:
+                    type: string
+                id:
+                    type: string
+                version:
+                    type: integer
+                    format: int32
+                claimant:
+                    type: string
+                atMs:
+                    type: string
+                expiresAtMs:
+                    type: string
+                keyPrimary:
+                    type: string
+                keySecondary:
+                    type: string
+                content:
+                    type: string
+                    format: bytes
+                createdMs:
+                    type: string
+                modifiedMs:
+                    type: string
+            description: Doc is a complete doc object with identity, data, and metadata.
+        DocChange:
+            type: object
+            properties:
+                oldId:
+                    $ref: '#/components/schemas/DocID'
+                newData:
+                    $ref: '#/components/schemas/DocData'
+            description: |-
+                DocChange identifies a doc by DocID and provides updated data. Only content
+                 and expires_at_ms from new_data are applied; keys are immutable after creation.
+        DocClaimQuery:
+            type: object
+            properties:
+                namespace:
+                    type: string
+                claimant:
+                    type: string
+                ids:
+                    type: array
+                    items:
+                        type: string
+                keyStart:
+                    type: string
+                keyEnd:
+                    type: string
+                durationMs:
+                    type: string
+            description: |-
+                DocClaimQuery describes an atomic all-or-nothing claim of docs in a namespace.
+
+                 Claim strategy (exactly one must be specified):
+                   - ids non-empty: claim these exact docs by ID; key fields are ignored.
+                   - key_start only (key_end == ""): exact match on primary key.
+                   - key_start + key_end: half-open range [key_start, key_end).
+        DocData:
+            type: object
+            properties:
+                namespace:
+                    type: string
+                id:
+                    type: string
+                keyPrimary:
+                    type: string
+                keySecondary:
+                    type: string
+                content:
+                    type: string
+                    format: bytes
+                expiresAtMs:
+                    type: string
+                createdMs:
+                    type: string
+                modifiedMs:
+                    type: string
+            description: |-
+                DocData holds the data portion of a doc, used for insertions. The created_ms
+                 and modified_ms fields are used only for journal replay; leave them zero for
+                 normal insertions.
+        DocID:
+            type: object
+            properties:
+                namespace:
+                    type: string
+                id:
+                    type: string
+                version:
+                    type: integer
+                    format: int32
+            description: DocID identifies a specific version of a doc.
+        DocsResponse:
+            type: object
+            properties:
+                docs:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/Doc'
+            description: DocsResponse contains the docs returned by a Docs call.
         GoogleProtobufAny:
             type: object
             properties:
@@ -332,6 +518,22 @@ components:
                     type: array
                     items:
                         $ref: '#/components/schemas/TaskID'
+                docInserts:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/DocData'
+                docChanges:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/DocChange'
+                docDeletes:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/DocID'
+                docDepends:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/DocID'
             description: |-
                 ModifyRequest sends a request to modify a set of tasks with given
                  dependencies. It is performed in a transaction, in which either all
@@ -351,8 +553,16 @@ components:
                     type: array
                     items:
                         $ref: '#/components/schemas/Task'
+                insertedDocs:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/Doc'
+                changedDocs:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/Doc'
             description: |-
-                ModifyResponse returns inserted and updated tasks when successful.
+                ModifyResponse returns inserted and updated tasks and docs when successful.
                  A dependency error (which is permanent) comes through as gRPC's NOT_FOUND code.
         QueueStats:
             type: object

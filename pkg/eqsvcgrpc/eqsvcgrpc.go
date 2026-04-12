@@ -503,7 +503,37 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 	for _, dep := range req.Depends {
 		modArgs = append(modArgs, entroq.DependingOn(dep.Id, dep.Version, entroq.WithIDQueue(dep.Queue)))
 	}
-	inserted, changed, err := s.impl.Modify(ctx, modArgs...)
+	for _, di := range req.DocInserts {
+		modArgs = append(modArgs, entroq.InsertingDoc(&entroq.DocData{
+			Namespace:    di.Namespace,
+			ID:           di.Id,
+			KeyPrimary:   di.KeyPrimary,
+			KeySecondary: di.KeySecondary,
+			Content:      di.Content,
+			ExpiresAt:    fromMS(di.ExpiresAtMs),
+			Created:      fromMS(di.CreatedMs),
+			Modified:     fromMS(di.ModifiedMs),
+		}))
+	}
+	for _, dc := range req.DocChanges {
+		old := dc.GetOldId()
+		nd := dc.GetNewData()
+		d := &entroq.Doc{
+			Namespace: old.GetNamespace(),
+			ID:        old.GetId(),
+			Version:   old.GetVersion(),
+			Content:   nd.GetContent(),
+			ExpiresAt: fromMS(nd.GetExpiresAtMs()),
+		}
+		modArgs = append(modArgs, d.Change())
+	}
+	for _, dd := range req.DocDeletes {
+		modArgs = append(modArgs, entroq.DeletingDocID(dd.Namespace, dd.Id, dd.Version))
+	}
+	for _, ddep := range req.DocDepends {
+		modArgs = append(modArgs, entroq.DependingOnDocID(ddep.Namespace, ddep.Id, ddep.Version))
+	}
+	resp, err := s.impl.Modify(ctx, modArgs...)
 	if err != nil {
 		if depErr, ok := entroq.AsDependency(err); ok {
 			tmap := map[pb.ActionType][]*entroq.TaskID{
@@ -526,6 +556,21 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 					})
 				}
 			}
+			// Doc dependency details carry DocID instead of TaskID.
+			docMap := map[pb.ActionType][]*entroq.DocID{
+				pb.ActionType_DELETE: depErr.DocDeletes,
+				pb.ActionType_DEPEND: depErr.DocDepends,
+				pb.ActionType_CHANGE: depErr.DocChanges,
+				pb.ActionType_CLAIM:  depErr.DocClaims,
+			}
+			for dtype, dvals := range docMap {
+				for _, did := range dvals {
+					details = append(details, &pb.ModifyDep{
+						Type:  dtype,
+						DocId: &pb.DocID{Namespace: did.Namespace, Id: did.ID, Version: did.Version},
+					})
+				}
+			}
 
 			stat, sErr := status.New(codes.NotFound, "modification dependency error").WithDetails(details...)
 			if sErr != nil {
@@ -536,22 +581,28 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 		return nil, autoCodeErrorf("modification failed: %w", err)
 	}
 	// Assemble the response.
-	resp := new(pb.ModifyResponse)
-	for _, task := range inserted {
+	pbResp := new(pb.ModifyResponse)
+	for _, task := range resp.InsertedTasks {
 		pt, err := protoFromTask(task)
 		if err != nil {
 			return nil, autoCodeErrorf("modify inserted task proto: %w", err)
 		}
-		resp.Inserted = append(resp.Inserted, pt)
+		pbResp.Inserted = append(pbResp.Inserted, pt)
 	}
-	for _, task := range changed {
+	for _, task := range resp.ChangedTasks {
 		pt, err := protoFromTask(task)
 		if err != nil {
 			return nil, autoCodeErrorf("modify changed task proto: %w", err)
 		}
-		resp.Changed = append(resp.Changed, pt)
+		pbResp.Changed = append(pbResp.Changed, pt)
 	}
-	return resp, nil
+	for _, d := range resp.InsertedDocs {
+		pbResp.InsertedDocs = append(pbResp.InsertedDocs, protoFromDoc(d))
+	}
+	for _, d := range resp.ChangedDocs {
+		pbResp.ChangedDocs = append(pbResp.ChangedDocs, protoFromDoc(d))
+	}
+	return pbResp, nil
 }
 
 func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksResponse, error) {
@@ -646,4 +697,94 @@ func (s *QSvc) QueueStats(ctx context.Context, req *pb.QueuesRequest) (*pb.Queue
 // Time returns the current time in milliseconds since the Epoch.
 func (s *QSvc) Time(ctx context.Context, req *pb.TimeRequest) (*pb.TimeResponse, error) {
 	return &pb.TimeResponse{TimeMs: toMS(time.Now().UTC())}, nil
+}
+
+// protoFromDoc converts an entroq.Doc to its proto representation.
+func protoFromDoc(d *entroq.Doc) *pb.Doc {
+	return &pb.Doc{
+		Namespace:    d.Namespace,
+		Id:           d.ID,
+		Version:      d.Version,
+		Claimant:     d.Claimant,
+		AtMs:         toMS(d.At),
+		ExpiresAtMs:  toMS(d.ExpiresAt),
+		KeyPrimary:   d.KeyPrimary,
+		KeySecondary: d.KeySecondary,
+		Content:      []byte(d.Content),
+		CreatedMs:    toMS(d.Created),
+		ModifiedMs:   toMS(d.Modified),
+	}
+}
+
+// docClaimDepDetails converts a DependencyError's doc fields into ModifyDep
+// detail messages for transport over gRPC status.
+func docClaimDepDetails(depErr *entroq.DependencyError) []proto.Message {
+	details := []proto.Message{&pb.ModifyDep{
+		Type: pb.ActionType_DETAIL,
+		Msg:  depErr.Message,
+	}}
+	for _, did := range depErr.DocDeletes {
+		details = append(details, &pb.ModifyDep{
+			Type:  pb.ActionType_DELETE,
+			DocId: &pb.DocID{Namespace: did.Namespace, Id: did.ID, Version: did.Version},
+		})
+	}
+	for _, did := range depErr.DocClaims {
+		details = append(details, &pb.ModifyDep{
+			Type:  pb.ActionType_CLAIM,
+			DocId: &pb.DocID{Namespace: did.Namespace, Id: did.ID, Version: did.Version},
+		})
+	}
+	return details
+}
+
+// Docs returns a listing of docs matching the given query.
+func (s *QSvc) Docs(ctx context.Context, req *pb.DocsRequest) (*pb.DocsResponse, error) {
+	q := req.GetQuery()
+	docs, err := s.impl.Docs(ctx, &entroq.DocQuery{
+		Namespace:  q.GetNamespace(),
+		KeyStart:   q.GetKeyStart(),
+		KeyEnd:     q.GetKeyEnd(),
+		Limit:      int(q.GetLimit()),
+		OmitValues: q.GetOmitValues(),
+	})
+	if err != nil {
+		return nil, autoCodeErrorf("docs: %w", err)
+	}
+	resp := new(pb.DocsResponse)
+	for _, d := range docs {
+		resp.Docs = append(resp.Docs, protoFromDoc(d))
+	}
+	return resp, nil
+}
+
+// ClaimDocs atomically claims a set of docs matching the given query.
+// Returns a NotFound status with ModifyDep details if any docs are missing or
+// already claimed.
+func (s *QSvc) ClaimDocs(ctx context.Context, req *pb.ClaimDocsRequest) (*pb.ClaimDocsResponse, error) {
+	cq := req.GetClaimQuery()
+	claimed, err := s.impl.ClaimDocs(ctx, &entroq.DocClaimQuery{
+		Namespace: cq.GetNamespace(),
+		Claimant:  cq.GetClaimant(),
+		IDs:       cq.GetIds(),
+		KeyStart:  cq.GetKeyStart(),
+		KeyEnd:    cq.GetKeyEnd(),
+		Duration:  time.Duration(cq.GetDurationMs()) * time.Millisecond,
+	})
+	if err != nil {
+		if depErr, ok := entroq.AsDependency(err); ok {
+			details := docClaimDepDetails(depErr)
+			stat, sErr := status.New(codes.NotFound, "claim docs dependency error").WithDetails(details...)
+			if sErr != nil {
+				return nil, codeErrorf(codes.NotFound, "claim docs dependency failed, unable to add details %v: %w", err, sErr)
+			}
+			return nil, stat.Err()
+		}
+		return nil, autoCodeErrorf("claim docs: %w", err)
+	}
+	resp := new(pb.ClaimDocsResponse)
+	for _, d := range claimed {
+		resp.Docs = append(resp.Docs, protoFromDoc(d))
+	}
+	return resp, nil
 }

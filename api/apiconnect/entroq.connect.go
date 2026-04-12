@@ -49,6 +49,10 @@ const (
 	EntroQTimeProcedure = "/api.EntroQ/Time"
 	// EntroQStreamTasksProcedure is the fully-qualified name of the EntroQ's StreamTasks RPC.
 	EntroQStreamTasksProcedure = "/api.EntroQ/StreamTasks"
+	// EntroQDocsProcedure is the fully-qualified name of the EntroQ's Docs RPC.
+	EntroQDocsProcedure = "/api.EntroQ/Docs"
+	// EntroQClaimDocsProcedure is the fully-qualified name of the EntroQ's ClaimDocs RPC.
+	EntroQClaimDocsProcedure = "/api.EntroQ/ClaimDocs"
 )
 
 // EntroQClient is a client for the api.EntroQ service.
@@ -64,6 +68,8 @@ type EntroQClient interface {
 	// single one. Typically this will have one task per response, but it is best
 	// for the client to consume however many there are.
 	StreamTasks(context.Context, *connect.Request[api.TasksRequest]) (*connect.ServerStreamForClient[api.TasksResponse], error)
+	Docs(context.Context, *connect.Request[api.DocsRequest]) (*connect.Response[api.DocsResponse], error)
+	ClaimDocs(context.Context, *connect.Request[api.ClaimDocsRequest]) (*connect.Response[api.ClaimDocsResponse], error)
 }
 
 // NewEntroQClient constructs a client for the api.EntroQ service. By default, it uses the Connect
@@ -125,6 +131,18 @@ func NewEntroQClient(httpClient connect.HTTPClient, baseURL string, opts ...conn
 			connect.WithSchema(entroQMethods.ByName("StreamTasks")),
 			connect.WithClientOptions(opts...),
 		),
+		docs: connect.NewClient[api.DocsRequest, api.DocsResponse](
+			httpClient,
+			baseURL+EntroQDocsProcedure,
+			connect.WithSchema(entroQMethods.ByName("Docs")),
+			connect.WithClientOptions(opts...),
+		),
+		claimDocs: connect.NewClient[api.ClaimDocsRequest, api.ClaimDocsResponse](
+			httpClient,
+			baseURL+EntroQClaimDocsProcedure,
+			connect.WithSchema(entroQMethods.ByName("ClaimDocs")),
+			connect.WithClientOptions(opts...),
+		),
 	}
 }
 
@@ -138,6 +156,8 @@ type entroQClient struct {
 	queueStats  *connect.Client[api.QueuesRequest, api.QueuesResponse]
 	time        *connect.Client[api.TimeRequest, api.TimeResponse]
 	streamTasks *connect.Client[api.TasksRequest, api.TasksResponse]
+	docs        *connect.Client[api.DocsRequest, api.DocsResponse]
+	claimDocs   *connect.Client[api.ClaimDocsRequest, api.ClaimDocsResponse]
 }
 
 // TryClaim calls api.EntroQ.TryClaim.
@@ -180,6 +200,16 @@ func (c *entroQClient) StreamTasks(ctx context.Context, req *connect.Request[api
 	return c.streamTasks.CallServerStream(ctx, req)
 }
 
+// Docs calls api.EntroQ.Docs.
+func (c *entroQClient) Docs(ctx context.Context, req *connect.Request[api.DocsRequest]) (*connect.Response[api.DocsResponse], error) {
+	return c.docs.CallUnary(ctx, req)
+}
+
+// ClaimDocs calls api.EntroQ.ClaimDocs.
+func (c *entroQClient) ClaimDocs(ctx context.Context, req *connect.Request[api.ClaimDocsRequest]) (*connect.Response[api.ClaimDocsResponse], error) {
+	return c.claimDocs.CallUnary(ctx, req)
+}
+
 // EntroQHandler is an implementation of the api.EntroQ service.
 type EntroQHandler interface {
 	TryClaim(context.Context, *connect.Request[api.ClaimRequest]) (*connect.Response[api.ClaimResponse], error)
@@ -193,6 +223,8 @@ type EntroQHandler interface {
 	// single one. Typically this will have one task per response, but it is best
 	// for the client to consume however many there are.
 	StreamTasks(context.Context, *connect.Request[api.TasksRequest], *connect.ServerStream[api.TasksResponse]) error
+	Docs(context.Context, *connect.Request[api.DocsRequest]) (*connect.Response[api.DocsResponse], error)
+	ClaimDocs(context.Context, *connect.Request[api.ClaimDocsRequest]) (*connect.Response[api.ClaimDocsResponse], error)
 }
 
 // NewEntroQHandler builds an HTTP handler from the service implementation. It returns the path on
@@ -250,6 +282,18 @@ func NewEntroQHandler(svc EntroQHandler, opts ...connect.HandlerOption) (string,
 		connect.WithSchema(entroQMethods.ByName("StreamTasks")),
 		connect.WithHandlerOptions(opts...),
 	)
+	entroQDocsHandler := connect.NewUnaryHandler(
+		EntroQDocsProcedure,
+		svc.Docs,
+		connect.WithSchema(entroQMethods.ByName("Docs")),
+		connect.WithHandlerOptions(opts...),
+	)
+	entroQClaimDocsHandler := connect.NewUnaryHandler(
+		EntroQClaimDocsProcedure,
+		svc.ClaimDocs,
+		connect.WithSchema(entroQMethods.ByName("ClaimDocs")),
+		connect.WithHandlerOptions(opts...),
+	)
 	return "/api.EntroQ/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case EntroQTryClaimProcedure:
@@ -268,6 +312,10 @@ func NewEntroQHandler(svc EntroQHandler, opts ...connect.HandlerOption) (string,
 			entroQTimeHandler.ServeHTTP(w, r)
 		case EntroQStreamTasksProcedure:
 			entroQStreamTasksHandler.ServeHTTP(w, r)
+		case EntroQDocsProcedure:
+			entroQDocsHandler.ServeHTTP(w, r)
+		case EntroQClaimDocsProcedure:
+			entroQClaimDocsHandler.ServeHTTP(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -307,4 +355,12 @@ func (UnimplementedEntroQHandler) Time(context.Context, *connect.Request[api.Tim
 
 func (UnimplementedEntroQHandler) StreamTasks(context.Context, *connect.Request[api.TasksRequest], *connect.ServerStream[api.TasksResponse]) error {
 	return connect.NewError(connect.CodeUnimplemented, errors.New("api.EntroQ.StreamTasks is not implemented"))
+}
+
+func (UnimplementedEntroQHandler) Docs(context.Context, *connect.Request[api.DocsRequest]) (*connect.Response[api.DocsResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("api.EntroQ.Docs is not implemented"))
+}
+
+func (UnimplementedEntroQHandler) ClaimDocs(context.Context, *connect.Request[api.ClaimDocsRequest]) (*connect.Response[api.ClaimDocsResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("api.EntroQ.ClaimDocs is not implemented"))
 }

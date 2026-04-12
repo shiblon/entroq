@@ -79,7 +79,7 @@ var modCmd = &cobra.Command{
 			modArgs = append(modArgs, entroq.ModifyAs(task.Claimant))
 		}
 
-		if _, _, err := eq.Modify(context.Background(), modArgs...); err != nil {
+		if _, err := eq.Modify(context.Background(), modArgs...); err != nil {
 			return fmt.Errorf("modify task %q: %w", flagMod.id, err)
 		}
 		return nil

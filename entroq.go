@@ -228,7 +228,13 @@ type Backend interface {
 	// function is intended to return a DependencyError if the transaction could
 	// not proceed because dependencies were missing or already claimed (and
 	// not expired) by another claimant.
-	Modify(ctx context.Context, mod *Modification) (inserted []*Task, changed []*Task, err error)
+	Modify(ctx context.Context, mod *Modification) (*ModifyResponse, error)
+
+	// Docs returns a list of docs matching the given query.
+	Docs(ctx context.Context, rq *DocQuery) ([]*Doc, error)
+
+	// ClaimDocs attempts to claim a set of docs.
+	ClaimDocs(ctx context.Context, cq *DocClaimQuery) ([]*Doc, error)
 
 	// Time returns the time as the backend understands it, in UTC.
 	Time(ctx context.Context) (time.Time, error)
@@ -474,10 +480,11 @@ func (c *EntroQ) RenewAllFor(ctx context.Context, tasks []*Task, duration time.D
 		modArgs = append(modArgs, Changing(t, ArrivalTimeBy(duration)))
 		taskIDs = append(taskIDs, t.IDVersion().String())
 	}
-	_, changed, err := c.Modify(ctx, modArgs...)
+	resp, err := c.Modify(ctx, modArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("renewal failed for tasks %q: %w", taskIDs, err)
 	}
+	changed := resp.ChangedTasks
 	if len(changed) != len(tasks) {
 		return nil, fmt.Errorf("renewal expected %d updated tasks, got %d", len(tasks), len(changed))
 	}
@@ -500,7 +507,7 @@ func (c *EntroQ) RenewAllFor(ctx context.Context, tasks []*Task, duration time.D
 //   - inserted: The tasks that were successfully created.
 //   - changed: The tasks that were successfully updated.
 //   - err: A *DependencyError if any version check failed.
-func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (inserted []*Task, changed []*Task, err error) {
+func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (*ModifyResponse, error) {
 	mod := NewModification(c.ClientID, modArgs...)
 	// Generate IDs for any inserts that don't have them. This is necessary
 	// because the backend does not assign IDs.
@@ -509,38 +516,43 @@ func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (inserted []*
 			ins.ID = c.GenID()
 		}
 	}
+	for _, ins := range mod.DocInserts {
+		if ins.ID == "" {
+			ins.ID = c.GenID()
+		}
+	}
 	for _, opt := range mod.Options() {
 		if err := opt.IsModifyBackend(c.backend); err != nil {
-			return nil, nil, fmt.Errorf("modify option incompatible with backend %T: %w", c.backend, err)
+			return nil, fmt.Errorf("modify option incompatible with backend %T: %w", c.backend, err)
 		}
 	}
 	for _, ins := range mod.Inserts {
 		if ins.Value != nil && !json.Valid(ins.Value) {
-			return nil, nil, fmt.Errorf("modify insert %q: value is not valid JSON", ins.Queue)
+			return nil, fmt.Errorf("modify insert %q: value is not valid JSON", ins.Queue)
 		}
 	}
 	for _, chg := range mod.Changes {
 		if chg.Value != nil && !json.Valid(chg.Value) {
-			return nil, nil, fmt.Errorf("modify change %s: value is not valid JSON", chg.ID)
+			return nil, fmt.Errorf("modify change %s: value is not valid JSON", chg.ID)
 		}
 	}
 	for {
-		ins, chg, err := c.backend.Modify(ctx, mod)
+		resp, err := c.backend.Modify(ctx, mod)
 		if err == nil {
-			return ins, chg, nil
+			return resp, nil
 		}
 		depErr, ok := AsDependency(err)
 		// If not a dependency error, pass it on out.
 		if !ok {
-			return nil, nil, fmt.Errorf("modify: %w", err)
+			return nil, fmt.Errorf("modify: %w", err)
 		}
 		// If anything is missing or there's a claim problem, bail.
 		if depErr.HasMissing() || depErr.HasClaims() {
-			return nil, nil, fmt.Errorf("modify non-ins deps: %w", err)
+			return nil, fmt.Errorf("modify non-ins deps: %w", err)
 		}
 		// No collisions? Not sure what's going on.
 		if !depErr.HasCollisions() {
-			return nil, nil, fmt.Errorf("non-collision errors: %w", err)
+			return nil, fmt.Errorf("non-collision errors: %w", err)
 		}
 
 		// If we get this far, the only errors we have are insertion collisions.
@@ -561,12 +573,25 @@ func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (inserted []*
 					continue
 				}
 				// Can't skip this one. Bail.
-				return nil, nil, fmt.Errorf("unskippable collision: %w", err)
+				return nil, fmt.Errorf("unskippable collision: %w", err)
 			}
 			newInserts = append(newInserts, td)
 		}
 		mod.Inserts = newInserts
 	}
+}
+
+// Docs returns a list of docs matching the given query.
+func (c *EntroQ) Docs(ctx context.Context, rq *DocQuery) ([]*Doc, error) {
+	return c.backend.Docs(ctx, rq)
+}
+
+// ClaimDocs attempts to claim a set of docs.
+func (c *EntroQ) ClaimDocs(ctx context.Context, cq *DocClaimQuery) ([]*Doc, error) {
+	if cq.Claimant == "" {
+		cq.Claimant = c.ClientID
+	}
+	return c.backend.ClaimDocs(ctx, cq)
 }
 
 // ModifyArg is an argument to the Modify function, which does batch modifications to the task store.
@@ -901,6 +926,10 @@ func WithModification(src *Modification) ModifyArg {
 		dest.Changes = append(dest.Changes, src.Changes...)
 		dest.Deletes = append(dest.Deletes, src.Deletes...)
 		dest.Depends = append(dest.Depends, src.Depends...)
+		dest.DocInserts = append(dest.DocInserts, src.DocInserts...)
+		dest.DocChanges = append(dest.DocChanges, src.DocChanges...)
+		dest.DocDeletes = append(dest.DocDeletes, src.DocDeletes...)
+		dest.DocDepends = append(dest.DocDepends, src.DocDepends...)
 	}
 }
 
@@ -915,6 +944,11 @@ type Modification struct {
 	Changes []*Task     `json:"changes"`
 	Deletes []*TaskID   `json:"deletes"`
 	Depends []*TaskID   `json:"depends"`
+
+	DocInserts []*DocData `json:"doc_inserts"`
+	DocChanges []*Doc     `json:"doc_changes"`
+	DocDeletes []*DocID   `json:"doc_deletes"`
+	DocDepends []*DocID   `json:"doc_depends"`
 }
 
 // String produces a friendly version of this modification.
@@ -1071,22 +1105,91 @@ func (m *Modification) missingDepends(foundDeps map[string]*Task) []*TaskID {
 // dependencies found in the backend, or nil if everything is fine. Problems
 // include missing or claimed dependencies, both of which will block a
 // modification.
-func (m *Modification) DependencyError(found map[string]*Task) error {
+func (m *Modification) DependencyError(found map[string]*Task, foundRes map[string]*Doc) error {
 	presentInserts := m.badInserts(found)
 	missingChanges, claimedChanges := m.badChanges(found)
 	missingDeletes, claimedDeletes := m.badDeletes(found)
 	missingDepends := m.missingDepends(found)
 
-	if len(presentInserts) > 0 || len(missingChanges) > 0 || len(claimedChanges) > 0 || len(missingDeletes) > 0 || len(claimedDeletes) > 0 || len(missingDepends) > 0 {
+	presentResIns := m.badDocInserts(foundRes)
+	missingResChg, claimedResChg := m.badDocChanges(foundRes)
+	missingResDel, claimedResDel := m.badDocDeletes(foundRes)
+	missingResDep := m.missingDocDepends(foundRes)
+
+	if len(presentInserts) > 0 || len(missingChanges) > 0 || len(claimedChanges) > 0 || len(missingDeletes) > 0 || len(claimedDeletes) > 0 || len(missingDepends) > 0 ||
+		len(presentResIns) > 0 || len(missingResChg) > 0 || len(claimedResChg) > 0 || len(missingResDel) > 0 || len(claimedResDel) > 0 || len(missingResDep) > 0 {
 		return &DependencyError{
-			Inserts: presentInserts,
-			Changes: missingChanges,
-			Deletes: missingDeletes,
-			Depends: m.missingDepends(found),
-			Claims:  append(claimedDeletes, claimedChanges...),
+			Inserts:    presentInserts,
+			Changes:    missingChanges,
+			Deletes:    missingDeletes,
+			Depends:    missingDepends,
+			Claims:     append(claimedDeletes, claimedChanges...),
+			DocInserts: presentResIns,
+			DocChanges: missingResChg,
+			DocDeletes: missingResDel,
+			DocDepends: missingResDep,
+			DocClaims:  append(claimedResDel, claimedResChg...),
 		}
 	}
 	return nil
+}
+
+// DocKey returns a namespace-qualified key for use in foundRes maps,
+// ensuring IDs that are identical across different namespaces do not collide.
+func DocKey(ns, id string) string {
+	return ns + "\x00" + id
+}
+
+func (m *Modification) badDocInserts(found map[string]*Doc) []*DocID {
+	var bad []*DocID
+	for _, ins := range m.DocInserts {
+		if ins.ID == "" {
+			continue
+		}
+		if _, ok := found[DocKey(ins.Namespace, ins.ID)]; ok {
+			bad = append(bad, &DocID{Namespace: ins.Namespace, ID: ins.ID})
+		}
+	}
+	return bad
+}
+
+func (m *Modification) badDocChanges(found map[string]*Doc) (missing, claimed []*DocID) {
+	for _, chg := range m.DocChanges {
+		r, ok := found[DocKey(chg.Namespace, chg.ID)]
+		if !ok || r.Version != chg.Version {
+			missing = append(missing, &DocID{Namespace: chg.Namespace, ID: chg.ID, Version: chg.Version})
+			continue
+		}
+		if r.Claimant != "" && r.Claimant != m.Claimant && time.Now().Before(r.ExpiresAt) {
+			claimed = append(claimed, &DocID{Namespace: chg.Namespace, ID: chg.ID, Version: chg.Version})
+		}
+	}
+	return missing, claimed
+}
+
+func (m *Modification) badDocDeletes(found map[string]*Doc) (missing, claimed []*DocID) {
+	for _, del := range m.DocDeletes {
+		r, ok := found[DocKey(del.Namespace, del.ID)]
+		if !ok || r.Version != del.Version {
+			missing = append(missing, del)
+			continue
+		}
+		if r.Claimant != "" && r.Claimant != m.Claimant && time.Now().Before(r.ExpiresAt) {
+			claimed = append(claimed, del)
+		}
+	}
+	return missing, claimed
+}
+
+func (m *Modification) missingDocDepends(found map[string]*Doc) []*DocID {
+	var missing []*DocID
+	for _, dep := range m.DocDepends {
+		r, ok := found[DocKey(dep.Namespace, dep.ID)]
+		if !ok || r.Version != dep.Version {
+			missing = append(missing, dep)
+		}
+	}
+	return missing
 }
 
 // DependencyError is returned when a dependency is missing when modifying the task store.
@@ -1097,6 +1200,13 @@ type DependencyError struct {
 	Changes []*TaskID
 
 	Claims []*TaskID
+
+	DocInserts []*DocID
+	DocDepends []*DocID
+	DocDeletes []*DocID
+	DocChanges []*DocID
+
+	DocClaims []*DocID
 
 	Message string
 }
@@ -1127,6 +1237,19 @@ func (m *DependencyError) Copy() *DependencyError {
 // HasMissing indicates whether there was anything missing in this error.
 func (m *DependencyError) HasMissing() bool {
 	return len(m.Depends) > 0 || len(m.Deletes) > 0 || len(m.Changes) > 0
+}
+
+// HasMissingDocs indicates whether any docs were missing (not claimed
+// by another, but actually absent). Used by workers to detect poison-pill tasks
+// whose required docs no longer exist.
+func (m *DependencyError) HasMissingDocs() bool {
+	return len(m.DocDepends) > 0 || len(m.DocDeletes) > 0 || len(m.DocChanges) > 0
+}
+
+// HasClaimedDocs indicates whether any docs were blocked by another
+// claimant. This is transient contention -- retry with backoff.
+func (m *DependencyError) HasClaimedDocs() bool {
+	return len(m.DocClaims) > 0
 }
 
 // HasClaims indicates whether any of the tasks were claimed by another claimant and unexpired.
@@ -1186,6 +1309,12 @@ func (m *DependencyError) Error() string {
 
 // AsDependency returns the *DependencyError within err (if any), unwrapping
 // through the error chain. Returns nil and false if err is not a DependencyError.
+// IsDependency returns true if the error is a dependency error.
+func IsDependency(err error) bool {
+	_, ok := AsDependency(err)
+	return ok
+}
+
 func AsDependency(err error) (*DependencyError, bool) {
 	var derr *DependencyError
 	if ok := errors.As(err, &derr); ok {

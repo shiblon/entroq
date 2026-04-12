@@ -81,6 +81,15 @@ type Handler[T any] interface {
 // It's a convenience for callers that don't need special finalization.
 type DoModifyRun[T any] func(context.Context, *entroq.Task, T) ([]entroq.ModifyArg, error)
 
+// DoModifyDocsRun[T] is like DoModifyRun but also receives the resources
+// acquired by the WithTakeDocs phase.
+type DoModifyDocsRun[T any] func(context.Context, *entroq.Task, T, *entroq.AcquiredDocs) ([]entroq.ModifyArg, error)
+
+// TakeDocsRun[T] is a function that inspects a newly claimed task and
+// declares what resources the worker needs before doing work. Returning a nil
+// *ResourceRequest (or not setting WithTakeDocs) skips the acquisition phase.
+type TakeDocsRun[T any] func(context.Context, *entroq.Task, T) (*entroq.DocRequest, error)
+
 // funcHandler[T] is a Handler[T] backed by plain functions.
 type funcHandler[T any] struct {
 	do     func(context.Context, *entroq.Task, T) error
@@ -115,13 +124,18 @@ func (h *funcHandler[T]) TaskFinish(ctx context.Context, task *entroq.Task, valu
 //
 // The finalization phase stops the renewal, freezes the task version, and
 // allows the task to be deleted or modified safely.
+//
+// If WithTakeDocs is set, a resource acquisition phase runs between
+// claiming the task and starting work. See WithTakeDocs for details.
 type Worker[T any] struct {
 	eqc *entroq.EntroQ
 
 	errQMap ErrQMap
 
-	handler  Handler[T]
-	doModify DoModifyRun[T] // set by WithDoModify; per-task state lives in runOne
+	handler         Handler[T]
+	doModify        DoModifyRun[T]          // set by WithDoModify
+	doModifyRes     DoModifyDocsRun[T] // set by WithDoModifyDocs
+	takeDocs   TakeDocsRun[T]     // set by WithTakeDocs
 }
 
 // New creates a new Worker[T] that claims tasks from its configured queues and
@@ -192,6 +206,31 @@ func WithDoModify[T any](f DoModifyRun[T]) Option[T] {
 	}
 }
 
+// WithDoModifyDocs sets a combined work and modification function that also
+// receives the resources acquired by the WithTakeDocs phase. Overwrites
+// any previous configuration. Requires WithTakeDocs to be set.
+func WithDoModifyDocs[T any](f DoModifyDocsRun[T]) Option[T] {
+	return func(w *Worker[T]) {
+		w.handler = nil
+		w.doModify = nil
+		w.doModifyRes = f
+	}
+}
+
+// WithTakeDocs sets the resource acquisition function. Before work begins,
+// this function is called with the claimed task to declare which resources are
+// needed. Required resources that are missing cause the task to be treated as a
+// poison pill (moved to the error queue). Required or optional resources claimed
+// by another worker cause a backoff-and-retry. Read-only resources are fetched
+// at acquisition time and version-pinned in the final Modify.
+//
+// WithTakeDocs is only meaningful when paired with WithDoModifyDocs.
+func WithTakeDocs[T any](f TakeDocsRun[T]) Option[T] {
+	return func(w *Worker[T]) {
+		w.takeDocs = f
+	}
+}
+
 // WithHandler sets a custom task handler for a worker.
 func WithHandler[T any](h Handler[T]) Option[T] {
 	return func(w *Worker[T]) {
@@ -208,14 +247,14 @@ func WithErrQMap[T any](f ErrQMap) Option[T] {
 
 func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, task *entroq.Task, errQ string, opts *runOpt) (isSentinel bool, err error) {
 	if errors.Is(sentinel, RetryError) {
-		_, _, err := w.eqc.Modify(ctx, task.RetryOrQuarantine(sentinel.Error(), errQ, opts.maxAttempts, entroq.ArrivalTimeBy(opts.baseRetryDelay)))
+		_, err := w.eqc.Modify(ctx, task.RetryOrQuarantine(sentinel.Error(), errQ, opts.maxAttempts, entroq.ArrivalTimeBy(opts.baseRetryDelay)))
 		if err != nil {
 			return true, fmt.Errorf("retry or quarantine modify: %w", err)
 		}
 		return true, nil
 	}
 	if errors.Is(sentinel, MoveError) {
-		_, _, err := w.eqc.Modify(ctx, task.Quarantine(sentinel.Error(), errQ))
+		_, err := w.eqc.Modify(ctx, task.Quarantine(sentinel.Error(), errQ))
 		if err != nil {
 			return true, fmt.Errorf("quarantine modify: %w", err)
 		}
@@ -225,6 +264,67 @@ func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, ta
 		return true, sentinel
 	}
 	return false, nil
+}
+
+// acquireDocs performs the resource acquisition phase for a claimed task.
+// It calls takeDocs to learn what is needed, then claims required and
+// optional resources and fetches read-only ones.
+//
+// Returns the acquired resources and nil on success.
+// Returns a *entroq.DependencyError if claiming failed; the caller inspects
+// HasMissingResources vs HasClaimedResources to decide whether to retry or
+// move the task to the error queue.
+func (w *Worker[T]) acquireDocs(ctx context.Context, task *entroq.Task, value T, opts *runOpt) (*entroq.AcquiredDocs, error) {
+	if w.takeDocs == nil {
+		return &entroq.AcquiredDocs{}, nil
+	}
+	req, err := w.takeDocs(ctx, task, value)
+	if err != nil {
+		return nil, fmt.Errorf("take resources: %w", err)
+	}
+	if req == nil {
+		return &entroq.AcquiredDocs{}, nil
+	}
+
+	acquired := &entroq.AcquiredDocs{}
+
+	for _, cq := range req.Required {
+		cq.Duration = opts.lease
+		results, err := w.eqc.ClaimDocs(ctx, &cq)
+		if err != nil {
+			return nil, err // caller inspects DependencyError
+		}
+		acquired.Required = append(acquired.Required, results...)
+	}
+
+	for _, cq := range req.Optional {
+		cq.Duration = opts.lease
+		results, err := w.eqc.ClaimDocs(ctx, &cq)
+		if err != nil {
+			if de, ok := entroq.AsDependency(err); ok && de.HasMissingDocs() {
+				continue // absent optional resource -- skip it
+			}
+			return nil, err
+		}
+		acquired.Optional = append(acquired.Optional, results...)
+	}
+
+	for _, rid := range req.ReadOnly {
+		results, err := w.eqc.Docs(ctx, &entroq.DocQuery{
+			Namespace: rid.Namespace,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("fetch read-only resource %v: %w", rid, err)
+		}
+		for _, r := range results {
+			if r.ID == rid.ID && r.Version == rid.Version {
+				acquired.ReadOnly = append(acquired.ReadOnly, r)
+				break
+			}
+		}
+	}
+
+	return acquired, nil
 }
 
 func renewModVersions(mod *entroq.Modification, renewed *entroq.TaskID) {
@@ -251,13 +351,20 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt) error {
 	// Set up the first (work) handler function, and track doModify args.
 	var taskDo DoTaskWork[T]
 	var returnedModArgs []entroq.ModifyArg // save these for later if it's a doModify handler
-	if w.doModify == nil {
-		taskDo = w.handler.TaskDo
-	} else {
+	var acquiredRes *entroq.AcquiredDocs
+	switch {
+	case w.doModifyRes != nil:
+		taskDo = func(ctx context.Context, task *entroq.Task, value T) (err error) {
+			returnedModArgs, err = w.doModifyRes(ctx, task, value, acquiredRes)
+			return err
+		}
+	case w.doModify != nil:
 		taskDo = func(ctx context.Context, task *entroq.Task, value T) (err error) {
 			returnedModArgs, err = w.doModify(ctx, task, value)
 			return err
 		}
+	default:
+		taskDo = w.handler.TaskDo
 	}
 
 	// Run ClaimWithRenew, capture initial and final tasks, react to sentinel errors
@@ -271,7 +378,34 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt) error {
 	finalTask, handleErr := ClaimWithRenew(rCtx, w.eqc, opts.qs, opts.lease, func(ctx context.Context, task *entroq.Task, value T) error {
 		initialTask = task
 		initialValue = value
-		defer rCancel()
+		// Note: do NOT call rCancel() here. If we cancel rCtx (and therefore
+		// gctx) while a renewal Modify is in flight over gRPC, the client sees
+		// context.Canceled but the server may have already committed the renewal.
+		// The renewal goroutine would then send the stale (pre-renewal) version,
+		// and the subsequent sentinel-error Modify would fail with a DependencyError
+		// on the wrong version. The stopRenew/taskCh handoff in ClaimWithRenew is
+		// the correct mechanism: it waits for any in-flight renew to complete before
+		// handing back the stable version.
+
+		// Resource acquisition phase: claim/fetch before work begins.
+		if w.takeDocs != nil {
+			res, err := w.acquireDocs(ctx, task, value, opts)
+			if err != nil {
+				if de, ok := entroq.AsDependency(err); ok {
+					if de.HasMissingDocs() {
+						// A required resource is gone -- this task can never succeed.
+						sentinelErr = fmt.Errorf("required resource missing: %w", MoveError)
+					} else {
+						// Resources are claimed by someone else -- transient, retry.
+						sentinelErr = fmt.Errorf("resource contention: %w", RetryError)
+					}
+					return nil
+				}
+				return fmt.Errorf("acquire resources: %w", err)
+			}
+			acquiredRes = res
+		}
+
 		if err := taskDo(ctx, task, value); err != nil {
 			// Check for sentinel errors, pass them out if they are, otherwise
 			// run it up the chain.
@@ -321,7 +455,7 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt) error {
 			case initialTask.Version < finalTask.Version:
 				renewModVersions(modification, finalTask.IDVersion())
 			}
-			if _, _, err := w.eqc.Modify(ctx, entroq.WithModification(modification)); err != nil {
+			if _, err := w.eqc.Modify(ctx, entroq.WithModification(modification)); err != nil {
 				if _, ok := entroq.AsDependency(err); ok {
 					log.Printf("Worker ack failed, throwing away: %v", err)
 					return fmt.Errorf("worker dependency: %w", err)
@@ -435,7 +569,7 @@ func (w *Worker[T]) Run(ctx context.Context, opts ...RunOption) error {
 		return fmt.Errorf("no queues specified to work on")
 	}
 
-	if w.handler == nil && w.doModify == nil {
+	if w.handler == nil && w.doModify == nil && w.doModifyRes == nil {
 		return fmt.Errorf("no work handler specified")
 	}
 
@@ -491,7 +625,29 @@ type DoWork func(ctx context.Context, stop FinalizeRenew) error
 // Used in ClaimWithRenew.
 type DoTaskWork[T any] func(ctx context.Context, task *entroq.Task, value T) error
 
-// ClaimWithRenew claims a task from the given queues (blocking)
+// ClaimWithRenew claims a task from the given queues (blocking), runs f with
+// background renewal, and returns the stable final task version. The final
+// version is delivered through a stop channel so there is no race between the
+// renewal goroutine's last write and the caller's read.
+//
+// # Context and gRPC safety
+//
+// The renewal goroutine issues Modify calls using gctx (derived from the
+// caller's ctx). It is critical that nothing cancels gctx from *inside* f.
+// If f (or its caller) cancels the context that drives the renewal Modify
+// calls, a renewal that is in-flight over gRPC can be interrupted on the
+// client side while the server has already committed the new version. The
+// renewal goroutine would then send the pre-renewal (stale) task version to
+// taskCh, and any subsequent Modify by the caller using that stale version
+// would fail with a DependencyError.
+//
+// The stopRenew/taskCh handoff is the correct and safe mechanism: closing
+// stopRenew lets the renewal goroutine finish any in-flight call, update
+// its local version, and only then send the stable task to taskCh.
+// Canceling gctx early bypasses that guarantee.
+//
+// In practice: callers that wrap ClaimWithRenew (e.g. runOne) must not
+// cancel the context they pass here from within the f callback.
 func ClaimWithRenew[T any](ctx context.Context, eq *entroq.EntroQ, qs []string, lease time.Duration, f DoTaskWork[T]) (*entroq.Task, error) {
 	task, err := eq.Claim(ctx, entroq.From(qs...), entroq.ClaimFor(lease))
 	if err != nil {
@@ -503,44 +659,54 @@ func ClaimWithRenew[T any](ctx context.Context, eq *entroq.EntroQ, qs []string, 
 		return nil, fmt.Errorf("unmarshal: %w", err)
 	}
 
-	g, ctx := errgroup.WithContext(ctx)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	// stopRenew is closed by the work goroutine when f returns. The renewal
+	// goroutine sends the stable final task over taskCh exactly once, then exits.
+	stopRenew := make(chan struct{})
+	taskCh := make(chan *entroq.Task, 1)
+
+	g, gctx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
-		if err := f(ctx, task, value); err != nil {
-			return fmt.Errorf("worker (%q): %w", qs, err)
-		}
-		cancel()
-		return nil
-	})
-
-	renewTask := task
-	g.Go(func() error {
+		renewed := task
 		for {
 			select {
 			case <-time.After(lease / 2):
-				_, mods, err := eq.Modify(ctx, renewTask.Change(entroq.ArrivalTimeBy(lease)))
+				resp, err := eq.Modify(gctx, renewed.Change(entroq.ArrivalTimeBy(lease)))
 				if err != nil {
+					if entroq.IsCanceled(err) || entroq.IsTimeout(err) {
+						taskCh <- renewed
+						return err
+					}
 					return fmt.Errorf("renew for: %w", err)
 				}
-				renewTask = mods[0]
-			case <-ctx.Done():
-				return ctx.Err()
+				renewed = resp.ChangedTasks[0]
+			case <-stopRenew:
+				taskCh <- renewed
+				return nil
+			case <-gctx.Done():
+				taskCh <- renewed
+				return gctx.Err()
 			}
 		}
 	})
 
-	if err := g.Wait(); err != nil {
-		if entroq.IsCanceled(err) || entroq.IsTimeout(err) {
-			// Clean exit, return current task.
-			return renewTask, nil
+	g.Go(func() error {
+		defer close(stopRenew)
+		if err := f(gctx, task, value); err != nil {
+			return fmt.Errorf("worker (%q): %w", qs, err)
 		}
-		return nil, fmt.Errorf("worker stopped (%q): %w", qs, err)
+		return nil
+	})
+
+	werr := g.Wait()
+	finalTask := <-taskCh
+	if werr != nil {
+		if entroq.IsCanceled(werr) || entroq.IsTimeout(werr) {
+			return finalTask, nil
+		}
+		return nil, fmt.Errorf("worker stopped (%q): %w", qs, werr)
 	}
-	// A successful renewal function *always* returns at least a context.Canceled
-	// error, so we should never get here.
-	return nil, fmt.Errorf("worker exited unexpectedly early (%q)", qs)
+	return finalTask, nil
 }
 
 // DoWithRenewAll runs the provided function while keeping all given task

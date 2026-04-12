@@ -30,6 +30,9 @@ type EQMem struct {
 	// safe for concurrent use, and follows sync.Map semantics.
 	queues map[string]*taskQueue
 
+	// namespaces allows resources to be accessed by namespace name.
+	namespaces map[string]*docNamespace
+
 	// qByID gets the queue name for a given task ID. This is used to quickly
 	// look up tasks when the queue name is unknown. That should never be the
 	// case, since modifications are done on existing tasks, and have
@@ -41,6 +44,9 @@ type EQMem struct {
 	// their own queue name, as well. Do not use directly. They require use of the
 	// mutex to access *every time*.
 	locksSuperUnsafe map[string]*qLock
+
+	// locksSuperUnsafeNS contains lockers for each known namespace.
+	locksSuperUnsafeNS map[string]*nsLock
 
 	// A journaler, if one has been requested via a journal directory.
 	journal *wal.WAL
@@ -69,6 +75,17 @@ type qLock struct {
 	// actually take it, and the global lock must be released before taking
 	// this one, this gets incremented while we hold the global lock,
 	// and decremented when unlocking the queue lock.
+	dependents int
+}
+
+type nsLock struct {
+	sync.Mutex
+	namespace string
+	docs *docNamespace
+	// Because we become dependent on the *existence* of the lock before we can
+	// actually take it, and the global lock must be released before taking
+	// this one, this gets incremented while we hold the global lock,
+	// and decremented when unlocking the namespace lock.
 	dependents int
 }
 
@@ -155,12 +172,14 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 	modifyDuration, _ := noopMeter.Float64Histogram("entroq.modify.duration")
 
 	m := &EQMem{
-		nw:               subq.New(),
-		queues:           make(map[string]*taskQueue),
-		qByID:            make(map[string]string),
-		locksSuperUnsafe: make(map[string]*qLock),
-		claimDuration:    claimDuration,
-		modifyDuration:   modifyDuration,
+		nw:                 subq.New(),
+		queues:             make(map[string]*taskQueue),
+		namespaces:         make(map[string]*docNamespace),
+		qByID:              make(map[string]string),
+		locksSuperUnsafe:   make(map[string]*qLock),
+		locksSuperUnsafeNS: make(map[string]*nsLock),
+		claimDuration:      claimDuration,
+		modifyDuration:     modifyDuration,
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -194,12 +213,15 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 
 				// Since changes represent the *final state* in the journal, we
 				// decrement the version number before attempting to apply the
-				// modification.
+				// modification so the version-check in DependencyError passes.
 				for _, chg := range mod.Changes {
 					chg.Version--
 				}
+				for _, chg := range mod.DocChanges {
+					chg.Version--
+				}
 
-				if _, _, err := m.modifyImpl(ctx, mod, true); err != nil {
+				if _, err := m.modifyImpl(ctx, mod, true); err != nil {
 					return fmt.Errorf("eqmem play mod: %w", err)
 				}
 				return nil
@@ -413,7 +435,7 @@ func ensureModQueues(mod *entroq.Modification, qByID map[string]string) {
 // only IDs will get a queue here if they can be found).
 //
 // Also, if any queue indexes don't have a queue represented, that is fixed here.
-func (m *EQMem) modPrep(mod *entroq.Modification) (sortedQueues []string, misplacedInsIDs map[string]string) {
+func (m *EQMem) modPrep(mod *entroq.Modification) (sortedQueues, sortedNamespaces []string, misplacedInsIDs map[string]string) {
 	// This has to be locked the whole time so that IDs and queues are matched
 	// properly if queues are missing somewhere.
 	defer un(lock(m))
@@ -452,7 +474,28 @@ func (m *EQMem) modPrep(mod *entroq.Modification) (sortedQueues []string, mispla
 	}
 	sort.Strings(sortedQueues)
 
-	return sortedQueues, misplacedInsIDs
+	namespaces := make(map[string]bool)
+	for _, ins := range mod.DocInserts {
+		namespaces[ins.Namespace] = true
+	}
+	for _, c := range mod.DocChanges {
+		namespaces[c.Namespace] = true
+	}
+	for _, d := range mod.DocDeletes {
+		namespaces[d.Namespace] = true
+	}
+	for _, d := range mod.DocDepends {
+		namespaces[d.Namespace] = true
+	}
+
+	delete(namespaces, "")
+
+	for n := range namespaces {
+		sortedNamespaces = append(sortedNamespaces, n)
+	}
+	sort.Strings(sortedNamespaces)
+
+	return sortedQueues, sortedNamespaces, misplacedInsIDs
 }
 
 // queueUnsafeInsertTask performs queue-level operations on a task, then
@@ -487,11 +530,7 @@ func (m *EQMem) queueUnsafeUpdateTask(ql *qLock, t *entroq.Task) func() {
 	return nil
 }
 
-// Modify attempts to do an atomic modification on the system, given a
-// particular set of modification information (deletions, changes, insertions,
-// dependencies).
-// Backends do not assign IDs, so all inserts must already have them specified.
-func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted, changed []*entroq.Task, err error) {
+func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (*entroq.ModifyResponse, error) {
 	start := time.Now()
 	defer func() {
 		m.modifyDuration.Record(ctx, time.Since(start).Seconds())
@@ -499,13 +538,19 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (inserted,
 	return m.modifyImpl(ctx, mod, false)
 }
 
-func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignoreClaimant bool) (inserted, changed []*entroq.Task, err error) {
+func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignoreClaimant bool) (*entroq.ModifyResponse, error) {
 	// Double check that IDs are assigned.
 	for _, t := range mod.Inserts {
 		if t.ID == "" {
-			return nil, nil, fmt.Errorf("eqmem modify: task to insert is missing ID")
+			return nil, fmt.Errorf("eqmem modify: task to insert is missing ID")
 		}
 	}
+	for _, r := range mod.DocInserts {
+		if r.ID == "" {
+			return nil, fmt.Errorf("eqmem modify: resource to insert is missing ID")
+		}
+	}
+	resp := new(entroq.ModifyResponse)
 	// Modify does a different locking dance than Claim. Like Claim, it
 	// releases the global lock quickly and leaves a gap between that and the
 	// multi-queue locking that happens. Unlike Claim, it locks *all* of the
@@ -530,24 +575,28 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 	// Get queues that are involved in this modification so we can grab locks.
 	// Also find any insertion requests with IDs, where the ID is in a queue
 	// different from the one requested.
-	queues, misplacedInsIDs := m.modPrep(mod)
-	// We can short-circuit if there are no known queues to lock.
-	// But we first have to check that there aren't any queue-less deletions, changes, or dependencies.
-	// The client API allows this in some circumstances, particularly for deletions and dependencies.
-	// We assume that modifications are always going to contain a FromQueue.
-	if len(queues) == 0 && len(mod.Deletes) == 0 && len(mod.Depends) == 0 {
-		return nil, nil, nil
+	queues, namespaces, misplacedInsIDs := m.modPrep(mod)
+	// We can short-circuit if there are no known queues or namespaces to lock.
+	if len(queues) == 0 && len(namespaces) == 0 && len(mod.Deletes) == 0 && len(mod.Depends) == 0 {
+		return resp, nil
 	}
 
-	// Lock all queues, and store them in a place that's easy to look up.
-	byQ := make(map[string]*qLock)
+	// Lock all queues and namespaces.
 	qls, unlockQueues := m.lockQueues(queues)
 	defer unlockQueues()
+	nls, unlockNamespaces := m.lockNamespaces(namespaces)
+	defer unlockNamespaces()
+
+	byQ := make(map[string]*qLock)
 	for _, ql := range qls {
 		byQ[ql.queue] = ql
 	}
+	byNS := make(map[string]*nsLock)
+	for _, nl := range nls {
+		byNS[nl.namespace] = nl
+	}
 
-	// Find the actual tasks involved. Queues were filled in when obtaining locks.
+	// Find the actual tasks and resources involved. 
 	found := make(map[string]*entroq.Task)
 	addFound := func(q string, id string) {
 		if q == "" || id == "" {
@@ -559,6 +608,19 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 			}
 		}
 	}
+
+	foundRes := make(map[string]*entroq.Doc)
+	addFoundRes := func(ns string, id string) {
+		if ns == "" || id == "" {
+			return
+		}
+		if nl, ok := byNS[ns]; ok {
+			if r, ok := nl.docs.Get(id); ok {
+				foundRes[entroq.DocKey(ns, r.ID)] = r
+			}
+		}
+	}
+
 	for _, d := range mod.Deletes {
 		addFound(d.Queue, d.ID)
 	}
@@ -570,21 +632,28 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 	}
 	for _, t := range mod.Inserts {
 		addFound(t.Queue, t.ID)
-		// If the insert task ID was found in *another* queue, we still want to
-		// know that. This can happen if a task is moved, and then an attempt
-		// is made to reinsert it. This should cause a collision.
 		if q, ok := misplacedInsIDs[t.ID]; ok {
 			addFound(q, t.ID)
 		}
 	}
 
-	if err := mod.DependencyError(found); err != nil {
+	for _, d := range mod.DocDeletes {
+		addFoundRes(d.Namespace, d.ID)
+	}
+	for _, d := range mod.DocDepends {
+		addFoundRes(d.Namespace, d.ID)
+	}
+	for _, c := range mod.DocChanges {
+		addFoundRes(c.Namespace, c.ID)
+	}
+	for _, t := range mod.DocInserts {
+		addFoundRes(t.Namespace, t.ID)
+	}
+
+	if err := mod.DependencyError(found, foundRes); err != nil {
 		depErr, ok := entroq.AsDependency(err)
-		// If we are doing special "ignore claimant" work (like reading from a
-		// journal), then only throw an error if we have something other than
-		// claim problems or something other than a dependency error.
 		if !ignoreClaimant || !ok || !depErr.OnlyClaims() {
-			return nil, nil, fmt.Errorf("eqmem modify: %w", err)
+			return nil, fmt.Errorf("eqmem modify: %w", err)
 		}
 	}
 
@@ -609,9 +678,18 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 		finalLockedSteps = append(finalLockedSteps, m.queueUnsafeUpdateTask(ql, t))
 	}
 
+	// Resource operations hold nsLock and need no global-index step (no equivalent
+	// of qByID for resources), so they are applied directly rather than deferred.
+	setRes := func(r *entroq.Doc) {
+		byNS[r.Namespace].docs.Set(r.ID, r)
+	}
+	deleteResID := func(ns, id string) {
+		byNS[ns].docs.Delete(id)
+	}
+
 	now, err := m.Time(ctx)
 	if err != nil {
-		return nil, nil, fmt.Errorf("modify get time: %w", err)
+		return nil, fmt.Errorf("modify get time: %w", err)
 	}
 
 	for _, d := range mod.Deletes {
@@ -629,7 +707,7 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 			// Original version was already checked earlier.
 			updateTask(newTask)
 		}
-		changed = append(changed, newTask)
+		resp.ChangedTasks = append(resp.ChangedTasks, newTask)
 	}
 	for _, td := range mod.Inserts {
 		id := td.ID
@@ -652,7 +730,44 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 			Modified: modified,
 		}
 		insertTask(newTask)
-		inserted = append(inserted, newTask)
+		resp.InsertedTasks = append(resp.InsertedTasks, newTask)
+	}
+
+	for _, d := range mod.DocDeletes {
+		deleteResID(d.Namespace, d.ID)
+	}
+	for _, c := range mod.DocChanges {
+		newRes := c.Copy()
+		newRes.Version++
+		newRes.Claimant = mod.Claimant
+		newRes.Modified = now
+		setRes(newRes)
+		resp.ChangedDocs = append(resp.ChangedDocs, newRes)
+	}
+	for _, rd := range mod.DocInserts {
+		id := rd.ID
+		created := rd.Created
+		if created.IsZero() {
+			created = now
+		}
+		modified := rd.Modified
+		if modified.IsZero() {
+			modified = now
+		}
+		newRes := &entroq.Doc{
+			Namespace:    rd.Namespace,
+			ID:           id,
+			Content:      rd.Content,
+			KeyPrimary:   rd.KeyPrimary,
+			KeySecondary: rd.KeySecondary,
+			ExpiresAt:    rd.ExpiresAt,
+			Claimant:     mod.Claimant,
+			Created:      created,
+			Modified:     modified,
+			Version:      1,
+		}
+		setRes(newRes)
+		resp.InsertedDocs = append(resp.InsertedDocs, newRes)
 	}
 
 	func() {
@@ -664,23 +779,26 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 		}
 	}()
 
-	// Now we can journal things. We have to take care to use what was actually
-	// inserted and what was actually changed.
-	// Note that this means that what is journaled has a version *1 ahead* of
-	// the version it is looking for. Thus, when reading journal entries, we
-	// decrement the version by one before applying a modification. What's
-	// journaled is the final state.
+	// Journal the final state of all changes so replay restores exactly what
+	// was committed. Inserted tasks/resources carry timestamps via Data() so
+	// replay preserves created/modified rather than using replay time.
+	// Changes are stored at their final version; the journal player decrements
+	// version by one before re-applying so the version-check passes.
 	if m.journal != nil {
 		jMod := &entroq.Modification{
-			Claimant: mod.Claimant,
-			Deletes:  mod.Deletes,
-			Depends:  mod.Depends,
-			Changes:  changed,
+			Claimant:        mod.Claimant,
+			Deletes:         mod.Deletes,
+			Depends:         mod.Depends,
+			Changes:         resp.ChangedTasks,
+			DocDeletes: mod.DocDeletes,
+			DocDepends: mod.DocDepends,
+			DocChanges: resp.ChangedDocs,
 		}
-		// TODO: this messes with the timestamps! It would be better if we
-		// could restore created/modified.
-		for _, ins := range inserted {
+		for _, ins := range resp.InsertedTasks {
 			jMod.Inserts = append(jMod.Inserts, ins.Data())
+		}
+		for _, ins := range resp.InsertedDocs {
+			jMod.DocInserts = append(jMod.DocInserts, ins.Data())
 		}
 		b, err := json.Marshal(jMod)
 		if err != nil {
@@ -691,10 +809,10 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 		}
 	}
 
-	entroq.NotifyModified(m.nw, inserted, changed)
+	entroq.NotifyModified(m.nw, resp.InsertedTasks, resp.ChangedTasks)
 
 	// All done!
-	return inserted, changed, nil
+	return resp, nil
 }
 
 // Time returns the current time.
@@ -945,6 +1063,68 @@ func (m *EQMem) lockQueues(qs []string) ([]*qLock, func()) {
 			if ts := m.queues[ql.queue]; ql.dependents == 0 && ts.Len() == 0 {
 				delete(m.queues, ql.queue)
 				delete(m.locksSuperUnsafe, ql.queue)
+			}
+		}
+	}
+}
+
+func (m *EQMem) locksForNamespaces(ns []string) []*nsLock {
+	defer un(lock(m))
+	var locks []*nsLock
+	for _, n := range ns {
+		locks = append(locks, m.lockForNamespaceUnsafe(n))
+	}
+	return locks
+}
+
+func (m *EQMem) lockForNamespaceUnsafe(ns string) (nl *nsLock) {
+	defer func() {
+		nl.dependents++
+	}()
+
+	nl = m.locksSuperUnsafeNS[ns]
+
+	if nss := m.namespaces[ns]; (nss == nil) != (nl == nil) {
+		log.Fatalf("Namespace storage and lock structures out of step for namespace %q: nss=%v, nl=%v", ns, nss, nl)
+	}
+
+	if nl != nil {
+		return nl
+	}
+
+	nss := newDocNamespace(ns)
+	m.namespaces[ns] = nss
+
+	nl = &nsLock{
+		namespace: ns,
+		docs: nss,
+	}
+	m.locksSuperUnsafeNS[ns] = nl
+
+	return nl
+}
+
+func (m *EQMem) lockNamespaces(ns []string) ([]*nsLock, func()) {
+	if len(ns) == 0 {
+		return nil, func() {}
+	}
+	nls := m.locksForNamespaces(ns)
+	for _, nl := range nls {
+		nl.Lock()
+	}
+
+	return nls, func() {
+		for i := len(nls) - 1; i >= 0; i-- {
+			nls[i].Unlock()
+		}
+		defer un(lock(m))
+		for i := len(nls) - 1; i >= 0; i-- {
+			nl := nls[i]
+			nl.dependents--
+
+			if nss := m.namespaces[nl.namespace]; nl.dependents == 0 && nss.Len() == 0 {
+				delete(m.namespaces, nl.namespace)
+				delete(m.locksSuperUnsafeNS, nl.namespace)
 			}
 		}
 	}

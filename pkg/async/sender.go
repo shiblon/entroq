@@ -203,7 +203,7 @@ func (s *Sender) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, _, err := s.eq.Modify(ctx,
+	if _, err := s.eq.Modify(ctx,
 		entroq.InsertingInto(targetQueue, entroq.WithRawValue(envValue)),
 	); err != nil {
 		http.Error(w, fmt.Sprintf("enqueue task: %v", err), http.StatusBadGateway)
@@ -241,7 +241,7 @@ func (s *Sender) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // deleteTask removes a task from EntroQ, logging on failure. Used for
 // response queue cleanup after the response has been read.
 func (s *Sender) deleteTask(ctx context.Context, task *entroq.Task) {
-	if _, _, err := s.eq.Modify(ctx, task.Delete()); err != nil {
+	if _, err := s.eq.Modify(ctx, task.Delete()); err != nil {
 		log.Printf("sender delete task %v: %v (GC will clean up)", task.ID, err)
 	}
 }

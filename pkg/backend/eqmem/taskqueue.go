@@ -3,74 +3,62 @@ package eqmem
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/shiblon/entroq"
 )
 
 // taskQueue is a synchronized map of task IDs to task values. It uses a
-// sync.Map underneath, but makes certain operations safer and quicker, like
-// obtaining the length. It is typed, so type assertions necessary for sync.Map
-// use are hidden and made simpler for this use case.
+// sync.Map underneath with an atomic size counter, avoiding a separate mutex
+// for size tracking while keeping reads (Get, Range) fully lock-free.
 //
-// It also provides a locked version of updates, allowing a load+store to be
-// done atomically. Reading from the map should be as fast as a normal
-// sync.Map, as it relies only on the internal locking instead of global
-// locking. Mutating operations that might change the size cause global
-// locking, albeit briefly. These do not affect ranges or reads.
+// Callers that mutate the queue (Set, Delete, Update) must hold the
+// corresponding qLock, which provides the mutual exclusion needed for
+// load-then-store operations like Update.
 type taskQueue struct {
-	sync.Mutex // for operations that can alter the size.
-
 	name string
-	size int
-	byID *sync.Map
+	size atomic.Int64
+	byID sync.Map
 }
 
 // newTaskQueue creates a new task store, allowing retrieval, deletion,
 // modification, and ranging over tasks by ID.
 func newTaskQueue(name string) *taskQueue {
-	return &taskQueue{
-		name: name,
-		byID: new(sync.Map),
-	}
+	return &taskQueue{name: name}
 }
 
-// Set inserts or changes a value in the store.
+// Set inserts or replaces the task for the given ID.
 func (s *taskQueue) Set(id string, val *entroq.Task) {
-	defer un(lock(s))
-	if _, ok := s.byID.Load(id); !ok {
-		s.size++
+	if _, loaded := s.byID.Swap(id, val); !loaded {
+		s.size.Add(1)
 	}
-	s.byID.Store(id, val)
 }
 
 // Delete removes the task for the corresponding ID, if present.
 func (s *taskQueue) Delete(id string) {
-	defer un(lock(s))
-	if _, ok := s.byID.LoadAndDelete(id); ok {
-		s.size--
+	if _, loaded := s.byID.LoadAndDelete(id); loaded {
+		s.size.Add(-1)
 	}
 }
 
-// Update loads a task and passes it to the given update function, holding the lock meanwhile.
-// If the task does not exist, it will return an error and never call the given function.
+// Update loads a task and passes it to the given update function, storing the
+// result. Callers must hold the qLock for this queue; that exclusivity makes
+// the load-then-store safe without an additional internal lock.
 func (s *taskQueue) Update(id string, f func(*entroq.Task) *entroq.Task) error {
-	defer un(lock(s))
 	val, ok := s.byID.Load(id)
 	if !ok {
 		return fmt.Errorf("task store update: task ID %v not found", id)
 	}
-	newTask := f(val.(*entroq.Task))
-	s.byID.Store(id, newTask)
+	s.byID.Store(id, f(val.(*entroq.Task)))
 	return nil
 }
 
-// Len returns the current size of this task store.
+// Len returns the current number of tasks in this store.
 func (s *taskQueue) Len() int {
 	if s == nil {
 		return 0
 	}
-	defer un(lock(s))
-	return s.size
+	return int(s.size.Load())
 }
 
 // Has indicates whether a given ID is in this task store.
@@ -79,9 +67,8 @@ func (s *taskQueue) Has(id string) bool {
 	return ok
 }
 
-// Get returns the task for the given ID, or not okay if not found,.
+// Get returns the task for the given ID, or not okay if not found.
 func (s *taskQueue) Get(id string) (*entroq.Task, bool) {
-	// No need to lock.
 	t, ok := s.byID.Load(id)
 	if !ok {
 		return nil, false
@@ -92,8 +79,7 @@ func (s *taskQueue) Get(id string) (*entroq.Task, bool) {
 // Range ranges over the keys and values in this task store, calling the
 // provided function for each. It follows the semantics of sync.Map precisely.
 func (s *taskQueue) Range(f func(string, *entroq.Task) bool) {
-	// No need to lock.
-	s.byID.Range(func(k, v interface{}) bool {
+	s.byID.Range(func(k, v any) bool {
 		return f(k.(string), v.(*entroq.Task))
 	})
 }

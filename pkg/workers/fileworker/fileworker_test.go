@@ -33,7 +33,7 @@ func TestWorker_run(t *testing.T) {
 	content := "hello world"
 
 	// Insert a task.
-	if _, _, err := eq.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue(content))); err != nil {
+	if _, err := eq.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue(content))); err != nil {
 		t.Fatalf("Failed to insert task: %v", err)
 	}
 

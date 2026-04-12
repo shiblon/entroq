@@ -47,7 +47,7 @@ func TestWorker_Run(t *testing.T) {
 	// Add a task to be journaled
 	queue := "/test/journal"
 	data := []byte(`{"hello":"world"}`)
-	if _, _, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue(json.RawMessage(data)))); err != nil {
+	if _, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue(json.RawMessage(data)))); err != nil {
 		t.Fatalf("Failed to insert task: %v", err)
 	}
 

@@ -50,7 +50,7 @@ func (cw *ConfigWorker) reloadConfig(ctx context.Context) error {
 	cw.cID = task.IDVersion()
 
 	// Immediately release the configuration task.
-	if _, _, err := cw.eqc.Modify(ctx, entroq.Changing(task, entroq.ArrivalTimeBy(0))); err != nil {
+	if _, err := cw.eqc.Modify(ctx, entroq.Changing(task, entroq.ArrivalTimeBy(0))); err != nil {
 		return fmt.Errorf("reload release: %w", err)
 	}
 
@@ -92,7 +92,7 @@ func main() {
 	defer client.Close()
 
 	// Initialize Config Task
-	if _, _, err := client.Modify(ctx, entroq.InsertingInto(configQueue, entroq.WithValue(Config{Multiplier: 2}))); err != nil {
+	if _, err := client.Modify(ctx, entroq.InsertingInto(configQueue, entroq.WithValue(Config{Multiplier: 2}))); err != nil {
 		log.Fatalf("Failed to init config: %v", err)
 	}
 
@@ -123,7 +123,7 @@ func main() {
 					continue
 				}
 
-				if _, _, err := client.Modify(ctx, task.Change(entroq.RawValueTo(valBytes), entroq.ArrivalTimeBy(0))); err != nil {
+				if _, err := client.Modify(ctx, task.Change(entroq.RawValueTo(valBytes), entroq.ArrivalTimeBy(0))); err != nil {
 					log.Printf("[Updater] Update error: %v", err)
 				}
 			}
@@ -138,7 +138,7 @@ func main() {
 				return
 			case <-time.After(time.Second):
 				val := rand.Intn(100)
-				if _, _, err := client.Modify(ctx, entroq.InsertingInto(workQueue, entroq.WithValue(val))); err != nil {
+				if _, err := client.Modify(ctx, entroq.InsertingInto(workQueue, entroq.WithValue(val))); err != nil {
 					log.Printf("[Producer] Task error: %v", err)
 				}
 			}

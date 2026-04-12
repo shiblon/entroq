@@ -129,6 +129,97 @@ message ClaimResponse {
   Task task = 1;
 }
 
+// DocID identifies a specific version of a doc.
+message DocID {
+  string namespace = 1;
+  string id = 2;
+  int32 version = 3;
+}
+
+// DocData holds the data portion of a doc, used for insertions. The created_ms
+// and modified_ms fields are used only for journal replay; leave them zero for
+// normal insertions.
+message DocData {
+  string namespace = 1;
+  string id = 2;
+  string key_primary = 3;
+  string key_secondary = 4;
+  bytes content = 5;
+  int64 expires_at_ms = 6;
+  int64 created_ms = 7;
+  int64 modified_ms = 8;
+}
+
+// DocChange identifies a doc by DocID and provides updated data. Only content
+// and expires_at_ms from new_data are applied; keys are immutable after creation.
+message DocChange {
+  DocID old_id = 1;
+  DocData new_data = 2;
+}
+
+// Doc is a complete doc object with identity, data, and metadata.
+message Doc {
+  string namespace = 1;
+  string id = 2;
+  int32 version = 3;
+  string claimant = 4;
+  int64 at_ms = 5;
+  int64 expires_at_ms = 6;
+  string key_primary = 7;
+  string key_secondary = 8;
+  bytes content = 9;
+  int64 created_ms = 10;
+  int64 modified_ms = 11;
+}
+
+// DocQuery describes a listing request for docs in a namespace with optional
+// key-range filtering. key_start and key_end form a half-open range
+// [key_start, key_end); leaving key_end empty lists from key_start onward.
+message DocQuery {
+  string namespace = 1;
+  string key_start = 2;
+  string key_end = 3;
+  int32 limit = 4;
+  bool omit_values = 5;
+}
+
+// DocClaimQuery describes an atomic all-or-nothing claim of docs in a namespace.
+//
+// Claim strategy (exactly one must be specified):
+//   - ids non-empty: claim these exact docs by ID; key fields are ignored.
+//   - key_start only (key_end == ""): exact match on primary key.
+//   - key_start + key_end: half-open range [key_start, key_end).
+message DocClaimQuery {
+  string namespace = 1;
+  string claimant = 2;
+  repeated string ids = 3;
+  string key_start = 4;
+  string key_end = 5;
+  int64 duration_ms = 6;
+}
+
+// DocsRequest asks for a listing of docs matching a query.
+message DocsRequest {
+  DocQuery query = 1;
+}
+
+// DocsResponse contains the docs returned by a Docs call.
+message DocsResponse {
+  repeated Doc docs = 1;
+}
+
+// ClaimDocsRequest asks to atomically claim a set of docs.
+message ClaimDocsRequest {
+  DocClaimQuery claim_query = 1;
+}
+
+// ClaimDocsResponse contains the docs claimed by a ClaimDocs call.
+// A dependency error (missing or already-claimed docs) comes through as
+// gRPC's NOT_FOUND code with ModifyDep details carrying doc_id fields.
+message ClaimDocsResponse {
+  repeated Doc docs = 1;
+}
+
 // ModifyRequest sends a request to modify a set of tasks with given
 // dependencies. It is performed in a transaction, in which either all
 // suggested modifications succeed and all dependencies are satisfied, or
@@ -143,13 +234,20 @@ message ModifyRequest {
   repeated TaskChange changes = 3;
   repeated TaskID deletes = 4;
   repeated TaskID depends = 5;
+
+  repeated DocData doc_inserts = 6;
+  repeated DocChange doc_changes = 7;
+  repeated DocID doc_deletes = 8;
+  repeated DocID doc_depends = 9;
 }
 
-// ModifyResponse returns inserted and updated tasks when successful.
+// ModifyResponse returns inserted and updated tasks and docs when successful.
 // A dependency error (which is permanent) comes through as gRPC's NOT_FOUND code.
 message ModifyResponse {
   repeated Task inserted = 1;
   repeated Task changed = 2;
+  repeated Doc inserted_docs = 3;
+  repeated Doc changed_docs = 4;
 }
 
 enum ActionType {
@@ -165,11 +263,14 @@ enum ActionType {
 
 // ModifyDep can be returned with a gRPC NotFound status indicating which
 // dependencies failed. This is done via the gRPC error return, not directly
-// in the response proto.
+// in the response proto. Either id (for task dependencies) or doc_id (for doc
+// dependencies) will be set; msg is used with type=DETAIL for a human-readable
+// error message.
 message ModifyDep {
   ActionType type = 1;
   TaskID id = 2;
-  string msg = 3; // Usually only used with type=DETAIL.
+  string msg = 3;
+  DocID doc_id = 4;
 }
 
 // AuthzDep can be returned with a gRPC PermissionDenied status indicating
@@ -278,6 +379,19 @@ service EntroQ {
   rpc StreamTasks(TasksRequest) returns (stream TasksResponse) {
     option (google.api.http) = {
       get: "/api/v0/tasks/stream"
+    };
+  }
+
+  rpc Docs(DocsRequest) returns (DocsResponse) {
+    option (google.api.http) = {
+      get: "/api/v0/docs"
+    };
+  }
+
+  rpc ClaimDocs(ClaimDocsRequest) returns (ClaimDocsResponse) {
+    option (google.api.http) = {
+      post: "/api/v0/docs/claim"
+      body: "*"
     };
   }
 }

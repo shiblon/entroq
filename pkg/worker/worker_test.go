@@ -20,7 +20,7 @@ func TestWorker_Basic(t *testing.T) {
 	}
 	defer client.Close()
 
-	if _, _, err := client.Modify(ctx, entroq.InsertingInto("test_q", entroq.WithValue("hi"))); err != nil {
+	if _, err := client.Modify(ctx, entroq.InsertingInto("test_q", entroq.WithValue("hi"))); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
 
@@ -37,7 +37,7 @@ func TestWorker_Basic(t *testing.T) {
 				return nil
 			}),
 			WithFinish(func(ctx context.Context, task *entroq.Task, _ string) error {
-				if _, _, err := client.Modify(ctx, task.Delete()); err != nil {
+				if _, err := client.Modify(ctx, task.Delete()); err != nil {
 					return err
 				}
 				done <- true

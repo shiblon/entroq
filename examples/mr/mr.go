@@ -533,7 +533,7 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 		for _, t := range updatedTasks {
 			modArgs = append(modArgs, t.Delete())
 		}
-		if _, _, err := w.client.Modify(ctx, modArgs...); err != nil {
+		if _, err := w.client.Modify(ctx, modArgs...); err != nil {
 			return fmt.Errorf("merge output: %w", err)
 		}
 
@@ -608,7 +608,7 @@ func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error 
 		}
 		updatedTask := stop()
 
-		if _, _, err := w.client.Modify(ctx, updatedTask.Delete(), entroq.InsertingInto(w.OutputQueue, entroq.WithValue(outputs))); err != nil {
+		if _, err := w.client.Modify(ctx, updatedTask.Delete(), entroq.InsertingInto(w.OutputQueue, entroq.WithValue(outputs))); err != nil {
 			return fmt.Errorf("reduce output: %w", err)
 		}
 		return nil
@@ -789,7 +789,7 @@ func (mr *MapReduce) Run(ctx context.Context) (string, error) {
 
 	// First create map tasks for all of the data.
 	for _, kv := range mr.Data {
-		if _, _, err := mr.client.Modify(ctx, entroq.InsertingInto(qMapInput, entroq.WithValue(kv))); err != nil {
+		if _, err := mr.client.Modify(ctx, entroq.InsertingInto(qMapInput, entroq.WithValue(kv))); err != nil {
 			return "", fmt.Errorf("insert map input: %w", err)
 		}
 	}

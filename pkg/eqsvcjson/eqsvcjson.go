@@ -111,6 +111,22 @@ func (h *Handler) Time(ctx context.Context, req *connect.Request[pb.TimeRequest]
 	return connect.NewResponse(resp), nil
 }
 
+func (h *Handler) Docs(ctx context.Context, req *connect.Request[pb.DocsRequest]) (*connect.Response[pb.DocsResponse], error) {
+	resp, err := h.svc.Docs(ctxWithMD(ctx, req.Header()), req.Msg)
+	if err != nil {
+		return nil, err
+	}
+	return connect.NewResponse(resp), nil
+}
+
+func (h *Handler) ClaimDocs(ctx context.Context, req *connect.Request[pb.ClaimDocsRequest]) (*connect.Response[pb.ClaimDocsResponse], error) {
+	resp, err := h.svc.ClaimDocs(ctxWithMD(ctx, req.Header()), req.Msg)
+	if err != nil {
+		return nil, err
+	}
+	return connect.NewResponse(resp), nil
+}
+
 // streamAdapter wraps a Connect server stream so it implements the grpc.ServerStream expected by eqsvcgrpc.
 type streamAdapter struct {
 	ctx    context.Context

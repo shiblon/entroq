@@ -428,6 +428,28 @@ func depErrorFromStat(stat *status.Status) error {
 			continue
 		}
 
+		// Doc dependency: doc_id is set, id is nil.
+		if detail.DocId != nil {
+			did := &entroq.DocID{
+				Namespace: detail.DocId.Namespace,
+				ID:        detail.DocId.Id,
+				Version:   detail.DocId.Version,
+			}
+			switch detail.Type {
+			case pb.ActionType_CLAIM:
+				depErr.DocClaims = append(depErr.DocClaims, did)
+			case pb.ActionType_DELETE:
+				depErr.DocDeletes = append(depErr.DocDeletes, did)
+			case pb.ActionType_CHANGE:
+				depErr.DocChanges = append(depErr.DocChanges, did)
+			case pb.ActionType_DEPEND:
+				depErr.DocDepends = append(depErr.DocDepends, did)
+			default:
+				return fmt.Errorf("grpc doc dependency unknown type %v in detail %v", detail.Type, detail)
+			}
+			continue
+		}
+
 		tid, err := fromTaskIDProto(detail.Id)
 		if err != nil {
 			return fmt.Errorf("grpc dependency from proto: %w", err)
@@ -473,21 +495,21 @@ func unpackGRPCError(grpcErr error) error {
 }
 
 // Modify modifies the task system with the given batch of modifications.
-func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserted []*entroq.Task, changed []*entroq.Task, err error) {
+func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (*entroq.ModifyResponse, error) {
 	req := &pb.ModifyRequest{
 		ClaimantId: mod.Claimant,
 	}
 	for _, ins := range mod.Inserts {
 		pd, err := protoFromTaskData(ins)
 		if err != nil {
-			return nil, nil, fmt.Errorf("grpc modify insert value: %w", err)
+			return nil, fmt.Errorf("grpc modify insert value: %w", err)
 		}
 		req.Inserts = append(req.Inserts, pd)
 	}
 	for _, task := range mod.Changes {
 		pc, err := changeProtoFromTask(task)
 		if err != nil {
-			return nil, nil, fmt.Errorf("grpc modify change value: %w", err)
+			return nil, fmt.Errorf("grpc modify change value: %w", err)
 		}
 		req.Changes = append(req.Changes, pc)
 	}
@@ -506,27 +528,70 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (inserte
 		})
 	}
 
-	resp, err := pb.NewEntroQClient(b.conn).Modify(ctx, req)
-	if err != nil {
-		return nil, nil, fmt.Errorf("grpc modify: %w", unpackGRPCError(err))
+	for _, di := range mod.DocInserts {
+		req.DocInserts = append(req.DocInserts, &pb.DocData{
+			Namespace:    di.Namespace,
+			Id:           di.ID,
+			KeyPrimary:   di.KeyPrimary,
+			KeySecondary: di.KeySecondary,
+			Content:      []byte(di.Content),
+			ExpiresAtMs:  toMS(di.ExpiresAt),
+			CreatedMs:    toMS(di.Created),
+			ModifiedMs:   toMS(di.Modified),
+		})
+	}
+	for _, dc := range mod.DocChanges {
+		req.DocChanges = append(req.DocChanges, &pb.DocChange{
+			OldId: &pb.DocID{Namespace: dc.Namespace, Id: dc.ID, Version: dc.Version},
+			NewData: &pb.DocData{
+				Content:     []byte(dc.Content),
+				ExpiresAtMs: toMS(dc.ExpiresAt),
+			},
+		})
+	}
+	for _, dd := range mod.DocDeletes {
+		req.DocDeletes = append(req.DocDeletes, &pb.DocID{
+			Namespace: dd.Namespace,
+			Id:        dd.ID,
+			Version:   dd.Version,
+		})
+	}
+	for _, ddep := range mod.DocDepends {
+		req.DocDepends = append(req.DocDepends, &pb.DocID{
+			Namespace: ddep.Namespace,
+			Id:        ddep.ID,
+			Version:   ddep.Version,
+		})
 	}
 
+	resp, err := pb.NewEntroQClient(b.conn).Modify(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("grpc modify: %w", unpackGRPCError(err))
+	}
+
+	mResp := new(entroq.ModifyResponse)
 	for _, t := range resp.GetInserted() {
 		task, err := fromTaskProto(t)
 		if err != nil {
-			return nil, nil, fmt.Errorf("grpc modify task proto: %w", err)
+			return nil, fmt.Errorf("grpc modify task proto: %w", err)
 		}
-		inserted = append(inserted, task)
+		mResp.InsertedTasks = append(mResp.InsertedTasks, task)
 	}
 	for _, t := range resp.GetChanged() {
 		task, err := fromTaskProto(t)
 		if err != nil {
-			return nil, nil, fmt.Errorf("grpc modify changed: %w", err)
+			return nil, fmt.Errorf("grpc modify changed: %w", err)
 		}
-		changed = append(changed, task)
+		mResp.ChangedTasks = append(mResp.ChangedTasks, task)
+	}
+	for _, d := range resp.GetInsertedDocs() {
+		mResp.InsertedDocs = append(mResp.InsertedDocs, fromDocProto(d))
+	}
+	for _, d := range resp.GetChangedDocs() {
+		mResp.ChangedDocs = append(mResp.ChangedDocs, fromDocProto(d))
 	}
 
-	return inserted, changed, nil
+	return mResp, nil
 }
 
 // Time returns the time as reported by the server.

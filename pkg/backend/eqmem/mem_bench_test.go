@@ -20,7 +20,7 @@ func BatchPopulate(ctx context.Context, c *entroq.EntroQ, n int, queues []string
 			q := queues[(i+j)%len(queues)]
 			ins = append(ins, entroq.InsertingInto(q, entroq.WithArrivalTime(now), entroq.WithValue("bench-value")))
 		}
-		if _, _, err := c.Modify(ctx, ins...); err != nil {
+		if _, err := c.Modify(ctx, ins...); err != nil {
 			return fmt.Errorf("populate batch: %w", err)
 		}
 	}

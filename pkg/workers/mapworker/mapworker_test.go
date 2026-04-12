@@ -26,7 +26,7 @@ func TestWorker(t *testing.T) {
 		Val:    "hello world",
 		Outbox: "/out",
 	}
-	if _, _, err := client.Modify(ctx, entroq.InsertingInto("/in", entroq.WithValue(input))); err != nil {
+	if _, err := client.Modify(ctx, entroq.InsertingInto("/in", entroq.WithValue(input))); err != nil {
 		t.Fatalf("Failed to insert task: %v", err)
 	}
 
