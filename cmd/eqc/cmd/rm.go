@@ -68,7 +68,7 @@ var rmCmd = &cobra.Command{
 				modArgs = append(modArgs, entroq.ModifyAs(task.Claimant))
 			}
 
-			_, mod, err := eq.Modify(ctx, modArgs...)
+			resp, err := eq.Modify(ctx, modArgs...)
 			if err != nil {
 				log.Printf("Try %d/%d - could not remove task %v: %v", i+1, flagRmRetries, flagRmID, err)
 				delErr = err
@@ -76,7 +76,7 @@ var rmCmd = &cobra.Command{
 				continue
 			}
 
-			b, err := json.Marshal(mod)
+			b, err := json.Marshal(resp.ChangedTasks)
 			if err != nil {
 				log.Fatalf("JSON marshal: %v", err)
 			}

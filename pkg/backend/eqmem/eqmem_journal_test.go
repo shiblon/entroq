@@ -25,16 +25,17 @@ func Example_journal() {
 	}
 	defer eq.Close()
 
-	inserted, _, err := eq.Modify(ctx,
+	resp, err := eq.Modify(ctx,
 		entroq.InsertingInto("/queue/of/tasks", entroq.WithValue("hey")),
 		entroq.InsertingInto("/queue/of/others", entroq.WithValue("other")),
 	)
 	if err != nil {
 		log.Fatalf("Error adding task: %v", err)
 	}
+	inserted := resp.InsertedTasks
 
 	// Change the queue for the first insertion.
-	if _, _, err := eq.Modify(ctx, inserted[0].Change(entroq.QueueTo("/queue/of/something"))); err != nil {
+	if _, err := eq.Modify(ctx, inserted[0].Change(entroq.QueueTo("/queue/of/something"))); err != nil {
 		log.Fatalf("Error modifying task: %v", err)
 	}
 

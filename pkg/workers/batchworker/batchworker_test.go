@@ -22,7 +22,7 @@ func TestWorker_proxy(t *testing.T) {
 
 	// Insert 3 tasks
 	for i := 1; i <= 3; i++ {
-		if _, _, err := client.Modify(ctx, entroq.InsertingInto("/in", entroq.WithValue(i))); err != nil {
+		if _, err := client.Modify(ctx, entroq.InsertingInto("/in", entroq.WithValue(i))); err != nil {
 			t.Fatalf("Failed to insert task %d: %v", i, err)
 		}
 	}
@@ -83,7 +83,7 @@ func TestWorker_proxyLinger(t *testing.T) {
 	}()
 
 	// Insert 1 task
-	if _, _, err := client.Modify(ctx, entroq.InsertingInto("/in", entroq.WithValue(1))); err != nil {
+	if _, err := client.Modify(ctx, entroq.InsertingInto("/in", entroq.WithValue(1))); err != nil {
 		t.Fatalf("Failed to insert first task: %v", err)
 	}
 
@@ -95,7 +95,7 @@ func TestWorker_proxyLinger(t *testing.T) {
 	}
 
 	// Insert 2nd task - should be caught by grace period
-	if _, _, err := client.Modify(ctx, entroq.InsertingInto("/in", entroq.WithValue(2))); err != nil {
+	if _, err := client.Modify(ctx, entroq.InsertingInto("/in", entroq.WithValue(2))); err != nil {
 		t.Fatalf("Failed to insert second task: %v", err)
 	}
 

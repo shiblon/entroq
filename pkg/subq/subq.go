@@ -11,8 +11,8 @@ import (
 	"time"
 )
 
-// SubQ is a queue subscription service. It is not public, though; it is based
-// on competing consumer principles, like EntroQ itself.
+// SubQ is a notification subscription service. It is based on competing consumer
+// principles, like EntroQ itself.
 type SubQ struct {
 	sync.Mutex
 
@@ -71,7 +71,7 @@ func New() *SubQ {
 	}
 }
 
-// Notify sends notifications to at most one waiting goroutines that something
+// Notify sends notifications to at most one waiting goroutine that something
 // is ready on the given queue. If nobody is listening, it immediately drops
 // the event. This function does not block, but notifies in a new goroutine.
 func (s *SubQ) Notify(q string) {

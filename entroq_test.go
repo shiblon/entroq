@@ -30,7 +30,7 @@ func Example() {
 	// Task values are JSON and can be any valid JSON value.
 
 	// Insert a few tasks:
-	ins, _, err := eq.Modify(ctx,
+	resp, err := eq.Modify(ctx,
 		entroq.InsertingInto("q1", entroq.WithValue("hello")),
 		entroq.InsertingInto("q2", entroq.WithValue("hello")))
 	if err != nil {
@@ -38,7 +38,7 @@ func Example() {
 	}
 
 	// You can get auto-assigned IDs, versions, etc. from each inserted task:
-	for _, t := range ins {
+	for _, t := range resp.InsertedTasks {
 		log.Printf("Task inserted: %s\n", t.ID)
 	}
 
@@ -60,7 +60,7 @@ func Example() {
 		// making it safe to use it in modification transactions.
 		worker.WithFinish(func(ctx context.Context, final *entroq.Task, v string) error {
 			fmt.Printf("Deleting task %q\n", v)
-			_, _, err := eq.Modify(ctx, final.Delete())
+			_, err := eq.Modify(ctx, final.Delete())
 			if err != nil {
 				return err
 			}
@@ -93,7 +93,7 @@ func Example_dependencies() {
 	defer eq.Close()
 
 	// 1. Insert a configuration task and a worker task.
-	_, _, err = eq.Modify(ctx,
+	_, err = eq.Modify(ctx,
 		entroq.InsertingInto("config", entroq.WithRawValue(json.RawMessage(`{"max_retries": 5}`))), // []byte() also works
 		entroq.InsertingInto("worker", entroq.WithValue("do work")),
 	)
@@ -122,7 +122,7 @@ func Example_dependencies() {
 				return fmt.Errorf("config missing during finalize")
 			}
 
-			_, _, err := eq.Modify(ctx, final.Delete(), config.Depend())
+			_, err := eq.Modify(ctx, final.Delete(), config.Depend())
 			if err != nil {
 				if depErr, ok := entroq.AsDependency(err); ok {
 					if len(depErr.Depends) > 0 {
@@ -134,7 +134,7 @@ func Example_dependencies() {
 						// Or we could force a retry and increment it's attempts
 						// (return RetryError). But there's nothing wrong with the task
 						// so far as we know, so make it immediately available.
-						if _, _, err := eq.Modify(ctx, final.Change(entroq.ArrivalTimeBy(0))); err != nil {
+						if _, err := eq.Modify(ctx, final.Change(entroq.ArrivalTimeBy(0))); err != nil {
 							// NOW it's our task that's the problem. Just bail.
 							return fmt.Errorf("task reset after config change: %w", err)
 						}
@@ -168,7 +168,7 @@ func Example_manualClaimAndRenew() {
 	// claim and renew tasks for custom daemon implementations.
 
 	// Insert a task to work on.
-	if _, _, err := eq.Modify(ctx, entroq.InsertingInto("manual_queue", entroq.WithValue("work"))); err != nil {
+	if _, err := eq.Modify(ctx, entroq.InsertingInto("manual_queue", entroq.WithValue("work"))); err != nil {
 		log.Fatalf("insert failed: %v", err)
 	}
 
@@ -187,7 +187,7 @@ func Example_manualClaimAndRenew() {
 		finalTask := stop()
 
 		// 4. Commit the work (by deleting the task or mutating it).
-		if _, _, err := eq.Modify(ctx, finalTask.Delete()); err != nil {
+		if _, err := eq.Modify(ctx, finalTask.Delete()); err != nil {
 			return fmt.Errorf("failed to commit: %w", err)
 		}
 		return nil
@@ -207,7 +207,7 @@ func TestDoWithRenewAll_ImmediateCancellationOnLeaseLoss(t *testing.T) {
 	defer eq.Close()
 
 	queue := "/test/cancel"
-	_, _, err = eq.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue("work")))
+	_, err = eq.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue("work")))
 	if err != nil {
 		t.Fatalf("failed to insert: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestDoWithRenewAll_ImmediateCancellationOnLeaseLoss(t *testing.T) {
 
 	// 3. Poach the task from underneath the worker.
 	// Bump version by claiming or deleting. Same claimant, so no need to spoof.
-	if _, _, err := eq.Modify(ctx, claimed.Delete()); err != nil {
+	if _, err := eq.Modify(ctx, claimed.Delete()); err != nil {
 		t.Fatalf("failed to steal task: %v", err)
 	}
 

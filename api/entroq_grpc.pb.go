@@ -29,6 +29,8 @@ type EntroQClient interface {
 	// single one. Typically this will have one task per response, but it is best
 	// for the client to consume however many there are.
 	StreamTasks(ctx context.Context, in *TasksRequest, opts ...grpc.CallOption) (EntroQ_StreamTasksClient, error)
+	Docs(ctx context.Context, in *DocsRequest, opts ...grpc.CallOption) (*DocsResponse, error)
+	ClaimDocs(ctx context.Context, in *ClaimDocsRequest, opts ...grpc.CallOption) (*ClaimDocsResponse, error)
 }
 
 type entroQClient struct {
@@ -134,6 +136,24 @@ func (x *entroQStreamTasksClient) Recv() (*TasksResponse, error) {
 	return m, nil
 }
 
+func (c *entroQClient) Docs(ctx context.Context, in *DocsRequest, opts ...grpc.CallOption) (*DocsResponse, error) {
+	out := new(DocsResponse)
+	err := c.cc.Invoke(ctx, "/api.EntroQ/Docs", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *entroQClient) ClaimDocs(ctx context.Context, in *ClaimDocsRequest, opts ...grpc.CallOption) (*ClaimDocsResponse, error) {
+	out := new(ClaimDocsResponse)
+	err := c.cc.Invoke(ctx, "/api.EntroQ/ClaimDocs", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // EntroQServer is the server API for EntroQ service.
 // All implementations must embed UnimplementedEntroQServer
 // for forward compatibility
@@ -149,6 +169,8 @@ type EntroQServer interface {
 	// single one. Typically this will have one task per response, but it is best
 	// for the client to consume however many there are.
 	StreamTasks(*TasksRequest, EntroQ_StreamTasksServer) error
+	Docs(context.Context, *DocsRequest) (*DocsResponse, error)
+	ClaimDocs(context.Context, *ClaimDocsRequest) (*ClaimDocsResponse, error)
 	mustEmbedUnimplementedEntroQServer()
 }
 
@@ -179,6 +201,12 @@ func (UnimplementedEntroQServer) Time(context.Context, *TimeRequest) (*TimeRespo
 }
 func (UnimplementedEntroQServer) StreamTasks(*TasksRequest, EntroQ_StreamTasksServer) error {
 	return status.Errorf(codes.Unimplemented, "method StreamTasks not implemented")
+}
+func (UnimplementedEntroQServer) Docs(context.Context, *DocsRequest) (*DocsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Docs not implemented")
+}
+func (UnimplementedEntroQServer) ClaimDocs(context.Context, *ClaimDocsRequest) (*ClaimDocsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ClaimDocs not implemented")
 }
 func (UnimplementedEntroQServer) mustEmbedUnimplementedEntroQServer() {}
 
@@ -340,6 +368,42 @@ func (x *entroQStreamTasksServer) Send(m *TasksResponse) error {
 	return x.ServerStream.SendMsg(m)
 }
 
+func _EntroQ_Docs_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DocsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EntroQServer).Docs(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/api.EntroQ/Docs",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EntroQServer).Docs(ctx, req.(*DocsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _EntroQ_ClaimDocs_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ClaimDocsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EntroQServer).ClaimDocs(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/api.EntroQ/ClaimDocs",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EntroQServer).ClaimDocs(ctx, req.(*ClaimDocsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // EntroQ_ServiceDesc is the grpc.ServiceDesc for EntroQ service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -374,6 +438,14 @@ var EntroQ_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Time",
 			Handler:    _EntroQ_Time_Handler,
+		},
+		{
+			MethodName: "Docs",
+			Handler:    _EntroQ_Docs_Handler,
+		},
+		{
+			MethodName: "ClaimDocs",
+			Handler:    _EntroQ_ClaimDocs_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

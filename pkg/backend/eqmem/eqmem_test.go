@@ -189,7 +189,7 @@ func TestEQMemJournalClaim(t *testing.T) {
 	}
 	defer eq.Close()
 
-	if _, _, err := eq.Modify(ctx,
+	if _, err := eq.Modify(ctx,
 		entroq.InsertingInto("/queue/of/tasks", entroq.WithValue("hey")),
 		entroq.InsertingInto("/queue/of/others", entroq.WithValue("other")),
 	); err != nil {
@@ -268,7 +268,7 @@ func stressJournalStats(t *testing.T) {
 	for q, s := range expectQueues {
 		s.Name = q
 		for i, n := 0, rand.Intn(maxQueueTasks); i < n; i++ {
-			if _, _, err := eq.Modify(ctx, entroq.InsertingInto(q, entroq.WithValue(fmt.Sprintf("value %d", i)))); err != nil {
+			if _, err := eq.Modify(ctx, entroq.InsertingInto(q, entroq.WithValue(fmt.Sprintf("value %d", i)))); err != nil {
 				t.Fatalf("Error inserting into %q: %v", q, err)
 			}
 			s.Size++
@@ -317,7 +317,7 @@ func stressJournalStats(t *testing.T) {
 			}
 			expectQueues[q].Claimed++
 			expectQueues[q].Available--
-			if _, _, err := eq.Modify(ctx, task.Change(entroq.QueueTo(newQ))); err != nil {
+			if _, err := eq.Modify(ctx, task.Change(entroq.QueueTo(newQ))); err != nil {
 				t.Fatalf("Error moving from %q to %q: %v", q, newQ, err)
 			}
 			expectQueues[q].Size--
@@ -375,7 +375,7 @@ func TestEQMem_journalClaimModClaim(t *testing.T) {
 	}
 	defer eq.Close()
 
-	if _, _, err := eq.Modify(ctx, entroq.InsertingInto("/queue/1")); err != nil {
+	if _, err := eq.Modify(ctx, entroq.InsertingInto("/queue/1")); err != nil {
 		t.Fatalf("Error inserting: %v", err)
 	}
 
@@ -384,7 +384,7 @@ func TestEQMem_journalClaimModClaim(t *testing.T) {
 		t.Fatalf("Error claiming: %v", err)
 	}
 
-	if _, _, err := eq.Modify(ctx, task.Change(entroq.QueueTo(task.Queue+"/failed-parse"))); err != nil {
+	if _, err := eq.Modify(ctx, task.Change(entroq.QueueTo(task.Queue+"/failed-parse"))); err != nil {
 		t.Fatalf("Error changing: %v", err)
 	}
 
@@ -428,7 +428,7 @@ func TestEQMem_journalInsClaimClaimDel(t *testing.T) {
 	}
 	defer eq1.Close()
 
-	if _, _, err := eq1.Modify(ctx, entroq.InsertingInto("hello", entroq.WithValue("hello"))); err != nil {
+	if _, err := eq1.Modify(ctx, entroq.InsertingInto("hello", entroq.WithValue("hello"))); err != nil {
 		t.Fatalf("Error inserting: %v", err)
 	}
 
@@ -451,7 +451,7 @@ func TestEQMem_journalInsClaimClaimDel(t *testing.T) {
 		t.Fatalf("Error claiming 2: %v", err)
 	}
 
-	if _, _, err := eq2.Modify(ctx, task.Delete()); err != nil {
+	if _, err := eq2.Modify(ctx, task.Delete()); err != nil {
 		t.Fatalf("Error deleting 2: %v", err)
 	}
 	eq2.Close()
@@ -464,6 +464,14 @@ func TestEQMem_journalInsClaimClaimDel(t *testing.T) {
 	eq3.Close()
 }
 
+func TestEQMemDocConcurrencyStress(t *testing.T) {
+	RunQTest(t, eqtest.DocConcurrencyStress)
+}
+
+func TestEQMemMixedAtomicStress(t *testing.T) {
+	RunQTest(t, eqtest.MixedAtomicStress)
+}
+
 func TestEQMemWorkerDependencyHandler(t *testing.T) {
 	RunQTest(t, eqtest.WorkerDependencyHandler)
 }
@@ -474,4 +482,16 @@ func TestEQMemWorkerCompactDependencyHandler(t *testing.T) {
 
 func TestEQMemWorkerRenewalNoDependencyHandler(t *testing.T) {
 	RunQTest(t, eqtest.WorkerRenewalNoDependencyHandler)
+}
+
+func TestEQMemSimpleDocLifecycle(t *testing.T) {
+	RunQTest(t, eqtest.SimpleDocLifecycle)
+}
+
+func TestEQMemDocMultiOp(t *testing.T) {
+	RunQTest(t, eqtest.DocMultiOp)
+}
+
+func TestEQMemDocListing(t *testing.T) {
+	RunQTest(t, eqtest.DocListing)
 }

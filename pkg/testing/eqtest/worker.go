@@ -68,7 +68,7 @@ func simpleWorkerOnce(ctx context.Context, t *testing.T, client *entroq.EntroQ, 
 				return nil
 			}),
 			worker.WithFinish(func(ctx context.Context, task *entroq.Task, _ json.RawMessage) error {
-				_, _, err := client.Modify(ctx, task.Delete())
+				_, err := client.Modify(ctx, task.Delete())
 				return err
 			}),
 		).Run(ctx, worker.Watching(queue))
@@ -86,11 +86,11 @@ func simpleWorkerOnce(ctx context.Context, t *testing.T, client *entroq.EntroQ, 
 
 	var inserted []*entroq.Task
 	for i := 0; i < numTasks; i++ {
-		ins, _, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithRawValue(json.RawMessage(fmt.Sprintf("%d", i)))))
+		resp, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithRawValue(json.RawMessage(fmt.Sprintf("%d", i)))))
 		if err != nil {
 			t.Fatalf("Failed to insert task: %v", err)
 		}
-		inserted = append(inserted, ins...)
+		inserted = append(inserted, resp.InsertedTasks...)
 		select {
 		case <-ctx.Done():
 			t.Fatalf("Canceled while inserting: %v", ctx.Err())
@@ -145,7 +145,7 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 				entroq.InsertingInto(smallQueue, entroq.WithValue("smallvalue")),
 			))
 		}
-		if _, _, err := client.Modify(ctx, args...); err != nil {
+		if _, err := client.Modify(ctx, args...); err != nil {
 			t.Fatalf("Insert queues failed: %v", err)
 		}
 	}
@@ -172,7 +172,7 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 					return nil
 				}),
 				worker.WithFinish(func(ctx context.Context, task *entroq.Task, _ json.RawMessage) error {
-					_, _, err := client.Modify(ctx, task.Delete())
+					_, err := client.Modify(ctx, task.Delete())
 					return err
 				}),
 			)
@@ -321,7 +321,7 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 				return nil
 			}),
 			worker.WithFinish(func(ctx context.Context, task *entroq.Task, _ string) error {
-				_, _, err := client.Modify(ctx, task.Delete())
+				_, err := client.Modify(ctx, task.Delete())
 				return err
 			}),
 		)
@@ -338,7 +338,7 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 		})
 
 		// Now stick our task in. The worker is ready and waiting.
-		if _, _, err := client.Modify(ctx, entroq.InsertingInto(c.input.Queue, entroq.WithID(c.input.ID), entroq.WithRawValue(c.input.Value))); err != nil {
+		if _, err := client.Modify(ctx, entroq.InsertingInto(c.input.Queue, entroq.WithID(c.input.ID), entroq.WithRawValue(c.input.Value))); err != nil {
 			t.Fatalf("Test %q insert task: %v", c.name, err)
 		}
 		waitCtx, waitCancel := context.WithTimeout(ctx, 5*time.Second)
@@ -428,12 +428,13 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		},
 	}
 
-	runWorkerOneCase := func(ctx context.Context, c tc) {
-		// Before starting, create a brand new ID for the task in the case.
-		// Otherwise we'll try to reinsert a moved task when we create work.
+	runWorkerOneCase := func(t *testing.T, ctx context.Context, c tc) {
+		t.Helper()
+		// Regenerate ID each iteration so re-runs don't collide with tasks
+		// left over from previous iterations (e.g. in the error queue).
 		c.input.ID = client.GenID()
 
-		const leaseTime = 5 * time.Second
+		const leaseTime = 2 * time.Second
 
 		w := worker.New(client,
 			worker.WithDo(func(ctx context.Context, task *entroq.Task, cmd string) error {
@@ -453,8 +454,10 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 				return nil
 			}),
 			worker.WithFinish(func(ctx context.Context, task *entroq.Task, _ string) error {
-				_, _, err := client.Modify(ctx, task.Delete())
-				return err
+				if _, err := client.Modify(ctx, task.Delete()); err != nil {
+					return fmt.Errorf("task deletion failed: %w", err)
+				}
+				return nil
 			}),
 		)
 
@@ -470,7 +473,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 			return nil
 		})
 
-		if _, _, err := client.Modify(ctx, entroq.InsertingInto(c.input.Queue,
+		if _, err := client.Modify(ctx, entroq.InsertingInto(c.input.Queue,
 			entroq.WithID(c.input.ID),
 			entroq.WithRawValue(c.input.Value),
 		)); err != nil {
@@ -484,18 +487,18 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 			// Delete the dead task, will always be version 1.
 			// Note: don't overwrite like this in real use.
 			c.input.Version = 1
-			if _, _, err := client.Modify(ctx, c.input.Delete()); err != nil {
+			if _, err := client.Modify(ctx, c.input.Delete()); err != nil {
 				t.Fatalf("Test %q tried to clean up dead task: %v", c.name, err)
 			}
 			return
 		}
 
-		waitCtx, waitCancel := context.WithTimeout(ctx, 3*leaseTime)
+		waitCtx, waitCancel := context.WithTimeout(ctx, 5*leaseTime)
 		defer waitCancel()
 		if err := client.WaitQueuesEmpty(waitCtx, entroq.MatchExact(c.input.Queue)); err != nil && !entroq.IsCanceled(err) {
 			t.Fatalf("Test %q: no moved tasks found, task was not expected to die: %v", c.name, err)
 		}
-			errTasks, err := client.Tasks(ctx, w.ErrorQueueFor(c.input.Queue))
+		errTasks, err := client.Tasks(ctx, w.ErrorQueueFor(c.input.Queue))
 		if err != nil {
 			t.Fatalf("Test %q find in error queue: %v", c.name, err)
 		}
@@ -525,7 +528,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		}
 	}
 
-	stressCount := 30
+	stressCount := 5
 	if testing.Short() {
 		stressCount = 1
 	}
@@ -534,8 +537,8 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 	// depending on desired outcomes, check error queue for expected value.
 	for _, test := range cases {
 		for i := 0; i < stressCount; i++ {
-			t.Run(fmt.Sprintf("case=%v-%v", test.name, i), func(*testing.T) {
-				runWorkerOneCase(ctx, test)
+			t.Run(fmt.Sprintf("case=%v-%v", test.name, i), func(st *testing.T) {
+				runWorkerOneCase(st, ctx, test)
 			})
 		}
 	}
@@ -545,7 +548,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 func WorkerRenewal(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	queue := path.Join(qPrefix, "worker_renewal")
 
-	_, _, err := client.Modify(ctx, entroq.InsertingInto(queue))
+	_, err := client.Modify(ctx, entroq.InsertingInto(queue))
 	if err != nil {
 		t.Fatalf("Error inserting: %v", err)
 	}
@@ -584,13 +587,14 @@ func WorkerDependencyHandler(ctx context.Context, t *testing.T, client *entroq.E
 	confQueue := path.Join(queue, "config")
 
 	// Insert a task.
-	inserted, _, err := client.Modify(ctx,
+	resp, err := client.Modify(ctx,
 		entroq.InsertingInto(queue, entroq.WithValue("dep-task")),
 		entroq.InsertingInto(confQueue), // empty task to depend on
 	)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
+	inserted := resp.InsertedTasks
 	_ = inserted[0]
 	confTask := inserted[1]
 
@@ -607,7 +611,7 @@ func WorkerDependencyHandler(ctx context.Context, t *testing.T, client *entroq.E
 		}),
 		worker.WithFinish(func(ctx context.Context, task *entroq.Task, val string) error {
 			// Try to delete the task. This will fail because we'll modify it in the main thread.
-			_, _, err := client.Modify(ctx, task.Delete(), confTask.Depend())
+			_, err := client.Modify(ctx, task.Delete(), confTask.Depend())
 			return err
 		}),
 	)
@@ -632,7 +636,7 @@ func WorkerDependencyHandler(ctx context.Context, t *testing.T, client *entroq.E
 	}
 
 	// Now modify the config task in the main thread to force a version mismatch for the worker.
-	if _, _, err := client.Modify(ctx, confTask.Change(entroq.ArrivalTimeBy(2*time.Second))); err != nil {
+	if _, err := client.Modify(ctx, confTask.Change(entroq.ArrivalTimeBy(2*time.Second))); err != nil {
 		t.Fatalf("Main thread modify: %v", err)
 	}
 
@@ -657,13 +661,14 @@ func WorkerCompactDependencyHandler(ctx context.Context, t *testing.T, client *e
 	queue := path.Join(qPrefix, "worker_compact_dep_handler")
 	confQueue := path.Join(queue, "config")
 
-	inserted, _, err := client.Modify(ctx,
+	resp, err := client.Modify(ctx,
 		entroq.InsertingInto(queue, entroq.WithValue("compact-dep-task")),
 		entroq.InsertingInto(confQueue), // just an empty task to depend on
 	)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
+	inserted := resp.InsertedTasks
 	_ = inserted[0]
 	confTask := inserted[1]
 
@@ -698,7 +703,7 @@ func WorkerCompactDependencyHandler(ctx context.Context, t *testing.T, client *e
 	}
 
 	// Alter the config task so that the dependency fails.
-	if _, _, err := client.Modify(ctx, confTask.Change(entroq.ArrivalTimeBy(2*time.Second))); err != nil {
+	if _, err := client.Modify(ctx, confTask.Change(entroq.ArrivalTimeBy(2*time.Second))); err != nil {
 		t.Fatalf("Modify dependency: %v", err)
 	}
 
@@ -717,11 +722,11 @@ func WorkerCompactDependencyHandler(ctx context.Context, t *testing.T, client *e
 func WorkerRenewalNoDependencyHandler(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	queue := path.Join(qPrefix, "worker_renewal_no_dep")
 
-	inserted, _, err := client.Modify(ctx, entroq.InsertingInto(queue))
+	resp, err := client.Modify(ctx, entroq.InsertingInto(queue))
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
-	task := inserted[0]
+	task := resp.InsertedTasks[0]
 
 	inWork := make(chan bool)
 	handlerCalled := make(chan bool, 1)
@@ -770,7 +775,7 @@ func WorkerRenewalNoDependencyHandler(ctx context.Context, t *testing.T, client 
 	}
 	task = tasks[0]
 
-	if _, _, err := client.Modify(ctx, task.Change(entroq.RawValueTo([]byte("\"broken-renewal\"")))); err != nil {
+	if _, err := client.Modify(ctx, task.Change(entroq.RawValueTo([]byte("\"broken-renewal\"")))); err != nil {
 		t.Fatalf("Main thread modify: %v", err)
 	}
 

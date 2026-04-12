@@ -16,8 +16,13 @@ func RunQTest(t *testing.T, tester eqtest.Tester) {
 	if err != nil {
 		t.Fatalf("Get client: %v", err)
 	}
-	defer client.Close()
-	defer stop()
+	// Use t.Cleanup so the server outlives any parallel subtests spawned by
+	// tester. defer would fire when this function returns, before parallel
+	// subtests finish, dropping the gRPC connection mid-flight.
+	t.Cleanup(func() {
+		client.Close()
+		stop()
+	})
 	tester(ctx, t, client, "grpctest/"+entroq.Hex16Generator())
 }
 
@@ -91,4 +96,24 @@ func TestGRPCWorkerCompactDependencyHandler(t *testing.T) {
 
 func TestGRPCWorkerRenewalNoDependencyHandler(t *testing.T) {
 	RunQTest(t, eqtest.WorkerRenewalNoDependencyHandler)
+}
+
+func TestGRPCSimpleDocLifecycle(t *testing.T) {
+	RunQTest(t, eqtest.SimpleDocLifecycle)
+}
+
+func TestGRPCDocMultiOp(t *testing.T) {
+	RunQTest(t, eqtest.DocMultiOp)
+}
+
+func TestGRPCDocListing(t *testing.T) {
+	RunQTest(t, eqtest.DocListing)
+}
+
+func TestGRPCDocConcurrencyStress(t *testing.T) {
+	RunQTest(t, eqtest.DocConcurrencyStress)
+}
+
+func TestGRPCMixedAtomicStress(t *testing.T) {
+	RunQTest(t, eqtest.MixedAtomicStress)
 }

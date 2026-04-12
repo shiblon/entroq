@@ -44,7 +44,7 @@ func TestWorker_run(t *testing.T) {
 		Body:   []byte("ping"),
 		Outbox: "/test/out",
 	}
-	if _, _, err := eq.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue(req))); err != nil {
+	if _, err := eq.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue(req))); err != nil {
 		t.Fatalf("Failed to insert request task: %v", err)
 	}
 
@@ -111,7 +111,7 @@ func TestWorker_timeout(t *testing.T) {
 		Timeout: 100 * time.Millisecond, // Very short timeout!
 		Errbox:  "/test/err",
 	}
-	if _, _, err := eq.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue(req))); err != nil {
+	if _, err := eq.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue(req))); err != nil {
 		t.Fatalf("Failed to insert request task: %v", err)
 	}
 

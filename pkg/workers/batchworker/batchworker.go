@@ -80,7 +80,7 @@ func (bw *Worker[T]) Run(ctx context.Context, opts ...RunOption) error {
 		}
 		modArgs = append(modArgs, entroq.InsertingInto(bw.outbox, entroq.WithValue(values)))
 
-		if _, _, err = bw.eqc.Modify(ctx, modArgs...); err != nil {
+		if _, err = bw.eqc.Modify(ctx, modArgs...); err != nil {
 			log.Printf("Batch commit failed: %v", err)
 			// Tasks will eventually time out and be retried.
 		}

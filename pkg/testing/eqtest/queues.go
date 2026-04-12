@@ -30,10 +30,11 @@ func QueueMatch(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefi
 			toInsert = append(toInsert, entroq.InsertingInto(q))
 		}
 	}
-	inserted, _, err := client.Modify(ctx, toInsert...)
+	resp, err := client.Modify(ctx, toInsert...)
 	if err != nil {
 		t.Fatalf("in QueueMatch - inserting empty tasks: %v", err)
 	}
+	inserted := resp.InsertedTasks
 
 	// Check that we got everything inserted.
 	if want, got := len(inserted), len(toInsert); want != got {
@@ -113,7 +114,7 @@ func QueueStats(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefi
 	nothingClaimedQueue := path.Join(qPrefix, "queue-1")
 	partiallyClaimedQueue := path.Join(qPrefix, "queue-2")
 
-	if _, _, err := client.Modify(ctx,
+	if _, err := client.Modify(ctx,
 		entroq.InsertingInto(nothingClaimedQueue),
 		entroq.InsertingInto(nothingClaimedQueue),
 		entroq.InsertingInto(partiallyClaimedQueue),
@@ -161,7 +162,7 @@ func QueueStatsLimit(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 	t.Helper()
 	for i := 0; i < 3; i++ {
 		q := path.Join(qPrefix, fmt.Sprintf("queue-%d", i))
-		if _, _, err := client.Modify(ctx, entroq.InsertingInto(q)); err != nil {
+		if _, err := client.Modify(ctx, entroq.InsertingInto(q)); err != nil {
 			t.Fatalf("Insert into %v: %v", q, err)
 		}
 	}

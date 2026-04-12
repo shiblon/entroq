@@ -114,7 +114,7 @@ func RunGC(ctx context.Context, eq *entroq.EntroQ, root string, opts ...GCOption
 			if task == nil {
 				break
 			}
-			if _, _, err := eq.Modify(ctx, task.Delete()); err != nil {
+			if _, err := eq.Modify(ctx, task.Delete()); err != nil {
 				log.Printf("gc delete task in %s: %v", qname, err)
 				success = false
 			}

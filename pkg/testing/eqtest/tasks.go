@@ -16,14 +16,16 @@ func SimpleChange(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 	inQueue := path.Join(qPrefix, "simple_change", "in")
 	outQueue := path.Join(qPrefix, "simple_change", "out")
 
-	inserted, _, err := client.Modify(ctx, entroq.InsertingInto(inQueue))
+	resp, err := client.Modify(ctx, entroq.InsertingInto(inQueue))
 	if err != nil {
 		t.Fatalf("Error inserting: %v", err)
 	}
-	_, changed, err := client.Modify(ctx, inserted[0].Change(entroq.QueueTo(outQueue)))
+	inserted := resp.InsertedTasks
+	resp, err = client.Modify(ctx, inserted[0].Change(entroq.QueueTo(outQueue)))
 	if err != nil {
 		t.Fatalf("Error changing: %v", err)
 	}
+	changed := resp.ChangedTasks
 	if changed[0].Queue != outQueue {
 		t.Fatalf("Change queue: want %q, got %v", outQueue, changed[0].Queue)
 	}
@@ -60,7 +62,7 @@ func ClaimUnblocksOnNotify(ctx context.Context, t *testing.T, client *entroq.Ent
 	time.Sleep(300 * time.Millisecond) // let Claim reach its wait before inserting
 
 	start := time.Now()
-	if _, _, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue("ping"))); err != nil {
+	if _, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue("ping"))); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
 
@@ -79,7 +81,7 @@ func ClaimUnblocksOnNotify(ctx context.Context, t *testing.T, client *entroq.Ent
 func TasksOmitValue(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	queue := path.Join(qPrefix, "tasks_omit_value")
 
-	inserted, _, err := client.Modify(ctx,
+	resp, err := client.Modify(ctx,
 		entroq.InsertingInto(queue, entroq.WithValue("t1")),
 		entroq.InsertingInto(queue, entroq.WithValue("t2")),
 		entroq.InsertingInto(queue, entroq.WithValue("t3")),
@@ -87,6 +89,7 @@ func TasksOmitValue(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	if err != nil {
 		t.Fatalf("Failed to insert tasks: %v", err)
 	}
+	inserted := resp.InsertedTasks
 
 	tasks, err := client.Tasks(ctx, queue, entroq.OmitValues())
 	if err != nil {
@@ -120,10 +123,11 @@ func TasksWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	for _, id := range ids {
 		args = append(args, entroq.InsertingInto(queue, entroq.WithID(id)))
 	}
-	inserted, _, err := client.Modify(ctx, args...)
+	resp, err := client.Modify(ctx, args...)
 	if err != nil {
 		t.Fatalf("Insertion failed: %v", err)
 	}
+	inserted := resp.InsertedTasks
 	if want, got := len(ids), len(inserted); want != got {
 		t.Fatalf("Expected %d tasks inserted, got %d", want, got)
 	}
@@ -183,10 +187,11 @@ func TasksWithIDOnly(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 		modArgs = append(modArgs, entroq.InsertingInto(q, entroq.WithValue(fmt.Sprintf("val %d", i))))
 	}
 
-	ins, _, err := client.Modify(ctx, modArgs...)
+	resp, err := client.Modify(ctx, modArgs...)
 	if err != nil {
 		t.Fatalf("Initial insert failed: %v", err)
 	}
+	ins := resp.InsertedTasks
 
 	var ids1, ids2 []string
 	var tasks1, tasks2 []*entroq.Task
@@ -235,10 +240,12 @@ func InsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 	knownID := client.GenID()
 
 	// Insert task with an explicit ID.
-	inserted, changed, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithID(knownID)))
+	resp, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithID(knownID)))
 	if err != nil {
 		t.Fatalf("Unable to insert task with known ID %q: %v", knownID, err)
 	}
+	inserted := resp.InsertedTasks
+	changed := resp.ChangedTasks
 
 	// Check that insertion with explicit IDs works.
 	if len(changed) != 0 {
@@ -266,7 +273,7 @@ func InsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 	}
 
 	// Try to insert with a known ID that's already there.
-	_, _, err = client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithID(knownID)))
+	_, err = client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithID(knownID)))
 	if err == nil {
 		t.Fatalf("Expected error inserting with existing ID %v, but got no error", knownID)
 	}
@@ -279,7 +286,7 @@ func InsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 	}
 
 	// Try to insert with a known ID when the task is in a different queue.
-	_, _, err = client.Modify(ctx, entroq.InsertingInto(queue+"/elsewhere", entroq.WithID(knownID)))
+	_, err = client.Modify(ctx, entroq.InsertingInto(queue+"/elsewhere", entroq.WithID(knownID)))
 	if err == nil {
 		t.Fatalf("Expected error inserting existing ID %v into a different queue, but got no error", knownID)
 	}
@@ -292,20 +299,20 @@ func InsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 	}
 
 	// Try to insert again, but allow it to be skipped.
-	_, _, err = client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithID(knownID), entroq.WithSkipColliding(true)))
+	_, err = client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithID(knownID), entroq.WithSkipColliding(true)))
 	if err != nil {
 		t.Fatalf("Expected no error inserting with existing skippable ID %v: %v", knownID, err)
 	}
 
-	// Insert another task.
-	inserted, _, err = client.Modify(ctx, entroq.InsertingInto(queue))
+	resp, err = client.Modify(ctx, entroq.InsertingInto(queue))
 	if err != nil {
 		t.Fatalf("Expected no insertion error, got: %v", err)
 	}
+	inserted = resp.InsertedTasks
 
 	// Try to insert the known ID and delete the new ID at the same time. This
 	// should work when it's set to skip colliding.
-	if _, _, err = client.Modify(ctx,
+	if _, err = client.Modify(ctx,
 		entroq.InsertingInto(queue,
 			entroq.WithID(knownID),
 			entroq.WithSkipColliding(true)),
@@ -368,10 +375,12 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 		insData = append(insData, task.Data())
 	}
 
-	inserted, changed, err := client.Modify(ctx, entroq.Inserting(insData...))
+	resp, err := client.Modify(ctx, entroq.Inserting(insData...))
 	if err != nil {
 		t.Fatalf("Got unexpected error inserting two tasks: %+v", err)
 	}
+	inserted := resp.InsertedTasks
+	changed := resp.ChangedTasks
 	if changed != nil {
 		t.Fatalf("Got unexpected changes during insertion: %+v", err)
 	}
@@ -458,7 +467,7 @@ func DeleteMissingTask(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	if _, _, err := client.Modify(ctx, entroq.Deleting("fake_task_id", 0)); err != nil {
+	if _, err := client.Modify(ctx, entroq.Deleting("fake_task_id", 0)); err != nil {
 		if depErr, ok := entroq.AsDependency(err); !ok {
 			t.Fatalf("Expected dependency error when deleting missing task, got: %v", err)
 		} else {
@@ -470,12 +479,13 @@ func DeleteMissingTask(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		t.Fatalf("Expected error when deleting missing task, got: %v", err)
 	}
 
-	ins, _, err := client.Modify(ctx, entroq.InsertingInto("my queue", entroq.WithValue("hi")))
+	resp, err := client.Modify(ctx, entroq.InsertingInto("my queue", entroq.WithValue("hi")))
 	if err != nil {
 		t.Fatalf("Error inserting task for delete missing test: %v", err)
 	}
+	ins := resp.InsertedTasks
 
-	if _, _, err := client.Modify(ctx, entroq.Deleting(ins[0].ID, 1 /* wrong version */)); err != nil {
+	if _, err := client.Modify(ctx, entroq.Deleting(ins[0].ID, 1 /* wrong version */)); err != nil {
 		if depErr, ok := entroq.AsDependency(err); !ok {
 			t.Fatalf("Expected dependency error when deleting with wrong version, got: %v", err)
 		} else {

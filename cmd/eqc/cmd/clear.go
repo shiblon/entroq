@@ -63,7 +63,7 @@ var clearCmd = &cobra.Command{
 				}
 				for cid, args := range byClaimant {
 					forceArgs := append(args, entroq.ModifyAs(cid))
-					if _, _, err := eq.Modify(ctx, forceArgs...); err != nil {
+					if _, err := eq.Modify(ctx, forceArgs...); err != nil {
 						log.Fatalf("Force clear failed: %v", err)
 					}
 				}
@@ -88,7 +88,7 @@ var clearCmd = &cobra.Command{
 				}
 				log.Fatalf("Error claiming: %v", err)
 			}
-			if _, _, err := eq.Modify(ctx, task.Delete()); err != nil {
+			if _, err := eq.Modify(ctx, task.Delete()); err != nil {
 				log.Fatalf("Error deleting: %v", err)
 			}
 		}
