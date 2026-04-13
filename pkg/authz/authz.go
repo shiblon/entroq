@@ -48,7 +48,10 @@ type Request struct {
 	Authz *Authorization `json:"authz"`
 	// Queues contains information about what is desired: what queues to
 	// operate on, and what should be done to them.
-	Queues []*Queue `json:"queues"`
+	Queues []*Queue `json:"queues,omitempty"`
+	// Namespaces contains information about what is desired for document
+	// storage: what namespaces to operate on, and what actions to take.
+	Namespaces []*Namespace `json:"namespaces,omitempty"`
 }
 
 // NewYAMLRequest creates a request from YAML/JSON.
@@ -103,6 +106,17 @@ type Queue struct {
 	Actions []Action `yaml:",flow" json:"actions"`
 }
 
+// Namespace contains information about a single namespace. Like queues,
+// it supports exact or prefix matching.
+type Namespace struct {
+	// An exact name to match.
+	Exact string `yaml:",omitempty" json:"exact,omitempty"`
+	// The kind of matching to do (default exact)
+	Prefix string `yaml:",omitempty" json:"prefix,omitempty"`
+	// Actions contains the desired things to be done with this namespace.
+	Actions []Action `yaml:",flow" json:"actions"`
+}
+
 // String produces a simple string representing this queue spec.
 func (q *Queue) String() string {
 	vals := []string{
@@ -131,6 +145,10 @@ type AuthzError struct {
 	// were not matched. If multiple actions were desired for a single queue,
 	// only those disallowed are expected to be given back in the response.
 	Failed []*Queue `json:"failed"`
+
+	// FailedNamespaces contains namespace information for things that were
+	// not allowed by policy.
+	FailedNamespaces []*Namespace `json:"failed_namespaces"`
 
 	// For other kinds of errors.
 	Errors []string `json:"errors"`

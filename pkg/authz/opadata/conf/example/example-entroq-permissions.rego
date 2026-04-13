@@ -23,8 +23,14 @@ user_queues contains qs if {
 	some qs in this_user.queues
 }
 
+user_namespaces contains ns if {
+	some ns in this_user.namespaces
+}
+
 # Auto-grant every authenticated user full access to their personal /users/<name>/ prefix.
 user_queues contains {"prefix": concat("", ["/users/", equser.name, "/"]), "actions": ["ALL"]}
+
+user_namespaces contains {"prefix": concat("", ["/users/", equser.name, "/"]), "actions": ["ALL"]}
 
 role_queues contains q if {
 	some r in policy.roles
@@ -32,6 +38,16 @@ role_queues contains q if {
 	some q in r.queues
 }
 
+role_namespaces contains n if {
+	some r in policy.roles
+	({x | some x in this_user.roles} | {"*"})[r.name]
+	some n in r.namespaces
+}
+
 allowed_queues contains q if {
 	some q in (user_queues | role_queues)
+}
+
+allowed_namespaces contains n if {
+	some n in (user_namespaces | role_namespaces)
 }
