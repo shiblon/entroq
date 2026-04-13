@@ -2,8 +2,8 @@ package eqgrpc
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/shiblon/entroq"
@@ -13,6 +13,10 @@ import (
 
 // fromDocProto converts a proto Doc to an entroq.Doc.
 func fromDocProto(d *pb.Doc) *entroq.Doc {
+	content, err := protoToJSON(d.Content)
+	if err != nil {
+		log.Printf("ERROR: doc content conversion: %v", err)
+	}
 	return &entroq.Doc{
 		Namespace:    d.Namespace,
 		ID:           d.Id,
@@ -22,7 +26,7 @@ func fromDocProto(d *pb.Doc) *entroq.Doc {
 		ExpiresAt:    fromMS(d.ExpiresAtMs),
 		Key:          d.Key,
 		SecondaryKey: d.SecondaryKey,
-		Content:      json.RawMessage(d.Content),
+		Content:      content,
 		Created:      fromMS(d.CreatedMs),
 		Modified:     fromMS(d.ModifiedMs),
 	}
