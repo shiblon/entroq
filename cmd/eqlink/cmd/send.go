@@ -1,9 +1,11 @@
 package cmd
 
 import (
+	"fmt"
+
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
 	"github.com/shiblon/entroq/pkg/async"
+	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
 	"github.com/spf13/cobra"
 )
 
@@ -18,14 +20,26 @@ Use "eqlink run" to start the full sidecar (sender + receiver + GC).`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
+		_, stopMetrics, err := setupMetrics(ctx)
+		if err != nil {
+			return fmt.Errorf("metrics: %w", err)
+		}
+		defer stopMetrics()
+
 		eq, err := entroq.New(ctx, eqgrpc.Opener(entroqAddr, eqgrpc.WithInsecure()))
 		if err != nil {
 			return err
 		}
 		defer eq.Close()
 
+		tlsCfg, err := loadTLSConfig(certFile, keyFile, caFile)
+		if err != nil {
+			return fmt.Errorf("load tls: %w", err)
+		}
+
 		sender := async.NewSender(eq, senderAddr, myQueue,
 			async.WithSenderRequestTimeout(requestTimeout),
+			async.WithSenderTLSConfig(tlsCfg),
 		)
 		return sender.Run(ctx)
 	},

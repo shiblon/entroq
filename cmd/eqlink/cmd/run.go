@@ -4,14 +4,15 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
 	"github.com/shiblon/entroq/pkg/async"
+	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
 	"github.com/shiblon/entroq/pkg/worker"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
@@ -58,8 +59,14 @@ Graceful shutdown on SIGINT/SIGTERM:
 		}
 		defer eq.Close()
 
+		tlsCfg, err := loadTLSConfig(certFile, keyFile, caFile)
+		if err != nil {
+			return fmt.Errorf("load tls: %w", err)
+		}
+
 		sender := async.NewSender(eq, senderAddr, myQueue,
 			async.WithSenderRequestTimeout(requestTimeout),
+			async.WithSenderTLSConfig(tlsCfg),
 		)
 
 		g, _ := errgroup.WithContext(ctx)
@@ -68,10 +75,20 @@ Graceful shutdown on SIGINT/SIGTERM:
 			return sender.Run(ctx)
 		})
 
+		var rcvOpts []async.ReceiverOption
+		if tlsCfg != nil {
+			rcvOpts = append(rcvOpts, async.WithReceiverHTTPClient(&http.Client{
+				Transport: &http.Transport{
+					TLSClientConfig:     tlsCfg,
+					MaxIdleConnsPerHost: 32,
+				},
+			}))
+		}
+
 		rcvCtx, rcvCancel := context.WithCancel(ctx)
 		defer rcvCancel()
 		recvWorker := worker.New(eq,
-			worker.WithDoModify(async.ReceiverHandler(upstream)),
+			worker.WithDoModify(async.ReceiverHandler(upstream, rcvOpts...)),
 		)
 		for range concurrency {
 			g.Go(func() error {
@@ -128,6 +145,7 @@ func init() {
 	flags.DurationVar(&drainTimeout, "drain_timeout", 35*time.Second, "How long to wait for in-flight requests to finish on shutdown.")
 	flags.DurationVar(&gcInterval, "gc_interval", 10*time.Minute, "How often to run the GC scan.")
 	flags.DurationVar(&gcGrace, "gc_grace", 15*time.Second, "Extra time after expiry before GC deletes a response queue.")
+
 	runCmd.MarkFlagRequired("queue")
 
 	rootCmd.AddCommand(runCmd)

@@ -2,6 +2,7 @@ package async
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"github.com/shiblon/entroq"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
+	"google.golang.org/grpc/metadata"
 )
 
 const defaultRequestTimeout = 30 * time.Second
@@ -37,6 +39,7 @@ type Sender struct {
 	requestTimeout time.Duration
 	addr           string
 	mp             metric.MeterProvider
+	tlsConfig      *tls.Config
 
 	srv *http.Server // set by Serve; Close uses it for shutdown
 
@@ -63,6 +66,14 @@ func WithSenderRequestTimeout(d time.Duration) SenderOption {
 func WithSenderMeterProvider(mp metric.MeterProvider) SenderOption {
 	return func(s *Sender) {
 		s.mp = mp
+	}
+}
+
+// WithSenderTLSConfig sets the TLS configuration for the sender's HTTP server.
+// If provided, the server will use this config for mTLS and identity extraction.
+func WithSenderTLSConfig(cfg *tls.Config) SenderOption {
+	return func(s *Sender) {
+		s.tlsConfig = cfg
 	}
 }
 
@@ -141,11 +152,21 @@ func (s *Sender) Serve(ctx context.Context, lis net.Listener) error {
 	}
 
 	s.Lock()
-	s.srv = &http.Server{Handler: s}
+	s.srv = &http.Server{
+		Handler:   s,
+		TLSConfig: s.tlsConfig,
+	}
 	srv := s.srv
 	s.Unlock()
 
-	if err := srv.Serve(lis); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	var err error
+	if s.tlsConfig != nil {
+		err = srv.ServeTLS(lis, "", "")
+	} else {
+		err = srv.Serve(lis)
+	}
+
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("sender serve: %w", err)
 	}
 	return nil
@@ -165,6 +186,14 @@ func (s *Sender) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	ctx := r.Context()
+
+	// If we have TLS peer certificates, use the Common Name as the identity
+	// for the underlying EntroQ calls. This allows the backend to perform
+	// authorization based on the mTLS identity of the caller.
+	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+		cn := r.TLS.PeerCertificates[0].Subject.CommonName
+		ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "mTLS "+cn)
+	}
 
 	targetQueue, forwardPath, err := parsePath(r.URL.Path)
 	if err != nil {
