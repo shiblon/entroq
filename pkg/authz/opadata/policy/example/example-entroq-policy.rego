@@ -10,11 +10,19 @@ users := [{
 		"prefix": "/users/auser/",
 		"actions": ["*"],
 	}],
+	"namespaces": [{
+		"prefix": "/users/auser/",
+		"actions": ["*"],
+	}],
 }]
 
 roles := [{
 	"name": "*",
 	"queues": [{
+		"prefix": "/global/",
+		"actions": ["READ"],
+	}],
+	"namespaces": [{
 		"prefix": "/global/",
 		"actions": ["READ"],
 	}],

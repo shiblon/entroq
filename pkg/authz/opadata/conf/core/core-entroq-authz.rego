@@ -24,6 +24,7 @@ package entroq.authz
 
 import rego.v1
 
+import data.entroq.namespaces
 import data.entroq.permissions
 import data.entroq.queues
 import data.entroq.user
@@ -32,9 +33,13 @@ failed contains q if {
 	some q in queues.disallowed(input.queues, permissions.allowed_queues)
 }
 
-# Add a message containing user information if there are queue mismatches.
+failed_namespaces contains n if {
+	some n in namespaces.disallowed(input.namespaces, permissions.allowed_namespaces)
+}
+
+# Add a message containing user information if there are queue or namespace mismatches.
 errors contains msg if {
-	count(failed) > 0
+	(count(failed) + count(failed_namespaces)) > 0
 	user.name
 	msg := concat("User: ", user.name)
 }
@@ -42,13 +47,16 @@ errors contains msg if {
 default allow := false
 
 allow if {
-	# It is possible to have allowed queues for non-authorized users.
-	# We only say "allow" if there are, in fact, some queues that _could_ be
+	# It is possible to have allowed resources for non-authorized users.
+	# We only say "allow" if there are, in fact, some resources that _could_ be
 	# allowed.
-	count(permissions.allowed_queues) > 0
+	(count(permissions.allowed_queues) + count(permissions.allowed_namespaces)) > 0
 
 	# Only allow if none of the allowed queues failed.
 	count(failed) == 0
+
+	# Only allow if none of the allowed namespaces failed.
+	count(failed_namespaces) == 0
 
 	# Only allow if there are no additional errors.
 	count(errors) == 0
