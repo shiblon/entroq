@@ -53,6 +53,7 @@ import (
 
 	pb "github.com/shiblon/entroq/api"
 	hpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 const (
@@ -247,7 +248,33 @@ func toMS(t time.Time) int64 {
 	return t.Truncate(time.Millisecond).UnixNano() / 1000000
 }
 
+func jsonToProto(raw []byte) (*structpb.Value, error) {
+	if len(raw) == 0 {
+		return structpb.NewNullValue(), nil
+	}
+	v := new(structpb.Value)
+	if err := v.UnmarshalJSON(raw); err != nil {
+		return nil, fmt.Errorf("json to proto: %w", err)
+	}
+	return v, nil
+}
+
+func protoToJSON(v *structpb.Value) ([]byte, error) {
+	if v == nil {
+		return nil, nil
+	}
+	b, err := v.MarshalJSON()
+	if err != nil {
+		return nil, fmt.Errorf("proto to json: %w", err)
+	}
+	return b, nil
+}
+
 func fromTaskProto(t *pb.Task) (*entroq.Task, error) {
+	val, err := protoToJSON(t.Value)
+	if err != nil {
+		return nil, fmt.Errorf("task value: %w", err)
+	}
 	return &entroq.Task{
 		Queue:    t.Queue,
 		ID:       t.Id,
@@ -255,7 +282,7 @@ func fromTaskProto(t *pb.Task) (*entroq.Task, error) {
 		At:       fromMS(t.AtMs),
 		Claimant: t.ClaimantId,
 		Claims:   t.Claims,
-		Value:    t.Value,
+		Value:    val,
 		Created:  fromMS(t.CreatedMs),
 		Modified: fromMS(t.ModifiedMs),
 		// Omit FromQueue - not needed here.
@@ -265,10 +292,14 @@ func fromTaskProto(t *pb.Task) (*entroq.Task, error) {
 }
 
 func protoFromTaskData(td *entroq.TaskData) (*pb.TaskData, error) {
+	val, err := jsonToProto(td.Value)
+	if err != nil {
+		return nil, fmt.Errorf("task data value: %w", err)
+	}
 	return &pb.TaskData{
 		Queue:   td.Queue,
 		AtMs:    toMS(td.At),
-		Value:   td.Value,
+		Value:   val,
 		Attempt: td.Attempt,
 		Err:     td.Err,
 		Id:      td.ID,
@@ -529,22 +560,30 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (*entroq
 	}
 
 	for _, di := range mod.DocInserts {
+		val, err := jsonToProto(di.Content)
+		if err != nil {
+			return nil, fmt.Errorf("doc insert value: %w", err)
+		}
 		req.DocInserts = append(req.DocInserts, &pb.DocData{
 			Namespace:    di.Namespace,
 			Id:           di.ID,
 			Key:          di.Key,
 			SecondaryKey: di.SecondaryKey,
-			Content:      []byte(di.Content),
+			Content:      val,
 			ExpiresAtMs:  toMS(di.ExpiresAt),
 			CreatedMs:    toMS(di.Created),
 			ModifiedMs:   toMS(di.Modified),
 		})
 	}
 	for _, dc := range mod.DocChanges {
+		val, err := jsonToProto(dc.Content)
+		if err != nil {
+			return nil, fmt.Errorf("doc change value: %w", err)
+		}
 		req.DocChanges = append(req.DocChanges, &pb.DocChange{
 			OldId: &pb.DocID{Namespace: dc.Namespace, Id: dc.ID, Version: dc.Version},
 			NewData: &pb.DocData{
-				Content:     []byte(dc.Content),
+				Content:     val,
 				ExpiresAtMs: toMS(dc.ExpiresAt),
 			},
 		})

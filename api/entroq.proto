@@ -3,6 +3,7 @@ syntax = "proto3";
 package api;
 
 import "google/api/annotations.proto";
+import "google/protobuf/struct.proto";
 
 option go_package = "github.com/shiblon/entroq/api;api";
 
@@ -29,8 +30,8 @@ message TaskData {
   // The epoch time in millis when this task becomes available.
   int64 at_ms = 2;
 
-  // The task's JSON payload (opaque bytes).
-  bytes value = 3;
+  // The task's JSON payload.
+  google.protobuf.Value value = 3;
 
   // An optional ID (UUID) for an inserted task to use.
   // Default is for the backend to assign one, and that is sufficient for many
@@ -69,8 +70,8 @@ message Task {
   // The UUID representing the claimant (owner) for this task.
   string claimant_id = 5;
 
-  // The task's JSON payload (opaque bytes).
-  bytes value = 6;
+  // The task's JSON payload.
+  google.protobuf.Value value = 6;
 
   // Epoch times in millis for creation and update of this task.
   int64 created_ms = 7;
@@ -144,7 +145,7 @@ message DocData {
   string id = 2;
   string key = 3;
   string secondary_key = 4;
-  bytes content = 5;
+  google.protobuf.Value content = 5;
   int64 expires_at_ms = 6;
   int64 created_ms = 7;
   int64 modified_ms = 8;
@@ -167,7 +168,7 @@ message Doc {
   int64 expires_at_ms = 6;
   string key = 7;
   string secondary_key = 8;
-  bytes content = 9;
+  google.protobuf.Value content = 9;
   int64 created_ms = 10;
   int64 modified_ms = 11;
 }

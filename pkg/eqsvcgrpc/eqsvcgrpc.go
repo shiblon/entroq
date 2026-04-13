@@ -51,6 +51,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/structpb"
 
 	pb "github.com/shiblon/entroq/api"
 )
@@ -282,7 +283,33 @@ func toMS(t time.Time) int64 {
 	return t.Truncate(time.Millisecond).UnixNano() / 1000000
 }
 
+func jsonToProto(raw []byte) (*structpb.Value, error) {
+	if len(raw) == 0 {
+		return structpb.NewNullValue(), nil
+	}
+	v := new(structpb.Value)
+	if err := v.UnmarshalJSON(raw); err != nil {
+		return nil, fmt.Errorf("json to proto: %w", err)
+	}
+	return v, nil
+}
+
+func protoToJSON(v *structpb.Value) ([]byte, error) {
+	if v == nil {
+		return nil, nil
+	}
+	b, err := v.MarshalJSON()
+	if err != nil {
+		return nil, fmt.Errorf("proto to json: %w", err)
+	}
+	return b, nil
+}
+
 func protoFromTask(t *entroq.Task) (*pb.Task, error) {
+	val, err := jsonToProto(t.Value)
+	if err != nil {
+		return nil, fmt.Errorf("task value: %w", err)
+	}
 	return &pb.Task{
 		Queue:      t.Queue,
 		Id:         t.ID,
@@ -290,7 +317,7 @@ func protoFromTask(t *entroq.Task) (*pb.Task, error) {
 		AtMs:       toMS(t.At),
 		ClaimantId: t.Claimant,
 		Claims:     t.Claims,
-		Value:      t.Value,
+		Value:      val,
 		CreatedMs:  toMS(t.Created),
 		ModifiedMs: toMS(t.Modified),
 		Attempt:    t.Attempt,
@@ -474,21 +501,29 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 		entroq.ModifyAs(req.ClaimantId),
 	}
 	for _, insert := range req.Inserts {
+		val, err := protoToJSON(insert.Value)
+		if err != nil {
+			return nil, autoCodeErrorf("insert value: %w", err)
+		}
 		modArgs = append(modArgs,
 			entroq.InsertingInto(insert.Queue,
 				entroq.WithArrivalTime(fromMS(insert.AtMs)),
-				entroq.WithRawValue(insert.Value),
+				entroq.WithRawValue(val),
 				entroq.WithAttempt(insert.Attempt),
 				entroq.WithErr(insert.Err),
 				entroq.WithID(insert.Id)))
 	}
 	for _, change := range req.Changes {
+		val, err := protoToJSON(change.GetNewData().GetValue())
+		if err != nil {
+			return nil, autoCodeErrorf("change value: %w", err)
+		}
 		t := &entroq.Task{
 			ID:        change.GetOldId().Id,
 			Version:   change.GetOldId().Version,
 			Claimant:  req.ClaimantId,
 			Queue:     change.GetNewData().Queue,
-			Value:     change.GetNewData().Value,
+			Value:     val,
 			At:        fromMS(change.GetNewData().AtMs),
 			Attempt:   change.GetNewData().Attempt,
 			Err:       change.GetNewData().Err,
@@ -503,12 +538,16 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 		modArgs = append(modArgs, entroq.DependingOn(dep.Id, dep.Version, entroq.WithIDQueue(dep.Queue)))
 	}
 	for _, di := range req.DocInserts {
+		val, err := protoToJSON(di.Content)
+		if err != nil {
+			return nil, autoCodeErrorf("doc insert content: %w", err)
+		}
 		modArgs = append(modArgs, entroq.InsertingDoc(&entroq.DocData{
 			Namespace:    di.Namespace,
 			ID:           di.Id,
 			Key:          di.Key,
 			SecondaryKey: di.SecondaryKey,
-			Content:      di.Content,
+			Content:      val,
 			ExpiresAt:    fromMS(di.ExpiresAtMs),
 			Created:      fromMS(di.CreatedMs),
 			Modified:     fromMS(di.ModifiedMs),
@@ -517,11 +556,15 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 	for _, dc := range req.DocChanges {
 		old := dc.GetOldId()
 		nd := dc.GetNewData()
+		val, err := protoToJSON(nd.Content)
+		if err != nil {
+			return nil, autoCodeErrorf("doc change content: %w", err)
+		}
 		d := &entroq.Doc{
 			Namespace: old.GetNamespace(),
 			ID:        old.GetId(),
 			Version:   old.GetVersion(),
-			Content:   nd.GetContent(),
+			Content:   val,
 			ExpiresAt: fromMS(nd.GetExpiresAtMs()),
 		}
 		modArgs = append(modArgs, d.Change())
@@ -596,10 +639,18 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 		pbResp.Changed = append(pbResp.Changed, pt)
 	}
 	for _, d := range resp.InsertedDocs {
-		pbResp.InsertedDocs = append(pbResp.InsertedDocs, protoFromDoc(d))
+		pd, err := protoFromDoc(d)
+		if err != nil {
+			return nil, autoCodeErrorf("modify inserted doc proto: %w", err)
+		}
+		pbResp.InsertedDocs = append(pbResp.InsertedDocs, pd)
 	}
 	for _, d := range resp.ChangedDocs {
-		pbResp.ChangedDocs = append(pbResp.ChangedDocs, protoFromDoc(d))
+		pd, err := protoFromDoc(d)
+		if err != nil {
+			return nil, autoCodeErrorf("modify changed doc proto: %w", err)
+		}
+		pbResp.ChangedDocs = append(pbResp.ChangedDocs, pd)
 	}
 	return pbResp, nil
 }
@@ -699,7 +750,11 @@ func (s *QSvc) Time(ctx context.Context, req *pb.TimeRequest) (*pb.TimeResponse,
 }
 
 // protoFromDoc converts an entroq.Doc to its proto representation.
-func protoFromDoc(d *entroq.Doc) *pb.Doc {
+func protoFromDoc(d *entroq.Doc) (*pb.Doc, error) {
+	content, err := jsonToProto(d.Content)
+	if err != nil {
+		return nil, fmt.Errorf("doc content: %w", err)
+	}
 	return &pb.Doc{
 		Namespace:    d.Namespace,
 		Id:           d.ID,
@@ -709,10 +764,10 @@ func protoFromDoc(d *entroq.Doc) *pb.Doc {
 		ExpiresAtMs:  toMS(d.ExpiresAt),
 		Key:          d.Key,
 		SecondaryKey: d.SecondaryKey,
-		Content:      []byte(d.Content),
+		Content:      content,
 		CreatedMs:    toMS(d.Created),
 		ModifiedMs:   toMS(d.Modified),
-	}
+	}, nil
 }
 
 // docClaimDepDetails converts a DependencyError's doc fields into ModifyDep
@@ -753,7 +808,11 @@ func (s *QSvc) Docs(ctx context.Context, req *pb.DocsRequest) (*pb.DocsResponse,
 	}
 	resp := new(pb.DocsResponse)
 	for _, d := range docs {
-		resp.Docs = append(resp.Docs, protoFromDoc(d))
+		pd, err := protoFromDoc(d)
+		if err != nil {
+			return nil, autoCodeErrorf("docs doc proto: %w", err)
+		}
+		resp.Docs = append(resp.Docs, pd)
 	}
 	return resp, nil
 }
@@ -782,7 +841,11 @@ func (s *QSvc) ClaimDocs(ctx context.Context, req *pb.ClaimDocsRequest) (*pb.Cla
 	}
 	resp := new(pb.ClaimDocsResponse)
 	for _, d := range claimed {
-		resp.Docs = append(resp.Docs, protoFromDoc(d))
+		pd, err := protoFromDoc(d)
+		if err != nil {
+			return nil, autoCodeErrorf("claim docs doc proto: %w", err)
+		}
+		resp.Docs = append(resp.Docs, pd)
 	}
 	return resp, nil
 }
