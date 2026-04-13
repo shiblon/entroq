@@ -22,7 +22,8 @@ import (
 type ReceiverOption func(*receiverConfig)
 
 type receiverConfig struct {
-	mp metric.MeterProvider
+	mp         metric.MeterProvider
+	httpClient *http.Client
 }
 
 // WithReceiverMeterProvider sets the OTel MeterProvider for the receiver.
@@ -30,6 +31,14 @@ type receiverConfig struct {
 func WithReceiverMeterProvider(mp metric.MeterProvider) ReceiverOption {
 	return func(c *receiverConfig) {
 		c.mp = mp
+	}
+}
+
+// WithReceiverHTTPClient sets the HTTP client used for forwarding requests.
+// This allows for custom TLS configurations, timeouts, and connection pooling.
+func WithReceiverHTTPClient(client *http.Client) ReceiverOption {
+	return func(c *receiverConfig) {
+		c.httpClient = client
 	}
 }
 
@@ -45,7 +54,14 @@ func WithReceiverMeterProvider(mp metric.MeterProvider) ReceiverOption {
 //	    worker.WithDoModify(async.ReceiverHandler("http://localhost:8000")),
 //	).Run(ctx)
 func ReceiverHandler(upstream string, opts ...ReceiverOption) worker.DoModifyRun[Envelope] {
-	cfg := &receiverConfig{mp: noop.NewMeterProvider()}
+	cfg := &receiverConfig{
+		mp: noop.NewMeterProvider(),
+		httpClient: &http.Client{
+			Transport: &http.Transport{
+				MaxIdleConnsPerHost: 32,
+			},
+		},
+	}
 	for _, o := range opts {
 		o(cfg)
 	}
@@ -61,12 +77,6 @@ func ReceiverHandler(upstream string, opts ...ReceiverOption) worker.DoModifyRun
 		metric.WithDescription("Task handling duration in seconds."),
 		metric.WithUnit("s"),
 	)
-
-	client := &http.Client{
-		Transport: &http.Transport{
-			MaxIdleConnsPerHost: 32,
-		},
-	}
 	return func(ctx context.Context, task *entroq.Task, env Envelope, _ []*entroq.Doc) ([]entroq.ModifyArg, error) {
 		start := time.Now()
 		defer func() {
@@ -74,7 +84,7 @@ func ReceiverHandler(upstream string, opts ...ReceiverOption) worker.DoModifyRun
 			duration.Record(ctx, time.Since(start).Seconds())
 		}()
 
-		resp, err := forward(ctx, client, upstream, env)
+		resp, err := forward(ctx, cfg.httpClient, upstream, env)
 		if err != nil {
 			log.Printf("receiver forward %s%s: %v", upstream, env.Path, err)
 			forwardErrors.Add(ctx, 1)

@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"net/http"
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/async"
@@ -22,14 +23,35 @@ Use "eqlink run" to start the full sidecar (sender + receiver + GC).`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
+		_, stopMetrics, err := setupMetrics(ctx)
+		if err != nil {
+			return fmt.Errorf("metrics: %w", err)
+		}
+		defer stopMetrics()
+
 		eq, err := entroq.New(ctx, eqgrpc.Opener(entroqAddr, eqgrpc.WithInsecure()))
 		if err != nil {
 			return err
 		}
 		defer eq.Close()
 
+		tlsCfg, err := loadTLSConfig(certFile, keyFile, caFile)
+		if err != nil {
+			return fmt.Errorf("load tls: %w", err)
+		}
+
+		var rcvOpts []async.ReceiverOption
+		if tlsCfg != nil {
+			rcvOpts = append(rcvOpts, async.WithReceiverHTTPClient(&http.Client{
+				Transport: &http.Transport{
+					TLSClientConfig:     tlsCfg,
+					MaxIdleConnsPerHost: 32,
+				},
+			}))
+		}
+
 		recvWorker := worker.New(eq,
-			worker.WithDoModify(async.ReceiverHandler(upstream)),
+			worker.WithDoModify(async.ReceiverHandler(upstream, rcvOpts...)),
 		)
 
 		g, ctx := errgroup.WithContext(ctx)
