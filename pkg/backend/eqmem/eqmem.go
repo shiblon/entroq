@@ -81,7 +81,7 @@ type qLock struct {
 type nsLock struct {
 	sync.Mutex
 	namespace string
-	docs *docNamespace
+	docs      *docNamespace
 	// Because we become dependent on the *existence* of the lock before we can
 	// actually take it, and the global lock must be released before taking
 	// this one, this gets incremented while we hold the global lock,
@@ -596,7 +596,7 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 		byNS[nl.namespace] = nl
 	}
 
-	// Find the actual tasks and resources involved. 
+	// Find the actual tasks and resources involved.
 	found := make(map[string]*entroq.Task)
 	addFound := func(q string, id string) {
 		if q == "" || id == "" {
@@ -609,14 +609,14 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 		}
 	}
 
-	foundRes := make(map[string]*entroq.Doc)
-	addFoundRes := func(ns string, id string) {
+	foundDocs := make(map[string]*entroq.Doc)
+	addFoundDoc := func(ns string, id string) {
 		if ns == "" || id == "" {
 			return
 		}
 		if nl, ok := byNS[ns]; ok {
-			if r, ok := nl.docs.Get(id); ok {
-				foundRes[entroq.DocKey(ns, r.ID)] = r
+			if d, ok := nl.docs.Get(id); ok {
+				foundDocs[entroq.DocKey(ns, d.ID)] = d
 			}
 		}
 	}
@@ -638,19 +638,19 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 	}
 
 	for _, d := range mod.DocDeletes {
-		addFoundRes(d.Namespace, d.ID)
+		addFoundDoc(d.Namespace, d.ID)
 	}
 	for _, d := range mod.DocDepends {
-		addFoundRes(d.Namespace, d.ID)
+		addFoundDoc(d.Namespace, d.ID)
 	}
 	for _, c := range mod.DocChanges {
-		addFoundRes(c.Namespace, c.ID)
+		addFoundDoc(c.Namespace, c.ID)
 	}
 	for _, t := range mod.DocInserts {
-		addFoundRes(t.Namespace, t.ID)
+		addFoundDoc(t.Namespace, t.ID)
 	}
 
-	if err := mod.DependencyError(found, foundRes); err != nil {
+	if err := mod.DependencyError(found, foundDocs); err != nil {
 		depErr, ok := entroq.AsDependency(err)
 		if !ignoreClaimant || !ok || !depErr.OnlyClaims() {
 			return nil, fmt.Errorf("eqmem modify: %w", err)
@@ -758,8 +758,8 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 			Namespace:    rd.Namespace,
 			ID:           id,
 			Content:      rd.Content,
-			KeyPrimary:   rd.KeyPrimary,
-			KeySecondary: rd.KeySecondary,
+			Key:          rd.Key,
+			SecondaryKey: rd.SecondaryKey,
 			ExpiresAt:    rd.ExpiresAt,
 			Claimant:     mod.Claimant,
 			Created:      created,
@@ -786,10 +786,10 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 	// version by one before re-applying so the version-check passes.
 	if m.journal != nil {
 		jMod := &entroq.Modification{
-			Claimant:        mod.Claimant,
-			Deletes:         mod.Deletes,
-			Depends:         mod.Depends,
-			Changes:         resp.ChangedTasks,
+			Claimant:   mod.Claimant,
+			Deletes:    mod.Deletes,
+			Depends:    mod.Depends,
+			Changes:    resp.ChangedTasks,
 			DocDeletes: mod.DocDeletes,
 			DocDepends: mod.DocDepends,
 			DocChanges: resp.ChangedDocs,
@@ -1097,7 +1097,7 @@ func (m *EQMem) lockForNamespaceUnsafe(ns string) (nl *nsLock) {
 
 	nl = &nsLock{
 		namespace: ns,
-		docs: nss,
+		docs:      nss,
 	}
 	m.locksSuperUnsafeNS[ns] = nl
 

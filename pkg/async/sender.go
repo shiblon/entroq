@@ -188,7 +188,7 @@ func (s *Sender) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	expiry := time.Now().Add(s.requestTimeout)
 	responseQueue := path.Join(s.myQueue, "response",
 		fmt.Sprintf("exp=%d", expiry.Unix()),
-		entroq.Hex16Generator())
+		entroq.GenHex16())
 
 	env := Envelope{
 		Method:        r.Method,

@@ -345,7 +345,7 @@ func NewMapWorker(eq *entroq.EntroQ, inQueue string, newEmitter func() MapEmitte
 // Runs until the context is canceled or an unrecoverable error is encountered.
 func (w *MapWorker) Run(ctx context.Context) error {
 	return worker.New(w.client,
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, kv *KV) ([]entroq.ModifyArg, error) {
+		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, kv *KV, _ []*entroq.Doc) ([]entroq.ModifyArg, error) {
 			emitter := w.newEmitter()
 			if w.EarlyReduce != nil {
 				emitter = newReducingProxyMapEmitter(emitter, w.EarlyReduce)

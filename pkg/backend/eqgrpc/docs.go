@@ -20,8 +20,8 @@ func fromDocProto(d *pb.Doc) *entroq.Doc {
 		Claimant:     d.Claimant,
 		At:           fromMS(d.AtMs),
 		ExpiresAt:    fromMS(d.ExpiresAtMs),
-		KeyPrimary:   d.KeyPrimary,
-		KeySecondary: d.KeySecondary,
+		Key:          d.Key,
+		SecondaryKey: d.SecondaryKey,
 		Content:      json.RawMessage(d.Content),
 		Created:      fromMS(d.CreatedMs),
 		Modified:     fromMS(d.ModifiedMs),
@@ -33,6 +33,7 @@ func (b *backend) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc,
 	resp, err := pb.NewEntroQClient(b.conn).Docs(ctx, &pb.DocsRequest{
 		Query: &pb.DocQuery{
 			Namespace:  rq.Namespace,
+			Ids:        rq.IDs,
 			KeyStart:   rq.KeyStart,
 			KeyEnd:     rq.KeyEnd,
 			Limit:      int32(rq.Limit),
@@ -49,16 +50,14 @@ func (b *backend) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc,
 	return docs, nil
 }
 
-// ClaimDocs attempts an all-or-nothing claim of docs matching the query.
-// Returns a DependencyError if any docs are missing or already claimed.
-func (b *backend) ClaimDocs(ctx context.Context, cq *entroq.DocClaimQuery) ([]*entroq.Doc, error) {
+// ClaimDocs attempts an all-or-nothing claim of all docs with the given
+// primary key in the namespace. Returns a DependencyError if any are claimed.
+func (b *backend) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.Doc, error) {
 	resp, err := pb.NewEntroQClient(b.conn).ClaimDocs(ctx, &pb.ClaimDocsRequest{
-		ClaimQuery: &pb.DocClaimQuery{
+		ClaimQuery: &pb.DocClaim{
 			Namespace:  cq.Namespace,
 			Claimant:   cq.Claimant,
-			Ids:        cq.IDs,
-			KeyStart:   cq.KeyStart,
-			KeyEnd:     cq.KeyEnd,
+			Key:        cq.Key,
 			DurationMs: int64(cq.Duration / time.Millisecond),
 		},
 	})

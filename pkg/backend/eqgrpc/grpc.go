@@ -532,8 +532,8 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (*entroq
 		req.DocInserts = append(req.DocInserts, &pb.DocData{
 			Namespace:    di.Namespace,
 			Id:           di.ID,
-			KeyPrimary:   di.KeyPrimary,
-			KeySecondary: di.KeySecondary,
+			Key:          di.Key,
+			SecondaryKey: di.SecondaryKey,
 			Content:      []byte(di.Content),
 			ExpiresAtMs:  toMS(di.ExpiresAt),
 			CreatedMs:    toMS(di.Created),

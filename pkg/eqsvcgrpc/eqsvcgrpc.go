@@ -274,7 +274,6 @@ func (s *QSvc) Authorize(ctx context.Context, req *authz.Request) error {
 	return nil
 }
 
-
 func fromMS(ms int64) time.Time {
 	return time.Unix(0, ms*int64(time.Millisecond))
 }
@@ -414,7 +413,7 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 	task, err := s.impl.Claim(ctx,
 		entroq.From(req.Queues...),
 		entroq.ClaimFor(duration),
-		entroq.ClaimAs(req.ClaimantId),
+		entroq.WithClaimant(req.ClaimantId),
 		entroq.ClaimPollTime(pollTime))
 	if err != nil {
 		return nil, autoCodeErrorf("eqsvcgrpc claim: %w", err)
@@ -445,7 +444,7 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 	task, err := s.impl.TryClaim(ctx,
 		entroq.From(req.Queues...),
 		entroq.ClaimFor(duration),
-		entroq.ClaimAs(req.ClaimantId))
+		entroq.WithClaimant(req.ClaimantId))
 	if err != nil {
 		return nil, autoCodeErrorf("try claim: %w", err)
 	}
@@ -507,8 +506,8 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 		modArgs = append(modArgs, entroq.InsertingDoc(&entroq.DocData{
 			Namespace:    di.Namespace,
 			ID:           di.Id,
-			KeyPrimary:   di.KeyPrimary,
-			KeySecondary: di.KeySecondary,
+			Key:          di.Key,
+			SecondaryKey: di.SecondaryKey,
 			Content:      di.Content,
 			ExpiresAt:    fromMS(di.ExpiresAtMs),
 			Created:      fromMS(di.CreatedMs),
@@ -708,8 +707,8 @@ func protoFromDoc(d *entroq.Doc) *pb.Doc {
 		Claimant:     d.Claimant,
 		AtMs:         toMS(d.At),
 		ExpiresAtMs:  toMS(d.ExpiresAt),
-		KeyPrimary:   d.KeyPrimary,
-		KeySecondary: d.KeySecondary,
+		Key:          d.Key,
+		SecondaryKey: d.SecondaryKey,
 		Content:      []byte(d.Content),
 		CreatedMs:    toMS(d.Created),
 		ModifiedMs:   toMS(d.Modified),
@@ -743,6 +742,7 @@ func (s *QSvc) Docs(ctx context.Context, req *pb.DocsRequest) (*pb.DocsResponse,
 	q := req.GetQuery()
 	docs, err := s.impl.Docs(ctx, &entroq.DocQuery{
 		Namespace:  q.GetNamespace(),
+		IDs:        q.GetIds(),
 		KeyStart:   q.GetKeyStart(),
 		KeyEnd:     q.GetKeyEnd(),
 		Limit:      int(q.GetLimit()),
@@ -763,12 +763,10 @@ func (s *QSvc) Docs(ctx context.Context, req *pb.DocsRequest) (*pb.DocsResponse,
 // already claimed.
 func (s *QSvc) ClaimDocs(ctx context.Context, req *pb.ClaimDocsRequest) (*pb.ClaimDocsResponse, error) {
 	cq := req.GetClaimQuery()
-	claimed, err := s.impl.ClaimDocs(ctx, &entroq.DocClaimQuery{
+	claimed, err := s.impl.ClaimDocs(ctx, &entroq.DocClaim{
 		Namespace: cq.GetNamespace(),
 		Claimant:  cq.GetClaimant(),
-		IDs:       cq.GetIds(),
-		KeyStart:  cq.GetKeyStart(),
-		KeyEnd:    cq.GetKeyEnd(),
+		Key:       cq.GetKey(),
 		Duration:  time.Duration(cq.GetDurationMs()) * time.Millisecond,
 	})
 	if err != nil {

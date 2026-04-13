@@ -57,7 +57,7 @@ func (aw *Worker) Run(ctx context.Context, eq *entroq.EntroQ, opts ...Option) er
 		return fmt.Errorf("appender is nil")
 	}
 
-	handler := func(ctx context.Context, task *entroq.Task, _ json.RawMessage) ([]entroq.ModifyArg, error) {
+	handler := func(ctx context.Context, task *entroq.Task, _ json.RawMessage, _ []*entroq.Doc) ([]entroq.ModifyArg, error) {
 		if err := aw.appender.Append(task.Value); err != nil {
 			return nil, fmt.Errorf("append task %s: %w", task.ID, err)
 		}
