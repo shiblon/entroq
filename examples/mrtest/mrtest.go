@@ -13,7 +13,6 @@ import (
 	"sort"
 	"strings"
 
-
 	"github.com/shiblon/entroq"
 	. "github.com/shiblon/entroq/examples/mr"
 )
@@ -81,7 +80,7 @@ func MRCheck(ctx context.Context, eq *entroq.EntroQ, numDocs, numMappers, numRed
 		return bytes.Compare(expected[i].Key, expected[j].Key) < 0
 	})
 
-	queuePrefix := "/mrtest/" + entroq.Hex16Generator()
+	queuePrefix := "/mrtest/" + entroq.GenHex16()
 
 	mr := NewMapReduce(eq, queuePrefix,
 		WithNumMappers(numMappers),

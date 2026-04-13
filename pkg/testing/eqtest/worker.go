@@ -60,14 +60,14 @@ func simpleWorkerOnce(ctx context.Context, t *testing.T, client *entroq.EntroQ, 
 	var consumed []*entroq.Task
 	g.Go(func() error {
 		return worker.New(client,
-			worker.WithDo(func(ctx context.Context, task *entroq.Task, _ json.RawMessage) error {
+			worker.WithDoWork(func(ctx context.Context, task *entroq.Task, _ json.RawMessage, _ []*entroq.Doc) error {
 				if task.Claims != 1 {
 					return fmt.Errorf("worker claim expected claims to be 1, got %d", task.Claims)
 				}
 				consumed = append(consumed, task)
 				return nil
 			}),
-			worker.WithFinish(func(ctx context.Context, task *entroq.Task, _ json.RawMessage) error {
+			worker.WithFinish(func(ctx context.Context, task *entroq.Task, _ json.RawMessage, _ []*entroq.Doc) error {
 				_, err := client.Modify(ctx, task.Delete())
 				return err
 			}),
@@ -163,7 +163,7 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 		g.Go(func() error {
 			ti := 0
 			w := worker.New(client,
-				worker.WithDo(func(ctx context.Context, task *entroq.Task, _ json.RawMessage) error {
+				worker.WithDoWork(func(ctx context.Context, task *entroq.Task, _ json.RawMessage, _ []*entroq.Doc) error {
 					ti++
 					if task.Claims != 1 {
 						return fmt.Errorf("worker claim expected to be 1, was %d", task.Claims)
@@ -171,7 +171,7 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 					consumedCh <- task
 					return nil
 				}),
-				worker.WithFinish(func(ctx context.Context, task *entroq.Task, _ json.RawMessage) error {
+				worker.WithFinish(func(ctx context.Context, task *entroq.Task, _ json.RawMessage, _ []*entroq.Doc) error {
 					_, err := client.Modify(ctx, task.Delete())
 					return err
 				}),
@@ -311,7 +311,7 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 		retriedTaskCh := make(chan *entroq.Task, 1)
 
 		w := worker.New(client,
-			worker.WithDo(func(ctx context.Context, task *entroq.Task, s string) error {
+			worker.WithDoWork(func(ctx context.Context, task *entroq.Task, s string, _ []*entroq.Doc) error {
 				// Only attempt this again if it's the first time.
 				if task.Attempt == 0 {
 					return fmt.Errorf("worker error (%q): %w", s, worker.RetryError)
@@ -320,7 +320,7 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 				retriedTaskCh <- task
 				return nil
 			}),
-			worker.WithFinish(func(ctx context.Context, task *entroq.Task, _ string) error {
+			worker.WithFinish(func(ctx context.Context, task *entroq.Task, _ string, _ []*entroq.Doc) error {
 				_, err := client.Modify(ctx, task.Delete())
 				return err
 			}),
@@ -437,7 +437,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		const leaseTime = 2 * time.Second
 
 		w := worker.New(client,
-			worker.WithDo(func(ctx context.Context, task *entroq.Task, cmd string) error {
+			worker.WithDoWork(func(ctx context.Context, task *entroq.Task, cmd string, _ []*entroq.Doc) error {
 				switch cmd {
 				case "die":
 					return fmt.Errorf("task asked to die: %w", worker.FatalError)
@@ -453,7 +453,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 				}
 				return nil
 			}),
-			worker.WithFinish(func(ctx context.Context, task *entroq.Task, _ string) error {
+			worker.WithFinish(func(ctx context.Context, task *entroq.Task, _ string, _ []*entroq.Doc) error {
 				if _, err := client.Modify(ctx, task.Delete()); err != nil {
 					return fmt.Errorf("task deletion failed: %w", err)
 				}
@@ -604,12 +604,12 @@ func WorkerDependencyHandler(ctx context.Context, t *testing.T, client *entroq.E
 	handlerCalled := make(chan bool, 1)
 
 	w := worker.New(client,
-		worker.WithDo(func(ctx context.Context, task *entroq.Task, val string) error {
+		worker.WithDoWork(func(ctx context.Context, task *entroq.Task, val string, _ []*entroq.Doc) error {
 			inWork <- true
 			<-letFinish
 			return nil
 		}),
-		worker.WithFinish(func(ctx context.Context, task *entroq.Task, val string) error {
+		worker.WithFinish(func(ctx context.Context, task *entroq.Task, val string, _ []*entroq.Doc) error {
 			// Try to delete the task. This will fail because we'll modify it in the main thread.
 			_, err := client.Modify(ctx, task.Delete(), confTask.Depend())
 			return err
@@ -677,7 +677,7 @@ func WorkerCompactDependencyHandler(ctx context.Context, t *testing.T, client *e
 	handlerCalled := make(chan bool, 1)
 
 	w := worker.New(client,
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, val string) ([]entroq.ModifyArg, error) {
+		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, val string, _ []*entroq.Doc) ([]entroq.ModifyArg, error) {
 			inWork <- true
 			<-letFinish
 			return []entroq.ModifyArg{task.Delete(), confTask.Depend()}, nil
@@ -735,7 +735,7 @@ func WorkerRenewalNoDependencyHandler(ctx context.Context, t *testing.T, client 
 	const lease = 2 * time.Second
 
 	w := worker.New(client,
-		worker.WithDo(func(ctx context.Context, task *entroq.Task, val string) error {
+		worker.WithDoWork(func(ctx context.Context, task *entroq.Task, val string, _ []*entroq.Doc) error {
 			inWork <- true
 			select {
 			case <-ctx.Done():

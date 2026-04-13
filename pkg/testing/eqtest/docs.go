@@ -18,9 +18,9 @@ import (
 func SimpleDocLifecycle(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	ns := path.Join(qPrefix, "simple_doc")
 	id := "doc-1"
-	val := []byte(`{"foo": "bar"}`)
+	val := json.RawMessage(`{"foo":"bar"}`)
 
-	// 1. Insert
+	// Insert a doc
 	resp, err := client.Modify(ctx, entroq.CreatingIn(ns,
 		entroq.WithIDKeys(id, "", ""),
 		entroq.WithContent(val),
@@ -36,8 +36,8 @@ func SimpleDocLifecycle(ctx context.Context, t *testing.T, client *entroq.EntroQ
 		t.Errorf("Inserted doc metadata mismatch: got %v/%v, want %v/%v", res.Namespace, res.ID, ns, id)
 	}
 
-	// 2. Change
-	newVal := []byte(`{"foo": "baz"}`)
+	// Change the doc
+	newVal := json.RawMessage(`{"foo":"baz"}`)
 	resp, err = client.Modify(ctx, res.Change(entroq.WithContent(newVal)))
 	if err != nil {
 		t.Fatalf("Change doc: %v", err)
@@ -53,8 +53,8 @@ func SimpleDocLifecycle(ctx context.Context, t *testing.T, client *entroq.EntroQ
 		t.Errorf("Changed version: want %v, got %v", res.Version+1, changed.Version)
 	}
 
-	// 3. Dependency Check (Should Fail)
-	_, err = client.Modify(ctx, res.Change(entroq.WithContent([]byte(`{"fail": true}`))))
+	// Try to depend on the doc before it changed (should fail)
+	_, err = client.Modify(ctx, res.Change(entroq.WithRawContent(json.RawMessage(`{"fail": true}`))))
 	if err == nil {
 		t.Fatal("Expected dependency error when changing old version, got nil")
 	}
@@ -62,13 +62,13 @@ func SimpleDocLifecycle(ctx context.Context, t *testing.T, client *entroq.EntroQ
 		t.Fatalf("Expected DependencyError, got %T: %v", err, err)
 	}
 
-	// 4. Delete
+	// Delete the doc
 	_, err = client.Modify(ctx, entroq.DeletingDoc(changed))
 	if err != nil {
 		t.Fatalf("Delete doc: %v", err)
 	}
 
-	// 5. Verify gone
+	// Ensure that it's gone
 	docs, err := client.Docs(ctx, &entroq.DocQuery{Namespace: ns})
 	if err != nil {
 		t.Fatalf("List docs: %v", err)
@@ -88,7 +88,7 @@ func DocMultiOp(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefi
 		entroq.InsertingInto(q, entroq.WithValue("task body")),
 		entroq.CreatingIn(ns,
 			entroq.WithIDKeys("state-1", "", ""),
-			entroq.WithContent([]byte(`"initial state"`)),
+			entroq.WithContent("initial state"),
 		),
 	)
 	if err != nil {
@@ -101,7 +101,7 @@ func DocMultiOp(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefi
 	doneQ := path.Join(q, "done")
 	_, err = client.Modify(ctx,
 		task.Change(entroq.QueueTo(doneQ)),
-		res.Change(entroq.WithContent([]byte(`"finished state"`))),
+		res.Change(entroq.WithContent("finished state")),
 	)
 	if err != nil {
 		t.Fatalf("Multi-transition: %v", err)
@@ -136,7 +136,7 @@ func DocListing(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefi
 	for _, d := range data {
 		args = append(args, entroq.CreatingIn(ns,
 			entroq.WithIDKeys(d.ID, d.PK, ""),
-			entroq.WithContent([]byte(`{}`)),
+			entroq.WithContent(nil),
 		))
 	}
 
@@ -164,8 +164,8 @@ func DocListing(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefi
 		t.Fatalf("Filter range [2,4): want 2 results, got %d", len(res))
 	}
 	for _, r := range res {
-		if r.KeyPrimary < "2" || r.KeyPrimary >= "4" {
-			t.Errorf("Doc PK out of range [2,4): %q", r.KeyPrimary)
+		if r.Key < "2" || r.Key >= "4" {
+			t.Errorf("Doc PK out of range [2,4): %q", r.Key)
 		}
 	}
 }
@@ -186,7 +186,7 @@ func DocConcurrencyStress(ctx context.Context, t *testing.T, client *entroq.Entr
 	for i := 0; i < numDocs; i++ {
 		setupArgs = append(setupArgs, entroq.CreatingIn(ns,
 			entroq.WithIDKeys(fmt.Sprintf("doc-%d", i), "", ""),
-			entroq.WithContent([]byte(`0`)),
+			entroq.WithContent(0),
 		))
 	}
 	if _, err := client.Modify(ctx, setupArgs...); err != nil {
@@ -224,7 +224,7 @@ func DocConcurrencyStress(ctx context.Context, t *testing.T, client *entroq.Entr
 						return fmt.Errorf("unmarshal: %w", err)
 					}
 
-					_, err = client.Modify(ctx, res.Change(entroq.WithContent([]byte(fmt.Sprint(val+1)))))
+					_, err = client.Modify(ctx, res.Change(entroq.WithContent(val+1)))
 					if err == nil {
 						break // success
 					}
@@ -287,7 +287,7 @@ func MixedAtomicStress(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 			entroq.InsertingInto(q, entroq.WithID(id), entroq.WithValue(0)),
 			entroq.CreatingIn(ns,
 				entroq.WithIDKeys(id, "", ""),
-				entroq.WithContent([]byte(`0`)),
+				entroq.WithContent(0),
 			),
 		); err != nil {
 			t.Fatalf("Setup mixed stress: %v", err)
@@ -340,8 +340,8 @@ func MixedAtomicStress(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 					}
 
 					_, err = client.Modify(ctx,
-						task.Change(entroq.RawValueTo([]byte(fmt.Sprint(tVal+1))), entroq.ArrivalTimeBy(0)),
-						res.Change(entroq.WithContent([]byte(fmt.Sprint(rVal+1)))),
+						task.Change(entroq.ValueTo(tVal+1), entroq.ArrivalTimeBy(0)),
+						res.Change(entroq.WithContent(rVal+1)),
 					)
 					if err == nil {
 						break // success

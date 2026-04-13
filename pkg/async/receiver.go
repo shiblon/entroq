@@ -67,7 +67,7 @@ func ReceiverHandler(upstream string, opts ...ReceiverOption) worker.DoModifyRun
 			MaxIdleConnsPerHost: 32,
 		},
 	}
-	return func(ctx context.Context, task *entroq.Task, env Envelope) ([]entroq.ModifyArg, error) {
+	return func(ctx context.Context, task *entroq.Task, env Envelope, _ []*entroq.Doc) ([]entroq.ModifyArg, error) {
 		start := time.Now()
 		defer func() {
 			handled.Add(ctx, 1)

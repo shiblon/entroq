@@ -155,7 +155,7 @@ func WithRunOption(opt worker.RunOption) Option {
 }
 
 // doWork is the internal handler that matches worker.DoModifyRun.
-func (pw *Worker) doWork(ctx context.Context, t *entroq.Task, input Input) ([]entroq.ModifyArg, error) {
+func (pw *Worker) doWork(ctx context.Context, t *entroq.Task, input Input, _ []*entroq.Doc) ([]entroq.ModifyArg, error) {
 	outbox := input.Outbox
 	if outbox == "" {
 		outbox = t.Queue + "/done"

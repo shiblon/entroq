@@ -18,10 +18,6 @@ release
 # Test binary, build with `go test -c`
 *.test
 
-# cmd binaries
-eqc
-eqpg
-
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
 vendor

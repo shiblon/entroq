@@ -16,7 +16,7 @@
 //		client, _ := entroq.New(ctx, mem.Opener()) // Open an in-memory EntroQ backend.
 //		if err := worker.Run(ctx,
 //	 		WithQueues("/my/inbox"),
-//			WithDoModify(func(ctx context.Context, task *entroq.Task, value json.RawMessage) ([]entroq.ModifyArg, error) {
+//			WithDoModify(func(ctx context.Context, task *entroq.Task, value json.RawMessage, docs []*entroq.Doc) ([]entroq.ModifyArg, error) {
 //		    	log.Printf("Working on task %v", task.ID)
 //		    	return []entroq.ModifyArg{task.Delete()}, nil
 //			}),
@@ -53,63 +53,187 @@ const DefaultBackoff = 10 * time.Second
 // Handler[T] is an interface that can be implemented to define work to be done.
 // The value T is the pre-unmarshaled task value. Use T = json.RawMessage to
 // receive raw bytes without any type-level unmarshaling.
+//
+// The three methods correspond to the three phases of task processing:
+//   - TakeDocs: pre-work doc acquisition (optional; return nil to skip)
+//   - DoWork: primary work, runs with background renewal
+//   - Finish: commit phase, runs after renewal stops with stable task version
 type Handler[T any] interface {
-	// TaskDo is called by Worker.Run for each claimed task. The task is renewed
-	// in the background while this function runs. value holds the result of
-	// unmarshaling task.Value into T.
+	// TakeDocs is called after a task is claimed and before DoWork. It declares which
+	// docs the worker needs to claim ownership of before doing work. Return
+	// nil to skip doc acquisition. A missing doc moves the task to the error
+	// queue. A claimed (contended) required doc causes a retry.
+	TakeDocs(context.Context, *entroq.Task, T) ([]*entroq.DocClaim, error)
+
+	// DoWork is called by Worker.Run for each claimed task. The task is renewed in
+	// the background while this function runs. value holds the result of
+	// unmarshaling task.Value into T. Docs holds any docs acquired by TakeDocs; it
+	// is non-nil but empty when no docs were acquired.
 	//
-	// On nil return, renewal is stopped and TaskFinish (if set) is called with
+	// On nil return, renewal is stopped and Finish (if set) is called with
 	// the stable task version.
 	//
-	// On RetryError or MoveError, the task is retried or moved respectively and
-	// TaskFinish is skipped.
+	// On RetryError or MoveError, the task is retried or moved and Finish
+	// is skipped. In both cases, the task's availability is set in the future
+	// and its attempt count is incremented (these errors, while convenient for
+	// managing task movement, are still errors).
 	//
-	// On any other error, TaskFinish is skipped and the error is treated as a
+	// On any other error, Finish is skipped and the error is treated as a
 	// fundamental error subject to backoff.
-	TaskDo(context.Context, *entroq.Task, T) error
+	DoWork(context.Context, *entroq.Task, T, []*entroq.Doc) error
 
-	// TaskFinish is called after TaskDo returns nil and renewal has stopped.
-	// It receives the stable (final renewed) task version and the same value
-	// that was passed to TaskDo. Use it to apply task modifications --
-	// deletion, requeueing, etc. -- and any associated cleanup. TaskFinish is
-	// skipped when TaskDo returns a non-nil error.
-	TaskFinish(context.Context, *entroq.Task, T) error
+	// Finish is called after DoWork returns nil and renewal has stopped. It
+	// receives the stable (final renewed) task version, the same value passed
+	// to DoWork, and the same docs. Use it to apply task modifications --
+	// deletion, requeueing, doc changes, etc. Finish is skipped when DoWork
+	// returns a non-nil error of any kind.
+	Finish(context.Context, *entroq.Task, T, []*entroq.Doc) error
 }
 
+// MakeHandler defines a function that can be called to make a new handler.
+// If you want to specify a full Handler[T] with your own state management,
+// etc., then this is how you instruct the worker to create it in each
+// invocation of Run.
+type MakeHandler[T any] func() (Handler[T], error)
+
 // DoModifyRun[T] is a function type that allows a work handler to be defined
-// that passes modifications out instead of making those modifications itself.
-// It's a convenience for callers that don't need special finalization.
-type DoModifyRun[T any] func(context.Context, *entroq.Task, T) ([]entroq.ModifyArg, error)
+// that passes modifications out instead of making those modifications itself
+// in a Finish function.
+//
+// The docs parameter carries any docs claimed by WithTakeDocs, and can be empty.
+type DoModifyRun[T any] func(context.Context, *entroq.Task, T, []*entroq.Doc) ([]entroq.ModifyArg, error)
 
-// DoModifyDocsRun[T] is like DoModifyRun but also receives the resources
-// acquired by the WithTakeDocs phase.
-type DoModifyDocsRun[T any] func(context.Context, *entroq.Task, T, *entroq.AcquiredDocs) ([]entroq.ModifyArg, error)
-
-// TakeDocsRun[T] is a function that inspects a newly claimed task and
+// TakeRun[T] is a function that inspects a newly claimed task and
 // declares what resources the worker needs before doing work. Returning a nil
 // *ResourceRequest (or not setting WithTakeDocs) skips the acquisition phase.
-type TakeDocsRun[T any] func(context.Context, *entroq.Task, T) (*entroq.DocRequest, error)
+type TakeRun[T any] func(context.Context, *entroq.Task, T) ([]*entroq.DocClaim, error)
+
+// DoFinishRun[T] defines a function shape that is called during the work and
+// finish portions of task handling. In both cases, you are given a task, a
+// value of that task properly typed, and if relevant, a document response with
+// all required and zero or more optional documents.
+//
+// In the finish phase, the same information is available but all objects will
+// have current version numbers for safe modification.
+type DoFinishRun[T any] func(context.Context, *entroq.Task, T, []*entroq.Doc) error
 
 // funcHandler[T] is a Handler[T] backed by plain functions.
 type funcHandler[T any] struct {
-	do     func(context.Context, *entroq.Task, T) error
-	finish func(context.Context, *entroq.Task, T) error
+	take   func(context.Context, *entroq.Task, T) ([]*entroq.DocClaim, error)
+	do     func(context.Context, *entroq.Task, T, []*entroq.Doc) error
+	finish func(context.Context, *entroq.Task, T, []*entroq.Doc) error
 }
 
-// TaskDo runs the specified "do" function.
-func (h *funcHandler[T]) TaskDo(ctx context.Context, task *entroq.Task, value T) error {
-	if h.do == nil {
-		return fmt.Errorf("no work function specified")
+// TakeDocs runs the specified take function if set, otherwise returns nil.
+func (h *funcHandler[T]) TakeDocs(ctx context.Context, task *entroq.Task, value T) ([]*entroq.DocClaim, error) {
+	if h.take == nil {
+		return nil, nil
 	}
-	return h.do(ctx, task, value)
+	return h.take(ctx, task, value)
 }
 
-// TaskFinish runs the specified "finish" function if it has been defined.
-func (h *funcHandler[T]) TaskFinish(ctx context.Context, task *entroq.Task, value T) error {
+// DoWork runs the specified "do" function.
+func (h *funcHandler[T]) DoWork(ctx context.Context, task *entroq.Task, value T, docs []*entroq.Doc) error {
+	if h.do == nil {
+		return fmt.Errorf("no work function specified: %w", FatalError)
+	}
+	return h.do(ctx, task, value, docs)
+}
+
+// Finish runs the specified "finish" function if it has been defined.
+func (h *funcHandler[T]) Finish(ctx context.Context, task *entroq.Task, value T, docs []*entroq.Doc) error {
 	if h.finish == nil {
 		return nil
 	}
-	return h.finish(ctx, task, value)
+	return h.finish(ctx, task, value, docs)
+}
+
+// doModifyhandler is a special handler that keeps track of "desired
+// modifications" passed out of the worker function. When work is specified in
+// this way, modifications are not done by the implementer of the work
+// function, rather they are "requested" by returning them. The worker then
+// takes the responsibility of fixing up their versions to the latest claimed
+// versions before packaging and sending the modification along. It's quite
+// convenient, so it's the most common way to define work, but it requires a
+// little state handling to pass requested modifications to the finish function.
+type doModifyHandler[T any] struct {
+	eqc      *entroq.EntroQ
+	take     TakeRun[T]
+	doModify DoModifyRun[T]
+
+	initialTask *entroq.Task
+	modArgs     []entroq.ModifyArg
+}
+
+func (h *doModifyHandler[T]) TakeDocs(ctx context.Context, task *entroq.Task, val T) ([]*entroq.DocClaim, error) {
+	h.initialTask = task
+	if h.take == nil {
+		return nil, nil
+	}
+	return h.take(ctx, task, val)
+}
+
+func (h *doModifyHandler[T]) DoWork(ctx context.Context, task *entroq.Task, val T, docs []*entroq.Doc) error {
+	var err error
+	if h.initialTask == nil {
+		h.initialTask = task
+	}
+	if h.doModify == nil {
+		return fmt.Errorf("No work function specified", FatalError)
+	}
+	h.modArgs, err = h.doModify(ctx, task, val, docs)
+	return err
+}
+
+func (h *doModifyHandler[T]) Finish(ctx context.Context, finalTask *entroq.Task, val T, _ []*entroq.Doc) error {
+	defer func() {
+		h.initialTask = nil
+		h.modArgs = nil
+	}()
+	if h.initialTask == nil {
+		return fmt.Errorf("unexpected nil initial task in doModify finish: %w", FatalError)
+	}
+	if len(h.modArgs) == 0 {
+		// Nothing to do!
+		return nil
+	}
+
+	modification := entroq.NewModification("", h.modArgs...)
+
+	if h.initialTask.Version > finalTask.Version {
+		return fmt.Errorf("task updated inside worker body, expected version <= %v, got %v", finalTask.Version, h.initialTask.Version)
+	}
+
+	// Fix up modification versions to reflect final refreshed state.
+	for _, t := range modification.Changes {
+		if t.ID == finalTask.ID {
+			t.Version = finalTask.Version
+		}
+	}
+	for _, t := range modification.Depends {
+		if t.ID == finalTask.ID {
+			t.Version = finalTask.Version
+		}
+	}
+	for _, t := range modification.Deletes {
+		if t.ID == finalTask.ID {
+			t.Version = finalTask.Version
+		}
+	}
+	// TODO: fix up documents, too
+
+	if _, err := h.eqc.Modify(ctx, entroq.WithModification(modification)); err != nil {
+		if _, ok := entroq.AsDependency(err); ok {
+			log.Printf("Worker ack failed, throwing away: %v", err)
+			return fmt.Errorf("worker doModify finish dependency: %w", err)
+		}
+		if entroq.IsCanceled(err) || entroq.IsTimeout(err) {
+			log.Printf("Worker exiting cleanly instead of acking: %v", err)
+			return fmt.Errorf("canceled doModify finish: %w", err)
+		}
+		return fmt.Errorf("worker doModify finish: %w", err)
+	}
+	return nil
 }
 
 // Worker[T] defines a looping protocol that processes tasks in a queue. It
@@ -118,7 +242,7 @@ func (h *funcHandler[T]) TaskFinish(ctx context.Context, task *entroq.Task, valu
 // ownership of the task while it does its job.
 //
 // The type parameter T is the Go type of the task value. The worker
-// unmarshals task.Value into T before calling TaskDo/TaskFinish, so handlers
+// unmarshals task.Value into T before calling DoWork/Finish, so handlers
 // always receive a ready-to-use value. Use T = json.RawMessage to opt out of
 // typed unmarshaling and receive the raw bytes directly.
 //
@@ -132,26 +256,70 @@ type Worker[T any] struct {
 
 	errQMap ErrQMap
 
-	handler         Handler[T]
-	doModify        DoModifyRun[T]          // set by WithDoModify
-	doModifyRes     DoModifyDocsRun[T] // set by WithDoModifyDocs
-	takeDocs   TakeDocsRun[T]     // set by WithTakeDocs
+	// Creates a new handler. Called once per Run.
+	makeHandler MakeHandler[T]
+}
+
+// workerOpts holds built-up worker options to be later checked against as a
+// new worker is created.
+type workerOpts[T any] struct {
+	makeHandler MakeHandler[T]
+
+	// These are all potential inputs to create a MakeHandler.
+	take     TakeRun[T]
+	doModify DoModifyRun[T]
+	do       DoFinishRun[T]
+	finish   DoFinishRun[T]
+
+	errQMap ErrQMap
 }
 
 // New creates a new Worker[T] that claims tasks from its configured queues and
 // presents pre-unmarshaled values of type T to the work handler.
+//
+// Options should be presented to, at a minimum, define the work to be done
+// when a task is acquired. At least one of WithDoWork or WithDoModify should be
+// specified, or WithMakeHandler if you have advanced needs.
 func New[T any](eq *entroq.EntroQ, opts ...Option[T]) *Worker[T] {
-	w := &Worker[T]{
-		eqc: eq,
-	}
+	wOpts := new(workerOpts[T])
 	for _, opt := range opts {
-		opt(w)
+		opt(wOpts)
 	}
-	return w
+
+	worker := &Worker[T]{
+		eqc:         eq,
+		errQMap:     wOpts.errQMap,
+		makeHandler: wOpts.makeHandler,
+	}
+
+	if worker.makeHandler != nil {
+		return worker
+	}
+
+	// No makeHandler specified, build one from what we have.
+	// DoModify handlers win. TakeDocs is always used.
+	if wOpts.doModify != nil {
+		worker.makeHandler = func() (Handler[T], error) {
+			return &doModifyHandler[T]{
+				eqc:      eq,
+				take:     wOpts.take,
+				doModify: wOpts.doModify,
+			}, nil
+		}
+	} else {
+		worker.makeHandler = func() (Handler[T], error) {
+			return &funcHandler[T]{
+				take:   wOpts.take,
+				do:     wOpts.do,
+				finish: wOpts.finish,
+			}, nil
+		}
+	}
+	return worker
 }
 
 // Option[T] can be passed to New to modify worker parameters.
-type Option[T any] func(*Worker[T])
+type Option[T any] func(*workerOpts[T])
 
 // ErrorQueueFor returns the error queue for the given inbox, using the worker's
 // configured mapping or the default if none is set.
@@ -168,30 +336,21 @@ func DefaultErrQMap(inbox string) string {
 	return inbox + "/err"
 }
 
-// WithDo sets the primary work function for a worker. Overwrites any
+// WithDoWork sets the primary work function for a worker. Overwrites any
 // previous handler configuration.
-func WithDo[T any](f func(context.Context, *entroq.Task, T) error) Option[T] {
-	return func(w *Worker[T]) {
-		switch fh := w.handler.(type) {
-		case *funcHandler[T]:
-			fh.do = f
-		default:
-			w.handler = &funcHandler[T]{do: f}
-		}
+func WithDoWork[T any](f DoFinishRun[T]) Option[T] {
+	return func(wo *workerOpts[T]) {
+		wo.do = f
 	}
 }
 
-// WithFinish sets the finalization function for a worker, called after Do
+// WithFinish sets the finalization function for a worker, called after DoWork
 // completes successfully and renewal has stopped. The function receives the
-// stable (finally-renewed) task and the original unmarshaled value. Overwrites
-// any previous handler configuration.
-func WithFinish[T any](f func(context.Context, *entroq.Task, T) error) Option[T] {
-	return func(w *Worker[T]) {
-		if fh, ok := w.handler.(*funcHandler[T]); ok {
-			fh.finish = f
-		} else {
-			w.handler = &funcHandler[T]{finish: f}
-		}
+// stable (finally-renewed) task, the original unmarshaled value, and any docs
+// acquired by WithTakeDocs. Overwrites any previous handler configuration.
+func WithFinish[T any](f DoFinishRun[T]) Option[T] {
+	return func(wo *workerOpts[T]) {
+		wo.finish = f
 	}
 }
 
@@ -200,47 +359,53 @@ func WithFinish[T any](f func(context.Context, *entroq.Task, T) error) Option[T]
 // is stack-allocated in each pass through the worker loop, so concurrent Run
 // goroutines are safe. Overwrites any previous configuration.
 func WithDoModify[T any](f DoModifyRun[T]) Option[T] {
-	return func(w *Worker[T]) {
-		w.handler = nil
-		w.doModify = f
+	return func(wo *workerOpts[T]) {
+		wo.doModify = f
 	}
 }
 
-// WithDoModifyDocs sets a combined work and modification function that also
-// receives the resources acquired by the WithTakeDocs phase. Overwrites
-// any previous configuration. Requires WithTakeDocs to be set.
-func WithDoModifyDocs[T any](f DoModifyDocsRun[T]) Option[T] {
-	return func(w *Worker[T]) {
-		w.handler = nil
-		w.doModify = nil
-		w.doModifyRes = f
-	}
-}
-
-// WithTakeDocs sets the resource acquisition function. Before work begins,
-// this function is called with the claimed task to declare which resources are
-// needed. Required resources that are missing cause the task to be treated as a
-// poison pill (moved to the error queue). Required or optional resources claimed
-// by another worker cause a backoff-and-retry. Read-only resources are fetched
-// at acquisition time and version-pinned in the final Modify.
+// WithTakeDocs sets the doc acquisition function. Before work begins, this
+// function is called with the claimed task to declare which docs are needed.
+// Required docs that are missing cause the task to be treated as a poison pill
+// (moved to the error queue). Required or optional docs claimed by another
+// worker cause a backoff-and-retry. Read-only docs are fetched at acquisition
+// time and version-pinned in the final Modify.
 //
-// WithTakeDocs is only meaningful when paired with WithDoModifyDocs.
-func WithTakeDocs[T any](f TakeDocsRun[T]) Option[T] {
-	return func(w *Worker[T]) {
-		w.takeDocs = f
+// When used with WithHandler, the handler's TakeDocs method takes
+// precedence and WithTakeDocs has no effect.
+func WithTakeDocs[T any](f TakeRun[T]) Option[T] {
+	return func(wo *workerOpts[T]) {
+		wo.take = f
 	}
 }
 
-// WithHandler sets a custom task handler for a worker.
-func WithHandler[T any](h Handler[T]) Option[T] {
-	return func(w *Worker[T]) {
-		w.handler = h
+// WithMakeHandler sets a "new" function to create a handler.
+// Why use this instead of just setting a handler? If you are going to call Run in
+// multiple goroutines, your handler will be shared between them. Stateful
+// handlers will not work properly. Here you can specify a function that
+// returns a new handler when called, side-stepping that issue by ensuring that
+// every call to Run has its own handler instance. The other pattern you can
+// use is to specify functions to call (taking care to keep state local!):
+//
+// Always available:
+//   - WithTakeDocs - specifies how to identify documents for a particular task.
+//
+// Two approaches to defining work/finishing:
+//   - WithDoModify - a single function that does work, then returns desired modifications to be handled by the worker.
+//   - WithDoWork, WithFinish - two functions to specify work, then to do modifications.
+//
+// It is expected that these single-function options are more ergonmic than
+// this, but they are not suitable if your handler needs to manage state that
+// is not captured in function parameters or otherwise concurrency-friendly.
+func WithMakeHandler[T any](h MakeHandler[T]) Option[T] {
+	return func(w *workerOpts[T]) {
+		w.makeHandler = h
 	}
 }
 
 // WithErrQMap sets the error queue mapping function for a worker.
 func WithErrQMap[T any](f ErrQMap) Option[T] {
-	return func(w *Worker[T]) {
+	return func(w *workerOpts[T]) {
 		w.errQMap = f
 	}
 }
@@ -266,106 +431,42 @@ func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, ta
 	return false, nil
 }
 
-// acquireDocs performs the resource acquisition phase for a claimed task.
-// It calls takeDocs to learn what is needed, then claims required and
-// optional resources and fetches read-only ones.
+// acquireDocs performs the doc acquisition phase for a claimed task.
+// It calls the provided take function to learn what is needed, then claims
+// ownership of those documents.
 //
-// Returns the acquired resources and nil on success.
 // Returns a *entroq.DependencyError if claiming failed; the caller inspects
-// HasMissingResources vs HasClaimedResources to decide whether to retry or
-// move the task to the error queue.
-func (w *Worker[T]) acquireDocs(ctx context.Context, task *entroq.Task, value T, opts *runOpt) (*entroq.AcquiredDocs, error) {
-	if w.takeDocs == nil {
-		return &entroq.AcquiredDocs{}, nil
-	}
-	req, err := w.takeDocs(ctx, task, value)
+// HasMissingDocs vs HasClaimedDocs to decide whether to retry or move the
+// task to the error queue.
+func (w *Worker[T]) acquireDocs(ctx context.Context, task *entroq.Task, value T, opts *runOpt, take TakeRun[T]) ([]*entroq.Doc, error) {
+	req, err := take(ctx, task, value)
 	if err != nil {
-		return nil, fmt.Errorf("take resources: %w", err)
+		return nil, fmt.Errorf("take docs: %w", err)
 	}
 	if req == nil {
-		return &entroq.AcquiredDocs{}, nil
+		return nil, nil
 	}
 
-	acquired := &entroq.AcquiredDocs{}
+	var acquired []*entroq.Doc
 
-	for _, cq := range req.Required {
+	for _, cq := range req {
 		cq.Duration = opts.lease
-		results, err := w.eqc.ClaimDocs(ctx, &cq)
+		results, err := w.eqc.ClaimDocs(ctx, cq)
 		if err != nil {
 			return nil, err // caller inspects DependencyError
 		}
-		acquired.Required = append(acquired.Required, results...)
-	}
-
-	for _, cq := range req.Optional {
-		cq.Duration = opts.lease
-		results, err := w.eqc.ClaimDocs(ctx, &cq)
-		if err != nil {
-			if de, ok := entroq.AsDependency(err); ok && de.HasMissingDocs() {
-				continue // absent optional resource -- skip it
-			}
-			return nil, err
-		}
-		acquired.Optional = append(acquired.Optional, results...)
-	}
-
-	for _, rid := range req.ReadOnly {
-		results, err := w.eqc.Docs(ctx, &entroq.DocQuery{
-			Namespace: rid.Namespace,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("fetch read-only resource %v: %w", rid, err)
-		}
-		for _, r := range results {
-			if r.ID == rid.ID && r.Version == rid.Version {
-				acquired.ReadOnly = append(acquired.ReadOnly, r)
-				break
-			}
-		}
+		acquired = append(acquired, results...)
 	}
 
 	return acquired, nil
 }
 
-func renewModVersions(mod *entroq.Modification, renewed *entroq.TaskID) {
-	for _, t := range mod.Changes {
-		if t.ID == renewed.ID {
-			t.Version = renewed.Version
-		}
-	}
-	for _, t := range mod.Depends {
-		if t.ID == renewed.ID {
-			t.Version = renewed.Version
-		}
-	}
-	for _, t := range mod.Deletes {
-		if t.ID == renewed.ID {
-			t.Version = renewed.Version
-		}
-	}
-}
-
 // runOne claims one task, unmarshals its value into T, runs the work function
 // with renewal, and applies any resulting modification.
-func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt) error {
-	// Set up the first (work) handler function, and track doModify args.
-	var taskDo DoTaskWork[T]
-	var returnedModArgs []entroq.ModifyArg // save these for later if it's a doModify handler
-	var acquiredRes *entroq.AcquiredDocs
-	switch {
-	case w.doModifyRes != nil:
-		taskDo = func(ctx context.Context, task *entroq.Task, value T) (err error) {
-			returnedModArgs, err = w.doModifyRes(ctx, task, value, acquiredRes)
-			return err
-		}
-	case w.doModify != nil:
-		taskDo = func(ctx context.Context, task *entroq.Task, value T) (err error) {
-			returnedModArgs, err = w.doModify(ctx, task, value)
-			return err
-		}
-	default:
-		taskDo = w.handler.TaskDo
-	}
+func (w *Worker[T]) runOne(ctx context.Context, handler Handler[T], opts *runOpt) error {
+	// Set up the work function. Both paths receive acquiredDocs.
+	// var returnedModArgs []entroq.ModifyArg // only used by doModify path
+	var acquiredDocs []*entroq.Doc
 
 	// Run ClaimWithRenew, capture initial and final tasks, react to sentinel errors
 	rCtx, rCancel := context.WithCancel(ctx)
@@ -375,7 +476,7 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt) error {
 		initialValue T
 		sentinelErr  error
 	)
-	finalTask, handleErr := ClaimWithRenew(rCtx, w.eqc, opts.qs, opts.lease, func(ctx context.Context, task *entroq.Task, value T) error {
+	finalTask, handleErr := ClaimWithRenew(rCtx, w.eqc, opts.qs, opts.lease, func(ctx context.Context, task *entroq.Task, value T, _ []*entroq.Doc) error {
 		initialTask = task
 		initialValue = value
 		// Note: do NOT call rCancel() here. If we cancel rCtx (and therefore
@@ -387,26 +488,25 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt) error {
 		// the correct mechanism: it waits for any in-flight renew to complete before
 		// handing back the stable version.
 
-		// Resource acquisition phase: claim/fetch before work begins.
-		if w.takeDocs != nil {
-			res, err := w.acquireDocs(ctx, task, value, opts)
-			if err != nil {
-				if de, ok := entroq.AsDependency(err); ok {
-					if de.HasMissingDocs() {
-						// A required resource is gone -- this task can never succeed.
-						sentinelErr = fmt.Errorf("required resource missing: %w", MoveError)
-					} else {
-						// Resources are claimed by someone else -- transient, retry.
-						sentinelErr = fmt.Errorf("resource contention: %w", RetryError)
-					}
-					return nil
-				}
-				return fmt.Errorf("acquire resources: %w", err)
-			}
-			acquiredRes = res
-		}
+		// Doc acquisition phase: claim/fetch before work begins.
 
-		if err := taskDo(ctx, task, value); err != nil {
+		res, err := w.acquireDocs(ctx, task, value, opts, handler.TakeDocs)
+		if err != nil {
+			if de, ok := entroq.AsDependency(err); ok {
+				if de.HasMissingDocs() {
+					// A required doc is gone -- this task can never succeed.
+					sentinelErr = fmt.Errorf("required doc missing: %w", MoveError)
+				} else {
+					// Docs are claimed by someone else -- transient, retry.
+					sentinelErr = fmt.Errorf("doc contention: %w", RetryError)
+				}
+				return nil
+			}
+			return fmt.Errorf("acquire docs: %w", err)
+		}
+		acquiredDocs = res
+
+		if err := handler.DoWork(ctx, task, value, acquiredDocs); err != nil {
 			// Check for sentinel errors, pass them out if they are, otherwise
 			// run it up the chain.
 			if isSentinelError(err) {
@@ -442,36 +542,8 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt) error {
 		return fmt.Errorf("worker claim failed (%q), backed off %v: %w", opts.qs, opts.backoff, handleErr)
 	}
 
-	// Define the finalizer function, we'll call it below.
-	var taskFinish DoTaskWork[T]
-	if w.doModify == nil {
-		taskFinish = w.handler.TaskFinish
-	} else {
-		taskFinish = func(ctx context.Context, task *entroq.Task, value T) error {
-			modification := entroq.NewModification("", returnedModArgs...)
-			switch {
-			case initialTask.Version > finalTask.Version:
-				return fmt.Errorf("task updated inside worker body, expected version <= %v, got %v", finalTask.Version, initialTask.Version)
-			case initialTask.Version < finalTask.Version:
-				renewModVersions(modification, finalTask.IDVersion())
-			}
-			if _, err := w.eqc.Modify(ctx, entroq.WithModification(modification)); err != nil {
-				if _, ok := entroq.AsDependency(err); ok {
-					log.Printf("Worker ack failed, throwing away: %v", err)
-					return fmt.Errorf("worker dependency: %w", err)
-				}
-				if entroq.IsCanceled(err) || entroq.IsTimeout(err) {
-					log.Printf("Worker exiting cleanly instead of acking: %v", err)
-					return fmt.Errorf("canceled in compact finish: %w", err)
-				}
-				return fmt.Errorf("worker doModify finish: %w", err)
-			}
-			return nil
-		}
-	}
-
 	// Finally call the finish function, handle any errors.
-	if err := taskFinish(ctx, finalTask, initialValue); err != nil {
+	if err := handler.Finish(ctx, finalTask, initialValue, acquiredDocs); err != nil {
 		// Too late to get sentinel errors - we don't know what task we have to
 		// move or retry it.
 		if de, ok := entroq.AsDependency(err); ok {
@@ -568,13 +640,13 @@ func (w *Worker[T]) Run(ctx context.Context, opts ...RunOption) error {
 	if len(ro.qs) == 0 {
 		return fmt.Errorf("no queues specified to work on")
 	}
-
-	if w.handler == nil && w.doModify == nil && w.doModifyRes == nil {
-		return fmt.Errorf("no work handler specified")
+	handler, err := w.makeHandler()
+	if err != nil {
+		return fmt.Errorf("failed to make handler: %v: %w", err, FatalError)
 	}
 
 	for {
-		if err := w.runOne(ctx, ro); err != nil {
+		if err := w.runOne(ctx, handler, ro); err != nil {
 			if entroq.IsCanceled(err) || entroq.IsTimeout(err) {
 				log.Printf("worker was asked to quit: %v", ctx.Err())
 				return nil
@@ -621,9 +693,9 @@ type DoWorkAll func(ctx context.Context, stop FinalizeRenewAll) error
 // DoWork defines a function like WorkAll, but handles only one task.
 type DoWork func(ctx context.Context, stop FinalizeRenew) error
 
-// DoTaskWork defines a function that can be called to do work on a task and its value.
-// Used in ClaimWithRenew.
-type DoTaskWork[T any] func(ctx context.Context, task *entroq.Task, value T) error
+// DoTaskWork defines a function that can be called to do work on a task, its
+// value, and any acquired docs. Used in ClaimWithRenew.
+type DoTaskWork[T any] func(ctx context.Context, task *entroq.Task, value T, docs []*entroq.Doc) error
 
 // ClaimWithRenew claims a task from the given queues (blocking), runs f with
 // background renewal, and returns the stable final task version. The final
@@ -692,7 +764,7 @@ func ClaimWithRenew[T any](ctx context.Context, eq *entroq.EntroQ, qs []string, 
 
 	g.Go(func() error {
 		defer close(stopRenew)
-		if err := f(gctx, task, value); err != nil {
+		if err := f(gctx, task, value, nil); err != nil {
 			return fmt.Errorf("worker (%q): %w", qs, err)
 		}
 		return nil

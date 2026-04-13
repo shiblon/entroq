@@ -82,6 +82,12 @@ paths:
                   in: query
                   schema:
                     type: boolean
+                - name: query.ids
+                  in: query
+                  schema:
+                    type: array
+                    items:
+                        type: string
             responses:
                 "200":
                     description: OK
@@ -337,7 +343,7 @@ components:
             type: object
             properties:
                 claimQuery:
-                    $ref: '#/components/schemas/DocClaimQuery'
+                    $ref: '#/components/schemas/DocClaim'
             description: ClaimDocsRequest asks to atomically claim a set of docs.
         ClaimDocsResponse:
             type: object
@@ -400,9 +406,9 @@ components:
                     type: string
                 expiresAtMs:
                     type: string
-                keyPrimary:
+                key:
                     type: string
-                keySecondary:
+                secondaryKey:
                     type: string
                 content:
                     type: string
@@ -422,30 +428,22 @@ components:
             description: |-
                 DocChange identifies a doc by DocID and provides updated data. Only content
                  and expires_at_ms from new_data are applied; keys are immutable after creation.
-        DocClaimQuery:
+        DocClaim:
             type: object
             properties:
                 namespace:
                     type: string
                 claimant:
                     type: string
-                ids:
-                    type: array
-                    items:
-                        type: string
-                keyStart:
-                    type: string
-                keyEnd:
+                key:
                     type: string
                 durationMs:
                     type: string
             description: |-
-                DocClaimQuery describes an atomic all-or-nothing claim of docs in a namespace.
+                DocClaim describes an atomic all-or-nothing claim of docs in a namespace.
 
-                 Claim strategy (exactly one must be specified):
-                   - ids non-empty: claim these exact docs by ID; key fields are ignored.
-                   - key_start only (key_end == ""): exact match on primary key.
-                   - key_start + key_end: half-open range [key_start, key_end).
+                 Claim strategy: always specify a namespace and key. Returned is all values
+                 with that key.
         DocData:
             type: object
             properties:
@@ -453,9 +451,9 @@ components:
                     type: string
                 id:
                     type: string
-                keyPrimary:
+                key:
                     type: string
-                keySecondary:
+                secondaryKey:
                     type: string
                 content:
                     type: string

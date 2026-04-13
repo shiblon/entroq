@@ -30,13 +30,13 @@ func TestWorker_Basic(t *testing.T) {
 
 	go func() {
 		w := New(client,
-			WithDo(func(ctx context.Context, task *entroq.Task, s string) error {
+			WithDo(func(ctx context.Context, task *entroq.Task, s string, _ []*entroq.Doc) error {
 				if s != "hi" {
 					return errors.New("wrong value")
 				}
 				return nil
 			}),
-			WithFinish(func(ctx context.Context, task *entroq.Task, _ string) error {
+			WithFinish(func(ctx context.Context, task *entroq.Task, _ string, _ []*entroq.Doc) error {
 				if _, err := client.Modify(ctx, task.Delete()); err != nil {
 					return err
 				}

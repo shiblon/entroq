@@ -23,7 +23,7 @@ func RunQTest(t *testing.T, tester eqtest.Tester) {
 		client.Close()
 		stop()
 	})
-	tester(ctx, t, client, "grpctest/"+entroq.Hex16Generator())
+	tester(ctx, t, client, "grpctest/"+entroq.GenHex16())
 }
 
 func TestGRPCTasksWithID(t *testing.T) {
