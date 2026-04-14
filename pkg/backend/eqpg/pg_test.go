@@ -226,7 +226,7 @@ func Example() {
 	go func() { time.Sleep(2 * time.Second); cancel() }()
 
 	w := worker.New(client,
-		worker.WithDo(func(ctx context.Context, claimed *entroq.Task, s string, _ []*entroq.Doc) error {
+		worker.WithDoWork(func(ctx context.Context, claimed *entroq.Task, s string, _ []*entroq.Doc) error {
 			// Do work with the task.
 			fmt.Println(s)
 			return nil
@@ -301,7 +301,7 @@ func Example_inTransaction() {
 	// when the task version is finalized (background renewal is stopped),
 	// updates the counter table.
 	w := worker.New(client,
-		worker.WithDo(func(ctx context.Context, claimed *entroq.Task, s string, _ []*entroq.Doc) error {
+		worker.WithDoWork(func(ctx context.Context, claimed *entroq.Task, s string, _ []*entroq.Doc) error {
 			// Do work with the task.
 			fmt.Println(s)
 			return nil

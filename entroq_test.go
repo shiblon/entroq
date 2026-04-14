@@ -51,7 +51,7 @@ func Example() {
 	w := worker.New(eq,
 		// Workers claim a task and pass it to your handler functions. In the
 		// background, the task's lease is renewed while the first function runs.
-		worker.WithDo(func(ctx context.Context, initial *entroq.Task, v string, _ []*entroq.Doc) error {
+		worker.WithDoWork(func(ctx context.Context, initial *entroq.Task, v string, _ []*entroq.Doc) error {
 			fmt.Printf("Worker handling task %q\n", v)
 			// Do work with it here.
 			return nil
@@ -107,7 +107,7 @@ func Example_dependencies() {
 	var config *entroq.Task
 
 	w := worker.New(eq,
-		worker.WithDo(func(ctx context.Context, initial *entroq.Task, _ json.RawMessage, _ []*entroq.Doc) error {
+		worker.WithDoWork(func(ctx context.Context, initial *entroq.Task, _ json.RawMessage, _ []*entroq.Doc) error {
 			if config == nil {
 				tasks, err := eq.Tasks(ctx, "config")
 				if err != nil || len(tasks) == 0 {
@@ -416,7 +416,7 @@ func Example_docKeyRange() {
 		log.Fatalf("range query: %v", err)
 	}
 	for _, d := range docs {
-		fmt.Println(d.KeyPrimary)
+		fmt.Println(d.Key)
 	}
 
 	// Output:
@@ -453,9 +453,9 @@ func Example_docAtomicTaskCommit() {
 	}
 
 	// Claim the state doc for exclusive modification.
-	claimed, err := eq.ClaimDocs(ctx, &entroq.DocClaimQuery{
+	claimed, err := eq.ClaimDocs(ctx, &entroq.DocClaim{
 		Namespace: "state",
-		IDs:       []string{stateDoc.ID},
+		Key:       stateDoc.Key,
 		Duration:  5 * time.Second,
 	})
 	if err != nil {
