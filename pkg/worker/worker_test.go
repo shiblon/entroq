@@ -30,7 +30,7 @@ func TestWorker_Basic(t *testing.T) {
 
 	go func() {
 		w := New(client,
-			WithDo(func(ctx context.Context, task *entroq.Task, s string, _ []*entroq.Doc) error {
+			WithDoWork(func(ctx context.Context, task *entroq.Task, s string, _ []*entroq.Doc) error {
 				if s != "hi" {
 					return errors.New("wrong value")
 				}

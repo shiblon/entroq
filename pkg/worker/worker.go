@@ -179,7 +179,7 @@ func (h *doModifyHandler[T]) DoWork(ctx context.Context, task *entroq.Task, val 
 		h.initialTask = task
 	}
 	if h.doModify == nil {
-		return fmt.Errorf("No work function specified", FatalError)
+		return fmt.Errorf("No work function specified: %w", FatalError)
 	}
 	h.modArgs, err = h.doModify(ctx, task, val, docs)
 	return err
