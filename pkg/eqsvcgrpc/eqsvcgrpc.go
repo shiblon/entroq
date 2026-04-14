@@ -561,11 +561,13 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 			return nil, autoCodeErrorf("doc change content: %w", err)
 		}
 		d := &entroq.Doc{
-			Namespace: old.GetNamespace(),
-			ID:        old.GetId(),
-			Version:   old.GetVersion(),
-			Content:   val,
-			ExpiresAt: fromMS(nd.GetExpiresAtMs()),
+			Namespace:    old.GetNamespace(),
+			ID:           old.GetId(),
+			Version:      old.GetVersion(),
+			Key:          nd.GetKey(),
+			SecondaryKey: nd.GetSecondaryKey(),
+			Content:      val,
+			ExpiresAt:    fromMS(nd.GetExpiresAtMs()),
 		}
 		modArgs = append(modArgs, d.Change())
 	}

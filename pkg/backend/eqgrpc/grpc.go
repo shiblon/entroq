@@ -583,8 +583,10 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (*entroq
 		req.DocChanges = append(req.DocChanges, &pb.DocChange{
 			OldId: &pb.DocID{Namespace: dc.Namespace, Id: dc.ID, Version: dc.Version},
 			NewData: &pb.DocData{
-				Content:     val,
-				ExpiresAtMs: toMS(dc.ExpiresAt),
+				Key:          dc.Key,
+				SecondaryKey: dc.SecondaryKey,
+				Content:      val,
+				ExpiresAtMs:  toMS(dc.ExpiresAt),
 			},
 		})
 	}
