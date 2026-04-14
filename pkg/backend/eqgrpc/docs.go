@@ -23,7 +23,6 @@ func fromDocProto(d *pb.Doc) *entroq.Doc {
 		Version:      d.Version,
 		Claimant:     d.Claimant,
 		At:           fromMS(d.AtMs),
-		ExpiresAt:    fromMS(d.ExpiresAtMs),
 		Key:          d.Key,
 		SecondaryKey: d.SecondaryKey,
 		Content:      content,

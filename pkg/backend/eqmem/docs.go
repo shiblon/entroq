@@ -1,7 +1,9 @@
 package eqmem
 
 import (
+	"cmp"
 	"context"
+	"slices"
 
 	"github.com/shiblon/entroq"
 )
@@ -55,6 +57,13 @@ func (m *EQMem) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, e
 		return true
 	})
 
+	slices.SortFunc(found, func(a, b *entroq.Doc) int {
+		if c := cmp.Compare(a.Key, b.Key); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.SecondaryKey, b.SecondaryKey)
+	})
+
 	return found, nil
 }
 
@@ -72,7 +81,7 @@ func (m *EQMem) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.D
 	nss := nls[0].docs
 
 	now, _ := m.Time(ctx)
-	expiresAt := now.Add(cq.Duration)
+	claimExpiry := now.Add(cq.Duration)
 
 	// Collect candidates first (no mutation during Range), then verify
 	// atomically, then write.
@@ -85,8 +94,8 @@ func (m *EQMem) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.D
 	})
 
 	for _, r := range candidates {
-		if r.Claimant != "" && now.Before(r.ExpiresAt) && r.Claimant != cq.Claimant {
-			return nil, entroq.DependencyErrorf("doc %s already claimed by %s until %v", r.ID, r.Claimant, r.ExpiresAt)
+		if r.Claimant != "" && now.Before(r.At) && r.Claimant != cq.Claimant {
+			return nil, entroq.DependencyErrorf("doc %s already claimed by %s until %v", r.ID, r.Claimant, r.At)
 		}
 	}
 
@@ -94,12 +103,19 @@ func (m *EQMem) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.D
 	for _, r := range candidates {
 		nr := r.Copy()
 		nr.Claimant = cq.Claimant
-		nr.ExpiresAt = expiresAt
+		nr.At = claimExpiry
 		nr.Version++
 		nr.Modified = now
 		nss.Set(r.ID, nr)
 		results = append(results, nr)
 	}
+
+	slices.SortFunc(results, func(a, b *entroq.Doc) int {
+		if c := cmp.Compare(a.Key, b.Key); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.SecondaryKey, b.SecondaryKey)
+	})
 
 	return results, nil
 }

@@ -495,3 +495,7 @@ func TestEQMemDocMultiOp(t *testing.T) {
 func TestEQMemDocListing(t *testing.T) {
 	RunQTest(t, eqtest.DocListing)
 }
+
+func TestEQMemDocClaimLocking(t *testing.T) {
+	RunQTest(t, eqtest.DocClaimLocking)
+}

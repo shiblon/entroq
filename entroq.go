@@ -34,6 +34,56 @@
 // There's no configuration to fiddle with; the service just adapts because
 // that's fundamental to the nature of a true competing consumer workflow
 // system.
+//
+// # Doc Store
+//
+// In addition to tasks, EntroQ provides a key-value doc store that lives in
+// the same atomic transaction space as tasks. A doc has a namespace, an
+// auto-assigned ID, a primary key, an optional secondary key, a JSON content
+// field, and an optional expiration time.
+//
+// Unlike tasks, docs are not work items to be claimed and deleted. They are
+// durable shared state: configuration, counters, reduce output, or any data
+// that multiple workers need to read or coordinate around.
+//
+// Docs and tasks share the same Modify call, so you can atomically create a
+// task and its initial doc state, or delete a task and update a doc, in one
+// round trip with no possibility of partial failure.
+//
+// # Doc Keys and Ordering
+//
+// The primary key groups related docs together. ClaimDocs acquires an
+// exclusive lease on all docs sharing a primary key in one atomic operation,
+// making the primary key the natural unit of exclusive ownership. The
+// secondary key provides a sort dimension within that group.
+//
+// Both Docs and ClaimDocs return results ordered by (primary key, secondary
+// key). This is guaranteed by both the PostgreSQL and eqmem backends. A
+// worker that claims a primary-key group receives docs in stable secondary-key
+// order, making reduce-shaped strategies simple.
+//
+// # Doc Storage Considerations
+//
+// All docs sharing a primary key are locked together during a claim. If a
+// single primary key references many docs, claim operations over that key
+// will be slower and take more memory proportional to the count. Design
+// primary keys so that the set of docs under one key is reasonable.
+//
+// The eqmem backend performs O(n) range scans over the full namespace on every
+// Docs or ClaimDocs call. It is suitable for development, testing, and
+// low-volume production use when docs play a central role for you. For
+// high-volume or latency-sensitive workloads, PostgreSQL is the recommended
+// backend.
+//
+// # Task-as-Mutex Pattern
+//
+// When multiple workers might compete to claim the same primary key, the
+// system will behave correctly, but contention can be reduced if documents are
+// only altered by workers that hold a related task, making that task a sort of
+// mutex. It could be a helpful design optimiation for some workloads,
+// eliminating contention on ClaimDocs entirely - only the worker holding the
+// task will ever try to claim those docs. It also bounds the lifetime of the
+// claim: when the task is deleted in Finish, the logical lock is released.
 package entroq
 
 // Copyright 2019 Chris Monson <shiblon@gmail.com>
@@ -1230,7 +1280,7 @@ func (m *Modification) badDocChanges(found map[string]*Doc) (missing, claimed []
 			missing = append(missing, &DocID{Namespace: chg.Namespace, ID: chg.ID, Version: chg.Version})
 			continue
 		}
-		if r.Claimant != "" && r.Claimant != m.Claimant && time.Now().Before(r.ExpiresAt) {
+		if r.Claimant != "" && r.Claimant != m.Claimant && time.Now().Before(r.At) {
 			claimed = append(claimed, &DocID{Namespace: chg.Namespace, ID: chg.ID, Version: chg.Version})
 		}
 	}
@@ -1244,7 +1294,7 @@ func (m *Modification) badDocDeletes(found map[string]*Doc) (missing, claimed []
 			missing = append(missing, del)
 			continue
 		}
-		if r.Claimant != "" && r.Claimant != m.Claimant && time.Now().Before(r.ExpiresAt) {
+		if r.Claimant != "" && r.Claimant != m.Claimant && time.Now().Before(r.At) {
 			claimed = append(claimed, del)
 		}
 	}

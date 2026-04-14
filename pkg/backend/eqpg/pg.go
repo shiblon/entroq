@@ -732,8 +732,8 @@ func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *mo
 	// Build parallel arrays for resource operation set.
 	rDepNS, rDepIDs, rDepVers := resourceIDArrays(mod.DocDepends)
 	rDelNS, rDelIDs, rDelVers := resourceIDArrays(mod.DocDeletes)
-	rInsNS, rInsIDs, rInsPKeys, rInsSKeys, rInsValues, rInsExpires := resourceInsertArrays(mod.DocInserts)
-	rChgNS, rChgIDs, rChgVers, rChgPKeys, rChgSKeys, rChgValues, rChgExpires, rChgAts := resourceChangeArrays(mod.DocChanges)
+	rInsNS, rInsIDs, rInsPKeys, rInsSKeys, rInsValues := resourceInsertArrays(mod.DocInserts)
+	rChgNS, rChgIDs, rChgVers, rChgPKeys, rChgSKeys, rChgValues, rChgAts := resourceChangeArrays(mod.DocChanges)
 
 	if options == nil {
 		options = &modifyConfig{}
@@ -767,19 +767,19 @@ func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *mo
 	// Resource modifications.
 	if len(rDepIDs)+len(rDelIDs)+len(rInsIDs)+len(rChgIDs) > 0 {
 		rRows, err := tx.QueryContext(ctx, `
-			SELECT kind, namespace, id, version, claimant, at, expires_at, key_primary, key_secondary, value, created, modified
+			SELECT kind, namespace, id, version, claimant, at, key_primary, key_secondary, value, created, modified
 			FROM _modify_docs(
 				$1,
 				$2::text[], $3::text[], $4::integer[],
 				$5::text[], $6::text[], $7::integer[],
-				$8::text[], $9::text[], $10::text[], $11::text[], $12::text[], $13::timestamptz[],
-				$14::text[], $15::text[], $16::integer[], $17::text[], $18::text[], $19::text[], $20::timestamptz[], $21::timestamptz[]
+				$8::text[], $9::text[], $10::text[], $11::text[], $12::text[],
+				$13::text[], $14::text[], $15::integer[], $16::text[], $17::text[], $18::text[], $19::timestamptz[]
 			)`,
 			mod.Claimant,
 			pq.Array(rDepNS), pq.Array(rDepIDs), pq.Array(rDepVers),
 			pq.Array(rDelNS), pq.Array(rDelIDs), pq.Array(rDelVers),
-			pq.Array(rInsNS), pq.Array(rInsIDs), pq.Array(rInsPKeys), pq.Array(rInsSKeys), pq.Array(rInsValues), pq.Array(rInsExpires),
-			pq.Array(rChgNS), pq.Array(rChgIDs), pq.Array(rChgVers), pq.Array(rChgPKeys), pq.Array(rChgSKeys), pq.Array(rChgValues), pq.Array(rChgExpires), pq.Array(rChgAts),
+			pq.Array(rInsNS), pq.Array(rInsIDs), pq.Array(rInsPKeys), pq.Array(rInsSKeys), pq.Array(rInsValues),
+			pq.Array(rChgNS), pq.Array(rChgIDs), pq.Array(rChgVers), pq.Array(rChgPKeys), pq.Array(rChgSKeys), pq.Array(rChgValues), pq.Array(rChgAts),
 		)
 		if err != nil {
 			return nil, parseModifyError(err, mod)
@@ -791,14 +791,13 @@ func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *mo
 			var kind string
 			var val []byte
 			var claimant sql.NullString
-			var at, expiresAt, created, modified sql.NullTime
-			if err := rRows.Scan(&kind, &r.Namespace, &r.ID, &r.Version, &claimant, &at, &expiresAt, &r.Key, &r.SecondaryKey, &val, &created, &modified); err != nil {
+			var at, created, modified sql.NullTime
+			if err := rRows.Scan(&kind, &r.Namespace, &r.ID, &r.Version, &claimant, &at, &r.Key, &r.SecondaryKey, &val, &created, &modified); err != nil {
 				return nil, fmt.Errorf("pg modify resource scan: %w", err)
 			}
 			r.Claimant = claimant.String
 			r.Content = val
 			r.At = at.Time
-			r.ExpiresAt = expiresAt.Time
 			r.Created = created.Time
 			r.Modified = modified.Time
 			switch kind {
@@ -1000,33 +999,30 @@ func resourceIDArrays(rids []*entroq.DocID) (ns, ids []string, versions []int32)
 }
 
 // resourceInsertArrays splits a slice of ResourceData into parallel arrays.
-func resourceInsertArrays(inserts []*entroq.DocData) (ns, ids, pkeys, skeys []string, values []*string, expires []time.Time) {
+func resourceInsertArrays(inserts []*entroq.DocData) (ns, ids, pkeys, skeys []string, values []*string) {
 	ns = make([]string, len(inserts))
 	ids = make([]string, len(inserts))
 	pkeys = make([]string, len(inserts))
 	skeys = make([]string, len(inserts))
 	values = make([]*string, len(inserts))
-	expires = make([]time.Time, len(inserts))
 	for i, ins := range inserts {
 		ns[i] = ins.Namespace
 		ids[i] = ins.ID
 		pkeys[i] = ins.Key
 		skeys[i] = ins.SecondaryKey
 		values[i] = jsonTextVal(ins.Content)
-		expires[i] = ins.ExpiresAt
 	}
 	return
 }
 
 // resourceChangeArrays splits a slice of Resource changes into parallel arrays.
-func resourceChangeArrays(changes []*entroq.Doc) (ns, ids []string, versions []int32, pkeys, skeys []string, values []*string, expires []time.Time, ats []time.Time) {
+func resourceChangeArrays(changes []*entroq.Doc) (ns, ids []string, versions []int32, pkeys, skeys []string, values []*string, ats []time.Time) {
 	ns = make([]string, len(changes))
 	ids = make([]string, len(changes))
 	versions = make([]int32, len(changes))
 	pkeys = make([]string, len(changes))
 	skeys = make([]string, len(changes))
 	values = make([]*string, len(changes))
-	expires = make([]time.Time, len(changes))
 	ats = make([]time.Time, len(changes))
 	for i, chg := range changes {
 		ns[i] = chg.Namespace
@@ -1035,7 +1031,6 @@ func resourceChangeArrays(changes []*entroq.Doc) (ns, ids []string, versions []i
 		pkeys[i] = chg.Key
 		skeys[i] = chg.SecondaryKey
 		values[i] = jsonTextVal(chg.Content)
-		expires[i] = chg.ExpiresAt
 		ats[i] = chg.At
 	}
 	return
@@ -1058,14 +1053,13 @@ func scanDocRows(rows *sql.Rows) ([]*entroq.Doc, error) {
 		r := new(entroq.Doc)
 		var val []byte
 		var claimant sql.NullString
-		var at, expiresAt, created, modified sql.NullTime
-		if err := rows.Scan(&r.Namespace, &r.ID, &r.Version, &claimant, &at, &expiresAt, &r.Key, &r.SecondaryKey, &val, &created, &modified); err != nil {
+		var at, created, modified sql.NullTime
+		if err := rows.Scan(&r.Namespace, &r.ID, &r.Version, &claimant, &at, &r.Key, &r.SecondaryKey, &val, &created, &modified); err != nil {
 			return nil, fmt.Errorf("pg docs scan: %w", err)
 		}
 		r.Content = val
 		r.Claimant = claimant.String
 		r.At = at.Time
-		r.ExpiresAt = expiresAt.Time
 		r.Created = created.Time
 		r.Modified = modified.Time
 		results = append(results, r)
@@ -1083,7 +1077,7 @@ func (b *EQPG) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, er
 	)
 	if len(rq.IDs) > 0 {
 		rows, err = b.DB.QueryContext(ctx,
-			`SELECT namespace, id, version, claimant, at, expires_at, key_primary, key_secondary, value, created, modified
+			`SELECT namespace, id, version, claimant, at, key_primary, key_secondary, value, created, modified
 			 FROM entroq.docs
 			 WHERE (namespace = $1 OR $1 = '') AND id = ANY($2)
 			 ORDER BY namespace, key_primary, key_secondary`,
@@ -1091,7 +1085,7 @@ func (b *EQPG) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, er
 		)
 	} else {
 		rows, err = b.DB.QueryContext(ctx,
-			`SELECT namespace, id, version, claimant, at, expires_at, key_primary, key_secondary, value, created, modified
+			`SELECT namespace, id, version, claimant, at, key_primary, key_secondary, value, created, modified
 			 FROM entroq.docs($1, $2, $3, $4, $5)`,
 			rq.Namespace, rq.KeyStart, rq.KeyEnd, rq.Limit, rq.OmitValues,
 		)
@@ -1113,7 +1107,7 @@ func (b *EQPG) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.Do
 
 	dur := fmt.Sprintf("%d microseconds", cq.Duration.Microseconds())
 	rows, err := b.DB.QueryContext(ctx,
-		`SELECT namespace, id, version, claimant, at, expires_at, key_primary, key_secondary, value, created, modified
+		`SELECT namespace, id, version, claimant, at, key_primary, key_secondary, value, created, modified
 		 FROM entroq._claim_docs($1, $2, $3::interval, $4)`,
 		cq.Namespace, cq.Claimant, dur, cq.Key,
 	)

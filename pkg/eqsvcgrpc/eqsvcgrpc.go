@@ -548,7 +548,6 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 			Key:          di.Key,
 			SecondaryKey: di.SecondaryKey,
 			Content:      val,
-			ExpiresAt:    fromMS(di.ExpiresAtMs),
 			Created:      fromMS(di.CreatedMs),
 			Modified:     fromMS(di.ModifiedMs),
 		}))
@@ -567,7 +566,6 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 			Key:          nd.GetKey(),
 			SecondaryKey: nd.GetSecondaryKey(),
 			Content:      val,
-			ExpiresAt:    fromMS(nd.GetExpiresAtMs()),
 		}
 		modArgs = append(modArgs, d.Change())
 	}
@@ -763,7 +761,6 @@ func protoFromDoc(d *entroq.Doc) (*pb.Doc, error) {
 		Version:      d.Version,
 		Claimant:     d.Claimant,
 		AtMs:         toMS(d.At),
-		ExpiresAtMs:  toMS(d.ExpiresAt),
 		Key:          d.Key,
 		SecondaryKey: d.SecondaryKey,
 		Content:      content,

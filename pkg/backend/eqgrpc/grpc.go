@@ -570,7 +570,6 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (*entroq
 			Key:          di.Key,
 			SecondaryKey: di.SecondaryKey,
 			Content:      val,
-			ExpiresAtMs:  toMS(di.ExpiresAt),
 			CreatedMs:    toMS(di.Created),
 			ModifiedMs:   toMS(di.Modified),
 		})
@@ -586,7 +585,6 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (*entroq
 				Key:          dc.Key,
 				SecondaryKey: dc.SecondaryKey,
 				Content:      val,
-				ExpiresAtMs:  toMS(dc.ExpiresAt),
 			},
 		})
 	}

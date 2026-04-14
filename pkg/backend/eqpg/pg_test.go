@@ -452,6 +452,10 @@ func Example_disableListenNotify() {
 
 	// Then, in your worker, rely entirely on polling instead of waiting for pushes:
 	// client.Claim(ctx, entroq.From("/example/my_queue"), entroq.ClaimPollTime(5 * time.Second))
+	fmt.Println("notifications disabled")
+
+	// Output:
+	// notifications disabled
 }
 
 func TestWorkerDependencyHandler(t *testing.T) {
@@ -476,4 +480,8 @@ func TestPGDocMultiOp(t *testing.T) {
 
 func TestPGDocListing(t *testing.T) {
 	RunQTest(t, eqtest.DocListing)
+}
+
+func TestPGDocClaimLocking(t *testing.T) {
+	RunQTest(t, eqtest.DocClaimLocking)
 }

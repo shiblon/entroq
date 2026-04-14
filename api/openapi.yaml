@@ -404,8 +404,6 @@ components:
                     type: string
                 atMs:
                     type: string
-                expiresAtMs:
-                    type: string
                 key:
                     type: string
                 secondaryKey:
@@ -426,7 +424,7 @@ components:
                     $ref: '#/components/schemas/DocData'
             description: |-
                 DocChange identifies a doc by DocID and provides updated data. Only content
-                 and expires_at_ms from new_data are applied; keys are immutable after creation.
+                 from new_data is applied; keys are immutable after creation.
         DocClaim:
             type: object
             properties:
@@ -440,9 +438,7 @@ components:
                     type: string
             description: |-
                 DocClaim describes an atomic all-or-nothing claim of docs in a namespace.
-
-                 Claim strategy: always specify a namespace and key. Returned is all values
-                 with that key.
+                 All docs sharing the given key are claimed together.
         DocData:
             type: object
             properties:
@@ -456,8 +452,6 @@ components:
                     type: string
                 content:
                     $ref: '#/components/schemas/GoogleProtobufValue'
-                expiresAtMs:
-                    type: string
                 createdMs:
                     type: string
                 modifiedMs:

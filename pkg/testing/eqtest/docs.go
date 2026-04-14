@@ -393,6 +393,66 @@ func MixedAtomicStress(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 	}
 }
 
+// DocClaimLocking verifies the all-or-nothing locking behavior of ClaimDocs:
+// a second claimant cannot claim the same key while docs are held by the first,
+// and the lock expires so a third claim can succeed after the duration elapses.
+func DocClaimLocking(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	ns := path.Join(qPrefix, "claim_lock_ns")
+	const key = "shared-key"
+
+	// Insert two docs with the same primary key.
+	if _, err := client.Modify(ctx,
+		entroq.CreatingIn(ns, entroq.WithKeys(key, "a"), entroq.WithContent(1)),
+		entroq.CreatingIn(ns, entroq.WithKeys(key, "b"), entroq.WithContent(2)),
+	); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	// First claimant acquires the lock.
+	const claimDur = 500 * time.Millisecond
+	docs, err := client.ClaimDocs(ctx, &entroq.DocClaim{
+		Namespace: ns,
+		Claimant:  "claimant-A",
+		Key:       key,
+		Duration:  claimDur,
+	})
+	if err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+	if len(docs) != 2 {
+		t.Fatalf("first claim: want 2 docs, got %d", len(docs))
+	}
+
+	// Second claimant must fail while first holds the lock.
+	_, err = client.ClaimDocs(ctx, &entroq.DocClaim{
+		Namespace: ns,
+		Claimant:  "claimant-B",
+		Key:       key,
+		Duration:  claimDur,
+	})
+	if err == nil {
+		t.Fatal("second claim should fail while first holds lock, got nil error")
+	}
+	if !entroq.IsDependency(err) {
+		t.Fatalf("expected DependencyError from second claim, got %T: %v", err, err)
+	}
+
+	// After the claim duration expires, a third claimant can succeed.
+	time.Sleep(claimDur + 50*time.Millisecond)
+	docs2, err := client.ClaimDocs(ctx, &entroq.DocClaim{
+		Namespace: ns,
+		Claimant:  "claimant-C",
+		Key:       key,
+		Duration:  claimDur,
+	})
+	if err != nil {
+		t.Fatalf("claim after expiry: %v", err)
+	}
+	if len(docs2) != 2 {
+		t.Fatalf("claim after expiry: want 2 docs, got %d", len(docs2))
+	}
+}
+
 // EqualDocs compares two docs for equality, allowing for a version increment.
 func EqualDocs(a, b *entroq.Doc, versionDiff int32) string {
 	copyA := *a
@@ -401,6 +461,5 @@ func EqualDocs(a, b *entroq.Doc, versionDiff int32) string {
 	copyA.At = b.At
 	copyA.Created = b.Created
 	copyA.Modified = b.Modified
-	copyA.ExpiresAt = b.ExpiresAt
 	return cmp.Diff(&copyA, b)
 }
