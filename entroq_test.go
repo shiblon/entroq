@@ -155,6 +155,15 @@ func Example_dependencies() {
 	if err := w.Run(ctx, worker.Watching("worker")); err != nil && !entroq.IsCanceled(err) {
 		log.Fatalf("worker failed: %v", err)
 	}
+
+	tasks, err := eq.Tasks(context.Background(), "worker")
+	if err != nil {
+		log.Fatalf("list tasks: %v", err)
+	}
+	fmt.Printf("tasks remaining: %d\n", len(tasks))
+
+	// Output:
+	// tasks remaining: 0
 }
 
 func Example_manualClaimAndRenew() {
@@ -197,6 +206,10 @@ func Example_manualClaimAndRenew() {
 	if err != nil {
 		log.Fatalf("manual processing failed: %v", err)
 	}
+	fmt.Println("task processed")
+
+	// Output:
+	// task processed
 }
 
 func TestDoWithRenewAll_ImmediateCancellationOnLeaseLoss(t *testing.T) {
@@ -334,12 +347,13 @@ func Example_docBasics() {
 	}
 	defer eq.Close()
 
-	// Create a doc in a namespace. Docs are identified by namespace + ID, and
-	// optionally indexed by primary and secondary key for range queries.
-	// Note that IDs must be unique in their namespace.
+	// Create a doc in a namespace. Docs are indexed by primary and optional
+	// secondary key. The ID is assigned automatically; use the key to address
+	// the doc in queries and claims. Use WithIDKeys only when you need an
+	// explicit ID (e.g. journal replay or cross-service references).
 	resp, err := eq.Modify(ctx,
 		entroq.CreatingIn("config",
-			entroq.WithIDKeys("server-cfg", "server", ""),
+			entroq.WithKeys("server", ""),
 			entroq.WithContent(map[string]any{"port": 8080}),
 		),
 	)
@@ -347,16 +361,16 @@ func Example_docBasics() {
 		log.Fatalf("create: %v", err)
 	}
 	doc := resp.InsertedDocs[0]
-	fmt.Printf("created doc %s version %d\n", doc.ID, doc.Version)
+	fmt.Printf("created doc key=%s version %d\n", doc.Key, doc.Version)
 
 	// Read it back.
-	docs, err := eq.Docs(ctx, &entroq.DocQuery{Namespace: "config"})
+	docs, err := eq.Docs(ctx, entroq.DocsIn("config"))
 	if err != nil {
 		log.Fatalf("list: %v", err)
 	}
 	fmt.Printf("listed %d doc(s)\n", len(docs))
 
-	// Update the content. Modify with the doc's current version as the identity.
+	// Update the content. The doc's current version acts as an optimistic lock.
 	resp, err = eq.Modify(ctx,
 		doc.Change(entroq.WithContent(map[string]any{"port": 9090})),
 	)
@@ -364,23 +378,23 @@ func Example_docBasics() {
 		log.Fatalf("update: %v", err)
 	}
 	updated := resp.ChangedDocs[0]
-	fmt.Printf("updated doc %s to version %d\n", updated.ID, updated.Version)
+	fmt.Printf("updated doc key=%s to version %d\n", updated.Key, updated.Version)
 
 	// Delete it.
 	if _, err := eq.Modify(ctx, entroq.DeletingDoc(updated)); err != nil {
 		log.Fatalf("delete: %v", err)
 	}
 
-	docs, err = eq.Docs(ctx, &entroq.DocQuery{Namespace: "config"})
+	docs, err = eq.Docs(ctx, entroq.DocsIn("config"))
 	if err != nil {
 		log.Fatalf("list after delete: %v", err)
 	}
 	fmt.Printf("listed %d doc(s) after delete\n", len(docs))
 
 	// Output:
-	// created doc server-cfg version 1
+	// created doc key=server version 1
 	// listed 1 doc(s)
-	// updated doc server-cfg to version 2
+	// updated doc key=server to version 2
 	// listed 0 doc(s) after delete
 }
 
@@ -398,7 +412,7 @@ func Example_docKeyRange() {
 	for _, k := range []string{"2024-01-01", "2024-06-15", "2025-03-10"} {
 		if _, err := eq.Modify(ctx,
 			entroq.CreatingIn(ns,
-				entroq.WithIDKeys(k, k, ""),
+				entroq.WithKeys(k, ""),
 				entroq.WithContent(k),
 			),
 		); err != nil {
@@ -407,11 +421,7 @@ func Example_docKeyRange() {
 	}
 
 	// List docs in the half-open range [2024-06-15, 2025-01-01).
-	docs, err := eq.Docs(ctx, &entroq.DocQuery{
-		Namespace: ns,
-		KeyStart:  "2024-06-15",
-		KeyEnd:    "2025-01-01",
-	})
+	docs, err := eq.Docs(ctx, entroq.DocsIn(ns).WithKeyRange("2024-06-15", "2025-01-01"))
 	if err != nil {
 		log.Fatalf("range query: %v", err)
 	}
@@ -436,7 +446,7 @@ func Example_docAtomicTaskCommit() {
 	// Create a shared state doc and a work task.
 	resp, err := eq.Modify(ctx,
 		entroq.CreatingIn("state",
-			entroq.WithIDKeys("counter", "", ""),
+			entroq.WithKeys("counter", ""),
 			entroq.WithContent(0),
 		),
 		entroq.InsertingInto("jobs", entroq.WithValue("increment")),
@@ -453,11 +463,7 @@ func Example_docAtomicTaskCommit() {
 	}
 
 	// Claim the state doc for exclusive modification.
-	claimed, err := eq.ClaimDocs(ctx, &entroq.DocClaim{
-		Namespace: "state",
-		Key:       stateDoc.Key,
-		Duration:  5 * time.Second,
-	})
+	claimed, err := eq.ClaimDocs(ctx, entroq.ClaimKey("state", stateDoc.Key).For(5*time.Second))
 	if err != nil {
 		log.Fatalf("claim doc: %v", err)
 	}
@@ -480,7 +486,7 @@ func Example_docAtomicTaskCommit() {
 	}
 
 	// Verify the final state.
-	docs, err := eq.Docs(ctx, &entroq.DocQuery{Namespace: "state"})
+	docs, err := eq.Docs(ctx, entroq.DocsIn("state"))
 	if err != nil {
 		log.Fatalf("read state: %v", err)
 	}
@@ -499,6 +505,168 @@ func Example_docAtomicTaskCommit() {
 	// Output:
 	// counter = 1
 	// jobs remaining = 0
+}
+
+// Example_docClaimContention demonstrates the all-or-nothing locking behavior
+// of ClaimDocs. All docs sharing a primary key are claimed together; a second
+// claimant attempting the same key while the lock is held gets a DependencyError.
+// A key that does not exist returns an empty slice rather than an error.
+func Example_docClaimContention() {
+	ctx := context.Background()
+	eq, err := entroq.New(ctx, eqmem.Opener())
+	if err != nil {
+		log.Fatalf("open: %v", err)
+	}
+	defer eq.Close()
+
+	const ns = "locks"
+	const key = "resource"
+
+	// A missing key returns an empty slice, not an error.
+	empty, err := eq.ClaimDocs(ctx, entroq.ClaimKey(ns, "no-such-key").For(time.Second))
+	if err != nil {
+		log.Fatalf("missing-key claim: %v", err)
+	}
+	fmt.Printf("missing key: %d docs\n", len(empty))
+
+	// Create two docs sharing the same primary key.
+	if _, err := eq.Modify(ctx,
+		entroq.CreatingIn(ns, entroq.WithKeys(key, "shard-0"), entroq.WithContent(0)),
+		entroq.CreatingIn(ns, entroq.WithKeys(key, "shard-1"), entroq.WithContent(0)),
+	); err != nil {
+		log.Fatalf("create: %v", err)
+	}
+
+	// First claimant acquires both docs atomically.
+	docs, err := eq.ClaimDocs(ctx, entroq.ClaimKey(ns, key))
+	if err != nil {
+		log.Fatalf("first claim: %v", err)
+	}
+	fmt.Printf("first claim: %d docs\n", len(docs))
+
+	// A second claimant is blocked while the first holds the lock.
+	// The lock expires automatically after Duration; use doc.Change() to
+	// release it early (which increments the version).
+	_, err = eq.ClaimDocs(ctx, &entroq.DocClaim{
+		Namespace: ns,
+		Claimant:  "other-claimant",
+		Key:       key,
+		Duration:  entroq.DefaultClaimDuration,
+	})
+	fmt.Printf("contention: IsDependency=%v\n", entroq.IsDependency(err))
+
+	// Output:
+	// missing key: 0 docs
+	// first claim: 2 docs
+	// contention: IsDependency=true
+}
+
+// Example_docVersionPin demonstrates DependingOnDoc as an optimistic-lock
+// check. The dependency pins a Modify to a specific doc version without
+// modifying the doc: the operation succeeds only when the doc is still at the
+// expected version. HasMissingDocs is true when any version-pinned dependency
+// fails -- whether the doc is genuinely absent or simply at a different version.
+func Example_docVersionPin() {
+	ctx := context.Background()
+	eq, err := entroq.New(ctx, eqmem.Opener())
+	if err != nil {
+		log.Fatalf("open: %v", err)
+	}
+	defer eq.Close()
+
+	// Create a config doc.
+	resp, err := eq.Modify(ctx,
+		entroq.CreatingIn("config",
+			entroq.WithKeys("limits", ""),
+			entroq.WithContent(map[string]any{"max": 100}),
+		),
+	)
+	if err != nil {
+		log.Fatalf("create: %v", err)
+	}
+	v1 := resp.InsertedDocs[0]
+	fmt.Printf("created at version %d\n", v1.Version)
+
+	// Update the doc so v1 is now stale.
+	resp, err = eq.Modify(ctx,
+		v1.Change(entroq.WithContent(map[string]any{"max": 200})),
+	)
+	if err != nil {
+		log.Fatalf("update: %v", err)
+	}
+	v2 := resp.ChangedDocs[0]
+	fmt.Printf("updated to version %d\n", v2.Version)
+
+	// Depend on the old version -- fails because the doc has moved on.
+	_, err = eq.Modify(ctx,
+		entroq.InsertingInto("work", entroq.WithValue("job")),
+		v1.Depend(),
+	)
+	if de, ok := entroq.AsDependency(err); ok {
+		fmt.Printf("stale pin: IsDependency=true, HasMissingDocs=%v\n", de.HasMissingDocs())
+	}
+
+	// Depend on the current version -- succeeds.
+	if _, err = eq.Modify(ctx,
+		entroq.InsertingInto("work", entroq.WithValue("job")),
+		v2.Depend(),
+	); err != nil {
+		log.Fatalf("current pin: %v", err)
+	}
+	fmt.Println("current pin: ok")
+
+	// Output:
+	// created at version 1
+	// updated to version 2
+	// stale pin: IsDependency=true, HasMissingDocs=true
+	// current pin: ok
+}
+
+// Example_docQueryByID demonstrates fetching specific docs by explicit ID.
+// When IDs are specified, key-range filtering and Limit are ignored and docs
+// are returned in the order the IDs are listed.
+func Example_docQueryByID() {
+	ctx := context.Background()
+	eq, err := entroq.New(ctx, eqmem.Opener())
+	if err != nil {
+		log.Fatalf("open: %v", err)
+	}
+	defer eq.Close()
+
+	// Create docs with known IDs for stable querying.
+	if _, err := eq.Modify(ctx,
+		entroq.CreatingIn("items",
+			entroq.WithIDKeys("id-alpha", "item", "0"),
+			entroq.WithContent("first"),
+		),
+		entroq.CreatingIn("items",
+			entroq.WithIDKeys("id-beta", "item", "1"),
+			entroq.WithContent("second"),
+		),
+		entroq.CreatingIn("items",
+			entroq.WithIDKeys("id-gamma", "item", "2"),
+			entroq.WithContent("third"),
+		),
+	); err != nil {
+		log.Fatalf("create: %v", err)
+	}
+
+	// Fetch a specific subset by ID; order follows the IDs slice.
+	docs, err := eq.Docs(ctx, entroq.DocsIn("items").WithIDs("id-gamma", "id-alpha"))
+	if err != nil {
+		log.Fatalf("query by ID: %v", err)
+	}
+	for _, d := range docs {
+		var s string
+		if err := d.ContentAs(&s); err != nil {
+			log.Fatalf("unmarshal: %v", err)
+		}
+		fmt.Printf("id=%s content=%s\n", d.ID, s)
+	}
+
+	// Output:
+	// id=id-gamma content=third
+	// id=id-alpha content=first
 }
 
 // containsAll returns true if s contains all of the given substrings.

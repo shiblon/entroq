@@ -760,7 +760,6 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 			Content:      rd.Content,
 			Key:          rd.Key,
 			SecondaryKey: rd.SecondaryKey,
-			ExpiresAt:    rd.ExpiresAt,
 			Claimant:     mod.Claimant,
 			Created:      created,
 			Modified:     modified,

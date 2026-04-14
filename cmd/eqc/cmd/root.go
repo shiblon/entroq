@@ -43,6 +43,7 @@ var rootFlags struct {
 	maxMsgSizeMB int
 	pgURL        string
 	pgHeartbeat  string
+	claimant     string
 }
 
 var eq *entroq.EntroQ
@@ -89,6 +90,11 @@ queue listings, individual task information, etc.`,
 			opts = append(opts, eqgrpc.WithMaxSize(size))
 		}
 
+		var clientOpts []entroq.Option
+		if rootFlags.claimant != "" {
+			clientOpts = append(clientOpts, entroq.WithClaimantID(rootFlags.claimant))
+		}
+
 		var err error
 		if rootFlags.pgURL != "" {
 			var hb time.Duration
@@ -97,9 +103,9 @@ queue listings, individual task information, etc.`,
 					return fmt.Errorf("pg heartbeat duration Parse: %w", err)
 				}
 			}
-			eq, err = entroq.New(context.Background(), eqpg.Opener(rootFlags.pgURL, eqpg.WithHeartbeat(hb)))
+			eq, err = entroq.New(context.Background(), eqpg.Opener(rootFlags.pgURL, eqpg.WithHeartbeat(hb)), clientOpts...)
 		} else {
-			eq, err = entroq.New(context.Background(), eqgrpc.Opener(rootFlags.svcAddr, opts...))
+			eq, err = entroq.New(context.Background(), eqgrpc.Opener(rootFlags.svcAddr, opts...), clientOpts...)
 		}
 		if err != nil {
 			return fmt.Errorf("entroq client open: %w", err)
@@ -140,12 +146,15 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&rootFlags.authzToken, "authz_token", "", "Pass an Authorization token.")
 	rootCmd.PersistentFlags().StringVar(&rootFlags.pgURL, "pg_url", "", "PostgreSQL URL for direct backend connection.")
 	rootCmd.PersistentFlags().StringVar(&rootFlags.pgHeartbeat, "pg_heartbeat", "", "Heartbeat interval for direct PG connection (e.g. 5s).")
+	rootCmd.PersistentFlags().StringVar(&rootFlags.claimant, "claimant", "", "Claimant ID for this process. Defaults to a random UUID if not set. Also read from EQC_CLAIMANT.")
 
 	viper.BindPFlag("svcaddr", rootCmd.PersistentFlags().Lookup("svcaddr"))
 	viper.BindPFlag("authz_token", rootCmd.PersistentFlags().Lookup("authz_token"))
 	viper.BindPFlag("max_msg_size_mb", rootCmd.PersistentFlags().Lookup("max_msg_size_mb"))
 	viper.BindPFlag("pg_url", rootCmd.PersistentFlags().Lookup("pg_url"))
 	viper.BindPFlag("pg_heartbeat", rootCmd.PersistentFlags().Lookup("pg_heartbeat"))
+	viper.BindPFlag("claimant", rootCmd.PersistentFlags().Lookup("claimant"))
+	viper.BindEnv("claimant", "EQC_CLAIMANT")
 }
 
 func mustTaskString(t *entroq.Task) string {
@@ -186,6 +195,7 @@ func initConfig() {
 	rootFlags.maxMsgSizeMB = viper.GetInt("max_msg_size_mb")
 	rootFlags.pgURL = viper.GetString("pg_url")
 	rootFlags.pgHeartbeat = viper.GetString("pg_heartbeat")
+	rootFlags.claimant = viper.GetString("claimant")
 
 	// If a config file is found, read it in.
 	if err := viper.ReadInConfig(); err == nil {

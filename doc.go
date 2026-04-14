@@ -17,7 +17,6 @@ type docOpts struct {
 	key          string
 	secondaryKey string
 	content      json.RawMessage
-	expiresAt    time.Time
 }
 
 // WithKeys sets the primary and secondary keys for doc creation. The ID is
@@ -64,13 +63,6 @@ func WithContent(v any) DocOpt {
 	return WithRawContent(b)
 }
 
-// WithExpiry sets the expiration time of a doc.
-func WithExpiry(at time.Time) DocOpt {
-	return func(o *docOpts) {
-		o.expiresAt = at
-	}
-}
-
 // DocID contains the identifying parts of a storage doc.
 type DocID struct {
 	Namespace string `json:"namespace"`
@@ -101,7 +93,6 @@ type DocData struct {
 	Key          string          `json:"key"`
 	SecondaryKey string          `json:"secondary_key"`
 	Content      json.RawMessage `json:"content"`
-	ExpiresAt    time.Time       `json:"expires_at"`
 	Created      time.Time       `json:"created"`
 	Modified     time.Time       `json:"modified"`
 }
@@ -113,7 +104,6 @@ type Doc struct {
 	Version      int32           `json:"version"`
 	Claimant     string          `json:"claimant"`
 	At           time.Time       `json:"at"`
-	ExpiresAt    time.Time       `json:"expires_at"`
 	Key          string          `json:"key"`
 	SecondaryKey string          `json:"secondary_key"`
 	Content      json.RawMessage `json:"content"`
@@ -128,7 +118,6 @@ func (r *Doc) Data() *DocData {
 		ID:           r.ID,
 		Key:          r.Key,
 		SecondaryKey: r.SecondaryKey,
-		ExpiresAt:    r.ExpiresAt,
 		Created:      r.Created,
 		Modified:     r.Modified,
 	}
@@ -177,8 +166,8 @@ func (r *Doc) Copy() *Doc {
 	return &cp
 }
 
-// Change returns a ModifyArg that changes this doc. Accepts WithContent
-// and WithExpiry options. WithIDKeys is ignored (keys are immutable).
+// Change returns a ModifyArg that changes this doc. Accepts WithContent.
+// WithIDKeys is ignored (keys are immutable).
 func (r *Doc) Change(opts ...DocOpt) ModifyArg {
 	return func(m *Modification) {
 		o := &docOpts{}
@@ -188,9 +177,6 @@ func (r *Doc) Change(opts ...DocOpt) ModifyArg {
 		nr := r.Copy()
 		if len(o.content) > 0 {
 			nr.Content = o.content
-		}
-		if !o.expiresAt.IsZero() {
-			nr.ExpiresAt = o.expiresAt
 		}
 		m.DocChanges = append(m.DocChanges, nr)
 	}
@@ -269,8 +255,7 @@ func InsertingDoc(rd *DocData) ModifyArg {
 
 // CreatingIn returns a ModifyArg that creates a doc in the given namespace.
 // Use WithKeys to set the primary and secondary keys, WithContent/WithRawContent
-// to set the payload, and WithExpiry to set an expiration time. Use WithIDKeys
-// only when explicit ID control is required.
+// to set the payload. Use WithIDKeys only when explicit ID control is required.
 func CreatingIn(ns string, opts ...DocOpt) ModifyArg {
 	return func(m *Modification) {
 		o := &docOpts{}
@@ -283,7 +268,6 @@ func CreatingIn(ns string, opts ...DocOpt) ModifyArg {
 			Key:          o.key,
 			SecondaryKey: o.secondaryKey,
 			Content:      o.content,
-			ExpiresAt:    o.expiresAt,
 		}
 		m.DocInserts = append(m.DocInserts, rd)
 	}
@@ -292,6 +276,12 @@ func CreatingIn(ns string, opts ...DocOpt) ModifyArg {
 // DocQuery is used to list docs from a namespace with optional range filtering.
 // If IDs are present, key range is ignored. Only one will be used. Limit does
 // not apply to ID lists.
+//
+// Construct with DocsIn for a fluent interface:
+//
+//	eq.Docs(ctx, entroq.DocsIn("config"))
+//	eq.Docs(ctx, entroq.DocsIn("metrics").WithKeyRange("2024-01-01", "2025-01-01"))
+//	eq.Docs(ctx, entroq.DocsIn("items").WithIDs("id-a", "id-b"))
 type DocQuery struct {
 	Namespace  string   `json:"namespace"`
 	IDs        []string `json:"ids"`
@@ -301,12 +291,67 @@ type DocQuery struct {
 	OmitValues bool     `json:"omit_values"`
 }
 
-// DocClaim is used to claim specific docs or a range of docs that share a key.
+// DocsIn returns a DocQuery scoped to the given namespace. Chain methods to
+// refine the query.
+func DocsIn(ns string) *DocQuery {
+	return &DocQuery{Namespace: ns}
+}
+
+// WithKeyRange filters docs to the half-open primary-key range [start, end).
+// An empty end means no upper bound.
+func (q *DocQuery) WithKeyRange(start, end string) *DocQuery {
+	q.KeyStart = start
+	q.KeyEnd = end
+	return q
+}
+
+// WithIDs restricts the query to specific doc IDs. Key range and Limit are
+// ignored when IDs are set. Docs are returned in the order IDs are listed.
+func (q *DocQuery) WithIDs(ids ...string) *DocQuery {
+	q.IDs = ids
+	return q
+}
+
+// WithLimit caps the number of docs returned. Has no effect when WithIDs is set.
+func (q *DocQuery) WithLimit(n int) *DocQuery {
+	q.Limit = n
+	return q
+}
+
+// WithOmitValues strips content payloads from returned docs, useful when only
+// keys and metadata are needed.
+func (q *DocQuery) WithOmitValues() *DocQuery {
+	q.OmitValues = true
+	return q
+}
+
+// DocClaim is used to claim all docs that share a primary key in a namespace.
+//
+// Construct with ClaimKey for a fluent interface:
+//
+//	eq.ClaimDocs(ctx, entroq.ClaimKey("state", "counter"))
+//	eq.ClaimDocs(ctx, entroq.ClaimKey("state", "counter").For(5*time.Second))
 type DocClaim struct {
 	Namespace string        `json:"namespace"`
 	Claimant  string        `json:"claimant"`
 	Key       string        `json:"key"`
 	Duration  time.Duration `json:"duration"`
+}
+
+// ClaimKey returns a DocClaim for the given namespace and primary key, using
+// DefaultClaimDuration. Call For to override the duration.
+func ClaimKey(ns, key string) *DocClaim {
+	return &DocClaim{
+		Namespace: ns,
+		Key:       key,
+		Duration:  DefaultClaimDuration,
+	}
+}
+
+// For sets the claim duration, overriding the DefaultClaimDuration set by ClaimKey.
+func (c *DocClaim) For(d time.Duration) *DocClaim {
+	c.Duration = d
+	return c
 }
 
 // Validate checks that the claim query specifies exactly one valid strategy.

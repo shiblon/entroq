@@ -176,14 +176,21 @@ class Transaction:
 # ---------------------------------------------------------------------------
 
 # Must match the value in schema.sql and backend/eqpg/schema.go.
-SCHEMA_VERSION = "0.10.0"
+SCHEMA_VERSION = "0.12.0"
+
+_INIT_HINT = (
+    "Initialize the database with:\n\n"
+    "  docker run --rm shiblon/entroq:1 schema init --db YOUR_DSN\n\n"
+    "where YOUR_DSN is a libpq connection string, e.g.:\n"
+    "  'host=localhost dbname=entroq user=entroq password=secret'"
+)
 
 
 def _check_schema_version(connstr: str) -> None:
     """Verify that the database schema version matches SCHEMA_VERSION.
 
-    Raises RuntimeError with a descriptive message on mismatch or if the
-    meta table is absent (uninitialized or pre-versioning database).
+    Raises RuntimeError with an actionable message on mismatch or if the
+    schema has not been initialized.
     """
     with psycopg.connect(connstr, row_factory=dict_row, options="-c search_path=entroq,public") as conn:
         try:
@@ -193,22 +200,21 @@ def _check_schema_version(connstr: str) -> None:
         except psycopg.DatabaseError as e:
             if e.diag.sqlstate == '42P01':  # undefined_table
                 raise RuntimeError(
-                    "meta table not found; "
-                    "initialize the database by running schema.sql"
+                    f"EntroQ schema not found -- database has not been initialized.\n"
+                    f"{_INIT_HINT}"
                 ) from e
             raise
         if row is None:
             raise RuntimeError(
-                "schema_version not found in meta; "
-                "re-run schema.sql to initialize"
+                f"EntroQ schema not initialized (schema_version missing).\n"
+                f"{_INIT_HINT}"
             )
         stored = row['value']
         if stored != SCHEMA_VERSION:
             raise RuntimeError(
-                f"schema version mismatch: database has {stored!r}, "
-                f"code expects {SCHEMA_VERSION!r}; apply schema.sql to migrate, "
-                f"then: UPDATE entroq.meta SET value = '{SCHEMA_VERSION}' "
-                f"WHERE key = 'schema_version'"
+                f"EntroQ schema version mismatch: database has {stored!r}, "
+                f"this client expects {SCHEMA_VERSION!r}.\n"
+                f"{_INIT_HINT}"
             )
 
 

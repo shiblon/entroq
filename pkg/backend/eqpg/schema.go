@@ -16,7 +16,7 @@ var SchemaSQL string
 // SchemaVersion is the schema version this build of eqpg expects to find in
 // the database. initDB refuses to open the backend if the stored version
 // differs, protecting against accidental use of a mismatched schema.
-const SchemaVersion = "0.11.0"
+const SchemaVersion = "0.12.0"
 
 // InitSchema applies the full idempotent EntroQ DDL to db. Safe to run on an
 // already-initialized database.

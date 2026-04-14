@@ -146,13 +146,12 @@ message DocData {
   string key = 3;
   string secondary_key = 4;
   google.protobuf.Value content = 5;
-  int64 expires_at_ms = 6;
-  int64 created_ms = 7;
-  int64 modified_ms = 8;
+  int64 created_ms = 6;
+  int64 modified_ms = 7;
 }
 
 // DocChange identifies a doc by DocID and provides updated data. Only content
-// and expires_at_ms from new_data are applied; keys are immutable after creation.
+// from new_data is applied; keys are immutable after creation.
 message DocChange {
   DocID old_id = 1;
   DocData new_data = 2;
@@ -165,12 +164,11 @@ message Doc {
   int32 version = 3;
   string claimant = 4;
   int64 at_ms = 5;
-  int64 expires_at_ms = 6;
-  string key = 7;
-  string secondary_key = 8;
-  google.protobuf.Value content = 9;
-  int64 created_ms = 10;
-  int64 modified_ms = 11;
+  string key = 6;
+  string secondary_key = 7;
+  google.protobuf.Value content = 8;
+  int64 created_ms = 9;
+  int64 modified_ms = 10;
 }
 
 // DocQuery describes a listing request for docs in a namespace. If ids is
@@ -187,14 +185,12 @@ message DocQuery {
 }
 
 // DocClaim describes an atomic all-or-nothing claim of docs in a namespace.
-//
-// Claim strategy: always specify a namespace and key. Returned is all values
-// with that key.
+// All docs sharing the given key are claimed together.
 message DocClaim {
   string namespace = 1;
   string claimant = 2;
-  string key = 4;
-  int64 duration_ms = 5;
+  string key = 3;
+  int64 duration_ms = 4;
 }
 
 // DocsRequest asks for a listing of docs matching a query.

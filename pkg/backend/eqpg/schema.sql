@@ -92,14 +92,12 @@ CREATE TABLE IF NOT EXISTS entroq.tasks (
 -- Resource Storage. Keyed by namespace + id.
 -- key_primary and key_secondary provide range-scan and sorting capabilities.
 -- at is used for claiming (locking).
--- expires_at is used for GC (permanent deletion).
 CREATE TABLE IF NOT EXISTS entroq.docs (
     namespace     TEXT                     NOT NULL CHECK (length(namespace) <= 64),
     id            TEXT                     NOT NULL CHECK (length(id) <= 64),
     version       INTEGER                  NOT NULL DEFAULT 0,
     claimant      TEXT                     CHECK (claimant IS NULL OR length(claimant) <= 64),
     at            TIMESTAMP WITH TIME ZONE,
-    expires_at    TIMESTAMP WITH TIME ZONE,
     key_primary   TEXT                     NOT NULL DEFAULT '' CHECK (length(key_primary) <= 256),
     key_secondary TEXT                     NOT NULL DEFAULT '' CHECK (length(key_secondary) <= 256),
     value         JSONB,
@@ -116,7 +114,6 @@ CREATE INDEX IF NOT EXISTS byQueueAt   ON entroq.tasks (queue, at);
 
 -- Storage Indexes.
 CREATE INDEX IF NOT EXISTS idx_docs_keys  ON entroq.docs (namespace, key_primary, key_secondary);
-CREATE INDEX IF NOT EXISTS idx_docs_gc    ON entroq.docs (expires_at) WHERE expires_at IS NOT NULL;
 
 -- Bucket index: supports range-based bucket selection in _try_claim_bucket.
 -- hashtext(id) & 255 gives a stable value in [0, 255] for any text ID.
@@ -171,7 +168,6 @@ DO $$ BEGIN
         id            text,
         version       integer,
         at            timestamptz,
-        expires_at    timestamptz,
         key_primary   text,
         key_secondary text,
         value         jsonb
@@ -640,11 +636,10 @@ $$;
 --   depends / deletes:  {"namespace": "<ns>", "id": "<id>", "version": <int>}
 --   inserts:            {"namespace": "<ns>", "id": "<id>",
 --                        "key_primary": "<str>", "key_secondary": "<str>",
---                        "content": <jsonb>, "expires_at": "<rfc3339>"}
+--                        "content": <jsonb>}
 --   changes:            {"namespace": "<ns>", "id": "<id>", "version": <int>,
 --                        "key_primary": "<str>", "key_secondary": "<str>",
---                        "content": <jsonb>, "expires_at": "<rfc3339>",
---                        "at": "<rfc3339>"}
+--                        "content": <jsonb>, "at": "<rfc3339>"}
 --
 -- All parameters default to '[]'. Returns tagged rows from _modify_docs:
 --   kind='inserted' or kind='changed', followed by all doc fields.
@@ -661,7 +656,6 @@ CREATE OR REPLACE FUNCTION entroq.modify_docs(
     version       integer,
     claimant      text,
     at            timestamptz,
-    expires_at    timestamptz,
     key_primary   text,
     key_secondary text,
     value         jsonb,
@@ -685,7 +679,6 @@ CREATE OR REPLACE FUNCTION entroq.modify_docs(
         ARRAY(SELECT coalesce(e->>'key_secondary', '') FROM jsonb_array_elements(p_inserts) e),
         ARRAY(SELECT CASE WHEN e ? 'content' THEN (e->'content')::text ELSE NULL END
               FROM jsonb_array_elements(p_inserts) e),
-        ARRAY(SELECT (e->>'expires_at')::timestamptz FROM jsonb_array_elements(p_inserts) e),
         -- changes
         ARRAY(SELECT e->>'namespace'             FROM jsonb_array_elements(p_changes) e),
         ARRAY(SELECT e->>'id'                    FROM jsonb_array_elements(p_changes) e),
@@ -694,7 +687,6 @@ CREATE OR REPLACE FUNCTION entroq.modify_docs(
         ARRAY(SELECT coalesce(e->>'key_secondary', '') FROM jsonb_array_elements(p_changes) e),
         ARRAY(SELECT CASE WHEN e ? 'content' THEN (e->'content')::text ELSE NULL END
               FROM jsonb_array_elements(p_changes) e),
-        ARRAY(SELECT (e->>'expires_at')::timestamptz FROM jsonb_array_elements(p_changes) e),
         ARRAY(SELECT (e->>'at')::timestamptz         FROM jsonb_array_elements(p_changes) e)
     )
 $$;
@@ -791,7 +783,6 @@ CREATE OR REPLACE FUNCTION entroq.docs(
     version       integer,
     claimant      text,
     at            timestamptz,
-    expires_at    timestamptz,
     key_primary   text,
     key_secondary text,
     value         jsonb,
@@ -799,7 +790,7 @@ CREATE OR REPLACE FUNCTION entroq.docs(
     modified      timestamptz
 ) LANGUAGE sql AS $$
     SELECT
-        namespace, id, version, claimant, at, expires_at,
+        namespace, id, version, claimant, at,
         key_primary, key_secondary,
         CASE WHEN p_omit_values THEN NULL::jsonb ELSE value END AS value,
         created, modified
@@ -826,7 +817,6 @@ CREATE OR REPLACE FUNCTION entroq._claim_docs(
     version       integer,
     claimant      text,
     at            timestamptz,
-    expires_at    timestamptz,
     key_primary   text,
     key_secondary text,
     value         jsonb,
@@ -862,15 +852,18 @@ BEGIN
     END IF;
 
     RETURN QUERY
-        UPDATE entroq.docs
-        SET
-            version  = entroq.docs.version + 1,
-            at       = v_now + p_duration,
-            claimant = p_claimant,
-            modified = v_now
-        WHERE entroq.docs.namespace = p_namespace
-          AND entroq.docs.key_primary = p_key
-        RETURNING *;
+        SELECT * FROM (
+            UPDATE entroq.docs
+            SET
+                version  = entroq.docs.version + 1,
+                at       = v_now + p_duration,
+                claimant = p_claimant,
+                modified = v_now
+            WHERE entroq.docs.namespace = p_namespace
+              AND entroq.docs.key_primary = p_key
+            RETURNING *
+        ) updated
+        ORDER BY key_primary, key_secondary;
 END;
 $$;
 
@@ -887,7 +880,6 @@ CREATE OR REPLACE FUNCTION entroq.claim_docs(
     version       integer,
     claimant      text,
     at            timestamptz,
-    expires_at    timestamptz,
     key_primary   text,
     key_secondary text,
     value         jsonb,
@@ -965,14 +957,12 @@ CREATE OR REPLACE FUNCTION entroq._modify_docs(
     p_ins_pkeys    text[],
     p_ins_skeys    text[],
     p_ins_values   text[],
-    p_ins_expires  timestamptz[],
     p_chg_ns       text[],
     p_chg_ids      text[],
     p_chg_vers     integer[],
     p_chg_pkeys    text[],
     p_chg_skeys    text[],
     p_chg_values   text[],
-    p_chg_expires  timestamptz[],
     p_chg_ats      timestamptz[]
 ) RETURNS TABLE(
     kind          text,
@@ -981,7 +971,6 @@ CREATE OR REPLACE FUNCTION entroq._modify_docs(
     version       integer,
     claimant      text,
     at            timestamptz,
-    expires_at    timestamptz,
     key_primary   text,
     key_secondary text,
     value         jsonb,
@@ -1037,13 +1026,13 @@ BEGIN
     -- Inserts
     RETURN QUERY
     WITH r AS (
-        INSERT INTO entroq.docs (namespace, id, version, key_primary, key_secondary, value, expires_at, created, modified)
-        SELECT ins_ns, ins_id, 0, ins_pk, ins_sk, ins_val::jsonb, ins_exp, v_now, v_now
-        FROM unnest(p_ins_ns, p_ins_ids, p_ins_pkeys, p_ins_skeys, p_ins_values, p_ins_expires)
-        AS i(ins_ns, ins_id, ins_pk, ins_sk, ins_val, ins_exp)
+        INSERT INTO entroq.docs (namespace, id, version, key_primary, key_secondary, value, created, modified)
+        SELECT ins_ns, ins_id, 0, ins_pk, ins_sk, ins_val::jsonb, v_now, v_now
+        FROM unnest(p_ins_ns, p_ins_ids, p_ins_pkeys, p_ins_skeys, p_ins_values)
+        AS i(ins_ns, ins_id, ins_pk, ins_sk, ins_val)
         RETURNING *
     )
-    SELECT 'inserted', r.namespace, r.id, r.version, r.claimant, r.at, r.expires_at, r.key_primary, r.key_secondary, r.value, r.created, r.modified FROM r;
+    SELECT 'inserted', r.namespace, r.id, r.version, r.claimant, r.at, r.key_primary, r.key_secondary, r.value, r.created, r.modified FROM r;
 
     -- Changes
     RETURN QUERY
@@ -1054,16 +1043,15 @@ BEGIN
             key_primary = c.chg_pk,
             key_secondary = c.chg_sk,
             value = c.chg_val::jsonb,
-            expires_at = c.chg_exp,
             at = c.chg_at,
             claimant = CASE WHEN c.chg_at IS NULL THEN NULL ELSE p_claimant END,
             modified = v_now
-        FROM unnest(p_chg_ns, p_chg_ids, p_chg_vers, p_chg_pkeys, p_chg_skeys, p_chg_values, p_chg_expires, p_chg_ats)
-        AS c(chg_ns, chg_id, chg_ver, chg_pk, chg_sk, chg_val, chg_exp, chg_at)
+        FROM unnest(p_chg_ns, p_chg_ids, p_chg_vers, p_chg_pkeys, p_chg_skeys, p_chg_values, p_chg_ats)
+        AS c(chg_ns, chg_id, chg_ver, chg_pk, chg_sk, chg_val, chg_at)
         WHERE entroq.docs.namespace = c.chg_ns AND entroq.docs.id = c.chg_id
         RETURNING *
     )
-    SELECT 'changed', r.namespace, r.id, r.version, r.claimant, r.at, r.expires_at, r.key_primary, r.key_secondary, r.value, r.created, r.modified FROM r;
+    SELECT 'changed', r.namespace, r.id, r.version, r.claimant, r.at, r.key_primary, r.key_secondary, r.value, r.created, r.modified FROM r;
 END;
 $$;
 
@@ -1081,5 +1069,5 @@ CREATE TABLE IF NOT EXISTS entroq.meta (
     value TEXT NOT NULL
 );
 
-INSERT INTO entroq.meta (key, value) VALUES ('schema_version', '0.11.0')
-    ON CONFLICT (key) DO UPDATE SET value = '0.11.0' WHERE entroq.meta.key = 'schema_version';
+INSERT INTO entroq.meta (key, value) VALUES ('schema_version', '0.12.0')
+    ON CONFLICT (key) DO UPDATE SET value = '0.12.0' WHERE entroq.meta.key = 'schema_version';

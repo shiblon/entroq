@@ -117,3 +117,7 @@ func TestGRPCDocConcurrencyStress(t *testing.T) {
 func TestGRPCMixedAtomicStress(t *testing.T) {
 	RunQTest(t, eqtest.MixedAtomicStress)
 }
+
+func TestGRPCDocClaimLocking(t *testing.T) {
+	RunQTest(t, eqtest.DocClaimLocking)
+}
