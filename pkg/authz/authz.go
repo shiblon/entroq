@@ -42,10 +42,14 @@ const (
 	All    Action = "*"
 )
 
-// Request conatins an authorization request to send to OPA.
+// Request contains an authorization request to send to OPA.
 type Request struct {
 	// Authz contains information that came in with the request (headers).
 	Authz *Authorization `json:"authz"`
+	// ClaimantId is the claimant ID supplied by the caller on the wire. OPA
+	// policy can enforce that this matches the token subject (e.g.
+	// input.authz.credentials JWT sub claim) to prevent impersonation.
+	ClaimantId string `json:"claimant_id,omitempty"`
 	// Queues contains information about what is desired: what queues to
 	// operate on, and what should be done to them.
 	Queues []*Queue `json:"queues,omitempty"`

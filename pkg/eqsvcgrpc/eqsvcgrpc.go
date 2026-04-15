@@ -361,6 +361,7 @@ func (s *QSvc) newAuthzRequest(ctx context.Context) *authz.Request {
 
 func (s *QSvc) claimAuthz(ctx context.Context, req *pb.ClaimRequest) *authz.Request {
 	authReq := s.newAuthzRequest(ctx)
+	authReq.ClaimantId = req.ClaimantId
 
 	for _, q := range req.GetQueues() {
 		authReq.Queues = append(authReq.Queues, &authz.Queue{
@@ -373,6 +374,7 @@ func (s *QSvc) claimAuthz(ctx context.Context, req *pb.ClaimRequest) *authz.Requ
 
 func (s *QSvc) tasksAuthz(ctx context.Context, req *pb.TasksRequest) *authz.Request {
 	authReq := s.newAuthzRequest(ctx)
+	authReq.ClaimantId = req.ClaimantId
 	authReq.Queues = append(authReq.Queues, &authz.Queue{
 		Exact:   req.Queue,
 		Actions: []authz.Action{authz.Read},
@@ -382,6 +384,7 @@ func (s *QSvc) tasksAuthz(ctx context.Context, req *pb.TasksRequest) *authz.Requ
 
 func (s *QSvc) modifyAuthz(ctx context.Context, req *pb.ModifyRequest) *authz.Request {
 	authReq := s.newAuthzRequest(ctx)
+	authReq.ClaimantId = req.ClaimantId
 
 	for _, ins := range req.Inserts {
 		authReq.Queues = append(authReq.Queues, &authz.Queue{

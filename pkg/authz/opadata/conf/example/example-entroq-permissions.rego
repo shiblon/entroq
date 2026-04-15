@@ -51,3 +51,12 @@ allowed_queues contains q if {
 allowed_namespaces contains n if {
 	some n in (user_namespaces | role_namespaces)
 }
+
+# is_admin is true when the authenticated user holds the built-in "admin" role.
+# Admins bypass the claimant_id prefix check, allowing them to operate under
+# any claimant (e.g. for forced deletion of tasks held by other processes).
+# Override or extend this rule to match your own admin role naming convention.
+is_admin if {
+	some r in this_user.roles
+	r == "admin"
+}

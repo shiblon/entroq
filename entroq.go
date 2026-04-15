@@ -390,7 +390,9 @@ func New(ctx context.Context, opener BackendOpener, opts ...Option) (*EntroQ, er
 	} else {
 		return nil, fmt.Errorf("no backend or backend opener specified")
 	}
-	eq.ClientID = eq.idGenRand()
+	if eq.ClientID == "" {
+		eq.ClientID = eq.idGenRand()
+	}
 	return eq, nil
 }
 
