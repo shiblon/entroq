@@ -20,53 +20,6 @@
 
 CREATE SCHEMA IF NOT EXISTS entroq;
 
--- pgcrypto provides gen_random_uuid() on PostgreSQL < 13.
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
-
--- Column additions for databases predating the claims/attempt/err fields.
-ALTER TABLE IF EXISTS entroq.tasks ADD COLUMN IF NOT EXISTS claims  INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE IF EXISTS entroq.tasks ADD COLUMN IF NOT EXISTS attempt INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE IF EXISTS entroq.tasks ADD COLUMN IF NOT EXISTS err     TEXT    NOT NULL DEFAULT '';
-
--- Column type migration: bytea -> jsonb for value.
--- encode(..., 'escape') converts bytea to text using escape format, which is
--- transparent for valid UTF-8 content (i.e., all valid JSON). Fails loudly if
--- value is not parseable as JSON, which is the correct behavior for a migration.
-ALTER TABLE IF EXISTS entroq.tasks ALTER COLUMN value TYPE jsonb
-    USING CASE WHEN value IS NULL THEN NULL ELSE encode(value, 'escape')::jsonb END;
-
--- Column type migration: uuid -> text for id and claimant.
--- Every UUID has a canonical text representation so this cast is safe.
--- No-ops if the columns are already text.
-ALTER TABLE IF EXISTS entroq.tasks ALTER COLUMN id       TYPE text USING id::text;
-ALTER TABLE IF EXISTS entroq.tasks ALTER COLUMN claimant TYPE text USING claimant::text;
-
--- ID length constraints. Idempotent: drop then re-add.
-ALTER TABLE IF EXISTS entroq.tasks DROP CONSTRAINT IF EXISTS id_max_len;
-ALTER TABLE IF EXISTS entroq.tasks ADD  CONSTRAINT         id_max_len       CHECK (length(id) <= 64);
-ALTER TABLE IF EXISTS entroq.tasks DROP CONSTRAINT IF EXISTS claimant_max_len;
-ALTER TABLE IF EXISTS entroq.tasks ADD  CONSTRAINT         claimant_max_len CHECK (claimant IS NULL OR length(claimant) <= 64);
-
--- Drop old UUID-typed composite types; recreated below with text id fields.
--- These types are not used in any function signatures, so no CASCADE is needed.
-DROP TYPE IF EXISTS entroq.task_id;
-DROP TYPE IF EXISTS entroq.task_arg;
-
--- Drop any stored procedures incompatible with current table schema. Recreating them is non-disruptive.
--- UUID-era signatures (pre-text migration):
-DROP FUNCTION IF EXISTS entroq._try_claim_bucket(text, uuid, interval, timestamptz, integer, integer);
-DROP FUNCTION IF EXISTS entroq._try_claim_one(text, uuid, interval);
-DROP FUNCTION IF EXISTS entroq.try_claim(text[], uuid, interval);
-DROP FUNCTION IF EXISTS entroq._modify_arrays(uuid, uuid[], integer[], uuid[], integer[], uuid[], text[], timestamptz[], bytea[], integer[], text[], uuid[], integer[], text[], timestamptz[], bytea[], integer[], text[]);
-DROP FUNCTION IF EXISTS entroq.modify(uuid, jsonb, jsonb, jsonb, jsonb);
--- Text-era signatures (pre-jsonb migration): return type changed, must drop and recreate.
-DROP FUNCTION IF EXISTS entroq._try_claim_bucket(text, text, interval, timestamptz, integer, integer);
-DROP FUNCTION IF EXISTS entroq._try_claim_one(text, text, interval);
-DROP FUNCTION IF EXISTS entroq.try_claim(text[], text, interval);
-DROP FUNCTION IF EXISTS entroq._modify_arrays(text, text[], integer[], text[], integer[], text[], text[], timestamptz[], bytea[], integer[], text[], text[], integer[], text[], timestamptz[], bytea[], integer[], text[]);
-DROP FUNCTION IF EXISTS entroq.modify(text, jsonb, jsonb, jsonb, jsonb);
-DROP FUNCTION IF EXISTS entroq.tasks(text, integer, boolean);
-
 -- Core table. id and claimant are TEXT with CHECK constraints limiting them
 -- to 64 characters -- long enough for UUIDs, ULIDs, etc.
 -- ID representation: task IDs and claimant IDs are stored as TEXT with a
@@ -626,6 +579,120 @@ CREATE OR REPLACE FUNCTION entroq.modify(
     )
 $$;
 
+-- entroq._modify_docs handles all doc table updates for an atomic modify call.
+-- Used internally by entroq.modify and the Go backend.
+-- Raises EQ001 on dependency failure.
+CREATE OR REPLACE FUNCTION entroq._modify_docs(
+    p_claimant     text,
+    p_dep_ns       text[],
+    p_dep_ids      text[],
+    p_dep_vers     integer[],
+    p_del_ns       text[],
+    p_del_ids      text[],
+    p_del_vers     integer[],
+    p_ins_ns       text[],
+    p_ins_ids      text[],
+    p_ins_pkeys    text[],
+    p_ins_skeys    text[],
+    p_ins_values   text[],
+    p_chg_ns       text[],
+    p_chg_ids      text[],
+    p_chg_vers     integer[],
+    p_chg_pkeys    text[],
+    p_chg_skeys    text[],
+    p_chg_values   text[],
+    p_chg_ats      timestamptz[]
+) RETURNS TABLE(
+    kind          text,
+    namespace     text,
+    id            text,
+    version       integer,
+    claimant      text,
+    at            timestamptz,
+    key_primary   text,
+    key_secondary text,
+    value         jsonb,
+    created       timestamptz,
+    modified      timestamptz
+) LANGUAGE plpgsql AS $$
+DECLARE
+    v_now          timestamptz := now();
+    v_missing      jsonb;
+    v_mismatched   jsonb;
+    v_collisions   jsonb;
+BEGIN
+    -- Dependency Checks
+    WITH all_deps(dep_ns, dep_id, dep_ver) AS (
+        SELECT * FROM unnest(coalesce(p_dep_ns, '{}'::text[]), coalesce(p_dep_ids, '{}'::text[]), coalesce(p_dep_vers, '{}'::integer[]))
+        UNION ALL
+        SELECT * FROM unnest(coalesce(p_del_ns, '{}'::text[]), coalesce(p_del_ids, '{}'::text[]), coalesce(p_del_vers, '{}'::integer[]))
+        UNION ALL
+        SELECT * FROM unnest(coalesce(p_chg_ns, '{}'::text[]), coalesce(p_chg_ids, '{}'::text[]), coalesce(p_chg_vers, '{}'::integer[]))
+    ),
+    locked AS (
+        SELECT s.namespace AS lck_ns, s.id AS lck_id, s.version AS lck_ver, s.claimant AS lck_claimant, s.at AS lck_at
+        FROM entroq.docs s
+        JOIN all_deps d ON s.namespace = d.dep_ns AND s.id = d.dep_id
+        FOR UPDATE
+    )
+    SELECT
+        coalesce(jsonb_agg(jsonb_build_object('ns', d.dep_ns, 'id', d.dep_id, 'version', d.dep_ver)) FILTER (WHERE l.lck_id IS NULL), '[]'::jsonb),
+        coalesce(jsonb_agg(jsonb_build_object('ns', d.dep_ns, 'id', d.dep_id, 'version', d.dep_ver))
+                 FILTER (WHERE l.lck_id IS NOT NULL AND (l.lck_ver != d.dep_ver OR (l.lck_claimant IS NOT NULL AND l.lck_claimant != p_claimant AND l.lck_at > v_now))),
+                 '[]'::jsonb)
+    INTO v_missing, v_mismatched
+    FROM all_deps d
+    LEFT JOIN locked l ON l.lck_ns = d.dep_ns AND l.lck_id = d.dep_id;
+
+    -- Collision Checks
+    SELECT coalesce(jsonb_agg(jsonb_build_object('ns', i.ins_ns, 'id', i.ins_id)), '[]'::jsonb)
+    INTO v_collisions
+    FROM unnest(coalesce(p_ins_ns, '{}'::text[]), coalesce(p_ins_ids, '{}'::text[])) AS i(ins_ns, ins_id)
+    JOIN entroq.docs s ON s.namespace = i.ins_ns AND s.id = i.ins_id;
+
+    IF v_missing != '[]'::jsonb OR v_mismatched != '[]'::jsonb OR v_collisions != '[]'::jsonb THEN
+        RAISE EXCEPTION 'entroq storage dependency error'
+            USING ERRCODE = 'EQ001',
+                  DETAIL  = jsonb_build_object('missing', v_missing, 'mismatched', v_mismatched, 'collisions', v_collisions)::text;
+    END IF;
+
+    -- Deletes
+    DELETE FROM entroq.docs
+    USING unnest(coalesce(p_del_ns, '{}'::text[]), coalesce(p_del_ids, '{}'::text[])) AS d(del_ns, del_id)
+    WHERE entroq.docs.namespace = d.del_ns AND entroq.docs.id = d.del_id;
+
+    -- Inserts
+    RETURN QUERY
+    WITH r AS (
+        INSERT INTO entroq.docs (namespace, id, version, key_primary, key_secondary, value, created, modified)
+        SELECT ins_ns, ins_id, 0, ins_pk, ins_sk, ins_val::jsonb, v_now, v_now
+        FROM unnest(p_ins_ns, p_ins_ids, p_ins_pkeys, p_ins_skeys, p_ins_values)
+        AS i(ins_ns, ins_id, ins_pk, ins_sk, ins_val)
+        RETURNING *
+    )
+    SELECT 'inserted', r.namespace, r.id, r.version, r.claimant, r.at, r.key_primary, r.key_secondary, r.value, r.created, r.modified FROM r;
+
+    -- Changes
+    RETURN QUERY
+    WITH r AS (
+        UPDATE entroq.docs
+        SET
+            version = entroq.docs.version + 1,
+            key_primary = c.chg_pk,
+            key_secondary = c.chg_sk,
+            value = c.chg_val::jsonb,
+            at = c.chg_at,
+            claimant = CASE WHEN c.chg_at IS NULL THEN NULL ELSE p_claimant END,
+            modified = v_now
+        FROM unnest(p_chg_ns, p_chg_ids, p_chg_vers, p_chg_pkeys, p_chg_skeys, p_chg_values, p_chg_ats)
+        AS c(chg_ns, chg_id, chg_ver, chg_pk, chg_sk, chg_val, chg_at)
+        WHERE entroq.docs.namespace = c.chg_ns AND entroq.docs.id = c.chg_id
+        RETURNING *
+    )
+    SELECT 'changed', r.namespace, r.id, r.version, r.claimant, r.at, r.key_primary, r.key_secondary, r.value, r.created, r.modified FROM r;
+END;
+$$;
+
 -- entroq.modify_docs is the ergonomic public SQL API for doc operations.
 -- Mirrors entroq.modify but delegates to _modify_docs instead of _modify_arrays.
 -- Callers needing atomic task+doc operations should wrap both in a transaction.
@@ -828,19 +895,20 @@ DECLARE
     v_claimed jsonb;
 BEGIN
     -- Lock all rows with this primary key to serialize concurrent claims.
-    PERFORM id FROM entroq.docs
-    WHERE namespace = p_namespace AND key_primary = p_key
+    -- Use alias d to avoid ambiguity with RETURNS TABLE output column names.
+    PERFORM d.id FROM entroq.docs AS d
+    WHERE d.namespace = p_namespace AND d.key_primary = p_key
     FOR UPDATE;
 
     -- Detect any already-claimed docs.
     SELECT coalesce(
-        jsonb_agg(jsonb_build_object('namespace', namespace, 'id', id, 'version', version))
-        FILTER (WHERE claimant IS NOT NULL AND at > v_now AND claimant <> p_claimant),
+        jsonb_agg(jsonb_build_object('namespace', d.namespace, 'id', d.id, 'version', d.version))
+        FILTER (WHERE d.claimant IS NOT NULL AND d.at > v_now AND d.claimant <> p_claimant),
         '[]'::jsonb
     )
     INTO v_claimed
-    FROM entroq.docs
-    WHERE namespace = p_namespace AND key_primary = p_key;
+    FROM entroq.docs AS d
+    WHERE d.namespace = p_namespace AND d.key_primary = p_key;
 
     IF v_claimed != '[]'::jsonb THEN
         RAISE EXCEPTION 'entroq doc claim dependency error'
@@ -851,8 +919,9 @@ BEGIN
                   )::text;
     END IF;
 
+    -- plpgsql only allows DML in WITH clauses, not as subquery expressions.
     RETURN QUERY
-        SELECT * FROM (
+        WITH updated AS (
             UPDATE entroq.docs
             SET
                 version  = entroq.docs.version + 1,
@@ -862,7 +931,8 @@ BEGIN
             WHERE entroq.docs.namespace = p_namespace
               AND entroq.docs.key_primary = p_key
             RETURNING *
-        ) updated
+        )
+        SELECT * FROM updated
         ORDER BY key_primary, key_secondary;
 END;
 $$;
@@ -907,9 +977,23 @@ ON CONFLICT (id) DO NOTHING;
 -- a high-watermark of processed 'at' times. This makes the notification system
 -- immune to ticker jitter, overlapping runs, or service restarts.
 --
--- If p_min_interval is specified, the function only proceeds if the 
--- watermark has stagnated for at least that long. This prevents distributed 
+-- If p_min_interval is specified, the function only proceeds if the
+-- watermark has stagnated for at least that long. This prevents distributed
 -- tickers from flooding the database with redundant updates and signals.
+--
+-- pg_cron tip: if your PostgreSQL instance has pg_cron installed (e.g., RDS,
+-- Cloud SQL, or self-hosted with the extension), you can schedule this function
+-- to cover direct clients (such as entroq_pg.py) that do not run their own
+-- heartbeat loop. Example:
+--
+--   SELECT cron.schedule('entroq-notify', '* * * * *',
+--       $$SELECT entroq.notify_ready_queues('5 seconds')$$);
+--
+-- The p_min_interval argument ('5 seconds' above) prevents redundant work when
+-- multiple backend instances or cron firings overlap within a minute. If the
+-- eqpg gRPC backend is also running, its heartbeat and the cron job will
+-- interleave harmlessly -- the watermark and interval guard ensure only one
+-- caller does real work per interval.
 CREATE OR REPLACE FUNCTION entroq.notify_ready_queues(p_min_interval interval DEFAULT '0 seconds')
 RETURNS SETOF text LANGUAGE plpgsql AS $$
 DECLARE
@@ -941,133 +1025,26 @@ BEGIN
 END;
 $$;
 
--- entroq._modify_docs handles all doc table updates for an atomic modify call.
--- Used internally by entroq.modify and the Go backend.
--- Raises EQ001 on dependency failure.
-CREATE OR REPLACE FUNCTION entroq._modify_docs(
-    p_claimant     text,
-    p_dep_ns       text[],
-    p_dep_ids      text[],
-    p_dep_vers     integer[],
-    p_del_ns       text[],
-    p_del_ids      text[],
-    p_del_vers     integer[],
-    p_ins_ns       text[],
-    p_ins_ids      text[],
-    p_ins_pkeys    text[],
-    p_ins_skeys    text[],
-    p_ins_values   text[],
-    p_chg_ns       text[],
-    p_chg_ids      text[],
-    p_chg_vers     integer[],
-    p_chg_pkeys    text[],
-    p_chg_skeys    text[],
-    p_chg_values   text[],
-    p_chg_ats      timestamptz[]
-) RETURNS TABLE(
-    kind          text,
-    namespace     text,
-    id            text,
-    version       integer,
-    claimant      text,
-    at            timestamptz,
-    key_primary   text,
-    key_secondary text,
-    value         jsonb,
-    created       timestamptz,
-    modified      timestamptz
-) LANGUAGE plpgsql AS $$
-DECLARE
-    v_now          timestamptz := now();
-    v_missing      jsonb;
-    v_mismatched   jsonb;
-    v_collisions   jsonb;
-BEGIN
-    -- Dependency Checks
-    WITH all_deps(dep_ns, dep_id, dep_ver) AS (
-        SELECT * FROM unnest(coalesce(p_dep_ns, '{}'::text[]), coalesce(p_dep_ids, '{}'::text[]), coalesce(p_dep_vers, '{}'::integer[]))
-        UNION ALL
-        SELECT * FROM unnest(coalesce(p_del_ns, '{}'::text[]), coalesce(p_del_ids, '{}'::text[]), coalesce(p_del_vers, '{}'::integer[]))
-        UNION ALL
-        SELECT * FROM unnest(coalesce(p_chg_ns, '{}'::text[]), coalesce(p_chg_ids, '{}'::text[]), coalesce(p_chg_vers, '{}'::integer[]))
-    ),
-    locked AS (
-        SELECT s.namespace AS lck_ns, s.id AS lck_id, s.version AS lck_ver, s.claimant AS lck_claimant, s.at AS lck_at
-        FROM entroq.docs s
-        JOIN all_deps d ON s.namespace = d.dep_ns AND s.id = d.dep_id
-        FOR UPDATE
-    )
-    SELECT
-        coalesce(jsonb_agg(jsonb_build_object('ns', d.dep_ns, 'id', d.dep_id, 'version', d.dep_ver)) FILTER (WHERE l.lck_id IS NULL), '[]'::jsonb),
-        coalesce(jsonb_agg(jsonb_build_object('ns', d.dep_ns, 'id', d.dep_id, 'version', d.dep_ver)) 
-                 FILTER (WHERE l.lck_id IS NOT NULL AND (l.lck_ver != d.dep_ver OR (l.lck_claimant IS NOT NULL AND l.lck_claimant != p_claimant AND l.lck_at > v_now))), 
-                 '[]'::jsonb)
-    INTO v_missing, v_mismatched
-    FROM all_deps d
-    LEFT JOIN locked l ON l.lck_ns = d.dep_ns AND l.lck_id = d.dep_id;
-
-    -- Collision Checks
-    SELECT coalesce(jsonb_agg(jsonb_build_object('ns', i.ins_ns, 'id', i.ins_id)), '[]'::jsonb)
-    INTO v_collisions
-    FROM unnest(coalesce(p_ins_ns, '{}'::text[]), coalesce(p_ins_ids, '{}'::text[])) AS i(ins_ns, ins_id)
-    JOIN entroq.docs s ON s.namespace = i.ins_ns AND s.id = i.ins_id;
-
-    IF v_missing != '[]'::jsonb OR v_mismatched != '[]'::jsonb OR v_collisions != '[]'::jsonb THEN
-        RAISE EXCEPTION 'entroq storage dependency error'
-            USING ERRCODE = 'EQ001',
-                  DETAIL  = jsonb_build_object('missing', v_missing, 'mismatched', v_mismatched, 'collisions', v_collisions)::text;
-    END IF;
-
-    -- Deletes
-    DELETE FROM entroq.docs
-    USING unnest(coalesce(p_del_ns, '{}'::text[]), coalesce(p_del_ids, '{}'::text[])) AS d(del_ns, del_id)
-    WHERE entroq.docs.namespace = d.del_ns AND entroq.docs.id = d.del_id;
-
-    -- Inserts
-    RETURN QUERY
-    WITH r AS (
-        INSERT INTO entroq.docs (namespace, id, version, key_primary, key_secondary, value, created, modified)
-        SELECT ins_ns, ins_id, 0, ins_pk, ins_sk, ins_val::jsonb, v_now, v_now
-        FROM unnest(p_ins_ns, p_ins_ids, p_ins_pkeys, p_ins_skeys, p_ins_values)
-        AS i(ins_ns, ins_id, ins_pk, ins_sk, ins_val)
-        RETURNING *
-    )
-    SELECT 'inserted', r.namespace, r.id, r.version, r.claimant, r.at, r.key_primary, r.key_secondary, r.value, r.created, r.modified FROM r;
-
-    -- Changes
-    RETURN QUERY
-    WITH r AS (
-        UPDATE entroq.docs
-        SET
-            version = entroq.docs.version + 1,
-            key_primary = c.chg_pk,
-            key_secondary = c.chg_sk,
-            value = c.chg_val::jsonb,
-            at = c.chg_at,
-            claimant = CASE WHEN c.chg_at IS NULL THEN NULL ELSE p_claimant END,
-            modified = v_now
-        FROM unnest(p_chg_ns, p_chg_ids, p_chg_vers, p_chg_pkeys, p_chg_skeys, p_chg_values, p_chg_ats)
-        AS c(chg_ns, chg_id, chg_ver, chg_pk, chg_sk, chg_val, chg_at)
-        WHERE entroq.docs.namespace = c.chg_ns AND entroq.docs.id = c.chg_id
-        RETURNING *
-    )
-    SELECT 'changed', r.namespace, r.id, r.version, r.claimant, r.at, r.key_primary, r.key_secondary, r.value, r.created, r.modified FROM r;
-END;
-$$;
-
--- Schema version tracking. Set once on first initialization; never overwritten
--- by subsequent re-runs of this script (ON CONFLICT DO NOTHING). The backend
--- reads this on startup and refuses to operate if it does not match the
--- compiled-in SchemaVersion constant, protecting against accidental use of a
--- mismatched schema.
+-- Schema version tracking. Updated on every run of this script so that
+-- re-applying the schema after a minor-version upgrade stamps the new version.
+-- The backend reads this on startup and refuses to operate if it does not match
+-- the compiled-in SchemaVersion constant.
 --
--- To migrate to a new version: apply the updated schema.sql, then manually
--- bump the stored version:
---   UPDATE entroq.meta SET value = '<new-version>' WHERE key = 'schema_version';
+-- Versioning policy (1.x+):
+--   - Schema version changes only when the schema itself changes.
+--   - Minor version bumps (1.x -> 1.y) may change the schema, but only
+--     additively: new tables, columns with defaults, indexes, or functions.
+--     No column renames, type changes, or data movement.
+--   - Patch releases never change the schema.
+--   - Upgrading from any 1.x schema to any later 1.y schema is always safe:
+--     re-run this script and the new additions appear without touching existing
+--     data.
+--   - Schemas predating 1.0 (0.x) cannot be migrated. Drain all tasks and
+--     reinitialize: DROP SCHEMA entroq CASCADE, then run eqpg schema init.
 CREATE TABLE IF NOT EXISTS entroq.meta (
     key   TEXT PRIMARY KEY NOT NULL,
     value TEXT NOT NULL
 );
 
-INSERT INTO entroq.meta (key, value) VALUES ('schema_version', '0.12.0')
-    ON CONFLICT (key) DO UPDATE SET value = '0.12.0' WHERE entroq.meta.key = 'schema_version';
+INSERT INTO entroq.meta (key, value) VALUES ('schema_version', '1.0.0')
+    ON CONFLICT (key) DO UPDATE SET value = '1.0.0' WHERE entroq.meta.key = 'schema_version';

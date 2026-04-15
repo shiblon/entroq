@@ -56,7 +56,7 @@ claimant_mismatch if {
 
 # Add a message containing user information if there are queue or namespace mismatches.
 errors contains msg if {
-	(count(failed) + count(failed_namespaces)) > 0
+	count(failed) + count(failed_namespaces) > 0
 	user.name
 	msg := concat("", ["User: ", user.name])
 }
@@ -71,7 +71,7 @@ allow if {
 	# It is possible to have allowed resources for non-authorized users.
 	# We only say "allow" if there are, in fact, some resources that _could_ be
 	# allowed.
-	(count(permissions.allowed_queues) + count(permissions.allowed_namespaces)) > 0
+	count(permissions.allowed_queues) + count(permissions.allowed_namespaces) > 0
 
 	# Only allow if none of the allowed queues failed.
 	count(failed) == 0

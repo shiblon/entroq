@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	_ "embed"
 	"fmt"
+	"strings"
 )
 
 // SchemaSQL is the full idempotent DDL for the EntroQ PostgreSQL schema,
@@ -16,7 +17,16 @@ var SchemaSQL string
 // SchemaVersion is the schema version this build of eqpg expects to find in
 // the database. initDB refuses to open the backend if the stored version
 // differs, protecting against accidental use of a mismatched schema.
-const SchemaVersion = "0.12.0"
+//
+// Versioning policy (1.x+):
+//   - Schema version changes only when the schema itself changes.
+//   - Minor releases (1.x -> 1.y) may change the schema, but only additively:
+//     new tables, columns with defaults, indexes, or functions. No renames,
+//     type changes, or data movement.
+//   - Patch releases never change the schema.
+//   - Any 1.x schema upgrades to any later 1.y by re-running schema.sql.
+//   - Schemas predating 1.0 cannot be migrated; see UpgradeSchema.
+const SchemaVersion = "1.0.0"
 
 // InitSchema applies the full idempotent EntroQ DDL to db. Safe to run on an
 // already-initialized database.
@@ -51,16 +61,13 @@ type UpgradeResult int
 
 const (
 	UpgradeAlreadyCurrent UpgradeResult = iota // schema was already at SchemaVersion; nothing done
-	UpgradeFromLegacy                          // public.tasks moved to entroq.tasks and schema applied
-	UpgradeApplied                             // entroq.tasks existed but schema was re-applied
+	UpgradeApplied                             // schema was re-applied (new minor version)
 )
 
 func (r UpgradeResult) String() string {
 	switch r {
 	case UpgradeAlreadyCurrent:
 		return "already current"
-	case UpgradeFromLegacy:
-		return "upgraded from legacy (public.tasks -> entroq.tasks)"
 	case UpgradeApplied:
 		return "schema applied"
 	default:
@@ -68,60 +75,35 @@ func (r UpgradeResult) String() string {
 	}
 }
 
-// tableExists reports whether a table exists in the given schema.
-func tableExists(ctx context.Context, db *sql.DB, schema, table string) (bool, error) {
-	var exists bool
-	err := db.QueryRowContext(ctx,
-		`SELECT EXISTS (
-			SELECT 1 FROM information_schema.tables
-			WHERE table_schema = $1 AND table_name = $2
-		)`, schema, table,
-	).Scan(&exists)
-	return exists, err
-}
-
-// UpgradeSchema brings the database to SchemaVersion, detecting its current
-// state and taking the appropriate action:
+// UpgradeSchema brings the database to SchemaVersion:
 //
 //   - Already at SchemaVersion: returns UpgradeAlreadyCurrent; nothing is changed.
-//   - Legacy state (public.tasks exists, no entroq schema): moves public.tasks
-//     into the entroq schema, then applies schema.sql (which handles the
-//     UUID->text cast, constraints, indexes, functions, and meta version).
-//   - entroq.tasks exists but schema version is missing or mismatched: applies
-//     schema.sql to bring it up to date.
-//
-// Safe to run on an already-current database.
+//   - 1.x schema at an older minor version: re-applies schema.sql (additive
+//     changes only by policy) and returns UpgradeApplied.
+//   - Pre-1.0 schema (0.x): returns an error. The 0.x -> 1.0 gap is too large
+//     to migrate automatically. Drain all tasks, drop the schema, and
+//     reinitialize: DROP SCHEMA entroq CASCADE, then run eqpg schema init.
+//   - Uninitialized database: applies schema.sql fresh and returns UpgradeApplied.
 func UpgradeSchema(ctx context.Context, db *sql.DB) (UpgradeResult, error) {
-	// Already current?
-	if v, err := StoredSchemaVersion(ctx, db); err == nil && v == SchemaVersion {
-		return UpgradeAlreadyCurrent, nil
-	}
-
-	// Legacy state: public.tasks exists without entroq.tasks.
-	publicExists, err := tableExists(ctx, db, "public", "tasks")
-	if err != nil {
-		return 0, fmt.Errorf("upgrade: check public.tasks: %w", err)
-	}
-	entroqExists, err := tableExists(ctx, db, "entroq", "tasks")
-	if err != nil {
-		return 0, fmt.Errorf("upgrade: check entroq.tasks: %w", err)
-	}
-
-	result := UpgradeApplied
-	if publicExists && !entroqExists {
-		if _, err := db.ExecContext(ctx,
-			`CREATE SCHEMA IF NOT EXISTS entroq;
-			 ALTER TABLE public.tasks SET SCHEMA entroq;`,
-		); err != nil {
-			return 0, fmt.Errorf("upgrade: move public.tasks to entroq: %w", err)
+	stored, err := StoredSchemaVersion(ctx, db)
+	if err == nil {
+		if stored == SchemaVersion {
+			return UpgradeAlreadyCurrent, nil
 		}
-		result = UpgradeFromLegacy
+		if strings.HasPrefix(stored, "0.") {
+			return 0, fmt.Errorf(
+				"schema version %q predates 1.0 and cannot be migrated automatically; "+
+					"drain all tasks and reinitialize: DROP SCHEMA entroq CASCADE, "+
+					"then run: eqpg schema init",
+				stored,
+			)
+		}
 	}
 
 	if err := InitSchema(ctx, db); err != nil {
 		return 0, fmt.Errorf("upgrade: apply schema: %w", err)
 	}
-	return result, nil
+	return UpgradeApplied, nil
 }
 
 // UpgradeSchema brings this backend's database to SchemaVersion.

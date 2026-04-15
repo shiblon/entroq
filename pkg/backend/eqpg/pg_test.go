@@ -485,3 +485,80 @@ func TestPGDocListing(t *testing.T) {
 func TestPGDocClaimLocking(t *testing.T) {
 	RunQTest(t, eqtest.DocClaimLocking)
 }
+
+// TestSchemaInit verifies that InitSchema succeeds on a blank database,
+// records the correct SchemaVersion, and is idempotent when run a second time.
+// Uses a fresh database within the shared testcontainers postgres instance so
+// that it exercises the exact path that TestMain bypasses (TestMain already has
+// the schema applied when m.Run() fires).
+func TestSchemaInit(t *testing.T) {
+	const testDB = "entroq_schema_init_test"
+	ctx := context.Background()
+
+	adminDB, err := OpenDB(pgHostPort,
+		WithDB("postgres"),
+		WithUsername("postgres"),
+		WithPassword("password"))
+	if err != nil {
+		t.Fatalf("open admin db: %v", err)
+	}
+	defer adminDB.Close()
+
+	if _, err := adminDB.ExecContext(ctx, "CREATE DATABASE "+testDB); err != nil {
+		t.Fatalf("create test database: %v", err)
+	}
+
+	freshDB, err := OpenDB(pgHostPort,
+		WithDB(testDB),
+		WithUsername("postgres"),
+		WithPassword("password"))
+	if err != nil {
+		t.Fatalf("open fresh db: %v", err)
+	}
+
+	// Ping to confirm the connection is live before we try anything.
+	if err := freshDB.PingContext(ctx); err != nil {
+		freshDB.Close()
+		t.Fatalf("ping fresh db: %v", err)
+	}
+
+	// First apply: blank database.
+	if err := InitSchema(ctx, freshDB); err != nil {
+		freshDB.Close()
+		t.Fatalf("InitSchema on blank db: %v", err)
+	}
+
+	got, err := StoredSchemaVersion(ctx, freshDB)
+	if err != nil {
+		freshDB.Close()
+		t.Fatalf("StoredSchemaVersion after init: %v", err)
+	}
+	if got != SchemaVersion {
+		freshDB.Close()
+		t.Errorf("StoredSchemaVersion after init: want %q, got %q", SchemaVersion, got)
+	}
+
+	// Second apply: idempotency check.
+	if err := InitSchema(ctx, freshDB); err != nil {
+		freshDB.Close()
+		t.Fatalf("InitSchema idempotency: %v", err)
+	}
+
+	got, err = StoredSchemaVersion(ctx, freshDB)
+	if err != nil {
+		freshDB.Close()
+		t.Fatalf("StoredSchemaVersion after re-init: %v", err)
+	}
+	if got != SchemaVersion {
+		freshDB.Close()
+		t.Errorf("StoredSchemaVersion after re-init: want %q, got %q", SchemaVersion, got)
+	}
+
+	// Close the fresh connection before dropping -- postgres refuses to drop a
+	// database with open connections.
+	freshDB.Close()
+
+	if _, err := adminDB.ExecContext(ctx, "DROP DATABASE "+testDB); err != nil {
+		t.Logf("drop test database (non-fatal): %v", err)
+	}
+}

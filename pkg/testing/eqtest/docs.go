@@ -46,8 +46,16 @@ func SimpleDocLifecycle(ctx context.Context, t *testing.T, client *entroq.EntroQ
 		t.Fatalf("ChangedDocs length: want 1, got %v", len(resp.ChangedDocs))
 	}
 	changed := resp.ChangedDocs[0]
-	if string(changed.Content) != string(newVal) {
-		t.Errorf("Changed content: want %s, got %s", newVal, changed.Content)
+	// Compare semantically: PostgreSQL normalizes JSONB whitespace on retrieval.
+	var wantJ, gotJ any
+	if err := json.Unmarshal(newVal, &wantJ); err != nil {
+		t.Fatalf("Unmarshal want: %v", err)
+	}
+	if err := json.Unmarshal(changed.Content, &gotJ); err != nil {
+		t.Fatalf("Unmarshal got: %v", err)
+	}
+	if diff := cmp.Diff(wantJ, gotJ); diff != "" {
+		t.Errorf("Changed content mismatch (-want +got):\n%s", diff)
 	}
 	if changed.Version != res.Version+1 {
 		t.Errorf("Changed version: want %v, got %v", res.Version+1, changed.Version)
@@ -378,12 +386,16 @@ func MixedAtomicStress(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 	tSum, rSum := 0, 0
 	for _, task := range tasks {
 		var v int
-		json.Unmarshal(task.Value, &v)
+		if err := json.Unmarshal(task.Value, &v); err != nil {
+			t.Fatalf("Unmarshal task value: %v", err)
+		}
 		tSum += v
 	}
 	for _, r := range docs {
 		var v int
-		json.Unmarshal(r.Content, &v)
+		if err := json.Unmarshal(r.Content, &v); err != nil {
+			t.Fatalf("Unmarshal doc content: %v", err)
+		}
 		rSum += v
 	}
 

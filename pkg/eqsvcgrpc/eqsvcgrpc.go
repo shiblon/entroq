@@ -284,7 +284,13 @@ func toMS(t time.Time) int64 {
 }
 
 func jsonToProto(raw []byte) (*structpb.Value, error) {
+	if raw == nil {
+		// nil means "no value" (e.g. OmitValues was set). Return nil so the
+		// proto field is unset and protoToJSON round-trips back to nil.
+		return nil, nil
+	}
 	if len(raw) == 0 {
+		// Empty but non-nil: treat as JSON null.
 		return structpb.NewNullValue(), nil
 	}
 	v := new(structpb.Value)
