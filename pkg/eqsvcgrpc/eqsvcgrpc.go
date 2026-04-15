@@ -660,10 +660,10 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 		return nil, err // don't wrap, has status codes
 	}
 
-	// Claimant will only really be limited if it is nonzero.
-	// Tasks will only be limited if non-empty.
+	// Claimant will only really be a filter if it is nonzero.
+	// Task IDs will only be used as a filter if non-empty.
 	opts := []entroq.TasksOpt{
-		entroq.LimitClaimant(req.ClaimantId),
+		entroq.ClaimedBy(req.ClaimantId),
 		entroq.WithTaskID(req.TaskId...),
 		entroq.LimitTasks(int(req.Limit)),
 	}
