@@ -15,6 +15,8 @@ RUN go build -ldflags "-X github.com/shiblon/entroq/pkg/version.Version=${VERSIO
 # The ":debug" version includes a busybox shell for easier "docker exec" debugging.
 FROM gcr.io/distroless/static-debian12:debug
 
+LABEL org.opencontainers.image.source="https://github.com/shiblon/entroq"
+
 # Note: Distroless images already include CA bundles and common timezone data.
 # The distroless "nonroot" user ID is 65532.
 # However, the "static" image doesn't define a default USER, so we can set it.

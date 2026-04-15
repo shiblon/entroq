@@ -17,6 +17,8 @@ RUN mkdir -p /data/entroq/journal && chown -R 65532:65532 /data
 # 2. Switch to a secure, minimal runtime container.
 FROM gcr.io/distroless/static-debian12:debug
 
+LABEL org.opencontainers.image.source="https://github.com/shiblon/entroq"
+
 # Non-root user ID 65532:65532 (default nonroot)
 USER 65532:65532
 
