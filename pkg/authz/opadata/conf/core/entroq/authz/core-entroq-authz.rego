@@ -19,7 +19,6 @@
 # How these are obtained is up to the deployer of the service. A default
 # configuration is given in default-permissions.rego. Comments there indicate
 # the shape of the data that it works with.
-# regal ignore:directory-package-mismatch
 package entroq.authz
 
 import rego.v1

@@ -1,9 +1,7 @@
-# regal ignore:directory-package-mismatch
 package entroq.permissions
 
 import rego.v1
 
-# regal ignore:test-outside-test-package
 test_this_user_found if {
 	this_user == {
 		"name": "auser",
@@ -21,13 +19,11 @@ test_this_user_found if {
 		}]
 }
 
-# regal ignore:test-outside-test-package
 test_this_user_not_found if {
 	not this_user with data.entroq.user.name as "auser"
 		with data.entroq.policy.users as [{"name": "buser"}]
 }
 
-# regal ignore:test-outside-test-package
 test_only_match_wildcard_role_queues if {
 	count(role_queues) == 2 with data.entroq.user.name as "blah"
 		with input.queues as [{
@@ -50,7 +46,6 @@ test_only_match_wildcard_role_queues if {
 		}]
 }
 
-# regal ignore:test-outside-test-package
 test_only_match_wildcard_role_queues_single if {
 	count(role_queues) == 1 with data.entroq.user.name as "auser"
 		with input.queues as [{
@@ -67,14 +62,12 @@ test_only_match_wildcard_role_queues_single if {
 		}]
 }
 
-# regal ignore:test-outside-test-package
 test_only_extra_user_queues if {
 	user_queues == {{"prefix": "/users/blah/", "actions": ["ALL"]}} with data.entroq.user.name as "blah"
 		with data.entroq.policy.users as []
 		with data.entroq.policy.roles as []
 }
 
-# regal ignore:test-outside-test-package
 test_user_with_queues if {
 	user_queues == {
 		{"prefix": "/users/blah/", "actions": ["ALL"]},
@@ -96,7 +89,6 @@ test_user_with_queues if {
 		}]
 }
 
-# regal ignore:test-outside-test-package
 test_no_matching_user_queues if {
 	user_queues == {{"prefix": "/users/auser/", "actions": ["ALL"]}} with data.entroq.user.name as "auser"
 		with input.queues as [{

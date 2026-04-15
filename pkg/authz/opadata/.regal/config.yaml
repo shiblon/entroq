@@ -1,0 +1,7 @@
+rules:
+  testing:
+    test-outside-test-package:
+      # Test rules are intentionally placed in the same package as the code
+      # under test so they can assert on internal rules (failed, claimant_mismatch,
+      # etc.). Moving to a _test package would require exposing those internals.
+      level: ignore
