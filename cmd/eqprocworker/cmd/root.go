@@ -24,6 +24,7 @@ import (
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
+	"github.com/shiblon/entroq/pkg/version"
 	"github.com/shiblon/entroq/pkg/workers/procworker"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -37,8 +38,9 @@ var (
 
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
-	Use:   "eqprocworker [options]",
-	Short: "EntroQ Worker CLI that reads a subprocess task and runs the specified command",
+	Use:     "eqprocworker [options]",
+	Version: version.Version,
+	Short:   "EntroQ Worker CLI that reads a subprocess task and runs the specified command",
 	Long: `The eqprocworker processes EntroQ tasks and runs subprocess commands.
 
 	It starts an EntroQ worker that accepts a subprocess definition and tries

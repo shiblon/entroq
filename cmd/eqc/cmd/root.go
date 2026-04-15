@@ -29,6 +29,7 @@ import (
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
 	"github.com/shiblon/entroq/pkg/backend/eqpg"
+	"github.com/shiblon/entroq/pkg/version"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
@@ -62,8 +63,9 @@ func cliJSON(s string) (json.RawMessage, error) {
 
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
-	Use:   "eqc [options] <command>",
-	Short: "EntroQ Client CLI for poking at an EntroQ gRPC service",
+	Use:     "eqc [options] <command>",
+	Version: version.Version,
+	Short:   "EntroQ Client CLI for poking at an EntroQ gRPC service",
 	Long: `The eqc CLI allows you to query an EntroQ service, getting
 queue listings, individual task information, etc.`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {

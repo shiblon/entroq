@@ -31,6 +31,7 @@ build_image() {
     local dockerfile="${2}"
     echo "--- Building ${name} ---"
     docker build \
+        --build-arg "VERSION=${VERSION}" \
         -f "${REPO_ROOT}/${dockerfile}" \
         -t "${REGISTRY}/${name}:${VERSION}" \
         -t "${REGISTRY}/${name}:latest" \

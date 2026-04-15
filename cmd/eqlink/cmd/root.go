@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/shiblon/entroq/pkg/version"
 	"github.com/spf13/cobra"
 )
 
@@ -18,8 +19,9 @@ var (
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "eqlink",
-	Short: "Async HTTP networking sidecar over EntroQ task queues.",
+	Use:     "eqlink",
+	Version: version.Version,
+	Short:   "Async HTTP networking sidecar over EntroQ task queues.",
 	Long: `eqlink translates synchronous HTTP calls into EntroQ task queue operations,
 giving services fault tolerance and load balancing without changing their code.
 

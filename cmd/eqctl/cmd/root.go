@@ -5,12 +5,14 @@ import (
 	"log"
 	"os"
 
+	"github.com/shiblon/entroq/pkg/version"
 	"github.com/spf13/cobra"
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "eqctl",
-	Short: "EntroQ operator CLI for deployment and configuration tasks.",
+	Use:     "eqctl",
+	Version: version.Version,
+	Short:   "EntroQ operator CLI for deployment and configuration tasks.",
 	Long: `eqctl is the operator CLI for EntroQ. It provides tools for
 deploying and configuring EntroQ services, including OPA policy setup
 and schema management.`,

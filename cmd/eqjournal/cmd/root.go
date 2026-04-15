@@ -10,6 +10,7 @@ import (
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
+	"github.com/shiblon/entroq/pkg/version"
 	"github.com/shiblon/entroq/pkg/workers/appendworker"
 	"github.com/shiblon/stuffedio/wal"
 	"github.com/spf13/cobra"
@@ -26,8 +27,9 @@ var (
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "eqjournal [options]",
-	Short: "EntroQ Worker CLI that appends tasks to a stuffedio journal",
+	Use:     "eqjournal [options]",
+	Version: version.Version,
+	Short:   "EntroQ Worker CLI that appends tasks to a stuffedio journal",
 	Long: `The eqjournal processes EntroQ tasks by appending their values to a 
 rotating stuffedio journal. This is useful for building durable audit trails 
 and agent reasoning logs.`,

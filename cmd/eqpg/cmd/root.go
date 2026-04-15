@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/shiblon/entroq/pkg/version"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
@@ -19,8 +20,9 @@ var (
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "eqpg",
-	Short: "PostgreSQL-backed EntroQ: service management and schema utilities.",
+	Use:     "eqpg",
+	Version: version.Version,
+	Short:   "PostgreSQL-backed EntroQ: service management and schema utilities.",
 }
 
 // Execute is the entry point called from main.
