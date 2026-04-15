@@ -136,15 +136,17 @@ func (c *EntroQ) Tasks(ctx context.Context, queue string, opts ...TasksOpt) ([]*
 // TasksOpt is an option that can be passed into Tasks to control what it returns.
 type TasksOpt func(*EntroQ, *TasksQuery)
 
-// LimitSelf only returns self-claimed tasks or expired tasks.
-func LimitSelf() TasksOpt {
+// ClaimedBySelf filters the tasks query to only return tasks claimed by this client
+// (or tasks whose claim has expired).
+func ClaimedBySelf() TasksOpt {
 	return func(c *EntroQ, q *TasksQuery) {
 		q.Claimant = c.ClientID
 	}
 }
 
-// LimitClaimant only returns tasks with the given claimant, or expired tasks.
-func LimitClaimant(id string) TasksOpt {
+// ClaimedBy filters the tasks query to only return tasks claimed by the given
+// claimant (or tasks whose claim has expired).
+func ClaimedBy(id string) TasksOpt {
 	return func(_ *EntroQ, q *TasksQuery) {
 		q.Claimant = id
 	}
