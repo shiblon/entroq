@@ -7,8 +7,9 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download -x
 
+ARG VERSION=dev
 COPY . .
-RUN go build -o /bin/eqmemsvc ./cmd/eqmemsvc
+RUN go build -ldflags "-X github.com/shiblon/entroq/pkg/version.Version=${VERSION}" -o /bin/eqmemsvc ./cmd/eqmemsvc
 
 # Create data directory for persistency with correct non-root permissions
 RUN mkdir -p /data/entroq/journal && chown -R 65532:65532 /data

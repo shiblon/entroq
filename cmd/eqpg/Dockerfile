@@ -7,8 +7,9 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download -x
 
+ARG VERSION=dev
 COPY . .
-RUN go build -o /bin/eqpg ./cmd/eqpg
+RUN go build -ldflags "-X github.com/shiblon/entroq/pkg/version.Version=${VERSION}" -o /bin/eqpg ./cmd/eqpg
 
 # 2. Switch to a secure, minimal runtime container.
 # The ":debug" version includes a busybox shell for easier "docker exec" debugging.

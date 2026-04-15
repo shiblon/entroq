@@ -14,6 +14,7 @@ import (
 	"github.com/shiblon/entroq/pkg/authz/opahttp"
 	"github.com/shiblon/entroq/pkg/backend/eqmem"
 	"github.com/shiblon/entroq/pkg/eqsvcgrpc"
+	"github.com/shiblon/entroq/pkg/version"
 	"github.com/shiblon/entroq/pkg/eqsvcjson"
 	"github.com/shiblon/entroq/pkg/otel"
 	"github.com/spf13/cobra"
@@ -54,8 +55,9 @@ const (
 
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
-	Use:   "eqmemsvc",
-	Short: "A memory-backed EntroQ service. Ephemeral - don't trust to keep your data.",
+	Use:     "eqmemsvc",
+	Version: version.Version,
+	Short:   "A memory-backed EntroQ service. Ephemeral - don't trust to keep your data.",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := context.Background()
 
