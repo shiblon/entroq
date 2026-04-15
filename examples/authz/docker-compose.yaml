@@ -46,16 +46,16 @@ services:
       - "--watch"
       - "--log-level=info"
       - "/etc/opa/core"
-      - "/etc/opa/example"
+      - "/etc/opa/providers"
       - "/etc/opa/local"
+
     ports:
       - "8181:8181"
     volumes:
-      # Core entroq Rego -- queue matching and authz logic.
-      - ../../pkg/authz/opadata/conf/core:/etc/opa/core
-      # Example permissions implementation -- maps users/roles to queues.
-      - ../../pkg/authz/opadata/conf/example:/etc/opa/example
-      # Local overrides -- inline JWKS user.rego + data.json with key material
-      # and policy. Replace user.rego with the reference implementation and
-      # add a jwks_url to data.json when using a real IDP.
-      - ./opa:/etc/opa/local
+      # OPA policy directories seeded by: eqctl opa init ./opa-conf
+      # Core EntroQ Rego -- do not modify.
+      - ./opa-conf/core:/etc/opa/core
+      # Built-in OIDC provider -- do not modify.
+      - ./opa-conf/providers:/etc/opa/providers
+      # Your config: edit opa-conf/local/data.json for IDP settings and policy.
+      - ./opa-conf/local:/etc/opa/local

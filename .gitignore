@@ -39,6 +39,7 @@ __pycache__/
 
 # Configs
 .gemini/
+.claude/
 
 # AI Stuff
 QUBIT.md
