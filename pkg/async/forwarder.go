@@ -2,6 +2,7 @@ package async
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/shiblon/entroq"
@@ -74,11 +75,11 @@ func (f *Forwarder) Run(ctx context.Context) error {
 	dst := f.dst
 
 	fwdWorker := worker.New(f.src,
-		worker.WithDoWork(func(ctx context.Context, task *entroq.Task, val []byte, _ []*entroq.Doc) error {
+		worker.WithDoWork(func(ctx context.Context, task *entroq.Task, val json.RawMessage, _ []*entroq.Doc) error {
 			_, err := dst.Modify(ctx, entroq.InsertingInto(dstQueue, entroq.WithRawValue(val)))
 			return err
 		}),
-		worker.WithFinish(func(ctx context.Context, task *entroq.Task, _ []byte, _ []*entroq.Doc) error {
+		worker.WithFinish(func(ctx context.Context, task *entroq.Task, _ json.RawMessage, _ []*entroq.Doc) error {
 			_, err := f.src.Modify(ctx, task.Delete())
 			return err
 		}),
