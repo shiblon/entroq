@@ -37,11 +37,33 @@ failed_namespaces contains n if {
 	some n in namespaces.disallowed(input.namespaces, permissions.allowed_namespaces)
 }
 
+# claimant_mismatch is true when the caller supplies a claimant_id that does
+# not begin with their authenticated identity (user.name + "#"). This prevents
+# cross-identity impersonation while allowing per-process nonces within the
+# same identity. Only fires when both sides are present; unauthenticated
+# requests and empty claimant_ids pass through unchanged.
+#
+# To allow admins to operate under any claimant (e.g. for forced deletion),
+# add an exception in your permissions policy:
+#
+#   import data.entroq.authz
+#   claimant_mismatch := false if { data.entroq.permissions.is_admin }
+claimant_mismatch if {
+	input.claimant_id != ""
+	user.name
+	not startswith(input.claimant_id, concat("", [user.name, "#"]))
+	not permissions.is_admin
+}
+
 # Add a message containing user information if there are queue or namespace mismatches.
 errors contains msg if {
 	(count(failed) + count(failed_namespaces)) > 0
 	user.name
-	msg := concat("User: ", user.name)
+	msg := concat("", ["User: ", user.name])
+}
+
+errors contains "claimant_id does not match authenticated user" if {
+	claimant_mismatch
 }
 
 default allow := false

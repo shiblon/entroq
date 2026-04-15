@@ -245,6 +245,97 @@ func TestJWKSAllow(t *testing.T) {
 		}
 	})
 
+	t.Run("claimant matches sub prefix", func(t *testing.T) {
+		tok := makeToken(t, rsaKey, username, audience, issuer, time.Hour)
+		input := map[string]any{
+			"authz": map[string]any{
+				"type":        "Bearer",
+				"credentials": tok,
+			},
+			"claimant_id": username + "#some-nonce",
+			"queues": []any{
+				map[string]any{
+					"exact":   "/shared/inbox",
+					"actions": []any{"CLAIM"},
+				},
+			},
+		}
+		if !evalAllow(t, input, storeData) {
+			t.Error("expected allow=true for matching claimant prefix, got false")
+		}
+	})
+
+	t.Run("claimant mismatches sub", func(t *testing.T) {
+		tok := makeToken(t, rsaKey, username, audience, issuer, time.Hour)
+		input := map[string]any{
+			"authz": map[string]any{
+				"type":        "Bearer",
+				"credentials": tok,
+			},
+			"claimant_id": "otheruser#some-nonce",
+			"queues": []any{
+				map[string]any{
+					"exact":   "/shared/inbox",
+					"actions": []any{"CLAIM"},
+				},
+			},
+		}
+		if evalAllow(t, input, storeData) {
+			t.Error("expected allow=false for mismatched claimant, got true")
+		}
+	})
+
+	t.Run("empty claimant_id allowed", func(t *testing.T) {
+		tok := makeToken(t, rsaKey, username, audience, issuer, time.Hour)
+		input := map[string]any{
+			"authz": map[string]any{
+				"type":        "Bearer",
+				"credentials": tok,
+			},
+			"claimant_id": "",
+			"queues": []any{
+				map[string]any{
+					"exact":   "/shared/inbox",
+					"actions": []any{"CLAIM"},
+				},
+			},
+		}
+		if !evalAllow(t, input, storeData) {
+			t.Error("expected allow=true for empty claimant_id, got false")
+		}
+	})
+
+	t.Run("admin claimant mismatch allowed", func(t *testing.T) {
+		adminStore := map[string]any{
+			"entroq": map[string]any{
+				"idp": storeData["entroq"].(map[string]any)["idp"],
+				"policy": map[string]any{
+					"users": []any{
+						map[string]any{
+							"name":   username,
+							"roles":  []any{"admin"},
+							"queues": []any{},
+						},
+					},
+					"roles": []any{},
+				},
+			},
+		}
+		tok := makeToken(t, rsaKey, username, audience, issuer, time.Hour)
+		input := map[string]any{
+			"authz": map[string]any{
+				"type":        "Bearer",
+				"credentials": tok,
+			},
+			// Admin operating under a different process's claimant.
+			"claimant_id": "otheruser#some-nonce",
+			"queues":      []any{},
+		}
+		if !evalAllow(t, input, adminStore) {
+			t.Error("expected allow=true for admin with mismatched claimant, got false")
+		}
+	})
+
 	t.Run("personal namespace prefix allowed", func(t *testing.T) {
 		tok := makeToken(t, rsaKey, username, audience, issuer, time.Hour)
 		input := map[string]any{

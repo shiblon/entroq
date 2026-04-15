@@ -174,3 +174,39 @@ test_allow_false_empty_allowed_queues if {
 		with data.entroq.permissions.allowed_queues as set()
 		with input.queues as []
 }
+
+# regal ignore:test-outside-test-package
+test_claimant_match_allow if {
+	allow with data.entroq.user.name as "auser"
+		with data.entroq.permissions.allowed_queues as [{"exact": "/q", "actions": ["CLAIM"]}]
+		with data.entroq.permissions.allowed_namespaces as set()
+		with input.queues as [{"exact": "/q", "actions": ["CLAIM"]}]
+		with input.claimant_id as "auser#abc123"
+}
+
+# regal ignore:test-outside-test-package
+test_claimant_mismatch_deny if {
+	not allow with data.entroq.user.name as "auser"
+		with data.entroq.permissions.allowed_queues as [{"exact": "/q", "actions": ["CLAIM"]}]
+		with data.entroq.permissions.allowed_namespaces as set()
+		with input.queues as [{"exact": "/q", "actions": ["CLAIM"]}]
+		with input.claimant_id as "otheruser#abc123"
+}
+
+# regal ignore:test-outside-test-package
+test_claimant_empty_allow if {
+	allow with data.entroq.user.name as "auser"
+		with data.entroq.permissions.allowed_queues as [{"exact": "/q", "actions": ["CLAIM"]}]
+		with data.entroq.permissions.allowed_namespaces as set()
+		with input.queues as [{"exact": "/q", "actions": ["CLAIM"]}]
+		with input.claimant_id as ""
+}
+
+# regal ignore:test-outside-test-package
+test_claimant_set_no_user_allow if {
+	# Unauthenticated: user.name is undefined, claimant_id passes through.
+	allow with data.entroq.permissions.allowed_queues as [{"exact": "/q", "actions": ["CLAIM"]}]
+		with data.entroq.permissions.allowed_namespaces as set()
+		with input.queues as [{"exact": "/q", "actions": ["CLAIM"]}]
+		with input.claimant_id as "anyone#abc123"
+}
