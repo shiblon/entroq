@@ -11,6 +11,15 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.0.0-rc2] - 2026-04-15
+
+### Fixed
+
+- Removed self-referential `replace` directive from `go.mod` that would break
+  `go get github.com/shiblon/entroq` for downstream consumers.
+
+---
+
 ## [1.0.0-rc1] - 2026-04-15
 
 First release candidate for 1.0. The 0.x series was exploratory; 1.0 carries
