@@ -1,4 +1,3 @@
-# regal ignore:directory-package-mismatch
 package entroq.permissions
 
 import rego.v1

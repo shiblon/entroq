@@ -1,4 +1,3 @@
-# regal ignore:directory-package-mismatch
 package entroq.queues
 
 import rego.v1
