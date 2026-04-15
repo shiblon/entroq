@@ -4,18 +4,15 @@
 # bundle data (data.entroq.idp.jwks), rather than fetching from a live URL.
 # This avoids needing a running IDP for the example.
 #
-# For production, replace this file with the reference implementation at:
-#   pkg/authz/opadata/conf/example/example-entroq-user.rego
+# For production with a real IDP, remove this file entirely. The built-in
+# provider at conf/providers/entroq/user/oidc-entroq-user.rego fetches the
+# JWKS from data.entroq.idp.jwks_url at evaluation time (with OPA's built-in
+# caching). Just add jwks_url to data.json and drop this file.
 #
-# That version fetches the JWKS from data.entroq.idp.jwks_url at evaluation
-# time (with OPA's built-in caching), which is the correct approach for a
-# real IDP such as Google, Okta, Auth0, or Keycloak.
-#
-# The data.entroq.idp fields used here:
+# The data.entroq.idp fields used here (inline-key variant for local dev):
 #   jwks     - JSON string of the JWKS document (inline public key material)
 #   audience - expected "aud" claim in the JWT
 #   issuer   - expected "iss" claim in the JWT
-# regal ignore:directory-package-mismatch,unresolved-reference
 package entroq.user
 
 import rego.v1
