@@ -782,7 +782,7 @@ func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *mo
 			pq.Array(rChgNS), pq.Array(rChgIDs), pq.Array(rChgVers), pq.Array(rChgPKeys), pq.Array(rChgSKeys), pq.Array(rChgValues), pq.Array(rChgAts),
 		)
 		if err != nil {
-			return nil, parseModifyError(err, mod)
+			return nil, parseModifyDocsError(err, mod)
 		}
 		defer rRows.Close()
 
@@ -919,6 +919,77 @@ func parseModifyError(err error, mod *entroq.Modification) error {
 	}
 	for _, c := range detail.Collisions {
 		depErr.Inserts = append(depErr.Inserts, &entroq.TaskID{ID: c.ID, Version: c.Version})
+	}
+
+	return depErr
+}
+
+// parseModifyDocsError converts an EQ001 PostgreSQL error from _modify_docs
+// into a DependencyError with doc fields populated. The doc error JSON uses
+// {ns, id, version} for missing/mismatched and {ns, id} for collisions,
+// unlike the task error which uses {id, version}. Other errors are returned unchanged.
+func parseModifyDocsError(err error, mod *entroq.Modification) error {
+	if err == nil {
+		return nil
+	}
+	pgerr := new(pq.Error)
+	if !errors.As(err, &pgerr) || string(pgerr.Code) != "EQ001" {
+		return err
+	}
+
+	var detail struct {
+		Missing []struct {
+			NS      string `json:"ns"`
+			ID      string `json:"id"`
+			Version int32  `json:"version"`
+		} `json:"missing"`
+		Mismatched []struct {
+			NS      string `json:"ns"`
+			ID      string `json:"id"`
+			Version int32  `json:"version"`
+		} `json:"mismatched"`
+		Collisions []struct {
+			NS string `json:"ns"`
+			ID string `json:"id"`
+		} `json:"collisions"`
+	}
+	if jsonErr := json.Unmarshal([]byte(pgerr.Detail), &detail); jsonErr != nil {
+		return fmt.Errorf("pg modify docs EQ001 with unparseable detail %q: %w", pgerr.Detail, err)
+	}
+
+	// Build lookup sets to categorize (namespace, id) pairs by operation.
+	dependKeys := make(map[string]bool, len(mod.DocDepends))
+	for _, d := range mod.DocDepends {
+		dependKeys[entroq.DocKey(d.Namespace, d.ID)] = true
+	}
+	deleteKeys := make(map[string]bool, len(mod.DocDeletes))
+	for _, d := range mod.DocDeletes {
+		deleteKeys[entroq.DocKey(d.Namespace, d.ID)] = true
+	}
+
+	depErr := new(entroq.DependencyError)
+
+	categorize := func(ns, id string, version int32) {
+		did := &entroq.DocID{Namespace: ns, ID: id, Version: version}
+		k := entroq.DocKey(ns, id)
+		switch {
+		case dependKeys[k]:
+			depErr.DocDepends = append(depErr.DocDepends, did)
+		case deleteKeys[k]:
+			depErr.DocDeletes = append(depErr.DocDeletes, did)
+		default:
+			depErr.DocChanges = append(depErr.DocChanges, did)
+		}
+	}
+
+	for _, m := range detail.Missing {
+		categorize(m.NS, m.ID, m.Version)
+	}
+	for _, m := range detail.Mismatched {
+		categorize(m.NS, m.ID, m.Version)
+	}
+	for _, c := range detail.Collisions {
+		depErr.DocInserts = append(depErr.DocInserts, &entroq.DocID{Namespace: c.NS, ID: c.ID})
 	}
 
 	return depErr
