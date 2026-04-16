@@ -698,7 +698,10 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 	for _, c := range mod.Changes {
 		newTask := c.Copy()
 		newTask.Version++
-		newTask.Claimant = mod.Claimant
+		// Preserve claimant on renewal (At pushed to future); clear otherwise.
+		if !newTask.At.After(now) {
+			newTask.Claimant = ""
+		}
 		newTask.Modified = now
 		if c.FromQueue != c.Queue {
 			deleteID(c.FromQueue, c.ID)

@@ -29,10 +29,17 @@ func SimpleChange(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 	if changed[0].Queue != outQueue {
 		t.Fatalf("Change queue: want %q, got %v", outQueue, changed[0].Queue)
 	}
+	// Modifying a task clears the claimant -- it is no longer held.
+	if changed[0].Claimant != "" {
+		t.Fatalf("Expected claimant to be cleared after change, got %q", changed[0].Claimant)
+	}
 	changed[0].Queue = inQueue
 
-	if diff := EqualTasksVersionIncr(inserted[0], changed[0], 1); diff != "" {
-		t.Fatalf("Tasks not equal (except version bump):\n%v", diff)
+	// Clone inserted[0] with claimant zeroed so the version-bump comparison is apples-to-apples.
+	wantBase := *inserted[0]
+	wantBase.Claimant = ""
+	if diff := EqualTasksVersionIncr(&wantBase, changed[0], 1); diff != "" {
+		t.Fatalf("Tasks not equal (except version bump and claimant):\n%v", diff)
 	}
 }
 
