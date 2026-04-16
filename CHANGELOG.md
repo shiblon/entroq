@@ -45,6 +45,10 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pushing a version tag (clean tree, no `replace` directives, CHANGELOG entry
   present, tag does not already exist).
 
+- **eqmem move**: eqmemsvc became instead `eqmem serve` to mirror eqpg.
+
+- **eqredis**: starting an eqredis instance now has its own command.
+
 ### Fixed
 
 - **eqpg doc modify errors**: `_modify_docs` errors were parsed by the task
