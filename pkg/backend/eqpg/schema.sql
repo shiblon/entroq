@@ -472,7 +472,10 @@ BEGIN
                 at       = c.chg_at,
                 value    = c.chg_value::jsonb,
                 attempt  = c.chg_attempt,
-                err      = c.chg_err
+                err      = c.chg_err,
+                -- Preserve claimant on renewal (chg_at pushed past now);
+                -- clear it otherwise so the task is available to any claimant.
+                claimant = CASE WHEN c.chg_at > v_now THEN entroq.tasks.claimant ELSE NULL END
             FROM unnest(
                 coalesce(p_chg_ids,      '{}'::text[]),
                 coalesce(p_chg_vers,     '{}'::integer[]),

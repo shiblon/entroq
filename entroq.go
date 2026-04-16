@@ -636,7 +636,44 @@ func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (*ModifyRespo
 			newInserts = append(newInserts, td)
 		}
 		mod.Inserts = newInserts
+
+		collidingDocKeys := make(map[string]bool)
+		for _, ins := range depErr.DocInserts {
+			collidingDocKeys[DocKey(ins.Namespace, ins.ID)] = true
+		}
+		var newDocInserts []*DocData
+		for _, dd := range mod.DocInserts {
+			if collidingDocKeys[DocKey(dd.Namespace, dd.ID)] {
+				if dd.skipCollidingID {
+					continue
+				}
+				return nil, fmt.Errorf("unskippable doc collision: %w", err)
+			}
+			newDocInserts = append(newDocInserts, dd)
+		}
+		mod.DocInserts = newDocInserts
 	}
+}
+
+// TryClaimDocByID attempts to claim the doc identified by ns and id by
+// pushing its arrival time to now+duration. This is an optimistic operation:
+// it reads the doc first, then changes it. If the doc was modified between the
+// read and the change, the backend returns a DependencyError and the caller
+// may retry. If the doc is currently claimed by another claimant, a
+// DependencyError with DocClaims set is returned.
+func (c *EntroQ) TryClaimDocByID(ctx context.Context, ns, id string, duration time.Duration) (*Doc, error) {
+	docs, err := c.Docs(ctx, DocsIn(ns).WithIDs(id))
+	if err != nil {
+		return nil, fmt.Errorf("try claim doc by id: get doc: %w", err)
+	}
+	if len(docs) == 0 {
+		return nil, fmt.Errorf("try claim doc by id: doc %s/%s not found", ns, id)
+	}
+	resp, err := c.Modify(ctx, docs[0].Change(WithDocArrivalTimeBy(duration)))
+	if err != nil {
+		return nil, fmt.Errorf("try claim doc by id: %w", err)
+	}
+	return resp.ChangedDocs[0], nil
 }
 
 // Docs returns a list of docs matching the given query.
@@ -1389,9 +1426,14 @@ func (m *DependencyError) HasClaims() bool {
 	return len(m.Claims) > 0
 }
 
-// HasCollisions indicates whether any of the inserted tasks collided with existing IDs.
+// HasCollisions indicates whether any inserted tasks or docs collided with existing IDs.
 func (m *DependencyError) HasCollisions() bool {
-	return len(m.Inserts) > 0
+	return len(m.Inserts) > 0 || len(m.DocInserts) > 0
+}
+
+// HasAny reports whether any dependency fields are populated.
+func (m *DependencyError) HasAny() bool {
+	return m.HasMissing() || m.HasCollisions() || m.HasClaims() || m.HasMissingDocs() || m.HasClaimedDocs()
 }
 
 // OnlyClaims indicates that the error was only related to claimants (tasks or
