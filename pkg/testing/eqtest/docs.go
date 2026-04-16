@@ -465,6 +465,113 @@ func DocClaimLocking(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 	}
 }
 
+// DocInsertWithID tests collision detection and skip-colliding behavior for
+// doc inserts that specify an explicit ID.
+//
+// This test specifically exercises the bug path that existed before the fix:
+//   - eqredis silently overwrote on explicit-ID collision instead of returning
+//     DependencyError.DocInserts.
+//   - eqpg called the task error parser for doc errors, misrouting collisions.
+//   - The entroq Modify retry loop didn't handle DocInserts collisions at all.
+func DocInsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	ns := path.Join(qPrefix, "doc_insert_with_id")
+	knownID := client.GenID()
+
+	// Insert a doc with an explicit ID -- should succeed.
+	resp, err := client.Modify(ctx, entroq.CreatingIn(ns,
+		entroq.WithIDKeys(knownID, "pk", "sk"),
+		entroq.WithContent("first"),
+	))
+	if err != nil {
+		t.Fatalf("first insert with explicit ID %q: %v", knownID, err)
+	}
+	if len(resp.InsertedDocs) != 1 {
+		t.Fatalf("first insert: want 1 InsertedDoc, got %d", len(resp.InsertedDocs))
+	}
+	if resp.InsertedDocs[0].ID != knownID {
+		t.Fatalf("first insert: want ID %q, got %q", knownID, resp.InsertedDocs[0].ID)
+	}
+
+	// Inserting the same explicit ID again must return DependencyError with
+	// DocInserts populated -- not silently overwrite, not misroute to Changes.
+	_, err = client.Modify(ctx, entroq.CreatingIn(ns,
+		entroq.WithIDKeys(knownID, "pk", "sk"),
+		entroq.WithContent("second"),
+	))
+	if err == nil {
+		t.Fatal("second insert with same explicit ID: expected DependencyError, got nil")
+	}
+	depErr, ok := entroq.AsDependency(err)
+	if !ok {
+		t.Fatalf("second insert: expected DependencyError, got %T: %v", err, err)
+	}
+	if want, got := 1, len(depErr.DocInserts); want != got {
+		t.Fatalf("second insert: want %d DocInserts in dependency error, got %d (%v)", want, got, depErr)
+	}
+	if depErr.DocInserts[0].ID != knownID {
+		t.Fatalf("second insert: DocInserts[0].ID = %q, want %q", depErr.DocInserts[0].ID, knownID)
+	}
+
+	// Verify the original content is unchanged (no silent overwrite).
+	docs, err := client.Docs(ctx, entroq.DocsIn(ns).WithIDs(knownID))
+	if err != nil {
+		t.Fatalf("verify after collision: %v", err)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("verify after collision: want 1 doc, got %d", len(docs))
+	}
+	if string(docs[0].Content) != `"first"` {
+		t.Errorf("verify after collision: content changed to %s, want %q", docs[0].Content, `"first"`)
+	}
+
+	// Inserting with WithSkipCollidingDoc must succeed and leave the original intact.
+	_, err = client.Modify(ctx, entroq.CreatingIn(ns,
+		entroq.WithIDKeys(knownID, "pk", "sk"),
+		entroq.WithContent("overwrite-attempt"),
+		entroq.WithSkipCollidingDoc(true),
+	))
+	if err != nil {
+		t.Fatalf("skip-colliding insert: expected no error, got %v", err)
+	}
+
+	docs, err = client.Docs(ctx, entroq.DocsIn(ns).WithIDs(knownID))
+	if err != nil {
+		t.Fatalf("verify after skip: %v", err)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("verify after skip: want 1 doc, got %d", len(docs))
+	}
+	if string(docs[0].Content) != `"first"` {
+		t.Errorf("verify after skip: content changed to %s, want %q", docs[0].Content, `"first"`)
+	}
+
+	// Skip-colliding insert alongside another real operation must execute the
+	// real operation while dropping the colliding insert.
+	otherID := client.GenID()
+	_, err = client.Modify(ctx,
+		entroq.CreatingIn(ns,
+			entroq.WithIDKeys(knownID, "pk", "sk"),
+			entroq.WithContent("overwrite-attempt"),
+			entroq.WithSkipCollidingDoc(true),
+		),
+		entroq.CreatingIn(ns,
+			entroq.WithIDKeys(otherID, "pk2", "sk2"),
+			entroq.WithContent("new-doc"),
+		),
+	)
+	if err != nil {
+		t.Fatalf("skip-colliding + new insert: expected no error, got %v", err)
+	}
+
+	docs, err = client.Docs(ctx, entroq.DocsIn(ns))
+	if err != nil {
+		t.Fatalf("final list: %v", err)
+	}
+	if len(docs) != 2 {
+		t.Fatalf("final list: want 2 docs, got %d", len(docs))
+	}
+}
+
 // EqualDocs compares two docs for equality, allowing for a version increment.
 func EqualDocs(a, b *entroq.Doc, versionDiff int32) string {
 	copyA := *a

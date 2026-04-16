@@ -499,3 +499,7 @@ func TestEQMemDocListing(t *testing.T) {
 func TestEQMemDocClaimLocking(t *testing.T) {
 	RunQTest(t, eqtest.DocClaimLocking)
 }
+
+func TestEQMemDocInsertWithID(t *testing.T) {
+	RunQTest(t, eqtest.DocInsertWithID)
+}

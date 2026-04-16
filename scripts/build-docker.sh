@@ -3,8 +3,9 @@
 # Usage: ./scripts/build-docker.sh <version> [--push]
 #
 # Builds:
-#   ghcr.io/shiblon/entroq-pg:<version>   -- PostgreSQL-backed gRPC service
-#   ghcr.io/shiblon/entroq-mem:<version>  -- in-memory gRPC service (with journal)
+#   ghcr.io/shiblon/entroq-pg:<version>     -- PostgreSQL-backed gRPC service
+#   ghcr.io/shiblon/entroq-mem:<version>    -- in-memory gRPC service (with journal)
+#   ghcr.io/shiblon/entroq-redis:<version>  -- Redis-backed gRPC service
 #
 # Pass --push to push to ghcr.io after building.
 # Before pushing for the first time, authenticate with:
@@ -39,8 +40,9 @@ build_image() {
     echo "Built ${REGISTRY}/${name}:${VERSION}"
 }
 
-build_image entroq-pg  cmd/eqpg/Dockerfile
-build_image entroq-mem cmd/eqmemsvc/Dockerfile
+build_image entroq-pg    cmd/eqpg/Dockerfile
+build_image entroq-mem   cmd/eqmem/Dockerfile
+build_image entroq-redis cmd/eqredis/Dockerfile
 
 if [ "${PUSH}" = "1" ]; then
     echo "--- Pushing images ---"
@@ -48,5 +50,7 @@ if [ "${PUSH}" = "1" ]; then
     docker push "${REGISTRY}/entroq-pg:latest"
     docker push "${REGISTRY}/entroq-mem:${VERSION}"
     docker push "${REGISTRY}/entroq-mem:latest"
-    echo "Pushed ${REGISTRY}/entroq-pg:${VERSION} and ${REGISTRY}/entroq-mem:${VERSION}"
+    docker push "${REGISTRY}/entroq-redis:${VERSION}"
+    docker push "${REGISTRY}/entroq-redis:latest"
+    echo "Pushed entroq-pg, entroq-mem, entroq-redis at ${VERSION}"
 fi

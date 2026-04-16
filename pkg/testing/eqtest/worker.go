@@ -716,6 +716,11 @@ func WorkerCompactDependencyHandler(ctx context.Context, t *testing.T, client *e
 	case <-time.After(5 * time.Second):
 		t.Fatal("Timeout waiting for dependency handler")
 	}
+
+	runCancel()
+	if err := <-errCh; err != nil && !entroq.IsCanceled(err) {
+		t.Errorf("worker exit: %v", err)
+	}
 }
 
 // WorkerRenewalNoDependencyHandler verifies that renewal failures don't trigger the hook.

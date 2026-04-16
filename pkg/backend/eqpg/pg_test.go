@@ -486,6 +486,10 @@ func TestPGDocClaimLocking(t *testing.T) {
 	RunQTest(t, eqtest.DocClaimLocking)
 }
 
+func TestPGDocInsertWithID(t *testing.T) {
+	RunQTest(t, eqtest.DocInsertWithID)
+}
+
 // TestSchemaInit verifies that InitSchema succeeds on a blank database,
 // records the correct SchemaVersion, and is idempotent when run a second time.
 // Uses a fresh database within the shared testcontainers postgres instance so

@@ -13,10 +13,12 @@ import (
 type DocOpt func(*docOpts)
 
 type docOpts struct {
-	id           string
-	key          string
-	secondaryKey string
-	content      json.RawMessage
+	id              string
+	key             string
+	secondaryKey    string
+	content         json.RawMessage
+	at              time.Time
+	skipCollidingID bool
 }
 
 // WithKeys sets the primary and secondary keys for doc creation. The ID is
@@ -63,6 +65,33 @@ func WithContent(v any) DocOpt {
 	return WithRawContent(b)
 }
 
+// WithDocArrivalTime sets the arrival time on a doc change. When non-zero and in the
+// future, the backend will also record the caller as the claimant so the doc
+// can be renewed or released.
+func WithDocArrivalTime(t time.Time) DocOpt {
+	return func(o *docOpts) {
+		o.at = t
+	}
+}
+
+// WithDocArrivalTimeBy sets the doc arrival time to now plus d. Use this to
+// claim or renew a doc by pushing its At into the future.
+func WithDocArrivalTimeBy(d time.Duration) DocOpt {
+	return func(o *docOpts) {
+		o.at = time.Now().Add(d)
+	}
+}
+
+// WithSkipCollidingDoc marks a doc insert as skippable when its explicit ID
+// already exists. When the caller specifies an ID and that doc is already
+// present, the Modify call removes this insert and retries rather than
+// returning an error. Analogous to WithSkipColliding for task inserts.
+func WithSkipCollidingDoc(skip bool) DocOpt {
+	return func(o *docOpts) {
+		o.skipCollidingID = skip
+	}
+}
+
 // DocID contains the identifying parts of a storage doc.
 type DocID struct {
 	Namespace string `json:"namespace"`
@@ -95,6 +124,11 @@ type DocData struct {
 	Content      json.RawMessage `json:"content"`
 	Created      time.Time       `json:"created"`
 	Modified     time.Time       `json:"modified"`
+
+	// skipCollidingID indicates that a collision on insertion is not fatal.
+	// When the explicit ID already exists, Modify removes this insert and
+	// retries rather than returning an error. Analogous to TaskData's field.
+	skipCollidingID bool
 }
 
 // Doc represents a durable state record in EntroQ.
@@ -166,8 +200,8 @@ func (r *Doc) Copy() *Doc {
 	return &cp
 }
 
-// Change returns a ModifyArg that changes this doc. Accepts WithContent.
-// WithIDKeys is ignored (keys are immutable).
+// Change returns a ModifyArg that changes this doc. Accepts WithContent,
+// WithDocArrivalTime, and WithDocArrivalTimeBy. WithIDKeys is ignored (keys are immutable).
 func (r *Doc) Change(opts ...DocOpt) ModifyArg {
 	return func(m *Modification) {
 		o := &docOpts{}
@@ -177,6 +211,9 @@ func (r *Doc) Change(opts ...DocOpt) ModifyArg {
 		nr := r.Copy()
 		if len(o.content) > 0 {
 			nr.Content = o.content
+		}
+		if !o.at.IsZero() {
+			nr.At = o.at
 		}
 		m.DocChanges = append(m.DocChanges, nr)
 	}
@@ -256,6 +293,7 @@ func InsertingDoc(rd *DocData) ModifyArg {
 // CreatingIn returns a ModifyArg that creates a doc in the given namespace.
 // Use WithKeys to set the primary and secondary keys, WithContent/WithRawContent
 // to set the payload. Use WithIDKeys only when explicit ID control is required.
+// Use WithSkipCollidingDoc to allow the insert to be silently dropped on ID collision.
 func CreatingIn(ns string, opts ...DocOpt) ModifyArg {
 	return func(m *Modification) {
 		o := &docOpts{}
@@ -263,11 +301,12 @@ func CreatingIn(ns string, opts ...DocOpt) ModifyArg {
 			opt(o)
 		}
 		rd := &DocData{
-			Namespace:    ns,
-			ID:           o.id,
-			Key:          o.key,
-			SecondaryKey: o.secondaryKey,
-			Content:      o.content,
+			Namespace:       ns,
+			ID:              o.id,
+			Key:             o.key,
+			SecondaryKey:    o.secondaryKey,
+			Content:         o.content,
+			skipCollidingID: o.skipCollidingID,
 		}
 		m.DocInserts = append(m.DocInserts, rd)
 	}
