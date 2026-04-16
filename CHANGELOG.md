@@ -11,6 +11,54 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.0.0-rc3] - 2026-04-16
+
+### Added
+
+- **Redis backend** (`pkg/backend/eqredis`): new production-quality backend
+  using Redis WATCH/MULTI/EXEC for optimistic locking. Supports all task and
+  doc operations, including claims, renewals, modifications, and dependencies.
+  All keys use the `{eq}` hash tag, ensuring cluster-mode compatibility by
+  pinning all data to a single hash slot (see package doc for the tradeoff).
+
+- **Doc insert collision detection**: inserting a doc with an explicit ID now
+  returns `DependencyError.DocInserts` if that ID already exists, matching the
+  behavior of task inserts. Previously eqredis silently overwrote and eqpg
+  misrouted the error through the task error parser. eqmem was already correct.
+
+- **`WithSkipCollidingDoc`** (`DocOpt`): marks a doc insert as droppable on ID
+  collision, analogous to `WithSkipColliding` for task inserts. The `Modify`
+  retry loop strips skippable collisions and retries automatically.
+
+- **`WithDocArrivalTime` / `WithDocArrivalTimeBy`** (`DocOpt`): set the `At`
+  field on a doc change, enabling renewal or claim-by-ID patterns without
+  mutating the `Doc` struct directly.
+
+- **`TryClaimDocByID`**: client-level helper that claims a specific doc by
+  namespace and ID, analogous to the `eqc tryclaimid` command for tasks.
+
+- **`DependencyError.HasCollisions`** now covers doc insert collisions
+  (`DocInserts`) in addition to task insert collisions (`Inserts`), so the
+  `Modify` retry loop handles both uniformly.
+
+- **Release script** (`scripts/tag-release.sh`): pre-flight checks before
+  pushing a version tag (clean tree, no `replace` directives, CHANGELOG entry
+  present, tag does not already exist).
+
+### Fixed
+
+- **eqpg doc modify errors**: `_modify_docs` errors were parsed by the task
+  error parser, which ignored the `ns` field and misrouted collisions into
+  `Changes`. A dedicated `parseModifyDocsError` now correctly populates
+  `DocDepends`, `DocDeletes`, `DocChanges`, and `DocInserts`.
+
+- **Claimant preservation on renewal**: a `Change` that pushes `At` into the
+  future (renewal) now preserves the existing claimant in all three backends.
+  Previously all three backends cleared the claimant unconditionally on any
+  `Change`, breaking worker renewal loops.
+
+---
+
 ## [1.0.0-rc2] - 2026-04-15
 
 ### Fixed
