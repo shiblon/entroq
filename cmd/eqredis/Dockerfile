@@ -9,7 +9,7 @@ RUN go mod download -x
 
 ARG VERSION=dev
 COPY . .
-RUN go build -ldflags "-X github.com/shiblon/entroq/pkg/version.Version=${VERSION}" -o /bin/eqredis ./cmd/eqredis
+RUN go build -ldflags "-X github.com/shiblon/entroq/pkg/version.injected=${VERSION}" -o /bin/eqredis ./cmd/eqredis
 
 # 2. Switch to a secure, minimal runtime container.
 FROM gcr.io/distroless/static-debian12:debug
