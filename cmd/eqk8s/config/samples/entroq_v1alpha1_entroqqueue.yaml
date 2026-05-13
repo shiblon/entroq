@@ -1,0 +1,9 @@
+apiVersion: entroq.my.domain/v1alpha1
+kind: EntroQQueue
+metadata:
+  labels:
+    app.kubernetes.io/name: eqk8s
+    app.kubernetes.io/managed-by: kustomize
+  name: entroqqueue-sample
+spec:
+  # TODO(user): Add fields here

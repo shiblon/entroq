@@ -1,0 +1,32 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - create
+  - get
+  - update
+- apiGroups:
+  - entroq.entroq.io
+  resources:
+  - entroqidentities
+  - entroqqueues
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - entroq.entroq.io
+  resources:
+  - entroqidentities/status
+  - entroqqueues/status
+  verbs:
+  - get
+  - patch
+  - update

@@ -1,0 +1,5 @@
+## Append samples of your project ##
+resources:
+- entroq_v1alpha1_entroqqueue.yaml
+- entroq_v1alpha1_entroqidentity.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples
