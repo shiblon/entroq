@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"time"
 
+	"path"
+
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/async"
 	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
@@ -25,6 +27,8 @@ var (
 	concurrency    int
 	requestTimeout time.Duration
 	drainTimeout   time.Duration
+	domainSuffix   string
+	namespace      string
 )
 
 var runCmd = &cobra.Command{
@@ -64,9 +68,11 @@ Graceful shutdown on SIGINT/SIGTERM:
 			return fmt.Errorf("load tls: %w", err)
 		}
 
-		sender := async.NewSender(eq, senderAddr, myQueue,
+		sender := async.NewSender(eq, senderAddr,
 			async.WithSenderRequestTimeout(requestTimeout),
 			async.WithSenderTLSConfig(tlsCfg),
+			async.WithSenderDomainSuffix(domainSuffix),
+			async.WithSenderNamespace(namespace),
 		)
 
 		g, _ := errgroup.WithContext(ctx)
@@ -92,7 +98,7 @@ Graceful shutdown on SIGINT/SIGTERM:
 		)
 		for range concurrency {
 			g.Go(func() error {
-				return recvWorker.Run(rcvCtx, worker.Watching(myQueue))
+				return recvWorker.Run(rcvCtx, worker.Watching(path.Join(myQueue, "inbox")))
 			})
 		}
 
@@ -137,7 +143,9 @@ Graceful shutdown on SIGINT/SIGTERM:
 
 func init() {
 	flags := runCmd.Flags()
-	flags.StringVar(&myQueue, "queue", "", "This sidecar's queue name (required).")
+	flags.StringVar(&myQueue, "queue", "", "This sidecar's service queue prefix (required). Receiver watches <prefix>/inbox; GC scans <prefix>/.")
+	flags.StringVar(&domainSuffix, "domain-suffix", ".localhost", "Domain suffix stripped from the Host header to derive the target service. E.g. .localhost or .eq.local.")
+	flags.StringVar(&namespace, "namespace", "", "Default namespace prepended to single-label targets. E.g. payments makes bar.localhost route to payments/bar/inbox.")
 	flags.StringVar(&senderAddr, "addr", ":8080", "Address for the sender to listen on.")
 	flags.StringVar(&upstream, "upstream", "http://localhost:8000", "Upstream service address for the receiver.")
 	flags.IntVar(&concurrency, "concurrency", 1, "Number of concurrent receiver goroutines.")
@@ -145,8 +153,8 @@ func init() {
 	flags.DurationVar(&drainTimeout, "drain_timeout", 35*time.Second, "How long to wait for in-flight requests to finish on shutdown.")
 	flags.DurationVar(&gcInterval, "gc_interval", 10*time.Minute, "How often to run the GC scan.")
 	flags.DurationVar(&gcGrace, "gc_grace", 15*time.Second, "Extra time after expiry before GC deletes a response queue.")
-
 	runCmd.MarkFlagRequired("queue")
 
 	rootCmd.AddCommand(runCmd)
 }
+

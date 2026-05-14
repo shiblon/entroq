@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"time"
@@ -132,9 +133,7 @@ func forward(ctx context.Context, client *http.Client, upstream string, env Enve
 		if err != nil {
 			return nil, fmt.Errorf("new request in forward: %w", err)
 		}
-		for k, v := range env.Headers {
-			req.Header.Set(k, v)
-		}
+		maps.Copy(req.Header, env.Headers)
 		return req, nil
 	}
 
@@ -166,14 +165,9 @@ func forward(ctx context.Context, client *http.Client, upstream string, env Enve
 			return Response{StatusCode: http.StatusBadGateway, Error: fmt.Sprintf("read response body: %v", err)}, err
 		}
 
-		headers := make(map[string]string, len(httpResp.Header))
-		for k := range httpResp.Header {
-			headers[k] = httpResp.Header.Get(k)
-		}
-
 		return Response{
 			StatusCode: httpResp.StatusCode,
-			Headers:    headers,
+			Headers:    copyHeaders(httpResp.Header),
 			Body:       json.RawMessage(body),
 		}, nil
 	}
