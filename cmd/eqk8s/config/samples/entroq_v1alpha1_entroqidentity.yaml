@@ -1,9 +1,15 @@
-apiVersion: entroq.my.domain/v1alpha1
+apiVersion: entroq.entroq.io/v1alpha1
 kind: EntroQIdentity
 metadata:
-  labels:
-    app.kubernetes.io/name: eqk8s
-    app.kubernetes.io/managed-by: kustomize
-  name: entroqidentity-sample
+  name: svc-a-identity
+  namespace: default
 spec:
-  # TODO(user): Add fields here
+  identities:
+  - serviceAccount: svc-a
+    labels:
+      group: frontend
+      team: payments
+  - serviceAccount: svc-c
+    labels:
+      group: internal-tools
+      team: payments

@@ -66,6 +66,8 @@ func main() {
 	var secureMetrics bool
 	var opaURL string
 	var resyncInterval time.Duration
+	var meshConfigMapNamespace string
+	var enableWebhook bool
 	var enableHTTP2 bool
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
@@ -85,6 +87,8 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.StringVar(&opaURL, "opa-url", "http://localhost:8181", "Base URL of the OPA instance.")
 	flag.DurationVar(&resyncInterval, "resync-interval", 5*time.Minute, "How often the reconciler re-pushes the mesh document to OPA, regardless of CRD changes.")
+	flag.StringVar(&meshConfigMapNamespace, "mesh-configmap-namespace", "entroq-system", "Namespace for the entroq-mesh ConfigMap that OPA mounts on startup.")
+	flag.BoolVar(&enableWebhook, "enable-webhook", false, "Start the validating admission webhook server. Requires TLS certificates; disabled by default for local development.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	opts := zap.Options{
@@ -125,7 +129,10 @@ func main() {
 		webhookServerOptions.KeyName = webhookCertKey
 	}
 
-	webhookServer := webhook.NewServer(webhookServerOptions)
+	var webhookServer webhook.Server
+	if enableWebhook {
+		webhookServer = webhook.NewServer(webhookServerOptions)
+	}
 
 	// Metrics endpoint is enabled in 'config/default/kustomization.yaml'. The Metrics options configure the server.
 	// More info:
@@ -165,7 +172,7 @@ func main() {
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
-		WebhookServer:          webhookServer,
+		WebhookServer:          webhookServer, // nil when --enable-webhook=false; manager skips webhook startup
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "eqk8s.entroq.io",
@@ -187,22 +194,25 @@ func main() {
 	}
 
 	if err := (&controller.MeshReconciler{
-		Client:         mgr.GetClient(),
-		Scheme:         mgr.GetScheme(),
-		OPAClient:      eqk8s.NewOPAClient(eqk8s.WithOPAURL(opaURL)),
-		ResyncInterval: resyncInterval,
+		Client:                 mgr.GetClient(),
+		Scheme:                 mgr.GetScheme(),
+		OPAClient:              eqk8s.NewOPAClient(eqk8s.WithOPAURL(opaURL)),
+		ResyncInterval:         resyncInterval,
+		MeshConfigMapNamespace: meshConfigMapNamespace,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "mesh")
 		os.Exit(1)
 	}
-	mgr.GetWebhookServer().Register(
-		"/validate-entroq-entroq-io-v1alpha1-entroqqueuename",
-		admission.WithValidator(mgr.GetScheme(), &eqwebhook.EntroQQueueValidator{}),
-	)
-	mgr.GetWebhookServer().Register(
-		"/validate-entroq-entroq-io-v1alpha1-entroqidentity",
-		admission.WithValidator(mgr.GetScheme(), &eqwebhook.EntroQIdentityValidator{}),
-	)
+	if enableWebhook {
+		mgr.GetWebhookServer().Register(
+			"/validate-entroq-entroq-io-v1alpha1-entroqqueuename",
+			admission.WithValidator(mgr.GetScheme(), &eqwebhook.EntroQQueueValidator{}),
+		)
+		mgr.GetWebhookServer().Register(
+			"/validate-entroq-entroq-io-v1alpha1-entroqidentity",
+			admission.WithValidator(mgr.GetScheme(), &eqwebhook.EntroQIdentityValidator{}),
+		)
+	}
 	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

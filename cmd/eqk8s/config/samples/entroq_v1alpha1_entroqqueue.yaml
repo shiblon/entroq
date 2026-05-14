@@ -1,9 +1,15 @@
-apiVersion: entroq.my.domain/v1alpha1
+apiVersion: entroq.entroq.io/v1alpha1
 kind: EntroQQueue
 metadata:
-  labels:
-    app.kubernetes.io/name: eqk8s
-    app.kubernetes.io/managed-by: kustomize
-  name: entroqqueue-sample
+  name: svc-b-inbox
+  namespace: default
 spec:
-  # TODO(user): Add fields here
+  queues:
+  - pattern: /payments/svc-b/inbox
+    matchType: Exact
+    allowedCallers:
+    - labels:
+        group: frontend
+    - labels:
+        group: internal-tools
+        team: payments
