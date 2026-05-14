@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"maps"
 	"net"
 	"net/http"
@@ -25,6 +26,8 @@ type ReceiverOption func(*receiverConfig)
 type receiverConfig struct {
 	mp         metric.MeterProvider
 	httpClient *http.Client
+	name       string
+	auditLog   *slog.Logger
 }
 
 // WithReceiverMeterProvider sets the OTel MeterProvider for the receiver.
@@ -40,6 +43,22 @@ func WithReceiverMeterProvider(mp metric.MeterProvider) ReceiverOption {
 func WithReceiverHTTPClient(client *http.Client) ReceiverOption {
 	return func(c *receiverConfig) {
 		c.httpClient = client
+	}
+}
+
+// WithReceiverName sets the service identity used in audit log entries as the
+// "queue" field. Typically the service's own queue prefix (e.g. "payments/svc-b").
+func WithReceiverName(name string) ReceiverOption {
+	return func(c *receiverConfig) {
+		c.name = name
+	}
+}
+
+// WithReceiverAuditLogger enables structured audit logging. When set, a
+// request_handled event is emitted after each task is forwarded to the upstream.
+func WithReceiverAuditLogger(l *slog.Logger) ReceiverOption {
+	return func(c *receiverConfig) {
+		c.auditLog = l
 	}
 }
 
@@ -89,6 +108,16 @@ func ReceiverHandler(upstream string, opts ...ReceiverOption) worker.DoModifyRun
 		if err != nil {
 			log.Printf("receiver forward %s%s: %v", upstream, env.Path, err)
 			forwardErrors.Add(ctx, 1)
+		}
+		if cfg.auditLog != nil {
+			cfg.auditLog.LogAttrs(ctx, slog.LevelInfo, "request_handled",
+				slog.String("queue", cfg.name),
+				slog.String("response_queue", env.ResponseQueue),
+				slog.String("method", env.Method),
+				slog.String("path", env.Path),
+				slog.Int("status_code", resp.StatusCode),
+				slog.Float64("duration_s", time.Since(start).Seconds()),
+			)
 		}
 
 		respValue, err := json.Marshal(resp)
