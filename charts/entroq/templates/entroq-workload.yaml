@@ -1,0 +1,112 @@
+{{- if .Values.entroq.enabled }}
+{{- /*
+  storage.enabled=false -> Deployment (memory-only, ephemeral, simple)
+  storage.enabled=true  -> StatefulSet with PVC (journaled, durable)
+*/}}
+apiVersion: apps/v1
+kind: {{ if .Values.entroq.storage.enabled }}StatefulSet{{ else }}Deployment{{ end }}
+metadata:
+  name: entroq
+  namespace: entroq-system
+  labels:
+    {{- include "entroq.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "entroq.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "entroq.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: entroq
+      containers:
+      - name: entroq
+        image: "{{ .Values.entroq.image.repository }}:{{ .Values.entroq.image.tag }}"
+        imagePullPolicy: {{ .Values.entroq.image.pullPolicy }}
+        args:
+        - serve
+        - --authz=opahttp
+        - --opa_url=http://localhost:{{ .Values.entroq.service.opaPort }}
+        {{- if .Values.entroq.storage.enabled }}
+        - --journal={{ .Values.entroq.storage.mountPath }}
+        - --mkdir
+        - --periodic_snapshot=1h
+        - --journal_cleanup
+        {{- end }}
+        ports:
+        - containerPort: {{ .Values.entroq.service.grpcPort }}
+          name: grpc
+        readinessProbe:
+          tcpSocket:
+            port: {{ .Values.entroq.service.grpcPort }}
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        resources:
+          {{- toYaml .Values.entroq.resources.entroq | nindent 10 }}
+        {{- if .Values.entroq.storage.enabled }}
+        volumeMounts:
+        - name: journal
+          mountPath: {{ .Values.entroq.storage.mountPath }}
+        {{- end }}
+
+      - name: opa
+        image: "{{ .Values.entroq.opa.image.repository }}:{{ .Values.entroq.opa.image.tag }}"
+        imagePullPolicy: {{ .Values.entroq.opa.image.pullPolicy }}
+        args:
+        - run
+        - --server
+        - --addr=0.0.0.0:{{ .Values.entroq.service.opaPort }}
+        {{- $extra := include "entroq.opaExtraArgs" . | trim }}
+        {{- if $extra }}
+        {{- $extra | nindent 8 }}
+        {{- end }}
+        - /rego/core-entroq-authz.rego
+        - /rego/core-entroq-jwt.rego
+        - /rego/core-entroq-namespaces.rego
+        - /rego/core-entroq-queues.rego
+        - /rego/k8s-entroq-permissions.rego
+        - /rego/k8s-entroq-user.rego
+        - /data/data.json
+        ports:
+        - containerPort: {{ .Values.entroq.service.opaPort }}
+          name: http
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: {{ .Values.entroq.service.opaPort }}
+          initialDelaySeconds: 3
+          periodSeconds: 5
+        resources:
+          {{- toYaml .Values.entroq.resources.opa | nindent 10 }}
+        volumeMounts:
+        - name: opa-rego
+          mountPath: /rego
+          readOnly: true
+        - name: opa-data
+          mountPath: /data
+          readOnly: true
+
+      volumes:
+      - name: opa-rego
+        configMap:
+          name: opa-rego
+      - name: opa-data
+        configMap:
+          name: opa-data
+
+  {{- if .Values.entroq.storage.enabled }}
+  volumeClaimTemplates:
+  - metadata:
+      name: journal
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      {{- if .Values.entroq.storage.storageClass }}
+      storageClassName: {{ .Values.entroq.storage.storageClass | quote }}
+      {{- end }}
+      resources:
+        requests:
+          storage: {{ .Values.entroq.storage.size }}
+  {{- end }}
+{{- end }}

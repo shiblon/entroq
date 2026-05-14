@@ -1,0 +1,89 @@
+# Default values for the EntroQ mesh chart.
+# Override with: helm install entroq ./charts/entroq -f my-values.yaml
+# or:           helm install entroq ./charts/entroq --set key=value
+
+# -- Operator: watches EntroQQueue and EntroQIdentity CRDs, pushes OPA policy.
+operator:
+  enabled: true
+  image:
+    repository: eqk8s-operator
+    tag: dev
+    pullPolicy: IfNotPresent
+  # URL of the OPA instance the operator pushes mesh documents to.
+  # Defaults to the OPA sidecar in the entroq-system namespace.
+  opaUrl: "http://entroq.entroq-system.svc.cluster.local:8181"
+  # How often the operator re-pushes the mesh document to OPA even without CRD changes.
+  resyncInterval: 5m
+  # Namespace where the operator writes the entroq-mesh ConfigMap for OPA startup durability.
+  meshConfigMapNamespace: entroq-system
+  resources:
+    requests:
+      cpu: 10m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 128Mi
+
+# -- EntroQ server + OPA sidecar.
+entroq:
+  enabled: true
+  image:
+    repository: eqmem
+    tag: dev
+    pullPolicy: IfNotPresent
+
+  # Storage strategy.
+  # enabled: false  -- memory-only mode; data is lost on restart (Deployment).
+  # enabled: true   -- journaled mode with a PersistentVolumeClaim (StatefulSet).
+  storage:
+    enabled: false
+    size: 1Gi
+    storageClass: ""   # leave blank to use the cluster default StorageClass
+    mountPath: /data/entroq/journal
+
+  # OPA sidecar configuration.
+  opa:
+    image:
+      repository: openpolicyagent/opa
+      tag: "1.16.2"
+      pullPolicy: IfNotPresent
+    # Uncomment to enable structured JSON decision logs to stdout (verbose).
+    # decisionLogs: true
+    # Uncomment to enable debug-level OPA logging (reveals JWKS failures etc.).
+    # debug: true
+
+  # k8s OIDC settings for OPA JWT verification.
+  # Obtain cluster-specific values from:
+  #   kubectl get --raw /.well-known/openid-configuration
+  auth:
+    jwksUrl: "https://kubernetes.default.svc/openid/v1/jwks"
+    audience: "https://kubernetes.default.svc.cluster.local"
+    issuer:   "https://kubernetes.default.svc.cluster.local"
+    caFile:   "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+
+  service:
+    grpcPort: 37706
+    opaPort: 8181
+
+  resources:
+    entroq:
+      requests:
+        cpu: 10m
+        memory: 64Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+    opa:
+      requests:
+        cpu: 10m
+        memory: 64Mi
+      limits:
+        cpu: 250m
+        memory: 128Mi
+
+# -- OIDC discovery RBAC.
+# Grants anonymous read access to the k8s OIDC JWKS endpoint so OPA can
+# verify SA JWTs. Required on Minikube; already enabled on most managed
+# clusters (GKE, EKS, AKS). Set to true only if your cluster denies it.
+oidcDiscovery:
+  grantAnonymous: false

@@ -1,0 +1,131 @@
+{{- if .Values.operator.enabled }}
+# Leader election: allows the operator to acquire a lease so only one replica
+# is active at a time.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: eqk8s-leader-election-role
+  namespace: eqk8s-system
+  labels:
+    {{- include "entroq.labels" . | nindent 4 }}
+rules:
+- apiGroups: [""]
+  resources: [configmaps]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [coordination.k8s.io]
+  resources: [leases]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [""]
+  resources: [events]
+  verbs: [create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: eqk8s-leader-election-rolebinding
+  namespace: eqk8s-system
+  labels:
+    {{- include "entroq.labels" . | nindent 4 }}
+subjects:
+- kind: ServiceAccount
+  name: eqk8s-controller-manager
+  namespace: eqk8s-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: eqk8s-leader-election-role
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: eqk8s-controller-manager
+  namespace: eqk8s-system
+  labels:
+    {{- include "entroq.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: eqk8s-manager-role
+  labels:
+    {{- include "entroq.labels" . | nindent 4 }}
+rules:
+- apiGroups: [""]
+  resources: [configmaps]
+  verbs: [create, get, list, update, watch]
+- apiGroups: [entroq.entroq.io]
+  resources: [entroqidentities, entroqqueues]
+  verbs: [get, list, watch]
+- apiGroups: [entroq.entroq.io]
+  resources: [entroqidentities/status, entroqqueues/status]
+  verbs: [get, patch, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: eqk8s-manager-rolebinding
+  labels:
+    {{- include "entroq.labels" . | nindent 4 }}
+subjects:
+- kind: ServiceAccount
+  name: eqk8s-controller-manager
+  namespace: eqk8s-system
+roleRef:
+  kind: ClusterRole
+  name: eqk8s-manager-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: eqk8s-controller-manager
+  namespace: eqk8s-system
+  labels:
+    {{- include "entroq.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "entroq.operatorSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "entroq.operatorSelectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: eqk8s-controller-manager
+      containers:
+      - name: manager
+        image: "{{ .Values.operator.image.repository }}:{{ .Values.operator.image.tag }}"
+        imagePullPolicy: {{ .Values.operator.image.pullPolicy }}
+        args:
+        - --leader-elect
+        - --health-probe-bind-address=:8081
+        - --metrics-secure=false
+        - --opa-url={{ .Values.operator.opaUrl }}
+        - --resync-interval={{ .Values.operator.resyncInterval }}
+        - --mesh-configmap-namespace={{ .Values.operator.meshConfigMapNamespace }}
+        ports:
+        - containerPort: 8081
+          name: health
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          {{- toYaml .Values.operator.resources | nindent 10 }}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+      securityContext:
+        runAsNonRoot: true
+      terminationGracePeriodSeconds: 10
+{{- end }}
