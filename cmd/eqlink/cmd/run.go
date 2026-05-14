@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -29,6 +30,7 @@ var (
 	drainTimeout   time.Duration
 	domainSuffix   string
 	namespace      string
+	auditLog       bool
 )
 
 var runCmd = &cobra.Command{
@@ -68,11 +70,14 @@ Graceful shutdown on SIGINT/SIGTERM:
 			return fmt.Errorf("load tls: %w", err)
 		}
 
+		alog := newAuditLogger()
 		sender := async.NewSender(eq, senderAddr,
 			async.WithSenderRequestTimeout(requestTimeout),
 			async.WithSenderTLSConfig(tlsCfg),
 			async.WithSenderDomainSuffix(domainSuffix),
 			async.WithSenderNamespace(namespace),
+			async.WithSenderName(myQueue),
+			async.WithSenderAuditLogger(alog),
 		)
 
 		g, _ := errgroup.WithContext(ctx)
@@ -82,6 +87,10 @@ Graceful shutdown on SIGINT/SIGTERM:
 		})
 
 		var rcvOpts []async.ReceiverOption
+		rcvOpts = append(rcvOpts,
+			async.WithReceiverName(myQueue),
+			async.WithReceiverAuditLogger(alog),
+		)
 		if tlsCfg != nil {
 			rcvOpts = append(rcvOpts, async.WithReceiverHTTPClient(&http.Client{
 				Transport: &http.Transport{
@@ -153,8 +162,18 @@ func init() {
 	flags.DurationVar(&drainTimeout, "drain_timeout", 35*time.Second, "How long to wait for in-flight requests to finish on shutdown.")
 	flags.DurationVar(&gcInterval, "gc_interval", 10*time.Minute, "How often to run the GC scan.")
 	flags.DurationVar(&gcGrace, "gc_grace", 15*time.Second, "Extra time after expiry before GC deletes a response queue.")
+	flags.BoolVar(&auditLog, "audit-log", false, "Emit structured JSON audit events to stderr for every request mediated (request_enqueued, request_handled, response_received).")
 	runCmd.MarkFlagRequired("queue")
 
 	rootCmd.AddCommand(runCmd)
+}
+
+// newAuditLogger returns a JSON slog.Logger writing to stderr when --audit-log
+// is set, or nil (disabled) otherwise.
+func newAuditLogger() *slog.Logger {
+	if !auditLog {
+		return nil
+	}
+	return slog.New(slog.NewJSONHandler(os.Stderr, nil))
 }
 

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"path"
@@ -59,6 +60,8 @@ type Sender struct {
 	eq             *entroq.EntroQ
 	domainSuffix   string
 	namespace      string
+	name           string
+	auditLog       *slog.Logger
 	requestTimeout time.Duration
 	addr           string
 	mp             metric.MeterProvider
@@ -117,6 +120,26 @@ func WithSenderDomainSuffix(suffix string) SenderOption {
 func WithSenderNamespace(ns string) SenderOption {
 	return func(s *Sender) {
 		s.namespace = ns
+	}
+}
+
+// WithSenderName sets the service identity used in audit log entries as the
+// "from" field. Typically the service's own queue prefix (e.g. "payments/svc-a").
+// Has no effect when audit logging is disabled.
+func WithSenderName(name string) SenderOption {
+	return func(s *Sender) {
+		s.name = name
+	}
+}
+
+// WithSenderAuditLogger enables structured audit logging for every request
+// the sender mediates. When set, three events are emitted per request:
+// request_enqueued (on task insert), and response_received (on task claim).
+// Payload content is never logged; only queue names, method, path, status,
+// and timing are recorded.
+func WithSenderAuditLogger(l *slog.Logger) SenderOption {
+	return func(s *Sender) {
+		s.auditLog = l
 	}
 }
 
@@ -308,6 +331,15 @@ func (s *Sender) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("enqueue task: %v", err), http.StatusBadGateway)
 		return
 	}
+	if s.auditLog != nil {
+		s.auditLog.LogAttrs(ctx, slog.LevelInfo, "request_enqueued",
+			slog.String("from", s.name),
+			slog.String("to", targetInbox),
+			slog.String("method", r.Method),
+			slog.String("path", r.URL.Path),
+			slog.String("response_queue", responseQueue),
+		)
+	}
 
 	// Block until the response arrives, the request timeout elapses, or the
 	// caller disconnects. WithTimeout derives from ctx so whichever deadline
@@ -326,6 +358,13 @@ func (s *Sender) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, fmt.Sprintf("unmarshal response: %v", err), http.StatusBadGateway)
 		return
+	}
+	if s.auditLog != nil {
+		s.auditLog.LogAttrs(ctx, slog.LevelInfo, "response_received",
+			slog.String("response_queue", responseQueue),
+			slog.Int("status_code", resp.StatusCode),
+			slog.Float64("duration_s", time.Since(start).Seconds()),
+		)
 	}
 
 	for k, vs := range resp.Headers {
