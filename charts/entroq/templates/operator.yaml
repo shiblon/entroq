@@ -95,7 +95,7 @@ spec:
       serviceAccountName: eqk8s-controller-manager
       containers:
       - name: manager
-        image: "{{ .Values.operator.image.repository }}:{{ .Values.operator.image.tag }}"
+        image: "{{ .Values.operator.image.repository }}:{{ .Values.operator.image.tag | default .Chart.AppVersion }}"
         imagePullPolicy: {{ .Values.operator.image.pullPolicy }}
         args:
         - --leader-elect

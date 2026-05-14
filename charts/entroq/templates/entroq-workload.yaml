@@ -1,10 +1,11 @@
-{{- if .Values.entroq.enabled }}
-{{- /*
-  storage.enabled=false -> Deployment (memory-only, ephemeral, simple)
-  storage.enabled=true  -> StatefulSet with PVC (journaled, durable)
-*/}}
+{{- if .Values.entroq.enabled -}}
+{{- $backend := .Values.entroq.backend.type -}}
+{{- $isJournal  := eq $backend "journal"  -}}
+{{- $isPostgres := eq $backend "postgres" -}}
+{{- $isRedis    := eq $backend "redis"    -}}
+---
 apiVersion: apps/v1
-kind: {{ if .Values.entroq.storage.enabled }}StatefulSet{{ else }}Deployment{{ end }}
+kind: {{ if $isJournal }}StatefulSet{{ else }}Deployment{{ end }}
 metadata:
   name: entroq
   namespace: entroq-system
@@ -23,17 +24,42 @@ spec:
       serviceAccountName: entroq
       containers:
       - name: entroq
-        image: "{{ .Values.entroq.image.repository }}:{{ .Values.entroq.image.tag }}"
-        imagePullPolicy: {{ .Values.entroq.image.pullPolicy }}
+        image: {{ include "entroq.serverImage" . }}
+        imagePullPolicy: {{ .Values.entroq.images.pullPolicy }}
         args:
         - serve
         - --authz=opahttp
         - --opa_url=http://localhost:{{ .Values.entroq.service.opaPort }}
-        {{- if .Values.entroq.storage.enabled }}
+        {{- if $isJournal }}
         - --journal={{ .Values.entroq.storage.mountPath }}
         - --mkdir
         - --periodic_snapshot=1h
         - --journal_cleanup
+        {{- else if $isPostgres }}
+        - --dbaddr={{ .Values.entroq.postgres.addr }}
+        - --dbname={{ .Values.entroq.postgres.database }}
+        - --dbuser={{ .Values.entroq.postgres.user }}
+        {{- if .Values.entroq.postgres.initSchema }}
+        - --init_schema
+        {{- end }}
+        {{- else if $isRedis }}
+        - --addr={{ .Values.entroq.redis.addr }}
+        - --db={{ .Values.entroq.redis.db }}
+        {{- end }}
+        {{- if $isPostgres }}
+        env:
+        - name: PGPASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "entroq.postgresSecretName" . }}
+              key: password
+        {{- else if $isRedis }}
+        env:
+        - name: EQ_REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "entroq.redisSecretName" . }}
+              key: password
         {{- end }}
         ports:
         - containerPort: {{ .Values.entroq.service.grpcPort }}
@@ -45,7 +71,7 @@ spec:
           periodSeconds: 5
         resources:
           {{- toYaml .Values.entroq.resources.entroq | nindent 10 }}
-        {{- if .Values.entroq.storage.enabled }}
+        {{- if $isJournal }}
         volumeMounts:
         - name: journal
           mountPath: {{ .Values.entroq.storage.mountPath }}
@@ -96,7 +122,7 @@ spec:
         configMap:
           name: opa-data
 
-  {{- if .Values.entroq.storage.enabled }}
+  {{- if $isJournal }}
   volumeClaimTemplates:
   - metadata:
       name: journal
