@@ -1,0 +1,21 @@
+{{- if .Values.entroq.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: entroq
+  namespace: entroq-system
+  labels:
+    {{- include "entroq.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "entroq.selectorLabels" . | nindent 4 }}
+  ports:
+  - name: grpc
+    port: {{ .Values.entroq.service.grpcPort }}
+    targetPort: {{ .Values.entroq.service.grpcPort }}
+    protocol: TCP
+  - name: opa
+    port: {{ .Values.entroq.service.opaPort }}
+    targetPort: {{ .Values.entroq.service.opaPort }}
+    protocol: TCP
+{{- end }}

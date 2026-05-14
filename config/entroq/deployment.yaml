@@ -37,6 +37,14 @@ spec:
         - run
         - --server
         - --addr=0.0.0.0:8181
+        # Uncomment to emit every auth decision as structured JSON to stdout.
+        # Useful for debugging allow/deny decisions; can be verbose in production.
+        # Route to your log aggregator (e.g. Loki via Promtail/Alloy).
+        #- --set=decision_logs.console=true
+        #
+        # Uncomment for verbose OPA internals (HTTP requests, rule evaluation).
+        # Reveals JWKS fetch failures and other low-level issues immediately.
+        #- --log-level=debug
         - /rego/core-entroq-authz.rego
         - /rego/core-entroq-jwt.rego
         - /rego/core-entroq-namespaces.rego
