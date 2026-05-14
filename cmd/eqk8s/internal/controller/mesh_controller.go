@@ -41,16 +41,17 @@ import (
 // the OPA mesh authorization document whenever either changes.
 type MeshReconciler struct {
 	client.Client
-	Scheme         *runtime.Scheme
-	OPAClient      *eqk8s.OPAClient
-	ResyncInterval time.Duration
+	Scheme                 *runtime.Scheme
+	OPAClient              *eqk8s.OPAClient
+	ResyncInterval         time.Duration
+	MeshConfigMapNamespace string
 }
 
 // +kubebuilder:rbac:groups=entroq.entroq.io,resources=entroqqueues,verbs=get;list;watch
 // +kubebuilder:rbac:groups=entroq.entroq.io,resources=entroqqueues/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=entroq.entroq.io,resources=entroqidentities,verbs=get;list;watch
 // +kubebuilder:rbac:groups=entroq.entroq.io,resources=entroqidentities/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;create;update
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;create;update;list;watch
 
 func (r *MeshReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -81,9 +82,8 @@ func (r *MeshReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 }
 
 const (
-	meshConfigMapName      = "entroq-mesh"
-	meshConfigMapNamespace = "entroq-system"
-	meshConfigMapKey       = "mesh.json"
+	meshConfigMapName = "entroq-mesh"
+	meshConfigMapKey  = "mesh.json"
 )
 
 // writeMeshConfigMap writes the mesh document to a ConfigMap so OPA can load
@@ -97,12 +97,12 @@ func (r *MeshReconciler) writeMeshConfigMap(ctx context.Context, mesh eqk8s.OPAM
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      meshConfigMapName,
-			Namespace: meshConfigMapNamespace,
+			Namespace: r.MeshConfigMapNamespace,
 		},
 	}
 
 	existing := &corev1.ConfigMap{}
-	err = r.Get(ctx, types.NamespacedName{Name: meshConfigMapName, Namespace: meshConfigMapNamespace}, existing)
+	err = r.Get(ctx, types.NamespacedName{Name: meshConfigMapName, Namespace: r.MeshConfigMapNamespace}, existing)
 	if errors.IsNotFound(err) {
 		cm.Data = map[string]string{meshConfigMapKey: string(data)}
 		return r.Create(ctx, cm)
