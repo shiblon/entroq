@@ -57,7 +57,7 @@ Use "eqlink run" to start the full sidecar (sender + receiver + GC).`,
 		g, ctx := errgroup.WithContext(ctx)
 		for range concurrency {
 			g.Go(func() error {
-				if err := recvWorker.Run(ctx, worker.Watching(myQueue)); err != nil {
+				if err := recvWorker.Run(ctx, worker.Watching(myQueue+"/inbox")); err != nil {
 					return fmt.Errorf("run worker: %w", err)
 				}
 				return nil
@@ -69,7 +69,7 @@ Use "eqlink run" to start the full sidecar (sender + receiver + GC).`,
 
 func init() {
 	flags := recvCmd.Flags()
-	flags.StringVar(&myQueue, "queue", "", "Queue to claim tasks from (required).")
+	flags.StringVar(&myQueue, "queue", "", "Service queue prefix (required). Receiver watches <prefix>/inbox.")
 	flags.StringVar(&upstream, "upstream", "http://localhost:8000", "Upstream service address.")
 	flags.IntVar(&concurrency, "concurrency", 1, "Number of concurrent receiver goroutines.")
 	recvCmd.MarkFlagRequired("queue")

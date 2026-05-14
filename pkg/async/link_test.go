@@ -33,8 +33,8 @@ func TestSharedEQSidecar(t *testing.T) {
 	stopReceivers := mustStartReceivers(ctx, t, eq, queue, upstream.URL, 2)
 	defer stopReceivers()
 
-	sender := async.NewSender(eq, "", queue)
-	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("http://test/%s/ping", queue), nil).WithContext(ctx)
+	sender := async.NewSender(eq, "", async.WithSenderDomainSuffix(".test"))
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("http://%s.test/ping", queue), nil).WithContext(ctx)
 	w := httptest.NewRecorder()
 	sender.ServeHTTP(w, req)
 

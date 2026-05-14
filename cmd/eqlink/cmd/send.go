@@ -37,9 +37,11 @@ Use "eqlink run" to start the full sidecar (sender + receiver + GC).`,
 			return fmt.Errorf("load tls: %w", err)
 		}
 
-		sender := async.NewSender(eq, senderAddr, myQueue,
+		sender := async.NewSender(eq, senderAddr,
 			async.WithSenderRequestTimeout(requestTimeout),
 			async.WithSenderTLSConfig(tlsCfg),
+			async.WithSenderDomainSuffix(domainSuffix),
+			async.WithSenderNamespace(namespace),
 		)
 		return sender.Run(ctx)
 	},
@@ -47,10 +49,9 @@ Use "eqlink run" to start the full sidecar (sender + receiver + GC).`,
 
 func init() {
 	flags := sendCmd.Flags()
-	flags.StringVar(&myQueue, "queue", "", "This sidecar's queue namespace (required).")
 	flags.StringVar(&senderAddr, "addr", ":8080", "Address to listen on.")
 	flags.DurationVar(&requestTimeout, "request_timeout", 0, "Request timeout (0 uses package default of 30s).")
-	sendCmd.MarkFlagRequired("queue")
-
+	flags.StringVar(&domainSuffix, "domain-suffix", ".localhost", "Domain suffix stripped from Host header to derive the target service.")
+	flags.StringVar(&namespace, "namespace", "", "Default namespace prepended to single-label targets.")
 	rootCmd.AddCommand(sendCmd)
 }

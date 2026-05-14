@@ -10,11 +10,6 @@
 #                             use a self-signed cluster CA (e.g.
 #                             /var/run/secrets/kubernetes.io/serviceaccount/ca.crt)
 #
-# The JWKS response is cached by OPA (respecting HTTP cache headers), so the
-# network fetch only occurs on startup and after cache expiry. The print()
-# below fires once per cache miss -- silent in normal operation, visible on
-# failure so operators can diagnose JWKS access problems in pod logs.
-#
 # NOTE: the k8s OIDC JWKS endpoint requires anonymous read access. On Minikube
 # this is not enabled by default. Fix:
 #   kubectl create clusterrolebinding oidc-discovery-anonymous \
@@ -23,6 +18,21 @@
 package entroq.jwt
 
 import rego.v1
+
+# _log_jwks logs a warning when the JWKS fetch returns a non-200 status.
+# The two branches together always succeed regardless of status, so this
+# never fails the calling rule. print() fires only on the error branch.
+_log_jwks(url, status) if {
+	status != 200
+	print("entroq.jwt: JWKS fetch from", url, "returned HTTP", status,
+		"-- JWT verification will fail.",
+		"On Minikube: kubectl create clusterrolebinding oidc-discovery-anonymous",
+		"--clusterrole=system:service-account-issuer-discovery --group=system:unauthenticated")
+}
+
+_log_jwks(_, status) if {
+	status == 200
+}
 
 verified_sub(token, config) := sub if {
 	ca_cert := object.get(config, "ca_cert_file", "")
@@ -36,7 +46,7 @@ verified_sub(token, config) := sub if {
 		},
 		ca_opts,
 	))
-	print("entroq.jwt: JWKS fetch from", config.jwks_url, "->", resp.status_code)
+	_log_jwks(config.jwks_url, resp.status_code)
 	resp.status_code == 200
 	[valid, _, payload] := io.jwt.decode_verify(token, {
 		"cert": json.marshal(resp.body),
