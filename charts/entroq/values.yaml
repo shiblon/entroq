@@ -6,15 +6,11 @@
 operator:
   enabled: true
   image:
-    repository: eqk8s-operator
-    tag: dev
+    repository: entroq-operator
+    tag: ""            # defaults to .Chart.AppVersion
     pullPolicy: IfNotPresent
-  # URL of the OPA instance the operator pushes mesh documents to.
-  # Defaults to the OPA sidecar in the entroq-system namespace.
   opaUrl: "http://entroq.entroq-system.svc.cluster.local:8181"
-  # How often the operator re-pushes the mesh document to OPA even without CRD changes.
   resyncInterval: 5m
-  # Namespace where the operator writes the entroq-mesh ConfigMap for OPA startup durability.
   meshConfigMapNamespace: entroq-system
   resources:
     requests:
@@ -27,30 +23,58 @@ operator:
 # -- EntroQ server + OPA sidecar.
 entroq:
   enabled: true
-  image:
-    repository: eqmem
-    tag: dev
+
+  # Storage backend. One of:
+  #   memory    -- in-process only; data lost on restart (Deployment, no PVC)
+  #   journal   -- in-process with WAL journal; durable (StatefulSet + PVC)
+  #   postgres  -- PostgreSQL; configure entroq.postgres below
+  #   redis     -- Redis (experimental); configure entroq.redis below
+  backend:
+    type: memory
+
+  # Images for each backend. Tag defaults to .Chart.AppVersion when left blank.
+  images:
+    mem:       # used for memory and journal backends (same binary)
+      repository: entroq-mem
+      tag: ""
+    postgres:
+      repository: entroq-pg
+      tag: ""
+    redis:
+      repository: entroq-redis
+      tag: ""
     pullPolicy: IfNotPresent
 
-  # Storage strategy.
-  # enabled: false  -- memory-only mode; data is lost on restart (Deployment).
-  # enabled: true   -- journaled mode with a PersistentVolumeClaim (StatefulSet).
+  # Journal storage (backend.type=journal only).
   storage:
-    enabled: false
     size: 1Gi
-    storageClass: ""   # leave blank to use the cluster default StorageClass
+    storageClass: ""   # blank = cluster default StorageClass
     mountPath: /data/entroq/journal
 
-  # OPA sidecar configuration.
+  # PostgreSQL connection (backend.type=postgres only).
+  postgres:
+    addr: "postgres:5432"
+    database: entroq
+    user: entroq
+    password: ""          # chart creates a Secret from this value
+    existingSecret: ""    # use a pre-existing Secret instead (recommended for production)
+    initSchema: true      # idempotent; safe to leave enabled
+
+  # Redis connection (backend.type=redis, experimental).
+  redis:
+    addr: "redis:6379"
+    password: ""          # chart creates a Secret from this value
+    existingSecret: ""    # use a pre-existing Secret instead (recommended for production)
+    db: 0
+
+  # OPA sidecar.
   opa:
     image:
       repository: openpolicyagent/opa
       tag: "1.16.2"
       pullPolicy: IfNotPresent
-    # Uncomment to enable structured JSON decision logs to stdout (verbose).
-    # decisionLogs: true
-    # Uncomment to enable debug-level OPA logging (reveals JWKS failures etc.).
-    # debug: true
+    # decisionLogs: true   # emit structured auth decisions to stdout (verbose)
+    # debug: true          # debug-level OPA logging (reveals JWKS failures etc.)
 
   # k8s OIDC settings for OPA JWT verification.
   # Obtain cluster-specific values from:
@@ -82,8 +106,7 @@ entroq:
         memory: 128Mi
 
 # -- OIDC discovery RBAC.
-# Grants anonymous read access to the k8s OIDC JWKS endpoint so OPA can
-# verify SA JWTs. Required on Minikube; already enabled on most managed
-# clusters (GKE, EKS, AKS). Set to true only if your cluster denies it.
+# Set true on Minikube or clusters that restrict anonymous JWKS access.
+# Most managed clusters (GKE, EKS, AKS) already allow it.
 oidcDiscovery:
   grantAnonymous: false
