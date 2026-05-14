@@ -21,11 +21,6 @@ import rego.v1
 
 import data.entroq.jwt
 
-name := jwt.verified_sub(
-	input.authz.credentials,
-	data.entroq.idp.jwks_url,
-	data.entroq.idp.audience,
-	data.entroq.idp.issuer,
-) if {
+name := jwt.verified_sub(input.authz.credentials, data.entroq.idp) if {
 	input.authz.type == "Bearer"
 }

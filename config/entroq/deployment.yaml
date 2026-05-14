@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: entroq
+  namespace: entroq-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: entroq
+  template:
+    metadata:
+      labels:
+        app: entroq
+    spec:
+      serviceAccountName: entroq
+      containers:
+      - name: entroq
+        image: eqmem:dev
+        imagePullPolicy: Never
+        args:
+        - serve
+        - --authz=opahttp
+        - --opa_url=http://localhost:8181
+        ports:
+        - containerPort: 37706
+          name: grpc
+        readinessProbe:
+          tcpSocket:
+            port: 37706
+          initialDelaySeconds: 5
+          periodSeconds: 5
+
+      - name: opa
+        image: openpolicyagent/opa:latest
+        args:
+        - run
+        - --server
+        - --addr=0.0.0.0:8181
+        - /rego/core-entroq-authz.rego
+        - /rego/core-entroq-jwt.rego
+        - /rego/core-entroq-namespaces.rego
+        - /rego/core-entroq-queues.rego
+        - /rego/k8s-entroq-permissions.rego
+        - /rego/k8s-entroq-user.rego
+        - /data/data.json
+        ports:
+        - containerPort: 8181
+          name: http
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8181
+          initialDelaySeconds: 3
+          periodSeconds: 5
+        volumeMounts:
+        - name: opa-rego
+          mountPath: /rego
+          readOnly: true
+        - name: opa-data
+          mountPath: /data
+          readOnly: true
+
+      volumes:
+      - name: opa-rego
+        configMap:
+          name: opa-rego
+      - name: opa-data
+        configMap:
+          name: opa-data
