@@ -93,6 +93,82 @@ go run ./cmd/eqc --svcaddr localhost:37706 \
   ins -q /payments/svc-b/inbox '{}'
 ```
 
+## Storage Backends
+
+### memory (default)
+
+No external dependencies. Data is lost on pod restart. Good for development
+and stateless workloads.
+
+```bash
+helm install entroq ./charts/entroq
+```
+
+### journal (durable in-process)
+
+Persists tasks to a WAL journal on a PersistentVolumeClaim. Uses a
+StatefulSet. No external database required.
+
+```bash
+helm install entroq ./charts/entroq \
+  --set entroq.backend.type=journal \
+  --set entroq.storage.size=10Gi
+```
+
+### postgres
+
+Requires a PostgreSQL instance already running and reachable from the cluster.
+This chart does not provision PostgreSQL — deploy it separately using the
+[Bitnami chart](https://github.com/bitnami/charts/tree/main/bitnami/postgresql),
+[CloudNativePG](https://cloudnative-pg.io/), or your own installation.
+
+**Development** (password stored in Helm release history — not for production):
+```bash
+helm install entroq ./charts/entroq \
+  --set entroq.backend.type=postgres \
+  --set entroq.postgres.addr=postgres:5432 \
+  --set entroq.postgres.database=entroq \
+  --set entroq.postgres.user=entroq \
+  --set entroq.postgres.password=mypassword
+```
+
+**Production** — create the Secret before installing the chart, then point
+the chart at it. The password never enters Helm's release history:
+```bash
+# 1. Create the secret (do this once, independently of Helm)
+kubectl create secret generic entroq-pg-credentials \
+  --from-literal=password=mypassword \
+  -n entroq-system
+
+# 2. Install the chart, referencing the existing secret
+helm install entroq ./charts/entroq \
+  --set entroq.backend.type=postgres \
+  --set entroq.postgres.addr=postgres:5432 \
+  --set entroq.postgres.database=entroq \
+  --set entroq.postgres.user=entroq \
+  --set entroq.postgres.existingSecret=entroq-pg-credentials
+```
+
+The chart skips creating a Secret when `existingSecret` is set, and mounts
+the password as the `PGPASSWORD` environment variable instead of passing it
+as a CLI argument (which would be visible in `ps` output).
+
+### redis (experimental)
+
+Requires a Redis instance already running and reachable from the cluster.
+This chart does not provision Redis. Same secret pattern as postgres. Use `entroq.redis.existingSecret` in production:
+
+```bash
+kubectl create secret generic entroq-redis-credentials \
+  --from-literal=password=mypassword \
+  -n entroq-system
+
+helm install entroq ./charts/entroq \
+  --set entroq.backend.type=redis \
+  --set entroq.redis.addr=redis:6379 \
+  --set entroq.redis.existingSecret=entroq-redis-credentials
+```
+
 ## Configuration
 
 Key values — override with `--set key=value` or `-f my-values.yaml`:
