@@ -7,9 +7,10 @@
 #   {
 #     "entroq": {
 #       "k8s": {
-#         "jwks_url": "https://kubernetes.default.svc/openid/v1/jwks",
-#         "audience": "https://kubernetes.default.svc.cluster.local",
-#         "issuer":   "https://kubernetes.default.svc.cluster.local"
+#         "jwks_url":     "https://kubernetes.default.svc/openid/v1/jwks",
+#         "audience":     "https://kubernetes.default.svc.cluster.local",
+#         "issuer":       "https://kubernetes.default.svc.cluster.local",
+#         "ca_cert_file": "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 #       }
 #     }
 #   }
@@ -22,11 +23,6 @@ import rego.v1
 
 import data.entroq.jwt
 
-name := jwt.verified_sub(
-	input.authz.credentials,
-	data.entroq.k8s.jwks_url,
-	data.entroq.k8s.audience,
-	data.entroq.k8s.issuer,
-) if {
+name := jwt.verified_sub(input.authz.credentials, data.entroq.k8s) if {
 	input.authz.type == "Bearer"
 }

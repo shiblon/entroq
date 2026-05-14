@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: entroq
+  namespace: entroq-system
+spec:
+  selector:
+    app: entroq
+  ports:
+  - name: grpc
+    port: 37706
+    targetPort: 37706
+    protocol: TCP
+  - name: opa
+    port: 8181
+    targetPort: 8181
+    protocol: TCP
