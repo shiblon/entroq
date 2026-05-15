@@ -3,6 +3,7 @@ package async_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -61,7 +62,7 @@ func TestSidecarE2E(t *testing.T) {
 		suffix    = ".test"
 	)
 
-	stopSvc := mustStartReceivers(ctx, t, eq, namespace+"/"+svc, upstream.URL, 2)
+	stopSvc := mustStartReceivers(ctx, t, eq, "/"+namespace+"/"+svc, upstream.URL, 2)
 	defer stopSvc()
 
 	sender := async.NewSender(eq, "",
@@ -282,6 +283,59 @@ func TestSidecarE2E(t *testing.T) {
 	}
 }
 
+// TestSidecarContentLength verifies that Content-Length set by the upstream
+// is stripped from forwarded response headers and the body arrives intact.
+// This is a regression test: blindly forwarding Content-Length while the body
+// passes through JSON encoding caused an IncompleteRead on the receiving side.
+func TestSidecarContentLength(t *testing.T) {
+	const payload = `{"hello":"world","value":42}`
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := []byte(payload)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+		w.WriteHeader(http.StatusOK)
+		w.Write(body) //nolint:errcheck
+	}))
+	defer upstream.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	eq, stopEQ := mustStartEntroQ(ctx, t, eqmem.Opener())
+	defer stopEQ()
+
+	stop := mustStartReceivers(ctx, t, eq, "/test/svc", upstream.URL, 1)
+	defer stop()
+
+	sender := async.NewSender(eq, "", async.WithSenderDomainSuffix(".local"), async.WithSenderNamespace("test"))
+
+	req := httptest.NewRequest(http.MethodGet, "http://svc.local/data", nil).WithContext(ctx)
+	w := httptest.NewRecorder()
+	sender.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body)
+	}
+	if cl := w.Header().Get("Content-Length"); cl != "" {
+		t.Errorf("Content-Length should be stripped from forwarded response, got %q", cl)
+	}
+	// Compare as parsed JSON -- whitespace may differ after the round-trip but
+	// the value must be structurally identical and complete (no IncompleteRead).
+	var got, want any
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("response body not valid JSON: %v (body: %q)", err, w.Body)
+	}
+	if err := json.Unmarshal([]byte(payload), &want); err != nil {
+		t.Fatalf("payload not valid JSON: %v", err)
+	}
+	gotBytes, _ := json.Marshal(got)
+	wantBytes, _ := json.Marshal(want)
+	if string(gotBytes) != string(wantBytes) {
+		t.Errorf("body mismatch: got %s, want %s", gotBytes, wantBytes)
+	}
+}
+
 // TestSidecarNamespaceRouting verifies that multi-label hosts produce the
 // correct queue prefix, routing requests to the right inbox.
 func TestSidecarNamespaceRouting(t *testing.T) {
@@ -294,9 +348,9 @@ func TestSidecarNamespaceRouting(t *testing.T) {
 	eq, stopEQ := mustStartEntroQ(ctx, t, eqmem.Opener())
 	defer stopEQ()
 
-	stopA := mustStartReceivers(ctx, t, eq, "ns1/alpha", upstream.URL, 1)
+	stopA := mustStartReceivers(ctx, t, eq, "/ns1/alpha", upstream.URL, 1)
 	defer stopA()
-	stopB := mustStartReceivers(ctx, t, eq, "ns2/beta", upstream.URL, 1)
+	stopB := mustStartReceivers(ctx, t, eq, "/ns2/beta", upstream.URL, 1)
 	defer stopB()
 
 	sender := async.NewSender(eq, "", async.WithSenderDomainSuffix(".local"))

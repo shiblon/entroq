@@ -5,10 +5,13 @@ import (
 	"net/http"
 )
 
-// hopByHop lists headers that are meaningful only for a single TCP hop and
-// must not be forwarded by a proxy to the next hop.
+// hopByHop lists headers that must not be forwarded by a proxy.
+// Content-Length is included because the proxy recalculates it from the
+// actual body written; forwarding the upstream value causes mismatches when
+// the body passes through JSON encoding.
 var hopByHop = map[string]bool{
 	"Connection":          true,
+	"Content-Length":      true,
 	"Keep-Alive":          true,
 	"Proxy-Authenticate":  true,
 	"Proxy-Authorization": true,

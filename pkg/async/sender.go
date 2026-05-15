@@ -328,6 +328,7 @@ func (s *Sender) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if _, err := s.eq.Modify(ctx,
 		entroq.InsertingInto(targetInbox, entroq.WithRawValue(envValue)),
 	); err != nil {
+		log.Printf("sender enqueue to %s: %v", targetInbox, err)
 		http.Error(w, fmt.Sprintf("enqueue task: %v", err), http.StatusBadGateway)
 		return
 	}
@@ -348,7 +349,7 @@ func (s *Sender) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	task, err := s.eq.Claim(claimCtx, entroq.From(responseQueue))
 	if err != nil {
-		log.Printf("sender await response on %s: %v", responseQueue, err)
+		log.Printf("sender await response on %s (timeout=%v): %v", responseQueue, s.requestTimeout, err)
 		http.Error(w, fmt.Sprintf("await response: %v", err), http.StatusGatewayTimeout)
 		return
 	}
@@ -389,13 +390,14 @@ func (s *Sender) deleteTask(ctx context.Context, task *entroq.Task) {
 // queueFromHost derives a queue prefix from an HTTP Host header value.
 // It strips the port, then the configured domain suffix, and maps the remaining
 // dot-separated labels left-to-right to a slash-separated queue path.
+// The result always starts with "/" to match EntroQ queue naming conventions.
 //
 // If only one label remains after suffix stripping and namespace is non-empty,
 // the namespace is prepended:
 //
-//	"bar.localhost"          suffix=".localhost" ns="payments" -> "payments/bar"
-//	"payments.bar.localhost" suffix=".localhost" ns="payments" -> "payments/bar"
-//	"bar.localhost"          suffix=".localhost" ns=""         -> "bar"
+//	"bar.localhost"          suffix=".localhost" ns="payments" -> "/payments/bar"
+//	"payments.bar.localhost" suffix=".localhost" ns="payments" -> "/payments/bar"
+//	"bar.localhost"          suffix=".localhost" ns=""         -> "/bar"
 func queueFromHost(host, domainSuffix, namespace string) (string, error) {
 	h := host
 	if i := strings.LastIndex(h, ":"); i >= 0 {
@@ -412,5 +414,5 @@ func queueFromHost(host, domainSuffix, namespace string) (string, error) {
 	if len(parts) == 1 && namespace != "" {
 		parts = append([]string{namespace}, parts...)
 	}
-	return strings.Join(parts, "/"), nil
+	return "/" + strings.Join(parts, "/"), nil
 }

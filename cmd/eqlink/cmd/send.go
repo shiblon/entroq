@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/async"
@@ -50,7 +51,7 @@ Use "eqlink run" to start the full sidecar (sender + receiver + GC).`,
 func init() {
 	flags := sendCmd.Flags()
 	flags.StringVar(&senderAddr, "addr", ":8080", "Address to listen on.")
-	flags.DurationVar(&requestTimeout, "request_timeout", 0, "Request timeout (0 uses package default of 30s).")
+	flags.DurationVar(&requestTimeout, "request_timeout", 30*time.Second, "How long the sender waits for a response task before returning 504.")
 	flags.StringVar(&domainSuffix, "domain-suffix", ".localhost", "Domain suffix stripped from Host header to derive the target service.")
 	flags.StringVar(&namespace, "namespace", "", "Default namespace prepended to single-label targets.")
 	rootCmd.AddCommand(sendCmd)

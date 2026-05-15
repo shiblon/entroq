@@ -67,4 +67,18 @@ caller_satisfies(labels, matchers) if {
 	}
 }
 
+# Response queue grant: any caller permitted on X/inbox may also access
+# X/response/ to claim replies. Response queues are ephemeral per-request
+# queues with random nonces; prefix access is required.
+allowed_queues contains {"prefix": response_prefix, "actions": ["ALL"]} if {
+	data.mesh.initialized
+	identity
+	some policy in data.mesh.queues
+	caller_satisfies(identity.labels, policy.allowedCallers)
+	policy.matchType == "Exact"
+	endswith(policy.pattern, "/inbox")
+	base := substring(policy.pattern, 0, count(policy.pattern) - count("inbox"))
+	response_prefix := concat("", [base, "response/"])
+}
+
 allowed_namespaces := set()
