@@ -375,7 +375,7 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 		// Check whether the parent context was canceled.
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("grpc claim: %w", ctx.Err())
+			return nil, fmt.Errorf("grpc claim caller: %w", ctx.Err())
 		default:
 		}
 		ctx, cancel := context.WithTimeout(ctx, ClaimRetryInterval)
@@ -387,14 +387,14 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 		})
 		cancel() // cleanup just in case.
 		if err != nil {
-			if entroq.IsTimeout(err) {
+			if entroq.IsTimeout(err) || isGRPCTimeout(err) {
 				// If we just timed out on our little request context, then
 				// we can go around again.
 				// It's possible that the *parent* context timed out, which
 				// is why we check that at the beginning of the loop, as well.
 				continue
 			}
-			return nil, fmt.Errorf("grpc claim: %w", unpackGRPCError(err))
+			return nil, fmt.Errorf("grpc claim response: %w", unpackGRPCError(err))
 		}
 		if resp.Task == nil {
 			return nil, fmt.Errorf("no task returned from backend Claim")
@@ -404,7 +404,7 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 }
 
 // TryClaim attempts to claim a task from the queue. Normally returns both a
-// nil task and error if nothing is ready.
+// nil task and nil error if nothing is ready.
 func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
 	resp, err := pb.NewEntroQClient(b.conn).TryClaim(ctx, &pb.ClaimRequest{
 		ClaimantId: cq.Claimant,
@@ -508,6 +508,17 @@ func depErrorFromStat(stat *status.Status) error {
 		}
 	}
 	return depErr
+}
+
+func isGRPCTimeout(grpcErr error) bool {
+	if grpcErr == nil {
+		return false
+	}
+	stat, ok := status.FromError(grpcErr)
+	if !ok {
+		return false
+	}
+	return stat.Code() == codes.DeadlineExceeded
 }
 
 func unpackGRPCError(grpcErr error) error {
