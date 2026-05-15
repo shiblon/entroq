@@ -25,15 +25,16 @@ import (
 )
 
 var (
-	myQueue        string
-	senderAddr     string
-	upstream       string
-	concurrency    int
-	requestTimeout time.Duration
-	drainTimeout   time.Duration
-	domainSuffix   string
-	namespace      string
-	auditLog       bool
+	myQueue             string
+	senderAddr          string
+	upstream            string
+	concurrency         int
+	requestTimeout      time.Duration
+	drainTimeout        time.Duration
+	domainSuffix        string
+	namespace           string
+	auditLog            bool
+	tokenReloadInterval time.Duration
 )
 
 var runCmd = &cobra.Command{
@@ -142,19 +143,43 @@ Graceful shutdown on SIGINT/SIGTERM:
 			)
 		})
 
-		// SIGHUP handler: reload the token file without restarting.
+		// Token reload: periodically stat the token file and reload on mtime
+		// change. k8s projected tokens are rotated by the kubelet (typically
+		// at 80% of the 1h TTL) by updating the file; SIGHUP is also accepted
+		// for manual/scripted reloads.
 		hupCtx, hupCancel := context.WithCancel(gCtx)
 		if creds != nil {
 			g.Go(func() error {
+				info, _ := os.Stat(authzTokenFile)
+				var lastMtime time.Time
+				if info != nil {
+					lastMtime = info.ModTime()
+				}
+				ticker := time.NewTicker(tokenReloadInterval)
+				defer ticker.Stop()
 				for {
 					select {
 					case <-hupCtx.Done():
 						return nil
 					case <-hupsigs:
 						if err := creds.reload(); err != nil {
-							log.Printf("token reload: %v", err)
+							log.Printf("token reload (SIGHUP): %v", err)
 						} else {
-							log.Printf("token reloaded from %s", authzTokenFile)
+							log.Printf("token reloaded (SIGHUP) from %s", authzTokenFile)
+						}
+					case <-ticker.C:
+						fi, err := os.Stat(authzTokenFile)
+						if err != nil {
+							log.Printf("token stat %s: %v", authzTokenFile, err)
+							continue
+						}
+						if fi.ModTime().After(lastMtime) {
+							lastMtime = fi.ModTime()
+							if err := creds.reload(); err != nil {
+								log.Printf("token reload (stat): %v", err)
+							} else {
+								log.Printf("token reloaded (stat) from %s", authzTokenFile)
+							}
 						}
 					}
 				}
@@ -205,6 +230,7 @@ func init() {
 	flags.DurationVar(&gcInterval, "gc_interval", 10*time.Minute, "How often to run the GC scan.")
 	flags.DurationVar(&gcGrace, "gc_grace", 15*time.Second, "Extra time after expiry before GC deletes a response queue.")
 	flags.BoolVar(&auditLog, "audit-log", false, "Emit structured JSON audit events to stderr for every request mediated (request_enqueued, request_handled, response_received).")
+	flags.DurationVar(&tokenReloadInterval, "token-reload-interval", 5*time.Minute, "How often to stat the --authz-token-file and reload it if changed. Handles k8s projected token rotation.")
 	runCmd.MarkFlagRequired("queue")
 
 	rootCmd.AddCommand(runCmd)
