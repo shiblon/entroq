@@ -37,7 +37,7 @@ spec:
         - name: SVC_B
           value: "http://svc-b.localhost:8080"
       - name: eqlink
-        image: eqlink:dev
+        image: entroq-link:dev
         imagePullPolicy: IfNotPresent
         args:
         - run

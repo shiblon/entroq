@@ -43,7 +43,7 @@ eval $(minikube docker-env)
 docker build -t greetings-svc-a:dev examples/greetings-demo/svc-a
 docker build -t greetings-svc-b:dev examples/greetings-demo/svc-b
 docker build -t greetings-svc-c:dev examples/greetings-demo/svc-c
-docker build -t eqlink:dev          -f cmd/eqlink/Dockerfile .
+docker build -t entroq-link:dev          -f cmd/eqlink/Dockerfile .
 ```
 
 ## Deploy

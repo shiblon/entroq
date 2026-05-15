@@ -27,8 +27,8 @@ Point your shell's Docker CLI at Minikube so images land where k8s can find them
 
 ```bash
 eval $(minikube docker-env)
-docker build -t eqmem:dev          -f cmd/eqmem/Dockerfile .
-docker build -t eqk8s-operator:dev -f cmd/eqk8s/Dockerfile .
+docker build -t entroq-mem:dev      -f cmd/eqmem/Dockerfile .
+docker build -t entroq-operator:dev -f cmd/eqk8s/Dockerfile .
 ```
 
 Repeat this after any source change. Images are built directly into
@@ -40,12 +40,17 @@ are required — `IfNotPresent` (the chart default) finds them immediately.
 ```bash
 make helm-sync   # copies Rego files + CRDs into the chart (incremental)
 helm install entroq ./charts/entroq \
-  --set oidcDiscovery.grantAnonymous=true
+  --set oidcDiscovery.grantAnonymous=true \
+  --set entroq.images.mem.tag=dev \
+  --set operator.image.tag=dev
 ```
 
 The `oidcDiscovery.grantAnonymous=true` flag grants anonymous read access
 to the k8s OIDC JWKS endpoint. Minikube denies this by default; most
 managed clusters (GKE, EKS, AKS) already allow it.
+
+The `*.tag=dev` overrides tell the chart to use the locally built `dev`-tagged
+images instead of the release tag. Omit them when installing a released chart.
 
 ### 4. Verify the stack
 
@@ -197,11 +202,11 @@ cd cmd/eqk8s && make manifests && cd ../..
 
 # Rebuild operator image
 eval $(minikube docker-env)
-docker build -t eqk8s-operator:dev -f cmd/eqk8s/Dockerfile .
+docker build -t entroq-operator:dev -f cmd/eqk8s/Dockerfile .
 
 # Sync chart and upgrade
 make helm-sync
-helm upgrade entroq ./charts/entroq --set oidcDiscovery.grantAnonymous=true
+helm upgrade entroq ./charts/entroq --set oidcDiscovery.grantAnonymous=true --set entroq.images.mem.tag=dev --set operator.image.tag=dev
 
 # Bounce the operator pod to pick up the new image
 kubectl rollout restart deployment -n eqk8s-system eqk8s-controller-manager
@@ -211,7 +216,7 @@ After changing Rego files only (no image rebuild needed):
 
 ```bash
 make helm-sync
-helm upgrade entroq ./charts/entroq --set oidcDiscovery.grantAnonymous=true
+helm upgrade entroq ./charts/entroq --set oidcDiscovery.grantAnonymous=true --set entroq.images.mem.tag=dev --set operator.image.tag=dev
 kubectl rollout restart deployment -n entroq-system entroq
 ```
 
