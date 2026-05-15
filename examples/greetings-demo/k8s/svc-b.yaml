@@ -1,0 +1,47 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: svc-b
+  namespace: greetings
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: svc-b
+  namespace: greetings
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: svc-b
+  template:
+    metadata:
+      labels:
+        app: svc-b
+    spec:
+      serviceAccountName: svc-b
+      # svc-c.localhost -> 127.0.0.1 so outbound calls reach the eqlink sender.
+      hostAliases:
+      - ip: "127.0.0.1"
+        hostnames:
+        - svc-c.localhost
+      containers:
+      - name: app
+        image: greetings-svc-b:dev
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+        env:
+        # eqlink sender listens on :8080. svc-c.localhost resolves to 127.0.0.1
+        # via hostAliases below, so this call travels through the queue mesh.
+        - name: SVC_C
+          value: "http://svc-c.localhost:8080"
+      - name: eqlink
+        image: eqlink:dev
+        imagePullPolicy: IfNotPresent
+        args:
+        - run
+        - --entroq=entroq.entroq-system.svc.cluster.local:37706
+        - --queue=/greetings/svc-b
+        - --namespace=greetings
+        - --authz-token-file=/var/run/secrets/kubernetes.io/serviceaccount/token

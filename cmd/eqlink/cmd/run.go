@@ -77,7 +77,11 @@ Graceful shutdown on SIGINT/SIGTERM:
 				grpc.WithPerRPCCredentials(creds),
 			))
 		}
-		eq, err := entroq.New(ctx, eqgrpc.Opener(entroqAddr, grpcOpts...))
+		var eqOpts []entroq.Option
+		if creds != nil {
+			eqOpts = append(eqOpts, entroq.WithClaimantID(creds.claimant))
+		}
+		eq, err := entroq.New(ctx, eqgrpc.Opener(entroqAddr, grpcOpts...), eqOpts...)
 		if err != nil {
 			return err
 		}
@@ -98,7 +102,7 @@ Graceful shutdown on SIGINT/SIGTERM:
 			async.WithSenderAuditLogger(alog),
 		)
 
-		g, _ := errgroup.WithContext(ctx)
+		g, gCtx := errgroup.WithContext(ctx)
 
 		g.Go(func() error {
 			return sender.Run(ctx)
@@ -118,7 +122,7 @@ Graceful shutdown on SIGINT/SIGTERM:
 			}))
 		}
 
-		rcvCtx, rcvCancel := context.WithCancel(ctx)
+		rcvCtx, rcvCancel := context.WithCancel(gCtx)
 		defer rcvCancel()
 		recvWorker := worker.New(eq,
 			worker.WithDoModify(async.ReceiverHandler(upstream, rcvOpts...)),
@@ -129,7 +133,7 @@ Graceful shutdown on SIGINT/SIGTERM:
 			})
 		}
 
-		gcCtx, gcCancel := context.WithCancel(ctx)
+		gcCtx, gcCancel := context.WithCancel(gCtx)
 		defer gcCancel()
 		g.Go(func() error {
 			return async.RunGCLoop(gcCtx, eq, myQueue,
@@ -139,11 +143,12 @@ Graceful shutdown on SIGINT/SIGTERM:
 		})
 
 		// SIGHUP handler: reload the token file without restarting.
+		hupCtx, hupCancel := context.WithCancel(gCtx)
 		if creds != nil {
 			g.Go(func() error {
 				for {
 					select {
-					case <-ctx.Done():
+					case <-hupCtx.Done():
 						return nil
 					case <-hupsigs:
 						if err := creds.reload(); err != nil {
@@ -156,11 +161,13 @@ Graceful shutdown on SIGINT/SIGTERM:
 			})
 		}
 
-		// Signal handler: staged shutdown.
+		// Signal handler: staged shutdown. Also fires when any goroutine fails
+		// (gCtx cancelled), ensuring the sender and GC are always cleaned up.
 		g.Go(func() error {
+			defer gcCancel()
+			defer hupCancel()
 			select {
-			case <-ctx.Done():
-				return nil
+			case <-gCtx.Done():
 			case sig := <-sigs:
 				log.Printf("received %v: stopping receivers", sig)
 			}
@@ -168,17 +175,16 @@ Graceful shutdown on SIGINT/SIGTERM:
 			rcvCancel()
 			log.Printf("receivers stopped")
 
-			// Stage 2: drain and close the sender. srv.Shutdown waits for
-			// active HTTP handlers to return, which includes the full
-			// EntroQ round-trip for each in-flight request.
+			// Drain and close the sender. srv.Shutdown waits for active HTTP
+			// handlers to return, including the full EntroQ round-trip.
+			// Use a fresh context -- gCtx may already be cancelled here.
 			log.Printf("draining sender (timeout: %v)...", drainTimeout)
-			drainCtx, cancel := context.WithTimeout(ctx, drainTimeout)
+			drainCtx, cancel := context.WithTimeout(context.Background(), drainTimeout)
 			defer cancel()
 			if err := sender.Close(drainCtx); err != nil {
 				log.Printf("sender close: %v", err)
 			}
 
-			gcCancel()
 			return nil
 		})
 
@@ -216,8 +222,9 @@ func newAuditLogger() *slog.Logger {
 // tokenFileCreds implements grpc.PerRPCCredentials with an in-memory token
 // that is loaded once at startup and reloaded on SIGHUP.
 type tokenFileCreds struct {
-	path  string
-	token atomic.Pointer[string]
+	path     string
+	claimant string // sub#nonce, computed once at startup
+	token    atomic.Pointer[string]
 }
 
 // newTokenFileCreds loads the token immediately; returns an error if the file
@@ -227,6 +234,7 @@ func newTokenFileCreds(path string) (*tokenFileCreds, error) {
 	if err := c.reload(); err != nil {
 		return nil, err
 	}
+	c.claimant = entroq.MustClaimantFromSub(*c.token.Load())
 	return c, nil
 }
 

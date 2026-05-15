@@ -69,8 +69,18 @@ const (
 )
 
 type backendOptions struct {
-	dialOpts    []grpc.DialOption
-	bearerToken string
+	dialOpts           []grpc.DialOption
+	bearerToken        string
+	claimRetryInterval time.Duration
+}
+
+// WithClaimRetryInterval overrides how long the gRPC client holds a single
+// Claim RPC open before dropping it and retrying. Defaults to ClaimRetryInterval.
+// Primarily useful in tests where 2 minutes is impractical.
+func WithClaimRetryInterval(d time.Duration) Option {
+	return func(opts *backendOptions) {
+		opts.claimRetryInterval = d
+	}
 }
 
 // Option allows grpc-opener-specific options to be sent in Opener.
@@ -180,7 +190,8 @@ func Opener(addr string, opts ...Option) entroq.BackendOpener {
 }
 
 type backend struct {
-	conn *grpc.ClientConn
+	conn               *grpc.ClientConn
+	claimRetryInterval time.Duration
 }
 
 // New creates a new gRPC backend that attaches to the task service via gRPC.
@@ -189,7 +200,11 @@ func New(conn *grpc.ClientConn, opts ...Option) (*backend, error) {
 	for _, opt := range opts {
 		opt(options)
 	}
-	return &backend{conn}, nil
+	interval := options.claimRetryInterval
+	if interval <= 0 {
+		interval = ClaimRetryInterval
+	}
+	return &backend{conn: conn, claimRetryInterval: interval}, nil
 }
 
 // Close closes the underlying connection to the gRPC task service.
@@ -378,7 +393,7 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 			return nil, fmt.Errorf("grpc claim caller: %w", ctx.Err())
 		default:
 		}
-		ctx, cancel := context.WithTimeout(ctx, ClaimRetryInterval)
+		ctx, cancel := context.WithTimeout(ctx, b.claimRetryInterval)
 		resp, err := pb.NewEntroQClient(b.conn).Claim(ctx, &pb.ClaimRequest{
 			ClaimantId: cq.Claimant,
 			Queues:     cq.Queues,
