@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -19,6 +21,7 @@ import (
 	"github.com/shiblon/entroq/pkg/worker"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc"
 )
 
 var (
@@ -53,13 +56,28 @@ Graceful shutdown on SIGINT/SIGTERM:
 		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 		defer signal.Stop(sigs)
 
+		hupsigs := make(chan os.Signal, 1)
+		signal.Notify(hupsigs, syscall.SIGHUP)
+		defer signal.Stop(hupsigs)
+
 		_, stopMetrics, err := setupMetrics(ctx)
 		if err != nil {
 			return fmt.Errorf("metrics: %w", err)
 		}
 		defer stopMetrics()
 
-		eq, err := entroq.New(ctx, eqgrpc.Opener(entroqAddr, eqgrpc.WithInsecure()))
+		grpcOpts := []eqgrpc.Option{eqgrpc.WithInsecure()}
+		var creds *tokenFileCreds
+		if authzTokenFile != "" {
+			creds, err = newTokenFileCreds(authzTokenFile)
+			if err != nil {
+				return err
+			}
+			grpcOpts = append(grpcOpts, eqgrpc.WithDialOpts(
+				grpc.WithPerRPCCredentials(creds),
+			))
+		}
+		eq, err := entroq.New(ctx, eqgrpc.Opener(entroqAddr, grpcOpts...))
 		if err != nil {
 			return err
 		}
@@ -120,6 +138,24 @@ Graceful shutdown on SIGINT/SIGTERM:
 			)
 		})
 
+		// SIGHUP handler: reload the token file without restarting.
+		if creds != nil {
+			g.Go(func() error {
+				for {
+					select {
+					case <-ctx.Done():
+						return nil
+					case <-hupsigs:
+						if err := creds.reload(); err != nil {
+							log.Printf("token reload: %v", err)
+						} else {
+							log.Printf("token reloaded from %s", authzTokenFile)
+						}
+					}
+				}
+			})
+		}
+
 		// Signal handler: staged shutdown.
 		g.Go(func() error {
 			select {
@@ -175,5 +211,40 @@ func newAuditLogger() *slog.Logger {
 		return nil
 	}
 	return slog.New(slog.NewJSONHandler(os.Stderr, nil))
+}
+
+// tokenFileCreds implements grpc.PerRPCCredentials with an in-memory token
+// that is loaded once at startup and reloaded on SIGHUP.
+type tokenFileCreds struct {
+	path  string
+	token atomic.Pointer[string]
+}
+
+// newTokenFileCreds loads the token immediately; returns an error if the file
+// cannot be read.
+func newTokenFileCreds(path string) (*tokenFileCreds, error) {
+	c := &tokenFileCreds{path: path}
+	if err := c.reload(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+func (c *tokenFileCreds) reload() error {
+	data, err := os.ReadFile(c.path)
+	if err != nil {
+		return fmt.Errorf("bearer token file %q: %w", c.path, err)
+	}
+	tok := strings.TrimSpace(string(data))
+	c.token.Store(&tok)
+	return nil
+}
+
+func (c *tokenFileCreds) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
+	return map[string]string{"authorization": "Bearer " + *c.token.Load()}, nil
+}
+
+func (*tokenFileCreds) RequireTransportSecurity() bool {
+	return false
 }
 

@@ -140,7 +140,9 @@ func (c *BearerCredentials) GetRequestMetadata(ctx context.Context, uri ...strin
 }
 
 // RequireTransportSecurity is always false, tread carefully! If not on localhost, ensure security is on.
-func (*BearerCredentials) RequireTransportSecurity() bool { return false }
+func (*BearerCredentials) RequireTransportSecurity() bool {
+	return false
+}
 
 // Opener creates an opener function to be used to get a gRPC backend. If the
 // address string is empty, it defaults to the DefaultAddr, the default value
@@ -154,8 +156,7 @@ func Opener(addr string, opts ...Option) entroq.BackendOpener {
 		opt(options)
 	}
 
-	switch {
-	case options.bearerToken != "":
+	if options.bearerToken != "" {
 		options.dialOpts = append(options.dialOpts, grpc.WithPerRPCCredentials(
 			NewBearerCredentials(options.bearerToken),
 		))
