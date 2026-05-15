@@ -27,7 +27,7 @@ spec:
         ports:
         - containerPort: 8000
       - name: eqlink
-        image: eqlink:dev
+        image: entroq-link:dev
         imagePullPolicy: IfNotPresent
         args:
         - run
