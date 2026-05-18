@@ -1,0 +1,17 @@
+{{- if .Values.entroq.enabled }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: entroq-system
+  labels:
+    {{- include "entroq.labels" . | nindent 4 }}
+{{- end }}
+---
+{{- if .Values.operator.enabled }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: eqk8s-system
+  labels:
+    {{- include "entroq.labels" . | nindent 4 }}
+{{- end }}

@@ -84,7 +84,7 @@ func mustStartReceivers(ctx context.Context, t testing.TB, eq *entroq.EntroQ, qu
 
 	g, gctx := errgroup.WithContext(ctx)
 	for range concurrency {
-		g.Go(func() error { return recvWorker.Run(gctx, worker.Watching(queue)) })
+		g.Go(func() error { return recvWorker.Run(gctx, worker.Watching(queue+"/inbox")) })
 	}
 
 	return func() {
@@ -106,9 +106,6 @@ func BenchmarkSidecar(b *testing.B) {
 			eq, stopEQ := mustStartEntroQ(ctx, b, eqmem.Opener())
 			defer stopEQ()
 
-			// Queue name has no leading slash: parsePath extracts the first
-			// path segment as the target queue, so it must match the queue
-			// receivers claim from.
 			queue := fmt.Sprintf("bench-c%d", n)
 			stopReceivers := mustStartReceivers(ctx, b, eq, queue, upstream.URL, n)
 			defer stopReceivers()
@@ -116,8 +113,8 @@ func BenchmarkSidecar(b *testing.B) {
 			// Drive the sender via ServeHTTP directly, bypassing TCP between
 			// the benchmark client and the sender. This isolates queue
 			// round-trip latency from TCP connection overhead.
-			sender := async.NewSender(eq, "", queue)
-			reqURL := fmt.Sprintf("http://bench/%s/ping", queue)
+			sender := async.NewSender(eq, "", async.WithSenderDomainSuffix(".test"))
+			reqURL := fmt.Sprintf("http://%s.test/ping", queue)
 
 			b.ResetTimer()
 			b.RunParallel(func(pb *testing.PB) {

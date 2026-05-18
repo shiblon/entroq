@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: svc-c
+  namespace: greetings
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: svc-c
+  namespace: greetings
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: svc-c
+  template:
+    metadata:
+      labels:
+        app: svc-c
+    spec:
+      serviceAccountName: svc-c
+      containers:
+      - name: app
+        image: greetings-svc-c:dev
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+      - name: eqlink
+        image: entroq-link:dev
+        imagePullPolicy: IfNotPresent
+        args:
+        - run
+        - --entroq=entroq.entroq-system.svc.cluster.local:37706
+        - --queue=/greetings/svc-c
+        - --namespace=greetings
+        - --authz-token-file=/var/run/secrets/kubernetes.io/serviceaccount/token

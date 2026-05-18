@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: entroq
+  namespace: entroq-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: entroq
+  template:
+    metadata:
+      labels:
+        app: entroq
+    spec:
+      serviceAccountName: entroq
+      containers:
+      - name: entroq
+        image: eqmem:dev
+        imagePullPolicy: Never
+        args:
+        - serve
+        - --authz=opahttp
+        - --opa_url=http://localhost:8181
+        ports:
+        - containerPort: 37706
+          name: grpc
+        readinessProbe:
+          tcpSocket:
+            port: 37706
+          initialDelaySeconds: 5
+          periodSeconds: 5
+
+      - name: opa
+        image: openpolicyagent/opa:1.16.2
+        args:
+        - run
+        - --server
+        - --addr=0.0.0.0:8181
+        # Uncomment to emit every auth decision as structured JSON to stdout.
+        # Useful for debugging allow/deny decisions; can be verbose in production.
+        # Route to your log aggregator (e.g. Loki via Promtail/Alloy).
+        #- --set=decision_logs.console=true
+        #
+        # Uncomment for verbose OPA internals (HTTP requests, rule evaluation).
+        # Reveals JWKS fetch failures and other low-level issues immediately.
+        #- --log-level=debug
+        - /rego/core-entroq-authz.rego
+        - /rego/core-entroq-jwt.rego
+        - /rego/core-entroq-namespaces.rego
+        - /rego/core-entroq-queues.rego
+        - /rego/k8s-entroq-permissions.rego
+        - /rego/k8s-entroq-user.rego
+        - /data/data.json
+        ports:
+        - containerPort: 8181
+          name: http
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8181
+          initialDelaySeconds: 3
+          periodSeconds: 5
+        volumeMounts:
+        - name: opa-rego
+          mountPath: /rego
+          readOnly: true
+        - name: opa-data
+          mountPath: /data
+          readOnly: true
+
+      volumes:
+      - name: opa-rego
+        configMap:
+          name: opa-rego
+      - name: opa-data
+        configMap:
+          name: opa-data

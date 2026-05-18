@@ -1,0 +1,22 @@
+resources:
+- config/entroq
+
+configMapGenerator:
+- name: opa-rego
+  namespace: entroq-system
+  options:
+    disableNameSuffixHash: true
+  files:
+  - pkg/authz/opadata/conf/core/entroq/authz/core-entroq-authz.rego
+  - pkg/authz/opadata/conf/core/entroq/jwt/core-entroq-jwt.rego
+  - pkg/authz/opadata/conf/core/entroq/namespaces/core-entroq-namespaces.rego
+  - pkg/authz/opadata/conf/core/entroq/queues/core-entroq-queues.rego
+  - pkg/authz/opadata/conf/providers/k8s/permissions/k8s-entroq-permissions.rego
+  - pkg/authz/opadata/conf/providers/k8s/user/k8s-entroq-user.rego
+
+- name: opa-data
+  namespace: entroq-system
+  options:
+    disableNameSuffixHash: true
+  files:
+  - config/entroq/opa-data/data.json

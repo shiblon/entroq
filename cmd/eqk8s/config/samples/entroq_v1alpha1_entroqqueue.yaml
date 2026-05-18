@@ -1,0 +1,15 @@
+apiVersion: entroq.entroq.io/v1alpha1
+kind: EntroQQueue
+metadata:
+  name: svc-b-inbox
+  namespace: default
+spec:
+  queues:
+  - pattern: /payments/svc-b/inbox
+    matchType: Exact
+    allowedCallers:
+    - labels:
+        group: frontend
+    - labels:
+        group: internal-tools
+        team: payments

@@ -1,0 +1,112 @@
+# Default values for the EntroQ mesh chart.
+# Override with: helm install entroq ./charts/entroq -f my-values.yaml
+# or:           helm install entroq ./charts/entroq --set key=value
+
+# -- Operator: watches EntroQQueue and EntroQIdentity CRDs, pushes OPA policy.
+operator:
+  enabled: true
+  image:
+    repository: entroq-operator
+    tag: ""            # defaults to .Chart.AppVersion
+    pullPolicy: IfNotPresent
+  opaUrl: "http://entroq.entroq-system.svc.cluster.local:8181"
+  resyncInterval: 5m
+  meshConfigMapNamespace: entroq-system
+  resources:
+    requests:
+      cpu: 10m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 128Mi
+
+# -- EntroQ server + OPA sidecar.
+entroq:
+  enabled: true
+
+  # Storage backend. One of:
+  #   memory    -- in-process only; data lost on restart (Deployment, no PVC)
+  #   journal   -- in-process with WAL journal; durable (StatefulSet + PVC)
+  #   postgres  -- PostgreSQL; configure entroq.postgres below
+  #   redis     -- Redis (experimental); configure entroq.redis below
+  backend:
+    type: memory
+
+  # Images for each backend. Tag defaults to .Chart.AppVersion when left blank.
+  images:
+    mem:       # used for memory and journal backends (same binary)
+      repository: entroq-mem
+      tag: ""
+    postgres:
+      repository: entroq-pg
+      tag: ""
+    redis:
+      repository: entroq-redis
+      tag: ""
+    pullPolicy: IfNotPresent
+
+  # Journal storage (backend.type=journal only).
+  storage:
+    size: 1Gi
+    storageClass: ""   # blank = cluster default StorageClass
+    mountPath: /data/entroq/journal
+
+  # PostgreSQL connection (backend.type=postgres only).
+  postgres:
+    addr: "postgres:5432"
+    database: entroq
+    user: entroq
+    password: ""          # chart creates a Secret from this value
+    existingSecret: ""    # use a pre-existing Secret instead (recommended for production)
+    initSchema: true      # idempotent; safe to leave enabled
+
+  # Redis connection (backend.type=redis, experimental).
+  redis:
+    addr: "redis:6379"
+    password: ""          # chart creates a Secret from this value
+    existingSecret: ""    # use a pre-existing Secret instead (recommended for production)
+    db: 0
+
+  # OPA sidecar.
+  opa:
+    image:
+      repository: openpolicyagent/opa
+      tag: "1.16.2"
+      pullPolicy: IfNotPresent
+    # decisionLogs: true   # emit structured auth decisions to stdout (verbose)
+    # debug: true          # debug-level OPA logging (reveals JWKS failures etc.)
+
+  # k8s OIDC settings for OPA JWT verification.
+  # Obtain cluster-specific values from:
+  #   kubectl get --raw /.well-known/openid-configuration
+  auth:
+    jwksUrl: "https://kubernetes.default.svc/openid/v1/jwks"
+    audience: "https://kubernetes.default.svc.cluster.local"
+    issuer:   "https://kubernetes.default.svc.cluster.local"
+    caFile:   "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+
+  service:
+    grpcPort: 37706
+    opaPort: 8181
+
+  resources:
+    entroq:
+      requests:
+        cpu: 10m
+        memory: 64Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+    opa:
+      requests:
+        cpu: 10m
+        memory: 64Mi
+      limits:
+        cpu: 250m
+        memory: 128Mi
+
+# -- OIDC discovery RBAC.
+# Set true on Minikube or clusters that restrict anonymous JWKS access.
+# Most managed clusters (GKE, EKS, AKS) already allow it.
+oidcDiscovery:
+  grantAnonymous: false

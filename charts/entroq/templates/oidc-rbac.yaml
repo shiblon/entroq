@@ -1,0 +1,20 @@
+{{- if .Values.oidcDiscovery.grantAnonymous }}
+# Grants anonymous read access to the k8s OIDC JWKS endpoint.
+# Required on Minikube and some hardened clusters where anonymous access is
+# disabled. On most managed clusters (GKE, EKS, AKS) this is already granted.
+# Enable with: --set oidcDiscovery.grantAnonymous=true
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: oidc-discovery-anonymous
+  labels:
+    {{- include "entroq.labels" . | nindent 4 }}
+subjects:
+- kind: Group
+  name: system:unauthenticated
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: system:service-account-issuer-discovery
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}

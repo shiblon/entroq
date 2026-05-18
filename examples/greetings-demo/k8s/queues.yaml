@@ -1,0 +1,20 @@
+apiVersion: entroq.entroq.io/v1alpha1
+kind: EntroQQueue
+metadata:
+  name: greetings-policy
+  namespace: greetings
+spec:
+  queues:
+  # svc-b's inbox: only svc-a (frontend) may call it
+  - pattern: /greetings/svc-b/inbox
+    matchType: Exact
+    allowedCallers:
+    - labels:
+        tier: frontend
+
+  # svc-c's inbox: only backend services may call it
+  - pattern: /greetings/svc-c/inbox
+    matchType: Exact
+    allowedCallers:
+    - labels:
+        tier: backend
