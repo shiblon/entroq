@@ -4,9 +4,23 @@ This document explains how EntroQ's authorization system works, how to configure
 it, and how to integrate it with real identity providers (Google, Auth0, Okta, etc.).
 
 **Scope:** This authorization layer applies only to the gRPC and HTTP/JSON
-(Connect) server endpoints (`eqpg serve`, `eqmemsvc`). It does not apply to
-direct backend connections (e.g. connecting a Go client directly to PostgreSQL).
-See Security Notes for details.
+(Connect) server endpoints (`eqpg serve`, `eqmem serve`, `eqredis serve`). It
+does not apply to direct backend connections (e.g. connecting a Go client
+directly to PostgreSQL). See Security Notes for details.
+
+## Two Provider Modes
+
+EntroQ ships two provider sets. Pick one based on your deployment:
+
+| Mode | Provider directory | When to use |
+|---|---|---|
+| **OIDC / standalone** | `conf/providers/entroq/` | Any deployment where clients authenticate with a JWT from an OIDC-compatible IDP (Google, Auth0, Okta, Azure AD, Keycloak, …) |
+| **Kubernetes mesh** | `conf/providers/k8s/` | Kubernetes deployments using the eqk8s operator and eqlink sidecars. Identity comes from pod service account tokens; permissions come from `EntroQQueue` and `EntroQIdentity` CRDs. |
+
+The core logic (`conf/core/`) is shared by both. Never modify it.
+
+The rest of this document covers the OIDC mode in full detail, then
+the Kubernetes mesh mode in its own section.
 
 ## Overview
 
@@ -480,6 +494,196 @@ users with the `"admin"` role, which bypasses the claimant check:
 | Unauthenticated | None -- any claimant ID accepted |
 | Authenticated, shared service account | Cross-identity spoofing blocked; within-identity accidents blocked by nonce; within-identity malice is a known gap |
 | Authenticated, per-workload identity (e.g. k8s workload identity) | Full isolation -- each workload has a distinct sub |
+
+
+## Kubernetes Mesh Provider
+
+In Kubernetes deployments using the eqk8s operator, authorization works
+differently from the OIDC path. Load `conf/providers/k8s/` instead of
+`conf/providers/entroq/`. The Helm chart handles this automatically.
+
+### Identity
+
+The k8s user provider (`conf/providers/k8s/user/`) extracts identity from
+Kubernetes service account tokens — the projected tokens that Kubernetes
+automatically mounts into every pod at
+`/var/run/secrets/kubernetes.io/serviceaccount/token`.
+
+The token's `sub` claim has the form:
+```
+system:serviceaccount:<namespace>:<service-account-name>
+```
+
+This becomes the caller's identity throughout the policy. The eqlink sidecar
+reads the pod's token and attaches it as `Authorization: Bearer <token>` on
+every queue operation.
+
+Unlike OIDC, k8s SA tokens are already validated by the Kubernetes API server,
+so `io.jwt.decode` is used rather than `io.jwt.decode_verify`.
+
+### Permissions
+
+The k8s permissions provider (`conf/providers/k8s/permissions/`) derives access
+from two sources:
+
+**1. Auto-grant (always on)**
+
+Every service account gets `ALL` access to its own queue prefix
+`/<namespace>/<name>/` with no configuration required. This covers the
+service's inbox, response queues, and GC prefix automatically.
+
+```
+system:serviceaccount:payments:svc-a  →  ALL on /payments/svc-a/
+```
+
+**2. Mesh grants (from CRDs)**
+
+The eqk8s operator watches `EntroQQueue` and `EntroQIdentity` CRDs across all
+namespaces and pushes a `data.mesh` document to OPA via the data API on every
+reconcile. The k8s permissions provider uses this document to resolve
+cross-service access.
+
+If `data.mesh.initialized` is false or absent (OPA just restarted, operator
+hasn't reconciled yet), mesh grants are suppressed. Auto-grants still fire, so
+a service can always reach its own queues; cross-service calls are denied until
+the mesh document arrives.
+
+**3. Response queue grant (automatic)**
+
+Any caller permitted on `X/inbox` also receives `ALL` on `X/response/`. Response
+queues are ephemeral per-request queues; callers need prefix access to claim
+replies.
+
+### The Mesh Document
+
+The operator builds `data.mesh` from CRDs and pushes it to
+`http://localhost:8181/v1/data/mesh` via OPA's data API:
+
+```json
+{
+  "initialized": true,
+  "identities": {
+    "system:serviceaccount:payments:svc-a": {
+      "labels": {"tier": "frontend", "app": "svc-a"}
+    },
+    "system:serviceaccount:payments:svc-b": {
+      "labels": {"tier": "backend", "app": "svc-b"}
+    }
+  },
+  "queues": [
+    {
+      "pattern": "/payments/svc-b/inbox",
+      "matchType": "Exact",
+      "allowedCallers": [
+        {"tier": "frontend"}
+      ]
+    }
+  ]
+}
+```
+
+Fields:
+
+| Field | Source CRD | Meaning |
+|---|---|---|
+| `initialized` | operator internal | True once the operator has completed at least one successful reconcile |
+| `identities` | `EntroQIdentity` | Maps each service account to a set of label claims |
+| `queues[].pattern` | `EntroQQueue` | The queue name or prefix to protect |
+| `queues[].matchType` | `EntroQQueue` | `Exact` or `Prefix` |
+| `queues[].allowedCallers` | `EntroQQueue` | List of label-set matchers. AND within one entry; OR across entries |
+
+Label matching: a caller satisfies a queue policy if its identity labels match
+**all** key-value pairs in **any one** of the `allowedCallers` entries.
+
+### CRD Examples
+
+**EntroQIdentity** — assigns labels to one or more service accounts:
+
+```yaml
+apiVersion: entroq.entroq.io/v1alpha1
+kind: EntroQIdentity
+metadata:
+  name: payments-identities
+  namespace: payments
+spec:
+  identities:
+  - serviceAccount: svc-a
+    labels:
+      tier: frontend
+      app: svc-a
+  - serviceAccount: svc-b
+    labels:
+      tier: backend
+      app: svc-b
+```
+
+**EntroQQueue** — declares who may call a queue:
+
+```yaml
+apiVersion: entroq.entroq.io/v1alpha1
+kind: EntroQQueue
+metadata:
+  name: payments-policy
+  namespace: payments
+spec:
+  queues:
+  - pattern: /payments/svc-b/inbox
+    matchType: Exact
+    allowedCallers:
+    - labels:
+        tier: frontend
+```
+
+### Deploying with Helm
+
+The Helm chart (`charts/entroq`) deploys everything: the EntroQ service, OPA
+sidecar (loaded with `conf/core/` and `conf/providers/k8s/`), the eqk8s
+operator, and the CRD definitions.
+
+```bash
+helm install entroq ./charts/entroq --set backend=pg
+```
+
+OPA and the operator are wired together automatically; no manual OPA data API
+calls are needed.
+
+### Running OPA manually (without Helm)
+
+Load `conf/core/` and `conf/providers/k8s/` — do **not** load
+`conf/providers/entroq/` alongside them; the two provider sets define the same
+packages and will conflict.
+
+```bash
+opa run --server \
+  --bundle ./conf/core/ \
+  --bundle ./conf/providers/k8s/
+```
+
+Start the EntroQ service with OPA enabled:
+
+```bash
+eqpg serve \
+  --authz opahttp \
+  --opa_url http://localhost:8181 \
+  --opa_path /v1/data/entroq/authz \
+  ...
+```
+
+The operator pushes `data.mesh` on every CRD reconcile. You can inspect the
+current mesh document at any time:
+
+```bash
+curl http://localhost:8181/v1/data/mesh | jq .
+```
+
+### Testing k8s policies
+
+The test suite in `conf/tests/providers/k8s/` covers cross-namespace calls,
+response-queue grants, and label predicate evaluation. Run them with:
+
+```bash
+opa test ./conf/ -v
+```
 
 
 ## Security Notes
