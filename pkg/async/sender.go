@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"path"
@@ -57,7 +58,10 @@ type Sender struct {
 	sync.Mutex
 
 	eq             *entroq.EntroQ
-	myQueue        string
+	domainSuffix   string
+	namespace      string
+	name           string
+	auditLog       *slog.Logger
 	requestTimeout time.Duration
 	addr           string
 	mp             metric.MeterProvider
@@ -100,13 +104,52 @@ func WithSenderTLSConfig(cfg *tls.Config) SenderOption {
 	}
 }
 
-// NewSender creates a Sender that listens on addr and uses myQueue as the
-// namespace for response queues.
-func NewSender(eq *entroq.EntroQ, addr, myQueue string, opts ...SenderOption) *Sender {
+
+// WithSenderDomainSuffix sets the domain suffix stripped from the Host header
+// to derive the target service name. Defaults to ".localhost".
+func WithSenderDomainSuffix(suffix string) SenderOption {
+	return func(s *Sender) {
+		s.domainSuffix = suffix
+	}
+}
+
+// WithSenderNamespace sets the default namespace prepended to single-label
+// host names. When the host resolves to a single service name (e.g. "bar"
+// from "bar.localhost"), the namespace is prepended to form "ns/bar".
+// Has no effect when the host already encodes a namespace (e.g. "ns.bar.localhost").
+func WithSenderNamespace(ns string) SenderOption {
+	return func(s *Sender) {
+		s.namespace = ns
+	}
+}
+
+// WithSenderName sets the service identity used in audit log entries as the
+// "from" field. Typically the service's own queue prefix (e.g. "payments/svc-a").
+// Has no effect when audit logging is disabled.
+func WithSenderName(name string) SenderOption {
+	return func(s *Sender) {
+		s.name = name
+	}
+}
+
+// WithSenderAuditLogger enables structured audit logging for every request
+// the sender mediates. When set, three events are emitted per request:
+// request_enqueued (on task insert), and response_received (on task claim).
+// Payload content is never logged; only queue names, method, path, status,
+// and timing are recorded.
+func WithSenderAuditLogger(l *slog.Logger) SenderOption {
+	return func(s *Sender) {
+		s.auditLog = l
+	}
+}
+
+// NewSender creates a Sender that listens on addr and routes outbound requests
+// by extracting the target service from the Host header of incoming requests.
+func NewSender(eq *entroq.EntroQ, addr string, opts ...SenderOption) *Sender {
 	s := &Sender{
 		eq:             eq,
 		addr:           addr,
-		myQueue:        myQueue,
+		domainSuffix:   ".localhost",
 		requestTimeout: defaultRequestTimeout,
 		mp:             noop.NewMeterProvider(),
 	}
@@ -233,11 +276,26 @@ func (s *Sender) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "mTLS "+cn)
 	}
 
-	targetQueue, forwardPath, err := parsePath(r.URL.Path)
+	// Reject streaming protocols early with a clear explanation.
+	// eqlink buffers the full request and response as task payloads; streaming
+	// is fundamentally incompatible with this transport model.
+	if r.Header.Get("Upgrade") != "" {
+		http.Error(w, "eqlink does not support protocol upgrades (WebSocket, HTTP/2 upgrade, etc.); this transport is request-response only", http.StatusNotImplemented)
+		return
+	}
+	if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
+		http.Error(w, "eqlink does not support server-sent events; this transport is request-response only", http.StatusNotImplemented)
+		return
+	}
+
+	queuePrefix, err := queueFromHost(r.Host, s.domainSuffix, s.namespace)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
+	targetInbox := path.Join(queuePrefix, "inbox")
+	// RequestURI includes the query string; Path alone would drop it.
+	forwardPath := r.URL.RequestURI()
 
 	// TODO: add MaxBodySize option and cap with http.MaxBytesReader to avoid
 	// memory pressure from large payloads. Return 413 when exceeded.
@@ -247,13 +305,10 @@ func (s *Sender) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	headers := make(map[string]string, len(r.Header))
-	for k := range r.Header {
-		headers[k] = r.Header.Get(k)
-	}
+	headers := copyHeaders(r.Header)
 
 	expiry := time.Now().Add(s.requestTimeout)
-	responseQueue := path.Join(s.myQueue, "response",
+	responseQueue := path.Join(queuePrefix, "response",
 		fmt.Sprintf("exp=%d", expiry.Unix()),
 		entroq.GenHex16())
 
@@ -271,10 +326,20 @@ func (s *Sender) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if _, err := s.eq.Modify(ctx,
-		entroq.InsertingInto(targetQueue, entroq.WithRawValue(envValue)),
+		entroq.InsertingInto(targetInbox, entroq.WithRawValue(envValue)),
 	); err != nil {
+		log.Printf("sender enqueue to %s: %v", targetInbox, err)
 		http.Error(w, fmt.Sprintf("enqueue task: %v", err), http.StatusBadGateway)
 		return
+	}
+	if s.auditLog != nil {
+		s.auditLog.LogAttrs(ctx, slog.LevelInfo, "request_enqueued",
+			slog.String("from", s.name),
+			slog.String("to", targetInbox),
+			slog.String("method", r.Method),
+			slog.String("path", r.URL.Path),
+			slog.String("response_queue", responseQueue),
+		)
 	}
 
 	// Block until the response arrives, the request timeout elapses, or the
@@ -284,7 +349,7 @@ func (s *Sender) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	task, err := s.eq.Claim(claimCtx, entroq.From(responseQueue))
 	if err != nil {
-		log.Printf("sender await response on %s: %v", responseQueue, err)
+		log.Printf("sender await response on %s (timeout=%v): %v", responseQueue, s.requestTimeout, err)
 		http.Error(w, fmt.Sprintf("await response: %v", err), http.StatusGatewayTimeout)
 		return
 	}
@@ -295,9 +360,18 @@ func (s *Sender) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("unmarshal response: %v", err), http.StatusBadGateway)
 		return
 	}
+	if s.auditLog != nil {
+		s.auditLog.LogAttrs(ctx, slog.LevelInfo, "response_received",
+			slog.String("response_queue", responseQueue),
+			slog.Int("status_code", resp.StatusCode),
+			slog.Float64("duration_s", time.Since(start).Seconds()),
+		)
+	}
 
-	for k, v := range resp.Headers {
-		w.Header().Set(k, v)
+	for k, vs := range resp.Headers {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
 	}
 	w.WriteHeader(resp.StatusCode)
 	if _, err := w.Write(resp.Body); err != nil {
@@ -313,21 +387,32 @@ func (s *Sender) deleteTask(ctx context.Context, task *entroq.Task) {
 	}
 }
 
-// parsePath splits an incoming path into the target queue name and the
-// forwarded request path. The first non-empty path segment is the queue name;
-// the remainder (with leading slash) is the forwarded path.
+// queueFromHost derives a queue prefix from an HTTP Host header value.
+// It strips the port, then the configured domain suffix, and maps the remaining
+// dot-separated labels left-to-right to a slash-separated queue path.
+// The result always starts with "/" to match EntroQ queue naming conventions.
 //
-// "/svc-b/process" -> ("svc-b", "/process", nil)
-// "/svc-b"         -> ("svc-b", "/",        nil)
+// If only one label remains after suffix stripping and namespace is non-empty,
+// the namespace is prepended:
 //
-// TODO: first-segment routing doesn't compose with hierarchical queue names
-// (e.g. /ns=org/svc-b). A future convention (double-slash delimiter, header,
-// etc.) could support namespaced targets, which would be useful for authz groups.
-func parsePath(path string) (queue, forwardPath string, err error) {
-	path = strings.TrimPrefix(path, "/")
-	queue, rest, _ := strings.Cut(path, "/")
-	if queue == "" {
-		return "", "", fmt.Errorf("path must begin with a target queue name")
+//	"bar.localhost"          suffix=".localhost" ns="payments" -> "/payments/bar"
+//	"payments.bar.localhost" suffix=".localhost" ns="payments" -> "/payments/bar"
+//	"bar.localhost"          suffix=".localhost" ns=""         -> "/bar"
+func queueFromHost(host, domainSuffix, namespace string) (string, error) {
+	h := host
+	if i := strings.LastIndex(h, ":"); i >= 0 {
+		h = h[:i]
 	}
-	return queue, "/" + rest, nil
+	if !strings.HasSuffix(h, domainSuffix) {
+		return "", fmt.Errorf("host %q does not end with domain suffix %q", host, domainSuffix)
+	}
+	h = strings.TrimSuffix(h, domainSuffix)
+	if h == "" {
+		return "", fmt.Errorf("host %q has no service name before domain suffix %q", host, domainSuffix)
+	}
+	parts := strings.Split(h, ".")
+	if len(parts) == 1 && namespace != "" {
+		parts = append([]string{namespace}, parts...)
+	}
+	return "/" + strings.Join(parts, "/"), nil
 }

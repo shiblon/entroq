@@ -71,12 +71,13 @@ func Example_sidecar() {
 	rcvCtx, rcvCancel := context.WithCancel(ctx)
 	defer rcvCancel()
 	recv := worker.New(eq, worker.WithDoModify(async.ReceiverHandler(upstream.URL)))
-	go recv.Run(rcvCtx, worker.Watching(queue)) //nolint:errcheck
+	go recv.Run(rcvCtx, worker.Watching(queue+"/inbox")) //nolint:errcheck
 
-	// Sender: the first path segment names the target queue; the rest is forwarded.
-	sender := async.NewSender(eq, "", queue)
+	// Sender: routes outbound requests by target service name from the Host header.
+	// "echo-svc.test" strips ".test" to get "echo-svc", which maps to the inbox queue.
+	sender := async.NewSender(eq, "", async.WithSenderDomainSuffix(".test"))
 	req := httptest.NewRequest(http.MethodGet,
-		"http://local/"+queue+"/hello", nil).WithContext(ctx)
+		"http://"+queue+".test/hello", nil).WithContext(ctx)
 	w := httptest.NewRecorder()
 	sender.ServeHTTP(w, req)
 

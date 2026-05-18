@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"time"
@@ -24,6 +26,8 @@ type ReceiverOption func(*receiverConfig)
 type receiverConfig struct {
 	mp         metric.MeterProvider
 	httpClient *http.Client
+	name       string
+	auditLog   *slog.Logger
 }
 
 // WithReceiverMeterProvider sets the OTel MeterProvider for the receiver.
@@ -39,6 +43,22 @@ func WithReceiverMeterProvider(mp metric.MeterProvider) ReceiverOption {
 func WithReceiverHTTPClient(client *http.Client) ReceiverOption {
 	return func(c *receiverConfig) {
 		c.httpClient = client
+	}
+}
+
+// WithReceiverName sets the service identity used in audit log entries as the
+// "queue" field. Typically the service's own queue prefix (e.g. "payments/svc-b").
+func WithReceiverName(name string) ReceiverOption {
+	return func(c *receiverConfig) {
+		c.name = name
+	}
+}
+
+// WithReceiverAuditLogger enables structured audit logging. When set, a
+// request_handled event is emitted after each task is forwarded to the upstream.
+func WithReceiverAuditLogger(l *slog.Logger) ReceiverOption {
+	return func(c *receiverConfig) {
+		c.auditLog = l
 	}
 }
 
@@ -89,6 +109,16 @@ func ReceiverHandler(upstream string, opts ...ReceiverOption) worker.DoModifyRun
 			log.Printf("receiver forward %s%s: %v", upstream, env.Path, err)
 			forwardErrors.Add(ctx, 1)
 		}
+		if cfg.auditLog != nil {
+			cfg.auditLog.LogAttrs(ctx, slog.LevelInfo, "request_handled",
+				slog.String("queue", cfg.name),
+				slog.String("response_queue", env.ResponseQueue),
+				slog.String("method", env.Method),
+				slog.String("path", env.Path),
+				slog.Int("status_code", resp.StatusCode),
+				slog.Float64("duration_s", time.Since(start).Seconds()),
+			)
+		}
 
 		respValue, err := json.Marshal(resp)
 		if err != nil {
@@ -132,9 +162,7 @@ func forward(ctx context.Context, client *http.Client, upstream string, env Enve
 		if err != nil {
 			return nil, fmt.Errorf("new request in forward: %w", err)
 		}
-		for k, v := range env.Headers {
-			req.Header.Set(k, v)
-		}
+		maps.Copy(req.Header, env.Headers)
 		return req, nil
 	}
 
@@ -166,14 +194,9 @@ func forward(ctx context.Context, client *http.Client, upstream string, env Enve
 			return Response{StatusCode: http.StatusBadGateway, Error: fmt.Sprintf("read response body: %v", err)}, err
 		}
 
-		headers := make(map[string]string, len(httpResp.Header))
-		for k := range httpResp.Header {
-			headers[k] = httpResp.Header.Get(k)
-		}
-
 		return Response{
 			StatusCode: httpResp.StatusCode,
-			Headers:    headers,
+			Headers:    copyHeaders(httpResp.Header),
 			Body:       json.RawMessage(body),
 		}, nil
 	}

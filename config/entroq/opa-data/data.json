@@ -1,0 +1,10 @@
+{
+  "entroq": {
+    "k8s": {
+      "jwks_url":     "https://kubernetes.default.svc/openid/v1/jwks",
+      "audience":     "https://kubernetes.default.svc.cluster.local",
+      "issuer":       "https://kubernetes.default.svc.cluster.local",
+      "ca_cert_file": "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+    }
+  }
+}

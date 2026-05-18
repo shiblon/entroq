@@ -1,0 +1,6 @@
+namespace: entroq-system
+
+resources:
+- serviceaccount.yaml
+- service.yaml
+- deployment.yaml

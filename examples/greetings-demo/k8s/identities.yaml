@@ -1,0 +1,19 @@
+apiVersion: entroq.entroq.io/v1alpha1
+kind: EntroQIdentity
+metadata:
+  name: greetings-identities
+  namespace: greetings
+spec:
+  identities:
+  - serviceAccount: svc-a
+    labels:
+      app: svc-a
+      tier: frontend
+  - serviceAccount: svc-b
+    labels:
+      app: svc-b
+      tier: backend
+  - serviceAccount: svc-c
+    labels:
+      app: svc-c
+      tier: backend

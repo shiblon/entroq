@@ -1,0 +1,15 @@
+apiVersion: entroq.entroq.io/v1alpha1
+kind: EntroQIdentity
+metadata:
+  name: svc-a-identity
+  namespace: default
+spec:
+  identities:
+  - serviceAccount: svc-a
+    labels:
+      group: frontend
+      team: payments
+  - serviceAccount: svc-c
+    labels:
+      group: internal-tools
+      team: payments

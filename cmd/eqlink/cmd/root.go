@@ -11,7 +11,8 @@ import (
 )
 
 var (
-	entroqAddr string
+	entroqAddr      string
+	authzTokenFile  string
 
 	certFile string
 	keyFile  string
@@ -41,6 +42,7 @@ func Execute() {
 func init() {
 	pflags := rootCmd.PersistentFlags()
 	pflags.StringVar(&entroqAddr, "entroq", "localhost:37706", "EntroQ gRPC service address.")
+	pflags.StringVar(&authzTokenFile, "authz-token-file", "", "Path to a bearer token file. Read per-RPC; handles k8s projected token rotation.")
 
 	pflags.StringVar(&certFile, "cert", "", "Path to the TLS certificate file.")
 	pflags.StringVar(&keyFile, "key", "", "Path to the TLS private key file.")
