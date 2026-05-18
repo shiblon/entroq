@@ -7,7 +7,96 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [Unreleased]
+## [1.0.0] - 2026-05-18
+
+### Added
+
+- **Kubernetes mesh operator** (`cmd/eqk8s`): new controller-runtime operator
+  that watches `EntroQQueue` and `EntroQIdentity` CRDs across all namespaces,
+  builds an OPA authorization document from them, and pushes it to OPA via the
+  data API on every reconcile. Also hosts a validating admission webhook that
+  rejects malformed CRDs before they reach etcd.
+
+- **`EntroQQueue` CRD**: declares which queues a service exposes and which
+  callers may enqueue to them, expressed as label-set predicates
+  (`allowedCallers`). AND semantics within one entry; OR semantics across
+  entries. Patterns support `Exact`, `Prefix`, and `Glob` match types.
+
+- **`EntroQIdentity` CRD**: maps a Kubernetes service account to a set of mesh
+  label claims. The operator resolves these claims at authorization time, so
+  the OPA policy never inspects raw JWT fields directly.
+
+- **Helm chart** (`charts/entroq`): single-command install of the operator and
+  an EntroQ server. Four backend modes: `memory` (ephemeral), `journal`
+  (StatefulSet + PVC), `postgres`, and `redis`. Passwords come from Kubernetes
+  Secrets; an `existingSecret` pattern is supported for production.
+
+- **eqlink host-header routing**: services call
+  `http://svc-name.localhost:8080/path`; eqlink reads the `Host` header,
+  strips the domain suffix, and routes to the correct queue. Configurable via
+  `--domain-suffix` (default `.localhost`; use `.eq.local` with a CoreDNS
+  wildcard in-cluster). `--namespace` sets the caller's namespace for
+  cross-namespace calls via `http://ns.svc.eq.local:8080/path`.
+
+- **eqlink audit logging** (`--audit-log`): structured JSON events on stderr
+  via slog. Events: `request_enqueued` (sender side), `request_handled`
+  (receiver side), `response_received` (sender side). Correlation key is the
+  per-request `response_queue`. Payload content is never logged. Production
+  path: stderr → Promtail/Alloy → Loki.
+
+- **eqlink credential rotation**: the token file (`--token-file`) is re-read
+  on a 5-minute poll interval and immediately on SIGHUP, enabling credential
+  rotation without restart.
+
+- **eqlink Dockerfile**: the eqlink sidecar now has its own image
+  (`entroq-operator` repo, `eqlink` binary), suitable for use as an init or
+  sidecar container.
+
+- **K8s OPA provider** (`pkg/eqk8s`): parses `system:serviceaccount:ns:name`
+  from the JWT `sub` field, auto-grants `ALL` on the service's own queue
+  prefix, and resolves label claims from the OPA mesh document.
+
+- **OPA k8s Rego policy and tests** (`pkg/authz/opadata/conf/providers/k8s`):
+  complete mesh authorization policy with a full test suite covering
+  cross-namespace calls, response-queue grants, and label predicate evaluation.
+
+- **greetings-demo** (`examples/greetings-demo`): end-to-end example of three
+  Python services communicating via the queue mesh on Kubernetes, including
+  manifests, `EntroQQueue`/`EntroQIdentity` declarations, and a step-by-step
+  README.
+
+### Fixed
+
+- **gRPC client claim retry loop** (`pkg/backend/eqgrpc`): a `WithTimeout`
+  context expiry was treated as a terminal error rather than a retriable
+  deadline, causing workers to exit silently after a 2-minute idle wait.
+
+- **eqlink `send` request timeout**: the default was `0` due to `init()`
+  ordering shadowing `run`'s 30-second default, causing instant claim failures
+  that disrupted the shared gRPC connection and killed the inbox receiver.
+
+- **Queue name leading slash** (`pkg/async`): `queueFromHost` produced
+  `ns/svc` instead of `/ns/svc`, causing silent OPA authorization failures for
+  all mesh calls.
+
+- **OPA k8s permissions response-queue grant**: callers permitted on
+  `X/inbox` now also receive a `CLAIM` grant on the `X/response/` prefix so
+  they can receive replies.
+
+- **Content-Length forwarding** (`cmd/eqlink`): forwarding `Content-Length`
+  from the original request caused `IncompleteRead` after JSON round-trip
+  through the envelope. It is now stripped (treated as hop-by-hop) and
+  recalculated by the response writer from the actual body.
+
+- **errgroup context propagation** (`cmd/eqlink`): receiver, GC, and SIGHUP
+  goroutines were started with independent contexts; failures did not propagate
+  to siblings. All now derive from the root group context.
+
+### Changed
+
+- **Image names** standardized: `entroq-mem`, `entroq-pg`, `entroq-redis`,
+  `entroq-operator`. Previously inconsistent across Dockerfiles and k8s
+  manifests.
 
 ---
 
