@@ -69,8 +69,18 @@ const (
 )
 
 type backendOptions struct {
-	dialOpts    []grpc.DialOption
-	bearerToken string
+	dialOpts           []grpc.DialOption
+	bearerToken        string
+	claimRetryInterval time.Duration
+}
+
+// WithClaimRetryInterval overrides how long the gRPC client holds a single
+// Claim RPC open before dropping it and retrying. Defaults to ClaimRetryInterval.
+// Primarily useful in tests where 2 minutes is impractical.
+func WithClaimRetryInterval(d time.Duration) Option {
+	return func(opts *backendOptions) {
+		opts.claimRetryInterval = d
+	}
 }
 
 // Option allows grpc-opener-specific options to be sent in Opener.
@@ -140,7 +150,9 @@ func (c *BearerCredentials) GetRequestMetadata(ctx context.Context, uri ...strin
 }
 
 // RequireTransportSecurity is always false, tread carefully! If not on localhost, ensure security is on.
-func (*BearerCredentials) RequireTransportSecurity() bool { return false }
+func (*BearerCredentials) RequireTransportSecurity() bool {
+	return false
+}
 
 // Opener creates an opener function to be used to get a gRPC backend. If the
 // address string is empty, it defaults to the DefaultAddr, the default value
@@ -154,8 +166,7 @@ func Opener(addr string, opts ...Option) entroq.BackendOpener {
 		opt(options)
 	}
 
-	switch {
-	case options.bearerToken != "":
+	if options.bearerToken != "" {
 		options.dialOpts = append(options.dialOpts, grpc.WithPerRPCCredentials(
 			NewBearerCredentials(options.bearerToken),
 		))
@@ -179,7 +190,8 @@ func Opener(addr string, opts ...Option) entroq.BackendOpener {
 }
 
 type backend struct {
-	conn *grpc.ClientConn
+	conn               *grpc.ClientConn
+	claimRetryInterval time.Duration
 }
 
 // New creates a new gRPC backend that attaches to the task service via gRPC.
@@ -188,7 +200,11 @@ func New(conn *grpc.ClientConn, opts ...Option) (*backend, error) {
 	for _, opt := range opts {
 		opt(options)
 	}
-	return &backend{conn}, nil
+	interval := options.claimRetryInterval
+	if interval <= 0 {
+		interval = ClaimRetryInterval
+	}
+	return &backend{conn: conn, claimRetryInterval: interval}, nil
 }
 
 // Close closes the underlying connection to the gRPC task service.
@@ -374,10 +390,10 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 		// Check whether the parent context was canceled.
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("grpc claim: %w", ctx.Err())
+			return nil, fmt.Errorf("grpc claim caller: %w", ctx.Err())
 		default:
 		}
-		ctx, cancel := context.WithTimeout(ctx, ClaimRetryInterval)
+		ctx, cancel := context.WithTimeout(ctx, b.claimRetryInterval)
 		resp, err := pb.NewEntroQClient(b.conn).Claim(ctx, &pb.ClaimRequest{
 			ClaimantId: cq.Claimant,
 			Queues:     cq.Queues,
@@ -386,14 +402,14 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 		})
 		cancel() // cleanup just in case.
 		if err != nil {
-			if entroq.IsTimeout(err) {
+			if entroq.IsTimeout(err) || isGRPCTimeout(err) {
 				// If we just timed out on our little request context, then
 				// we can go around again.
 				// It's possible that the *parent* context timed out, which
 				// is why we check that at the beginning of the loop, as well.
 				continue
 			}
-			return nil, fmt.Errorf("grpc claim: %w", unpackGRPCError(err))
+			return nil, fmt.Errorf("grpc claim response: %w", unpackGRPCError(err))
 		}
 		if resp.Task == nil {
 			return nil, fmt.Errorf("no task returned from backend Claim")
@@ -403,7 +419,7 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 }
 
 // TryClaim attempts to claim a task from the queue. Normally returns both a
-// nil task and error if nothing is ready.
+// nil task and nil error if nothing is ready.
 func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
 	resp, err := pb.NewEntroQClient(b.conn).TryClaim(ctx, &pb.ClaimRequest{
 		ClaimantId: cq.Claimant,
@@ -507,6 +523,17 @@ func depErrorFromStat(stat *status.Status) error {
 		}
 	}
 	return depErr
+}
+
+func isGRPCTimeout(grpcErr error) bool {
+	if grpcErr == nil {
+		return false
+	}
+	stat, ok := status.FromError(grpcErr)
+	if !ok {
+		return false
+	}
+	return stat.Code() == codes.DeadlineExceeded
 }
 
 func unpackGRPCError(grpcErr error) error {

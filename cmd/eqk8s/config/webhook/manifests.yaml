@@ -1,0 +1,46 @@
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: validating-webhook-configuration
+webhooks:
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-entroq-entroq-io-v1alpha1-entroqidentity
+  failurePolicy: Fail
+  name: ventroqidentity.kb.io
+  rules:
+  - apiGroups:
+    - entroq.entroq.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - entroqidentities
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-entroq-entroq-io-v1alpha1-entroqqueuename
+  failurePolicy: Fail
+  name: ventroqqueue.kb.io
+  rules:
+  - apiGroups:
+    - entroq.entroq.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - entroqqueues
+  sideEffects: None

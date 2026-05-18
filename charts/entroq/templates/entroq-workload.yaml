@@ -1,0 +1,138 @@
+{{- if .Values.entroq.enabled -}}
+{{- $backend := .Values.entroq.backend.type -}}
+{{- $isJournal  := eq $backend "journal"  -}}
+{{- $isPostgres := eq $backend "postgres" -}}
+{{- $isRedis    := eq $backend "redis"    -}}
+---
+apiVersion: apps/v1
+kind: {{ if $isJournal }}StatefulSet{{ else }}Deployment{{ end }}
+metadata:
+  name: entroq
+  namespace: entroq-system
+  labels:
+    {{- include "entroq.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "entroq.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "entroq.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: entroq
+      containers:
+      - name: entroq
+        image: {{ include "entroq.serverImage" . }}
+        imagePullPolicy: {{ .Values.entroq.images.pullPolicy }}
+        args:
+        - serve
+        - --authz=opahttp
+        - --opa_url=http://localhost:{{ .Values.entroq.service.opaPort }}
+        {{- if $isJournal }}
+        - --journal={{ .Values.entroq.storage.mountPath }}
+        - --mkdir
+        - --periodic_snapshot=1h
+        - --journal_cleanup
+        {{- else if $isPostgres }}
+        - --dbaddr={{ .Values.entroq.postgres.addr }}
+        - --dbname={{ .Values.entroq.postgres.database }}
+        - --dbuser={{ .Values.entroq.postgres.user }}
+        {{- if .Values.entroq.postgres.initSchema }}
+        - --init_schema
+        {{- end }}
+        {{- else if $isRedis }}
+        - --addr={{ .Values.entroq.redis.addr }}
+        - --db={{ .Values.entroq.redis.db }}
+        {{- end }}
+        {{- if $isPostgres }}
+        env:
+        - name: PGPASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "entroq.postgresSecretName" . }}
+              key: password
+        {{- else if $isRedis }}
+        env:
+        - name: EQ_REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "entroq.redisSecretName" . }}
+              key: password
+        {{- end }}
+        ports:
+        - containerPort: {{ .Values.entroq.service.grpcPort }}
+          name: grpc
+        readinessProbe:
+          tcpSocket:
+            port: {{ .Values.entroq.service.grpcPort }}
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        resources:
+          {{- toYaml .Values.entroq.resources.entroq | nindent 10 }}
+        {{- if $isJournal }}
+        volumeMounts:
+        - name: journal
+          mountPath: {{ .Values.entroq.storage.mountPath }}
+        {{- end }}
+
+      - name: opa
+        image: "{{ .Values.entroq.opa.image.repository }}:{{ .Values.entroq.opa.image.tag }}"
+        imagePullPolicy: {{ .Values.entroq.opa.image.pullPolicy }}
+        args:
+        - run
+        - --server
+        - --addr=0.0.0.0:{{ .Values.entroq.service.opaPort }}
+        {{- $extra := include "entroq.opaExtraArgs" . | trim }}
+        {{- if $extra }}
+        {{- $extra | nindent 8 }}
+        {{- end }}
+        - /rego/core-entroq-authz.rego
+        - /rego/core-entroq-jwt.rego
+        - /rego/core-entroq-namespaces.rego
+        - /rego/core-entroq-queues.rego
+        - /rego/k8s-entroq-permissions.rego
+        - /rego/k8s-entroq-user.rego
+        - /data/data.json
+        ports:
+        - containerPort: {{ .Values.entroq.service.opaPort }}
+          name: http
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: {{ .Values.entroq.service.opaPort }}
+          initialDelaySeconds: 3
+          periodSeconds: 5
+        resources:
+          {{- toYaml .Values.entroq.resources.opa | nindent 10 }}
+        volumeMounts:
+        - name: opa-rego
+          mountPath: /rego
+          readOnly: true
+        - name: opa-data
+          mountPath: /data
+          readOnly: true
+
+      volumes:
+      - name: opa-rego
+        configMap:
+          name: opa-rego
+      - name: opa-data
+        configMap:
+          name: opa-data
+
+  {{- if $isJournal }}
+  volumeClaimTemplates:
+  - metadata:
+      name: journal
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      {{- if .Values.entroq.storage.storageClass }}
+      storageClassName: {{ .Values.entroq.storage.storageClass | quote }}
+      {{- end }}
+      resources:
+        requests:
+          storage: {{ .Values.entroq.storage.size }}
+  {{- end }}
+{{- end }}
