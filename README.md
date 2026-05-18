@@ -16,9 +16,9 @@ Kubernetes deployment via Helm.
 ---
 
 Pronounced "Entro-Q" ("Entro-Queue"), as in the letter that comes after
-"Entro-P". It is not a pubsub system, a database, or a general-purpose RPC
-framework: the queue is the primitive that the document store, the mesh, and
-everything else compose from.
+"Entro-P", the next step in managing systems complexity.
+
+It's the right way to outsource reliability and consistency guarantees when working in a competing-consumer environment where exactly-once semantics are needed and work should never be lost. It enables infinite composability, and the microservice mesh built on top of it showcases just one of the many powerful ways it can be used.
 
 Background: [Asynchronous Thinking for Microservice System Design](https://github.com/shiblon/entroq/wiki/Asynchronous-Thinking-for-Microservice-System-Design)  
 Go docs: [pkg.go.dev/github.com/shiblon/entroq](https://pkg.go.dev/github.com/shiblon/entroq) | [CHANGELOG](CHANGELOG.md)
