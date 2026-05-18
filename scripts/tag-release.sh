@@ -36,7 +36,14 @@ if ! grep -q "^\#\# \[${VERSION}\]" CHANGELOG.md; then
     fail "no CHANGELOG.md entry found for [${VERSION}]; add one before tagging"
 fi
 
-# 4. Tag does not already exist.
+# 4. SchemaVersion major.minor matches release tag major.minor.
+TAG_MAJMIN="$(echo "${VERSION}" | sed 's/^\([0-9]*\.[0-9]*\).*/\1/')"
+SCHEMA_MAJMIN="$(grep 'SchemaVersion\s*=' pkg/backend/eqpg/schema.go | sed 's/.*"\([0-9]*\.[0-9]*\).*/\1/')"
+if [ "${TAG_MAJMIN}" != "${SCHEMA_MAJMIN}" ]; then
+    fail "SchemaVersion major.minor (${SCHEMA_MAJMIN}) does not match release tag major.minor (${TAG_MAJMIN}); update pkg/backend/eqpg/schema.go"
+fi
+
+# 5. Tag does not already exist.
 if git rev-parse "v${VERSION}" >/dev/null 2>&1; then
     fail "tag v${VERSION} already exists"
 fi

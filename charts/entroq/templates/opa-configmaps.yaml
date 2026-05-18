@@ -1,0 +1,37 @@
+{{- if .Values.entroq.enabled }}
+# opa-rego: all Rego policy files. Populated from files/rego/ in the chart.
+# Run 'make helm-sync' from the repo root to refresh these from source.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opa-rego
+  namespace: entroq-system
+  labels:
+    {{- include "entroq.labels" . | nindent 4 }}
+data:
+  {{- range $path, $content := .Files.Glob "files/rego/*.rego" }}
+  {{ base $path }}: |
+    {{- $content | toString | nindent 4 }}
+  {{- end }}
+---
+# opa-data: k8s OIDC configuration for JWT verification.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opa-data
+  namespace: entroq-system
+  labels:
+    {{- include "entroq.labels" . | nindent 4 }}
+data:
+  data.json: |
+    {
+      "entroq": {
+        "k8s": {
+          "jwks_url":     {{ .Values.entroq.auth.jwksUrl | quote }},
+          "audience":     {{ .Values.entroq.auth.audience | quote }},
+          "issuer":       {{ .Values.entroq.auth.issuer | quote }},
+          "ca_cert_file": {{ .Values.entroq.auth.caFile | quote }}
+        }
+      }
+    }
+{{- end }}
