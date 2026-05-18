@@ -9,7 +9,8 @@ RUN go mod download -x
 
 ARG VERSION=dev
 COPY . .
-RUN go build -ldflags "-X github.com/shiblon/entroq/pkg/version.injected=${VERSION}" -o /bin/eqmem ./cmd/eqmem
+RUN go build -ldflags "-X github.com/shiblon/entroq/pkg/version.injected=${VERSION}" -o /bin/eqmem ./cmd/eqmem && \
+    go build -ldflags "-X github.com/shiblon/entroq/pkg/version.injected=${VERSION}" -o /bin/eqc  ./cmd/eqc
 
 # Create data directory for persistence with correct non-root permissions.
 RUN mkdir -p /data/entroq/journal && chown -R 65532:65532 /data
@@ -23,6 +24,7 @@ USER 65532:65532
 
 COPY --from=builder --chown=65532:65532 /data /data
 COPY --from=builder /bin/eqmem /bin/eqmem
+COPY --from=builder /bin/eqc  /bin/eqc
 
 VOLUME /data/entroq
 
