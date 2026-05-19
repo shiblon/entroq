@@ -20,6 +20,9 @@
 
 CREATE SCHEMA IF NOT EXISTS entroq;
 
+-- pgcrypto provides gen_random_bytes(), used for auto-generating task IDs.
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 -- Core table. id and claimant are TEXT with CHECK constraints limiting them
 -- to 64 characters -- long enough for UUIDs, ULIDs, etc.
 -- ID representation: task IDs and claimant IDs are stored as TEXT with a
