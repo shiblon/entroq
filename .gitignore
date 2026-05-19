@@ -46,3 +46,5 @@ QUBIT.md
 charts/entroq/files/
 charts/entroq/crds/
 charts/*.tgz
+
+/eqc
