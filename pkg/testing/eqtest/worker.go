@@ -465,7 +465,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		defer cancel()
 		g, gctx := errgroup.WithContext(ctx)
 		g.Go(func() error {
-			if err := w.Run(gctx, worker.Watching(c.input.Queue), worker.WithLease(leaseTime), worker.WithBackoff(100*time.Millisecond)); err != nil && !entroq.IsCanceled(err) {
+			if err := w.Run(gctx, worker.Watching(c.input.Queue), worker.WithLease(leaseTime)); err != nil && !entroq.IsCanceled(err) {
 				// Log quickly so we can see it before waits fail below.
 				log.Printf("Worker Run error: %v", err)
 				return err

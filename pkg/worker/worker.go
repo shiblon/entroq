@@ -45,11 +45,6 @@ type ErrQMap func(inbox string) string
 // worker task errors out as retryable. This is an exponential backoff baseline.
 const DefaultRetryDelay = 30 * time.Second
 
-// DefaultBackoff is the time a worker sleeps after a fundamental error
-// (renewal failure, connection error, etc.) before attempting to claim again.
-// It prevents "thundering herd" or "tight loop" failures during outages.
-const DefaultBackoff = 10 * time.Second
-
 // Handler[T] is an interface that can be implemented to define work to be done.
 // The value T is the pre-unmarshaled task value. Use T = json.RawMessage to
 // receive raw bytes without any type-level unmarshaling.
@@ -78,8 +73,10 @@ type Handler[T any] interface {
 	// and its attempt count is incremented (these errors, while convenient for
 	// managing task movement, are still errors).
 	//
-	// On any other error, Finish is skipped and the error is treated as a
-	// fundamental error subject to backoff.
+	// On any other error, Finish is skipped and the worker exits. Backoff and
+	// restart are the responsibility of the process orchestrator (e.g.
+	// Kubernetes, systemd). To retry or quarantine the task instead, return an
+	// error wrapping RetryError or MoveError explicitly.
 	DoWork(context.Context, *entroq.Task, T, []*entroq.Doc) error
 
 	// Finish is called after DoWork returns nil and renewal has stopped. It
@@ -98,9 +95,12 @@ type MakeHandler[T any] func() (Handler[T], error)
 
 // DoModifyRun[T] is a function type that allows a work handler to be defined
 // that passes modifications out instead of making those modifications itself
-// in a Finish function.
+// in a Finish function. The docs parameter carries any docs claimed by
+// WithTakeDocs, and can be empty.
 //
-// The docs parameter carries any docs claimed by WithTakeDocs, and can be empty.
+// Return nil on success. To retry the task wrap RetryError; to quarantine it
+// wrap MoveError. Any other non-nil error causes the worker to exit — backoff
+// and restart are the responsibility of the process orchestrator.
 type DoModifyRun[T any] func(context.Context, *entroq.Task, T, []*entroq.Doc) ([]entroq.ModifyArg, error)
 
 // TakeRun[T] is a function that inspects a newly claimed task and
@@ -513,7 +513,7 @@ func (w *Worker[T]) runOne(ctx context.Context, handler Handler[T], opts *runOpt
 				sentinelErr = err
 				return nil // retry and move errors will be handled outside with the final task.
 			}
-			return fmt.Errorf("task do: %v", err)
+			return fmt.Errorf("task do: %w", err)
 		}
 		return nil
 	})
@@ -531,15 +531,7 @@ func (w *Worker[T]) runOne(ctx context.Context, handler Handler[T], opts *runOpt
 	}
 
 	if handleErr != nil {
-		// Not a sentinel, institute backoff in case the worker jUst loops
-		// really fast on a broken network connection or similar.
-		log.Printf("Worker claim failed (%q), backing off %v: %v", opts.qs, opts.backoff, handleErr)
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(opts.backoff):
-		}
-		return fmt.Errorf("worker claim failed (%q), backed off %v: %w", opts.qs, opts.backoff, handleErr)
+		return fmt.Errorf("worker (%q): %w", opts.qs, handleErr)
 	}
 
 	// Finally call the finish function, handle any errors.
@@ -573,7 +565,6 @@ type runOpt struct {
 	maxAttempts    int32
 	lease          time.Duration
 	onDepError     func(context.Context, *entroq.Task, *entroq.DependencyError) error
-	backoff        time.Duration
 }
 
 // Watching specifies the queues Run will watch.
@@ -613,14 +604,6 @@ func WithBaseRetryDelay(d time.Duration) RunOption {
 	}
 }
 
-// WithBackoff sets how long the worker sleeps after an infrastructure error
-// before attempting to claim again. Defaults to DefaultBackoff.
-func WithBackoff(d time.Duration) RunOption {
-	return func(ro *runOpt) {
-		ro.backoff = d
-	}
-}
-
 func isSentinelError(sentinel error) bool {
 	return errors.Is(sentinel, RetryError) || errors.Is(sentinel, MoveError) || errors.Is(sentinel, FatalError)
 }
@@ -631,7 +614,6 @@ func (w *Worker[T]) Run(ctx context.Context, opts ...RunOption) error {
 	ro := &runOpt{
 		lease:          entroq.DefaultClaimDuration,
 		baseRetryDelay: DefaultRetryDelay,
-		backoff:        DefaultBackoff,
 	}
 	for _, opt := range opts {
 		opt(ro)
@@ -672,6 +654,27 @@ var (
 	// should not continue processing tasks.
 	FatalError = errors.New("worker fatal")
 )
+
+// RetryErrorf is a convenience wrapper for making a retry error for workers.
+// Workers will retry a task with this error up to a threshold, then quarantine
+// it.
+func RetryErrorf(fstr string, args ...any) error {
+	return fmt.Errorf(fstr+": %w", append(args, RetryError)...)
+}
+
+// MoveErrorf is a convenience wrapper for making a move error for workers.
+// These are errors with a task that is not going to do better with a retry
+// (malformed, for example).
+func MoveErrorf(fstr string, args ...any) error {
+	return fmt.Errorf(fstr+": %w", append(args, MoveError)...)
+}
+
+// FatalErrorf is a convenience wrapper for making a fatal error for workers.
+// These are errors the worker is not expected to recover from, so it should
+// crash.
+func FatalErrorf(fstr string, args ...any) error {
+	return fmt.Errorf(fstr+": %w", append(args, FatalError)...)
+}
 
 // Renewal Machinery
 
