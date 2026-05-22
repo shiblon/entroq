@@ -195,8 +195,10 @@ func GetContent[T any](r *Doc) (T, error) {
 // Copy returns a deep copy of the doc.
 func (r *Doc) Copy() *Doc {
 	cp := *r
-	cp.Content = make([]byte, len(r.Content))
-	copy(cp.Content, r.Content)
+	if len(r.Content) > 0 {
+		cp.Content = make([]byte, len(r.Content))
+		copy(cp.Content, r.Content)
+	}
 	return &cp
 }
 

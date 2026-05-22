@@ -7,6 +7,85 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.1.0] - 2026-05-22
+
+### Added
+
+- **`NamespaceStats`** (`EntroQ.NamespaceStats`, `Backend.NamespaceStats`): new
+  method returning per-namespace doc statistics (`Size`, `Claimed`), with
+  prefix/exact filtering and limit, analogous to `QueueStats` for task queues.
+  Implemented in all backends: eqpg (index-only scan), eqmem (lock-free
+  `sync.Map` range), eqredis (new `{eq}:ns` registry set + `{eq}:nsclaimed:{ns}`
+  ZSET), and eqgrpc (new `NamespaceStats` RPC).
+
+- **`eqc ns` command** (alias `namespaces`): lists doc namespaces with size and
+  claimed counts. Mirrors `eqc qs` / `eqc stats` for task queues.
+
+- **`MatchQuery` type** (replaces `QueuesQuery`): the prefix/exact/limit query
+  struct is now named `MatchQuery` to reflect its use in both queue and namespace
+  listing. `QueuesQuery` remains as a type alias. `WithLimit` replaces
+  `LimitQueues`; the old name is kept as a `var` alias.
+
+- **`{eq}:qsclaimed:{name}` ZSET** (eqredis): replaces the `{eq}:inflight:{name}`
+  SET for claimed task tracking. Score is `AtMs` (claim expiry), so
+  `ZCOUNT >now` gives an exact current claimed count without a GC pass.
+  `Claimed` and `Future` in `QueueStats` are now exact rather than approximate.
+
+- **`{eq}:nsclaimed:{ns}` ZSET and `{eq}:ns` SET** (eqredis): parallel
+  structures for doc namespaces, enabling exact claimed counts and efficient
+  namespace enumeration without a full keyspace `SCAN`.
+
+- **`NamespacesRequest` / `NamespacesResponse` / `NamespaceStat` proto messages**
+  and `NamespaceStats` RPC added to the gRPC API.
+
+- **`at_ms` field on `DocData` proto message**: doc changes now carry the
+  requested arrival/claim-expiry time over gRPC. Previously, doc changes with a
+  future `At` (e.g. renewals via `Modify`) silently dropped the timestamp,
+  making claim-by-modify impossible over gRPC.
+
+### Fixed
+
+- **Claimant cleared after `Modify`** (eqpg): a task change without an explicit
+  future `At` was not reliably clearing the claimant due to client/server clock
+  skew — Go's `time.Now()` arrived at the database fractionally ahead of
+  `v_now`, causing the "renewal" branch to fire and preserve the claimant.
+  `Changing()` now sends zero time as a sentinel; the schema treats any `at`
+  older than one year as "use `v_now`" rather than comparing against the exact
+  epoch value.
+
+- **Doc claimant always set on `Modify`** (all backends): doc inserts and
+  content-only changes unconditionally set `Claimant` to the modifier's ID.
+  Fixed to match task semantics: claimant is set only when the new `At` is
+  strictly in the future; past or zero `At` releases the claim.
+
+- **`Doc.Copy()` with nil content** produced `[]byte{}` (empty non-nil slice),
+  which serializes as invalid JSON and caused `log.Fatalf` in the eqmem
+  journaling path. Now leaves `Content` nil when there is no content.
+
+- **`_modify_docs` `IS NULL` check** (eqpg): the doc-change claimant condition
+  used `IS NULL` to detect "no new arrival time", but Go sends zero time as the
+  Go epoch (`0001-01-01`), not SQL NULL. Fixed to use the same `> v_now` /
+  one-year threshold pattern as `_modify_arrays`.
+
+### Changed
+
+- **Schema version `1.0.1` → `1.1.0`** (eqpg): four columns made `NOT NULL`:
+  `tasks.claimant`, `tasks.created`, `docs.claimant`, `docs.at`. All default
+  to `''` or `now()`. Idempotent migration blocks handle existing databases.
+  `docs.at` is now `NOT NULL DEFAULT now()`, aligning its semantics with
+  `tasks.at` (both represent claim expiry; `at > now` with non-empty claimant
+  means currently held).
+
+- **eqredis GC simplified**: the per-queue inflight-expiry loop is removed.
+  GC now only removes empty queues from `{eq}:qs` and empty namespaces from
+  `{eq}:ns`. Claimed-entry cleanup is handled atomically in claim/modify/delete
+  paths or by the ZSET score semantics.
+
+- **`queueMatches` → `matchesQuery`** (eqmem): renamed to reflect use in both
+  queue and namespace filtering.
+
+---
+
 ## [1.0.0] - 2026-05-18
 
 ### Added
@@ -97,58 +176,6 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Image names** standardized: `entroq-mem`, `entroq-pg`, `entroq-redis`,
   `entroq-operator`. Previously inconsistent across Dockerfiles and k8s
   manifests.
-
----
-
-## [1.0.0-rc3] - 2026-04-16
-
-### Added
-
-- **Redis backend** (`pkg/backend/eqredis`): new production-quality backend
-  using Redis WATCH/MULTI/EXEC for optimistic locking. Supports all task and
-  doc operations, including claims, renewals, modifications, and dependencies.
-  All keys use the `{eq}` hash tag, ensuring cluster-mode compatibility by
-  pinning all data to a single hash slot (see package doc for the tradeoff).
-
-- **Doc insert collision detection**: inserting a doc with an explicit ID now
-  returns `DependencyError.DocInserts` if that ID already exists, matching the
-  behavior of task inserts. Previously eqredis silently overwrote and eqpg
-  misrouted the error through the task error parser. eqmem was already correct.
-
-- **`WithSkipCollidingDoc`** (`DocOpt`): marks a doc insert as droppable on ID
-  collision, analogous to `WithSkipColliding` for task inserts. The `Modify`
-  retry loop strips skippable collisions and retries automatically.
-
-- **`WithDocArrivalTime` / `WithDocArrivalTimeBy`** (`DocOpt`): set the `At`
-  field on a doc change, enabling renewal or claim-by-ID patterns without
-  mutating the `Doc` struct directly.
-
-- **`TryClaimDocByID`**: client-level helper that claims a specific doc by
-  namespace and ID, analogous to the `eqc tryclaimid` command for tasks.
-
-- **`DependencyError.HasCollisions`** now covers doc insert collisions
-  (`DocInserts`) in addition to task insert collisions (`Inserts`), so the
-  `Modify` retry loop handles both uniformly.
-
-- **Release script** (`scripts/tag-release.sh`): pre-flight checks before
-  pushing a version tag (clean tree, no `replace` directives, CHANGELOG entry
-  present, tag does not already exist).
-
-- **eqmem move**: eqmemsvc became instead `eqmem serve` to mirror eqpg.
-
-- **eqredis**: starting an eqredis instance now has its own command.
-
-### Fixed
-
-- **eqpg doc modify errors**: `_modify_docs` errors were parsed by the task
-  error parser, which ignored the `ns` field and misrouted collisions into
-  `Changes`. A dedicated `parseModifyDocsError` now correctly populates
-  `DocDepends`, `DocDeletes`, `DocChanges`, and `DocInserts`.
-
-- **Claimant preservation on renewal**: a `Change` that pushes `At` into the
-  future (renewal) now preserves the existing claimant in all three backends.
-  Previously all three backends cleared the claimant unconditionally on any
-  `Change`, breaking worker renewal loops.
 
 ---
 

@@ -148,6 +148,9 @@ message DocData {
   google.protobuf.Value content = 5;
   int64 created_ms = 6;
   int64 modified_ms = 7;
+  // at_ms is the requested arrival/claim-expiry time for doc changes.
+  // Zero means "use the backend's current time and release any claim."
+  int64 at_ms = 8;
 }
 
 // DocChange identifies a doc by DocID and provides updated data. Only content
@@ -213,6 +216,25 @@ message ClaimDocsRequest {
 // gRPC's NOT_FOUND code with ModifyDep details carrying doc_id fields.
 message ClaimDocsResponse {
   repeated Doc docs = 1;
+}
+
+// NamespaceStat contains statistics for a single doc namespace.
+message NamespaceStat {
+  string name = 1;
+  int32 num_docs = 2;
+  int32 num_claimed = 3;
+}
+
+// NamespacesRequest asks for a listing of doc namespaces.
+message NamespacesRequest {
+  repeated string match_prefix = 1;
+  repeated string match_exact = 2;
+  int32 limit = 3;
+}
+
+// NamespacesResponse contains the requested list of namespace statistics.
+message NamespacesResponse {
+  repeated NamespaceStat namespaces = 1;
 }
 
 // ModifyRequest sends a request to modify a set of tasks with given
@@ -387,6 +409,12 @@ service EntroQ {
     option (google.api.http) = {
       post: "/api/v0/docs/claim"
       body: "*"
+    };
+  }
+
+  rpc NamespaceStats(NamespacesRequest) returns (NamespacesResponse) {
+    option (google.api.http) = {
+      get: "/api/v0/namespaces/stats"
     };
   }
 }

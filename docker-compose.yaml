@@ -10,7 +10,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - ./backend/eqpg/schema.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./pkg/backend/eqpg/schema.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U entroq -d entroq"]
       interval: 5s

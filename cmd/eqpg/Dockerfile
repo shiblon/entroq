@@ -9,7 +9,8 @@ RUN go mod download -x
 
 ARG VERSION=dev
 COPY . .
-RUN go build -ldflags "-X github.com/shiblon/entroq/pkg/version.injected=${VERSION}" -o /bin/eqpg ./cmd/eqpg
+RUN go build -ldflags "-X github.com/shiblon/entroq/pkg/version.injected=${VERSION}" -o /bin/eqpg ./cmd/eqpg && \
+    go build -ldflags "-X github.com/shiblon/entroq/pkg/version.injected=${VERSION}" -o /bin/eqc  ./cmd/eqc
 
 # 2. Switch to a secure, minimal runtime container.
 # The ":debug" version includes a busybox shell for easier "docker exec" debugging.
@@ -23,6 +24,7 @@ LABEL org.opencontainers.image.source="https://github.com/shiblon/entroq"
 USER 65532:65532
 
 COPY --from=builder /bin/eqpg /bin/eqpg
+COPY --from=builder /bin/eqc  /bin/eqc
 
 # gRPC endpoint
 EXPOSE 37706

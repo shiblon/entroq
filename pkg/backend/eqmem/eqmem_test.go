@@ -503,3 +503,15 @@ func TestEQMemDocClaimLocking(t *testing.T) {
 func TestEQMemDocInsertWithID(t *testing.T) {
 	RunQTest(t, eqtest.DocInsertWithID)
 }
+
+func TestEQMemDocClaimantBehavior(t *testing.T) {
+	RunQTest(t, eqtest.DocClaimantBehavior)
+}
+
+func TestEQMemQueueStatsAccuracy(t *testing.T) {
+	RunQTest(t, eqtest.QueueStatsAccuracy)
+}
+
+func TestEQMemNamespaceStats(t *testing.T) {
+	RunQTest(t, eqtest.NamespaceStats)
+}
