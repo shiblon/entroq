@@ -1054,7 +1054,7 @@ $$;
 --     data.
 --   - Schemas predating 1.0 (0.x) cannot be migrated. Drain all tasks and
 --     reinitialize: DROP SCHEMA entroq CASCADE, then run eqpg schema init.
--- Migrations: 1.0.0 → 1.0.1
+-- Migrations: 1.0.0 → 1.1.0
 -- Each block checks pg_attribute to skip on fresh installs where the column
 -- is already correct, avoiding unnecessary table scans on re-runs.
 
@@ -1111,5 +1111,5 @@ CREATE TABLE IF NOT EXISTS entroq.meta (
     value TEXT NOT NULL
 );
 
-INSERT INTO entroq.meta (key, value) VALUES ('schema_version', '1.0.1')
-    ON CONFLICT (key) DO UPDATE SET value = '1.0.1' WHERE entroq.meta.key = 'schema_version';
+INSERT INTO entroq.meta (key, value) VALUES ('schema_version', '1.1.0')
+    ON CONFLICT (key) DO UPDATE SET value = '1.1.0' WHERE entroq.meta.key = 'schema_version';
