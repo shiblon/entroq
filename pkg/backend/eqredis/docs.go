@@ -332,6 +332,7 @@ func (e *EQRedis) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq
 						Modified:     nowMs,
 					}
 					pipe.HSet(ctx, docKey(f.Namespace, f.ID), updated.toMap())
+					pipe.ZAdd(ctx, nsclaimedKey(f.Namespace), redis.Z{Score: float64(newAtMs), Member: f.ID})
 					claimed = append(claimed, updated.toDoc())
 				}
 				return nil

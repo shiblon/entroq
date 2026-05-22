@@ -36,9 +36,9 @@ CREATE TABLE IF NOT EXISTS entroq.tasks (
     version  INTEGER                  NOT NULL DEFAULT 0,
     queue    TEXT                     NOT NULL DEFAULT '',
     at       TIMESTAMP WITH TIME ZONE NOT NULL,
-    created  TIMESTAMP WITH TIME ZONE,
-    modified TIMESTAMP WITH TIME ZONE NOT NULL,
-    claimant TEXT                     CHECK (claimant IS NULL OR length(claimant) <= 64),
+    created  TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    modified TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    claimant TEXT                     NOT NULL DEFAULT '' CHECK (length(claimant) <= 64),
     value    JSONB,
     claims   INTEGER                  NOT NULL DEFAULT 0,
     attempt  INTEGER                  NOT NULL DEFAULT 0,
@@ -52,8 +52,8 @@ CREATE TABLE IF NOT EXISTS entroq.docs (
     namespace     TEXT                     NOT NULL CHECK (length(namespace) <= 64),
     id            TEXT                     NOT NULL CHECK (length(id) <= 64),
     version       INTEGER                  NOT NULL DEFAULT 0,
-    claimant      TEXT                     CHECK (claimant IS NULL OR length(claimant) <= 64),
-    at            TIMESTAMP WITH TIME ZONE,
+    claimant      TEXT                     NOT NULL DEFAULT '' CHECK (length(claimant) <= 64),
+    at            TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
     key_primary   TEXT                     NOT NULL DEFAULT '' CHECK (length(key_primary) <= 256),
     key_secondary TEXT                     NOT NULL DEFAULT '' CHECK (length(key_secondary) <= 256),
     value         JSONB,
@@ -69,7 +69,9 @@ CREATE INDEX IF NOT EXISTS byQueue     ON entroq.tasks (queue);
 CREATE INDEX IF NOT EXISTS byQueueAt   ON entroq.tasks (queue, at);
 
 -- Storage Indexes.
-CREATE INDEX IF NOT EXISTS idx_docs_keys  ON entroq.docs (namespace, key_primary, key_secondary);
+CREATE INDEX IF NOT EXISTS idx_docs_keys     ON entroq.docs (namespace, key_primary, key_secondary);
+-- Covers NamespaceStats: GROUP BY namespace with FILTER on at/claimant, index-only.
+CREATE INDEX IF NOT EXISTS idx_docs_ns_stats ON entroq.docs (namespace, at, claimant);
 
 -- Bucket index: supports range-based bucket selection in _try_claim_bucket.
 -- hashtext(id) & 255 gives a stable value in [0, 255] for any text ID.
@@ -433,7 +435,11 @@ BEGIN
     USING unnest(coalesce(p_del_ids, '{}'::text[]), coalesce(p_del_vers, '{}'::integer[])) AS d(del_id, del_ver)
     WHERE entroq.tasks.id = d.del_id AND entroq.tasks.version = d.del_ver;
 
-    -- Inserts: empty string = auto-generate; Go zero time = use v_now.
+    -- Inserts: empty string = auto-generate.
+    -- at: timestamps older than 1 year are treated as "use now". This threshold
+    -- avoids needing a sentinel value for Go's zero time (0001-01-01), which
+    -- arrives as a far-past timestamp. Legitimate past timestamps (within a year)
+    -- are preserved; a past at is harmless -- the task is immediately available.
     -- CTE wraps the INSERT so RETURNING * is unambiguous; the outer SELECT
     -- uses alias r.col to avoid RETURNS TABLE OUT-parameter shadowing.
     RETURN QUERY
@@ -443,7 +449,7 @@ BEGIN
                 CASE WHEN ins_id = '' THEN encode(gen_random_bytes(8), 'hex') ELSE ins_id END,
                 0,
                 ins_queue,
-                CASE WHEN ins_at = '0001-01-01 00:00:00+00'::timestamptz THEN v_now ELSE ins_at END,
+                CASE WHEN ins_at < v_now - interval '1 year' THEN v_now ELSE ins_at END,
                 p_claimant,
                 ins_value::jsonb,
                 v_now, v_now,
@@ -463,7 +469,9 @@ BEGIN
             r.claims, r.attempt, r.err
         FROM r;
 
-    -- Changes: update each task to its new values, incrementing version.
+    -- Changes: at older than 1 year snaps to v_now (covers Go's zero time);
+    -- otherwise preserved as-is (a past at is harmless). Claimant is set only
+    -- when chg_at is strictly in the future; past/present releases the task.
     -- CTE for the same reason as inserts: avoid RETURNS TABLE OUT-parameter shadowing.
     RETURN QUERY
         WITH r AS (
@@ -472,13 +480,11 @@ BEGIN
                 version  = entroq.tasks.version + 1,
                 modified = v_now,
                 queue    = c.chg_queue,
-                at       = c.chg_at,
+                at       = CASE WHEN c.chg_at < v_now - interval '1 year' THEN v_now ELSE c.chg_at END,
                 value    = c.chg_value::jsonb,
                 attempt  = c.chg_attempt,
                 err      = c.chg_err,
-                -- Preserve claimant on renewal (chg_at pushed past now);
-                -- clear it otherwise so the task is available to any claimant.
-                claimant = CASE WHEN c.chg_at > v_now THEN entroq.tasks.claimant ELSE NULL END
+                claimant = CASE WHEN c.chg_at > v_now THEN p_claimant ELSE '' END
             FROM unnest(
                 coalesce(p_chg_ids,      '{}'::text[]),
                 coalesce(p_chg_vers,     '{}'::integer[]),
@@ -644,7 +650,7 @@ BEGIN
     SELECT
         coalesce(jsonb_agg(jsonb_build_object('ns', d.dep_ns, 'id', d.dep_id, 'version', d.dep_ver)) FILTER (WHERE l.lck_id IS NULL), '[]'::jsonb),
         coalesce(jsonb_agg(jsonb_build_object('ns', d.dep_ns, 'id', d.dep_id, 'version', d.dep_ver))
-                 FILTER (WHERE l.lck_id IS NOT NULL AND (l.lck_ver != d.dep_ver OR (l.lck_claimant IS NOT NULL AND l.lck_claimant != p_claimant AND l.lck_at > v_now))),
+                 FILTER (WHERE l.lck_id IS NOT NULL AND (l.lck_ver != d.dep_ver OR (l.lck_claimant != '' AND l.lck_claimant != p_claimant AND l.lck_at > v_now))),
                  '[]'::jsonb)
     INTO v_missing, v_mismatched
     FROM all_deps d
@@ -678,7 +684,7 @@ BEGIN
     )
     SELECT 'inserted', r.namespace, r.id, r.version, r.claimant, r.at, r.key_primary, r.key_secondary, r.value, r.created, r.modified FROM r;
 
-    -- Changes
+    -- Changes: future chg_at means claim/renew; past/zero means release.
     RETURN QUERY
     WITH r AS (
         UPDATE entroq.docs
@@ -687,8 +693,9 @@ BEGIN
             key_primary = c.chg_pk,
             key_secondary = c.chg_sk,
             value = c.chg_val::jsonb,
-            at = c.chg_at,
-            claimant = CASE WHEN c.chg_at IS NULL THEN NULL ELSE p_claimant END,
+            -- at: >1 year old snaps to v_now (covers Go's zero time); otherwise preserved.
+            at = CASE WHEN c.chg_at < v_now - interval '1 year' THEN v_now ELSE c.chg_at END,
+            claimant = CASE WHEN c.chg_at > v_now THEN p_claimant ELSE '' END,
             modified = v_now
         FROM unnest(p_chg_ns, p_chg_ids, p_chg_vers, p_chg_pkeys, p_chg_skeys, p_chg_values, p_chg_ats)
         AS c(chg_ns, chg_id, chg_ver, chg_pk, chg_sk, chg_val, chg_at)
@@ -909,7 +916,7 @@ BEGIN
     -- Detect any already-claimed docs.
     SELECT coalesce(
         jsonb_agg(jsonb_build_object('namespace', d.namespace, 'id', d.id, 'version', d.version))
-        FILTER (WHERE d.claimant IS NOT NULL AND d.at > v_now AND d.claimant <> p_claimant),
+        FILTER (WHERE d.claimant != '' AND d.at > v_now AND d.claimant <> p_claimant),
         '[]'::jsonb
     )
     INTO v_claimed
@@ -1047,10 +1054,62 @@ $$;
 --     data.
 --   - Schemas predating 1.0 (0.x) cannot be migrated. Drain all tasks and
 --     reinitialize: DROP SCHEMA entroq CASCADE, then run eqpg schema init.
+-- Migrations: 1.0.0 → 1.0.1
+-- Each block checks pg_attribute to skip on fresh installs where the column
+-- is already correct, avoiding unnecessary table scans on re-runs.
+
+DO $$
+DECLARE v_not_null boolean;
+BEGIN
+    SELECT attnotnull INTO v_not_null FROM pg_attribute
+    WHERE attrelid = 'entroq.tasks'::regclass AND attname = 'claimant';
+    IF NOT v_not_null THEN
+        UPDATE entroq.tasks SET claimant = '' WHERE claimant IS NULL;
+        ALTER TABLE entroq.tasks ALTER COLUMN claimant SET NOT NULL;
+        ALTER TABLE entroq.tasks ALTER COLUMN claimant SET DEFAULT '';
+    END IF;
+END $$;
+
+DO $$
+DECLARE v_not_null boolean;
+BEGIN
+    SELECT attnotnull INTO v_not_null FROM pg_attribute
+    WHERE attrelid = 'entroq.tasks'::regclass AND attname = 'created';
+    IF NOT v_not_null THEN
+        UPDATE entroq.tasks SET created = modified WHERE created IS NULL;
+        ALTER TABLE entroq.tasks ALTER COLUMN created SET NOT NULL;
+        ALTER TABLE entroq.tasks ALTER COLUMN created SET DEFAULT now();
+    END IF;
+END $$;
+
+DO $$
+DECLARE v_not_null boolean;
+BEGIN
+    SELECT attnotnull INTO v_not_null FROM pg_attribute
+    WHERE attrelid = 'entroq.docs'::regclass AND attname = 'claimant';
+    IF NOT v_not_null THEN
+        UPDATE entroq.docs SET claimant = '' WHERE claimant IS NULL;
+        ALTER TABLE entroq.docs ALTER COLUMN claimant SET NOT NULL;
+        ALTER TABLE entroq.docs ALTER COLUMN claimant SET DEFAULT '';
+    END IF;
+END $$;
+
+DO $$
+DECLARE v_not_null boolean;
+BEGIN
+    SELECT attnotnull INTO v_not_null FROM pg_attribute
+    WHERE attrelid = 'entroq.docs'::regclass AND attname = 'at';
+    IF NOT v_not_null THEN
+        UPDATE entroq.docs SET at = created WHERE at IS NULL;
+        ALTER TABLE entroq.docs ALTER COLUMN at SET NOT NULL;
+        ALTER TABLE entroq.docs ALTER COLUMN at SET DEFAULT now();
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS entroq.meta (
     key   TEXT PRIMARY KEY NOT NULL,
     value TEXT NOT NULL
 );
 
-INSERT INTO entroq.meta (key, value) VALUES ('schema_version', '1.0.0')
-    ON CONFLICT (key) DO UPDATE SET value = '1.0.0' WHERE entroq.meta.key = 'schema_version';
+INSERT INTO entroq.meta (key, value) VALUES ('schema_version', '1.0.1')
+    ON CONFLICT (key) DO UPDATE SET value = '1.0.1' WHERE entroq.meta.key = 'schema_version';

@@ -35,7 +35,6 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		log.Fatalf("Postgres start: %v", err)
 	}
-	fmt.Println("hi")
 	defer func() {
 		if err := ctr.Terminate(ctx); err != nil {
 			log.Printf("Postgres stop: %v", err)
@@ -488,6 +487,18 @@ func TestPGDocClaimLocking(t *testing.T) {
 
 func TestPGDocInsertWithID(t *testing.T) {
 	RunQTest(t, eqtest.DocInsertWithID)
+}
+
+func TestPGDocClaimantBehavior(t *testing.T) {
+	RunQTest(t, eqtest.DocClaimantBehavior)
+}
+
+func TestPGQueueStatsAccuracy(t *testing.T) {
+	RunQTest(t, eqtest.QueueStatsAccuracy)
+}
+
+func TestPGNamespaceStats(t *testing.T) {
+	RunQTest(t, eqtest.NamespaceStats)
 }
 
 // TestSchemaInit verifies that InitSchema succeeds on a blank database,

@@ -825,6 +825,26 @@ func (s *QSvc) Docs(ctx context.Context, req *pb.DocsRequest) (*pb.DocsResponse,
 	return resp, nil
 }
 
+// NamespaceStats returns statistics for doc namespaces matching the query.
+func (s *QSvc) NamespaceStats(ctx context.Context, req *pb.NamespacesRequest) (*pb.NamespacesResponse, error) {
+	nsMap, err := s.impl.NamespaceStats(ctx,
+		entroq.MatchPrefix(req.MatchPrefix...),
+		entroq.MatchExact(req.MatchExact...),
+		entroq.WithLimit(int(req.Limit)))
+	if err != nil {
+		return nil, autoCodeErrorf("namespace stats: %w", err)
+	}
+	resp := new(pb.NamespacesResponse)
+	for _, stat := range nsMap {
+		resp.Namespaces = append(resp.Namespaces, &pb.NamespaceStat{
+			Name:       stat.Name,
+			NumDocs:    int32(stat.Size),
+			NumClaimed: int32(stat.Claimed),
+		})
+	}
+	return resp, nil
+}
+
 // ClaimDocs atomically claims a set of docs matching the given query.
 // Returns a NotFound status with ModifyDep details if any docs are missing or
 // already claimed.

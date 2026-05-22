@@ -742,7 +742,12 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 	for _, c := range mod.DocChanges {
 		newRes := c.Copy()
 		newRes.Version++
-		newRes.Claimant = mod.Claimant
+		// Claim/renew if requested.At is in the future; release otherwise.
+		if newRes.At.After(now) {
+			newRes.Claimant = mod.Claimant
+		} else {
+			newRes.Claimant = ""
+		}
 		newRes.Modified = now
 		setRes(newRes)
 		resp.ChangedDocs = append(resp.ChangedDocs, newRes)
@@ -763,7 +768,7 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 			Content:      rd.Content,
 			Key:          rd.Key,
 			SecondaryKey: rd.SecondaryKey,
-			Claimant:     mod.Claimant,
+			Claimant:     "",
 			Created:      created,
 			Modified:     modified,
 			Version:      1,
@@ -904,7 +909,7 @@ func (m *EQMem) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Tas
 	return found, nil
 }
 
-func queueMatches(val string, qq *entroq.QueuesQuery) bool {
+func matchesQuery(val string, qq *entroq.QueuesQuery) bool {
 	if len(qq.MatchPrefix) == 0 && len(qq.MatchExact) == 0 {
 		return true
 	}
@@ -942,7 +947,7 @@ func (m *EQMem) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[str
 
 	qs := make(map[string]*entroq.QueueStat)
 	for _, q := range qnames {
-		if !queueMatches(q, qq) {
+		if !matchesQuery(q, qq) {
 			continue
 		}
 		if qq.Limit > 0 && len(qs) >= qq.Limit {

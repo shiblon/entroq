@@ -149,6 +149,42 @@ paths:
                         application/json:
                             schema:
                                 $ref: '#/components/schemas/Status'
+    /api/v0/namespaces/stats:
+        get:
+            tags:
+                - EntroQ
+            operationId: EntroQ_NamespaceStats
+            parameters:
+                - name: matchPrefix
+                  in: query
+                  schema:
+                    type: array
+                    items:
+                        type: string
+                - name: matchExact
+                  in: query
+                  schema:
+                    type: array
+                    items:
+                        type: string
+                - name: limit
+                  in: query
+                  schema:
+                    type: integer
+                    format: int32
+            responses:
+                "200":
+                    description: OK
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/NamespacesResponse'
+                default:
+                    description: Default error response
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/Status'
     /api/v0/queues:
         get:
             tags:
@@ -556,6 +592,26 @@ components:
             description: |-
                 ModifyResponse returns inserted and updated tasks and docs when successful.
                  A dependency error (which is permanent) comes through as gRPC's NOT_FOUND code.
+        NamespaceStat:
+            type: object
+            properties:
+                name:
+                    type: string
+                numDocs:
+                    type: integer
+                    format: int32
+                numClaimed:
+                    type: integer
+                    format: int32
+            description: NamespaceStat contains statistics for a single doc namespace.
+        NamespacesResponse:
+            type: object
+            properties:
+                namespaces:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/NamespaceStat'
+            description: NamespacesResponse contains the requested list of namespace statistics.
         QueueStats:
             type: object
             properties:

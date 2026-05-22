@@ -60,6 +60,10 @@ func SimpleDocLifecycle(ctx context.Context, t *testing.T, client *entroq.EntroQ
 	if changed.Version != res.Version+1 {
 		t.Errorf("Changed version: want %v, got %v", res.Version+1, changed.Version)
 	}
+	// requested.At = current.At (insertion time, past) → claimant must be cleared.
+	if changed.Claimant != "" {
+		t.Errorf("Content-only change on unclaimed doc: claimant should be empty, got %q", changed.Claimant)
+	}
 
 	// Try to depend on the doc before it changed (should fail)
 	_, err = client.Modify(ctx, res.Change(entroq.WithRawContent(json.RawMessage(`{"fail": true}`))))
@@ -569,6 +573,56 @@ func DocInsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 	}
 	if len(docs) != 2 {
 		t.Fatalf("final list: want 2 docs, got %d", len(docs))
+	}
+}
+
+// DocClaimantBehavior verifies the claimant field semantics for doc modifications.
+//
+// The rule: after a Modify, current.Claimant = requested.Claimant if requested.At > now, else "".
+// requested.At comes from WithDocArrivalTime/WithDocArrivalTimeBy; if not supplied,
+// current.At is used (the existing value is copied through).
+func DocClaimantBehavior(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	t.Helper()
+	ns := path.Join(qPrefix, "doc_claimant_behavior")
+
+	// Insert: claimant must be empty; at defaults to now (past by query time).
+	resp, err := client.Modify(ctx, entroq.CreatingIn(ns, entroq.WithKeys("k", "")))
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	doc := resp.InsertedDocs[0]
+	if doc.Claimant != "" {
+		t.Errorf("after insert: claimant want %q, got %q", "", doc.Claimant)
+	}
+
+	// Content-only change: requested.At = current.At (past) → claimant cleared.
+	resp, err = client.Modify(ctx, doc.Change(entroq.WithContent(struct{ V int }{1})))
+	if err != nil {
+		t.Fatalf("content-only change: %v", err)
+	}
+	doc = resp.ChangedDocs[0]
+	if doc.Claimant != "" {
+		t.Errorf("after content-only change: claimant want %q, got %q", "", doc.Claimant)
+	}
+
+	// Change with future at: requested.At > now → claimant set to modifier.
+	resp, err = client.Modify(ctx, doc.Change(entroq.WithDocArrivalTimeBy(10*time.Second)))
+	if err != nil {
+		t.Fatalf("change with future at: %v", err)
+	}
+	doc = resp.ChangedDocs[0]
+	if doc.Claimant != client.ClientID {
+		t.Errorf("after future-at change: claimant want %q, got %q", client.ClientID, doc.Claimant)
+	}
+
+	// Change with past at (release): requested.At <= now → claimant cleared.
+	resp, err = client.Modify(ctx, doc.Change(entroq.WithDocArrivalTimeBy(-1*time.Second)))
+	if err != nil {
+		t.Fatalf("change with past at: %v", err)
+	}
+	doc = resp.ChangedDocs[0]
+	if doc.Claimant != "" {
+		t.Errorf("after past-at change (release): claimant want %q, got %q", "", doc.Claimant)
 	}
 }
 
