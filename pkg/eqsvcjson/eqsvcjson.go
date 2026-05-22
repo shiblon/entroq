@@ -124,6 +124,14 @@ func (h *Handler) ClaimDocs(ctx context.Context, req *connect.Request[pb.ClaimDo
 	return connect.NewResponse(resp), nil
 }
 
+func (h *Handler) NamespaceStats(ctx context.Context, req *connect.Request[pb.NamespacesRequest]) (*connect.Response[pb.NamespacesResponse], error) {
+	resp, err := h.svc.NamespaceStats(ctxWithMD(ctx, req.Header()), req.Msg)
+	if err != nil {
+		return nil, err
+	}
+	return connect.NewResponse(resp), nil
+}
+
 // streamAdapter wraps a Connect server stream so it implements the grpc.ServerStream expected by eqsvcgrpc.
 type streamAdapter struct {
 	ctx    context.Context

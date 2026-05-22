@@ -790,16 +790,10 @@ func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *mo
 			r := new(entroq.Doc)
 			var kind string
 			var val []byte
-			var claimant sql.NullString
-			var at, created, modified sql.NullTime
-			if err := rRows.Scan(&kind, &r.Namespace, &r.ID, &r.Version, &claimant, &at, &r.Key, &r.SecondaryKey, &val, &created, &modified); err != nil {
+			if err := rRows.Scan(&kind, &r.Namespace, &r.ID, &r.Version, &r.Claimant, &r.At, &r.Key, &r.SecondaryKey, &val, &r.Created, &r.Modified); err != nil {
 				return nil, fmt.Errorf("pg modify resource scan: %w", err)
 			}
-			r.Claimant = claimant.String
 			r.Content = val
-			r.At = at.Time
-			r.Created = created.Time
-			r.Modified = modified.Time
 			switch kind {
 			case "inserted":
 				resp.InsertedDocs = append(resp.InsertedDocs, r)
@@ -834,16 +828,10 @@ func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *mo
 		t := new(entroq.Task)
 		var kind string
 		var val []byte
-		var claimant sql.NullString
-		var at, created, modified sql.NullTime
-		if err := rows.Scan(&kind, &t.ID, &t.Version, &t.Queue, &at, &created, &modified, &claimant, &val, &t.Claims, &t.Attempt, &t.Err); err != nil {
+		if err := rows.Scan(&kind, &t.ID, &t.Version, &t.Queue, &t.At, &t.Created, &t.Modified, &t.Claimant, &val, &t.Claims, &t.Attempt, &t.Err); err != nil {
 			return nil, fmt.Errorf("pg modify task scan: %w", err)
 		}
 		t.Value = val
-		t.Claimant = claimant.String
-		t.At = at.Time
-		t.Created = created.Time
-		t.Modified = modified.Time
 		switch kind {
 		case "inserted":
 			resp.InsertedTasks = append(resp.InsertedTasks, t)
@@ -1123,16 +1111,10 @@ func scanDocRows(rows *sql.Rows) ([]*entroq.Doc, error) {
 	for rows.Next() {
 		r := new(entroq.Doc)
 		var val []byte
-		var claimant sql.NullString
-		var at, created, modified sql.NullTime
-		if err := rows.Scan(&r.Namespace, &r.ID, &r.Version, &claimant, &at, &r.Key, &r.SecondaryKey, &val, &created, &modified); err != nil {
+		if err := rows.Scan(&r.Namespace, &r.ID, &r.Version, &r.Claimant, &r.At, &r.Key, &r.SecondaryKey, &val, &r.Created, &r.Modified); err != nil {
 			return nil, fmt.Errorf("pg docs scan: %w", err)
 		}
 		r.Content = val
-		r.Claimant = claimant.String
-		r.At = at.Time
-		r.Created = created.Time
-		r.Modified = modified.Time
 		results = append(results, r)
 	}
 	return results, rows.Err()

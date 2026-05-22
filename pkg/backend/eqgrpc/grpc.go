@@ -618,6 +618,7 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (*entroq
 				Key:          dc.Key,
 				SecondaryKey: dc.SecondaryKey,
 				Content:      val,
+				AtMs:         toMS(dc.At),
 			},
 		})
 	}

@@ -2,12 +2,14 @@
 //
 // Data model:
 //
-//	{eq}:q:{name}        -- ZSET: member=taskID, score=atUnixMilli (task index per queue)
-//	{eq}:t:{id}          -- Hash: task fields (id, queue, value, at, created, modified, claimant, version, claims, attempt, err)
-//	{eq}:qs              -- Set: active queue names (maintained lazily; GC removes empties)
-//	{eq}:inflight:{name} -- Set: task IDs currently claimed in this queue
-//	{eq}:d:{ns}/{id}     -- Hash: doc fields (namespace, id, version, claimant, at, key_primary, key_secondary, content, created, modified)
-//	{eq}:dnsidx:{ns}     -- ZSET: doc namespace index, member=keyPrimary\x00keySecondary\x00id, score=0
+//	{eq}:q:{name}           -- ZSET: member=taskID, score=atUnixMilli (task index per queue)
+//	{eq}:t:{id}             -- Hash: task fields (id, queue, value, at, created, modified, claimant, version, claims, attempt, err)
+//	{eq}:qs                 -- Set: active queue names (maintained lazily; GC removes empties)
+//	{eq}:qsclaimed:{name}   -- ZSET: claimed task IDs, score=atUnixMilli; ZCOUNT >now gives exact claimed count
+//	{eq}:d:{ns}/{id}        -- Hash: doc fields (namespace, id, version, claimant, at, key_primary, key_secondary, content, created, modified)
+//	{eq}:dnsidx:{ns}        -- ZSET: doc namespace index, member=keyPrimary\x00keySecondary\x00id, score=0
+//	{eq}:ns                 -- Set: active namespace names (maintained lazily; GC removes empties)
+//	{eq}:nsclaimed:{ns}     -- ZSET: claimed doc IDs, score=atUnixMilli; ZCOUNT >now gives exact claimed count
 //
 // Key hash tags:
 //
@@ -65,8 +67,12 @@ func queueKey(name string) string {
 	return keyPrefix + "q:" + name
 }
 
-func inflightKey(name string) string {
-	return keyPrefix + "inflight:" + name
+func qsclaimedKey(name string) string {
+	return keyPrefix + "qsclaimed:" + name
+}
+
+func nsclaimedKey(ns string) string {
+	return keyPrefix + "nsclaimed:" + ns
 }
 
 func docKey(namespace, id string) string {
@@ -77,6 +83,7 @@ func docKey(namespace, id string) string {
 }
 
 const queuesKey = keyPrefix + "qs"
+const namespacesKey = keyPrefix + "ns"
 
 // EQRedis implements entroq.Backend using Redis.
 type EQRedis struct {

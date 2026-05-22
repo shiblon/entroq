@@ -41,7 +41,6 @@ func (e *EQRedis) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 // Returns nil, nil if no task is available.
 func (e *EQRedis) tryClaimOne(ctx context.Context, queue string, claimant string, duration time.Duration, now time.Time) (*entroq.Task, error) {
 	qKey := queueKey(queue)
-	ifKey := inflightKey(queue)
 	nowMs := now.UnixMilli()
 	newAtMs := now.Add(duration).UnixMilli()
 
@@ -99,7 +98,7 @@ func (e *EQRedis) tryClaimOne(ctx context.Context, queue string, claimant string
 			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 				pipe.HSet(ctx, tKey, f.toMap())
 				pipe.ZAdd(ctx, qKey, redis.Z{Score: float64(newAtMs), Member: id})
-				pipe.SAdd(ctx, ifKey, id)
+				pipe.ZAdd(ctx, qsclaimedKey(queue), redis.Z{Score: float64(newAtMs), Member: id})
 				pipe.SAdd(ctx, queuesKey, queue)
 				return nil
 			})

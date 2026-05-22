@@ -575,6 +575,7 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 			Key:          nd.GetKey(),
 			SecondaryKey: nd.GetSecondaryKey(),
 			Content:      val,
+			At:           fromMS(nd.GetAtMs()),
 		}
 		modArgs = append(modArgs, d.Change())
 	}
@@ -821,6 +822,26 @@ func (s *QSvc) Docs(ctx context.Context, req *pb.DocsRequest) (*pb.DocsResponse,
 			return nil, autoCodeErrorf("docs doc proto: %w", err)
 		}
 		resp.Docs = append(resp.Docs, pd)
+	}
+	return resp, nil
+}
+
+// NamespaceStats returns statistics for doc namespaces matching the query.
+func (s *QSvc) NamespaceStats(ctx context.Context, req *pb.NamespacesRequest) (*pb.NamespacesResponse, error) {
+	nsMap, err := s.impl.NamespaceStats(ctx,
+		entroq.MatchPrefix(req.MatchPrefix...),
+		entroq.MatchExact(req.MatchExact...),
+		entroq.WithLimit(int(req.Limit)))
+	if err != nil {
+		return nil, autoCodeErrorf("namespace stats: %w", err)
+	}
+	resp := new(pb.NamespacesResponse)
+	for _, stat := range nsMap {
+		resp.Namespaces = append(resp.Namespaces, &pb.NamespaceStat{
+			Name:       stat.Name,
+			NumDocs:    int32(stat.Size),
+			NumClaimed: int32(stat.Claimed),
+		})
 	}
 	return resp, nil
 }

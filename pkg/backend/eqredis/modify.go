@@ -266,13 +266,13 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 		resp = entroq.ModifyResponse{}
 
 		_, err := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-			// Deletes: remove task hash, remove from queue ZSET and inflight set.
+			// Deletes: remove task hash, queue ZSET entry, and claimed ZSET entry.
 			for _, t := range dels {
 				st := states[t.id]
 				q := st.fields.Queue
 				pipe.Del(ctx, taskKey(t.id))
 				pipe.ZRem(ctx, queueKey(q), t.id)
-				pipe.SRem(ctx, inflightKey(q), t.id)
+				pipe.ZRem(ctx, qsclaimedKey(q), t.id)
 				// Queue cleanup is handled by the GC goroutine.
 			}
 
@@ -289,12 +289,11 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 					newAtMs = nowMs
 				}
 
-				// Preserve claimant if the task is being pushed to the future
-				// (renewal). Clear it when At <= now so the task is available
-				// to any claimant.
+				// Future at: claim/renew (set claimant to modifier).
+				// Past/zero at: release (clear claimant).
 				newClaimant := ""
 				if newAtMs > nowMs {
-					newClaimant = st.fields.Claimant
+					newClaimant = claimant
 				}
 
 				f := &taskFields{
@@ -317,9 +316,12 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 
 				if newQueue != oldQueue {
 					pipe.ZRem(ctx, queueKey(oldQueue), t.ID)
-					pipe.SRem(ctx, inflightKey(oldQueue), t.ID)
+					pipe.ZRem(ctx, qsclaimedKey(oldQueue), t.ID)
+				}
+				if newAtMs > nowMs {
+					pipe.ZAdd(ctx, qsclaimedKey(newQueue), redis.Z{Score: float64(newAtMs), Member: t.ID})
 				} else {
-					pipe.SRem(ctx, inflightKey(newQueue), t.ID)
+					pipe.ZRem(ctx, qsclaimedKey(newQueue), t.ID)
 				}
 
 				resp.ChangedTasks = append(resp.ChangedTasks, f.toTask())
@@ -362,6 +364,7 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 				k := d.Namespace + "/" + d.ID
 				st := docStates[k]
 				pipe.Del(ctx, docKey(d.Namespace, d.ID))
+				pipe.ZRem(ctx, nsclaimedKey(d.Namespace), d.ID)
 				if st.found {
 					pipe.ZRem(ctx, docNSIndexKey(d.Namespace),
 						docIndexMember(st.fields.KeyPrimary, st.fields.KeySecondary, d.ID))
@@ -394,6 +397,7 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 					Score:  0,
 					Member: docIndexMember(dd.Key, dd.SecondaryKey, id),
 				})
+				pipe.SAdd(ctx, namespacesKey, dd.Namespace)
 				resp.InsertedDocs = append(resp.InsertedDocs, f.toDoc())
 			}
 
@@ -441,6 +445,11 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 					Score:  0,
 					Member: docIndexMember(d.Key, d.SecondaryKey, d.ID),
 				})
+				if newAtMs > nowMs {
+					pipe.ZAdd(ctx, nsclaimedKey(d.Namespace), redis.Z{Score: float64(newAtMs), Member: d.ID})
+				} else {
+					pipe.ZRem(ctx, nsclaimedKey(d.Namespace), d.ID)
+				}
 				resp.ChangedDocs = append(resp.ChangedDocs, f.toDoc())
 			}
 

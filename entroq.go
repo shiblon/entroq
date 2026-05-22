@@ -287,6 +287,9 @@ type Backend interface {
 	// deletion).
 	ClaimDocs(ctx context.Context, cq *DocClaim) ([]*Doc, error)
 
+	// NamespaceStats returns statistics for doc namespaces matching the query.
+	NamespaceStats(ctx context.Context, qq *MatchQuery) (map[string]*NamespaceStat, error)
+
 	// Time returns the time as the backend understands it, in UTC.
 	Time(ctx context.Context) (time.Time, error)
 
@@ -926,8 +929,10 @@ func Changing(task *Task, changeArgs ...ChangeArg) ModifyArg {
 		newTask := *task
 		// From queue is always the current queue.
 		newTask.FromQueue = task.Queue
-		// Reset when changing, at least by default. Callers may override.
-		newTask.At = m.now
+		// Zero time signals the backend to use its own "now" and clear the
+		// claimant (task is released). Callers may override via ArrivalTimeTo
+		// or ArrivalTimeBy to renew or defer.
+		newTask.At = time.Time{}
 		for _, a := range changeArgs {
 			a(m, &newTask)
 		}
