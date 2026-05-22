@@ -184,3 +184,15 @@ func TestGRPCDocClaimLocking(t *testing.T) {
 func TestGRPCDocInsertWithID(t *testing.T) {
 	RunQTest(t, eqtest.DocInsertWithID)
 }
+
+func TestGRPCDocClaimantBehavior(t *testing.T) {
+	RunQTest(t, eqtest.DocClaimantBehavior)
+}
+
+func TestGRPCQueueStatsAccuracy(t *testing.T) {
+	RunQTest(t, eqtest.QueueStatsAccuracy)
+}
+
+func TestGRPCNamespaceStats(t *testing.T) {
+	RunQTest(t, eqtest.NamespaceStats)
+}

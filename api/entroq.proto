@@ -148,6 +148,9 @@ message DocData {
   google.protobuf.Value content = 5;
   int64 created_ms = 6;
   int64 modified_ms = 7;
+  // at_ms is the requested arrival/claim-expiry time for doc changes.
+  // Zero means "use the backend's current time and release any claim."
+  int64 at_ms = 8;
 }
 
 // DocChange identifies a doc by DocID and provides updated data. Only content

@@ -575,6 +575,7 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 			Key:          nd.GetKey(),
 			SecondaryKey: nd.GetSecondaryKey(),
 			Content:      val,
+			At:           fromMS(nd.GetAtMs()),
 		}
 		modArgs = append(modArgs, d.Change())
 	}
