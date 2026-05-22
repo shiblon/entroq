@@ -26,7 +26,7 @@ var SchemaSQL string
 //   - Patch releases never change the schema.
 //   - Any 1.x schema upgrades to any later 1.y by re-running schema.sql.
 //   - Schemas predating 1.0 cannot be migrated; see UpgradeSchema.
-const SchemaVersion = "1.0.1"
+const SchemaVersion = "1.1.0"
 
 // InitSchema applies the full idempotent EntroQ DDL to db. Safe to run on an
 // already-initialized database.

@@ -7,6 +7,85 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.1.0] - 2026-05-22
+
+### Added
+
+- **`NamespaceStats`** (`EntroQ.NamespaceStats`, `Backend.NamespaceStats`): new
+  method returning per-namespace doc statistics (`Size`, `Claimed`), with
+  prefix/exact filtering and limit, analogous to `QueueStats` for task queues.
+  Implemented in all backends: eqpg (index-only scan), eqmem (lock-free
+  `sync.Map` range), eqredis (new `{eq}:ns` registry set + `{eq}:nsclaimed:{ns}`
+  ZSET), and eqgrpc (new `NamespaceStats` RPC).
+
+- **`eqc ns` command** (alias `namespaces`): lists doc namespaces with size and
+  claimed counts. Mirrors `eqc qs` / `eqc stats` for task queues.
+
+- **`MatchQuery` type** (replaces `QueuesQuery`): the prefix/exact/limit query
+  struct is now named `MatchQuery` to reflect its use in both queue and namespace
+  listing. `QueuesQuery` remains as a type alias. `WithLimit` replaces
+  `LimitQueues`; the old name is kept as a `var` alias.
+
+- **`{eq}:qsclaimed:{name}` ZSET** (eqredis): replaces the `{eq}:inflight:{name}`
+  SET for claimed task tracking. Score is `AtMs` (claim expiry), so
+  `ZCOUNT >now` gives an exact current claimed count without a GC pass.
+  `Claimed` and `Future` in `QueueStats` are now exact rather than approximate.
+
+- **`{eq}:nsclaimed:{ns}` ZSET and `{eq}:ns` SET** (eqredis): parallel
+  structures for doc namespaces, enabling exact claimed counts and efficient
+  namespace enumeration without a full keyspace `SCAN`.
+
+- **`NamespacesRequest` / `NamespacesResponse` / `NamespaceStat` proto messages**
+  and `NamespaceStats` RPC added to the gRPC API.
+
+- **`at_ms` field on `DocData` proto message**: doc changes now carry the
+  requested arrival/claim-expiry time over gRPC. Previously, doc changes with a
+  future `At` (e.g. renewals via `Modify`) silently dropped the timestamp,
+  making claim-by-modify impossible over gRPC.
+
+### Fixed
+
+- **Claimant cleared after `Modify`** (eqpg): a task change without an explicit
+  future `At` was not reliably clearing the claimant due to client/server clock
+  skew — Go's `time.Now()` arrived at the database fractionally ahead of
+  `v_now`, causing the "renewal" branch to fire and preserve the claimant.
+  `Changing()` now sends zero time as a sentinel; the schema treats any `at`
+  older than one year as "use `v_now`" rather than comparing against the exact
+  epoch value.
+
+- **Doc claimant always set on `Modify`** (all backends): doc inserts and
+  content-only changes unconditionally set `Claimant` to the modifier's ID.
+  Fixed to match task semantics: claimant is set only when the new `At` is
+  strictly in the future; past or zero `At` releases the claim.
+
+- **`Doc.Copy()` with nil content** produced `[]byte{}` (empty non-nil slice),
+  which serializes as invalid JSON and caused `log.Fatalf` in the eqmem
+  journaling path. Now leaves `Content` nil when there is no content.
+
+- **`_modify_docs` `IS NULL` check** (eqpg): the doc-change claimant condition
+  used `IS NULL` to detect "no new arrival time", but Go sends zero time as the
+  Go epoch (`0001-01-01`), not SQL NULL. Fixed to use the same `> v_now` /
+  one-year threshold pattern as `_modify_arrays`.
+
+### Changed
+
+- **Schema version `1.0.1` → `1.1.0`** (eqpg): four columns made `NOT NULL`:
+  `tasks.claimant`, `tasks.created`, `docs.claimant`, `docs.at`. All default
+  to `''` or `now()`. Idempotent migration blocks handle existing databases.
+  `docs.at` is now `NOT NULL DEFAULT now()`, aligning its semantics with
+  `tasks.at` (both represent claim expiry; `at > now` with non-empty claimant
+  means currently held).
+
+- **eqredis GC simplified**: the per-queue inflight-expiry loop is removed.
+  GC now only removes empty queues from `{eq}:qs` and empty namespaces from
+  `{eq}:ns`. Claimed-entry cleanup is handled atomically in claim/modify/delete
+  paths or by the ZSET score semantics.
+
+- **`queueMatches` → `matchesQuery`** (eqmem): renamed to reflect use in both
+  queue and namespace filtering.
+
+---
+
 ## [1.0.0] - 2026-05-18
 
 ### Added
