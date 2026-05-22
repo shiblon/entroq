@@ -31,6 +31,7 @@ type EntroQClient interface {
 	StreamTasks(ctx context.Context, in *TasksRequest, opts ...grpc.CallOption) (EntroQ_StreamTasksClient, error)
 	Docs(ctx context.Context, in *DocsRequest, opts ...grpc.CallOption) (*DocsResponse, error)
 	ClaimDocs(ctx context.Context, in *ClaimDocsRequest, opts ...grpc.CallOption) (*ClaimDocsResponse, error)
+	NamespaceStats(ctx context.Context, in *NamespacesRequest, opts ...grpc.CallOption) (*NamespacesResponse, error)
 }
 
 type entroQClient struct {
@@ -154,6 +155,15 @@ func (c *entroQClient) ClaimDocs(ctx context.Context, in *ClaimDocsRequest, opts
 	return out, nil
 }
 
+func (c *entroQClient) NamespaceStats(ctx context.Context, in *NamespacesRequest, opts ...grpc.CallOption) (*NamespacesResponse, error) {
+	out := new(NamespacesResponse)
+	err := c.cc.Invoke(ctx, "/api.EntroQ/NamespaceStats", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // EntroQServer is the server API for EntroQ service.
 // All implementations must embed UnimplementedEntroQServer
 // for forward compatibility
@@ -171,6 +181,7 @@ type EntroQServer interface {
 	StreamTasks(*TasksRequest, EntroQ_StreamTasksServer) error
 	Docs(context.Context, *DocsRequest) (*DocsResponse, error)
 	ClaimDocs(context.Context, *ClaimDocsRequest) (*ClaimDocsResponse, error)
+	NamespaceStats(context.Context, *NamespacesRequest) (*NamespacesResponse, error)
 	mustEmbedUnimplementedEntroQServer()
 }
 
@@ -207,6 +218,9 @@ func (UnimplementedEntroQServer) Docs(context.Context, *DocsRequest) (*DocsRespo
 }
 func (UnimplementedEntroQServer) ClaimDocs(context.Context, *ClaimDocsRequest) (*ClaimDocsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ClaimDocs not implemented")
+}
+func (UnimplementedEntroQServer) NamespaceStats(context.Context, *NamespacesRequest) (*NamespacesResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method NamespaceStats not implemented")
 }
 func (UnimplementedEntroQServer) mustEmbedUnimplementedEntroQServer() {}
 
@@ -404,6 +418,24 @@ func _EntroQ_ClaimDocs_Handler(srv interface{}, ctx context.Context, dec func(in
 	return interceptor(ctx, in, info, handler)
 }
 
+func _EntroQ_NamespaceStats_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(NamespacesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EntroQServer).NamespaceStats(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/api.EntroQ/NamespaceStats",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EntroQServer).NamespaceStats(ctx, req.(*NamespacesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // EntroQ_ServiceDesc is the grpc.ServiceDesc for EntroQ service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -446,6 +478,10 @@ var EntroQ_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ClaimDocs",
 			Handler:    _EntroQ_ClaimDocs_Handler,
+		},
+		{
+			MethodName: "NamespaceStats",
+			Handler:    _EntroQ_NamespaceStats_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

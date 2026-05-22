@@ -20,24 +20,27 @@ type TasksQuery struct {
 	OmitValues bool
 }
 
-// QueuesQuery modifies a queue listing request.
-type QueuesQuery struct {
+// MatchQuery modifies a listing request by name, for queues or namespaces.
+type MatchQuery struct {
 	// MatchPrefix specifies allowable prefix matches. If empty, limitations
 	// are not set based on prefix matching. All prefix match conditions are ORed.
 	// If both this and MatchExact are empty or nil, no limitations are set on
-	// queue name: all will be returned.
+	// name: all will be returned.
 	MatchPrefix []string
 
 	// MatchExact specifies allowable exact matches. If empty, limitations are
-	// not set on exact queue names.
+	// not set on exact names.
 	MatchExact []string
 
-	// Limit specifies an upper bound on the number of queue names returned.
+	// Limit specifies an upper bound on the number of names returned.
 	Limit int
 }
 
-func newQueuesQuery(opts ...QueuesOpt) *QueuesQuery {
-	q := new(QueuesQuery)
+// QueuesQuery is an alias for MatchQuery for backwards compatibility.
+type QueuesQuery = MatchQuery
+
+func newMatchQuery(opts ...QueuesOpt) *MatchQuery {
+	q := new(MatchQuery)
 	for _, opt := range opts {
 		opt(q)
 	}
@@ -57,6 +60,13 @@ type QueueStat struct {
 	MaxClaims int `json:"maxClaims"` // The maximum number of claims for a task in the queue.
 }
 
+// NamespaceStat holds high-level information about a doc namespace.
+type NamespaceStat struct {
+	Name    string `json:"name"`
+	Size    int    `json:"size"`    // Total number of docs.
+	Claimed int    `json:"claimed"` // Number of docs currently claimed.
+}
+
 // QueuesFromStats can be used for converting the new QueueStats to the old
 // Queues output, making it easier on backend implementers to just define one
 // function (similar to how WaitTryClaim or PollTryClaim can make implementing
@@ -74,14 +84,17 @@ func QueuesFromStats(stats map[string]*QueueStat, err error) (map[string]int, er
 
 // Queues returns a mapping from all queue names to their task counts.
 func (c *EntroQ) Queues(ctx context.Context, opts ...QueuesOpt) (map[string]int, error) {
-	query := newQueuesQuery(opts...)
-	return c.backend.Queues(ctx, query)
+	return c.backend.Queues(ctx, newMatchQuery(opts...))
 }
 
 // QueueStats returns a mapping from queue names to task stats.
 func (c *EntroQ) QueueStats(ctx context.Context, opts ...QueuesOpt) (map[string]*QueueStat, error) {
-	query := newQueuesQuery(opts...)
-	return c.backend.QueueStats(ctx, query)
+	return c.backend.QueueStats(ctx, newMatchQuery(opts...))
+}
+
+// NamespaceStats returns a mapping from doc namespace names to doc stats.
+func (c *EntroQ) NamespaceStats(ctx context.Context, opts ...QueuesOpt) (map[string]*NamespaceStat, error) {
+	return c.backend.NamespaceStats(ctx, newMatchQuery(opts...))
 }
 
 // QueuesEmpty indicates whether the specified task queues are all empty. If no
@@ -123,13 +136,10 @@ func (c *EntroQ) WaitQueuesEmpty(ctx context.Context, opts ...QueuesOpt) error {
 
 // Tasks returns a slice of all tasks in the given queue.
 func (c *EntroQ) Tasks(ctx context.Context, queue string, opts ...TasksOpt) ([]*Task, error) {
-	query := &TasksQuery{
-		Queue: queue,
-	}
+	query := &TasksQuery{Queue: queue}
 	for _, opt := range opts {
 		opt(c, query)
 	}
-
 	return c.backend.Tasks(ctx, query)
 }
 
@@ -175,26 +185,29 @@ func WithTaskID(ids ...string) TasksOpt {
 	}
 }
 
-// QueuesOpt modifies how queue requests are made.
-type QueuesOpt func(*QueuesQuery)
+// QueuesOpt modifies how queue or namespace listing requests are made.
+type QueuesOpt func(*MatchQuery)
 
-// MatchPrefix adds allowable prefix matches for a queue listing.
+// MatchPrefix adds allowable prefix matches for a listing.
 func MatchPrefix(prefixes ...string) QueuesOpt {
-	return func(q *QueuesQuery) {
+	return func(q *MatchQuery) {
 		q.MatchPrefix = append(q.MatchPrefix, prefixes...)
 	}
 }
 
-// MatchExact adds an allowable exact match for a queue listing.
+// MatchExact adds allowable exact matches for a listing.
 func MatchExact(matches ...string) QueuesOpt {
-	return func(q *QueuesQuery) {
+	return func(q *MatchQuery) {
 		q.MatchExact = append(q.MatchExact, matches...)
 	}
 }
 
-// LimitQueues sets the limit on the number of queues that are returned.
-func LimitQueues(limit int) QueuesOpt {
-	return func(q *QueuesQuery) {
+// WithLimit sets the limit on the number of results returned.
+func WithLimit(limit int) QueuesOpt {
+	return func(q *MatchQuery) {
 		q.Limit = limit
 	}
 }
+
+// LimitQueues is an alias for WithLimit for backwards compatibility.
+var LimitQueues = WithLimit

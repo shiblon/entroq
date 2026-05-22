@@ -53,6 +53,8 @@ const (
 	EntroQDocsProcedure = "/api.EntroQ/Docs"
 	// EntroQClaimDocsProcedure is the fully-qualified name of the EntroQ's ClaimDocs RPC.
 	EntroQClaimDocsProcedure = "/api.EntroQ/ClaimDocs"
+	// EntroQNamespaceStatsProcedure is the fully-qualified name of the EntroQ's NamespaceStats RPC.
+	EntroQNamespaceStatsProcedure = "/api.EntroQ/NamespaceStats"
 )
 
 // EntroQClient is a client for the api.EntroQ service.
@@ -70,6 +72,7 @@ type EntroQClient interface {
 	StreamTasks(context.Context, *connect.Request[api.TasksRequest]) (*connect.ServerStreamForClient[api.TasksResponse], error)
 	Docs(context.Context, *connect.Request[api.DocsRequest]) (*connect.Response[api.DocsResponse], error)
 	ClaimDocs(context.Context, *connect.Request[api.ClaimDocsRequest]) (*connect.Response[api.ClaimDocsResponse], error)
+	NamespaceStats(context.Context, *connect.Request[api.NamespacesRequest]) (*connect.Response[api.NamespacesResponse], error)
 }
 
 // NewEntroQClient constructs a client for the api.EntroQ service. By default, it uses the Connect
@@ -143,21 +146,28 @@ func NewEntroQClient(httpClient connect.HTTPClient, baseURL string, opts ...conn
 			connect.WithSchema(entroQMethods.ByName("ClaimDocs")),
 			connect.WithClientOptions(opts...),
 		),
+		namespaceStats: connect.NewClient[api.NamespacesRequest, api.NamespacesResponse](
+			httpClient,
+			baseURL+EntroQNamespaceStatsProcedure,
+			connect.WithSchema(entroQMethods.ByName("NamespaceStats")),
+			connect.WithClientOptions(opts...),
+		),
 	}
 }
 
 // entroQClient implements EntroQClient.
 type entroQClient struct {
-	tryClaim    *connect.Client[api.ClaimRequest, api.ClaimResponse]
-	claim       *connect.Client[api.ClaimRequest, api.ClaimResponse]
-	modify      *connect.Client[api.ModifyRequest, api.ModifyResponse]
-	tasks       *connect.Client[api.TasksRequest, api.TasksResponse]
-	queues      *connect.Client[api.QueuesRequest, api.QueuesResponse]
-	queueStats  *connect.Client[api.QueuesRequest, api.QueuesResponse]
-	time        *connect.Client[api.TimeRequest, api.TimeResponse]
-	streamTasks *connect.Client[api.TasksRequest, api.TasksResponse]
-	docs        *connect.Client[api.DocsRequest, api.DocsResponse]
-	claimDocs   *connect.Client[api.ClaimDocsRequest, api.ClaimDocsResponse]
+	tryClaim       *connect.Client[api.ClaimRequest, api.ClaimResponse]
+	claim          *connect.Client[api.ClaimRequest, api.ClaimResponse]
+	modify         *connect.Client[api.ModifyRequest, api.ModifyResponse]
+	tasks          *connect.Client[api.TasksRequest, api.TasksResponse]
+	queues         *connect.Client[api.QueuesRequest, api.QueuesResponse]
+	queueStats     *connect.Client[api.QueuesRequest, api.QueuesResponse]
+	time           *connect.Client[api.TimeRequest, api.TimeResponse]
+	streamTasks    *connect.Client[api.TasksRequest, api.TasksResponse]
+	docs           *connect.Client[api.DocsRequest, api.DocsResponse]
+	claimDocs      *connect.Client[api.ClaimDocsRequest, api.ClaimDocsResponse]
+	namespaceStats *connect.Client[api.NamespacesRequest, api.NamespacesResponse]
 }
 
 // TryClaim calls api.EntroQ.TryClaim.
@@ -210,6 +220,11 @@ func (c *entroQClient) ClaimDocs(ctx context.Context, req *connect.Request[api.C
 	return c.claimDocs.CallUnary(ctx, req)
 }
 
+// NamespaceStats calls api.EntroQ.NamespaceStats.
+func (c *entroQClient) NamespaceStats(ctx context.Context, req *connect.Request[api.NamespacesRequest]) (*connect.Response[api.NamespacesResponse], error) {
+	return c.namespaceStats.CallUnary(ctx, req)
+}
+
 // EntroQHandler is an implementation of the api.EntroQ service.
 type EntroQHandler interface {
 	TryClaim(context.Context, *connect.Request[api.ClaimRequest]) (*connect.Response[api.ClaimResponse], error)
@@ -225,6 +240,7 @@ type EntroQHandler interface {
 	StreamTasks(context.Context, *connect.Request[api.TasksRequest], *connect.ServerStream[api.TasksResponse]) error
 	Docs(context.Context, *connect.Request[api.DocsRequest]) (*connect.Response[api.DocsResponse], error)
 	ClaimDocs(context.Context, *connect.Request[api.ClaimDocsRequest]) (*connect.Response[api.ClaimDocsResponse], error)
+	NamespaceStats(context.Context, *connect.Request[api.NamespacesRequest]) (*connect.Response[api.NamespacesResponse], error)
 }
 
 // NewEntroQHandler builds an HTTP handler from the service implementation. It returns the path on
@@ -294,6 +310,12 @@ func NewEntroQHandler(svc EntroQHandler, opts ...connect.HandlerOption) (string,
 		connect.WithSchema(entroQMethods.ByName("ClaimDocs")),
 		connect.WithHandlerOptions(opts...),
 	)
+	entroQNamespaceStatsHandler := connect.NewUnaryHandler(
+		EntroQNamespaceStatsProcedure,
+		svc.NamespaceStats,
+		connect.WithSchema(entroQMethods.ByName("NamespaceStats")),
+		connect.WithHandlerOptions(opts...),
+	)
 	return "/api.EntroQ/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case EntroQTryClaimProcedure:
@@ -316,6 +338,8 @@ func NewEntroQHandler(svc EntroQHandler, opts ...connect.HandlerOption) (string,
 			entroQDocsHandler.ServeHTTP(w, r)
 		case EntroQClaimDocsProcedure:
 			entroQClaimDocsHandler.ServeHTTP(w, r)
+		case EntroQNamespaceStatsProcedure:
+			entroQNamespaceStatsHandler.ServeHTTP(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -363,4 +387,8 @@ func (UnimplementedEntroQHandler) Docs(context.Context, *connect.Request[api.Doc
 
 func (UnimplementedEntroQHandler) ClaimDocs(context.Context, *connect.Request[api.ClaimDocsRequest]) (*connect.Response[api.ClaimDocsResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("api.EntroQ.ClaimDocs is not implemented"))
+}
+
+func (UnimplementedEntroQHandler) NamespaceStats(context.Context, *connect.Request[api.NamespacesRequest]) (*connect.Response[api.NamespacesResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("api.EntroQ.NamespaceStats is not implemented"))
 }

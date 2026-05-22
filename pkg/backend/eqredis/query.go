@@ -74,17 +74,17 @@ func (e *EQRedis) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[s
 		return map[string]*entroq.QueueStat{}, nil
 	}
 
-	// Pipeline ZCARD, ZCOUNT (available), and SCARD (inflight) for all queues.
+	// Pipeline ZCARD, ZCOUNT (available), and ZCOUNT >now (claimed) for all queues.
 	pipe := e.client.Pipeline()
 	zcardCmds := make(map[string]*redis.IntCmd, len(names))
 	zcountCmds := make(map[string]*redis.IntCmd, len(names))
-	scardCmds := make(map[string]*redis.IntCmd, len(names))
+	claimedCmds := make(map[string]*redis.IntCmd, len(names))
 	nowStr := fmt.Sprintf("%d", nowMs)
 
 	for _, name := range names {
 		zcardCmds[name] = pipe.ZCard(ctx, queueKey(name))
 		zcountCmds[name] = pipe.ZCount(ctx, queueKey(name), "0", nowStr)
-		scardCmds[name] = pipe.SCard(ctx, inflightKey(name))
+		claimedCmds[name] = pipe.ZCount(ctx, qsclaimedKey(name), fmt.Sprintf("(%d", nowMs), "+inf")
 	}
 	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
 		return nil, fmt.Errorf("queue stats pipeline: %w", err)
@@ -98,7 +98,7 @@ func (e *EQRedis) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[s
 			continue
 		}
 		available := int(zcountCmds[name].Val())
-		claimed := int(scardCmds[name].Val())
+		claimed := int(claimedCmds[name].Val())
 		future := size - available - claimed
 		if future < 0 {
 			future = 0

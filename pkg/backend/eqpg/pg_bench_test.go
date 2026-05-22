@@ -17,7 +17,7 @@ func populateRaw(ctx context.Context, backend *EQPG, n int, queues []string) err
 	const q = `
 		INSERT INTO entroq.tasks (id, version, queue, at, created, modified, claimant, value, claims, attempt, err)
 		SELECT
-			gen_random_uuid(),
+			encode(gen_random_bytes(8), 'hex'),
 			0,
 			$1,
 			now(),

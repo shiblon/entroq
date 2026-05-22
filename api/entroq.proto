@@ -215,6 +215,25 @@ message ClaimDocsResponse {
   repeated Doc docs = 1;
 }
 
+// NamespaceStat contains statistics for a single doc namespace.
+message NamespaceStat {
+  string name = 1;
+  int32 num_docs = 2;
+  int32 num_claimed = 3;
+}
+
+// NamespacesRequest asks for a listing of doc namespaces.
+message NamespacesRequest {
+  repeated string match_prefix = 1;
+  repeated string match_exact = 2;
+  int32 limit = 3;
+}
+
+// NamespacesResponse contains the requested list of namespace statistics.
+message NamespacesResponse {
+  repeated NamespaceStat namespaces = 1;
+}
+
 // ModifyRequest sends a request to modify a set of tasks with given
 // dependencies. It is performed in a transaction, in which either all
 // suggested modifications succeed and all dependencies are satisfied, or
@@ -387,6 +406,12 @@ service EntroQ {
     option (google.api.http) = {
       post: "/api/v0/docs/claim"
       body: "*"
+    };
+  }
+
+  rpc NamespaceStats(NamespacesRequest) returns (NamespacesResponse) {
+    option (google.api.http) = {
+      get: "/api/v0/namespaces/stats"
     };
   }
 }

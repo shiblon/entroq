@@ -156,3 +156,15 @@ func TestDocClaimLocking(t *testing.T) {
 func TestDocInsertWithID(t *testing.T) {
 	RunQTest(t, eqtest.DocInsertWithID)
 }
+
+func TestDocClaimantBehavior(t *testing.T) {
+	RunQTest(t, eqtest.DocClaimantBehavior)
+}
+
+func TestQueueStatsAccuracy(t *testing.T) {
+	RunQTest(t, eqtest.QueueStatsAccuracy)
+}
+
+func TestNamespaceStats(t *testing.T) {
+	RunQTest(t, eqtest.NamespaceStats)
+}
