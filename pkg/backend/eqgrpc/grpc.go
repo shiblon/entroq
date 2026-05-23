@@ -489,6 +489,8 @@ func depErrorFromStat(stat *status.Status) error {
 				Version:   detail.DocId.Version,
 			}
 			switch detail.Type {
+			case pb.ActionType_INSERT:
+				depErr.DocInserts = append(depErr.DocInserts, did)
 			case pb.ActionType_CLAIM:
 				depErr.DocClaims = append(depErr.DocClaims, did)
 			case pb.ActionType_DELETE:

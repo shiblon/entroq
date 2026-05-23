@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import List, Tuple, Optional, Union
 
-from .types import Task, TaskData, TaskChange, TaskID
+from .types import Task, TaskData, TaskChange, TaskID, Doc, DocData, DocChange, DocID
 
 class EntroQBase(ABC):
     """Abstract base class for EntroQ clients."""
@@ -41,5 +41,43 @@ class EntroQBase(ABC):
         depends: List[Union[Task, TaskID]] = (),
         unsafe_claimant_id: Optional[str] = None,
     ) -> Tuple[List[Task], List[Task]]:
-        """Atomically apply modifications."""
+        """Atomically apply task modifications."""
+        pass
+
+    @abstractmethod
+    def docs(
+        self,
+        namespace: str = '',
+        key_start: str = '',
+        key_end: str = '',
+        limit: int = 0,
+        omit_values: bool = False,
+    ) -> List[Doc]:
+        """Return docs in a namespace, optionally filtered by key range [key_start, key_end)."""
+        pass
+
+    @abstractmethod
+    def claim_docs(
+        self,
+        namespace: str,
+        key: str,
+        duration_ms: int = 30000,
+    ) -> List[Doc]:
+        """Atomically claim all docs sharing key in namespace.
+
+        Returns empty list if no docs with that key exist.
+        Raises DependencyError if any matching doc is already claimed by another claimant.
+        """
+        pass
+
+    @abstractmethod
+    def modify_docs(
+        self,
+        inserts: List[DocData] = (),
+        changes: List[DocChange] = (),
+        deletes: List[Union[Doc, DocID]] = (),
+        depends: List[Union[Doc, DocID]] = (),
+        unsafe_claimant_id: Optional[str] = None,
+    ) -> Tuple[List[Doc], List[Doc]]:
+        """Atomically apply doc modifications. Returns (inserted_docs, changed_docs)."""
         pass

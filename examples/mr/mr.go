@@ -506,7 +506,7 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 	if len(tasks) <= 1 {
 		return nil
 	}
-	err := worker.DoWithRenewAll(ctx, w.client, tasks, claimDuration, func(ctx context.Context, stop worker.FinalizeRenewAll) error {
+	err := worker.DoWhileRenewing(ctx, w.client, func(ctx context.Context, stop worker.FinalizeRenew) error {
 		// Append and sort. Note that in real life with real scale, we would
 		// want to do an on-disk merge sort (since individual components would
 		// already be sorted).
@@ -526,11 +526,11 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 
 		// Now all key/value pairs are merged into a single sorted list. Create a new task and delete the others.
 		// Stop to get stable version tasks (no longer renewed in the background).
-		updatedTasks := stop()
+		stable := stop()
 
 		var modArgs []entroq.ModifyArg
 		modArgs = append(modArgs, entroq.InsertingInto(w.InputQueue, entroq.WithValue(kvs)))
-		for _, t := range updatedTasks {
+		for _, t := range stable.Tasks {
 			modArgs = append(modArgs, t.Delete())
 		}
 		if _, err := w.client.Modify(ctx, modArgs...); err != nil {
@@ -538,7 +538,7 @@ func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) err
 		}
 
 		return nil
-	})
+	}, entroq.RenewingTasks(tasks), entroq.WithRenewInterval(claimDuration))
 	if err != nil {
 		return fmt.Errorf("merge while claimed: %w", err)
 	}
@@ -596,7 +596,7 @@ func reduceSortedKVs(ctx context.Context, reduce Reducer, kvs []*KV) ([]*KV, err
 // and runs a reduce function on each set corresponding to a unique key,
 // writing them out in the order they appear (to maintain sorting).
 func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error {
-	if err := worker.DoWithRenew(ctx, w.client, task, claimDuration, func(ctx context.Context, stop worker.FinalizeRenew) error {
+	if err := worker.DoWhileRenewing(ctx, w.client, func(ctx context.Context, stop worker.FinalizeRenew) error {
 		kvs, err := entroq.GetValue[[]*KV](task)
 		if err != nil {
 			return fmt.Errorf("reduce from json: %w", err)
@@ -606,13 +606,13 @@ func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error 
 		if err != nil {
 			return fmt.Errorf("reduce sorted: %w", err)
 		}
-		updatedTask := stop()
+		stable := stop()
 
-		if _, err := w.client.Modify(ctx, updatedTask.Delete(), entroq.InsertingInto(w.OutputQueue, entroq.WithValue(outputs))); err != nil {
+		if _, err := w.client.Modify(ctx, stable.Tasks[0].Delete(), entroq.InsertingInto(w.OutputQueue, entroq.WithValue(outputs))); err != nil {
 			return fmt.Errorf("reduce output: %w", err)
 		}
 		return nil
-	}); err != nil {
+	}, entroq.RenewingTask(task), entroq.WithRenewInterval(claimDuration)); err != nil {
 		return fmt.Errorf("reduce task: %w", err)
 	}
 	return nil

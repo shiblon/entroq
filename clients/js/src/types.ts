@@ -73,7 +73,132 @@ export interface ClaimResponse {
 }
 
 /**
- * ModifyRequest to atomically update, insert, or delete tasks.
+ * DocID identifies a specific version of a doc.
+ */
+export interface DocID {
+  namespace: string;
+  id: string;
+  version: number;
+}
+
+/**
+ * DocData holds the data portion of a doc, used for insertions.
+ * atMs controls claim behavior on changes: "0" (or omitted) releases the
+ * claim; a future ms timestamp sets the caller as claimant until then.
+ */
+export interface DocData {
+  namespace: string;
+  id?: string;
+  key: string;
+  secondaryKey?: string;
+  content?: any;
+  atMs?: string; // int64 -> string; future = claim/renew, "0" = release
+  createdMs?: string; // for journal replay only
+  modifiedMs?: string; // for journal replay only
+}
+
+/**
+ * DocChange identifies a doc by DocID and provides updated data.
+ */
+export interface DocChange {
+  oldId: DocID;
+  newData: DocData;
+}
+
+/**
+ * Doc is a complete doc object.
+ */
+export interface Doc {
+  namespace: string;
+  id: string;
+  version: number;
+  claimant: string;
+  atMs: string; // int64 -> string
+  key: string;
+  secondaryKey: string;
+  content?: any;
+  createdMs: string; // int64 -> string
+  modifiedMs: string; // int64 -> string
+}
+
+/**
+ * DocQuery describes a listing request for docs in a namespace.
+ * If ids is non-empty, key range and limit are ignored.
+ */
+export interface DocQuery {
+  namespace: string;
+  keyStart?: string;
+  keyEnd?: string;
+  limit?: number;
+  omitValues?: boolean;
+  ids?: string[];
+}
+
+/**
+ * DocClaim describes an atomic all-or-nothing claim of docs sharing a key.
+ */
+export interface DocClaim {
+  namespace: string;
+  key: string;
+  durationMs?: string; // int64 -> string; defaults to DefaultClaimDuration
+  claimant?: string;   // normally auto-set by the client
+}
+
+/**
+ * DocsRequest asks for a listing of docs matching a query.
+ */
+export interface DocsRequest {
+  query: DocQuery;
+}
+
+/**
+ * DocsResponse contains the listed docs.
+ */
+export interface DocsResponse {
+  docs: Doc[];
+}
+
+/**
+ * ClaimDocsRequest asks to atomically claim a set of docs.
+ */
+export interface ClaimDocsRequest {
+  claimQuery: DocClaim;
+}
+
+/**
+ * ClaimDocsResponse contains the claimed docs.
+ */
+export interface ClaimDocsResponse {
+  docs: Doc[];
+}
+
+/**
+ * NamespaceStat contains statistics for a single doc namespace.
+ */
+export interface NamespaceStat {
+  name: string;
+  numDocs: number;
+  numClaimed: number;
+}
+
+/**
+ * NamespacesRequest asks for a listing of doc namespaces.
+ */
+export interface NamespacesRequest {
+  matchPrefix?: string[];
+  matchExact?: string[];
+  limit?: number;
+}
+
+/**
+ * NamespacesResponse contains the requested namespace statistics.
+ */
+export interface NamespacesResponse {
+  namespaces: NamespaceStat[];
+}
+
+/**
+ * ModifyRequest to atomically update, insert, or delete tasks and docs.
  */
 export interface ModifyRequest {
   claimantId: string;
@@ -81,6 +206,10 @@ export interface ModifyRequest {
   changes?: TaskChange[];
   deletes?: TaskID[];
   depends?: TaskID[];
+  docInserts?: DocData[];
+  docChanges?: DocChange[];
+  docDeletes?: DocID[];
+  docDepends?: DocID[];
 }
 
 /**
@@ -89,6 +218,8 @@ export interface ModifyRequest {
 export interface ModifyResponse {
   inserted?: Task[];
   changed?: Task[];
+  insertedDocs?: Doc[];
+  changedDocs?: Doc[];
 }
 
 /**
@@ -133,7 +264,7 @@ export interface TimeResponse {
 }
 
 /**
- * EntroQClientInterface defines the methods required by a worker.
+ * EntroQClientInterface defines the methods required by a task worker.
  */
 export interface EntroQClientInterface {
   claim(
@@ -144,4 +275,14 @@ export interface EntroQClientInterface {
   modify(
     request: Omit<ModifyRequest, "claimantId">
   ): Promise<ModifyResponse>;
+}
+
+/**
+ * EntroQDocClientInterface extends EntroQClientInterface with doc operations,
+ * required by a doc-aware worker.
+ */
+export interface EntroQDocClientInterface extends EntroQClientInterface {
+  docs(request: DocsRequest): Promise<DocsResponse>;
+  claimDocs(request: ClaimDocsRequest): Promise<ClaimDocsResponse>;
+  namespaceStats(request?: NamespacesRequest): Promise<NamespacesResponse>;
 }
