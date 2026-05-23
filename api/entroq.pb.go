@@ -171,7 +171,7 @@ type TaskData struct {
 	AtMs int64 `protobuf:"varint,2,opt,name=at_ms,json=atMs,proto3" json:"at_ms,omitempty"`
 	// The task's JSON payload.
 	Value *structpb.Value `protobuf:"bytes,3,opt,name=value,proto3" json:"value,omitempty"`
-	// An optional ID (UUID) for an inserted task to use.
+	// An optional ID for an inserted task to use.
 	// Default is for the backend to assign one, and that is sufficient for many
 	// cases. If you desire to make a database entry that *references* a task,
 	// however, in that case it can make sense to specify an explicit task ID for
@@ -328,7 +328,7 @@ type Task struct {
 	Version int32  `protobuf:"varint,3,opt,name=version,proto3" json:"version,omitempty"`
 	// The epoch time in millis when this task becomes available.
 	AtMs int64 `protobuf:"varint,4,opt,name=at_ms,json=atMs,proto3" json:"at_ms,omitempty"`
-	// The UUID representing the claimant (owner) for this task.
+	// The ID representing the claimant (owner) for this task.
 	ClaimantId string `protobuf:"bytes,5,opt,name=claimant_id,json=claimantId,proto3" json:"claimant_id,omitempty"`
 	// The task's JSON payload.
 	Value *structpb.Value `protobuf:"bytes,6,opt,name=value,proto3" json:"value,omitempty"`
