@@ -514,6 +514,108 @@ func (c *EntroQ) TryClaim(ctx context.Context, opts ...ClaimOpt) (*Task, error) 
 	return c.backend.TryClaim(ctx, query)
 }
 
+// RenewConfig holds all options for renewal.
+type RenewConfig struct {
+	Interval time.Duration
+	Tasks    []*Task
+	Docs     []*Doc
+}
+
+// NewRenewConfig creates a RenewConfig from the given options.
+func NewRenewConfig(opts ...RenewOption) *RenewConfig {
+	c := &RenewConfig{
+		Interval: DefaultClaimDuration,
+	}
+	for _, o := range opts {
+		o(c)
+	}
+	return c
+}
+
+// IsEmpty signals whether there are no tasks or documents in this RenewConfig.
+func (rc *RenewConfig) IsEmpty() bool {
+	return len(rc.Tasks) == 0 && len(rc.Docs) == 0
+}
+
+// RenewOption lets you specify what to do during a renewal
+type RenewOption func(*RenewConfig)
+
+// RenewingTasks specifies tasks to refresh in Renew.
+func RenewingTasks(ts []*Task) RenewOption {
+	return func(rc *RenewConfig) {
+		rc.Tasks = ts
+	}
+}
+
+// RenewingTask specifies one task to renew. Calling this is an append
+// operation - you may call it multiple times to renew multiple tasks.
+func RenewingTask(t *Task) RenewOption {
+	return func(rc *RenewConfig) {
+		rc.Tasks = append(rc.Tasks, t)
+	}
+}
+
+// RenewingDocs specifies docs to refresh in Renew.
+func RenewingDocs(ds []*Doc) RenewOption {
+	return func(rc *RenewConfig) {
+		rc.Docs = ds
+	}
+}
+
+// RenewingDoc specifies a single doc to refresh. Appends to the config.
+func RenewingDoc(d *Doc) RenewOption {
+	return func(rc *RenewConfig) {
+		rc.Docs = append(rc.Docs, d)
+	}
+}
+
+// WithRenewInterval sets the lease time for renewed tasks.
+func WithRenewInterval(dt time.Duration) RenewOption {
+	return func(rc *RenewConfig) {
+		rc.Interval = dt
+	}
+}
+
+// RenewResponse stores tasks and docs that were updated.
+type RenewResponse struct {
+	Tasks []*Task
+	Docs  []*Doc
+}
+
+// RenewEverything updates the At time of all specified tasks and docs.
+func (c *EntroQ) Renew(ctx context.Context, opts ...RenewOption) (*RenewResponse, error) {
+	conf := NewRenewConfig(opts...)
+	if len(conf.Tasks) == 0 && len(conf.Docs) == 0 {
+		return nil, fmt.Errorf("renew: no docs or tasks specified")
+	}
+	// Note that we use the default claimant always in this situation. These
+	// functions are high-level user-friendly things and don't allow some of
+	// the other hocus pocus that might happen in a grpc proxy situation (where
+	// claimant IDs need to come from the request, not the client it uses to
+	// perform its work).
+	var modArgs []ModifyArg
+	var taskIDs []string
+	var docIDs []string
+	for _, t := range conf.Tasks {
+		modArgs = append(modArgs, t.Change(ArrivalTimeBy(conf.Interval)))
+		taskIDs = append(taskIDs, t.IDVersion().String())
+	}
+	for _, d := range conf.Docs {
+		modArgs = append(modArgs, d.Change(WithDocArrivalTimeBy(conf.Interval)))
+		docIDs = append(docIDs, d.IDVersion().String())
+	}
+	resp, err := c.Modify(ctx, modArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("renewal failed for tasks/docs %q/%q: %w", taskIDs, docIDs, err)
+	}
+	changed := resp.ChangedTasks
+	changedDocs := resp.ChangedDocs
+	if len(changed) != len(conf.Tasks) || len(changedDocs) != len(conf.Docs) {
+		return nil, fmt.Errorf("renewal expected updates of %d tasks / %d docs, got %d / %d", len(conf.Tasks), len(conf.Docs), len(changed), len(changedDocs))
+	}
+	return &RenewResponse{Tasks: changed, Docs: changedDocs}, nil
+}
+
 // RenewFor attempts to renew the given task's lease (update arrival time) for
 // the given duration. Returns the new task.
 func (c *EntroQ) RenewFor(ctx context.Context, task *Task, duration time.Duration) (*Task, error) {

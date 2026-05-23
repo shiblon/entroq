@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from typing import List, Tuple, Optional, Callable, Iterator, Union
 
-from .types import Task, TaskData, TaskChange, TaskID, DependencyError
+from .types import Task, TaskData, TaskChange, TaskID, DependencyError, Doc, DocChange
 from .base import EntroQBase
 
 class StopWorker(Exception):

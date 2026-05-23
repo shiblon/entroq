@@ -610,6 +610,7 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 			}
 			// Doc dependency details carry DocID instead of TaskID.
 			docMap := map[pb.ActionType][]*entroq.DocID{
+				pb.ActionType_INSERT: depErr.DocInserts,
 				pb.ActionType_DELETE: depErr.DocDeletes,
 				pb.ActionType_DEPEND: depErr.DocDepends,
 				pb.ActionType_CHANGE: depErr.DocChanges,

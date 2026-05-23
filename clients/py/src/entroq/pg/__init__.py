@@ -22,7 +22,10 @@ from typing import Iterator, List, Optional, Tuple, Union
 import psycopg
 from psycopg.rows import dict_row
 
-from ..types import Task, TaskData, TaskChange, TaskID, DependencyError
+from ..types import (
+    Task, TaskData, TaskChange, TaskID, DependencyError,
+    Doc, DocData, DocChange, DocID, _DOC_RELEASE_AT,
+)
 from ..base import EntroQBase
 from ..worker import renewing as common_renewing, EntroQWorker as common_worker, StopWorker
 
@@ -105,6 +108,61 @@ def _row_to_task(row: dict) -> Task:
     )
 
 
+def _row_to_doc(row: dict) -> Doc:
+    return Doc(
+        namespace=row['namespace'],
+        id=str(row['id']),
+        version=row['version'],
+        key=row['key_primary'],
+        secondary_key=row['key_secondary'],
+        content=row['value'],
+        claimant=str(row['claimant']) if row['claimant'] else '',
+        at=row['at'],
+        created=row['created'],
+        modified=row['modified'],
+    )
+
+
+def _encode_doc_ids(items) -> str:
+    return json.dumps([
+        {'namespace': i.namespace, 'id': str(i.id), 'version': i.version}
+        for i in items
+    ])
+
+
+def _encode_doc_inserts(items) -> str:
+    out = []
+    for it in items:
+        obj = {
+            'namespace': it.namespace,
+            'key_primary': it.key,
+            'key_secondary': it.secondary_key,
+        }
+        if it.id:
+            obj['id'] = str(it.id)
+        if it.content is not None:
+            obj['content'] = it.content
+        out.append(obj)
+    return json.dumps(out)
+
+
+def _encode_doc_changes(items) -> str:
+    out = []
+    for c in items:
+        obj = {
+            'namespace': c.namespace,
+            'id': str(c.id),
+            'version': c.version,
+            'key_primary': c.key,
+            'key_secondary': c.secondary_key,
+            'at': (c.at or _DOC_RELEASE_AT).isoformat(),
+        }
+        if c.content is not None:
+            obj['content'] = c.content
+        out.append(obj)
+    return json.dumps(out)
+
+
 # ---------------------------------------------------------------------------
 # Transaction
 # ---------------------------------------------------------------------------
@@ -168,6 +226,49 @@ class Transaction:
         for row in rows:
             t = _row_to_task(row)
             (inserted if row['kind'] == 'inserted' else changed).append(t)
+        return inserted, changed
+
+    def modify_docs(
+        self,
+        inserts=(),
+        changes=(),
+        deletes=(),
+        depends=(),
+        unsafe_claimant_id=None,
+    ) -> Tuple[List['Doc'], List['Doc']]:
+        """Atomically apply doc inserts, changes, deletes, and dependency checks.
+
+        Runs within the enclosing transaction. A DependencyError rolls back
+        the entire transaction on context manager exit.
+        """
+        claimant = unsafe_claimant_id or self._claimant
+        try:
+            rows = self.conn.execute(
+                '''SELECT kind, namespace, id, version, claimant, at,
+                          key_primary, key_secondary, value, created, modified
+                   FROM modify_docs(%s, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb)''',
+                (
+                    claimant,
+                    _encode_doc_ids(depends),
+                    _encode_doc_ids(deletes),
+                    _encode_doc_inserts(inserts),
+                    _encode_doc_changes(changes),
+                ),
+            ).fetchall()
+        except psycopg.DatabaseError as e:
+            if e.diag.sqlstate == 'EQ001':
+                detail = json.loads(e.diag.message_detail)
+                raise DependencyError(
+                    missing=detail.get('missing', []),
+                    mismatched=detail.get('mismatched', []),
+                    collisions=detail.get('collisions', []),
+                ) from e
+            raise
+
+        inserted, changed = [], []
+        for row in rows:
+            d = _row_to_doc(row)
+            (inserted if row['kind'] == 'inserted' else changed).append(d)
         return inserted, changed
 
 
@@ -371,6 +472,66 @@ class EntroQ(EntroQBase):
             self.modify(deletes=[task.as_id()])
             yield task
 
+    def docs(
+        self,
+        namespace: str = '',
+        key_start: str = '',
+        key_end: str = '',
+        limit: int = 0,
+        omit_values: bool = False,
+    ) -> List[Doc]:
+        """Return docs in a namespace, optionally filtered by key range [key_start, key_end)."""
+        with psycopg.connect(self._connstr, row_factory=dict_row, options="-c search_path=entroq,public") as conn:
+            return [_row_to_doc(r) for r in conn.execute(
+                'SELECT * FROM docs(%s, %s, %s, %s, %s)',
+                (namespace, key_start, key_end, limit, omit_values),
+            ).fetchall()]
+
+    def claim_docs(
+        self,
+        namespace: str,
+        key: str,
+        duration_ms: int = 30000,
+    ) -> List[Doc]:
+        """Atomically claim all docs sharing key in namespace.
+
+        Returns empty list if no docs with that key exist.
+        Raises DependencyError if any matching doc is already claimed by another claimant.
+        """
+        with psycopg.connect(self._connstr, row_factory=dict_row, options="-c search_path=entroq,public") as conn:
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM claim_docs(%s, %s, %s::interval, %s)",
+                    (namespace, self._claimant, f'{duration_ms} milliseconds', key),
+                ).fetchall()
+            except psycopg.DatabaseError as e:
+                if e.diag.sqlstate == 'EQ001':
+                    detail = json.loads(e.diag.message_detail)
+                    raise DependencyError(
+                        message=str(e),
+                        missing=detail.get('missing_docs', []),
+                        collisions=detail.get('claimed_docs', []),
+                    ) from e
+                raise
+        return [_row_to_doc(r) for r in rows]
+
+    def modify_docs(
+        self,
+        inserts: List[DocData] = (),
+        changes: List[DocChange] = (),
+        deletes: List[Union[Doc, DocID]] = (),
+        depends: List[Union[Doc, DocID]] = (),
+        unsafe_claimant_id: Optional[str] = None,
+    ) -> Tuple[List[Doc], List[Doc]]:
+        """Atomically apply doc modifications. Returns (inserted_docs, changed_docs)."""
+        with self.transaction() as txn:
+            return txn.modify_docs(
+                inserts=inserts,
+                changes=changes,
+                deletes=deletes,
+                depends=depends,
+                unsafe_claimant_id=unsafe_claimant_id,
+            )
 
 
 class EQWorker(common_worker):

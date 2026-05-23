@@ -188,20 +188,20 @@ func Example_manualClaimAndRenew() {
 		log.Fatalf("claim failed: %v", err)
 	}
 
-	// 2. Wrap your work in worker.DoWithRenew so the task doesn't expire while you work.
-	err = worker.DoWithRenew(ctx, eq, task, 5*time.Second, func(ctx context.Context, stop worker.FinalizeRenew) error {
+	// 2. Wrap your work in worker.DoWhileRenewing so the task doesn't expire while you work.
+	err = worker.DoWhileRenewing(ctx, eq, func(ctx context.Context, stop worker.FinalizeRenew) error {
 
 		// ... do some long running work ...
 
 		// 3. Stop background renewal to get a stable, finalized version of the task.
-		finalTask := stop()
+		stable := stop()
 
 		// 4. Commit the work (by deleting the task or mutating it).
-		if _, err := eq.Modify(ctx, finalTask.Delete()); err != nil {
+		if _, err := eq.Modify(ctx, stable.Tasks[0].Delete()); err != nil {
 			return fmt.Errorf("failed to commit: %w", err)
 		}
 		return nil
-	})
+	}, entroq.RenewingTask(task), entroq.WithRenewInterval(5*time.Second))
 
 	if err != nil {
 		log.Fatalf("manual processing failed: %v", err)
@@ -212,7 +212,7 @@ func Example_manualClaimAndRenew() {
 	// task processed
 }
 
-func TestDoWithRenewAll_ImmediateCancellationOnLeaseLoss(t *testing.T) {
+func TestDoWhileRenewing_ImmediateCancellationOnLeaseLoss(t *testing.T) {
 	ctx := context.Background()
 	eq, err := entroq.New(ctx, eqmem.Opener())
 	if err != nil {
@@ -238,11 +238,11 @@ func TestDoWithRenewAll_ImmediateCancellationOnLeaseLoss(t *testing.T) {
 
 	go func() {
 		// Use a short renewal interval to speed up the test.
-		errChan <- worker.DoWithRenewAll(ctx, eq, []*entroq.Task{claimed}, 100*time.Millisecond, func(ctx context.Context, stop worker.FinalizeRenewAll) error {
+		errChan <- worker.DoWhileRenewing(ctx, eq, func(ctx context.Context, stop worker.FinalizeRenew) error {
 			// Wait for the context to be canceled from the outside.
 			<-ctx.Done()
 			return ctx.Err()
-		})
+		}, entroq.RenewingTask(claimed), entroq.WithRenewInterval(100*time.Millisecond))
 	}()
 
 	// 3. Poach the task from underneath the worker.
@@ -251,7 +251,7 @@ func TestDoWithRenewAll_ImmediateCancellationOnLeaseLoss(t *testing.T) {
 		t.Fatalf("failed to steal task: %v", err)
 	}
 
-	// 4. Verify that DoWithRenewAll returns DependencyError (wrapped or direct)
+	// 4. Verify that DoWhileRenewing returns DependencyError (wrapped or direct)
 	// and that it happened quickly.
 	select {
 	case err := <-errChan:
