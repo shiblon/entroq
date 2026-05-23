@@ -16,8 +16,6 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"log"
 	"time"
 
@@ -68,7 +66,7 @@ var rmCmd = &cobra.Command{
 				modArgs = append(modArgs, entroq.ModifyAs(task.Claimant))
 			}
 
-			resp, err := eq.Modify(ctx, modArgs...)
+			_, err = eq.Modify(ctx, modArgs...)
 			if err != nil {
 				log.Printf("Try %d/%d - could not remove task %v: %v", i+1, flagRmRetries, flagRmID, err)
 				delErr = err
@@ -76,12 +74,6 @@ var rmCmd = &cobra.Command{
 				continue
 			}
 
-			b, err := json.Marshal(resp.ChangedTasks)
-			if err != nil {
-				log.Fatalf("JSON marshal: %v", err)
-			}
-
-			fmt.Println(string(b))
 			return
 		}
 		log.Fatalf("Could not delete task %v: %v", flagRmID, delErr)
