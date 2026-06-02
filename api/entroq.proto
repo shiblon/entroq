@@ -174,10 +174,12 @@ message Doc {
   int64 modified_ms = 10;
 }
 
-// DocQuery describes a listing request for docs in a namespace. If ids is
-// non-empty, only those docs are returned (key range and limit are ignored).
-// Otherwise, key_start and key_end form a half-open range [key_start, key_end)
-// on key_primary; leaving key_end empty lists from key_start onward.
+// DocQuery describes a listing request for docs in a namespace. Exactly one
+// of the following filter modes should be set (they are mutually exclusive):
+//   - ids: return only those specific docs (key range and limit are ignored).
+//   - key_exact: return all docs with exactly this primary key.
+//   - key_start / key_end: half-open range [key_start, key_end) on key_primary;
+//     leaving key_end empty lists from key_start onward.
 message DocQuery {
   string namespace = 1;
   string key_start = 2;
@@ -185,6 +187,7 @@ message DocQuery {
   int32 limit = 4;
   bool omit_values = 5;
   repeated string ids = 6;
+  string key_exact = 7;
 }
 
 // DocClaim describes an atomic all-or-nothing claim of docs in a namespace.

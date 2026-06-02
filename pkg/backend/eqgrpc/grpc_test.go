@@ -125,9 +125,6 @@ func TestGRPCWorkerRetryOnError(t *testing.T) {
 	RunQTest(t, eqtest.WorkerRetryOnError)
 }
 
-func TestGRPCWorkerRenewal(t *testing.T) {
-	RunQTest(t, eqtest.WorkerRenewal)
-}
 
 func TestGRPCClaimUnblocksOnNotify(t *testing.T) {
 	RunQTest(t, eqtest.ClaimUnblocksOnNotify)

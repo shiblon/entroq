@@ -517,7 +517,7 @@ func DocInsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 	}
 
 	// Verify the original content is unchanged (no silent overwrite).
-	docs, err := client.Docs(ctx, entroq.DocsIn(ns).WithIDs(knownID))
+	docs, err := client.Docs(ctx, &entroq.DocQuery{Namespace: ns, IDs: []string{knownID}})
 	if err != nil {
 		t.Fatalf("verify after collision: %v", err)
 	}
@@ -538,7 +538,7 @@ func DocInsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 		t.Fatalf("skip-colliding insert: expected no error, got %v", err)
 	}
 
-	docs, err = client.Docs(ctx, entroq.DocsIn(ns).WithIDs(knownID))
+	docs, err = client.Docs(ctx, &entroq.DocQuery{Namespace: ns, IDs: []string{knownID}})
 	if err != nil {
 		t.Fatalf("verify after skip: %v", err)
 	}
@@ -567,7 +567,7 @@ func DocInsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 		t.Fatalf("skip-colliding + new insert: expected no error, got %v", err)
 	}
 
-	docs, err = client.Docs(ctx, entroq.DocsIn(ns))
+	docs, err = client.Docs(ctx, &entroq.DocQuery{Namespace: ns})
 	if err != nil {
 		t.Fatalf("final list: %v", err)
 	}

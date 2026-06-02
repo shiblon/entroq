@@ -37,6 +37,7 @@ func (b *backend) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc,
 		Query: &pb.DocQuery{
 			Namespace:  rq.Namespace,
 			Ids:        rq.IDs,
+			KeyExact:  rq.KeyExact,
 			KeyStart:   rq.KeyStart,
 			KeyEnd:     rq.KeyEnd,
 			Limit:      int32(rq.Limit),

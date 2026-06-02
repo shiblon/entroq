@@ -7,7 +7,7 @@ type OPADocument struct {
 	Mesh OPAMesh `json:"mesh"`
 }
 
-// OPAMesh holds the two sections of mesh authorization data.
+// OPAMesh holds the mesh authorization data pushed to OPA.
 type OPAMesh struct {
 	// Initialized is always true when written by the operator. Rego checks this
 	// to distinguish "document not yet loaded" from "no policy exists".
@@ -15,6 +15,10 @@ type OPAMesh struct {
 
 	// Queues is the list of queue policies derived from EntroQQueue resources.
 	Queues []OPAQueuePolicy `json:"queues"`
+
+	// Namespaces is the list of doc namespace policies derived from the
+	// namespaces field of EntroQQueue resources.
+	Namespaces []OPANamespacePolicy `json:"namespaces"`
 
 	// Identities maps each service account identity string to its mesh label
 	// claims, derived from EntroQIdentity resources.
@@ -28,7 +32,21 @@ type OPAQueuePolicy struct {
 	// Pattern is the queue path or pattern.
 	Pattern string `json:"pattern"`
 
-	// MatchType is one of "Exact", "Prefix", or "Glob".
+	// MatchType is one of "Exact" or "Prefix".
+	MatchType string `json:"matchType"`
+
+	// AllowedCallers is a list of label requirement sets. A caller is permitted
+	// if its labels satisfy at least one entry (OR across entries, AND within).
+	AllowedCallers []map[string]string `json:"allowedCallers"`
+}
+
+// OPANamespacePolicy describes a single doc namespace pattern and the callers
+// permitted to access it. Structurally identical to OPAQueuePolicy.
+type OPANamespacePolicy struct {
+	// Pattern is the namespace path or pattern.
+	Pattern string `json:"pattern"`
+
+	// MatchType is one of "Exact" or "Prefix".
 	MatchType string `json:"matchType"`
 
 	// AllowedCallers is a list of label requirement sets. A caller is permitted

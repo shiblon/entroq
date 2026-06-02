@@ -88,6 +88,10 @@ paths:
                     type: array
                     items:
                         type: string
+                - name: query.keyExact
+                  in: query
+                  schema:
+                    type: string
             responses:
                 "200":
                     description: OK
