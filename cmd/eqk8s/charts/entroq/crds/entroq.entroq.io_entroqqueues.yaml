@@ -39,6 +39,55 @@ spec:
           spec:
             description: EntroQQueueSpec defines the desired state of EntroQQueue.
             properties:
+              namespaces:
+                description: |-
+                  namespaces is the list of doc namespace patterns and their associated
+                  access policies. Optional: omit when no namespace grants are needed.
+                items:
+                  description: NamespacePattern pairs a doc namespace path pattern
+                    with its access policy.
+                  properties:
+                    allowedCallers:
+                      description: |-
+                        allowedCallers lists the label matchers that grant access to this namespace.
+                        A caller is permitted if it satisfies at least one matcher (OR semantics).
+                      items:
+                        description: |-
+                          LabelMatcher specifies a set of required label key/value pairs.
+                          A caller satisfies this matcher only if it carries all specified labels (AND semantics).
+                          Label keys and values must follow k8s label conventions.
+                        properties:
+                          labels:
+                            additionalProperties:
+                              type: string
+                            description: Labels is the set of key/value pairs that
+                              must all be present on the caller.
+                            minProperties: 1
+                            type: object
+                        required:
+                        - labels
+                        type: object
+                      minItems: 1
+                      type: array
+                    matchType:
+                      default: Exact
+                      description: |-
+                        matchType controls how pattern is applied: Exact or Prefix.
+                        Defaults to Exact.
+                      enum:
+                      - Exact
+                      - Prefix
+                      type: string
+                    pattern:
+                      description: pattern is the namespace path to match, interpreted
+                        according to matchType.
+                      minLength: 1
+                      type: string
+                  required:
+                  - allowedCallers
+                  - pattern
+                  type: object
+                type: array
               queues:
                 description: queues is the list of queue patterns and their associated
                   access policies.

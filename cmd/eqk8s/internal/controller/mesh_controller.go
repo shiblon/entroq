@@ -135,6 +135,17 @@ func buildMesh(queues []entroqv1alpha1.EntroQQueue, identities []entroqv1alpha1.
 				AllowedCallers: callers,
 			})
 		}
+		for _, np := range q.Spec.Namespaces {
+			var callers []map[string]string
+			for _, ac := range np.AllowedCallers {
+				callers = append(callers, ac.Labels)
+			}
+			mesh.Namespaces = append(mesh.Namespaces, eqk8s.OPANamespacePolicy{
+				Pattern:        np.Pattern,
+				MatchType:      string(np.MatchType),
+				AllowedCallers: callers,
+			})
+		}
 	}
 
 	for _, id := range identities {
