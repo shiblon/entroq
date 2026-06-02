@@ -30,7 +30,7 @@ func TestSharedEQSidecar(t *testing.T) {
 	defer stopEQ()
 
 	const queue = "svc-test"
-	stopReceivers := mustStartReceivers(ctx, t, eq, queue, upstream.URL, 2)
+	stopReceivers := mustStartReceivers(ctx, t, eq, "/"+queue, upstream.URL, 2)
 	defer stopReceivers()
 
 	sender := async.NewSender(eq, "", async.WithSenderDomainSuffix(".test"))
