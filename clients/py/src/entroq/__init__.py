@@ -1,3 +1,8 @@
-from .types import Task, TaskID, TaskData, TaskChange, DependencyError, Doc, DocID, DocData, DocChange
-from .worker import EntroQWorker, StopWorker, renewing
+from .types import (
+    Task, TaskID, TaskData, TaskChange,
+    Doc, DocID, DocData, DocChange,
+    Modification, ModifyResult,
+    DependencyError,
+)
+from .worker import EntroQWorker, Handler, StopWorker, RetryError, MoveError, DocClaim
 from .base import EntroQBase

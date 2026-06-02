@@ -264,7 +264,7 @@ export interface TimeResponse {
 }
 
 /**
- * EntroQClientInterface defines the methods required by a task worker.
+ * EntroQClientInterface defines the methods required by a worker.
  */
 export interface EntroQClientInterface {
   claim(
@@ -275,6 +275,7 @@ export interface EntroQClientInterface {
   modify(
     request: Omit<ModifyRequest, "claimantId">
   ): Promise<ModifyResponse>;
+  claimDocs(request: ClaimDocsRequest): Promise<ClaimDocsResponse>;
 }
 
 /**

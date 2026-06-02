@@ -88,11 +88,10 @@ describe("EntroQ Integration", () => {
     const worker = new EntroQWorker(client, { leaseMs: 1000, pollMs: 100 });
     
     let handledValue: any;
-    const workerPromise = worker.run([q], async (task, stop) => {
+    const workerPromise = worker.run([q], async (task) => {
       handledValue = task.value;
-      await stop();
       worker.stop();
-      return "delete";
+      return { deletes: [{ id: task.id, version: task.version, queue: task.queue }] };
     });
 
     await workerPromise;
