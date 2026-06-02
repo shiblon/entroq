@@ -4,9 +4,27 @@ metadata:
   name: svc-b-inbox
   namespace: default
 spec:
+  # queues grants task-queue access. Each pattern lists the callers (by mesh
+  # labels) permitted to claim, insert, or delete tasks on that queue.
   queues:
   - pattern: /payments/svc-b/inbox
     matchType: Exact
+    allowedCallers:
+    - labels:
+        group: frontend
+    - labels:
+        group: internal-tools
+        team: payments
+
+  # namespaces grants doc-namespace access. Omit this section when the service
+  # does not use the EntroQ document store.
+  #
+  # Here the same callers that can enqueue requests to svc-b also get access
+  # to read and write documents under the /payments/svc-b/ namespace prefix,
+  # so they can attach supporting documents to tasks they submit.
+  namespaces:
+  - pattern: /payments/svc-b/
+    matchType: Prefix
     allowedCallers:
     - labels:
         group: frontend

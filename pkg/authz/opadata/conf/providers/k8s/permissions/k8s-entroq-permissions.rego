@@ -81,4 +81,22 @@ allowed_queues contains {"prefix": response_prefix, "actions": ["ALL"]} if {
 	response_prefix := concat("", [base, "response/"])
 }
 
-allowed_namespaces := set()
+# Namespace grants: one entry per namespace policy the caller satisfies.
+allowed_namespaces contains n if {
+	data.mesh.initialized
+	identity
+	some policy in data.mesh.namespaces
+	caller_satisfies(identity.labels, policy.allowedCallers)
+	n := namespace_spec(policy)
+}
+
+# namespace_spec translates a mesh namespace policy into a namespaces-compatible
+# spec object.
+namespace_spec(policy) := {"exact": policy.pattern, "actions": ["ALL"]} if {
+	policy.matchType == "Exact"
+}
+
+namespace_spec(policy) := {"prefix": policy.pattern, "actions": ["ALL"]} if {
+	policy.matchType == "Prefix"
+}
+
