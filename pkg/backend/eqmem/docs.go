@@ -1,9 +1,7 @@
 package eqmem
 
 import (
-	"cmp"
 	"context"
-	"slices"
 
 	"github.com/shiblon/entroq"
 )
@@ -11,16 +9,18 @@ import (
 // Docs returns a slice of docs in a namespace. If IDs are specified, only
 // those docs are returned (key range is ignored and Limit does not apply).
 // Otherwise, docs are filtered by optional key range and subject to Limit.
+// Results are returned sorted by (key_primary, key_secondary).
 func (m *EQMem) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, error) {
 	nls, unlock := m.lockNamespaces([]string{rq.Namespace})
-	defer unlock()
 
 	if len(nls) == 0 {
+		unlock()
 		return nil, nil
 	}
 	nss := nls[0].docs
 
 	if len(rq.IDs) > 0 {
+		defer unlock()
 		var found []*entroq.Doc
 		for _, id := range rq.IDs {
 			r, ok := nss.Get(id)
@@ -36,33 +36,48 @@ func (m *EQMem) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, e
 		return found, nil
 	}
 
-	var found []*entroq.Doc
-	nss.Range(func(id string, r *entroq.Doc) bool {
-		if rq.KeyStart != "" && r.Key < rq.KeyStart {
-			return true
-		}
-		if rq.KeyEnd != "" && r.Key >= rq.KeyEnd {
-			return true
-		}
+	// Range scan: clone under lock then release so writers aren't blocked.
+	snap := nss.snapshot()
+	unlock()
 
+	limit := rq.Limit
+	var found []*entroq.Doc
+
+	collect := func(r *entroq.Doc) bool {
+		if limit > 0 && len(found) >= limit {
+			return false
+		}
 		res := r.Copy()
 		if rq.OmitValues {
 			res.Content = nil
 		}
 		found = append(found, res)
-
-		if rq.Limit > 0 && len(found) >= rq.Limit {
-			return false
-		}
 		return true
-	})
+	}
 
-	slices.SortFunc(found, func(a, b *entroq.Doc) int {
-		if c := cmp.Compare(a.Key, b.Key); c != 0 {
-			return c
-		}
-		return cmp.Compare(a.SecondaryKey, b.SecondaryKey)
-	})
+	switch {
+	case rq.KeyExact != "":
+		snap.AscendGreaterOrEqual(docKeyEntry{Key: rq.KeyExact}, func(e docKeyEntry) bool {
+			if e.Key != rq.KeyExact {
+				return false
+			}
+			return collect(e.Doc)
+		})
+	case rq.KeyEnd != "":
+		snap.AscendRange(
+			docKeyEntry{Key: rq.KeyStart},
+			docKeyEntry{Key: rq.KeyEnd},
+			func(e docKeyEntry) bool { return collect(e.Doc) },
+		)
+	case rq.KeyStart != "":
+		snap.AscendGreaterOrEqual(docKeyEntry{Key: rq.KeyStart}, func(e docKeyEntry) bool {
+			return collect(e.Doc)
+		})
+	default:
+		snap.Ascend(func(e docKeyEntry) bool {
+			return collect(e.Doc)
+		})
+	}
 
 	return found, nil
 }
@@ -83,13 +98,12 @@ func (m *EQMem) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.D
 	now, _ := m.Time(ctx)
 	claimExpiry := now.Add(cq.Duration)
 
-	// Collect candidates first (no mutation during Range), then verify
-	// atomically, then write.
 	var candidates []*entroq.Doc
-	nss.Range(func(id string, r *entroq.Doc) bool {
-		if r.Key == cq.Key {
-			candidates = append(candidates, r)
+	nss.AscendFrom(docKeyEntry{Key: cq.Key}, func(r *entroq.Doc) bool {
+		if r.Key != cq.Key {
+			return false
 		}
+		candidates = append(candidates, r)
 		return true
 	})
 
@@ -109,13 +123,6 @@ func (m *EQMem) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.D
 		nss.Set(r.ID, nr)
 		results = append(results, nr)
 	}
-
-	slices.SortFunc(results, func(a, b *entroq.Doc) int {
-		if c := cmp.Compare(a.Key, b.Key); c != 0 {
-			return c
-		}
-		return cmp.Compare(a.SecondaryKey, b.SecondaryKey)
-	})
 
 	return results, nil
 }

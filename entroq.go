@@ -767,7 +767,7 @@ func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (*ModifyRespo
 // may retry. If the doc is currently claimed by another claimant, a
 // DependencyError with DocClaims set is returned.
 func (c *EntroQ) TryClaimDocByID(ctx context.Context, ns, id string, duration time.Duration) (*Doc, error) {
-	docs, err := c.Docs(ctx, DocsIn(ns).WithIDs(id))
+	docs, err := c.Docs(ctx, &DocQuery{Namespace: ns, IDs: []string{id}})
 	if err != nil {
 		return nil, fmt.Errorf("try claim doc by id: get doc: %w", err)
 	}

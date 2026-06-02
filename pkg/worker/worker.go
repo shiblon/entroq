@@ -129,7 +129,7 @@ type TakeRun[T any] func(context.Context, *entroq.Task, T) ([]*entroq.DocClaim, 
 // DoFinishRun[T] defines a function shape that is called during the work and
 // finish portions of task handling. In both cases, you are given a task, a
 // value of that task properly typed, and if relevant, a document response with
-// all required and zero or more optional documents.
+// all required documents.
 //
 // In the finish phase, the same information is available but all objects will
 // have current version numbers for safe modification.
@@ -203,7 +203,7 @@ func (h *doModifyHandler[T]) DoWork(ctx context.Context, task *entroq.Task, val 
 	return err
 }
 
-func (h *doModifyHandler[T]) Finish(ctx context.Context, finalTask *entroq.Task, val T, _ []*entroq.Doc) error {
+func (h *doModifyHandler[T]) Finish(ctx context.Context, finalTask *entroq.Task, val T, finalDocs []*entroq.Doc) error {
 	defer func() {
 		h.initialTask = nil
 		h.modArgs = nil
@@ -222,7 +222,7 @@ func (h *doModifyHandler[T]) Finish(ctx context.Context, finalTask *entroq.Task,
 		return fmt.Errorf("task updated inside worker body, expected version <= %v, got %v", finalTask.Version, h.initialTask.Version)
 	}
 
-	// Fix up modification versions to reflect final refreshed state.
+	// Fix up task modification versions to reflect the final renewed state.
 	for _, t := range modification.Changes {
 		if t.ID == finalTask.ID {
 			t.Version = finalTask.Version
@@ -238,7 +238,28 @@ func (h *doModifyHandler[T]) Finish(ctx context.Context, finalTask *entroq.Task,
 			t.Version = finalTask.Version
 		}
 	}
-	// TODO: fix up documents, too
+
+	// Fix up doc modification versions to reflect the final renewed state.
+	type nsID = [2]string
+	docVers := make(map[nsID]int32, len(finalDocs))
+	for _, d := range finalDocs {
+		docVers[nsID{d.Namespace, d.ID}] = d.Version
+	}
+	for _, dc := range modification.DocChanges {
+		if v, ok := docVers[nsID{dc.Namespace, dc.ID}]; ok {
+			dc.Version = v
+		}
+	}
+	for _, dd := range modification.DocDeletes {
+		if v, ok := docVers[nsID{dd.Namespace, dd.ID}]; ok {
+			dd.Version = v
+		}
+	}
+	for _, dd := range modification.DocDepends {
+		if v, ok := docVers[nsID{dd.Namespace, dd.ID}]; ok {
+			dd.Version = v
+		}
+	}
 
 	if _, err := h.eqc.Modify(ctx, entroq.WithModification(modification)); err != nil {
 		if _, ok := entroq.AsDependency(err); ok {
@@ -385,9 +406,8 @@ func WithDoModify[T any](f DoModifyRun[T]) Option[T] {
 // WithTakeDocs sets the doc acquisition function. Before work begins, this
 // function is called with the claimed task to declare which docs are needed.
 // Required docs that are missing cause the task to be treated as a poison pill
-// (moved to the error queue). Required or optional docs claimed by another
-// worker cause a backoff-and-retry. Read-only docs are fetched at acquisition
-// time and version-pinned in the final Modify.
+// (moved to the error queue). Required docs claimed by another worker cause a
+// backoff-and-retry
 //
 // When used with WithHandler, the handler's TakeDocs method takes
 // precedence and WithTakeDocs has no effect.
@@ -538,8 +558,8 @@ func (w *Worker[T]) runOne(ctx context.Context, handler Handler[T], opts *runOpt
 		finalDocs   []*entroq.Doc
 	)
 
-	handleErr := DoWhileRenewing(rCtx, w.eqc,
-		func(ctx context.Context, stop FinalizeRenew) error {
+	handleErr := doWhileRenewing(rCtx, w.eqc,
+		func(ctx context.Context, stop finalizeRenew) error {
 			defer func() {
 				stable := stop()
 				if len(stable.Tasks) > 0 {
@@ -714,16 +734,16 @@ func FatalErrorf(fstr string, args ...any) error {
 
 // Renewal Machinery
 
-// FinalizeRenew defines a function that can be called to stop renewal from a
+// finalizeRenew is a function that can be called to stop renewal from a
 // worker routine. It returns a RenewResponse with tasks and/or docs with
 // stable versions (no longer renewing).
-type FinalizeRenew func() *entroq.RenewResponse
+type finalizeRenew func() *entroq.RenewResponse
 
-// DoWork defines a function that handles tasks and docs.
-type DoWork func(ctx context.Context, stop FinalizeRenew) error
+// workFn handles tasks and docs while renewal runs in the background.
+type workFn func(ctx context.Context, stop finalizeRenew) error
 
-// DoWhileRenewing runs the given work function while keeping the provided tasks and docs claimed in the background.
-func DoWhileRenewing(ctx context.Context, c *entroq.EntroQ, doWork DoWork, opts ...entroq.RenewOption) error {
+// doWhileRenewing runs the given work function while keeping the provided tasks and docs claimed in the background.
+func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, work workFn, opts ...entroq.RenewOption) error {
 	conf := entroq.NewRenewConfig(opts...)
 	if conf.IsEmpty() {
 		return fmt.Errorf("do while renewing: nothing to renew")
@@ -808,7 +828,7 @@ func DoWhileRenewing(ctx context.Context, c *entroq.EntroQ, doWork DoWork, opts 
 	}
 
 	g.Go(func() error {
-		if err := doWork(fctx, finalize); err != nil {
+		if err := work(fctx, finalize); err != nil {
 			if errors.Is(err, context.Canceled) {
 				if causeErr := context.Cause(fctx); causeErr != nil {
 					return fmt.Errorf("work func canceled with error: %w", causeErr)
@@ -825,4 +845,3 @@ func DoWhileRenewing(ctx context.Context, c *entroq.EntroQ, doWork DoWork, opts 
 	}
 	return nil
 }
-

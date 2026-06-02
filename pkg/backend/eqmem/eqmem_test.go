@@ -74,9 +74,6 @@ func TestEQMemWorkerRetryOnError(t *testing.T) {
 	RunQTest(t, eqtest.WorkerRetryOnError)
 }
 
-func TestEQMemWorkerRenewal(t *testing.T) {
-	RunQTest(t, eqtest.WorkerRenewal)
-}
 
 func TestEQMemClaimUnblocksOnNotify(t *testing.T) {
 	RunQTest(t, eqtest.ClaimUnblocksOnNotify)

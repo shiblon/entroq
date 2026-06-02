@@ -1136,6 +1136,14 @@ func (b *EQPG) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, er
 			 ORDER BY namespace, key_primary, key_secondary`,
 			rq.Namespace, pq.StringArray(rq.IDs),
 		)
+	} else if rq.KeyExact != "" {
+		rows, err = b.DB.QueryContext(ctx,
+			`SELECT namespace, id, version, claimant, at, key_primary, key_secondary, value, created, modified
+			 FROM entroq.docs
+			 WHERE (namespace = $1 OR $1 = '') AND key_primary = $2
+			 ORDER BY key_primary, key_secondary`,
+			rq.Namespace, rq.KeyExact,
+		)
 	} else {
 		rows, err = b.DB.QueryContext(ctx,
 			`SELECT namespace, id, version, claimant, at, key_primary, key_secondary, value, created, modified

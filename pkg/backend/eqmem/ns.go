@@ -14,17 +14,16 @@ func (m *EQMem) NamespaceStats(ctx context.Context, qq *entroq.MatchQuery) (map[
 		return nil, fmt.Errorf("namespace stats time: %w", err)
 	}
 
-	// Snapshot namespace pointers under the global lock; iterate without locks.
-	// sync.Map.Range is safe concurrently; eventual consistency is fine for stats.
+	// Snapshot namespace lock pointers under the global lock.
 	type nsEntry struct {
 		name string
-		ns   *docNamespace
+		nl   *nsLock
 	}
 	var entries []nsEntry
 	func() {
 		defer un(lock(m))
-		for name, ns := range m.namespaces {
-			entries = append(entries, nsEntry{name, ns})
+		for name, nl := range m.locksSuperUnsafeNS {
+			entries = append(entries, nsEntry{name, nl})
 		}
 	}()
 
@@ -36,8 +35,14 @@ func (m *EQMem) NamespaceStats(ctx context.Context, qq *entroq.MatchQuery) (map[
 		if qq.Limit > 0 && len(result) >= qq.Limit {
 			break
 		}
+		// Clone under the namespace lock, then iterate the snapshot lock-free.
+		e.nl.Lock()
+		snap := e.nl.docs.snapshot()
+		e.nl.Unlock()
+
 		stat := &entroq.NamespaceStat{Name: e.name}
-		e.ns.Range(func(_ string, d *entroq.Doc) bool {
+		snap.Ascend(func(entry docKeyEntry) bool {
+			d := entry.Doc
 			stat.Size++
 			if d.At.After(now) && d.Claimant != "" {
 				stat.Claimed++

@@ -808,6 +808,7 @@ func (s *QSvc) Docs(ctx context.Context, req *pb.DocsRequest) (*pb.DocsResponse,
 	docs, err := s.impl.Docs(ctx, &entroq.DocQuery{
 		Namespace:  q.GetNamespace(),
 		IDs:        q.GetIds(),
+		KeyExact:   q.GetKeyExact(),
 		KeyStart:   q.GetKeyStart(),
 		KeyEnd:     q.GetKeyEnd(),
 		Limit:      int(q.GetLimit()),
