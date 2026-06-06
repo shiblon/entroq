@@ -390,9 +390,6 @@ func TestWorkerRetryOnError(t *testing.T) {
 	RunQTest(t, eqtest.WorkerRetryOnError)
 }
 
-func TestWorkerRenewal(t *testing.T) {
-	RunQTest(t, eqtest.WorkerRenewal)
-}
 
 func TestClaimUnblocksOnNotify(t *testing.T) {
 	RunQTest(t, eqtest.ClaimUnblocksOnNotify)

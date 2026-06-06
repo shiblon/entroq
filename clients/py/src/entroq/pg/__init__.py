@@ -1,39 +1,31 @@
-"""EntroQ PostgreSQL client.
+"""EntroQ PostgreSQL client — async.
 
-Talks directly to a PostgreSQL database that has been initialized by the Go
-eqpg backend (which installs the stored procedures modify,
-try_claim_one, etc.).
-
-Requires psycopg >= 3.
+Talks directly to a PostgreSQL database initialized by the Go eqpg backend.
+Requires psycopg >= 3 (psycopg3).
 """
+from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import re
-import threading
 import time
 import uuid
-from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
-from contextlib import contextmanager
-from typing import Iterator, List, Optional, Tuple, Union
+from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import AsyncIterator
 
 import psycopg
 from psycopg.rows import dict_row
 
-from ..types import Task, TaskData, TaskChange, TaskID, DependencyError
+from ..types import Task, Doc, DependencyError, Modification, ModifyResult, _DOC_RELEASE_AT
 from ..base import EntroQBase
-from ..worker import renewing as common_renewing, EntroQWorker as common_worker, StopWorker
 
 
 # ---------------------------------------------------------------------------
-# PostgreSQL LISTEN/NOTIFY channel name
-# Mirrors pgChannelName() in backend/eqpg/pgnotify.go - must stay in sync.
+# LISTEN/NOTIFY channel name — must mirror pgChannelName() in eqpg/pgnotify.go
 # ---------------------------------------------------------------------------
 
 _nonalnum = re.compile(r'[^a-zA-Z0-9]')
-
 
 def _pg_channel_name(queue: str) -> str:
     sanitized = _nonalnum.sub('_', queue)
@@ -44,50 +36,8 @@ def _pg_channel_name(queue: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# JSONB encoding helpers for modify
+# Row → dataclass helpers
 # ---------------------------------------------------------------------------
-
-def _encode_ids(items) -> str:
-    return json.dumps([{'id': str(i.id), 'version': i.version} for i in items])
-
-
-def _encode_inserts(items) -> str:
-    out = []
-    for it in items:
-        obj = {
-            'queue': it.queue,
-            'value': it.value,
-        }
-        if it.id:
-            obj['id'] = str(it.id)
-        if it.at is not None:
-            obj['at'] = it.at.isoformat()
-        if it.attempt:
-            obj['attempt'] = it.attempt
-        if it.err:
-            obj['err'] = it.err
-        out.append(obj)
-    return json.dumps(out)
-
-
-def _encode_changes(items) -> str:
-    out = []
-    for c in items:
-        obj = {
-            'id': str(c.id),
-            'version': c.version,
-            'queue': c.queue,
-            'value': c.value,
-        }
-        if c.at is not None:
-            obj['at'] = c.at.isoformat()
-        if c.attempt:
-            obj['attempt'] = c.attempt
-        if c.err:
-            obj['err'] = c.err
-        out.append(obj)
-    return json.dumps(out)
-
 
 def _row_to_task(row: dict) -> Task:
     return Task(
@@ -104,78 +54,183 @@ def _row_to_task(row: dict) -> Task:
         err=row['err'],
     )
 
+def _row_to_doc(row: dict) -> Doc:
+    return Doc(
+        namespace=row['namespace'],
+        id=str(row['id']),
+        version=row['version'],
+        key=row['key_primary'],
+        secondary_key=row['key_secondary'],
+        content=row['value'],
+        claimant=str(row['claimant']) if row['claimant'] else '',
+        at=row['at'],
+        created=row['created'],
+        modified=row['modified'],
+    )
+
 
 # ---------------------------------------------------------------------------
-# Transaction
+# JSONB encoding helpers for stored procedures
 # ---------------------------------------------------------------------------
+
+def _encode_task_ids(items) -> str:
+    return json.dumps([{'id': str(i.id), 'version': i.version} for i in items])
+
+def _encode_task_inserts(items) -> str:
+    out = []
+    for it in items:
+        obj: dict = {'queue': it.queue, 'value': it.value}
+        if it.id:       obj['id'] = str(it.id)
+        if it.at:       obj['at'] = it.at.isoformat()
+        if it.attempt:  obj['attempt'] = it.attempt
+        if it.err:      obj['err'] = it.err
+        out.append(obj)
+    return json.dumps(out)
+
+def _encode_task_changes(items) -> str:
+    out = []
+    for c in items:
+        obj: dict = {
+            'id': str(c.id), 'version': c.version,
+            'queue': c.queue, 'value': c.value,
+        }
+        if c.at:        obj['at'] = c.at.isoformat()
+        if c.attempt:   obj['attempt'] = c.attempt
+        if c.err:       obj['err'] = c.err
+        out.append(obj)
+    return json.dumps(out)
+
+def _encode_doc_ids(items) -> str:
+    return json.dumps([{'namespace': i.namespace, 'id': str(i.id), 'version': i.version} for i in items])
+
+def _encode_doc_inserts(items) -> str:
+    out = []
+    for it in items:
+        obj: dict = {
+            'namespace': it.namespace,
+            'key_primary': it.key,
+            'key_secondary': it.secondary_key,
+        }
+        if it.id:       obj['id'] = str(it.id)
+        if it.content is not None: obj['content'] = it.content
+        out.append(obj)
+    return json.dumps(out)
+
+def _encode_doc_changes(items) -> str:
+    out = []
+    for c in items:
+        obj: dict = {
+            'namespace': c.namespace, 'id': str(c.id), 'version': c.version,
+            'key_primary': c.key, 'key_secondary': c.secondary_key,
+            'at': (c.at or _DOC_RELEASE_AT).isoformat(),
+        }
+        if c.content is not None: obj['content'] = c.content
+        out.append(obj)
+    return json.dumps(out)
+
+
+# ---------------------------------------------------------------------------
+# DependencyError parsing from psycopg DatabaseError
+# ---------------------------------------------------------------------------
+
+def _dep_error_from_pg(e: psycopg.DatabaseError) -> DependencyError:
+    detail = json.loads(e.diag.message_detail)
+    return DependencyError(
+        message=str(e),
+        missing=detail.get('missing', []),
+        mismatched=detail.get('mismatched', []),
+        collisions=detail.get('collisions', []),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Transaction (pg-specific: combines task + doc ops in one connection tx)
+# ---------------------------------------------------------------------------
+
+_OPTS = "-c search_path=entroq,public"
+
 
 class Transaction:
-    """An EntroQ operation context sharing a single database transaction.
+    """EntroQ operations sharing a single database transaction.
 
-    Obtain via EntroQ.transaction(), not directly.
-
-    The conn attribute is the underlying psycopg connection and may be used
-    for arbitrary SQL within the same transaction. A DependencyError or any
-    other exception raised by modify() will cause the transaction to roll back
-    on context manager exit, unwinding all SQL executed within it.
-
-    Note: claim() and try_claim() are intentionally absent. Claim before
-    opening a transaction; modify (and your own SQL) inside it.
+    Obtain via ``async with client.transaction() as txn:``.
+    The ``conn`` attribute is the underlying psycopg AsyncConnection and may
+    be used for arbitrary SQL within the same transaction.
     """
 
-    def __init__(self, conn: psycopg.Connection, claimant: str):
+    def __init__(self, conn: psycopg.AsyncConnection, claimant: str) -> None:
         self.conn = conn
         self._claimant = claimant
 
-    def modify(
-        self,
-        inserts=(),
-        changes=(),
-        deletes=(),
-        depends=(),
-        unsafe_claimant_id=None,
-    ) -> Tuple[List['Task'], List['Task']]:
-        """Atomically apply inserts, changes, deletes, and dependency checks.
-
-        Runs within the enclosing transaction. A DependencyError rolls back
-        the entire transaction on context manager exit.
-        """
+    async def modify(self, modification: Modification, *, unsafe_claimant_id: str | None = None) -> ModifyResult:
+        """Atomically apply task and doc operations within the enclosing transaction."""
         claimant = unsafe_claimant_id or self._claimant
-        try:
-            rows = self.conn.execute(
-                '''SELECT kind, id, version, queue, at, created, modified,
-                          claimant, value, claims, attempt, err
-                   FROM modify(%s, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb)''',
-                (
-                    claimant,
-                    _encode_ids(depends),
-                    _encode_ids(deletes),
-                    _encode_inserts(inserts),
-                    _encode_changes(changes),
-                ),
-            ).fetchall()
-        except psycopg.DatabaseError as e:
-            if e.diag.sqlstate == 'EQ001':
-                detail = json.loads(e.diag.message_detail)
-                raise DependencyError(
-                    missing=detail.get('missing', []),
-                    mismatched=detail.get('mismatched', []),
-                    collisions=detail.get('collisions', []),
-                ) from e
-            raise
+        task_inserted: list[Task] = []
+        task_changed: list[Task] = []
+        doc_inserted: list[Doc] = []
+        doc_changed: list[Doc] = []
 
-        inserted, changed = [], []
-        for row in rows:
-            t = _row_to_task(row)
-            (inserted if row['kind'] == 'inserted' else changed).append(t)
-        return inserted, changed
+        # Task operations
+        has_task_ops = any([
+            modification.task_inserts, modification.task_changes,
+            modification.task_deletes, modification.task_depends,
+        ])
+        if has_task_ops:
+            try:
+                cur = await self.conn.execute(
+                    '''SELECT kind, id, version, queue, at, created, modified,
+                              claimant, value, claims, attempt, err
+                       FROM modify(%s, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb)''',
+                    (
+                        claimant,
+                        _encode_task_ids(modification.task_depends),
+                        _encode_task_ids(modification.task_deletes),
+                        _encode_task_inserts(modification.task_inserts),
+                        _encode_task_changes(modification.task_changes),
+                    ),
+                )
+                for row in await cur.fetchall():
+                    t = _row_to_task(row)
+                    (task_inserted if row['kind'] == 'inserted' else task_changed).append(t)
+            except psycopg.DatabaseError as e:
+                if e.diag.sqlstate == 'EQ001':
+                    raise _dep_error_from_pg(e) from e
+                raise
+
+        # Doc operations
+        has_doc_ops = any([
+            modification.doc_inserts, modification.doc_changes,
+            modification.doc_deletes, modification.doc_depends,
+        ])
+        if has_doc_ops:
+            try:
+                cur = await self.conn.execute(
+                    '''SELECT kind, namespace, id, version, claimant, at,
+                              key_primary, key_secondary, value, created, modified
+                       FROM modify_docs(%s, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb)''',
+                    (
+                        claimant,
+                        _encode_doc_ids(modification.doc_depends),
+                        _encode_doc_ids(modification.doc_deletes),
+                        _encode_doc_inserts(modification.doc_inserts),
+                        _encode_doc_changes(modification.doc_changes),
+                    ),
+                )
+                for row in await cur.fetchall():
+                    d = _row_to_doc(row)
+                    (doc_inserted if row['kind'] == 'inserted' else doc_changed).append(d)
+            except psycopg.DatabaseError as e:
+                if e.diag.sqlstate == 'EQ001':
+                    raise _dep_error_from_pg(e) from e
+                raise
+
+        return ModifyResult(task_inserted, task_changed, doc_inserted, doc_changed)
 
 
 # ---------------------------------------------------------------------------
-# Schema version check
+# Schema version check (sync: runs once at startup)
 # ---------------------------------------------------------------------------
 
-# Must match the value in schema.sql and backend/eqpg/schema.go.
 SCHEMA_VERSION = "0.12.0"
 
 _INIT_HINT = (
@@ -185,194 +240,141 @@ _INIT_HINT = (
     "  'host=localhost dbname=entroq user=entroq password=secret'"
 )
 
-
 def _check_schema_version(connstr: str) -> None:
-    """Verify that the database schema version matches SCHEMA_VERSION.
-
-    Raises RuntimeError with an actionable message on mismatch or if the
-    schema has not been initialized.
-    """
-    with psycopg.connect(connstr, row_factory=dict_row, options="-c search_path=entroq,public") as conn:
+    with psycopg.connect(connstr, row_factory=dict_row, options=_OPTS) as conn:
         try:
-            row = conn.execute(
-                "SELECT value FROM meta WHERE key = 'schema_version'"
-            ).fetchone()
+            row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
         except psycopg.DatabaseError as e:
-            if e.diag.sqlstate == '42P01':  # undefined_table
-                raise RuntimeError(
-                    f"EntroQ schema not found -- database has not been initialized.\n"
-                    f"{_INIT_HINT}"
-                ) from e
+            if e.diag.sqlstate == '42P01':
+                raise RuntimeError(f"EntroQ schema not found.\n{_INIT_HINT}") from e
             raise
         if row is None:
-            raise RuntimeError(
-                f"EntroQ schema not initialized (schema_version missing).\n"
-                f"{_INIT_HINT}"
-            )
+            raise RuntimeError(f"EntroQ schema not initialized (schema_version missing).\n{_INIT_HINT}")
         stored = row['value']
         if stored != SCHEMA_VERSION:
             raise RuntimeError(
                 f"EntroQ schema version mismatch: database has {stored!r}, "
-                f"this client expects {SCHEMA_VERSION!r}.\n"
-                f"{_INIT_HINT}"
+                f"client expects {SCHEMA_VERSION!r}.\n{_INIT_HINT}"
             )
 
 
 # ---------------------------------------------------------------------------
-# Main client
+# Main async client
 # ---------------------------------------------------------------------------
 
 class EntroQ(EntroQBase):
-    """EntroQ client that connects directly to PostgreSQL.
+    """EntroQ client that connects directly to PostgreSQL (async)."""
 
-    Args:
-        connstr: A libpq connection string or DSN, e.g.
-                 "host=localhost dbname=entroq user=entroq password=secret"
-    """
-
-    def __init__(self, connstr: str):
+    def __init__(self, connstr: str) -> None:
         self._connstr = connstr
         self._claimant = str(uuid.uuid4())
         _check_schema_version(connstr)
 
-    def time(self) -> datetime:
-        """Return the current time according to the database."""
-        with psycopg.connect(self._connstr, row_factory=dict_row, options="-c search_path=entroq,public") as conn:
-            return conn.execute('SELECT now() AS t').fetchone()['t']
+    async def time(self) -> datetime:
+        async with await psycopg.AsyncConnection.connect(self._connstr, autocommit=True, row_factory=dict_row, options=_OPTS) as conn:
+            row = await (await conn.execute('SELECT now() AS t')).fetchone()
+            return row['t']
 
-    def queues(self, prefix: str = '', exact: List[str] = (), limit: int = 0) -> List[dict]:
-        """Return queue stats as a list of dicts with 'name' and 'num_tasks'.
+    async def queues(self, prefix: str = '', exact=(), limit: int = 0) -> list[dict]:
+        async with await psycopg.AsyncConnection.connect(self._connstr, autocommit=True, row_factory=dict_row, options=_OPTS) as conn:
+            cur = await conn.execute('SELECT * FROM queues(%s, %s, %s)', (prefix, list(exact), limit))
+            return await cur.fetchall()
 
-        If exact is non-empty it takes precedence over prefix.
-        """
-        with psycopg.connect(self._connstr, row_factory=dict_row, options="-c search_path=entroq,public") as conn:
-            return conn.execute(
-                'SELECT * FROM queues(%s, %s, %s)',
-                (prefix, list(exact), limit),
-            ).fetchall()
+    async def tasks(self, queue: str = '', limit: int = 0, omit_values: bool = False) -> list[Task]:
+        async with await psycopg.AsyncConnection.connect(self._connstr, autocommit=True, row_factory=dict_row, options=_OPTS) as conn:
+            cur = await conn.execute('SELECT * FROM tasks(%s, %s, %s)', (queue, limit, omit_values))
+            return [_row_to_task(r) for r in await cur.fetchall()]
 
-    def tasks(self, queue: str = '', limit: int = 0, omit_values: bool = False) -> List[Task]:
-        """Return tasks ordered by at. queue='' means all queues."""
-        with psycopg.connect(self._connstr, row_factory=dict_row, options="-c search_path=entroq,public") as conn:
-            return [_row_to_task(r) for r in conn.execute(
-                'SELECT * FROM tasks(%s, %s, %s)',
-                (queue, limit, omit_values),
-            ).fetchall()]
-
-    def try_claim(self, queue: Union[str, List[str]], duration_ms: int = 30000) -> Optional[Task]:
-        """Try to claim one task from queue (str or list of str).
-
-        Returns None if no task is available in any of the given queues.
-        """
+    async def try_claim(self, queue: str | list[str], duration_ms: int = 30000) -> Task | None:
         queues = [queue] if isinstance(queue, str) else list(queue)
-        with psycopg.connect(self._connstr, row_factory=dict_row, options="-c search_path=entroq,public") as conn:
-            rows = conn.execute(
+        async with await psycopg.AsyncConnection.connect(self._connstr, autocommit=True, row_factory=dict_row, options=_OPTS) as conn:
+            cur = await conn.execute(
                 "SELECT * FROM try_claim(%s, %s, %s::interval)",
                 (queues, self._claimant, f'{duration_ms} milliseconds'),
-            ).fetchall()
+            )
+            rows = await cur.fetchall()
         return _row_to_task(rows[0]) if rows else None
 
-    def claim(self, queue: Union[str, List[str]], duration_ms: int = 30000, poll_ms: int = 5000, timeout_s: Optional[float] = None, poll_only: bool = False) -> Task:
-        """Block until a task is available in queue (str or list), then claim it.
-
-        By default uses PostgreSQL LISTEN/NOTIFY to wake up promptly when a
-        task arrives, falling back to poll_ms-interval polling if no
-        notification arrives.
-        """
-        deadline = None if timeout_s is None else time.time() + timeout_s
-
-        def _wait(notify):
-            """Try to claim; if nothing available, wait then return False, or
-            raise TimeoutError if the deadline has passed. Returns True when a
-            task is claimed."""
-            t = self.try_claim(queue, duration_ms)
-            if t is not None:
-                return t
-            if deadline is not None and time.time() >= deadline:
-                raise TimeoutError(f'claim timed out after {timeout_s}s')
-            wait = poll_ms / 1000 if deadline is None else min(poll_ms / 1000, deadline - time.time())
-            notify(wait)
-            return None
-
-        if poll_only:
-            while True:
-                t = _wait(time.sleep)
-                if t is not None:
-                    return t
-
+    async def claim(self, queue: str | list[str], duration_ms: int = 30000, poll_ms: int = 5000, timeout_s: float | None = None) -> Task:
         queues = [queue] if isinstance(queue, str) else list(queue)
         channels = [_pg_channel_name(q) for q in queues]
-        with psycopg.connect(self._connstr, options="-c search_path=entroq,public") as lconn:
-            lconn.autocommit = True
-            for ch in channels:
-                lconn.execute(f'LISTEN "{ch}"')
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
 
-            def _notify_wait(wait):
-                for _ in lconn.notifies(timeout=wait):
-                    break   # one notification is enough; retry the claim
+        async with await psycopg.AsyncConnection.connect(self._connstr, autocommit=True, options=_OPTS) as lconn:
+            for ch in channels:
+                await lconn.execute(f'LISTEN "{ch}"')
 
             while True:
-                t = _wait(_notify_wait)
-                if t is not None:
-                    return t
+                task = await self.try_claim(queue, duration_ms)
+                if task is not None:
+                    return task
 
-    @contextmanager
-    def transaction(self):
-        """Context manager that runs EntroQ operations and user SQL in one transaction."""
-        with psycopg.connect(self._connstr, row_factory=dict_row, options="-c search_path=entroq,public") as conn:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError(f'claim timed out after {timeout_s}s')
+
+                wait = poll_ms / 1000
+                if deadline is not None:
+                    wait = min(wait, deadline - time.monotonic())
+
+                async for _ in lconn.notifies(timeout=wait):
+                    break  # one notification is enough; retry the claim
+
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator[Transaction]:
+        """Async context manager: runs EntroQ operations and user SQL in one transaction."""
+        async with await psycopg.AsyncConnection.connect(self._connstr, row_factory=dict_row, options=_OPTS) as conn:
             yield Transaction(conn, self._claimant)
 
-    def modify(
+    async def modify(self, modification: Modification, *, unsafe_claimant_id: str | None = None) -> ModifyResult:
+        async with self.transaction() as txn:
+            return await txn.modify(modification, unsafe_claimant_id=unsafe_claimant_id)
+
+    async def docs(
         self,
-        inserts: List[TaskData] = (),
-        changes: List[TaskChange] = (),
-        deletes: List[Union[Task, TaskID]] = (),
-        depends: List[Union[Task, TaskID]] = (),
-        unsafe_claimant_id: Optional[str] = None,
-    ) -> Tuple[List[Task], List[Task]]:
-        """Atomically apply inserts, changes, deletes, and dependency checks."""
-        with self.transaction() as txn:
-            return txn.modify(
-                inserts=inserts,
-                changes=changes,
-                deletes=deletes,
-                depends=depends,
-                unsafe_claimant_id=unsafe_claimant_id,
+        namespace: str = '',
+        key_start: str = '',
+        key_end: str = '',
+        limit: int = 0,
+        omit_values: bool = False,
+    ) -> list[Doc]:
+        async with await psycopg.AsyncConnection.connect(self._connstr, autocommit=True, row_factory=dict_row, options=_OPTS) as conn:
+            cur = await conn.execute(
+                'SELECT * FROM docs(%s, %s, %s, %s, %s)',
+                (namespace, key_start, key_end, limit, omit_values),
             )
+            return [_row_to_doc(r) for r in await cur.fetchall()]
 
-    def delete(self, task: Union[Task, TaskID]):
-        """Delete a single task (Task or TaskID)."""
-        self.modify(deletes=[task])
+    async def claim_docs(self, namespace: str, key: str, duration_ms: int = 30000) -> list[Doc]:
+        async with await psycopg.AsyncConnection.connect(self._connstr, autocommit=True, row_factory=dict_row, options=_OPTS) as conn:
+            try:
+                cur = await conn.execute(
+                    "SELECT * FROM claim_docs(%s, %s, %s::interval, %s)",
+                    (namespace, self._claimant, f'{duration_ms} milliseconds', key),
+                )
+                return [_row_to_doc(r) for r in await cur.fetchall()]
+            except psycopg.DatabaseError as e:
+                if e.diag.sqlstate == 'EQ001':
+                    detail = json.loads(e.diag.message_detail)
+                    raise DependencyError(
+                        message=str(e),
+                        missing=detail.get('missing_docs', []),
+                        collisions=detail.get('claimed_docs', []),
+                    ) from e
+                raise
 
-    def renew_for(self, task: Task, duration: int = 30) -> Task:
-        """Extend a task's claim expiry by duration seconds."""
-        at = self.time() + timedelta(seconds=duration)
-        _, changed = self.modify(changes=[task.as_change(at=at)])
-        return changed[0]
-
-    @contextmanager
-    def renewing(self, task: Task, duration: int = 30):
-        """Context manager that renews a task claim in the background."""
-        with common_renewing(self, task, duration_s=duration) as current_task:
-            yield current_task
-
-    def pop_all(self, queue: str, force: bool = False) -> Iterator[Task]:
-        """Claim and delete every task in queue, yielding each one."""
+    async def pop_all(self, queue: str, force: bool = False) -> AsyncIterator[Task]:
+        """Claim and delete every task in queue, yielding each."""
         if force:
-            for task in self.tasks(queue=queue):
-                self.modify(deletes=[task.as_id()], unsafe_claimant_id=task.claimant)
+            for task in await self.tasks(queue=queue):
+                await self.modify(
+                    Modification(Modification.deleting(task.as_id())),
+                    unsafe_claimant_id=task.claimant,
+                )
                 yield task
             return
-
         while True:
-            task = self.try_claim(queue)
+            task = await self.try_claim(queue)
             if task is None:
                 return
-            self.modify(deletes=[task.as_id()])
+            await self.modify(Modification(Modification.deleting(task.as_id())))
             yield task
-
-
-
-class EQWorker(common_worker):
-    """Claims tasks from a queue and dispatches them to a handler function using EntroQ client."""
-    pass

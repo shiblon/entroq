@@ -71,7 +71,7 @@ func Example_sidecar() {
 	rcvCtx, rcvCancel := context.WithCancel(ctx)
 	defer rcvCancel()
 	recv := worker.New(eq, worker.WithDoModify(async.ReceiverHandler(upstream.URL)))
-	go recv.Run(rcvCtx, worker.Watching(queue+"/inbox")) //nolint:errcheck
+	go recv.Run(rcvCtx, worker.Watching("/"+queue+"/inbox")) //nolint:errcheck
 
 	// Sender: routes outbound requests by target service name from the Host header.
 	// "echo-svc.test" strips ".test" to get "echo-svc", which maps to the inbox queue.

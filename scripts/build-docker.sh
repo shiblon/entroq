@@ -2,7 +2,7 @@
 # Build and optionally push EntroQ Docker images to ghcr.io.
 # Usage: ./scripts/build-docker.sh <version> [--push]
 #
-# Builds:
+# Builds (tags: <version>, <major>.<minor> for stable releases, latest):
 #   ghcr.io/shiblon/entroq-pg:<version>       -- PostgreSQL-backed gRPC service
 #   ghcr.io/shiblon/entroq-mem:<version>      -- in-memory gRPC service (with journal)
 #   ghcr.io/shiblon/entroq-redis:<version>    -- Redis-backed gRPC service
@@ -20,10 +20,19 @@ if [ -z "${VERSION}" ]; then
     echo "Usage: $0 <version> [--push]" >&2
     exit 1
 fi
+case "${VERSION}" in
+    v*) echo "error: version must not have a 'v' prefix (got '${VERSION}'); use '${VERSION#v}'" >&2; exit 1 ;;
+esac
 
 PUSH=0
 if [ "${2}" = "--push" ]; then
     PUSH=1
+fi
+
+# Derive major.minor alias for stable releases only (X.Y.Z with no pre-release suffix).
+MINOR_TAG=""
+if echo "${VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+    MINOR_TAG="$(echo "${VERSION}" | sed 's/^\([0-9]*\.[0-9]*\).*/\1/')"
 fi
 
 cd "$(dirname "$0")/.."
@@ -41,6 +50,9 @@ build_image() {
     -t "${REGISTRY}/${name}:${VERSION}" \
     -t "${REGISTRY}/${name}:latest" \
     .
+  if [ -n "${MINOR_TAG}" ]; then
+    docker tag "${REGISTRY}/${name}:${VERSION}" "${REGISTRY}/${name}:${MINOR_TAG}"
+  fi
   echo "Built ${REGISTRY}/${name}:${VERSION}"
 }
 
@@ -62,5 +74,12 @@ if [ "${PUSH}" = "1" ]; then
   docker push "${REGISTRY}/entroq-operator:latest"
   docker push "${REGISTRY}/entroq-link:${VERSION}"
   docker push "${REGISTRY}/entroq-link:latest"
+  if [ -n "${MINOR_TAG}" ]; then
+    docker push "${REGISTRY}/entroq-pg:${MINOR_TAG}"
+    docker push "${REGISTRY}/entroq-mem:${MINOR_TAG}"
+    docker push "${REGISTRY}/entroq-redis:${MINOR_TAG}"
+    docker push "${REGISTRY}/entroq-operator:${MINOR_TAG}"
+    docker push "${REGISTRY}/entroq-link:${MINOR_TAG}"
+  fi
   echo "Pushed entroq-pg, entroq-mem, entroq-redis, entroq-operator, entroq-link at ${VERSION}"
 fi

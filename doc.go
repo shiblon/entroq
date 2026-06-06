@@ -314,56 +314,21 @@ func CreatingIn(ns string, opts ...DocOpt) ModifyArg {
 	}
 }
 
-// DocQuery is used to list docs from a namespace with optional range filtering.
-// If IDs are present, key range is ignored. Only one will be used. Limit does
-// not apply to ID lists.
+// DocQuery is used to list docs from a namespace with one of three mutually
+// exclusive filter modes: IDs, KeyExact, or KeyStart/KeyEnd range.
 //
-// Construct with DocsIn for a fluent interface:
-//
-//	eq.Docs(ctx, entroq.DocsIn("config"))
-//	eq.Docs(ctx, entroq.DocsIn("metrics").WithKeyRange("2024-01-01", "2025-01-01"))
-//	eq.Docs(ctx, entroq.DocsIn("items").WithIDs("id-a", "id-b"))
+//	eq.Docs(ctx, &entroq.DocQuery{Namespace: "config"})
+//	eq.Docs(ctx, &entroq.DocQuery{Namespace: "metrics", KeyStart: "2024-01-01", KeyEnd: "2025-01-01"})
+//	eq.Docs(ctx, &entroq.DocQuery{Namespace: "metrics", KeyExact: "2024-06-01"})
+//	eq.Docs(ctx, &entroq.DocQuery{Namespace: "items", IDs: []string{"id-a", "id-b"}})
 type DocQuery struct {
 	Namespace  string   `json:"namespace"`
 	IDs        []string `json:"ids"`
+	KeyExact  string   `json:"key_exact"`
 	KeyStart   string   `json:"key_start"`
 	KeyEnd     string   `json:"key_end"`
 	Limit      int      `json:"limit"`
 	OmitValues bool     `json:"omit_values"`
-}
-
-// DocsIn returns a DocQuery scoped to the given namespace. Chain methods to
-// refine the query.
-func DocsIn(ns string) *DocQuery {
-	return &DocQuery{Namespace: ns}
-}
-
-// WithKeyRange filters docs to the half-open primary-key range [start, end).
-// An empty end means no upper bound.
-func (q *DocQuery) WithKeyRange(start, end string) *DocQuery {
-	q.KeyStart = start
-	q.KeyEnd = end
-	return q
-}
-
-// WithIDs restricts the query to specific doc IDs. Key range and Limit are
-// ignored when IDs are set. Docs are returned in the order IDs are listed.
-func (q *DocQuery) WithIDs(ids ...string) *DocQuery {
-	q.IDs = ids
-	return q
-}
-
-// WithLimit caps the number of docs returned. Has no effect when WithIDs is set.
-func (q *DocQuery) WithLimit(n int) *DocQuery {
-	q.Limit = n
-	return q
-}
-
-// WithOmitValues strips content payloads from returned docs, useful when only
-// keys and metadata are needed.
-func (q *DocQuery) WithOmitValues() *DocQuery {
-	q.OmitValues = true
-	return q
 }
 
 // DocClaim is used to claim all docs that share a primary key in a namespace.

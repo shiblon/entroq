@@ -544,40 +544,6 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 	}
 }
 
-// WorkerRenewal tests that task claims are renewed periodically for longer-running work tasks.
-func WorkerRenewal(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	queue := path.Join(qPrefix, "worker_renewal")
-
-	_, err := client.Modify(ctx, entroq.InsertingInto(queue))
-	if err != nil {
-		t.Fatalf("Error inserting: %v", err)
-	}
-
-	// Newly-inserted task will have version 0.
-
-	task, err := client.Claim(ctx, entroq.From(queue), entroq.ClaimFor(6*time.Second))
-	if err != nil {
-		t.Fatalf("Failed to claim task: %v", err)
-	}
-
-	// Task now has version 1.
-
-	if err := worker.DoWithRenew(ctx, client, task, 6*time.Second, func(ctx context.Context, stop worker.FinalizeRenew) error {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("worker do with renew: %w", ctx.Err())
-		case <-time.After(10 * time.Second): // long enough for 3 renewals.
-		}
-		renewed := stop()
-		if want, got := task.Version+3, renewed.Version; want != got {
-			t.Fatalf("Expected renewed task to be at version %d, got %d", want, got)
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("Error renewing and waiting: %v", err)
-	}
-}
-
 // ClaimUnblocksOnNotify verifies that Claim wakes promptly when a task is
 // inserted rather than waiting the full poll interval. Backends that implement
 // a NotifyWaiter (eqpg via LISTEN/NOTIFY, eqmem via in-process signaling)

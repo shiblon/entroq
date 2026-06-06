@@ -6,7 +6,6 @@ package mrtest
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
@@ -17,17 +16,16 @@ import (
 	. "github.com/shiblon/entroq/examples/mr"
 )
 
-// MRCheck is a check function that runs a mapreduce using the specified number of mappers and reducers.
+// MRCheck runs a MapReduce with the given parameters and verifies that the
+// output matches the expected word-count histogram.
 //
-// Creates a bunch of documents, filled with numeric strings (words are all
-// numbers, makes things easy). We start with a known histogram, then we
-// assemble documents by randomly drawing without replacement until the
-// distribution is empty. That way we know our outputs from the beginning,
-// and we get a random starting point.
+// Creates numDocs documents filled with numeric strings (words are integers).
+// Builds a known histogram first, then shuffles words into documents. After
+// running MapReduce, checks that the result docs match the histogram exactly.
 //
 // When using with quick.Check, the first two arguments should usually be
 // fixed, but the remainder can be "checked". Thus, it often makes sense to use
-// it in a closure, thus:
+// it in a closure:
 //
 //	config := &quick.Config{
 //		MaxCount: 5,
@@ -50,8 +48,8 @@ func MRCheck(ctx context.Context, eq *entroq.EntroQ, numDocs, numMappers, numRed
 	)
 
 	log.Printf("Checking MR with docs=%d, mappers=%d, reducers=%d", numDocs, numMappers, numReducers)
-	// Flattened slice of words (keep track in a histogram, too).
-	// Random histogram of "words" (integers).
+
+	// Build a random histogram of "words" (integers), then shuffle into docs.
 	var occurrences []string
 	histogram := make(map[string]int)
 	for i := 0; i < wordsPerDoc*numDocs; i++ {
@@ -59,8 +57,6 @@ func MRCheck(ctx context.Context, eq *entroq.EntroQ, numDocs, numMappers, numRed
 		histogram[val]++
 		occurrences = append(occurrences, val)
 	}
-
-	// Shuffle occurrences, then make "documents" out of them.
 	rand.Shuffle(len(occurrences), func(i, j int) {
 		occurrences[i], occurrences[j] = occurrences[j], occurrences[i]
 	})
@@ -70,8 +66,7 @@ func MRCheck(ctx context.Context, eq *entroq.EntroQ, numDocs, numMappers, numRed
 		docs = append(docs, NewKV(nil, []byte(strings.Join(occurrences[di*wordsPerDoc:(di+1)*wordsPerDoc], " "))))
 	}
 
-	// Create expected output from processing these documents. Should be sorted
-	// (lexicographical) list of words with their frequencies.
+	// Expected: sorted list of (word, count) pairs.
 	var expected []*KV
 	for word, count := range histogram {
 		expected = append(expected, NewKV([]byte(word), []byte(fmt.Sprint(count))))
@@ -82,83 +77,34 @@ func MRCheck(ctx context.Context, eq *entroq.EntroQ, numDocs, numMappers, numRed
 
 	queuePrefix := "/mrtest/" + entroq.GenHex16()
 
-	mr := NewMapReduce(eq, queuePrefix,
-		WithNumMappers(numMappers),
-		WithNumReducers(numReducers),
-		WithMap(WordCountMapper),
-		WithReduce(SumReducer),
-		WithEarlyReduce(SumReducer),
-		AddInput(docs...))
+	if err := RunAll(ctx, eq, queuePrefix, docs, WordCountMapper, SumReducer, numMappers, numReducers); err != nil {
+		log.Print(err)
+		return false
+	}
 
-	outQ, err := mr.Run(ctx)
+	results, err := Results(ctx, eq, queuePrefix)
 	if err != nil {
 		log.Print(err)
 		return false
 	}
 
-	tasks, err := eq.Tasks(ctx, outQ)
-	if err != nil {
-		log.Print(err)
+	if len(results) != len(expected) {
+		log.Printf("Expected %d results, got %d", len(expected), len(results))
+		return false
+	}
+
+	if !sort.SliceIsSorted(results, func(i, j int) bool {
+		return bytes.Compare(results[i].Key, results[j].Key) < 0
+	}) {
+		log.Printf("results are not sorted by key: %v", results)
 		return false
 	}
 
 	good := true
-	if len(tasks) == 0 || len(tasks) > numReducers {
-		log.Printf("Expected between 1 and %d output tasks, got %d", numReducers, len(tasks))
-		good = false
-		for i, t := range tasks {
-			kvs, err := entroq.GetValue[[]*KV](t)
-			if err != nil {
-				log.Printf("Failed to unmarshal task %v on queue %q: %v", t.IDVersion(), t.Queue, err)
-				return false
-			}
-			log.Printf("%d: %q %v", i, t.Queue, t.IDVersion())
-			kvmap := make(map[string]string)
-			for _, kv := range kvs {
-				kvmap[string(kv.Key)] = string(kv.Value)
-			}
-			out, err := json.Marshal(kvmap)
-			if err != nil {
-				log.Printf("Failed to marshal kvmap: %v", err)
-			}
-			log.Print(string(out))
-		}
-	}
-
-	// Check that each task's values are already in key-sorted order.
-	var allKVs []*KV
-	for i, task := range tasks {
-		got, err := entroq.GetValue[[]*KV](task)
-		if err != nil {
-			log.Print(err)
-			return false
-		}
-		if !sort.SliceIsSorted(got, func(i, j int) bool {
-			return bytes.Compare(got[i].Key, got[j].Key) < 0
-		}) {
-			log.Printf("reduce task %d contains unsorted keys: %v", i, got)
-			return false
-		}
-		allKVs = append(allKVs, got...)
-	}
-
-	sort.Slice(allKVs, func(i, j int) bool {
-		return bytes.Compare(allKVs[i].Key, allKVs[j].Key) < 0
-	})
-
-	for i, kv := range allKVs {
+	for i, kv := range results {
 		if want, got := expected[i].String(), kv.String(); want != got {
 			log.Printf("Expected %s, got %s", want, got)
 			good = false
-		}
-	}
-	if !good {
-		queues, err := eq.Queues(ctx, entroq.MatchPrefix(queuePrefix))
-		for q, n := range queues {
-			log.Printf("queue %q = %d", q, n)
-		}
-		if err != nil {
-			log.Printf("queues error: %v", err)
 		}
 	}
 	return good

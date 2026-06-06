@@ -164,12 +164,18 @@ func (e *EQRedis) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc,
 		idxKey := docNSIndexKey(rq.Namespace)
 		min := "-"
 		max := "+"
-		if rq.KeyStart != "" {
-			min = "[" + rq.KeyStart
-		}
-		if rq.KeyEnd != "" {
-			// Half-open range [start, end): exclude members >= end.
-			max = "(" + rq.KeyEnd
+		if rq.KeyExact != "" {
+			// Exact primary key match: inclusive on both ends with same value.
+			min = "[" + rq.KeyExact
+			max = "[" + rq.KeyExact
+		} else {
+			if rq.KeyStart != "" {
+				min = "[" + rq.KeyStart
+			}
+			if rq.KeyEnd != "" {
+				// Half-open range [start, end): exclude members >= end.
+				max = "(" + rq.KeyEnd
+			}
 		}
 
 		members, err := e.client.ZRangeArgs(ctx, redis.ZRangeArgs{

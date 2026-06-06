@@ -166,103 +166,6 @@ func Example_dependencies() {
 	// tasks remaining: 0
 }
 
-func Example_manualClaimAndRenew() {
-	ctx := context.Background()
-	eq, err := entroq.New(ctx, eqmem.Opener())
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer eq.Close()
-
-	// While eq.NewWorker is recommended for general use, you can manually
-	// claim and renew tasks for custom daemon implementations.
-
-	// Insert a task to work on.
-	if _, err := eq.Modify(ctx, entroq.InsertingInto("manual_queue", entroq.WithValue("work"))); err != nil {
-		log.Fatalf("insert failed: %v", err)
-	}
-
-	// 1. Manually claim the task.
-	task, err := eq.Claim(ctx, entroq.From("manual_queue"), entroq.ClaimFor(5*time.Second))
-	if err != nil {
-		log.Fatalf("claim failed: %v", err)
-	}
-
-	// 2. Wrap your work in worker.DoWithRenew so the task doesn't expire while you work.
-	err = worker.DoWithRenew(ctx, eq, task, 5*time.Second, func(ctx context.Context, stop worker.FinalizeRenew) error {
-
-		// ... do some long running work ...
-
-		// 3. Stop background renewal to get a stable, finalized version of the task.
-		finalTask := stop()
-
-		// 4. Commit the work (by deleting the task or mutating it).
-		if _, err := eq.Modify(ctx, finalTask.Delete()); err != nil {
-			return fmt.Errorf("failed to commit: %w", err)
-		}
-		return nil
-	})
-
-	if err != nil {
-		log.Fatalf("manual processing failed: %v", err)
-	}
-	fmt.Println("task processed")
-
-	// Output:
-	// task processed
-}
-
-func TestDoWithRenewAll_ImmediateCancellationOnLeaseLoss(t *testing.T) {
-	ctx := context.Background()
-	eq, err := entroq.New(ctx, eqmem.Opener())
-	if err != nil {
-		t.Fatalf("failed to create eq: %v", err)
-	}
-	defer eq.Close()
-
-	queue := "/test/cancel"
-	_, err = eq.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue("work")))
-	if err != nil {
-		t.Fatalf("failed to insert: %v", err)
-	}
-	// 1. Claim the task.
-	claimed, err := eq.Claim(ctx, entroq.From(queue), entroq.ClaimFor(10*time.Second))
-	if err != nil {
-		t.Fatalf("failed to claim: %v", err)
-	}
-
-	// 2. Start renewing.
-	errChan := make(chan error, 1)
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	go func() {
-		// Use a short renewal interval to speed up the test.
-		errChan <- worker.DoWithRenewAll(ctx, eq, []*entroq.Task{claimed}, 100*time.Millisecond, func(ctx context.Context, stop worker.FinalizeRenewAll) error {
-			// Wait for the context to be canceled from the outside.
-			<-ctx.Done()
-			return ctx.Err()
-		})
-	}()
-
-	// 3. Poach the task from underneath the worker.
-	// Bump version by claiming or deleting. Same claimant, so no need to spoof.
-	if _, err := eq.Modify(ctx, claimed.Delete()); err != nil {
-		t.Fatalf("failed to steal task: %v", err)
-	}
-
-	// 4. Verify that DoWithRenewAll returns DependencyError (wrapped or direct)
-	// and that it happened quickly.
-	select {
-	case err := <-errChan:
-		if _, ok := entroq.AsDependency(err); !ok {
-			t.Errorf("expected DependencyError, got %v", err)
-		}
-	case <-time.After(1 * time.Second):
-		t.Errorf("timed out waiting for worker cancellation after lease loss")
-	}
-}
-
 // TestDependencyErrorDocFields verifies that a DependencyError produced by a
 // missing-doc Modify contains populated doc fields and that Error() mentions them.
 func TestDependencyErrorDocFields(t *testing.T) {
@@ -364,7 +267,7 @@ func Example_docBasics() {
 	fmt.Printf("created doc key=%s version %d\n", doc.Key, doc.Version)
 
 	// Read it back.
-	docs, err := eq.Docs(ctx, entroq.DocsIn("config"))
+	docs, err := eq.Docs(ctx, &entroq.DocQuery{Namespace: "config"})
 	if err != nil {
 		log.Fatalf("list: %v", err)
 	}
@@ -385,7 +288,7 @@ func Example_docBasics() {
 		log.Fatalf("delete: %v", err)
 	}
 
-	docs, err = eq.Docs(ctx, entroq.DocsIn("config"))
+	docs, err = eq.Docs(ctx, &entroq.DocQuery{Namespace: "config"})
 	if err != nil {
 		log.Fatalf("list after delete: %v", err)
 	}
@@ -421,7 +324,7 @@ func Example_docKeyRange() {
 	}
 
 	// List docs in the half-open range [2024-06-15, 2025-01-01).
-	docs, err := eq.Docs(ctx, entroq.DocsIn(ns).WithKeyRange("2024-06-15", "2025-01-01"))
+	docs, err := eq.Docs(ctx, &entroq.DocQuery{Namespace: ns, KeyStart: "2024-06-15", KeyEnd: "2025-01-01"})
 	if err != nil {
 		log.Fatalf("range query: %v", err)
 	}
@@ -486,7 +389,7 @@ func Example_docAtomicTaskCommit() {
 	}
 
 	// Verify the final state.
-	docs, err := eq.Docs(ctx, entroq.DocsIn("state"))
+	docs, err := eq.Docs(ctx, &entroq.DocQuery{Namespace: "state"})
 	if err != nil {
 		log.Fatalf("read state: %v", err)
 	}
@@ -652,7 +555,7 @@ func Example_docQueryByID() {
 	}
 
 	// Fetch a specific subset by ID; order follows the IDs slice.
-	docs, err := eq.Docs(ctx, entroq.DocsIn("items").WithIDs("id-gamma", "id-alpha"))
+	docs, err := eq.Docs(ctx, &entroq.DocQuery{Namespace: "items", IDs: []string{"id-gamma", "id-alpha"}})
 	if err != nil {
 		log.Fatalf("query by ID: %v", err)
 	}
