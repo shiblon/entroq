@@ -79,7 +79,9 @@ func evalQuery(t *testing.T, query string, input map[string]any, storeData map[s
 	t.Helper()
 	ctx := context.Background()
 
-	mods, err := parseModules()
+	mods, err := parseModules(func(path string) bool {
+		return hasPrefix(path, []string{"conf/core/", "conf/providers/entroq/"})
+	})
 	if err != nil {
 		t.Fatalf("parse modules: %v", err)
 	}

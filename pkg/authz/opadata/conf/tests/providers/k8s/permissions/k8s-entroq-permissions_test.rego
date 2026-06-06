@@ -85,6 +85,49 @@ test_unknown_identity_no_mesh_grants if {
 	queues == {{"prefix": "/other/unknown/", "actions": ["ALL"]}}
 }
 
+# Namespace grant: svc-a satisfies the ns/shared namespace policy (group=frontend matches).
+test_namespace_grant_exact_match if {
+	mesh := object.union(mock_mesh, {"namespaces": [{
+		"pattern": "/shared/docs",
+		"matchType": "Exact",
+		"allowedCallers": [{"group": "frontend"}],
+	}]})
+	{"exact": "/shared/docs", "actions": ["ALL"]} in allowed_namespaces
+		with data.entroq.user.name as "system:serviceaccount:payments:svc-a"
+		with data.mesh as mesh
+}
+
+# Namespace grant: prefix match works.
+test_namespace_grant_prefix_match if {
+	mesh := object.union(mock_mesh, {"namespaces": [{
+		"pattern": "/shared/",
+		"matchType": "Prefix",
+		"allowedCallers": [{"group": "backend"}],
+	}]})
+	{"prefix": "/shared/", "actions": ["ALL"]} in allowed_namespaces
+		with data.entroq.user.name as "system:serviceaccount:payments:svc-b"
+		with data.mesh as mesh
+}
+
+# Namespace grant denied: caller labels don't satisfy policy.
+test_namespace_grant_denied if {
+	mesh := object.union(mock_mesh, {"namespaces": [{
+		"pattern": "/shared/docs",
+		"matchType": "Exact",
+		"allowedCallers": [{"group": "internal-tools"}],
+	}]})
+	not {"exact": "/shared/docs", "actions": ["ALL"]} in allowed_namespaces
+		with data.entroq.user.name as "system:serviceaccount:payments:svc-a"
+		with data.mesh as mesh
+}
+
+# No namespace grants when data.mesh.namespaces is absent or empty.
+test_no_namespace_grants_when_absent if {
+	allowed_namespaces == set()
+		with data.entroq.user.name as "system:serviceaccount:payments:svc-a"
+		with data.mesh as mock_mesh
+}
+
 # AND semantics within a matcher: both keys must match.
 test_and_semantics_within_matcher if {
 	mesh := object.union(mock_mesh, {"queues": [{

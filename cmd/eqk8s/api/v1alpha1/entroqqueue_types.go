@@ -55,11 +55,33 @@ type QueuePattern struct {
 	AllowedCallers []LabelMatcher `json:"allowedCallers"`
 }
 
+// NamespacePattern pairs a doc namespace path pattern with its access policy.
+type NamespacePattern struct {
+	// pattern is the namespace path to match, interpreted according to matchType.
+	// +kubebuilder:validation:MinLength=1
+	Pattern string `json:"pattern"`
+
+	// matchType controls how pattern is applied: Exact or Prefix.
+	// Defaults to Exact.
+	// +kubebuilder:default=Exact
+	MatchType MatchType `json:"matchType,omitempty"`
+
+	// allowedCallers lists the label matchers that grant access to this namespace.
+	// A caller is permitted if it satisfies at least one matcher (OR semantics).
+	// +kubebuilder:validation:MinItems=1
+	AllowedCallers []LabelMatcher `json:"allowedCallers"`
+}
+
 // EntroQQueueSpec defines the desired state of EntroQQueue.
 type EntroQQueueSpec struct {
 	// queues is the list of queue patterns and their associated access policies.
 	// +kubebuilder:validation:MinItems=1
 	Queues []QueuePattern `json:"queues"`
+
+	// namespaces is the list of doc namespace patterns and their associated
+	// access policies. Optional: omit when no namespace grants are needed.
+	// +optional
+	Namespaces []NamespacePattern `json:"namespaces,omitempty"`
 }
 
 // EntroQQueueStatus defines the observed or current state of EntroQQueue.

@@ -9,7 +9,13 @@ import {
   QueuesRequest,
   QueuesResponse,
   TimeResponse,
-  EntroQClientInterface,
+  EntroQDocClientInterface,
+  DocsRequest,
+  DocsResponse,
+  ClaimDocsRequest,
+  ClaimDocsResponse,
+  NamespacesRequest,
+  NamespacesResponse,
 } from "./types";
 
 export interface ClientOptions {
@@ -28,7 +34,7 @@ export function generateClaimantId(): string {
   );
 }
 
-export class EntroQClient implements EntroQClientInterface {
+export class EntroQClient implements EntroQDocClientInterface {
   private baseUrl: string;
   private claimantId: string;
   private headers: Record<string, string>;
@@ -256,6 +262,56 @@ export class EntroQClient implements EntroQClientInterface {
     } finally {
       reader.releaseLock();
     }
+  }
+
+  /**
+   * docs lists docs in a namespace, optionally filtered by key range or IDs.
+   */
+  async docs(request: DocsRequest): Promise<DocsResponse> {
+    const q = request.query;
+    const params = new URLSearchParams();
+    if (q.namespace) params.set("query.namespace", q.namespace);
+    if (q.keyStart) params.set("query.keyStart", q.keyStart);
+    if (q.keyEnd) params.set("query.keyEnd", q.keyEnd);
+    if (q.limit) params.set("query.limit", q.limit.toString());
+    if (q.omitValues) params.set("query.omitValues", "true");
+    if (q.ids) q.ids.forEach((id) => params.append("query.ids", id));
+    const qs = params.toString();
+    const resp = await this.request<any>(`/api/v0/docs${qs ? "?" + qs : ""}`, "GET");
+    return { docs: resp.docs || [] };
+  }
+
+  /**
+   * claimDocs atomically claims all docs sharing a key in a namespace.
+   */
+  async claimDocs(request: ClaimDocsRequest): Promise<ClaimDocsResponse> {
+    const body = {
+      claimQuery: {
+        ...request.claimQuery,
+        claimant: request.claimQuery.claimant ?? this.claimantId,
+        durationMs: request.claimQuery.durationMs ?? "30000",
+      },
+    };
+    const resp = await this.request<any>("/api/v0/docs/claim", "POST", body);
+    return { docs: resp.docs || [] };
+  }
+
+  /**
+   * namespaceStats returns statistics for doc namespaces.
+   */
+  async namespaceStats(request: NamespacesRequest = {}): Promise<NamespacesResponse> {
+    const params = new URLSearchParams();
+    if (request.matchPrefix)
+      request.matchPrefix.forEach((p) => params.append("matchPrefix", p));
+    if (request.matchExact)
+      request.matchExact.forEach((e) => params.append("matchExact", e));
+    if (request.limit) params.set("limit", request.limit.toString());
+    const qs = params.toString();
+    const resp = await this.request<any>(
+      `/api/v0/namespaces/stats${qs ? "?" + qs : ""}`,
+      "GET"
+    );
+    return { namespaces: resp.namespaces || [] };
   }
 
   /**

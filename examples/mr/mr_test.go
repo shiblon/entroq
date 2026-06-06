@@ -25,50 +25,38 @@ func TestMapReduce_inMemorySmall(t *testing.T) {
 	}
 	defer eq.Close()
 
-	mr := NewMapReduce(eq, "/mrtest",
-		WithNumMappers(2),
-		WithNumReducers(1),
-		WithMap(WordCountMapper),
-		WithReduce(NilReducer),
-		AddInput(NewKV(nil, []byte("word1 word2 word3 word4"))),
-		AddInput(NewKV(nil, []byte("word1 word3 word5 word7"))),
-		AddInput(NewKV(nil, []byte("word1 word4 word7 wordA"))),
-		AddInput(NewKV(nil, []byte("word1 word5 word9 wordE"))))
-
-	outQ, err := mr.Run(ctx)
-	if err != nil {
+	// word1 appears 4 times, word3/word4/word5/word7 twice, the rest once.
+	input := []*KV{
+		NewKV(nil, []byte("word1 word2 word3 word4")),
+		NewKV(nil, []byte("word1 word3 word5 word7")),
+		NewKV(nil, []byte("word1 word4 word7 wordA")),
+		NewKV(nil, []byte("word1 word5 word9 wordE")),
+	}
+	if err := RunAll(ctx, eq, "/mrtest", input, WordCountMapper, SumReducer, 2, 1); err != nil {
 		t.Fatal(err)
 	}
 
-	tasks, err := eq.Tasks(ctx, outQ)
+	results, err := Results(ctx, eq, "/mrtest")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	expected := []*KV{
-		NewKV([]byte("word1"), nil),
-		NewKV([]byte("word2"), nil),
-		NewKV([]byte("word3"), nil),
-		NewKV([]byte("word4"), nil),
-		NewKV([]byte("word5"), nil),
-		NewKV([]byte("word7"), nil),
-		NewKV([]byte("word9"), nil),
-		NewKV([]byte("wordA"), nil),
-		NewKV([]byte("wordE"), nil),
+		NewKV([]byte("word1"), []byte("4")),
+		NewKV([]byte("word2"), []byte("1")),
+		NewKV([]byte("word3"), []byte("2")),
+		NewKV([]byte("word4"), []byte("2")),
+		NewKV([]byte("word5"), []byte("2")),
+		NewKV([]byte("word7"), []byte("2")),
+		NewKV([]byte("word9"), []byte("1")),
+		NewKV([]byte("wordA"), []byte("1")),
+		NewKV([]byte("wordE"), []byte("1")),
 	}
 
-	if len(tasks) != 1 {
-		t.Fatalf("Expected 1 final reduced output task, got %d", len(tasks))
+	if len(results) != len(expected) {
+		t.Fatalf("Expected %d results, got %d", len(expected), len(results))
 	}
-
-	task := tasks[0]
-
-	kvs, err := entroq.GetValue[[]*KV](task)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	for i, kv := range kvs {
+	for i, kv := range results {
 		if kv.String() != expected[i].String() {
 			t.Errorf("Expected %s, got %s", expected[i], kv)
 		}

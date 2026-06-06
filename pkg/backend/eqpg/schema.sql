@@ -1044,17 +1044,20 @@ $$;
 -- the compiled-in SchemaVersion constant.
 --
 -- Versioning policy (1.x+):
---   - Schema version changes only when the schema itself changes.
---   - Minor version bumps (1.x -> 1.y) may change the schema, but only
---     additively: new tables, columns with defaults, indexes, or functions.
---     No column renames, type changes, or data movement.
+--   - Schema version tracks the release minor version (major.minor.0 on each
+--     minor release). A schema change always causes a minor bump; a minor bump
+--     does not always mean the schema changed.
+--   - Minor version changes (1.x -> 1.y) are additive only: new tables,
+--     columns with defaults, indexes, or functions. No column renames, type
+--     changes, or data movement.
 --   - Patch releases never change the schema.
 --   - Upgrading from any 1.x schema to any later 1.y schema is always safe:
 --     re-run this script and the new additions appear without touching existing
 --     data.
 --   - Schemas predating 1.0 (0.x) cannot be migrated. Drain all tasks and
 --     reinitialize: DROP SCHEMA entroq CASCADE, then run eqpg schema init.
--- Migrations: 1.0.0 → 1.1.0
+-- Migrations: 1.0.0 → 1.1.0 (see blocks below)
+-- Migrations: 1.1.0 → 1.2.0 (no structural changes)
 -- Each block checks pg_attribute to skip on fresh installs where the column
 -- is already correct, avoiding unnecessary table scans on re-runs.
 
@@ -1111,5 +1114,5 @@ CREATE TABLE IF NOT EXISTS entroq.meta (
     value TEXT NOT NULL
 );
 
-INSERT INTO entroq.meta (key, value) VALUES ('schema_version', '1.1.0')
-    ON CONFLICT (key) DO UPDATE SET value = '1.1.0' WHERE entroq.meta.key = 'schema_version';
+INSERT INTO entroq.meta (key, value) VALUES ('schema_version', '1.2.0')
+    ON CONFLICT (key) DO UPDATE SET value = '1.2.0' WHERE entroq.meta.key = 'schema_version';

@@ -35,6 +35,9 @@ func TestBuildMeshEmptyInputs(t *testing.T) {
 	if len(mesh.Queues) != 0 {
 		t.Errorf("expected no queues, got %d", len(mesh.Queues))
 	}
+	if len(mesh.Namespaces) != 0 {
+		t.Errorf("expected no namespaces, got %d", len(mesh.Namespaces))
+	}
 	if len(mesh.Identities) != 0 {
 		t.Errorf("expected no identities, got %d", len(mesh.Identities))
 	}
@@ -142,6 +145,85 @@ func TestBuildMeshIdentity(t *testing.T) {
 	}
 	if got := mesh.Identities[keyB]; got.Labels["group"] != wantB.Labels["group"] {
 		t.Errorf("svc-b: got %v, want %v", got, wantB)
+	}
+}
+
+func TestBuildMeshNamespaceExact(t *testing.T) {
+	queues := []entroqv1alpha1.EntroQQueue{
+		{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "payments", Name: "svc-b"},
+			Spec: entroqv1alpha1.EntroQQueueSpec{
+				Queues: []entroqv1alpha1.QueuePattern{
+					{Pattern: "/payments/svc-b/inbox", MatchType: entroqv1alpha1.MatchExact,
+						AllowedCallers: []entroqv1alpha1.LabelMatcher{{Labels: map[string]string{"group": "frontend"}}}},
+				},
+				Namespaces: []entroqv1alpha1.NamespacePattern{
+					{Pattern: "/shared/docs", MatchType: entroqv1alpha1.MatchExact,
+						AllowedCallers: []entroqv1alpha1.LabelMatcher{{Labels: map[string]string{"group": "frontend"}}}},
+				},
+			},
+		},
+	}
+
+	mesh := buildMesh(queues, nil)
+
+	if len(mesh.Queues) != 1 {
+		t.Fatalf("expected 1 queue policy, got %d", len(mesh.Queues))
+	}
+	if len(mesh.Namespaces) != 1 {
+		t.Fatalf("expected 1 namespace policy, got %d", len(mesh.Namespaces))
+	}
+	np := mesh.Namespaces[0]
+	if np.Pattern != "/shared/docs" {
+		t.Errorf("wrong namespace pattern: %q", np.Pattern)
+	}
+	if np.MatchType != "Exact" {
+		t.Errorf("wrong namespace matchType: %q", np.MatchType)
+	}
+	if len(np.AllowedCallers) != 1 || np.AllowedCallers[0]["group"] != "frontend" {
+		t.Errorf("wrong namespace allowedCallers: %v", np.AllowedCallers)
+	}
+}
+
+func TestBuildMeshNamespacePrefix(t *testing.T) {
+	queues := []entroqv1alpha1.EntroQQueue{
+		{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "svc"},
+			Spec: entroqv1alpha1.EntroQQueueSpec{
+				Queues: []entroqv1alpha1.QueuePattern{
+					{Pattern: "/shared/", MatchType: entroqv1alpha1.MatchPrefix,
+						AllowedCallers: []entroqv1alpha1.LabelMatcher{{Labels: map[string]string{"team": "platform"}}}},
+				},
+				Namespaces: []entroqv1alpha1.NamespacePattern{
+					{Pattern: "/docs/", MatchType: entroqv1alpha1.MatchPrefix,
+						AllowedCallers: []entroqv1alpha1.LabelMatcher{{Labels: map[string]string{"team": "platform"}}}},
+				},
+			},
+		},
+	}
+
+	mesh := buildMesh(queues, nil)
+
+	if len(mesh.Namespaces) != 1 {
+		t.Fatalf("expected 1 namespace policy, got %d", len(mesh.Namespaces))
+	}
+	if mesh.Namespaces[0].MatchType != "Prefix" {
+		t.Errorf("wrong namespace matchType: %q", mesh.Namespaces[0].MatchType)
+	}
+}
+
+func TestBuildMeshNoNamespacesWhenOmitted(t *testing.T) {
+	queues := []entroqv1alpha1.EntroQQueue{
+		queue("ns", "svc", []entroqv1alpha1.QueuePattern{
+			{Pattern: "/ns/svc/inbox", MatchType: entroqv1alpha1.MatchExact,
+				AllowedCallers: []entroqv1alpha1.LabelMatcher{{Labels: map[string]string{"x": "y"}}}},
+		}),
+	}
+
+	mesh := buildMesh(queues, nil)
+
+	if len(mesh.Namespaces) != 0 {
+		t.Errorf("expected 0 namespace policies, got %d", len(mesh.Namespaces))
 	}
 }
 

@@ -7,14 +7,13 @@ package mr
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
-	"path"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/shiblon/entroq"
@@ -22,10 +21,7 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-const (
-	claimDuration = 5 * time.Second
-	shuffleWait   = 5 * time.Second
-)
+const claimDuration = 5 * time.Second
 
 // Fingerprint64 produces a 64-bit unsigned integer from a byte string.
 func Fingerprint64(key []byte) uint64 {
@@ -39,157 +35,481 @@ func ShardForKey(key []byte, n int) int {
 	return int(Fingerprint64(key) % uint64(n))
 }
 
+// docRef identifies a doc by namespace and key.
+type docRef struct {
+	NS  string `json:"ns"`
+	Key string `json:"key"`
+}
+
+func (r docRef) asClaim() *entroq.DocClaim { return entroq.ClaimKey(r.NS, r.Key) }
+func (r docRef) asQuery() *entroq.DocQuery { return &entroq.DocQuery{Namespace: r.NS, KeyExact: r.Key} }
+
+func shardDocKey(n int) string       { return fmt.Sprintf("shard/%d", n) }
+func reduceDocKey(key []byte) string { return fmt.Sprintf("reduce/%x", key) }
+func resultDocKey(key []byte) string { return fmt.Sprintf("result/%x", key) }
+
+// keyValues is a mapper output entry: one map key with all its emitted values.
+type keyValues struct {
+	Key    []byte   `json:"key"`
+	Values [][]byte `json:"values"`
+}
+
+// mapOutput is the value of a map-result task. It points back to the shard doc
+// so the controller can delete it, and carries the mapper's grouped key/value
+// entries for the shuffle step.
+type mapOutput struct {
+	Shard   docRef       `json:"shard"`
+	Entries []*keyValues `json:"entries"`
+}
+
+// reduceOutput is the value of a reduce-result task. Doc is the reduce doc
+// reference plumbed through from the reduce task so the controller can claim
+// and delete intermediate docs. MapKey is the original map output key, used to
+// name the result doc. Result is the final reduced value.
+type reduceOutput struct {
+	Doc    docRef `json:"doc"`
+	MapKey []byte `json:"key"`
+	Result []byte `json:"result"`
+}
+
+// reduceClaim is the value of a reduce task. It identifies the reduce docs by
+// namespace and primary key, and carries the original map output key so the
+// result doc can be named correctly.
+type reduceClaim struct {
+	Doc    docRef `json:"doc"`
+	MapKey []byte `json:"map_key"`
+}
+
+// Controller coordinates the MapReduce pipeline. It creates shard docs and map
+// tasks during Setup, then drives the map and reduce phases by processing
+// result tasks from mapper and reducer workers.
+//
+// Queue layout (all relative to the prefix passed to NewController):
+//
+//	{prefix}/map           — map input tasks (controller → mappers)
+//	{prefix}/map/result    — map result tasks (mappers → controller)
+//	{prefix}/reduce        — reduce input tasks (controller → reducers)
+//	{prefix}/reduce/result — reduce result tasks (reducers → controller)
+//
+// All shard, intermediate, and result docs share the namespace equal to prefix.
+type Controller struct {
+	client *entroq.EntroQ
+	prefix string
+}
+
+// NewController creates a Controller for the given EntroQ client and prefix.
+func NewController(eq *entroq.EntroQ, prefix string) *Controller {
+	return &Controller{client: eq, prefix: prefix}
+}
+
+// MapQ is the queue that mappers watch for input tasks.
+func (c *Controller) MapQ() string { return c.prefix + "/map" }
+
+// MapResultQ is the queue where mappers post their result tasks.
+func (c *Controller) MapResultQ() string { return c.prefix + "/map/result" }
+
+// ReduceQ is the queue that reducers watch for input tasks.
+func (c *Controller) ReduceQ() string { return c.prefix + "/reduce" }
+
+// ReduceResultQ is the queue where reducers post their result tasks.
+func (c *Controller) ReduceResultQ() string { return c.prefix + "/reduce/result" }
+
+// DocNS is the namespace used for all shard, intermediate, and result docs.
+func (c *Controller) DocNS() string { return c.prefix }
+
+// Setup creates one shard doc and one map task per input KV. Call this before
+// starting mapper workers.
+func (c *Controller) Setup(ctx context.Context, input []*KV) error {
+	for i, kv := range input {
+		key := shardDocKey(i)
+		if _, err := c.client.Modify(ctx,
+			entroq.CreatingIn(c.DocNS(), entroq.WithKeys(key, ""), entroq.WithContent(kv)),
+			entroq.InsertingInto(c.MapQ(), entroq.WithValue(docRef{NS: c.DocNS(), Key: key})),
+		); err != nil {
+			return fmt.Errorf("setup shard %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// RunMapPhase processes map-result tasks until all shard docs are gone from the
+// namespace. It runs a Worker watching MapResultQ alongside a watcher goroutine
+// that cancels the phase when no shard docs remain.
+//
+// The Worker uses TakeDocs to claim each shard doc atomically before DoModify
+// runs. When the shard doc is absent (already processed by a speculative
+// duplicate mapper), DoModify receives empty docs and simply deletes the task.
+// When the doc is contended, the Worker retries automatically. On success it
+// atomically deletes the map-result task, deletes the shard doc, and creates
+// one reduce doc per output entry.
+func (c *Controller) RunMapPhase(ctx context.Context) error {
+	phaseCtx, phaseCancel := context.WithCancel(ctx)
+	defer phaseCancel()
+
+	g, gctx := errgroup.WithContext(phaseCtx)
+
+	g.Go(func() error {
+		return worker.New[mapOutput](c.client,
+			worker.WithTakeDocs(func(_ context.Context, _ *entroq.Task, out mapOutput) ([]*entroq.DocClaim, error) {
+				return []*entroq.DocClaim{out.Shard.asClaim()}, nil
+			}),
+			worker.WithDoModify(func(_ context.Context, task *entroq.Task, out mapOutput, docs []*entroq.Doc) ([]entroq.ModifyArg, error) {
+				if len(docs) == 0 {
+					// Shard doc already gone — duplicate result task; discard it.
+					return []entroq.ModifyArg{task.Delete()}, nil
+				}
+				// Secondary key is a fingerprint of the shard key:
+				// unique per shard, deterministic, no shared state needed.
+				secondary := fmt.Sprintf("%016x", Fingerprint64([]byte(out.Shard.Key)))
+				modArgs := []entroq.ModifyArg{task.Delete(), docs[0].Delete()}
+				for _, entry := range out.Entries {
+					modArgs = append(modArgs, entroq.CreatingIn(c.DocNS(),
+						entroq.WithKeys(reduceDocKey(entry.Key), secondary),
+						entroq.WithContent(entry),
+					))
+				}
+				return modArgs, nil
+			}),
+		).Run(gctx, worker.Watching(c.MapResultQ()), worker.WithLease(claimDuration))
+	})
+
+	// Watcher: cancel the phase when no shard docs remain.
+	// Bounds: '/' = 0x2F, '0' = 0x30, so "shard/..." sorts before "shard0".
+	g.Go(func() error {
+		for {
+			shards, err := c.client.Docs(gctx, &entroq.DocQuery{
+				Namespace:  c.DocNS(),
+				KeyStart:   "shard/",
+				KeyEnd:     "shard0",
+				OmitValues: true,
+				Limit:      1,
+			})
+			if err != nil {
+				if entroq.IsCanceled(err) {
+					return nil
+				}
+				return fmt.Errorf("shard check: %w", err)
+			}
+			if len(shards) == 0 {
+				phaseCancel()
+				return nil
+			}
+			select {
+			case <-gctx.Done():
+				return nil
+			case <-time.After(time.Second):
+			}
+		}
+	})
+
+	return g.Wait()
+}
+
+// RunReducePhase discovers all reduce docs created by the map phase, creates
+// one reduce task per unique primary key, then processes reduce-result tasks
+// until all reduce docs are deleted.
+func (c *Controller) RunReducePhase(ctx context.Context) error {
+	// Discover all reduce docs and create one reduce task per unique primary key.
+	docs, err := c.client.Docs(ctx, &entroq.DocQuery{
+		Namespace:  c.DocNS(),
+		KeyStart:   "reduce/",
+		KeyEnd:     "reduce0",
+		OmitValues: true,
+	})
+	if err != nil {
+		return fmt.Errorf("discover reduce docs: %w", err)
+	}
+
+	seen := make(map[string]bool)
+	for _, d := range docs {
+		if seen[d.Key] {
+			continue
+		}
+		seen[d.Key] = true
+		// Extract the original map output key from "reduce/<hex>".
+		mapKey, err := hex.DecodeString(strings.TrimPrefix(d.Key, "reduce/"))
+		if err != nil {
+			return fmt.Errorf("decode map key from %q: %w", d.Key, err)
+		}
+		if _, err := c.client.Modify(ctx,
+			entroq.InsertingInto(c.ReduceQ(), entroq.WithValue(reduceClaim{
+				Doc:    docRef{NS: c.DocNS(), Key: d.Key},
+				MapKey: mapKey,
+			})),
+		); err != nil {
+			return fmt.Errorf("create reduce task for %q: %w", d.Key, err)
+		}
+	}
+
+	phaseCtx, phaseCancel := context.WithCancel(ctx)
+	defer phaseCancel()
+
+	g, gctx := errgroup.WithContext(phaseCtx)
+
+	// Worker processes reduce-result tasks: claims reduce docs, creates result
+	// doc, deletes task.
+	g.Go(func() error {
+		return worker.New[reduceOutput](c.client,
+			worker.WithTakeDocs(func(_ context.Context, _ *entroq.Task, out reduceOutput) ([]*entroq.DocClaim, error) {
+				return []*entroq.DocClaim{out.Doc.asClaim()}, nil
+			}),
+			worker.WithDoModify(func(_ context.Context, task *entroq.Task, out reduceOutput, docs []*entroq.Doc) ([]entroq.ModifyArg, error) {
+				if len(docs) == 0 {
+					// Reduce docs already gone — duplicate result task; discard.
+					return []entroq.ModifyArg{task.Delete()}, nil
+				}
+				modArgs := []entroq.ModifyArg{task.Delete()}
+				for _, d := range docs {
+					modArgs = append(modArgs, d.Delete())
+				}
+				modArgs = append(modArgs, entroq.CreatingIn(c.DocNS(),
+					entroq.WithKeys(resultDocKey(out.MapKey), ""),
+					entroq.WithContent(&keyValues{Key: out.MapKey, Values: [][]byte{out.Result}}),
+				))
+				return modArgs, nil
+			}),
+		).Run(gctx, worker.Watching(c.ReduceResultQ()), worker.WithLease(claimDuration))
+	})
+
+	// Watcher: cancel the phase when no reduce docs remain.
+	g.Go(func() error {
+		for {
+			reduceDocs, err := c.client.Docs(gctx, &entroq.DocQuery{
+				Namespace:  c.DocNS(),
+				KeyStart:   "reduce/",
+				KeyEnd:     "reduce0",
+				OmitValues: true,
+				Limit:      1,
+			})
+			if err != nil {
+				if entroq.IsCanceled(err) {
+					return nil
+				}
+				return fmt.Errorf("reduce doc check: %w", err)
+			}
+			if len(reduceDocs) == 0 {
+				phaseCancel()
+				return nil
+			}
+			select {
+			case <-gctx.Done():
+				return nil
+			case <-time.After(time.Second):
+			}
+		}
+	})
+
+	return g.Wait()
+}
+
+// sliceReducerInput implements ReducerInput over a pre-sorted [][]byte slice.
+type sliceReducerInput struct {
+	key    []byte
+	values [][]byte
+	idx    int
+}
+
+func (s *sliceReducerInput) Key() []byte { return s.key }
+func (s *sliceReducerInput) Err() error  { return nil }
+func (s *sliceReducerInput) Value() []byte {
+	if s.idx == 0 || s.idx > len(s.values) {
+		return nil
+	}
+	return s.values[s.idx-1]
+}
+func (s *sliceReducerInput) Next() bool {
+	if s.idx >= len(s.values) {
+		return false
+	}
+	s.idx++
+	return true
+}
+
+// MapperWorker creates a worker that watches MapQ, reads the shard doc, runs
+// mapFn over its key/value, groups emitted output by key (sorting values
+// within each key), and posts a mapOutput to MapResultQ.
+func (c *Controller) MapperWorker(mapFn Mapper) *worker.Worker[docRef] {
+	return worker.New[docRef](c.client,
+		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, ref docRef, _ []*entroq.Doc) ([]entroq.ModifyArg, error) {
+			shardDocs, err := c.client.Docs(ctx, ref.asQuery())
+			if err != nil {
+				return nil, fmt.Errorf("mapper read shard: %w", err)
+			}
+			if len(shardDocs) == 0 {
+				// Shard already gone — duplicate task; discard.
+				return []entroq.ModifyArg{task.Delete()}, nil
+			}
+			var kv KV
+			if err := json.Unmarshal(shardDocs[0].Content, &kv); err != nil {
+				return nil, fmt.Errorf("mapper parse shard: %w", err)
+			}
+
+			// Collect emitted key/values, grouping by key.
+			kvMap := make(map[string][][]byte)
+			var keyOrder []string
+			emit := func(_ context.Context, k, v []byte) error {
+				ks := string(k)
+				if _, exists := kvMap[ks]; !exists {
+					keyOrder = append(keyOrder, ks)
+				}
+				kvMap[ks] = append(kvMap[ks], v)
+				return nil
+			}
+			if err := mapFn(ctx, kv.Key, kv.Value, emit); err != nil {
+				return nil, fmt.Errorf("mapper run: %w", err)
+			}
+
+			// Sort keys lexicographically; sort values within each key.
+			sort.Strings(keyOrder)
+			entries := make([]*keyValues, 0, len(keyOrder))
+			for _, ks := range keyOrder {
+				vals := kvMap[ks]
+				sort.Slice(vals, func(i, j int) bool {
+					return bytes.Compare(vals[i], vals[j]) < 0
+				})
+				entries = append(entries, &keyValues{Key: []byte(ks), Values: vals})
+			}
+
+			return []entroq.ModifyArg{
+				task.Delete(),
+				entroq.InsertingInto(c.MapResultQ(), entroq.WithValue(mapOutput{
+					Shard:   ref,
+					Entries: entries,
+				})),
+			}, nil
+		}),
+	)
+}
+
+// ReducerWorker creates a worker that watches ReduceQ, reads all reduce docs
+// for the claimed primary key, merges and sorts their values, runs reduceFn,
+// and posts a reduceOutput to ReduceResultQ.
+func (c *Controller) ReducerWorker(reduceFn Reducer) *worker.Worker[reduceClaim] {
+	return worker.New[reduceClaim](c.client,
+		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, rc reduceClaim, _ []*entroq.Doc) ([]entroq.ModifyArg, error) {
+			docs, err := c.client.Docs(ctx, rc.Doc.asQuery())
+			if err != nil {
+				return nil, fmt.Errorf("reducer read docs %q: %w", rc.Doc.Key, err)
+			}
+
+			// Merge values from all reduce docs for this primary key.
+			var values [][]byte
+			for _, d := range docs {
+				var kv keyValues
+				if err := json.Unmarshal(d.Content, &kv); err != nil {
+					return nil, fmt.Errorf("reducer parse doc %q: %w", d.ID, err)
+				}
+				values = append(values, kv.Values...)
+			}
+			sort.Slice(values, func(i, j int) bool {
+				return bytes.Compare(values[i], values[j]) < 0
+			})
+
+			result, err := reduceFn(ctx, &sliceReducerInput{key: rc.MapKey, values: values})
+			if err != nil {
+				return nil, fmt.Errorf("reducer compute: %w", err)
+			}
+
+			return []entroq.ModifyArg{
+				task.Delete(),
+				entroq.InsertingInto(c.ReduceResultQ(), entroq.WithValue(reduceOutput{
+					Doc:    rc.Doc,
+					MapKey: rc.MapKey,
+					Result: result,
+				})),
+			}, nil
+		}),
+	)
+}
+
+// RunAll runs the full MapReduce pipeline: setup, map phase with numMappers
+// concurrent mapper workers, then reduce phase with numReducers concurrent
+// reducer workers. On success, result docs are available in DocNS under keys
+// matching "result/<hex(mapOutputKey)>".
+func RunAll(ctx context.Context, eq *entroq.EntroQ, prefix string, input []*KV, mapFn Mapper, reduceFn Reducer, numMappers, numReducers int) error {
+	ctrl := NewController(eq, prefix)
+	if err := ctrl.Setup(ctx, input); err != nil {
+		return fmt.Errorf("setup: %w", err)
+	}
+
+	// Map phase: mapper workers + controller phase runner.
+	mapPhaseCtx, mapPhaseCancel := context.WithCancel(ctx)
+	defer mapPhaseCancel()
+
+	mg, mgctx := errgroup.WithContext(mapPhaseCtx)
+
+	for range numMappers {
+		mg.Go(func() error {
+			return ctrl.MapperWorker(mapFn).Run(mgctx,
+				worker.Watching(ctrl.MapQ()),
+				worker.WithLease(claimDuration),
+			)
+		})
+	}
+	mg.Go(func() error {
+		err := ctrl.RunMapPhase(mgctx)
+		mapPhaseCancel() // stop mappers once phase completes
+		return err
+	})
+
+	if err := mg.Wait(); err != nil {
+		return fmt.Errorf("map phase: %w", err)
+	}
+
+	// Reduce phase: reducer workers + controller phase runner.
+	reducePhaseCtx, reducePhaseCancel := context.WithCancel(ctx)
+	defer reducePhaseCancel()
+
+	rg, rgctx := errgroup.WithContext(reducePhaseCtx)
+
+	for range numReducers {
+		rg.Go(func() error {
+			return ctrl.ReducerWorker(reduceFn).Run(rgctx,
+				worker.Watching(ctrl.ReduceQ()),
+				worker.WithLease(claimDuration),
+			)
+		})
+	}
+	rg.Go(func() error {
+		err := ctrl.RunReducePhase(rgctx)
+		reducePhaseCancel() // stop reducers once phase completes
+		return err
+	})
+
+	return rg.Wait()
+}
+
+// Results returns all result key/value pairs from a completed RunAll, sorted
+// by key. ns must match the prefix passed to RunAll or NewController.DocNS.
+func Results(ctx context.Context, eq *entroq.EntroQ, ns string) ([]*KV, error) {
+	docs, err := eq.Docs(ctx, &entroq.DocQuery{
+		Namespace: ns,
+		KeyStart:  "result/",
+		KeyEnd:    "result0",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("results: %w", err)
+	}
+	var kvs []*KV
+	for _, d := range docs {
+		var kv keyValues
+		if err := json.Unmarshal(d.Content, &kv); err != nil {
+			return nil, fmt.Errorf("result parse %q: %w", d.Key, err)
+		}
+		var val []byte
+		if len(kv.Values) > 0 {
+			val = kv.Values[0]
+		}
+		kvs = append(kvs, NewKV(kv.Key, val))
+	}
+	return kvs, nil
+}
+
 // MapEmitFunc is the emit function passed to mappers.
 type MapEmitFunc func(ctx context.Context, key, value []byte) error
 
-// MapEmitter is passed to a map input processor so it can emit multiple
-// outputs for a single input by calling it.
-type MapEmitter interface {
-	// Emit is called to output data from a mapper.
-	Emit(ctx context.Context, key, value []byte) error
-
-	// AsModifyArgs takes a *completed* map output and produces shuffle task
-	// insertions from that output. Adds optional additional arguments as
-	// needed by the caller (for example, the caller may desire to delete the
-	// map task at the same time). Tasks are added to the queue <prefix>/<shard>.
-	AsModifyArgs(prefix string, additional ...entroq.ModifyArg) ([]entroq.ModifyArg, error)
-}
-
-// CollectingMapEmitter collects all of its output into a slice of shards, each
-// member of which contains a slice of kev/value pairs.
-type CollectingMapEmitter struct {
-	NumShards int
-	shards    [][]*KV
-}
-
-// NewCollectingMapEmitter creates a shard map emitter for use by a mapper.
-// When mapping is done, the data is collected into sorted slices of key/value
-// pairs, one per shard.
-func NewCollectingMapEmitter(numShards int) *CollectingMapEmitter {
-	if numShards < 1 {
-		numShards = 1
-	}
-
-	return &CollectingMapEmitter{
-		NumShards: numShards,
-		shards:    make([][]*KV, numShards),
-	}
-}
-
-// Emit adds a new key/value pair to the emitter.
-func (e *CollectingMapEmitter) Emit(_ context.Context, key, value []byte) error {
-	shard := ShardForKey(key, e.NumShards)
-	e.shards[shard] = append(e.shards[shard], NewKV(key, value))
-	return nil
-}
-
-// AsModifyArgs returns a slice of arguments to be sent to insert new shuffle
-// tasks after emissions are complete. Additional modifications can be passed in
-// to make, e.g., simultaneous task deletion easier to specify.
-func (e *CollectingMapEmitter) AsModifyArgs(qPrefix string, additional ...entroq.ModifyArg) ([]entroq.ModifyArg, error) {
-	var args []entroq.ModifyArg
-	for shard, kvs := range e.shards {
-		if len(kvs) == 0 {
-			continue
-		}
-		sort.Sort(byKey(kvs))
-		queue := path.Join(qPrefix, fmt.Sprint(shard))
-		args = append(args, entroq.InsertingInto(queue, entroq.WithValue(kvs)))
-	}
-	return append(args, additional...), nil
-}
-
-// reducingProxyMapEmitter collects its inputs and periodically runs an early
-// reducer over them before sending the reduced results to the target emitter.
-type reducingProxyMapEmitter struct {
-	sync.Mutex
-
-	target MapEmitter
-	reduce Reducer
-
-	collection []*KV
-	emitCtx    context.Context // needed in AsModifyArgs for final Emit call.
-}
-
-// newReducingProxyMapEmitter creates a new emitter that reduces over its
-// inputs and emits them to a target emitter. Used for early reducing in mapper
-// operations.
-func newReducingProxyMapEmitter(target MapEmitter, reduce Reducer) *reducingProxyMapEmitter {
-	return &reducingProxyMapEmitter{
-		target: target,
-		reduce: reduce,
-	}
-}
-
-// reduceAndEmit performs the reduce and emit operation.
-func (e *reducingProxyMapEmitter) reduceAndEmit(ctx context.Context, threshold int) error {
-	var (
-		kvs  []*KV
-		err  error
-		bail bool
-	)
-	func() {
-		e.Lock()
-		defer e.Unlock()
-
-		if len(e.collection) < threshold {
-			bail = true
-			return
-		}
-
-		sort.Sort(byKey(e.collection))
-
-		kvs, err = reduceSortedKVs(ctx, e.reduce, e.collection)
-		if err != nil {
-			err = fmt.Errorf("reduce and emit error: %w", err)
-		}
-	}()
-
-	if bail {
-		return nil
-	}
-
-	for _, kv := range kvs {
-		if err := e.target.Emit(ctx, kv.Key, kv.Value); err != nil {
-			return fmt.Errorf("proxy emit: %w", err)
-		}
-	}
-
-	e.Lock()
-	defer e.Unlock()
-
-	e.collection = kvs
-	return nil
-}
-
-// Emit collects values for a while, sorts them, reduces them, and sends them
-// to the target emitter.
-func (e *reducingProxyMapEmitter) Emit(ctx context.Context, key, value []byte) error {
-	func() {
-		e.Lock()
-		defer e.Unlock()
-
-		e.emitCtx = ctx
-		e.collection = append(e.collection, NewKV(key, value))
-	}()
-
-	if err := e.reduceAndEmit(ctx, 100); err != nil {
-		return fmt.Errorf("reducing proxy emit: %w", err)
-	}
-	return nil
-}
-
-// AsModifyArgs creates task insertions. This one simply forwards to the target
-// implementation.
-func (e *reducingProxyMapEmitter) AsModifyArgs(prefix string, additional ...entroq.ModifyArg) ([]entroq.ModifyArg, error) {
-	if err := e.reduceAndEmit(e.emitCtx, 1); err != nil {
-		return nil, fmt.Errorf("proxy modify args: %w", err)
-	}
-	return e.target.AsModifyArgs(prefix, additional...)
-}
-
-// MapProcessor is a function that accepts a key/value pair and emits zero or
-// more key/value pairs for reducing.
+// Mapper is called once per input KV. It emits zero or more key/value pairs
+// for the reduce phase by calling emit.
 type Mapper func(ctx context.Context, key, value []byte, emit MapEmitFunc) error
 
 // IdentityMapper produces the same output as its input.
@@ -206,7 +526,6 @@ func WordCountMapper(ctx context.Context, key, value []byte, emit MapEmitFunc) e
 	}
 	numEmitted := 0
 	for word, count := range words {
-		// Pause every so often to check for cancelation.
 		if (numEmitted+1)%1000 == 0 {
 			select {
 			case <-ctx.Done():
@@ -222,10 +541,10 @@ func WordCountMapper(ctx context.Context, key, value []byte, emit MapEmitFunc) e
 	return nil
 }
 
-// KV contains instructions for a mapper. It is just a key and value.
+// KV contains a key/value pair. It is the input type for mappers and is stored
+// as the content of shard docs.
 type KV struct {
 	Key   []byte `json:"key"`
-	Key2  []byte `json:"key2"` // secondary key for sorting
 	Value []byte `json:"value"`
 }
 
@@ -236,162 +555,32 @@ func NewKV(key, value []byte) *KV {
 
 // String converts this key/value pair into a readable string.
 func (kv *KV) String() string {
-	if len(kv.Key2) > 0 {
-		return fmt.Sprintf("(%s,%s)=%s", string(kv.Key), string(kv.Key2), string(kv.Value))
-	}
 	return fmt.Sprintf("(%s)=%s", string(kv.Key), string(kv.Value))
 }
 
-// byKey helps with sorting KV slices by key. It's used in more than one place,
-// which is why we don't just use sort.Slice.
-type byKey []*KV
-
-func (b byKey) Less(i, j int) bool {
-	cmp := bytes.Compare(b[i].Key, b[j].Key)
-	if cmp == 0 {
-		return bytes.Compare(b[i].Key2, b[j].Key2) < 0
-	}
-	return cmp < 0
-}
-func (b byKey) Swap(i, j int) { b[i], b[j] = b[j], b[i] }
-func (b byKey) Len() int      { return len(b) }
-
-// MapWorker claims map input tasks, processes them, and produces output tasks.
-type MapWorker struct {
-	client     *entroq.EntroQ
-	newEmitter func() MapEmitter
-
-	Name string
-
-	InputQueue   string
-	OutputPrefix string
-	Map          Mapper
-	EarlyReduce  Reducer
-}
-
-// MapWorkerOption is passed to NewMapWorker to change what it does.
-type MapWorkerOption func(*MapWorker)
-
-// WithMapper provides a mapper process to a map worker. The default is
-// IdentityMapper if not specified as an option.
-func WithMapper(m Mapper) MapWorkerOption {
-	return func(mw *MapWorker) {
-		if m == nil {
-			return
-		}
-		mw.Map = m
-	}
-}
-
-// WithEarlyReducer provides a reducer that can accept map output and
-// produce reduce input, ideally in a "reduced" way. This works if the input
-// value is the same type as the output value, which is not always the case
-//
-// The inputs and outputs are the same as for a Reducer, but *this reducer must
-// be able to operate on its own output*.
-//
-// This would be useful, for example, when summing over words to produce a
-// count of each unique word. The mapper may output "1" for each word, then the
-// intermediate reducer sums up all like words, producing an count. The final
-// reduction and intermediate shuffling then have much less work to do because
-// much of the reducing is happening in the map phase.
-func WithEarlyReducer(r Reducer) MapWorkerOption {
-	return func(mw *MapWorker) {
-		mw.EarlyReduce = r
-	}
-}
-
-// MapAsName sets the name for this worker. Worker names are empty by default.
-func MapAsName(name string) MapWorkerOption {
-	return func(mw *MapWorker) {
-		mw.Name = name
-	}
-}
-
-// MapToOutputPrefix provides an output queue prefix separate from the input
-// queue for mappers to place output tasks into. If not provided, mappers
-// append "done" to the input queue to form the output queue prefix.
-func MapToOutputPrefix(p string) MapWorkerOption {
-	return func(mw *MapWorker) {
-		if p == "" {
-			return
-		}
-		mw.OutputPrefix = p
-	}
-}
-
-// NewMapWorker creates a new MapWorker, which loops until told to stop,
-// claiming tasks and processing them, placing them into an appropriate output
-// queue calculated from the output key.
-func NewMapWorker(eq *entroq.EntroQ, inQueue string, newEmitter func() MapEmitter, opts ...MapWorkerOption) *MapWorker {
-	w := &MapWorker{
-		client:       eq,
-		newEmitter:   newEmitter,
-		InputQueue:   inQueue,
-		OutputPrefix: inQueue,
-		Map:          IdentityMapper,
-	}
-	for _, opt := range opts {
-		opt(w)
-	}
-	return w
-}
-
-// Run runs the map worker. It blocks, running until the map queue is
-// empty, it encounters an error, or its context is canceled, whichever comes
-// first. If this should be run in a goroutine, that is up to the caller.
-// The task value is expected to be a JSON-serialized KV struct.
-//
-// Runs until the context is canceled or an unrecoverable error is encountered.
-func (w *MapWorker) Run(ctx context.Context) error {
-	return worker.New(w.client,
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, kv *KV, _ []*entroq.Doc) ([]entroq.ModifyArg, error) {
-			emitter := w.newEmitter()
-			if w.EarlyReduce != nil {
-				emitter = newReducingProxyMapEmitter(emitter, w.EarlyReduce)
-			}
-			if err := w.Map(ctx, kv.Key, kv.Value, emitter.Emit); err != nil {
-				return nil, fmt.Errorf("map run map: %w", err)
-			}
-			emitArgs, err := emitter.AsModifyArgs(w.OutputPrefix)
-			if err != nil {
-				return nil, fmt.Errorf("mr run mod args: %v", err)
-			}
-			return append(emitArgs, task.Delete()), nil
-		}),
-	).Run(ctx, worker.Watching(w.InputQueue))
-}
-
-// ReducerInput provides a streaming interface for getting values during reduction.
+// ReducerInput provides a streaming interface for values during reduction.
 type ReducerInput interface {
-	// Key produces the key for this reduce operation.
+	// Key is always available; it is the map output key being reduced.
 	Key() []byte
-
-	// Value outputs the current value in the input.
+	// Value is the current value. Call Next before the first call.
 	Value() []byte
-
-	// Err returns any errors encountered while iterating over input.
+	// Err returns any iteration error. Check after Next returns false.
 	Err() error
-
-	// Next must be called before Value() (but Key() is always available).
+	// Next advances to the next value. Returns false when exhausted.
 	//
-	// Example:
-	//
-	// 	for input.Next() {
-	// 		process(input.Value())
-	// 	}
-	// 	if err := input.Err(); err != nil {
-	// 		return fmt.Errorf("error getting input: %w", err)
-	// 	}
+	//	for input.Next() {
+	//		process(input.Value())
+	//	}
+	//	if err := input.Err(); err != nil { ... }
 	Next() bool
 }
 
-// Reducer is called once per unique map-output key. It is expected to output a
-// single value for all inputs.
+// Reducer is called once per unique map-output key. It receives all values for
+// that key via input and must return a single combined value.
 type Reducer func(ctx context.Context, input ReducerInput) ([]byte, error)
 
 // FirstValueReducer outputs its first value and quits.
-func FirstValueReducer(ctx context.Context, input ReducerInput) ([]byte, error) {
+func FirstValueReducer(_ context.Context, input ReducerInput) ([]byte, error) {
 	if !input.Next() {
 		return nil, fmt.Errorf("no inputs to reducer")
 	}
@@ -401,14 +590,13 @@ func FirstValueReducer(ctx context.Context, input ReducerInput) ([]byte, error) 
 	return input.Value(), nil
 }
 
-// NilReducer produces a single nil value for the provided key. This can be useful for
-// sorting keys, for example, where the values are not useful or important.
-func NilReducer(ctx context.Context, input ReducerInput) ([]byte, error) {
+// NilReducer produces a single nil value for the provided key.
+func NilReducer(_ context.Context, _ ReducerInput) ([]byte, error) {
 	return nil, nil
 }
 
-// SumReducer produces a sum over (int) values for each key.
-func SumReducer(ctx context.Context, input ReducerInput) ([]byte, error) {
+// SumReducer produces a sum over integer values for each key.
+func SumReducer(_ context.Context, input ReducerInput) ([]byte, error) {
 	sum := 0
 	for input.Next() {
 		count, err := strconv.Atoi(string(input.Value()))
@@ -424,7 +612,7 @@ func SumReducer(ctx context.Context, input ReducerInput) ([]byte, error) {
 }
 
 // SliceReducer produces a JSON-serialized slice of all values in its input.
-func SliceReducer(ctx context.Context, input ReducerInput) ([]byte, error) {
+func SliceReducer(_ context.Context, input ReducerInput) ([]byte, error) {
 	var vals [][]byte
 	for input.Next() {
 		vals = append(vals, input.Value())
@@ -433,425 +621,4 @@ func SliceReducer(ctx context.Context, input ReducerInput) ([]byte, error) {
 		return nil, fmt.Errorf("get reduce value: %w", err)
 	}
 	return json.Marshal(vals)
-}
-
-// ReduceWorker consumes shuffle output and combines all values for a
-// particular key into a single key/value pair, which is then JSON-serialized,
-// one item per line, and written to a provided emitter.
-type ReduceWorker struct {
-	client *entroq.EntroQ
-
-	Name string
-
-	MapEmptyQueue string
-	InputQueue    string
-	OutputQueue   string
-	Reduce        Reducer
-}
-
-// ReduceWorkerOption is passed to NewReduceWorker to specify non-default options.
-type ReduceWorkerOption func(*ReduceWorker)
-
-// WithReducer specifies the reducer, otherwise NilReducer is used.
-func WithReducer(reduce Reducer) ReduceWorkerOption {
-	return func(w *ReduceWorker) {
-		w.Reduce = reduce
-	}
-}
-
-// ReduceToOutput specifies the output queue name for finished reduce shards.
-func ReduceToOutput(q string) ReduceWorkerOption {
-	return func(w *ReduceWorker) {
-		w.OutputQueue = q
-	}
-}
-
-// ReduceAsName sets the name of this reduce worker, defaults to blank.
-func ReduceAsName(name string) ReduceWorkerOption {
-	return func(w *ReduceWorker) {
-		w.Name = name
-	}
-}
-
-// NewReduceWorker creates a reduce worker for the given task client and input
-// queue, running the reducer over every unique key.
-func NewReduceWorker(eq *entroq.EntroQ, mapEmptyQueue, inQueue string, opts ...ReduceWorkerOption) *ReduceWorker {
-	w := &ReduceWorker{
-		client:        eq,
-		InputQueue:    inQueue,
-		MapEmptyQueue: mapEmptyQueue,
-		OutputQueue:   path.Join(inQueue, "out"),
-		Reduce:        NilReducer,
-	}
-	for _, opt := range opts {
-		opt(w)
-	}
-	return w
-}
-
-type proxyingReduceInput struct {
-	key   func() []byte
-	next  func() bool
-	value func() []byte
-	err   func() error
-}
-
-func (p *proxyingReduceInput) Key() []byte   { return p.key() }
-func (p *proxyingReduceInput) Next() bool    { return p.next() }
-func (p *proxyingReduceInput) Value() []byte { return p.value() }
-func (p *proxyingReduceInput) Err() error    { return p.err() }
-
-// mergeTasks takes multiple tasks as input, merges them together, and replaces them with a single task.
-func (w *ReduceWorker) mergeTasks(ctx context.Context, tasks []*entroq.Task) error {
-	if len(tasks) <= 1 {
-		return nil
-	}
-	err := worker.DoWithRenewAll(ctx, w.client, tasks, claimDuration, func(ctx context.Context, stop worker.FinalizeRenewAll) error {
-		// Append and sort. Note that in real life with real scale, we would
-		// want to do an on-disk merge sort (since individual components would
-		// already be sorted).
-		var kvs []*KV
-
-		for _, task := range tasks {
-			vals, err := entroq.GetValue[[]*KV](task)
-			if err != nil {
-				return fmt.Errorf("merge from json: %w", err)
-			}
-			kvs = append(kvs, vals...)
-		}
-
-		sort.Slice(kvs, func(i, j int) bool {
-			return bytes.Compare(kvs[i].Key, kvs[j].Key) < 0
-		})
-
-		// Now all key/value pairs are merged into a single sorted list. Create a new task and delete the others.
-		// Stop to get stable version tasks (no longer renewed in the background).
-		updatedTasks := stop()
-
-		var modArgs []entroq.ModifyArg
-		modArgs = append(modArgs, entroq.InsertingInto(w.InputQueue, entroq.WithValue(kvs)))
-		for _, t := range updatedTasks {
-			modArgs = append(modArgs, t.Delete())
-		}
-		if _, err := w.client.Modify(ctx, modArgs...); err != nil {
-			return fmt.Errorf("merge output: %w", err)
-		}
-
-		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("merge while claimed: %w", err)
-	}
-	return nil
-}
-
-// reduceSortedKVs takes a slice of key-value pairs, assumed to be sorted, and
-// runs the reduce function with its input iterating over a single key. It does
-// this once per unique key in the slice.
-func reduceSortedKVs(ctx context.Context, reduce Reducer, kvs []*KV) ([]*KV, error) {
-	var outputs []*KV
-	if len(kvs) == 0 {
-		return nil, nil
-	}
-
-	curr := 0
-
-	for curr < len(kvs) {
-		last := kvs[curr] // starting out - "last" is always first entry
-
-		input := &proxyingReduceInput{
-			key:   func() []byte { return last.Key },
-			value: func() []byte { return last.Value },
-			err:   func() error { return nil },
-			next: func() bool {
-				if curr >= len(kvs) {
-					return false
-				}
-				// If we aren't just started, and the current key is
-				// not the same as the last, can't continue.
-				if curr > 0 && !bytes.Equal(last.Key, kvs[curr].Key) {
-					return false
-				}
-				last = kvs[curr]
-				curr++
-				return true
-			},
-		}
-		currBefore := curr
-		output, err := reduce(ctx, input)
-		if currBefore == curr {
-			for input.Next() {
-				// The reducer didn't consume anything - we need to do that instead.
-			}
-		}
-		if err != nil {
-			return nil, fmt.Errorf("reduce sorted kvs: %w", err)
-		}
-		outputs = append(outputs, NewKV(last.Key, output))
-	}
-	return outputs, nil
-}
-
-// reduceTask takes a task (which is a list of key/value pairs, sorted),
-// and runs a reduce function on each set corresponding to a unique key,
-// writing them out in the order they appear (to maintain sorting).
-func (w *ReduceWorker) reduceTask(ctx context.Context, task *entroq.Task) error {
-	if err := worker.DoWithRenew(ctx, w.client, task, claimDuration, func(ctx context.Context, stop worker.FinalizeRenew) error {
-		kvs, err := entroq.GetValue[[]*KV](task)
-		if err != nil {
-			return fmt.Errorf("reduce from json: %w", err)
-		}
-
-		outputs, err := reduceSortedKVs(ctx, w.Reduce, kvs)
-		if err != nil {
-			return fmt.Errorf("reduce sorted: %w", err)
-		}
-		updatedTask := stop()
-
-		if _, err := w.client.Modify(ctx, updatedTask.Delete(), entroq.InsertingInto(w.OutputQueue, entroq.WithValue(outputs))); err != nil {
-			return fmt.Errorf("reduce output: %w", err)
-		}
-		return nil
-	}); err != nil {
-		return fmt.Errorf("reduce task: %w", err)
-	}
-	return nil
-}
-
-// Run starts a worker that consumes all reduce tasks in a particular queue,
-// and quits when it is empty. It actually does map output merging, too, since
-// there are exactly as many mergers as reducers, and reduce cannot proceed
-// until merging is finished.
-//
-// The worker watches for
-// - more than one task in its input queue, and
-// - an empty map queue.
-//
-// This worker has no need to claim tasks to do shuffling. It is assigned a specific
-// queue representing its shard, and no other worker will be assigned the same queue.
-//
-// Shuffle logic is as follows. In a watch/sleep loop,
-// - When more than one task is in the input queue, merge them into a single sorted task and replace.
-// - If only one task exists and there are no more map tasks, proceed to reduce.
-//
-// Reduce logic:
-// - pull (singleton) task from input queue
-// - run reduce over it and place the resulting sorted key/value pairs into the output queue.
-// - quit
-func (w *ReduceWorker) Run(ctx context.Context) error {
-	// First, merge until there is no more mapping work to do.
-	for {
-		// IMPORTANT! In general it's a very bad idea to use Tasks to grab tasks
-		// and operate on them. That's an "optimisic modify", and will generally
-		// result in system chaos. The thing that makes it safe here is unique
-		// to this workload: there is exactly one reducer created on each
-		// reducer shard queue. Were that not the case, the right way to go
-		// about this would be to use TryClaim in a loop until it returns no
-		// tasks.
-		mergeTasks, err := w.client.Tasks(ctx, w.InputQueue, entroq.LimitTasks(200))
-		if err != nil {
-			return fmt.Errorf("reduce get tasks: %w", err)
-		}
-		if len(mergeTasks) <= 1 {
-			empty, err := w.client.QueuesEmpty(ctx, entroq.MatchExact(w.MapEmptyQueue))
-			if err != nil {
-				return fmt.Errorf("reduce empty check: %w", err)
-			}
-			if empty {
-				break // all done - no more map tasks, 1 or fewer merge tasks.
-			}
-
-			// Nothing to do - sleep and continue.
-			select {
-			case <-ctx.Done():
-				return fmt.Errorf("reduce worker done: %w", ctx.Err())
-			case <-time.After(shuffleWait):
-			}
-			continue
-		}
-		// More than one merge task is in the queue. Merge and check again.
-		if err := w.mergeTasks(ctx, mergeTasks); err != nil {
-			if _, ok := entroq.AsDependency(err); !ok {
-				return fmt.Errorf("merge %d tasks: %w", len(mergeTasks), err)
-			}
-			continue
-		}
-	}
-
-	task, err := w.client.TryClaim(ctx, entroq.From(w.InputQueue), entroq.ClaimFor(claimDuration))
-	if err != nil {
-		return fmt.Errorf("reduce claim: %w", err)
-	}
-	if task == nil {
-		return nil
-	}
-	if err := w.reduceTask(ctx, task); err != nil {
-		return fmt.Errorf("reduce: %w", err)
-	}
-	return nil
-}
-
-// MapReduce creates and runs a full mapreduce pipeline, using EntroQ as its
-// state storage under the given queue prefix. It spawns in-memory workers as
-// goroutines, using the provided worker counts.
-type MapReduce struct {
-	client *entroq.EntroQ
-
-	QueuePrefix string
-	NumMappers  int
-	NumReducers int
-
-	Map         Mapper
-	Reduce      Reducer
-	EarlyReduce Reducer
-
-	Data []*KV
-}
-
-// MapReduceOption modifies how a MapReduce is created.
-type MapReduceOption func(*MapReduce)
-
-// WithMap instructs the mapreduce to use the given mapper. Defaults to IdentityMapper.
-func WithMap(m Mapper) MapReduceOption {
-	return func(mr *MapReduce) {
-		mr.Map = m
-	}
-}
-
-// WithReduce instructs the mapreduce to use the given reducer. Defaults to NilReducer.
-func WithReduce(r Reducer) MapReduceOption {
-	return func(mr *MapReduce) {
-		mr.Reduce = r
-	}
-}
-
-// WithEarlyReduce sets the early reducer for map operations.
-func WithEarlyReduce(r Reducer) MapReduceOption {
-	return func(mr *MapReduce) {
-		mr.EarlyReduce = r
-	}
-}
-
-// WithNumMappers sets the number of map workers.
-func WithNumMappers(n int) MapReduceOption {
-	if n < 1 {
-		n = 1
-	}
-	return func(mr *MapReduce) {
-		mr.NumMappers = n
-	}
-}
-
-// WithNumReducers sets the number of reduce workers.
-func WithNumReducers(n int) MapReduceOption {
-	if n < 1 {
-		n = 1
-	}
-	return func(mr *MapReduce) {
-		mr.NumReducers = n
-	}
-}
-
-// AddInput adds an input KV to a mapreduce.
-func AddInput(kvs ...*KV) MapReduceOption {
-	return func(mr *MapReduce) {
-		mr.Data = append(mr.Data, kvs...)
-	}
-}
-
-// NewMapReduce creates a mapreduce pipeline config, from which workers can be
-// started to carry out the desired data manipulations.
-func NewMapReduce(eq *entroq.EntroQ, qPrefix string, opts ...MapReduceOption) *MapReduce {
-	mr := &MapReduce{
-		client:      eq,
-		QueuePrefix: qPrefix,
-		NumMappers:  1,
-		NumReducers: 1,
-		Map:         IdentityMapper,
-		Reduce:      NilReducer,
-	}
-	for _, opt := range opts {
-		opt(mr)
-	}
-	return mr
-}
-
-// Run starts the mapreduce pipeline, adding data to EntroQ and starting workers.
-// Returns the output queue with finished tasks.
-func (mr *MapReduce) Run(ctx context.Context) (string, error) {
-	var (
-		qMap          = path.Join(mr.QueuePrefix, "map")
-		qMapInput     = path.Join(qMap, "input")
-		qReduce       = path.Join(mr.QueuePrefix, "reduce")
-		qReduceInput  = path.Join(qReduce, "input")
-		qReduceOutput = path.Join(qReduce, "output")
-	)
-
-	// First create map tasks for all of the data.
-	for _, kv := range mr.Data {
-		if _, err := mr.client.Modify(ctx, entroq.InsertingInto(qMapInput, entroq.WithValue(kv))); err != nil {
-			return "", fmt.Errorf("insert map input: %w", err)
-		}
-	}
-
-	// When all tasks are present, start map and reduce workers. They'll all exit when finished.
-	g, ctx := errgroup.WithContext(ctx)
-	mapCtx, mapCancel := context.WithCancel(ctx)
-
-	for i := 0; i < mr.NumMappers; i++ {
-		i := i
-		ctx := mapCtx
-		worker := NewMapWorker(mr.client, qMapInput,
-			func() MapEmitter { return NewCollectingMapEmitter(mr.NumReducers) },
-			MapAsName(fmt.Sprint(i)),
-			MapToOutputPrefix(qReduceInput),
-			WithMapper(mr.Map),
-			WithEarlyReducer(mr.EarlyReduce))
-
-		g.Go(func() error {
-			if err := worker.Run(ctx); err != nil && !entroq.IsCanceled(err) {
-				return fmt.Errorf("map worker: %w", err)
-			}
-			return nil
-		})
-	}
-
-	g.Go(func() error {
-		for {
-			empty, err := mr.client.QueuesEmpty(ctx, entroq.MatchExact(qMapInput))
-			if err != nil {
-				return fmt.Errorf("map worker empty queue check: %w", err)
-			}
-			if empty {
-				mapCancel()
-				return nil // all finished.
-			}
-			select {
-			case <-ctx.Done():
-				return fmt.Errorf("empty checker: %w", ctx.Err())
-			case <-time.After(5 * time.Second):
-			}
-		}
-	})
-
-	for i := 0; i < mr.NumReducers; i++ {
-		name := fmt.Sprint(i)
-		worker := NewReduceWorker(mr.client, qMapInput, path.Join(qReduceInput, name),
-			ReduceAsName(name),
-			WithReducer(mr.Reduce),
-			ReduceToOutput(qReduceOutput))
-
-		g.Go(func() error {
-			if err := worker.Run(ctx); err != nil {
-				return fmt.Errorf("reduce worker: %w", err)
-			}
-			return nil
-		})
-	}
-
-	if err := g.Wait(); err != nil {
-		return "", fmt.Errorf("pipeline error: %w", err)
-	}
-
-	return qReduceOutput, nil
 }

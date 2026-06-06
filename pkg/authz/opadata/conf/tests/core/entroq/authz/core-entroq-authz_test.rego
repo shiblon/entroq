@@ -158,6 +158,7 @@ test_allow_false_missing_actions if {
 test_allow_false_empty_allowed_queues if {
 	not allow with data.entroq.user.name as "auser"
 		with data.entroq.permissions.allowed_queues as set()
+		with data.entroq.permissions.allowed_namespaces as set()
 		with input.queues as []
 }
 
