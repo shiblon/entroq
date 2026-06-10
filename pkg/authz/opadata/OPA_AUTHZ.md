@@ -578,6 +578,15 @@ The operator builds `data.mesh` from CRDs and pushes it to
         {"tier": "frontend"}
       ]
     }
+  ],
+  "namespaces": [
+    {
+      "pattern": "/payments/shared-docs/",
+      "matchType": "Prefix",
+      "allowedCallers": [
+        {"team": "payments"}
+      ]
+    }
   ]
 }
 ```
@@ -591,6 +600,7 @@ Fields:
 | `queues[].pattern` | `EntroQQueue` | The queue name or prefix to protect |
 | `queues[].matchType` | `EntroQQueue` | `Exact` or `Prefix` |
 | `queues[].allowedCallers` | `EntroQQueue` | List of label-set matchers. AND within one entry; OR across entries |
+| `namespaces[]` | `EntroQQueue` | Document-namespace policies; same `pattern` / `matchType` / `allowedCallers` shape as `queues`, applied to doc-store namespace paths |
 
 Label matching: a caller satisfies a queue policy if its identity labels match
 **all** key-value pairs in **any one** of the `allowedCallers` entries.
@@ -632,6 +642,13 @@ spec:
     allowedCallers:
     - labels:
         tier: frontend
+  # Optional: gate document-store access the same way, by namespace path.
+  namespaces:
+  - pattern: /payments/shared-docs/
+    matchType: Prefix
+    allowedCallers:
+    - labels:
+        team: payments
 ```
 
 ### Deploying with Helm

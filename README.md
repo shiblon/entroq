@@ -72,10 +72,9 @@ go install github.com/shiblon/entroq/cmd/eqc@latest
 eqc --help
 ```
 
-There is also a Python-based CLI:
+The Python client installs from the `clients/py` subdirectory:
 ```bash
-python3 -m pip install git+https://github.com/shiblon/entroq
-python3 -m entroq --help
+python3 -m pip install "git+https://github.com/shiblon/entroq#subdirectory=clients/py"
 ```
 
 ## Language Clients
@@ -90,52 +89,52 @@ svc, _ := entroq.New(ctx, eqgrpc.Opener("localhost:37706"))
 defer svc.Close()
 
 w := worker.New(svc,
-    worker.WithDo(func(ctx context.Context, task *entroq.Task) error {
+    worker.WithDoModify(func(ctx context.Context, task *entroq.Task, val json.RawMessage, docs []*entroq.Doc) ([]entroq.ModifyArg, error) {
         log.Printf("Processing: %s", string(task.Value))
-        return nil // success
-    }),
-    worker.WithFinish(func(ctx context.Context, task *entroq.Task) error {
-        _, _, err := svc.Modify(ctx, task.Delete())
-        return err // finish
+        return []entroq.ModifyArg{task.Delete()}, nil // finish by deleting
     }),
 )
-w.Run(ctx, "/my/queue")
+w.Run(ctx, worker.Watching("/my/queue"))
 ```
 
 ### Python
-The Python client provides a flexible worker abstraction using context managers to handle task heartbeating and finalization.
+The Python client is async (`asyncio`). A worker claims tasks, renews the claim
+in the background while your handler runs, and atomically applies the
+`Modification` your handler returns.
 
 ```python
+import asyncio
 from entroq.json import EntroQJSON
+from entroq.types import Modification
 from entroq.worker import EntroQWorker
 
-client = EntroQJSON("http://localhost:9100")
-worker = EntroQWorker(client)
+async def main():
+    client = EntroQJSON("http://localhost:9100")
 
-def handle(renew, finalize):
-    with renew as task:
-        # Task is automatically renewed in the background here
+    @EntroQWorker.handler
+    async def process(task, docs):
         print(f"Processing: {task.value}")
+        return Modification(Modification.deleting(task))  # finish by deleting
 
-    with finalize as task:
-        # Renewal has stopped; task version is now stable
-        client.modify(deletes=[task.as_id()])
+    worker = EntroQWorker(client, "/my/queue")
+    await worker.run(process)
 
-worker.work("/my/queue", handle)
+asyncio.run(main())
 ```
 
 ### TypeScript (Node.js)
 The TypeScript client provides a worker abstraction for modern async/await environments. See [`clients/js/README.md`](clients/js/README.md) for installation and full API docs.
 
 ```typescript
-import { EntroQClient, EntroQWorker } from "@shiblon/entroq";
+import { EntroQClient, EntroQWorker } from "entroq";
 
 const client = new EntroQClient({ baseUrl: "http://localhost:9100" });
 const worker = new EntroQWorker(client);
 
 await worker.run(["/my/queue"], async (task) => {
-    console.log("Processing:", Buffer.from(task.value, "base64").toString());
-    return "delete"; // automatically deletes upon completion
+    console.log("Processing:", task.value);
+    // Return a modification to apply atomically; here we delete to finish.
+    return { deletes: [{ id: task.id, version: task.version, queue: task.queue }] };
 });
 ```
 
