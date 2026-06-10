@@ -4,6 +4,7 @@ package eqsvcjson
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -13,6 +14,8 @@ import (
 	"github.com/shiblon/entroq/api/apiconnect"
 	"github.com/shiblon/entroq/pkg/eqsvcgrpc"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 // Handler implements protoconnect.EntroQHandler by wrapping eqsvcgrpc.QSvc.
@@ -26,10 +29,25 @@ type Handler struct {
 func New(svc *eqsvcgrpc.QSvc, opts ...connect.HandlerOption) (string, http.Handler, error) {
 	h := &Handler{svc: svc}
 
+	// QSvc returns google.golang.org/grpc/status errors, which ConnectRPC does
+	// not recognize — left untranslated they collapse to CodeUnknown (HTTP 500)
+	// with their status code stringified into the message and their details
+	// dropped. Translate them centrally so codes and details survive over JSON.
+	opts = append(opts, connect.WithInterceptors(errTranslator()))
+
 	connectPath, connectHandler := apiconnect.NewEntroQHandler(h, opts...)
 
 	services := []*vanguard.Service{
-		vanguard.NewService(apiconnect.EntroQName, connectHandler),
+		// Talk to the in-process Connect backend in proto, not JSON. Otherwise
+		// Vanguard relays the backend's JSON bytes verbatim, and connect-go's
+		// codec omits zero-valued fields (e.g. version:0, atMs:0) — leaving
+		// thin clients to guess at missing fields. Forcing proto makes Vanguard
+		// re-marshal REST responses with its own EmitUnpopulated codec, so zero
+		// values are emitted explicitly.
+		vanguard.NewService(apiconnect.EntroQName, connectHandler,
+			vanguard.WithTargetProtocols(vanguard.ProtocolGRPC),
+			vanguard.WithTargetCodecs(vanguard.CodecProto),
+		),
 	}
 
 	transcoder, err := vanguard.NewTranscoder(services)
@@ -50,6 +68,59 @@ func ctxWithMD(ctx context.Context, headers http.Header) context.Context {
 		md[strings.ToLower(k)] = v
 	}
 	return metadata.NewIncomingContext(ctx, md)
+}
+
+// errTranslator returns a unary interceptor that converts grpc/status errors
+// from the wrapped QSvc into ConnectRPC errors, preserving codes and details.
+func errTranslator() connect.UnaryInterceptorFunc {
+	return func(next connect.UnaryFunc) connect.UnaryFunc {
+		return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+			resp, err := next(ctx, req)
+			if err != nil {
+				return resp, translateErr(err)
+			}
+			return resp, nil
+		}
+	}
+}
+
+// translateErr converts a google.golang.org/grpc/status error into a
+// *connect.Error. gRPC and Connect codes share numeric values, so the code maps
+// directly — except a dependency error (NotFound carrying ModifyDep details),
+// which becomes Aborted (HTTP 409 Conflict): it is an optimistic-concurrency
+// failure the caller should retry with fresh versions, not a "resource missing"
+// 404, which is also cacheable. The ModifyDep/AuthzDep details are re-attached
+// so JSON clients can see which items conflicted.
+func translateErr(err error) error {
+	stat, ok := status.FromError(err)
+	if !ok {
+		return err // not a grpc status; let Connect handle it.
+	}
+	code := connect.Code(stat.Code())
+	var details []proto.Message
+	isDep := false
+	for _, d := range stat.Details() {
+		switch m := d.(type) {
+		case *pb.ModifyDep:
+			isDep = true
+			details = append(details, m)
+		case *pb.AuthzDep:
+			details = append(details, m)
+		}
+	}
+	if isDep {
+		// TODO(next-minor): emit codes.Aborted from eqsvcgrpc directly and drop
+		// this remap; the eqgrpc client already accepts both NotFound and
+		// Aborted, so the server can switch without breaking older clients.
+		code = connect.CodeAborted
+	}
+	cerr := connect.NewError(code, errors.New(stat.Message()))
+	for _, d := range details {
+		if detail, derr := connect.NewErrorDetail(d); derr == nil {
+			cerr.AddDetail(detail)
+		}
+	}
+	return cerr
 }
 
 func (h *Handler) TryClaim(ctx context.Context, req *connect.Request[pb.ClaimRequest]) (*connect.Response[pb.ClaimResponse], error) {
