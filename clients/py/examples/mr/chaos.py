@@ -1,35 +1,38 @@
-"""Chaos worker that claims tasks and drops them without finalizing."""
+"""Chaos worker: claims tasks and abandons them so the claim expires.
 
+Demonstrates EntroQ's fault tolerance — a worker that dies mid-task loses
+nothing, because the unmodified claim simply expires and the task returns to its
+queue for another worker.
+"""
+
+import asyncio
 import logging
-import random
 import sys
-import time
-from typing import Union, List
+from typing import List, Union
+
 from entroq import EntroQBase
-from entroq.worker import EntroQWorker
+
 
 class ChaosWorker:
     def __init__(self, eq: EntroQBase):
-        self.worker = EntroQWorker(eq)
+        self.client = eq
 
-    def work(self, queue: Union[str, List[str]], sleep_time_s: int = 5):
-        logging.info("Starting ChaosWorker on queues: %s", queue)
-        def handle(renew, finalize):
+    async def work(self, queues: Union[str, List[str]], hold_s: float = 5.0):
+        logging.info("Starting ChaosWorker on queues: %s", queues)
+        while True:
             try:
-                with renew as task:
-                    if task is None:
-                        return
-                    logging.warning("CHAOS: Claimed task %s from %s. Plotting its demise...", task.id[:16], task.queue)
-                    time.sleep(sleep_time_s)
-                
-                # Intentionally NOT using finalize. The renew loop stops, 
-                # and the claim will naturally expire.
-                if task is not None:
-                    logging.warning("CHAOS: Dropping task %s on the floor.", task.id[:16])
-                
-                time.sleep(1) # Breathe to let other workers in!
+                # Short lease: hold the task briefly, then drop it on the floor.
+                # With no modify, the claim expires and the task comes back.
+                task = await self.client.try_claim(queues, duration_ms=int(hold_s * 2 * 1000))
+                if task is None:
+                    await asyncio.sleep(1)
+                    continue
+                logging.warning("CHAOS: claimed %s from %s; plotting its demise...",
+                                task.id[:16], task.queue)
+                await asyncio.sleep(hold_s)
+                logging.warning("CHAOS: dropping %s on the floor.", task.id[:16])
+                await asyncio.sleep(1)  # breathe, let real workers in
             except Exception as e:
                 print(f"FATAL: ChaosWorker crashed: {e}", file=sys.stderr)
                 logging.exception("ChaosWorker error")
-
-        self.worker.work(queue, handle)
+                await asyncio.sleep(1)

@@ -7,7 +7,8 @@ decides whether they may access a given queue.
 Two CRDs control the policy:
 
 - **`EntroQIdentity`** — maps a service account to a set of mesh label claims.
-- **`EntroQQueue`** — declares which queues exist and which callers may access them.
+- **`EntroQQueue`** — declares which queues exist and which callers may access
+  them, and (optionally) which callers may access document namespaces.
 
 The operator watches both across all namespaces, builds a mesh document, and
 pushes it to OPA on every change and on a periodic resync.
@@ -134,6 +135,33 @@ Example from the YAML above:
 | `{group: internal-tools}` | ✗ | second entry requires team=payments; first entry not satisfied |
 | `{group: backend}` | ✗ | no entry satisfied |
 
+### Document namespaces
+
+`EntroQQueue` can also gate access to the document store. The optional
+`spec.namespaces` list works exactly like `spec.queues`, but matches document
+**namespace** paths instead of queue paths:
+
+```yaml
+spec:
+  namespaces:
+  - pattern: /payments/shared-docs/
+    matchType: Prefix
+    allowedCallers:
+    - labels:
+        team: payments
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `spec.namespaces` | no | List of document-namespace patterns. |
+| `namespaces[].pattern` | yes | The namespace path or prefix to match. |
+| `namespaces[].matchType` | no | `Exact` (default) or `Prefix`. |
+| `namespaces[].allowedCallers` | yes | List of label matchers (at least one). |
+
+`matchType` and the AND-within-an-entry / OR-across-entries `allowedCallers`
+semantics are identical to queues (above). A single `EntroQQueue` resource may
+declare `queues`, `namespaces`, or both.
+
 ---
 
 ## Worked example
@@ -189,6 +217,13 @@ spec:
     allowedCallers:
     - labels:
         team: payments
+  namespaces:
+  # shared config docs: any payments team member may access
+  - pattern: /payments/shared-docs/
+    matchType: Prefix
+    allowedCallers:
+    - labels:
+        team: payments
 ```
 
 ---
@@ -203,8 +238,8 @@ curl -s http://localhost:8182/v1/data/mesh | jq .
 ```
 
 The response shows `initialized: true` once the operator has reconciled, plus
-the full `identities` and `queues` sections. If `initialized` is absent or
-false, the operator hasn't reconciled yet — check its logs:
+the full `identities`, `queues`, and `namespaces` sections. If `initialized` is
+absent or false, the operator hasn't reconciled yet — check its logs:
 
 ```bash
 kubectl logs -n eqk8s-system -l app.kubernetes.io/component=operator

@@ -1,149 +1,148 @@
-"""MapReduce implementation using EntroQ."""
+"""MapReduce implementation using EntroQ (async client).
 
+Task values are native JSON values (the client serializes them directly), so a
+map input task carries ``{"key": ..., "value": ...}`` and a shard/reduce task
+carries a list of those records — no manual encode/decode.
+
+Map and reduce steps are short, so each worker simply claims a task for long
+enough to finish it; there is no background renewal to manage.
+"""
+
+import asyncio
 import hashlib
-import json
 import logging
 import random
 import sys
-import time
 from collections import defaultdict
 from itertools import groupby
-from typing import Callable, Iterator, List, Tuple, Optional
-from contextlib import contextmanager
 from operator import itemgetter
+from typing import Callable
 
-from entroq import EntroQBase, TaskData, DependencyError
-from entroq.worker import renewing
+from entroq import EntroQBase, TaskData, Modification, DependencyError
 
-def fingerprint(key: bytes) -> int:
-    return int(hashlib.md5(key).hexdigest()[:16], 16)
 
-def shard_for_key(key: bytes, n: int) -> int:
+def fingerprint(key: str) -> int:
+    return int(hashlib.md5(key.encode("utf-8")).hexdigest()[:16], 16)
+
+
+def shard_for_key(key: str, n: int) -> int:
     return fingerprint(key) % max(1, n)
 
+
 class MapWorker:
-    def __init__(self, eq: EntroQBase, input_queue: str, output_prefix: str, mapper_fn: Callable, num_shards: int = 1):
+    def __init__(self, eq: EntroQBase, input_queue: str, output_prefix: str,
+                 mapper_fn: Callable, num_shards: int = 1):
         self.client = eq
         self.input_queue = input_queue
         self.output_prefix = output_prefix
         self.mapper_fn = mapper_fn
         self.num_shards = num_shards
 
-    def work(self, poll_s: float = 2.0):
-        """Process map tasks until the input queue is empty."""
+    async def work(self, poll_s: float = 2.0):
+        """Process map tasks until the input queue is empty, then retire."""
         logging.info("Starting MapWorker on queue: %s", self.input_queue)
         while True:
             try:
-                task = self.client.try_claim(self.input_queue, duration_ms=10000)
+                task = await self.client.try_claim(self.input_queue, duration_ms=30000)
                 if task is None:
-                    # Be robust: only exit if the queue is actually empty.
-                    qs = self.client.queues(exact=[self.input_queue])
-                    cnt = qs[0].get("num_tasks", 0) if qs else 0
-                    if cnt == 0:
-                        logging.info("MapWorker: queue empty (%d tasks), retiring.", cnt)
+                    # Only retire once the queue is actually empty.
+                    qs = await self.client.queues(exact=[self.input_queue])
+                    if (qs[0].get("num_tasks", 0) if qs else 0) == 0:
+                        logging.info("MapWorker: queue empty, retiring.")
                         return
-                    time.sleep(poll_s + random.uniform(0, 0.5))
+                    await asyncio.sleep(poll_s + random.uniform(0, 0.5))
                     continue
 
-                with renewing(self.client, task, duration_s=30) as current_task:
-                    kv = json.loads(current_task().value)
-                    key = kv.get("key", "").encode('utf-8')
-                    value = kv.get("value", "").encode('utf-8')
+                record = task.value  # {"key": ..., "value": ...}
+                key = record.get("key", "")
+                value = record.get("value", "")
 
-                    shards = defaultdict(list)
-                    def emit(k: bytes, v: bytes):
-                        shard = shard_for_key(k, self.num_shards)
-                        shards[shard].append({"key": k.decode('utf-8'), "value": v.decode('utf-8')})
+                shards: dict[int, list] = defaultdict(list)
 
-                    self.mapper_fn(key, value, emit)
+                def emit(k: str, v: str):
+                    shards[shard_for_key(k, self.num_shards)].append({"key": k, "value": v})
 
-                    inserts = []
-                    for shard, items in shards.items():
-                        if not items:
-                            continue
-                        items.sort(key=itemgetter("key"))
-                        q = f"{self.output_prefix}/{shard}"
-                        inserts.append(TaskData(queue=q, value=json.dumps(items).encode('utf-8')))
+                self.mapper_fn(key, value, emit)
 
-                    self.client.modify(inserts=inserts, deletes=[current_task()])
+                ops = [Modification.deleting(task)]
+                for shard, items in shards.items():
+                    if not items:
+                        continue
+                    items.sort(key=itemgetter("key"))
+                    ops.append(Modification.inserting(
+                        TaskData(queue=f"{self.output_prefix}/{shard}", value=items)))
+
+                await self.client.modify(Modification(*ops))
 
             except DependencyError as e:
                 logging.warning("MapWorker dependency error (will retry): %s", e)
             except Exception as e:
                 print(f"FATAL: MapWorker crashed: {e}", file=sys.stderr)
                 logging.exception("MapWorker task error")
-                time.sleep(1)
+                await asyncio.sleep(1)
+
 
 class ReduceWorker:
-    def __init__(self, eq: EntroQBase, map_empty_queue: str, input_queue: str, output_queue: str, reducer_fn: Callable):
+    def __init__(self, eq: EntroQBase, map_empty_queue: str, input_queue: str,
+                 output_queue: str, reducer_fn: Callable):
         self.client = eq
         self.map_empty_queue = map_empty_queue
         self.input_queue = input_queue
         self.output_queue = output_queue
         self.reducer_fn = reducer_fn
 
-    def work(self):
+    async def work(self):
         logging.info("Starting ReduceWorker on queue: %s", self.input_queue)
+        # 1. Coalesce all shard tasks for this reducer into one, but only once
+        #    the map stage has drained (no more shards will arrive).
         while True:
             try:
-                # 1. Merge tasks if > 1
-                tasks = self.client.tasks(self.input_queue, limit=200)
+                tasks = await self.client.tasks(self.input_queue, limit=200)
                 if len(tasks) > 1:
-                    merged = []
+                    merged: list = []
                     for t in tasks:
-                        kvs = json.loads(t.value)
-                        merged.extend(kvs)
-                    
+                        merged.extend(t.value)
                     merged.sort(key=itemgetter("key"))
-                    
                     try:
-                        self.client.modify(
-                            inserts=[TaskData(queue=self.input_queue, value=json.dumps(merged).encode('utf-8'))],
-                            deletes=tasks
-                        )
-                    except Exception as e:
-                        logging.debug("Merge conflict, retrying... %s", e)
+                        await self.client.modify(Modification(
+                            Modification.inserting(TaskData(queue=self.input_queue, value=merged)),
+                            *(Modification.deleting(t) for t in tasks),
+                        ))
+                    except DependencyError as e:
+                        logging.debug("Merge conflict, retrying: %s", e)
                     continue
 
-                if len(tasks) <= 1:
-                    # Check map empty queue
-                    map_tasks = self.client.queues(exact=[self.map_empty_queue])
-                    map_count = map_tasks[0].get("num_tasks", 0) if map_tasks else 0
-                    if map_count == 0:
-                        if not tasks:
-                            logging.info("ReduceWorker: Map stage empty, no shards to reduce. Exiting.")
-                            return
-                        break # ready to reduce!
-                    time.sleep(2)
+                map_qs = await self.client.queues(exact=[self.map_empty_queue])
+                if (map_qs[0].get("num_tasks", 0) if map_qs else 0) == 0:
+                    if not tasks:
+                        logging.info("ReduceWorker: no shards to reduce, exiting.")
+                        return
+                    break  # map stage drained and a single merged task remains
+                await asyncio.sleep(2)
 
             except Exception as e:
                 print(f"FATAL: ReduceWorker merge crash: {e}", file=sys.stderr)
                 logging.exception("ReduceWorker merge error")
-                time.sleep(1)
+                await asyncio.sleep(1)
 
-        # 2. Reduce the single task
+        # 2. Reduce the single coalesced task.
         try:
-            task = self.client.try_claim(self.input_queue, duration_ms=10000)
-            if not task:
+            task = await self.client.try_claim(self.input_queue, duration_ms=15000)
+            if task is None:
                 logging.info("ReduceWorker found no task to reduce, exiting.")
                 return
 
-            with renewing(self.client, task, duration_s=15) as current_task:
-                kvs = json.loads(current_task().value)
+            records = task.value  # already sorted by key
+            outputs = []
+            for k, group in groupby(records, key=itemgetter("key")):
+                out_val = self.reducer_fn(k, (g["value"] for g in group))
+                if out_val is not None:
+                    outputs.append({"key": k, "value": out_val})
 
-                outputs = []
-                for k, group in groupby(kvs, key=itemgetter("key")):
-                    vals = (g["value"].encode('utf-8') for g in group)
-                    out_val = self.reducer_fn(k.encode('utf-8'), vals)
-                    if out_val is not None:
-                        outputs.append({"key": k, "value": out_val.decode('utf-8')})
-
-                out_bytes = json.dumps(outputs).encode('utf-8')
-
-                self.client.modify(
-                    inserts=[TaskData(queue=self.output_queue, value=out_bytes)],
-                    deletes=[current_task()]
-                )
+            await self.client.modify(Modification(
+                Modification.inserting(TaskData(queue=self.output_queue, value=outputs)),
+                Modification.deleting(task),
+            ))
         except Exception as e:
             print(f"FATAL: ReduceWorker final reduce crash: {e}", file=sys.stderr)
             logging.exception("ReduceWorker reduce error")

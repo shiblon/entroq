@@ -7,6 +7,58 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.2.1] - 2026-06-10
+
+Go module `v1.2.1`. Client packages: TypeScript `entroq` 0.11.0 (drops the
+direct-PG client), Python `entroq` 0.10.1.
+
+### Fixed
+
+- **JSON/Connect error translation.** `eqsvcgrpc.QSvc` returns
+  `google.golang.org/grpc/status` errors, which ConnectRPC did not recognize:
+  served over JSON they collapsed to HTTP 500 (`UNKNOWN`) with the real status
+  stringified into the message and all details dropped. `eqsvcjson` now
+  translates grpc/status errors into `connect.Error`, preserving the code and
+  re-attaching `ModifyDep`/`AuthzDep` details. This affected **every** coded
+  error over the JSON endpoint — dependency errors and authz denials alike.
+- **JSON responses now emit zero-valued fields** (`version:0`, `atMs:0`,
+  `claims`, `attempt`, …). Vanguard was relaying the in-process Connect
+  backend's JSON, whose codec omits defaults; the transcoder now targets the
+  backend in proto and re-marshals responses with its own `EmitUnpopulated`
+  codec. Thin clients no longer have to infer that a missing field means zero
+  (which had made a version-0 task's `version` undefined in the TS client).
+
+### Changed
+
+- **Dependency errors over JSON are now `409 Conflict`** (gRPC `Aborted`
+  semantics: an optimistic-concurrency conflict to retry with fresh versions),
+  not a cacheable 404 or an opaque 500. Details are carried as a flat
+  `ModifyDep` list. The Python and TypeScript clients detect the dependency
+  error by the 409 status (404 still accepted for tolerance) and parse the
+  failed IDs; the TS client now throws a typed `EntroQDependencyError`.
+- **`eqgrpc` accepts both `NotFound` and `Aborted`** as the dependency-error
+  code, so the gRPC service can switch from `NotFound` to `Aborted` at a future
+  minor version with no client change. The service still emits `NotFound`.
+
+### Removed
+
+- **The JavaScript direct-to-PostgreSQL client** (`EntroQPG`, `clients/js/src/pg`)
+  and its `pg` dependency. The direct-PG path was incomplete (no doc support);
+  use the HTTP `EntroQClient`. Direct doc-store interaction is demonstrated in
+  the Python client.
+- `DOCS_TODO.md` (stale planning scratch).
+
+### Docs
+
+- Rewrote the README client quick-starts to match the shipped APIs: the async
+  Python worker (`EntroQWorker(eq, *queues)` + `Modification`-returning handler),
+  the `entroq` npm package name with modify-request handler returns, and the Go
+  `WithDoModify` / `worker.Watching` worker. Corrected the Python install path
+  (`#subdirectory=clients/py`) and dropped the removed `python -m entroq` CLI.
+- Added a runnable Python worker example (`clients/py/examples/worker/`) that is
+  exercised end-to-end by `clients/py/tests/test_example_worker.py` against an
+  `eqmem` subprocess — the Python analog of Go's testable examples.
+
 ## [1.2.0] - 2026-06-06
 
 ### Added
