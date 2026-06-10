@@ -1,5 +1,6 @@
 import {
   Task,
+  TaskID,
   ClaimRequest,
   ClaimResponse,
   ModifyRequest,
@@ -22,6 +23,41 @@ export interface ClientOptions {
   baseUrl: string;
   claimantId?: string;
   headers?: Record<string, string>;
+}
+
+const DEP_ACTION_TYPES = new Set([
+  "INSERT", "CHANGE", "DELETE", "DEPEND", "CLAIM", "DETAIL",
+]);
+
+/**
+ * EntroQDependencyError is thrown when a modification's preconditions are not
+ * met — a task to delete/change/depend-on was at a different version (or gone),
+ * or an insert ID collided. It is an optimistic-concurrency conflict (HTTP 409):
+ * re-read the affected tasks and retry. The grouped arrays list the IDs that
+ * failed, by action.
+ */
+export class EntroQDependencyError extends Error {
+  readonly inserts: TaskID[] = [];
+  readonly changes: TaskID[] = [];
+  readonly deletes: TaskID[] = [];
+  readonly depends: TaskID[] = [];
+  readonly claims: TaskID[] = [];
+
+  constructor(message: string, details: any[] = []) {
+    super(message);
+    this.name = "EntroQDependencyError";
+    for (const d of details) {
+      const id: TaskID | undefined = d?.id ?? undefined;
+      switch (d?.type) {
+        case "INSERT": if (id) this.inserts.push(id); break;
+        case "CHANGE": if (id) this.changes.push(id); break;
+        case "DELETE": if (id) this.deletes.push(id); break;
+        case "DEPEND": if (id) this.depends.push(id); break;
+        case "CLAIM":  if (id) this.claims.push(id); break;
+        case "DETAIL": if (d.msg) this.message = `${this.message}: ${d.msg}`; break;
+      }
+    }
+  }
 }
 
 export function generateClaimantId(): string {
@@ -62,12 +98,21 @@ export class EntroQClient implements EntroQDocClientInterface {
 
     if (!response.ok) {
       const text = await response.text();
-      let errorMsg: string;
+      let errJson: any = null;
       try {
-        const errJson = JSON.parse(text);
-        errorMsg = errJson.message || text;
+        errJson = JSON.parse(text);
       } catch {
-        errorMsg = text || response.statusText;
+        // not JSON
+      }
+      const errorMsg = errJson?.message || text || response.statusText;
+      // Dependency errors are 409 Conflict (404 also accepted for tolerance)
+      // carrying flat ModifyDep details. The detail-type check keeps an
+      // ordinary 404/409 from being misread as a dependency error.
+      if (response.status === 409 || response.status === 404) {
+        const details: any[] = Array.isArray(errJson?.details) ? errJson.details : [];
+        if (details.some((d) => DEP_ACTION_TYPES.has(d?.type))) {
+          throw new EntroQDependencyError(errorMsg, details);
+        }
       }
       throw new Error(`EntroQ request failed (${response.status}): ${errorMsg}`);
     }

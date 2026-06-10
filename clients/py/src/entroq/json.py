@@ -124,7 +124,10 @@ class EntroQJSON(EntroQBase):
         return resp.json()
 
     def _raise_for_error(self, resp: httpx.Response) -> None:
-        if resp.status_code == 404:
+        # Dependency errors arrive as 409 Conflict (Aborted). 404 is also
+        # accepted for tolerance; the dependency-detail check below keeps an
+        # ordinary 404 from being misread as a dependency error.
+        if resp.status_code in (409, 404):
             try:
                 body = resp.json()
                 details = body.get("details", [])
