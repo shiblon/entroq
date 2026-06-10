@@ -7,9 +7,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [1.1.1] - 2026-06-10
+## [1.2.1] - 2026-06-10
 
-Go module `v1.1.1`. Client packages: TypeScript `entroq` 0.11.0 (drops the
+Go module `v1.2.1`. Client packages: TypeScript `entroq` 0.11.0 (drops the
 direct-PG client), Python `entroq` 0.10.1.
 
 ### Fixed
@@ -59,13 +59,64 @@ direct-PG client), Python `entroq` 0.10.1.
   exercised end-to-end by `clients/py/tests/test_example_worker.py` against an
   `eqmem` subprocess — the Python analog of Go's testable examples.
 
-### Note
+## [1.2.0] - 2026-06-06
 
-- The Python and TypeScript clients were rewritten to an async, `Modification`-
-  based API (v0.10.0); the Go worker's renewal functions changed in a breaking
-  way; and `Modify`/doc storage were reworked (`eqmem` doc storage, renewal
-  privatization). These landed on `develop` since 1.1.0 and are captured here
-  for the next release.
+### Added
+
+- **`entroq.Renew`** with `RenewConfig` / `RenewOption` / `RenewResponse`: atomically
+  renews tasks and docs in a single `Modify` call. Replaces the former piecemeal
+  renewal helpers as the canonical renewal primitive.
+
+- **`Handler[T].TakeDocs`**: handlers can now declare which doc namespaces/keys they
+  want acquired before work begins. The worker fetches and locks them in sorted order
+  (deadlock-safe) and passes them via `DoWhileRenewing`.
+
+- **`eqk8s` namespace policy** (`OPANamespacePolicy`, `AllowedCallers`): the operator
+  now pushes per-namespace caller policy into the OPA mesh document. CRD
+  (`EntroQQueue`) and controller updated accordingly; OPA tests now load each auth
+  provider (entroq/OIDC, k8s) in isolation to prevent package conflicts.
+
+- **Python doc types**: `DocID`, `DocData`, `DocChange`, `Doc` with `as_id()` /
+  `as_change()` helpers; `docs()`, `claim_docs()`, `modify_docs()` on `EntroQBase`
+  and the pg implementation. Worker gains `Handler` ABC, `RetryError`, `MoveError`,
+  `DocClaim`; `Modification` and `ModifyResult` exported.
+
+- **TypeScript doc types and worker**: all doc types added; `ModifyRequest` /
+  `ModifyResponse` extended with doc fields; `EntroQDocClientInterface` with
+  `docs()`, `claimDocs()`, `namespaceStats()`.
+
+### Changed
+
+- **Worker renewal model** (`pkg/worker`): `DoWhileRenewing` replaces the former
+  `DoWithRenew` / `DoWithRenewAll` entry points. The worker now runs a single
+  atomic renewal loop covering both tasks and docs. `FinalizeRenew` returns
+  `*RenewResponse` (tasks + docs) instead of `[]Task`.
+
+- **`eqmem` doc namespace storage**: btree dual-index replaces `sync.Map`, giving
+  O(log n + k) range operations. Clone-on-read provides lock-free scans; also fixes
+  a `NamespaceStats` data race introduced by the btree switch.
+
+- **`eqc rm`**: quieter output, more consistent return values.
+
+### Fixed
+
+- **gRPC `DependencyError` doc encoding**: `DocInserts` was missing from
+  `DependencyError` on both the server (encoding) and client (decoding) sides.
+  Doc collision errors now include `ActionType_INSERT` as expected.
+
+- **Async Python tests**: missing leading slash on queue paths in async test helpers.
+
+### Breaking
+
+- **`DoWithRenew` / `DoWithRenewAll` / `ClaimWithRenew` / `ClaimRenew` removed**
+  from the public Go API. Use `entroq.Renew` directly for custom renewal loops, or
+  build workers via `pkg/worker` (`Handler[T]` + `Worker.Run`).
+
+- **`DocQuery.KeyExact`** replaces the `key_equals` proto field (field was new in
+  1.1.0 with no known external callers).
+
+- **`DoWork` function type** updated: the second argument is now `*RenewResponse`
+  (carries renewed tasks and docs) instead of `[]Task`.
 
 ---
 

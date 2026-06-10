@@ -516,7 +516,7 @@ func (w *Worker[T]) runOne(ctx context.Context, handler Handler[T], opts *runOpt
 	// Note: do NOT cancel rCtx from inside the work function. If rCtx is
 	// canceled while a renewal Modify is in flight over gRPC, the client sees
 	// context.Canceled but the server may have already committed the renewal.
-	// The stopRenew/taskCh handoff in DoWhileRenewing is the correct mechanism.
+	// The stopRenew/taskCh handoff in doWhileRenewing is the correct mechanism.
 	rCtx, rCancel := context.WithCancel(ctx)
 	defer rCancel()
 
