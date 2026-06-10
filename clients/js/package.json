@@ -1,6 +1,6 @@
 {
   "name": "entroq",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "EntroQ Task Queue Node Client",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
@@ -34,13 +34,9 @@
   },
   "devDependencies": {
     "@types/node": "^25.5.2",
-    "@types/pg": "^8.20.0",
     "@vitest/coverage-v8": "^4.1.4",
     "tsup": "^8.0.0",
     "typescript": "^5.0.0",
     "vitest": "^4.1.4"
-  },
-  "dependencies": {
-    "pg": "^8.20.0"
   }
 }

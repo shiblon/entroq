@@ -231,7 +231,7 @@ opt-in.
 
 ### Prerequisites
 
-- Go 1.24+
+- Go 1.25+
 - `kubectl` connected to a Kubernetes cluster
 - Docker (for building the operator image)
 

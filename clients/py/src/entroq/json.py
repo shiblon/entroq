@@ -124,7 +124,10 @@ class EntroQJSON(EntroQBase):
         return resp.json()
 
     def _raise_for_error(self, resp: httpx.Response) -> None:
-        if resp.status_code == 404:
+        # Dependency errors arrive as 409 Conflict (Aborted). 404 is also
+        # accepted for tolerance; the dependency-detail check below keeps an
+        # ordinary 404 from being misread as a dependency error.
+        if resp.status_code in (409, 404):
             try:
                 body = resp.json()
                 details = body.get("details", [])
@@ -188,7 +191,9 @@ class EntroQJSON(EntroQBase):
             "durationMs": str(duration_ms),
             "pollMs": "0",
         })
-        return _task_from_json(data["task"]) if "task" in data else None
+        # The server may emit an explicit "task": null when nothing is available
+        # (zero-valued fields are not omitted), so check the value, not the key.
+        return _task_from_json(data["task"]) if data.get("task") is not None else None
 
     async def claim(self, queue: str | list[str], duration_ms: int = 30000, poll_ms: int = 5000, timeout_s: float | None = None) -> Task:
         queues = [queue] if isinstance(queue, str) else list(queue)
@@ -198,7 +203,7 @@ class EntroQJSON(EntroQBase):
             "durationMs": str(duration_ms),
             "pollMs": str(poll_ms),
         })
-        if "task" in data:
+        if data.get("task") is not None:
             return _task_from_json(data["task"])
         raise TimeoutError("claim timed out")
 
