@@ -462,8 +462,11 @@ func authzErrFromStat(stat *status.Status) error {
 }
 
 func depErrorFromStat(stat *status.Status) error {
-	if stat.Code() != codes.NotFound {
-		return fmt.Errorf("expected NotFound, got something else: %w", stat.Err())
+	// Dependency errors currently arrive as NotFound; a future server minor
+	// version may switch to Aborted (a better fit for an optimistic-concurrency
+	// conflict). Accept both now so that switch needs no client change.
+	if c := stat.Code(); c != codes.NotFound && c != codes.Aborted {
+		return fmt.Errorf("expected NotFound or Aborted, got something else: %w", stat.Err())
 	}
 	// Dependency error, should have details.
 	depErr := &entroq.DependencyError{
@@ -551,7 +554,7 @@ func unpackGRPCError(grpcErr error) error {
 		return fmt.Errorf("%w", context.Canceled)
 	case codes.DeadlineExceeded:
 		return fmt.Errorf("%w", context.DeadlineExceeded)
-	case codes.NotFound:
+	case codes.NotFound, codes.Aborted:
 		return depErrorFromStat(stat)
 	case codes.PermissionDenied:
 		return authzErrFromStat(stat)
