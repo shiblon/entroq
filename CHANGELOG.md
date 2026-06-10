@@ -7,7 +7,10 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [Unreleased]
+## [1.1.1] - 2026-06-10
+
+Go module `v1.1.1`. Client packages: TypeScript `entroq` 0.11.0 (drops the
+direct-PG client), Python `entroq` 0.10.1.
 
 ### Fixed
 
