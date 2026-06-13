@@ -10,8 +10,8 @@ ordinary HTTP microservices asynchronous without any queue code in the services
 themselves. A sidecar intercepts outbound HTTP calls and routes them through
 queues transparently.
 
-Go, Python, and TypeScript clients. PostgreSQL, Redis, and in-memory backends.
-Kubernetes deployment via Helm.
+Go, Python, TypeScript, and Elixir clients. PostgreSQL, Redis, and in-memory
+backends. Kubernetes deployment via Helm.
 
 ---
 
@@ -136,6 +136,26 @@ await worker.run(["/my/queue"], async (task) => {
     // Return a modification to apply atomically; here we delete to finish.
     return { deletes: [{ id: task.id, version: task.version, queue: task.queue }] };
 });
+```
+
+### Elixir
+The Elixir client provides an HTTP/JSON client and a worker abstraction that
+renews task/doc claims while `perform/2` runs, then applies returned
+modifications after renewal stops and final versions are stable. See
+[`clients/elixir/README.md`](clients/elixir/README.md) for details.
+
+```elixir
+defmodule MyWorker do
+  use EntroQ.Worker
+
+  @impl true
+  def perform(task, _docs) do
+    {:modify, EntroQ.Modification.delete(task)}
+  end
+end
+
+client = EntroQ.new("http://localhost:9100")
+EntroQ.Worker.run(client, ["/my/queue"], MyWorker)
 ```
 
 ## Document Store
