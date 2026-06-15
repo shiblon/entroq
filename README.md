@@ -20,7 +20,7 @@ Pronounced "Entro-Q" ("Entro-Queue"), as in the letter that comes after
 
 It's the right way to outsource reliability and consistency guarantees when working in a competing-consumer environment where exactly-once semantics are needed and work should never be lost. It enables infinite composability, and the microservice mesh built on top of it showcases just one of the many powerful ways it can be used.
 
-Background: [Asynchronous Thinking for Microservice System Design](https://github.com/shiblon/entroq/wiki/Asynchronous-Thinking-for-Microservice-System-Design)  
+Background: [Asynchronous Thinking for Microservice System Design](https://github.com/shiblon/entroq/wiki/Asynchronous-Thinking-for-Microservice-System-Design)
 Go docs: [pkg.go.dev/github.com/shiblon/entroq](https://pkg.go.dev/github.com/shiblon/entroq) | [CHANGELOG](CHANGELOG.md)
 
 ## Core Concepts
@@ -85,7 +85,7 @@ EntroQ defines a simple protocol: `claim -> work -> modify`. All clients follow 
 The Go client is the reference implementation and supports automatic background task renewal.
 
 ```go
-svc, _ := entroq.New(ctx, eqgrpc.Opener("localhost:37706"))
+svc, _ := entroq.New(ctx, eqgrpc.Opener("localhost:37706", eqgrpc.WithInsecure()))
 defer svc.Close()
 
 w := worker.New(svc,
@@ -232,10 +232,11 @@ CRD reference (field-by-field, worked examples, policy verification):
 
 ## Production Deployment (Helm)
 
-For Kubernetes environments, a Helm v3 chart is available in `charts/entroq`. It supports backend toggling and secure secret management. See [`charts/entroq/README.md`](charts/entroq/README.md) for full options.
+For Kubernetes environments, a Helm v3 chart is available in `charts/entroq`. It supports backend toggling and secure secret management. See [`charts/entroq/README.md`](charts/entroq/README.md) for full options. Postgres is shown below. In-memory (journaled) and Redis-backed are also available.
 
 ```bash
-helm install my-queue ./charts/entroq --set backend=pg
+make helm-sync
+helm install my-queue ./charts/entroq --set entroq.backend.type=postgres
 ```
 
 ---

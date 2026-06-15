@@ -95,7 +95,7 @@ try to call svc-b's inbox directly:
 kubectl create serviceaccount stranger -n greetings
 TOKEN=$(kubectl create token stranger -n greetings)
 kubectl port-forward -n entroq-system svc/entroq 37706:37706 &
-go run ./cmd/eqc --entroq localhost:37706 --authz_token "$TOKEN" \
+go run ./cmd/eqc --svcaddr localhost:37706 --authz_token "$TOKEN" \
   ins -q /greetings/svc-b/inbox '{}'
 # Expected: permission denied
 ```
