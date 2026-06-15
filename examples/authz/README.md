@@ -12,13 +12,15 @@ Shows how to run EntroQ with OPA-based authorization and a JWT bearer token.
 
 ## Quick start
 
+The commands in this README assume your shell is in `examples/authz`.
+
 ```sh
 # Build and start the stack.
 docker compose up --build
 
 # In another terminal, install Python deps and run the example client.
 # The JSON/HTTP API is on port 9100; gRPC is on 37706.
-pip install requests pyjwt cryptography
+python -m pip install requests pyjwt cryptography
 python client.py
 ```
 
@@ -45,8 +47,8 @@ Exits 0 if all assertions pass, 1 on any failure.
 4. OPA evaluates `data.entroq.authz.allow`:
    - `opa/user.rego` verifies the JWT signature against the inline JWKS and
      extracts the `sub` claim as the username.
-   - `pkg/authz/opadata/conf/example/example-entroq-permissions.rego` maps
-     the username to allowed queues via `opa/data.json`.
+   - `pkg/authz/opadata/conf/providers/entroq/permissions/oidc-entroq-permissions.rego`
+     maps the username to allowed queues via `opa/data.json`.
    - `pkg/authz/opadata/conf/core/` contains the core queue-matching logic.
 5. EntroQ allows or denies the operation based on OPA's decision.
 
@@ -76,9 +78,10 @@ docker compose restart opa
 
 ## Using a real IDP
 
-Replace `opa/user.rego` with the reference implementation at
-`pkg/authz/opadata/conf/example/example-entroq-user.rego`, which fetches
-JWKS from a live URL. Update `opa/data.json`:
+For production, remove the local inline-key `opa/user.rego` override and load the
+OIDC user provider from
+`pkg/authz/opadata/conf/providers/entroq/user/oidc-entroq-user.rego`, which
+fetches JWKS from a live URL. Update `opa/data.json`:
 
 ```json
 {

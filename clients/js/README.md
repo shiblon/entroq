@@ -46,8 +46,8 @@ Tasks:
 - `time()` — server time, ms since epoch (as a string).
 - `queues(prefix?, exact?, limit?)` / `queueStats(...)` — queue listing and stats.
 - `tasks(request)` — list tasks in a queue.
-- `tryClaim(queues, durationMs?)` — claim a task if one is available now, else
-  `undefined`.
+- `tryClaim(queues, durationMs?)` — claim a task if one is available now; returns
+  a `ClaimResponse` whose `task` is omitted when nothing is available.
 - `claim(queues, durationMs?, pollMs?)` — block until a task is claimed.
 - `modify(request)` — apply an atomic batch of `inserts`/`changes`/`deletes`/
   `depends` (and the `doc*` equivalents). Returns the inserted/changed tasks.
@@ -141,7 +141,7 @@ npx vitest run --coverage # with coverage
 ```
 
 The integration tests require the **Go** toolchain: they start the in-memory
-server with `go run ./cmd/eqmem` and are skipped automatically if `go` is not on
+server with `go run ./cmd/eqmem serve` and are skipped automatically if `go` is not on
 `PATH`.
 
 ## Architecture

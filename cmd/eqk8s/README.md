@@ -259,13 +259,14 @@ and namespace policies) in the `default` namespace.
 
 ### Configure OPA
 
-Load the core and k8s provider policies — **not** the OIDC provider; the two
-provider sets define overlapping packages and will conflict if loaded together.
+From the repository root, load the core and k8s provider policies — **not** the
+OIDC provider; the two provider sets define overlapping packages and will
+conflict if loaded together.
 
 ```bash
 opa run --server \
-  --bundle ./conf/core/ \
-  --bundle ./conf/providers/k8s/
+  --bundle ./pkg/authz/opadata/conf/core/ \
+  --bundle ./pkg/authz/opadata/conf/providers/k8s/
 ```
 
 Point the EntroQ server at it:
@@ -314,10 +315,11 @@ make generate   # regenerates zz_generated.deepcopy.go
 make manifests  # regenerates config/crd/bases/ and config/webhook/
 ```
 
-Then copy the updated CRDs to the Helm chart:
+Then sync the updated CRDs to the root Helm chart:
 
 ```bash
-cp config/crd/bases/*.yaml charts/entroq/crds/
+cd ../..
+make helm-sync
 ```
 
 ---
