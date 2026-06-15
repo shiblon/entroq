@@ -12,6 +12,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/shiblon/entroq"
 )
+
 func SimpleChange(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	inQueue := path.Join(qPrefix, "simple_change", "in")
 	outQueue := path.Join(qPrefix, "simple_change", "out")
@@ -40,6 +41,49 @@ func SimpleChange(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 	wantBase.Claimant = ""
 	if diff := EqualTasksVersionIncr(&wantBase, changed[0], 1); diff != "" {
 		t.Fatalf("Tasks not equal (except version bump and claimant):\n%v", diff)
+	}
+}
+
+func TaskChangeFutureArrival(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	queue := path.Join(qPrefix, "task_change_future_arrival")
+	const delay = time.Second
+
+	resp, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue("later")))
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	inserted := resp.InsertedTasks[0]
+
+	before, err := client.Time(ctx)
+	if err != nil {
+		t.Fatalf("time before change: %v", err)
+	}
+	resp, err = client.Modify(ctx, inserted.Change(entroq.ArrivalTimeBy(delay)))
+	if err != nil {
+		t.Fatalf("change arrival: %v", err)
+	}
+	changed := resp.ChangedTasks[0]
+	if changed.At.Before(before.Add(delay - 100*time.Millisecond)) {
+		t.Fatalf("changed arrival time is too early: got %s, want about %s", changed.At.Format(time.RFC3339Nano), before.Add(delay).Format(time.RFC3339Nano))
+	}
+
+	tasks, err := client.Tasks(ctx, queue)
+	if err != nil {
+		t.Fatalf("tasks: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("tasks: got %d, want 1", len(tasks))
+	}
+	if tasks[0].At.Before(before.Add(delay - 100*time.Millisecond)) {
+		t.Fatalf("stored arrival time is too early: got %s, want about %s", tasks[0].At.Format(time.RFC3339Nano), before.Add(delay).Format(time.RFC3339Nano))
+	}
+
+	claimed, err := client.TryClaim(ctx, entroq.From(queue), entroq.ClaimFor(100*time.Millisecond))
+	if err != nil {
+		t.Fatalf("try claim future task: %v", err)
+	}
+	if claimed != nil {
+		t.Fatalf("future task was claimable immediately: %s", claimed)
 	}
 }
 

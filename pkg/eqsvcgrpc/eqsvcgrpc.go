@@ -538,7 +538,7 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 			Err:       change.GetNewData().Err,
 			FromQueue: change.GetOldId().Queue,
 		}
-		modArgs = append(modArgs, entroq.Changing(t))
+		modArgs = append(modArgs, entroq.Changing(t, entroq.ArrivalTimeTo(t.At)))
 	}
 	for _, del := range req.Deletes {
 		modArgs = append(modArgs, entroq.Deleting(del.Id, del.Version, entroq.WithIDQueue(del.Queue)))

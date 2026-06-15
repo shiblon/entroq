@@ -7,13 +7,26 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [1.2.1] - 2026-06-10
+## [1.2.1] - 2026-06-15
 
 Go module `v1.2.1`. Client packages: TypeScript `entroq` 0.11.0 (drops the
 direct-PG client), Python `entroq` 0.10.1.
 
+### Added
+
+- **`eqc work` shell worker.** Claims from one or more input queues, writes the
+  input task value to a local command's stdin, parses stdout as JSONL output
+  tasks for a single `--out-queue`, and finalizes with one atomic `Modify`.
+  Supports delayed output tasks via `--in`, unlimited retries by default, and
+  cron-like requeueing via `--recur-in`.
+
 ### Fixed
 
+- **gRPC task changes now preserve requested arrival time (`At`).** The gRPC
+  service reconstructed task changes with bare `Changing(t)`, which resets `At`
+  to the default release/immediate value. Changes sent over the gRPC protocol
+  now apply the wire `At` explicitly, fixing delayed task changes such as
+  retry/defer modifications made by gRPC clients.
 - **JSON/Connect error translation.** `eqsvcgrpc.QSvc` returns
   `google.golang.org/grpc/status` errors, which ConnectRPC did not recognize:
   served over JSON they collapsed to HTTP 500 (`UNKNOWN`) with the real status

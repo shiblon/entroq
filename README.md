@@ -77,6 +77,57 @@ The Python client installs from the `clients/py` subdirectory:
 python3 -m pip install "git+https://github.com/shiblon/entroq#subdirectory=clients/py"
 ```
 
+### Shell Workers
+`eqc work` is a small worker protocol for shell scripts and other local
+commands. It is meant for leaf work and simple work-then-respond flows:
+one input task is claimed, its JSON value is written to the command's stdin
+with a trailing newline, and each non-empty stdout line is parsed as one JSON
+output task.
+
+In one terminal, start a worker:
+
+```bash
+eqc work -q /demo/in -Q /demo/out -c 'printf "{\"seen\":%s}\n" "$(cat)"'
+```
+
+In another terminal, insert work and read the response:
+
+```bash
+eqc ins -q /demo/in -v '{"name":"Ada"}'
+eqc ts -q /demo/out
+```
+
+Use `-- COMMAND [ARG...]` instead of `-c` when you do not need a shell. This
+worker copies each input task value to `/demo/out`:
+
+```bash
+eqc work -q /demo/in -Q /demo/out -- cat
+```
+
+There is no implicit copy mode; `cat` is the explicit command in this example.
+
+Important details:
+
+- `-q, --queue` can be repeated; the worker claims one task at a time from any
+  listed input queue.
+- `-Q, --out-queue` is the single queue for all stdout JSONL output tasks.
+- `--in` delays output tasks, matching `eqc ins --in`.
+- On success, the input task is deleted and all stdout tasks are inserted in
+  the same `Modify`.
+- On command failure, the current task is modified in place: `attempt` and
+  `err` are updated, and `At` is moved by `--retry-in`. The default
+  `--max-attempts 0` means unlimited retries.
+- Invalid JSONL output, too much stdout, or exhausted attempts move the input
+  task to `--error-queue`, defaulting to `<input>/err`.
+- `--recur-in` is the cron-like mode: after a successful run, the claimed task
+  is deleted and a fresh copy of its input value is inserted back into the same
+  input queue with that relative delay.
+
+Scripts should write logs to stderr. They may call `eqc` for ordinary client
+operations, including document claims, but those operations are not part of the
+worker's final atomic `Modify`; claimed docs also need to be used within their
+original lease because `eqc work` does not renew them for the script.
+
 ## Language Clients
 
 EntroQ defines a simple protocol: `claim -> work -> modify`. All clients follow this transactional loop.
