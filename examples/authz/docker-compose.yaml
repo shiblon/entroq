@@ -46,16 +46,15 @@ services:
       - "--watch"
       - "--log-level=info"
       - "/etc/opa/core"
-      - "/etc/opa/providers"
+      - "/etc/opa/permissions"
       - "/etc/opa/local"
 
     ports:
       - "8181:8181"
     volumes:
-      # OPA policy directories seeded by: eqctl opa init ./opa-conf
       # Core EntroQ Rego -- do not modify.
-      - ./opa-conf/core:/etc/opa/core
-      # Built-in OIDC provider -- do not modify.
-      - ./opa-conf/providers:/etc/opa/providers
-      # Your config: edit opa-conf/local/data.json for IDP settings and policy.
-      - ./opa-conf/local:/etc/opa/local
+      - ../../pkg/authz/opadata/conf/core:/etc/opa/core:ro
+      # Built-in standalone/OIDC permissions provider -- do not modify.
+      - ../../pkg/authz/opadata/conf/providers/entroq/permissions:/etc/opa/permissions:ro
+      # Example config: inline-JWKS user provider plus users/roles policy.
+      - ./opa:/etc/opa/local:ro

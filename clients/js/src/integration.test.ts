@@ -1,10 +1,23 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { EntroQClient } from "./client";
+import { EntroQClient, EntroQDependencyError } from "./client";
 import { EntroQWorker } from "./worker";
-import { spawn, ChildProcess } from "child_process";
+import { spawn, execFileSync, ChildProcess } from "child_process";
 import path from "path";
 
-describe("EntroQ Integration", () => {
+// Repo root, two levels up from clients/js (vitest's cwd).
+const repoRoot = path.resolve(process.cwd(), "..", "..");
+
+function goAvailable(): boolean {
+  try {
+    execFileSync("go", ["version"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Run eqmem via `go run` rather than committing a binary. Skips if Go is absent.
+describe.skipIf(!goAvailable())("EntroQ Integration", () => {
   let eqmemsvc: ChildProcess;
   let client: EntroQClient;
   const httpPort = 9101; // Use a different port than default
@@ -13,11 +26,14 @@ describe("EntroQ Integration", () => {
 
   beforeAll(async () => {
     return new Promise((resolve, reject) => {
-      const binPath = path.join(process.cwd(), "eqmemsvc");
-      eqmemsvc = spawn(binPath, [
+      // `go run` runs the compiled server as a child, so a plain SIGTERM to the
+      // `go run` process would orphan it. detached: true puts both in their own
+      // process group; afterAll signals the whole group to reap them together.
+      eqmemsvc = spawn("go", [
+        "run", "./cmd/eqmem", "serve",
         "--http_port", httpPort.toString(),
         "--port", grpcPort.toString()
-      ]);
+      ], { cwd: repoRoot, detached: true });
 
       const onData = (data: Buffer) => {
         if (data.toString().includes("Starting EntroQ server")) {
@@ -30,15 +46,16 @@ describe("EntroQ Integration", () => {
       eqmemsvc.stderr?.on("data", onData);
 
       eqmemsvc.on("error", reject);
-      
-      // Safety timeout
-      setTimeout(() => reject(new Error("Timeout waiting for eqmemsvc")), 5000);
+
+      // Generous: `go run` compiles before it serves (cold cache on CI).
+      setTimeout(() => reject(new Error("Timeout waiting for eqmemsvc")), 60000);
     });
   });
 
   afterAll(() => {
-    if (eqmemsvc) {
-      eqmemsvc.kill();
+    if (eqmemsvc?.pid) {
+      // Negative pid signals the whole process group (go run + the server).
+      try { process.kill(-eqmemsvc.pid, "SIGTERM"); } catch { /* already gone */ }
     }
   });
 
@@ -77,6 +94,29 @@ describe("EntroQ Integration", () => {
     // 5. Verify empty
     const finalTasks = await client.tasks({ queue: q });
     expect(finalTasks.tasks).toHaveLength(0);
+  });
+
+  it("should surface a dependency error (409) as EntroQDependencyError", async () => {
+    const q = "/test/dep-error";
+    const ins = await client.modify({
+      inserts: [{ queue: q, atMs: "0", value: "v" }]
+    });
+    const task = ins.inserted![0];
+
+    // Delete at a version that does not exist: an optimistic-concurrency
+    // conflict the server reports as 409 with flat ModifyDep details.
+    const stale = { id: task.id, version: 999, queue: q };
+    await expect(
+      client.modify({ deletes: [stale] })
+    ).rejects.toBeInstanceOf(EntroQDependencyError);
+
+    try {
+      await client.modify({ deletes: [stale] });
+    } catch (err) {
+      const dep = err as EntroQDependencyError;
+      expect(dep.deletes).toHaveLength(1);
+      expect(dep.deletes[0].id).toBe(task.id);
+    }
   });
 
   it("should work with EntroQWorker against a real server", async () => {

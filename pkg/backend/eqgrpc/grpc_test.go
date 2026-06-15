@@ -109,6 +109,10 @@ func TestGRPCSimpleChange(t *testing.T) {
 	RunQTest(t, eqtest.SimpleChange)
 }
 
+func TestGRPCTaskChangeFutureArrival(t *testing.T) {
+	RunQTest(t, eqtest.TaskChangeFutureArrival)
+}
+
 func TestGRPCSimpleWorker(t *testing.T) {
 	RunQTest(t, eqtest.SimpleWorker)
 }
@@ -124,7 +128,6 @@ func TestGRPCWorkerMoveOnError(t *testing.T) {
 func TestGRPCWorkerRetryOnError(t *testing.T) {
 	RunQTest(t, eqtest.WorkerRetryOnError)
 }
-
 
 func TestGRPCClaimUnblocksOnNotify(t *testing.T) {
 	RunQTest(t, eqtest.ClaimUnblocksOnNotify)

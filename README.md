@@ -10,8 +10,8 @@ ordinary HTTP microservices asynchronous without any queue code in the services
 themselves. A sidecar intercepts outbound HTTP calls and routes them through
 queues transparently.
 
-Go, Python, and TypeScript clients. PostgreSQL, Redis, and in-memory backends.
-Kubernetes deployment via Helm.
+Go, Python, TypeScript, and Elixir clients. PostgreSQL, Redis, and in-memory
+backends. Kubernetes deployment via Helm.
 
 ---
 
@@ -20,7 +20,7 @@ Pronounced "Entro-Q" ("Entro-Queue"), as in the letter that comes after
 
 It's the right way to outsource reliability and consistency guarantees when working in a competing-consumer environment where exactly-once semantics are needed and work should never be lost. It enables infinite composability, and the microservice mesh built on top of it showcases just one of the many powerful ways it can be used.
 
-Background: [Asynchronous Thinking for Microservice System Design](https://github.com/shiblon/entroq/wiki/Asynchronous-Thinking-for-Microservice-System-Design)  
+Background: [Asynchronous Thinking for Microservice System Design](https://github.com/shiblon/entroq/wiki/Asynchronous-Thinking-for-Microservice-System-Design)
 Go docs: [pkg.go.dev/github.com/shiblon/entroq](https://pkg.go.dev/github.com/shiblon/entroq) | [CHANGELOG](CHANGELOG.md)
 
 ## Core Concepts
@@ -72,11 +72,61 @@ go install github.com/shiblon/entroq/cmd/eqc@latest
 eqc --help
 ```
 
-There is also a Python-based CLI:
+The Python client installs from the `clients/py` subdirectory:
 ```bash
-python3 -m pip install git+https://github.com/shiblon/entroq
-python3 -m entroq --help
+python3 -m pip install "git+https://github.com/shiblon/entroq#subdirectory=clients/py"
 ```
+
+### Shell Workers
+`eqc work` is a small worker protocol for shell scripts and other local
+commands. It is meant for leaf work and simple work-then-respond flows:
+one input task is claimed, its JSON value is written to the command's stdin
+with a trailing newline, and each non-empty stdout line is parsed as one JSON
+output task.
+
+In one terminal, start a worker:
+
+```bash
+eqc work -q /demo/in -Q /demo/out -c 'printf "{\"seen\":%s}\n" "$(cat)"'
+```
+
+In another terminal, insert work and read the response:
+
+```bash
+eqc ins -q /demo/in -v '{"name":"Ada"}'
+eqc ts -q /demo/out
+```
+
+Use `-- COMMAND [ARG...]` instead of `-c` when you do not need a shell. This
+worker copies each input task value to `/demo/out`:
+
+```bash
+eqc work -q /demo/in -Q /demo/out -- cat
+```
+
+There is no implicit copy mode; `cat` is the explicit command in this example.
+
+Important details:
+
+- `-q, --queue` can be repeated; the worker claims one task at a time from any
+  listed input queue.
+- `-Q, --out-queue` is the single queue for all stdout JSONL output tasks.
+- `--in` delays output tasks, matching `eqc ins --in`.
+- On success, the input task is deleted and all stdout tasks are inserted in
+  the same `Modify`.
+- On command failure, the current task is modified in place: `attempt` and
+  `err` are updated, and `At` is moved by `--retry-in`. The default
+  `--max-attempts 0` means unlimited retries.
+- Invalid JSONL output, too much stdout, or exhausted attempts move the input
+  task to `--error-queue`, defaulting to `<input>/err`.
+- `--recur-in` is the cron-like mode: after a successful run, the claimed task
+  is deleted and a fresh copy of its input value is inserted back into the same
+  input queue with that relative delay.
+
+Scripts should write logs to stderr. They may call `eqc` for ordinary client
+operations, including document claims, but those operations are not part of the
+worker's final atomic `Modify`; claimed docs also need to be used within their
+original lease because `eqc work` does not renew them for the script.
 
 ## Language Clients
 
@@ -86,57 +136,77 @@ EntroQ defines a simple protocol: `claim -> work -> modify`. All clients follow 
 The Go client is the reference implementation and supports automatic background task renewal.
 
 ```go
-svc, _ := entroq.New(ctx, eqgrpc.Opener("localhost:37706"))
+svc, _ := entroq.New(ctx, eqgrpc.Opener("localhost:37706", eqgrpc.WithInsecure()))
 defer svc.Close()
 
 w := worker.New(svc,
-    worker.WithDo(func(ctx context.Context, task *entroq.Task) error {
+    worker.WithDoModify(func(ctx context.Context, task *entroq.Task, val json.RawMessage, docs []*entroq.Doc) ([]entroq.ModifyArg, error) {
         log.Printf("Processing: %s", string(task.Value))
-        return nil // success
-    }),
-    worker.WithFinish(func(ctx context.Context, task *entroq.Task) error {
-        _, _, err := svc.Modify(ctx, task.Delete())
-        return err // finish
+        return []entroq.ModifyArg{task.Delete()}, nil // finish by deleting
     }),
 )
-w.Run(ctx, "/my/queue")
+w.Run(ctx, worker.Watching("/my/queue"))
 ```
 
 ### Python
-The Python client provides a flexible worker abstraction using context managers to handle task heartbeating and finalization.
+The Python client is async (`asyncio`). A worker claims tasks, renews the claim
+in the background while your handler runs, and atomically applies the
+`Modification` your handler returns.
 
 ```python
+import asyncio
 from entroq.json import EntroQJSON
+from entroq.types import Modification
 from entroq.worker import EntroQWorker
 
-client = EntroQJSON("http://localhost:9100")
-worker = EntroQWorker(client)
+async def main():
+    client = EntroQJSON("http://localhost:9100")
 
-def handle(renew, finalize):
-    with renew as task:
-        # Task is automatically renewed in the background here
+    @EntroQWorker.handler
+    async def process(task, docs):
         print(f"Processing: {task.value}")
+        return Modification(Modification.deleting(task))  # finish by deleting
 
-    with finalize as task:
-        # Renewal has stopped; task version is now stable
-        client.modify(deletes=[task.as_id()])
+    worker = EntroQWorker(client, "/my/queue")
+    await worker.run(process)
 
-worker.work("/my/queue", handle)
+asyncio.run(main())
 ```
 
 ### TypeScript (Node.js)
 The TypeScript client provides a worker abstraction for modern async/await environments. See [`clients/js/README.md`](clients/js/README.md) for installation and full API docs.
 
 ```typescript
-import { EntroQClient, EntroQWorker } from "@shiblon/entroq";
+import { EntroQClient, EntroQWorker } from "entroq";
 
 const client = new EntroQClient({ baseUrl: "http://localhost:9100" });
 const worker = new EntroQWorker(client);
 
 await worker.run(["/my/queue"], async (task) => {
-    console.log("Processing:", Buffer.from(task.value, "base64").toString());
-    return "delete"; // automatically deletes upon completion
+    console.log("Processing:", task.value);
+    // Return a modification to apply atomically; here we delete to finish.
+    return { deletes: [{ id: task.id, version: task.version, queue: task.queue }] };
 });
+```
+
+### Elixir
+The Elixir client provides an HTTP/JSON client and a worker abstraction that
+renews task/doc claims while `perform/2` runs, then applies returned
+modifications after renewal stops and final versions are stable. See
+[`clients/elixir/README.md`](clients/elixir/README.md) for details.
+
+```elixir
+defmodule MyWorker do
+  use EntroQ.Worker
+
+  @impl true
+  def perform(task, _docs) do
+    {:modify, EntroQ.Modification.delete(task)}
+  end
+end
+
+client = EntroQ.new("http://localhost:9100")
+EntroQ.Worker.run(client, ["/my/queue"], MyWorker)
 ```
 
 ## Document Store
@@ -213,10 +283,11 @@ CRD reference (field-by-field, worked examples, policy verification):
 
 ## Production Deployment (Helm)
 
-For Kubernetes environments, a Helm v3 chart is available in `charts/entroq`. It supports backend toggling and secure secret management. See [`charts/entroq/README.md`](charts/entroq/README.md) for full options.
+For Kubernetes environments, a Helm v3 chart is available in `charts/entroq`. It supports backend toggling and secure secret management. See [`charts/entroq/README.md`](charts/entroq/README.md) for full options. Postgres is shown below. In-memory (journaled) and Redis-backed are also available.
 
 ```bash
-helm install my-queue ./charts/entroq --set backend=pg
+make helm-sync
+helm install my-queue ./charts/entroq --set entroq.backend.type=postgres
 ```
 
 ---

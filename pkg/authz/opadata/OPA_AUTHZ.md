@@ -118,7 +118,7 @@ The general pattern is three mounts into the OPA container:
 | Mount | Source | Purpose |
 |---|---|---|
 | `/etc/opa/core` | `conf/core/` from this repo | Core logic -- do not modify |
-| `/etc/opa/providers` | `conf/providers/` from this repo | OIDC user + permissions -- do not modify |
+| `/etc/opa/providers` | `conf/providers/entroq/` from this repo | OIDC user + permissions -- do not modify |
 | `/etc/opa/local` | your own directory | `data.json` (IDP config, users, roles) |
 
 Your `local/` directory is the only thing you own and edit. It needs one file:
@@ -332,19 +332,23 @@ conf/
     entroq/authz/
     entroq/queues/
     entroq/namespaces/
-  providers/                       <- configure via data.json
+  providers/                       <- do not modify
     entroq/user/
     entroq/permissions/
+local/
   data.json                        <- users, roles, IDP config
 ```
 
-Run OPA pointing at this directory:
+Run OPA pointing at those directories:
 ```bash
-opa run --server --bundle ./conf/
+opa run --server --watch \
+  --bundle ./conf/core/ \
+  --bundle ./conf/providers/entroq/ \
+  --bundle ./local/
 ```
 
 To update users/roles without restarting OPA, push a new bundle to the HTTP
-bundle endpoint or update the file and send OPA a SIGINT (it reloads bundles).
+bundle endpoint or use `--watch` with local bundle files during development.
 
 ### Option B: Data API (simpler for dynamic updates)
 
@@ -371,7 +375,12 @@ bundle for the base data.
 OPA has a built-in test runner. To run the tests that ship with this package:
 
 ```bash
-opa test ./conf/ -v
+opa test \
+  ./conf/core/ \
+  ./conf/providers/entroq/ \
+  ./conf/tests/core/ \
+  ./conf/tests/providers/entroq/ \
+  -v
 ```
 
 When writing your own tests, mock `data.entroq.user.name` and
@@ -578,6 +587,15 @@ The operator builds `data.mesh` from CRDs and pushes it to
         {"tier": "frontend"}
       ]
     }
+  ],
+  "namespaces": [
+    {
+      "pattern": "/payments/shared-docs/",
+      "matchType": "Prefix",
+      "allowedCallers": [
+        {"team": "payments"}
+      ]
+    }
   ]
 }
 ```
@@ -591,6 +609,7 @@ Fields:
 | `queues[].pattern` | `EntroQQueue` | The queue name or prefix to protect |
 | `queues[].matchType` | `EntroQQueue` | `Exact` or `Prefix` |
 | `queues[].allowedCallers` | `EntroQQueue` | List of label-set matchers. AND within one entry; OR across entries |
+| `namespaces[]` | `EntroQQueue` | Document-namespace policies; same `pattern` / `matchType` / `allowedCallers` shape as `queues`, applied to doc-store namespace paths |
 
 Label matching: a caller satisfies a queue policy if its identity labels match
 **all** key-value pairs in **any one** of the `allowedCallers` entries.
@@ -632,6 +651,13 @@ spec:
     allowedCallers:
     - labels:
         tier: frontend
+  # Optional: gate document-store access the same way, by namespace path.
+  namespaces:
+  - pattern: /payments/shared-docs/
+    matchType: Prefix
+    allowedCallers:
+    - labels:
+        team: payments
 ```
 
 ### Deploying with Helm
@@ -641,7 +667,8 @@ sidecar (loaded with `conf/core/` and `conf/providers/k8s/`), the eqk8s
 operator, and the CRD definitions.
 
 ```bash
-helm install entroq ./charts/entroq --set backend=pg
+make helm-sync
+helm install entroq ./charts/entroq --set entroq.backend.type=postgres
 ```
 
 OPA and the operator are wired together automatically; no manual OPA data API
@@ -682,7 +709,12 @@ The test suite in `conf/tests/providers/k8s/` covers cross-namespace calls,
 response-queue grants, and label predicate evaluation. Run them with:
 
 ```bash
-opa test ./conf/ -v
+opa test \
+  ./conf/core/ \
+  ./conf/providers/k8s/ \
+  ./conf/tests/core/ \
+  ./conf/tests/providers/k8s/ \
+  -v
 ```
 
 
