@@ -21,8 +21,8 @@ specified, and requests/responses are given in this `authz` module.
 An OPA server must be running for this to be used, and only part of the
 configuration can be specified here. The core configuration files needed for
 OPA to function in an EntroQ setting are located in the
-[opadata/core](opadata/core) directory. Those files should be given to an OPA
-server as part of its policy Rego bundles.
+[opadata/conf/core](opadata/conf/core) directory. Those files should be given to
+an OPA server as part of its policy Rego bundles.
 
 The system user or deployer must provide a few things:
 
@@ -68,10 +68,10 @@ EntroQ has no opinions about how it is done.
 
 ## User-provided Policy
 
-Examples of what username and permissions files might look like can be found in the
-[opadata/example](opadata/example) directory. There, a simple (and bad!)
-approach to providing the username can be found, as can an approach for parsing
-provided data about users and roles.
+Examples of what policy data might look like can be found in the
+[opadata/policy/example](opadata/policy/example) directory. The built-in
+standalone/OIDC provider lives under
+[opadata/conf/providers/entroq](opadata/conf/providers/entroq).
 
 In that example, the users and roles are organized like this:
 
@@ -99,7 +99,8 @@ In that example, the users and roles are organized like this:
 ```
 
 If this structure suits your data purposes, feel free to copy the example permissions
-from the [example directory](opadata/example/example-permissions.rego).
+from the built-in provider at
+[opadata/conf/providers/entroq/permissions/oidc-entroq-permissions.rego](opadata/conf/providers/entroq/permissions/oidc-entroq-permissions.rego).
 
 The username should usually be taken from `input.identity`, following
 instructions in the OPA [security documentation](https://www.openpolicyagent.org/docs/latest/security/).

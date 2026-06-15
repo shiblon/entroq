@@ -409,7 +409,7 @@ func WithDoModify[T any](f DoModifyRun[T]) Option[T] {
 // (moved to the error queue). Required docs claimed by another worker cause a
 // backoff-and-retry
 //
-// When used with WithHandler, the handler's TakeDocs method takes
+// When used with WithMakeHandler, the handler's TakeDocs method takes
 // precedence and WithTakeDocs has no effect.
 func WithTakeDocs[T any](f TakeRun[T]) Option[T] {
 	return func(wo *workerOpts[T]) {

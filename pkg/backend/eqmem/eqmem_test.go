@@ -58,6 +58,10 @@ func TestEQMemSimpleChange(t *testing.T) {
 	RunQTest(t, eqtest.SimpleChange)
 }
 
+func TestEQMemTaskChangeFutureArrival(t *testing.T) {
+	RunQTest(t, eqtest.TaskChangeFutureArrival)
+}
+
 func TestEQMemSimpleWorker(t *testing.T) {
 	RunQTest(t, eqtest.SimpleWorker)
 }
@@ -73,7 +77,6 @@ func TestEQMemWorkerMoveOnError(t *testing.T) {
 func TestEQMemWorkerRetryOnError(t *testing.T) {
 	RunQTest(t, eqtest.WorkerRetryOnError)
 }
-
 
 func TestEQMemClaimUnblocksOnNotify(t *testing.T) {
 	RunQTest(t, eqtest.ClaimUnblocksOnNotify)

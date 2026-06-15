@@ -60,6 +60,7 @@ doc comments -- controller-gen only finds them as package-level declarations).
 cd cmd/eqk8s
 make manifests   # regenerate CRDs, RBAC, webhook manifests
 make generate    # regenerate DeepCopy methods
+cd -
 
 # Build and load into Minikube:
 eval $(minikube docker-env)
