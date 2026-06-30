@@ -11,9 +11,9 @@ import (
 	"testing/quick"
 
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/pkg/backend/eqmem"
 	. "github.com/shiblon/entroq/examples/mr"
 	"github.com/shiblon/entroq/examples/mrtest"
+	"github.com/shiblon/entroq/pkg/backend/eqmem"
 )
 
 func TestMapReduce_inMemorySmall(t *testing.T) {

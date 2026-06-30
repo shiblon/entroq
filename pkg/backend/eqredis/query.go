@@ -37,13 +37,13 @@ func matchesQueuesQuery(name string, qq *entroq.QueuesQuery) bool {
 // Stats are computed from the ZSET and inflight Set without reading task
 // hashes, so they are O(Q) in the number of matching queues:
 //
-//   Size      = ZCARD eq:q:{name}
-//   Claimed   = SCARD eq:inflight:{name}
-//   Available = ZCOUNT eq:q:{name} 0 now_ms
-//               (claimed tasks have score > now by definition, so this is exact)
-//   Future    = Size - Available - Claimed
-//               (approximation: includes expired-but-rescheduled tasks with claims>0)
-//   MaxClaims = 0 (always; see TestQueueStats in redis_test.go)
+//	Size      = ZCARD eq:q:{name}
+//	Claimed   = SCARD eq:inflight:{name}
+//	Available = ZCOUNT eq:q:{name} 0 now_ms
+//	            (claimed tasks have score > now by definition, so this is exact)
+//	Future    = Size - Available - Claimed
+//	            (approximation: includes expired-but-rescheduled tasks with claims>0)
+//	MaxClaims = 0 (always; see TestQueueStats in redis_test.go)
 //
 // MaxClaims requires reading every task hash in each queue -- O(tasks), not
 // O(queues). Postgres computes this via an index-only scan and does not block

@@ -12,7 +12,7 @@ import (
 )
 
 var (
-	cfgFile  string
+	cfgFile   string
 	redisAddr string
 	redisPwd  string
 	redisDB   int

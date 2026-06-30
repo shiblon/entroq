@@ -71,7 +71,7 @@ func TestWorker_Run(t *testing.T) {
 		if s, ok := stats[queue]; !ok || (ok && s.Size == 0) {
 			break
 		}
-		
+
 		select {
 		case err := <-errCh:
 			t.Fatalf("Worker exited early: %v", err)

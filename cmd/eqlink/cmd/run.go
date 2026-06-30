@@ -281,4 +281,3 @@ func (c *tokenFileCreds) GetRequestMetadata(ctx context.Context, uri ...string) 
 func (*tokenFileCreds) RequireTransportSecurity() bool {
 	return false
 }
-

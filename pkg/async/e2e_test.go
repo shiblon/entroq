@@ -19,11 +19,11 @@ import (
 // ReqHeaders contains all non-standard request headers received, allowing
 // tests to verify forwarding and filtering behavior.
 type echoResponse struct {
-	Method        string              `json:"method"`
-	Path          string              `json:"path"`
-	Query         string              `json:"query"`
-	Body          string              `json:"body"`
-	ReqHeaders    map[string][]string `json:"req_headers"`
+	Method     string              `json:"method"`
+	Path       string              `json:"path"`
+	Query      string              `json:"query"`
+	Body       string              `json:"body"`
+	ReqHeaders map[string][]string `json:"req_headers"`
 }
 
 // startEchoUpstream returns an httptest.Server that reflects the request
@@ -71,17 +71,17 @@ func TestSidecarE2E(t *testing.T) {
 	)
 
 	cases := []struct {
-		name             string
-		method           string
-		url              string
-		requestBody      string
-		setupReq         func(*http.Request)
-		wantPath         string
-		wantQuery        string
-		wantBody         string
-		wantRespHeader   string
-		wantRespMulti    []string
-		checkReqHeaders  func(*testing.T, map[string][]string)
+		name            string
+		method          string
+		url             string
+		requestBody     string
+		setupReq        func(*http.Request)
+		wantPath        string
+		wantQuery       string
+		wantBody        string
+		wantRespHeader  string
+		wantRespMulti   []string
+		checkReqHeaders func(*testing.T, map[string][]string)
 	}{
 		{
 			name:     "simple GET",
