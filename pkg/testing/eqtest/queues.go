@@ -11,6 +11,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/shiblon/entroq"
 )
+
 func QueueMatch(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	queue1 := path.Join(qPrefix, "queue-1")
 	queue2 := path.Join(qPrefix, "queue-2")
@@ -269,7 +270,10 @@ func NamespaceStats(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	if err != nil {
 		t.Fatalf("NamespaceStats all: %v", err)
 	}
-	for _, tc := range []struct{ ns string; size, claimed int }{
+	for _, tc := range []struct {
+		ns            string
+		size, claimed int
+	}{
 		{ns1, 2, 0},
 		{ns2, 3, 3}, // all docs under key "k" were claimed together
 		{ns3, 1, 0},
@@ -327,4 +331,3 @@ type taskQueueVersionValue struct {
 	Version int32
 	Value   json.RawMessage
 }
-

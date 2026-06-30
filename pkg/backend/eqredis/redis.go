@@ -87,9 +87,9 @@ const namespacesKey = keyPrefix + "ns"
 
 // EQRedis implements entroq.Backend using Redis.
 type EQRedis struct {
-	client    *redis.Client
-	nw        entroq.NotifyWaiter
-	stopGC    context.CancelFunc
+	client *redis.Client
+	nw     entroq.NotifyWaiter
+	stopGC context.CancelFunc
 }
 
 type redisOptions struct {
