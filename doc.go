@@ -324,7 +324,7 @@ func CreatingIn(ns string, opts ...DocOpt) ModifyArg {
 type DocQuery struct {
 	Namespace  string   `json:"namespace"`
 	IDs        []string `json:"ids"`
-	KeyExact  string   `json:"key_exact"`
+	KeyExact   string   `json:"key_exact"`
 	KeyStart   string   `json:"key_start"`
 	KeyEnd     string   `json:"key_end"`
 	Limit      int      `json:"limit"`

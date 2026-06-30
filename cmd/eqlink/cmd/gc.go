@@ -5,8 +5,8 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
 	"github.com/shiblon/entroq/pkg/async"
+	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
 	"github.com/spf13/cobra"
 )
 

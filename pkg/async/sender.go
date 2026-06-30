@@ -104,7 +104,6 @@ func WithSenderTLSConfig(cfg *tls.Config) SenderOption {
 	}
 }
 
-
 // WithSenderDomainSuffix sets the domain suffix stripped from the Host header
 // to derive the target service name. Defaults to ".localhost".
 func WithSenderDomainSuffix(suffix string) SenderOption {
