@@ -7,7 +7,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [Unreleased]
+## [1.4.0] - 2026-07-01
+
+Go module `v1.4.0`. Adds `eqlink push`, the source-side mirror of `pull`.
 
 ### Added
 
