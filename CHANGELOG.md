@@ -16,6 +16,11 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   honors `--cert`/`--key`/`--ca` (TLS) and `--authz-token-file` (bearer token,
   reloaded on rotation as `run` already does). Fixes #73. The token-reload logic
   is now shared across `run`, `pull`, and `push` via a new internal helper.
+- **Remote TLS inherits the local `--cert`/`--key`/`--ca`** when a `pull`/`push`
+  invocation sets none of its `--source-*`/`--dest-*` flags (logged). A single
+  trust domain then needs the certs given only once; distinct trust domains still
+  set their own per-connection flags. This also removes a footgun: an unset
+  remote is no longer silently insecure.
 
 ---
 
