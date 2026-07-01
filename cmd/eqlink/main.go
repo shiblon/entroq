@@ -5,6 +5,9 @@
 // Run "eqlink run" to start the full sidecar (sender + receiver + GC).
 // Individual components can be run separately with "eqlink send", "eqlink recv",
 // and "eqlink gc".
+//
+// "eqlink pull" is a separate mode that links two EntroQ instances directly,
+// moving tasks from a queue on a remote instance into a local inbox exactly once.
 package main
 
 import "github.com/shiblon/entroq/cmd/eqlink/cmd"

@@ -28,28 +28,13 @@
 // connection and, when configured, to pass the caller's identity to EntroQ for
 // authorization.
 //
-// # Cross-Instance Forwarding (Two EQ Instances)
+// # Cross-Instance Handoff (Two EQ Instances)
 //
-// When each datacenter needs its own EQ instance for fault isolation, a
-// forwarder worker bridges the two:
-//
-//	[EQ-A] <-claim- [Forwarder] -insert-> [EQ-B]
-//
-// Turning the above approach upside-down, you can have a queue represent
-// sending work to a remote entroq system, and similarly for receiving from
-// such a system. The same linkage works: a "send to remote" queue is listened
-// to by a receiver, which then forwards a request to the remote EntroQ
-// (perhaps in a different datacenter). A sender waits for connection and
-// converts data into messages to place into a local queue.
-//
-// Delivery is at-least-once: the insert into EQ-B and the delete from EQ-A
-// are separate transactions. If the forwarder crashes between them the task
-// will be re-forwarded. Workers on EQ-B should be designed for idempotent
-// processing.
-//
-// Response routing across instances requires additional complexity. For
-// request-response patterns across DCs, the single-EQ approach (receiver
-// connects to EQ-A over WAN) is simpler. The two-instance forwarder is best
-// suited for one-way task delegation: fire work at a remote DC and let it
-// process independently.
+// When each datacenter needs its own EQ instance, moving tasks between instances
+// is a separate concern handled by the pull worker (package
+// github.com/shiblon/entroq/pkg/workers/pullworker, exposed as "eqlink pull"):
+// it claims from a queue on a source instance and delivers into an inbox on the
+// destination, exactly once in effect. This package is the sender/receiver
+// sidecar; for request-response across datacenters the single-EQ approach (the
+// receiver connects to the remote EQ over the WAN) remains the simpler option.
 package async
