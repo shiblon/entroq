@@ -7,6 +7,18 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **`eqlink pull` and `push` can now secure the local connection.** The local
+  (`--entroq`) connection previously ignored transport security and auth; it now
+  honors `--cert`/`--key`/`--ca` (TLS) and `--authz-token-file` (bearer token,
+  reloaded on rotation as `run` already does). Fixes #73. The token-reload logic
+  is now shared across `run`, `pull`, and `push` via a new internal helper.
+
+---
+
 ## [1.4.0] - 2026-07-01
 
 Go module `v1.4.0`. Adds `eqlink push`, the source-side mirror of `pull`.
