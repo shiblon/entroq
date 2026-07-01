@@ -6,8 +6,9 @@
 // Individual components can be run separately with "eqlink send", "eqlink recv",
 // and "eqlink gc".
 //
-// "eqlink pull" is a separate mode that links two EntroQ instances directly,
-// moving tasks from a queue on a remote instance into a local inbox exactly once.
+// "eqlink pull" and "eqlink push" link two EntroQ instances directly, moving
+// tasks between them exactly once (pull claims from a remote instance into a
+// local inbox; push claims from a local queue into a remote inbox).
 package main
 
 import "github.com/shiblon/entroq/cmd/eqlink/cmd"
