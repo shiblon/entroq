@@ -7,7 +7,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [Unreleased]
+## [1.4.1] - 2026-07-01
+
+Go module `v1.4.1`. Secures the `eqlink pull`/`push` local connection (TLS + token).
 
 ### Fixed
 
