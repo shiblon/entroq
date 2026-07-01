@@ -42,7 +42,10 @@ collides on the tombstone, so no duplicate inbox task is produced.
 Run this next to the destination instance: only the claim from the source crosses
 the wire. A reaper deletes spent tombstones from <inbox>/_tombstone once their TTL
 elapses; the happy path deletes its own tombstone immediately, so the reaper only
-handles crash orphans.`,
+handles crash orphans.
+
+The local (--entroq) connection secures with --cert/--key/--ca and authenticates
+with --authz-token-file; the remote source uses --source-cert/--source-key/--source-ca.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		// Cancel on SIGINT/SIGTERM: workers stop claiming and exit cleanly. An
 		// interrupted in-flight delivery is safe -- the source task's lease keeps
@@ -50,8 +53,11 @@ handles crash orphans.`,
 		ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 		defer stop()
 
-		// Local (destination) instance: where tasks are delivered.
-		dst, err := entroq.New(ctx, eqgrpc.Opener(entroqAddr, eqgrpc.WithInsecure()))
+		g, gCtx := errgroup.WithContext(ctx)
+
+		// Local (destination) instance: where tasks are delivered. Transport
+		// security and auth come from --cert/--key/--ca and --authz-token-file.
+		dst, err := localEQ(gCtx, g)
 		if err != nil {
 			return fmt.Errorf("dest entroq: %w", err)
 		}
@@ -68,7 +74,7 @@ handles crash orphans.`,
 		} else {
 			srcOpts = append(srcOpts, eqgrpc.WithInsecure())
 		}
-		src, err := entroq.New(ctx, eqgrpc.Opener(sourceEntroqAddr, srcOpts...))
+		src, err := entroq.New(gCtx, eqgrpc.Opener(sourceEntroqAddr, srcOpts...))
 		if err != nil {
 			return fmt.Errorf("source entroq: %w", err)
 		}
@@ -78,8 +84,6 @@ handles crash orphans.`,
 		if sourceName == "" {
 			sourceName = sourceEntroqAddr
 		}
-
-		g, gCtx := errgroup.WithContext(ctx)
 
 		// Pull workers: claim from the source, deliver into the local inbox.
 		for range pullConcurrency {
