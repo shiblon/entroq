@@ -7,6 +7,33 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.3.0] - 2026-07-01
+
+Go module `v1.3.0`. Adds exactly-once cross-instance task handoff (`eqlink pull`).
+
+### Added
+
+- **`eqlink pull` and `pkg/workers/pullworker`.** Link two EntroQ instances
+  directly: claim tasks from a queue on a remote source instance and deliver
+  them into a local inbox, exactly once in effect. Each delivery atomically
+  inserts the inbox task and a value-stripped dedup tombstone keyed by a
+  deterministic transfer ID, then deletes the source task; a crash that
+  re-delivers collides on the tombstone, so no duplicate inbox task is produced.
+  The happy path deletes its own tombstone immediately, and a reaper sweeps
+  crash orphans once their TTL elapses. Run it next to the destination instance,
+  so only the claim from the source crosses the wire.
+- **`worker.NoWork`.** A standard no-op work function for finalize-only workers
+  (those whose whole job is moving tasks between queues), used with
+  `WithDoWork` alongside a `WithFinish`.
+
+### Removed
+
+- **At-least-once `Forwarder` and `eqlink forward`.** Superseded by `eqlink
+  pull`'s exactly-once handoff. A simple at-least-once "send a request and delete
+  the task" worker is a few lines anyone can write with the `worker` package.
+
+---
+
 ## [1.2.1] - 2026-06-15
 
 Go module `v1.2.1`. Client packages: TypeScript `entroq` 0.11.0 (drops the

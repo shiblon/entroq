@@ -11,8 +11,8 @@ import (
 )
 
 var (
-	entroqAddr      string
-	authzTokenFile  string
+	entroqAddr     string
+	authzTokenFile string
 
 	certFile string
 	keyFile  string
@@ -28,7 +28,10 @@ giving services fault tolerance and load balancing without changing their code.
 
 The sender proxies outgoing HTTP calls from the local service into queues.
 The receiver claims tasks from queues and forwards them to the local service.
-The GC cleans up stale response queues left by crashed senders.`,
+The GC cleans up stale response queues left by crashed senders.
+
+The pull command links two EntroQ instances directly, moving tasks from a queue
+on a remote instance into a local inbox exactly once.`,
 }
 
 // Execute is the entry point called from main.

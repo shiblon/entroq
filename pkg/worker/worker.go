@@ -135,6 +135,13 @@ type TakeRun[T any] func(context.Context, *entroq.Task, T) ([]*entroq.DocClaim, 
 // have current version numbers for safe modification.
 type DoFinishRun[T any] func(context.Context, *entroq.Task, T, []*entroq.Doc) error
 
+// NoWork is a no-op work function for finalize-only workers -- those whose
+// entire job is moving tasks between queues, so the queue topology is the state
+// machine and there is no work phase, only a commit. Pass it to WithDoWork and
+// put the real logic in WithFinish, which runs with a stable (renewed) task
+// version safe to modify.
+func NoWork[T any](context.Context, *entroq.Task, T, []*entroq.Doc) error { return nil }
+
 // funcHandler[T] is a Handler[T] backed by plain functions.
 type funcHandler[T any] struct {
 	take   func(context.Context, *entroq.Task, T) ([]*entroq.DocClaim, error)

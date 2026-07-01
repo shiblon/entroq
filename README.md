@@ -281,6 +281,23 @@ step-by-step walkthrough.
 CRD reference (field-by-field, worked examples, policy verification):
 [`docs/mesh-policy.md`](docs/mesh-policy.md)
 
+## Cross-Instance Task Handoff
+
+`eqlink pull` links two EntroQ instances directly, moving tasks from a queue on a
+remote instance into a local inbox **exactly once in effect**. Run it next to the
+destination and point it at the remote source; it claims there and delivers here:
+
+```
+[remote EQ] ──claim──▶ [eqlink pull] ──insert──▶ [local EQ inbox]
+```
+
+Each delivery atomically inserts the inbox task and a value-stripped dedup
+tombstone keyed by a deterministic transfer ID, then deletes the source task. If a
+crash re-delivers, the insert collides on the tombstone and no duplicate is
+produced; the happy path cleans up its own tombstone, and a reaper sweeps crash
+orphans once their TTL elapses. Inbox consumers need no special handling; they
+see ordinary tasks.
+
 ## Production Deployment (Helm)
 
 For Kubernetes environments, a Helm v3 chart is available in `charts/entroq`. It supports backend toggling and secure secret management. See [`charts/entroq/README.md`](charts/entroq/README.md) for full options. Postgres is shown below. In-memory (journaled) and Redis-backed are also available.
