@@ -45,7 +45,8 @@ elapses; the happy path deletes its own tombstone immediately, so the reaper onl
 handles crash orphans.
 
 The local (--entroq) connection secures with --cert/--key/--ca and authenticates
-with --authz-token-file; the remote source uses --source-cert/--source-key/--source-ca.`,
+with --authz-token-file; the remote source uses --source-cert/--source-key/--source-ca,
+falling back to --cert/--key/--ca when none of those are set.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		// Cancel on SIGINT/SIGTERM: workers stop claiming and exit cleanly. An
 		// interrupted in-flight delivery is safe -- the source task's lease keeps
@@ -63,8 +64,9 @@ with --authz-token-file; the remote source uses --source-cert/--source-key/--sou
 		}
 		defer dst.Close()
 
-		// Remote (source) instance: where tasks are claimed from.
-		srcTLS, err := loadTLSConfig(sourceCertFile, sourceKeyFile, sourceCAFile)
+		// Remote (source) instance: where tasks are claimed from. Its TLS falls
+		// back to the local --cert/--key/--ca when no --source-* flags are set.
+		srcTLS, err := remoteTLS("source", sourceCertFile, sourceKeyFile, sourceCAFile)
 		if err != nil {
 			return fmt.Errorf("source tls: %w", err)
 		}
