@@ -48,7 +48,10 @@ relying on each leaf's remote reaping.
 --source-name MUST be unique per source instance. It is mixed into the
 deterministic transfer id; if two leaves share a name, their tasks can collide on
 the shared destination and one leaf's work would be silently dropped as a
-duplicate. Use the tenant id, host id, or similar stable unique value.`,
+duplicate. Use the tenant id, host id, or similar stable unique value.
+
+The local (--entroq) connection secures with --cert/--key/--ca and authenticates
+with --authz-token-file; the remote destination uses --dest-cert/--dest-key/--dest-ca.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		// Cancel on SIGINT/SIGTERM: workers stop claiming and exit cleanly. An
 		// interrupted in-flight delivery is safe -- the source task's lease keeps
@@ -56,8 +59,11 @@ duplicate. Use the tenant id, host id, or similar stable unique value.`,
 		ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 		defer stop()
 
-		// Local (source) instance: where tasks are claimed from.
-		src, err := entroq.New(ctx, eqgrpc.Opener(entroqAddr, eqgrpc.WithInsecure()))
+		g, gCtx := errgroup.WithContext(ctx)
+
+		// Local (source) instance: where tasks are claimed from. Transport
+		// security and auth come from --cert/--key/--ca and --authz-token-file.
+		src, err := localEQ(gCtx, g)
 		if err != nil {
 			return fmt.Errorf("source entroq: %w", err)
 		}
@@ -74,13 +80,11 @@ duplicate. Use the tenant id, host id, or similar stable unique value.`,
 		} else {
 			destOpts = append(destOpts, eqgrpc.WithInsecure())
 		}
-		dst, err := entroq.New(ctx, eqgrpc.Opener(destEntroqAddr, destOpts...))
+		dst, err := entroq.New(gCtx, eqgrpc.Opener(destEntroqAddr, destOpts...))
 		if err != nil {
 			return fmt.Errorf("dest entroq: %w", err)
 		}
 		defer dst.Close()
-
-		g, gCtx := errgroup.WithContext(ctx)
 
 		// Push workers: claim from the local source, deliver into the remote inbox.
 		for range pushConcurrency {

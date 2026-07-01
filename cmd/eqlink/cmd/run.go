@@ -8,8 +8,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -56,10 +54,6 @@ Graceful shutdown on SIGINT/SIGTERM:
 		sigs := make(chan os.Signal, 1)
 		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 		defer signal.Stop(sigs)
-
-		hupsigs := make(chan os.Signal, 1)
-		signal.Notify(hupsigs, syscall.SIGHUP)
-		defer signal.Stop(hupsigs)
 
 		_, stopMetrics, err := setupMetrics(ctx)
 		if err != nil {
@@ -143,47 +137,10 @@ Graceful shutdown on SIGINT/SIGTERM:
 			)
 		})
 
-		// Token reload: periodically stat the token file and reload on mtime
-		// change. k8s projected tokens are rotated by the kubelet (typically
-		// at 80% of the 1h TTL) by updating the file; SIGHUP is also accepted
-		// for manual/scripted reloads.
+		// Token reload: reload the bearer token on rotation (SIGHUP or mtime).
 		hupCtx, hupCancel := context.WithCancel(gCtx)
 		if creds != nil {
-			g.Go(func() error {
-				info, _ := os.Stat(authzTokenFile)
-				var lastMtime time.Time
-				if info != nil {
-					lastMtime = info.ModTime()
-				}
-				ticker := time.NewTicker(tokenReloadInterval)
-				defer ticker.Stop()
-				for {
-					select {
-					case <-hupCtx.Done():
-						return nil
-					case <-hupsigs:
-						if err := creds.reload(); err != nil {
-							log.Printf("token reload (SIGHUP): %v", err)
-						} else {
-							log.Printf("token reloaded (SIGHUP) from %s", authzTokenFile)
-						}
-					case <-ticker.C:
-						fi, err := os.Stat(authzTokenFile)
-						if err != nil {
-							log.Printf("token stat %s: %v", authzTokenFile, err)
-							continue
-						}
-						if fi.ModTime().After(lastMtime) {
-							lastMtime = fi.ModTime()
-							if err := creds.reload(); err != nil {
-								log.Printf("token reload (stat): %v", err)
-							} else {
-								log.Printf("token reloaded (stat) from %s", authzTokenFile)
-							}
-						}
-					}
-				}
-			})
+			watchTokenReload(hupCtx, g, creds)
 		}
 
 		// Signal handler: staged shutdown. Also fires when any goroutine fails
@@ -243,41 +200,4 @@ func newAuditLogger() *slog.Logger {
 		return nil
 	}
 	return slog.New(slog.NewJSONHandler(os.Stderr, nil))
-}
-
-// tokenFileCreds implements grpc.PerRPCCredentials with an in-memory token
-// that is loaded once at startup and reloaded on SIGHUP.
-type tokenFileCreds struct {
-	path     string
-	claimant string // sub#nonce, computed once at startup
-	token    atomic.Pointer[string]
-}
-
-// newTokenFileCreds loads the token immediately; returns an error if the file
-// cannot be read.
-func newTokenFileCreds(path string) (*tokenFileCreds, error) {
-	c := &tokenFileCreds{path: path}
-	if err := c.reload(); err != nil {
-		return nil, err
-	}
-	c.claimant = entroq.MustClaimantFromSub(*c.token.Load())
-	return c, nil
-}
-
-func (c *tokenFileCreds) reload() error {
-	data, err := os.ReadFile(c.path)
-	if err != nil {
-		return fmt.Errorf("bearer token file %q: %w", c.path, err)
-	}
-	tok := strings.TrimSpace(string(data))
-	c.token.Store(&tok)
-	return nil
-}
-
-func (c *tokenFileCreds) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
-	return map[string]string{"authorization": "Bearer " + *c.token.Load()}, nil
-}
-
-func (*tokenFileCreds) RequireTransportSecurity() bool {
-	return false
 }
