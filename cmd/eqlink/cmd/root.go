@@ -30,8 +30,9 @@ The sender proxies outgoing HTTP calls from the local service into queues.
 The receiver claims tasks from queues and forwards them to the local service.
 The GC cleans up stale response queues left by crashed senders.
 
-The pull command links two EntroQ instances directly, moving tasks from a queue
-on a remote instance into a local inbox exactly once.`,
+The pull and push commands link two EntroQ instances directly, moving tasks
+between them exactly once: pull claims from a remote instance into a local inbox;
+push claims from a local queue into a remote inbox.`,
 }
 
 // Execute is the entry point called from main.

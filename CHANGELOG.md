@@ -7,6 +7,19 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **`eqlink push`.** The mirror of `eqlink pull`: claims from a local queue and
+  delivers into a remote instance's inbox, exactly once, over the same
+  `pullworker` engine. Runs next to the source (leaf), for hub-and-spoke fan-in.
+  The dedup tombstone lives on the remote destination, so its cleanup crosses the
+  wire; `--source-name` must be unique per source instance to avoid collisions on
+  the shared destination.
+
+---
+
 ## [1.3.0] - 2026-07-01
 
 Go module `v1.3.0`. Adds exactly-once cross-instance task handoff (`eqlink pull`).
