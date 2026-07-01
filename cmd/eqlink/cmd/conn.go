@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"os"
@@ -54,6 +55,24 @@ func localEQ(ctx context.Context, g *errgroup.Group) (*entroq.EntroQ, error) {
 		return nil, fmt.Errorf("local entroq: %w", err)
 	}
 	return eq, nil
+}
+
+// remoteTLS builds the TLS config for a remote connection (label names it, e.g.
+// "source" or "dest"). When none of the remote's cert/key/ca are set, it
+// inherits the local --cert/--key/--ca -- a convenience for the common
+// single-trust-domain case, where the flags would otherwise be repeated. This
+// only ever makes the remote MORE secure (an unset remote is otherwise
+// insecure); if the remote lives in a distinct trust domain, set its own
+// --<label>-cert/key/ca and no fallback happens. The fallback is logged so it's
+// never a surprise.
+func remoteTLS(label, cert, key, ca string) (*tls.Config, error) {
+	if cert == "" && key == "" && ca == "" {
+		if certFile != "" || keyFile != "" || caFile != "" {
+			log.Printf("%s: no --%s-cert/--%s-key/--%s-ca set; inheriting local --cert/--key/--ca", label, label, label, label)
+		}
+		return loadTLSConfig(certFile, keyFile, caFile)
+	}
+	return loadTLSConfig(cert, key, ca)
 }
 
 // tokenFileCreds implements grpc.PerRPCCredentials with an in-memory bearer

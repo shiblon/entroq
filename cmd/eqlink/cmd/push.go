@@ -51,7 +51,8 @@ the shared destination and one leaf's work would be silently dropped as a
 duplicate. Use the tenant id, host id, or similar stable unique value.
 
 The local (--entroq) connection secures with --cert/--key/--ca and authenticates
-with --authz-token-file; the remote destination uses --dest-cert/--dest-key/--dest-ca.`,
+with --authz-token-file; the remote destination uses --dest-cert/--dest-key/--dest-ca,
+falling back to --cert/--key/--ca when none of those are set.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		// Cancel on SIGINT/SIGTERM: workers stop claiming and exit cleanly. An
 		// interrupted in-flight delivery is safe -- the source task's lease keeps
@@ -69,8 +70,9 @@ with --authz-token-file; the remote destination uses --dest-cert/--dest-key/--de
 		}
 		defer src.Close()
 
-		// Remote (destination) instance: where tasks are delivered.
-		destTLS, err := loadTLSConfig(destCertFile, destKeyFile, destCAFile)
+		// Remote (destination) instance: where tasks are delivered. Its TLS falls
+		// back to the local --cert/--key/--ca when no --dest-* flags are set.
+		destTLS, err := remoteTLS("dest", destCertFile, destKeyFile, destCAFile)
 		if err != nil {
 			return fmt.Errorf("dest tls: %w", err)
 		}
