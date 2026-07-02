@@ -155,7 +155,7 @@ func init() {
 	flags.DurationVar(&heartbeat, "heartbeat", 5*time.Second, "Heartbeat interval for this service. Non-zero values designate this node as a cluster Leader.")
 	flags.BoolVar(&noListen, "no_listen", true, "Disable the persistent PostgreSQL LISTEN connection. Optimizes singleton deployments.")
 	flags.BoolVar(&initSchema, "init_schema", false, "Initialize the EntroQ schema before serving (idempotent; safe to always set).")
-	flags.BoolVar(&noGC, "no_gc", false, "Disable the built-in GC loop that drains queues opted in by name (a gc= or legacy exp= component).")
+	flags.BoolVar(&noGC, "no_gc", false, "Disable the built-in GC loop that drains queues opted in by name (a gc= component).")
 
 	rootCmd.AddCommand(serveCmd)
 }

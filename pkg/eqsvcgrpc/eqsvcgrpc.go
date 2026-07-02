@@ -103,7 +103,7 @@ func WithMetricInterval(d time.Duration) Option {
 }
 
 // WithGC enables a background garbage-collection loop that drains queues opted
-// in by name (a /gc= or legacy /exp= component). It is off by default: the
+// in by name (a /gc= component). It is off by default: the
 // service deletes nothing unless a caller enables it. Server binaries typically
 // enable it and expose their own opt-out flag.
 func WithGC() Option {

@@ -180,7 +180,7 @@ func init() {
 	f.BoolVar(&serve.cleanup, "journal_cleanup", false, "Remove compacted journal files after snapshotting. Requires --journal.")
 	f.IntVar(&serve.journalMaxItems, "journal_max_items", 0, "Rotate journal after this many items (0 = default).")
 	f.IntVar(&serve.journalMaxBytes, "journal_max_bytes", 0, "Rotate journal after this many bytes (0 = default).")
-	f.BoolVar(&serve.noGC, "no_gc", false, "Disable the built-in GC loop that drains queues opted in by name (a gc= or legacy exp= component).")
+	f.BoolVar(&serve.noGC, "no_gc", false, "Disable the built-in GC loop that drains queues opted in by name (a gc= component).")
 
 	rootCmd.AddCommand(serveCmd)
 }

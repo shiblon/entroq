@@ -7,12 +7,6 @@ import (
 	"time"
 )
 
-// gcKeys are the queue-name path keys that declare a garbage-collection
-// activation time. "gc" is canonical; "exp" is a grandfathered alias emitted by
-// older async response queues, kept so that upgrading a server does not strand
-// queues already named with it.
-var gcKeys = map[string]bool{"gc": true, "exp": true}
-
 // ParseGCActivation interprets a garbage-collection activation value: the time
 // after which a queue's claimable tasks may be collected.
 //
@@ -44,12 +38,10 @@ func ParseGCActivation(value string) (time.Time, error) {
 	return t, nil
 }
 
-// GCActivation resolves a queue's garbage-collection policy from its /gc=
-// (canonical) and /exp= (legacy async alias) path components. present is false
-// when neither key appears. When several are present the most specific one
-// wins: the last such component in path order, regardless of which key spells
-// it. A malformed value yields an error, and the caller must not collect the
-// queue on error.
+// GCActivation resolves a queue's garbage-collection policy from its /gc= path
+// components. present is false when no /gc= component appears. When several are
+// present the most specific one wins: the last in path order. A malformed value
+// yields an error, and the caller must not collect the queue on error.
 func GCActivation(qname string) (activateAt time.Time, present bool, err error) {
 	last := ""
 	for _, component := range PathComponents(qname) {
@@ -57,7 +49,7 @@ func GCActivation(qname string) (activateAt time.Time, present bool, err error) 
 			continue
 		}
 		key, val, found := strings.Cut(component[1:], "=")
-		if !found || !gcKeys[key] {
+		if !found || key != "gc" {
 			continue
 		}
 		last, present = val, true

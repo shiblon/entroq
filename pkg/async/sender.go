@@ -93,7 +93,7 @@ func WithSenderRequestTimeout(d time.Duration) SenderOption {
 }
 
 // WithSenderResponseGrace sets the margin added past the request timeout when
-// stamping the exp= value in the response queue name. The sender gives up at
+// stamping the gc= value in the response queue name. The sender gives up at
 // the request timeout but names the queue collectable only timeout+grace later,
 // so GC never deletes a response this sender might still be awaiting. Size it to
 // the worst-case clock skew between this sender and whatever collects the queue;
@@ -328,7 +328,7 @@ func (s *Sender) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// this sender might still be awaiting. See WithSenderResponseGrace.
 	collectAt := time.Now().Add(s.requestTimeout + s.responseGrace)
 	responseQueue := path.Join(queuePrefix, "response",
-		fmt.Sprintf("exp=%d", collectAt.Unix()),
+		fmt.Sprintf("gc=%d", collectAt.Unix()),
 		entroq.GenHex16())
 
 	env := Envelope{

@@ -118,7 +118,7 @@ func init() {
 	f.StringVar(&serve.authzStrategy, "authz", "none", "Authorization strategy: none, opahttp.")
 	f.StringVar(&serve.opaURL, "opa_url", "", fmt.Sprintf("OPA base URL. Default: %s.", opahttp.DefaultHostURL))
 	f.StringVar(&serve.opaPath, "opa_path", "", fmt.Sprintf("OPA API path. Default: %s.", opahttp.DefaultAPIPath))
-	f.BoolVar(&serve.noGC, "no_gc", false, "Disable the built-in GC loop that drains queues opted in by name (a gc= or legacy exp= component).")
+	f.BoolVar(&serve.noGC, "no_gc", false, "Disable the built-in GC loop that drains queues opted in by name (a gc= component).")
 
 	rootCmd.AddCommand(serveCmd)
 }

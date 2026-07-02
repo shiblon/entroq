@@ -100,26 +100,12 @@ func TestGCActivation(t *testing.T) {
 			want:    time.Time{},
 		},
 		{
-			name:    "legacy exp alias",
-			queue:   "/tasks/response/exp=1719000000",
-			present: true,
-			want:    time.Unix(1719000000, 0).UTC(),
+			name:  "exp is ignored",
+			queue: "/tasks/response/exp=1719000000",
 		},
 		{
-			name:    "last of same key wins",
+			name:    "last gc wins",
 			queue:   "/gc=100/sub/gc=200",
-			present: true,
-			want:    time.Unix(200, 0).UTC(),
-		},
-		{
-			name:    "last across keys wins (exp after gc)",
-			queue:   "/gc=200/sub/exp=100",
-			present: true,
-			want:    time.Unix(100, 0).UTC(),
-		},
-		{
-			name:    "last across keys wins (gc after exp)",
-			queue:   "/exp=100/sub/gc=200",
 			present: true,
 			want:    time.Unix(200, 0).UTC(),
 		},
@@ -211,8 +197,8 @@ func TestPathLabels(t *testing.T) {
 }
 
 func ExampleGCActivation() {
-	// The most specific (last) gc/exp component wins, across either key.
-	at, present, _ := GCActivation("/tasks/exp=100/response/gc=200")
+	// The most specific (last) gc component wins.
+	at, present, _ := GCActivation("/tasks/gc=100/response/gc=200")
 	fmt.Printf("present=%v activateAt=%d\n", present, at.Unix())
 	// Output: present=true activateAt=200
 }

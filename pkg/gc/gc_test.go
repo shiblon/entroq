@@ -21,9 +21,9 @@ func newTestEQ(ctx context.Context, t *testing.T) *entroq.EntroQ {
 	return eq
 }
 
-// TestRun verifies that a single scan drains queues whose gc=/exp= activation
-// time has passed while leaving not-yet-due, undirected, and malformed queues
-// untouched.
+// TestRun verifies that a single scan drains queues whose gc= activation time
+// has passed while leaving not-yet-due, undirected, malformed, and legacy exp=
+// queues untouched.
 func TestRun(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -38,10 +38,10 @@ func TestRun(t *testing.T) {
 		queue     string
 		wantEmpty bool
 	}{
-		{"legacy exp expired", fmt.Sprintf("/svc/response/exp=%d/aaaa", past), true},
 		{"canonical gc expired", fmt.Sprintf("/svc/gc=%d", past), true},
 		{"gc always on", "/svc/gc=0", true},
-		{"exp not yet due", fmt.Sprintf("/svc/response/exp=%d/bbbb", future), false},
+		{"gc not yet due", fmt.Sprintf("/svc/gc=%d/leaf", future), false},
+		{"exp is ignored", fmt.Sprintf("/svc/response/exp=%d/aaaa", past), false},
 		{"no gc directive", "/svc/plain", false},
 		{"malformed value is left alone", "/svc/gc=notatime", false},
 	}

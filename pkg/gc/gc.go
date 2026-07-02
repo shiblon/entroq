@@ -1,7 +1,7 @@
 // Package gc periodically collects tasks from queues that opt into garbage
 // collection by naming convention. A queue whose name carries a /gc=<timestamp>
-// (or the legacy /exp=<timestamp>) component becomes eligible once that time
-// passes; gc then drains its claimable tasks with TryClaim, which guarantees it
+// component becomes eligible once that time passes; gc then drains its
+// claimable tasks with TryClaim, which guarantees it
 // never deletes a task a worker currently holds.
 //
 // Collection is best-effort: it obeys the timestamps it sees and uses only
@@ -183,8 +183,8 @@ func RunLoop(ctx context.Context, eq *entroq.EntroQ, opts ...Option) error {
 	}
 }
 
-// Run performs one scan pass, deleting tasks from queues whose gc/exp
-// activation time has passed. It uses TryClaim to drain each queue, which
+// Run performs one scan pass, deleting tasks from queues whose gc activation
+// time has passed. It uses TryClaim to drain each queue, which
 // provides mutual exclusion between concurrent GC instances and guarantees it
 // only deletes tasks no worker currently holds. Use WithMatch to limit the
 // queues scanned; with none, every queue is scanned.

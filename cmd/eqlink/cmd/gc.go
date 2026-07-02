@@ -19,9 +19,9 @@ var gcCmd = &cobra.Command{
 	Use:   "gc",
 	Short: "Run the global GC: cleans up stale response queues left by crashed or removed sidecars.",
 	Long: `Periodically scans queues under the given prefix for a garbage-collection
-directive in the name (a /gc=<timestamp> or legacy /exp=<timestamp> component)
-whose time has passed, and deletes the claimable tasks in them. Async response
-queues (<root>/*/response/exp=<timestamp>) are the primary case.
+directive in the name (a /gc=<timestamp> component) whose time has passed, and
+deletes the claimable tasks in them. Async response queues
+(<root>/*/response/gc=<timestamp>) are the primary case.
 
 Run one instance of this command per EntroQ deployment for global coverage.
 Each "eqlink run" sidecar also runs a local GC scoped to its own queue.`,
