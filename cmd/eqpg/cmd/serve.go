@@ -37,6 +37,7 @@ var (
 	heartbeat     time.Duration
 	noListen      bool
 	initSchema    bool
+	noGC          bool
 )
 
 var serveCmd = &cobra.Command{
@@ -98,10 +99,16 @@ var serveCmd = &cobra.Command{
 
 		opener := eqpg.Opener(dbAddr, openerOptions...)
 
-		svc, err := eqsvcgrpc.New(ctx, opener, authzOpt,
-			eqsvcgrpc.WithMetricInterval(5*time.Second),
+		svcOpts := []eqsvcgrpc.Option{
+			authzOpt,
+			eqsvcgrpc.WithMetricInterval(5 * time.Second),
 			eqsvcgrpc.WithMeterProvider(mp),
-		)
+		}
+		if !noGC {
+			svcOpts = append(svcOpts, eqsvcgrpc.WithGC())
+		}
+
+		svc, err := eqsvcgrpc.New(ctx, opener, svcOpts...)
 		if err != nil {
 			return fmt.Errorf("failed to create eqsvcgrpc service: %w", err)
 		}
@@ -148,6 +155,7 @@ func init() {
 	flags.DurationVar(&heartbeat, "heartbeat", 5*time.Second, "Heartbeat interval for this service. Non-zero values designate this node as a cluster Leader.")
 	flags.BoolVar(&noListen, "no_listen", true, "Disable the persistent PostgreSQL LISTEN connection. Optimizes singleton deployments.")
 	flags.BoolVar(&initSchema, "init_schema", false, "Initialize the EntroQ schema before serving (idempotent; safe to always set).")
+	flags.BoolVar(&noGC, "no_gc", false, "Disable the built-in GC loop that drains queues opted in by name (a gc= or legacy exp= component).")
 
 	rootCmd.AddCommand(serveCmd)
 }

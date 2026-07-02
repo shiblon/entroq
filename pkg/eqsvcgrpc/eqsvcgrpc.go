@@ -45,6 +45,7 @@ import (
 	"github.com/golang/protobuf/proto"
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/authz"
+	"github.com/shiblon/entroq/pkg/gc"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
@@ -72,6 +73,9 @@ type QSvc struct {
 
 	authzHeader string
 	az          authz.Authorizer
+
+	gcEnabled bool
+	gcCancel  context.CancelFunc
 }
 
 // Option allows QSvc creation options to be defined.
@@ -95,6 +99,16 @@ func WithMetricInterval(d time.Duration) Option {
 			d = 5 * time.Second
 		}
 		s.metricInterval = d
+	}
+}
+
+// WithGC enables a background garbage-collection loop that drains queues opted
+// in by name (a /gc= or legacy /exp= component). It is off by default: the
+// service deletes nothing unless a caller enables it. Server binaries typically
+// enable it and expose their own opt-out flag.
+func WithGC() Option {
+	return func(s *QSvc) {
+		s.gcEnabled = true
 	}
 }
 
@@ -132,6 +146,18 @@ func New(ctx context.Context, opener entroq.BackendOpener, opts ...Option) (*QSv
 
 	if err := svc.initMetrics(); err != nil {
 		return nil, fmt.Errorf("eqsvcgrpc init metrics: %w", err)
+	}
+
+	if svc.gcEnabled {
+		// GC runs against this service's own backend, over every queue, and
+		// stops when Close cancels gcCtx (or the caller cancels ctx).
+		gcCtx, cancel := context.WithCancel(ctx)
+		svc.gcCancel = cancel
+		go func() {
+			if err := gc.RunLoop(gcCtx, impl, gc.WithMeterProvider(svc.mp)); err != nil {
+				log.Printf("eqsvcgrpc: gc loop stopped: %v", err)
+			}
+		}()
 	}
 
 	return svc, nil
@@ -209,8 +235,11 @@ func (s *QSvc) observeStats(o metric.Observer, gauge metric.Float64ObservableGau
 	}
 }
 
-// Close closes the backend connections.
+// Close stops the GC loop, if any, and closes the backend connections.
 func (s *QSvc) Close() error {
+	if s.gcCancel != nil {
+		s.gcCancel()
+	}
 	if err := s.impl.Close(); err != nil {
 		return fmt.Errorf("eqsvcgrpc close: %w", err)
 	}
