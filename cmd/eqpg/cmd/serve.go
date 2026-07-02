@@ -38,6 +38,7 @@ var (
 	noListen      bool
 	initSchema    bool
 	noGC          bool
+	gcInterval    time.Duration
 )
 
 var serveCmd = &cobra.Command{
@@ -105,7 +106,7 @@ var serveCmd = &cobra.Command{
 			eqsvcgrpc.WithMeterProvider(mp),
 		}
 		if !noGC {
-			svcOpts = append(svcOpts, eqsvcgrpc.WithGC())
+			svcOpts = append(svcOpts, eqsvcgrpc.WithGC(), eqsvcgrpc.WithGCInterval(gcInterval))
 		}
 
 		svc, err := eqsvcgrpc.New(ctx, opener, svcOpts...)
@@ -156,6 +157,7 @@ func init() {
 	flags.BoolVar(&noListen, "no_listen", true, "Disable the persistent PostgreSQL LISTEN connection. Optimizes singleton deployments.")
 	flags.BoolVar(&initSchema, "init_schema", false, "Initialize the EntroQ schema before serving (idempotent; safe to always set).")
 	flags.BoolVar(&noGC, "no_gc", false, "Disable the built-in GC loop that drains queues opted in by name (a gc= component).")
+	flags.DurationVar(&gcInterval, "gc_interval", time.Minute, "How often the built-in GC scans for collectable queues (when GC is enabled).")
 
 	rootCmd.AddCommand(serveCmd)
 }

@@ -36,7 +36,8 @@ var serve struct {
 	opaURL        string
 	opaPath       string
 
-	noGC bool
+	noGC       bool
+	gcInterval time.Duration
 
 	journal          string
 	createJournalDir bool
@@ -124,7 +125,7 @@ var serveCmd = &cobra.Command{
 
 		svcOpts := []eqsvcgrpc.Option{authzOpt, eqsvcgrpc.WithMeterProvider(mp)}
 		if !serve.noGC {
-			svcOpts = append(svcOpts, eqsvcgrpc.WithGC())
+			svcOpts = append(svcOpts, eqsvcgrpc.WithGC(), eqsvcgrpc.WithGCInterval(serve.gcInterval))
 		}
 
 		svc, err := eqsvcgrpc.New(ctx, eqmem.Opener(
@@ -181,6 +182,7 @@ func init() {
 	f.IntVar(&serve.journalMaxItems, "journal_max_items", 0, "Rotate journal after this many items (0 = default).")
 	f.IntVar(&serve.journalMaxBytes, "journal_max_bytes", 0, "Rotate journal after this many bytes (0 = default).")
 	f.BoolVar(&serve.noGC, "no_gc", false, "Disable the built-in GC loop that drains queues opted in by name (a gc= component).")
+	f.DurationVar(&serve.gcInterval, "gc_interval", time.Minute, "How often the built-in GC scans for collectable queues (when GC is enabled).")
 
 	rootCmd.AddCommand(serveCmd)
 }
