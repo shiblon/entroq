@@ -190,7 +190,7 @@ func init() {
 	flags.IntVar(&concurrency, "concurrency", 1, "Number of concurrent receiver goroutines.")
 	flags.DurationVar(&requestTimeout, "request_timeout", 30*time.Second, "Sender request timeout.")
 	flags.DurationVar(&drainTimeout, "drain_timeout", 35*time.Second, "How long to wait for in-flight requests to finish on shutdown.")
-	flags.BoolVar(&runGC, "run-gc", true, "Run a local GC loop scoped to this sidecar's --queue prefix. On by default for now; will default off once the backends run GC server-side.")
+	flags.BoolVar(&runGC, "run-gc", false, "Run a local GC loop scoped to this sidecar's --queue prefix. Off by default; the EntroQ server collects gc= queues itself. Enable only if the server runs with --no_gc.")
 	flags.DurationVar(&gcInterval, "gc_interval", 10*time.Minute, "How often to run the local GC scan (only when --run-gc is set).")
 	flags.DurationVar(&responseGrace, "response_grace", 15*time.Second, "Margin added past --request_timeout when stamping the response queue's collectable-at time, so GC does not delete a response still being awaited. Size to worst-case sender/GC clock skew.")
 	flags.BoolVar(&auditLog, "audit-log", false, "Emit structured JSON audit events to stderr for every request mediated (request_enqueued, request_handled, response_received).")
