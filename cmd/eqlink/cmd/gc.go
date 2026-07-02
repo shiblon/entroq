@@ -5,8 +5,8 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/pkg/async"
 	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
+	"github.com/shiblon/entroq/pkg/gc"
 	"github.com/spf13/cobra"
 )
 
@@ -34,9 +34,9 @@ Each "eqlink run" sidecar also runs a local GC scoped to its own queue.`,
 		}
 		defer eq.Close()
 
-		return async.RunGCLoop(ctx, eq,
-			async.WithGCMatch(entroq.MatchPrefix(gcQueueRoot)),
-			async.WithGCInterval(gcInterval),
+		return gc.RunLoop(ctx, eq,
+			gc.WithMatch(entroq.MatchPrefix(gcQueueRoot)),
+			gc.WithInterval(gcInterval),
 		)
 	},
 }

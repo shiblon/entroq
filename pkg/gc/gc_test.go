@@ -1,4 +1,4 @@
-package async_test
+package gc_test
 
 import (
 	"context"
@@ -7,19 +7,28 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/pkg/async"
 	"github.com/shiblon/entroq/pkg/backend/eqmem"
+	"github.com/shiblon/entroq/pkg/gc"
 )
 
-// TestRunGC verifies that a single GC pass drains queues whose gc=/exp=
-// activation time has passed while leaving not-yet-due, undirected, and
-// malformed queues untouched.
-func TestRunGC(t *testing.T) {
+func newTestEQ(ctx context.Context, t *testing.T) *entroq.EntroQ {
+	t.Helper()
+	eq, err := entroq.New(ctx, eqmem.Opener())
+	if err != nil {
+		t.Fatalf("open eqmem: %v", err)
+	}
+	t.Cleanup(func() { eq.Close() })
+	return eq
+}
+
+// TestRun verifies that a single scan drains queues whose gc=/exp= activation
+// time has passed while leaving not-yet-due, undirected, and malformed queues
+// untouched.
+func TestRun(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	eq, stop := mustStartEntroQ(ctx, t, eqmem.Opener())
-	defer stop()
+	eq := newTestEQ(ctx, t)
 
 	past := time.Now().Add(-time.Hour).Unix()
 	future := time.Now().Add(time.Hour).Unix()
@@ -43,8 +52,8 @@ func TestRunGC(t *testing.T) {
 		}
 	}
 
-	if err := async.RunGC(ctx, eq); err != nil {
-		t.Fatalf("RunGC: %v", err)
+	if err := gc.Run(ctx, eq); err != nil {
+		t.Fatalf("Run: %v", err)
 	}
 
 	sizes, err := eq.Queues(ctx)
@@ -62,14 +71,13 @@ func TestRunGC(t *testing.T) {
 	}
 }
 
-// TestRunGCRespectsMatch verifies that WithGCMatch scopes the scan: an expired
+// TestRunRespectsMatch verifies that WithMatch scopes the scan: an expired
 // queue outside the match is not collected.
-func TestRunGCRespectsMatch(t *testing.T) {
+func TestRunRespectsMatch(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	eq, stop := mustStartEntroQ(ctx, t, eqmem.Opener())
-	defer stop()
+	eq := newTestEQ(ctx, t)
 
 	past := time.Now().Add(-time.Hour).Unix()
 	inScope := fmt.Sprintf("/svc/gc=%d", past)
@@ -81,8 +89,8 @@ func TestRunGCRespectsMatch(t *testing.T) {
 		}
 	}
 
-	if err := async.RunGC(ctx, eq, async.WithGCMatch(entroq.MatchPrefix("/svc"))); err != nil {
-		t.Fatalf("RunGC: %v", err)
+	if err := gc.Run(ctx, eq, gc.WithMatch(entroq.MatchPrefix("/svc"))); err != nil {
+		t.Fatalf("Run: %v", err)
 	}
 
 	sizes, err := eq.Queues(ctx)

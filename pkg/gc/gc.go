@@ -1,4 +1,15 @@
-package async
+// Package gc periodically collects tasks from queues that opt into garbage
+// collection by naming convention. A queue whose name carries a /gc=<timestamp>
+// (or the legacy /exp=<timestamp>) component becomes eligible once that time
+// passes; gc then drains its claimable tasks with TryClaim, which guarantees it
+// never deletes a task a worker currently holds.
+//
+// Collection is best-effort: it obeys the timestamps it sees and uses only
+// normal claim/modify machinery, so it is safe to run continuously beside live
+// workers. It deliberately does not use the worker.Worker handler loop; it is a
+// standalone periodic scan, optionally scoped by the standard queue matcher, so
+// it works equally well embedded in a server or run on its own.
+package gc
 
 import (
 	"context"
@@ -14,20 +25,20 @@ import (
 	"github.com/shiblon/entroq/pkg/queues"
 )
 
-const defaultGCInterval = 10 * time.Minute
+const defaultInterval = time.Minute
 
-// GCOption configures RunGCLoop and RunGC.
-type GCOption func(*gcConfig)
+// Option configures RunLoop and Run.
+type Option func(*config)
 
-type gcConfig struct {
+type config struct {
 	match    []entroq.QueuesOpt
 	interval time.Duration
 	mp       metric.MeterProvider
 }
 
-func newGCConfig(opts []GCOption) gcConfig {
-	c := gcConfig{
-		interval: defaultGCInterval,
+func newConfig(opts []Option) config {
+	c := config{
+		interval: defaultInterval,
 		mp:       noop.NewMeterProvider(),
 	}
 	for _, o := range opts {
@@ -36,41 +47,41 @@ func newGCConfig(opts []GCOption) gcConfig {
 	return c
 }
 
-// WithGCInterval sets how often the GC scan runs. Defaults to 10 minutes.
-func WithGCInterval(d time.Duration) GCOption {
-	return func(c *gcConfig) {
+// WithInterval sets how often the scan runs. Defaults to one minute.
+func WithInterval(d time.Duration) Option {
+	return func(c *config) {
 		c.interval = d
 	}
 }
 
-// WithGCMatch limits the scan to the queues selected by the standard EntroQ
-// queue matcher (for example entroq.MatchPrefix or entroq.MatchExact). Options
+// WithMatch limits the scan to the queues selected by the standard EntroQ queue
+// matcher (for example entroq.MatchPrefix or entroq.MatchExact). Options
 // accumulate, matching the semantics of eq.Queues. With no match options every
 // queue is scanned.
-func WithGCMatch(opts ...entroq.QueuesOpt) GCOption {
-	return func(c *gcConfig) {
+func WithMatch(opts ...entroq.QueuesOpt) Option {
+	return func(c *config) {
 		c.match = append(c.match, opts...)
 	}
 }
 
-// WithGCMeterProvider sets the OTel MeterProvider used to emit GC metrics.
-// Defaults to a no-op provider, so metrics are inert unless one is supplied.
-func WithGCMeterProvider(mp metric.MeterProvider) GCOption {
-	return func(c *gcConfig) {
+// WithMeterProvider sets the OTel MeterProvider used to emit metrics. Defaults
+// to a no-op provider, so metrics are inert unless one is supplied.
+func WithMeterProvider(mp metric.MeterProvider) Option {
+	return func(c *config) {
 		if mp != nil {
 			c.mp = mp
 		}
 	}
 }
 
-// gcMetrics holds the OTel instruments emitted by a GC scan.
-type gcMetrics struct {
+// metrics holds the OTel instruments emitted by a scan.
+type metrics struct {
 	deleted  metric.Int64Counter
 	errors   metric.Int64Counter
 	sweepDur metric.Float64Histogram
 }
 
-func newGCMetrics(mp metric.MeterProvider) (*gcMetrics, error) {
+func newMetrics(mp metric.MeterProvider) (*metrics, error) {
 	m := mp.Meter("entroq.gc")
 	deleted, err := m.Int64Counter("entroq.gc.deleted_total",
 		metric.WithDescription("Total tasks deleted by garbage collection."),
@@ -91,7 +102,7 @@ func newGCMetrics(mp metric.MeterProvider) (*gcMetrics, error) {
 	if err != nil {
 		return nil, fmt.Errorf("gc sweep duration histogram: %w", err)
 	}
-	return &gcMetrics{deleted: deleted, errors: errors, sweepDur: sweepDur}, nil
+	return &metrics{deleted: deleted, errors: errors, sweepDur: sweepDur}, nil
 }
 
 // queueAttrs returns a fresh attribute set identifying a queue and its
@@ -107,17 +118,17 @@ func queueAttrs(qname string) []attribute.KeyValue {
 	}
 }
 
-func (m *gcMetrics) addError(ctx context.Context, qname, kind string) {
+func (m *metrics) addError(ctx context.Context, qname, kind string) {
 	// queueAttrs allocates a fresh slice, so appending here never aliases.
 	attrs := append(queueAttrs(qname), attribute.String("kind", kind))
 	m.errors.Add(ctx, 1, metric.WithAttributes(attrs...))
 }
 
-// RunGCLoop runs a GC scan periodically until ctx is canceled. Scan errors are
+// RunLoop runs a scan periodically until ctx is canceled. Scan errors are
 // logged and do not stop the loop.
-func RunGCLoop(ctx context.Context, eq *entroq.EntroQ, opts ...GCOption) error {
-	c := newGCConfig(opts)
-	m, err := newGCMetrics(c.mp)
+func RunLoop(ctx context.Context, eq *entroq.EntroQ, opts ...Option) error {
+	c := newConfig(opts)
+	m, err := newMetrics(c.mp)
 	if err != nil {
 		return fmt.Errorf("gc metrics: %w", err)
 	}
@@ -129,28 +140,28 @@ func RunGCLoop(ctx context.Context, eq *entroq.EntroQ, opts ...GCOption) error {
 		case <-ctx.Done():
 			return nil
 		case <-t.C:
-			if err := scanGC(ctx, eq, c, m); err != nil {
+			if err := scan(ctx, eq, c, m); err != nil {
 				log.Printf("gc scan error: %v", err)
 			}
 		}
 	}
 }
 
-// RunGC performs one GC scan pass, deleting tasks from queues whose gc/exp
-// activation time (plus grace) has passed. It uses TryClaim to drain each
-// queue, which provides mutual exclusion between concurrent GC instances and
-// guarantees it only deletes tasks no worker currently holds. Use WithGCMatch
-// to limit the queues scanned; with none, every queue is scanned.
-func RunGC(ctx context.Context, eq *entroq.EntroQ, opts ...GCOption) error {
-	c := newGCConfig(opts)
-	m, err := newGCMetrics(c.mp)
+// Run performs one scan pass, deleting tasks from queues whose gc/exp
+// activation time has passed. It uses TryClaim to drain each queue, which
+// provides mutual exclusion between concurrent GC instances and guarantees it
+// only deletes tasks no worker currently holds. Use WithMatch to limit the
+// queues scanned; with none, every queue is scanned.
+func Run(ctx context.Context, eq *entroq.EntroQ, opts ...Option) error {
+	c := newConfig(opts)
+	m, err := newMetrics(c.mp)
 	if err != nil {
 		return fmt.Errorf("gc metrics: %w", err)
 	}
-	return scanGC(ctx, eq, c, m)
+	return scan(ctx, eq, c, m)
 }
 
-func scanGC(ctx context.Context, eq *entroq.EntroQ, c gcConfig, m *gcMetrics) error {
+func scan(ctx context.Context, eq *entroq.EntroQ, c config, m *metrics) error {
 	start := time.Now()
 	defer func() { m.sweepDur.Record(ctx, time.Since(start).Seconds()) }()
 

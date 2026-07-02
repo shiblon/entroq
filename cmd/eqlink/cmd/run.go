@@ -16,6 +16,7 @@ import (
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/async"
 	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
+	"github.com/shiblon/entroq/pkg/gc"
 	"github.com/shiblon/entroq/pkg/worker"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
@@ -135,9 +136,9 @@ Graceful shutdown on SIGINT/SIGTERM:
 		defer gcCancel()
 		if runGC {
 			g.Go(func() error {
-				return async.RunGCLoop(gcCtx, eq,
-					async.WithGCMatch(entroq.MatchPrefix(myQueue)),
-					async.WithGCInterval(gcInterval),
+				return gc.RunLoop(gcCtx, eq,
+					gc.WithMatch(entroq.MatchPrefix(myQueue)),
+					gc.WithInterval(gcInterval),
 				)
 			})
 		}
