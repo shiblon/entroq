@@ -38,7 +38,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"strings"
 	"sync"
 	"time"
 
@@ -46,6 +45,7 @@ import (
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/authz"
 	"github.com/shiblon/entroq/pkg/gc"
+	"github.com/shiblon/entroq/pkg/queues"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
@@ -204,17 +204,7 @@ func (s *QSvc) initMetrics() error {
 // with s.mu held.
 func (s *QSvc) observeStats(o metric.Observer, gauge metric.Float64ObservableGauge, stats map[string]*entroq.QueueStat) {
 	for name, stat := range stats {
-		segments := strings.Split(strings.TrimPrefix(name, "/"), "/")
-		l1, l2, l3 := "", "", ""
-		if len(segments) > 0 {
-			l1 = "/" + segments[0]
-		}
-		if len(segments) > 1 {
-			l2 = l1 + "/" + segments[1]
-		}
-		if len(segments) > 2 {
-			l3 = l2 + "/" + segments[2]
-		}
+		l1, l2, l3 := queues.PathLabels(name)
 
 		base := []attribute.KeyValue{
 			attribute.String("queue", name),
