@@ -33,6 +33,8 @@ var (
 	namespace           string
 	auditLog            bool
 	tokenReloadInterval time.Duration
+	runGC               bool
+	responseGrace       time.Duration
 )
 
 var runCmd = &cobra.Command{
@@ -90,6 +92,7 @@ Graceful shutdown on SIGINT/SIGTERM:
 		alog := newAuditLogger()
 		sender := async.NewSender(eq, senderAddr,
 			async.WithSenderRequestTimeout(requestTimeout),
+			async.WithSenderResponseGrace(responseGrace),
 			async.WithSenderTLSConfig(tlsCfg),
 			async.WithSenderDomainSuffix(domainSuffix),
 			async.WithSenderNamespace(namespace),
@@ -130,12 +133,14 @@ Graceful shutdown on SIGINT/SIGTERM:
 
 		gcCtx, gcCancel := context.WithCancel(gCtx)
 		defer gcCancel()
-		g.Go(func() error {
-			return async.RunGCLoop(gcCtx, eq, myQueue,
-				async.WithGCInterval(gcInterval),
-				async.WithGCGrace(gcGrace),
-			)
-		})
+		if runGC {
+			g.Go(func() error {
+				return async.RunGCLoop(gcCtx, eq,
+					async.WithGCMatch(entroq.MatchPrefix(myQueue)),
+					async.WithGCInterval(gcInterval),
+				)
+			})
+		}
 
 		// Token reload: reload the bearer token on rotation (SIGHUP or mtime).
 		hupCtx, hupCancel := context.WithCancel(gCtx)
@@ -176,7 +181,7 @@ Graceful shutdown on SIGINT/SIGTERM:
 
 func init() {
 	flags := runCmd.Flags()
-	flags.StringVar(&myQueue, "queue", "", "This sidecar's service queue prefix (required). Receiver watches <prefix>/inbox; GC scans <prefix>/.")
+	flags.StringVar(&myQueue, "queue", "", "This sidecar's service queue prefix (required). Receiver watches <prefix>/inbox.")
 	flags.StringVar(&domainSuffix, "domain-suffix", ".localhost", "Domain suffix stripped from the Host header to derive the target service. E.g. .localhost or .eq.local.")
 	flags.StringVar(&namespace, "namespace", "", "Default namespace prepended to single-label targets. E.g. payments makes bar.localhost route to payments/bar/inbox.")
 	flags.StringVar(&senderAddr, "addr", ":8080", "Address for the sender to listen on.")
@@ -184,8 +189,9 @@ func init() {
 	flags.IntVar(&concurrency, "concurrency", 1, "Number of concurrent receiver goroutines.")
 	flags.DurationVar(&requestTimeout, "request_timeout", 30*time.Second, "Sender request timeout.")
 	flags.DurationVar(&drainTimeout, "drain_timeout", 35*time.Second, "How long to wait for in-flight requests to finish on shutdown.")
-	flags.DurationVar(&gcInterval, "gc_interval", 10*time.Minute, "How often to run the GC scan.")
-	flags.DurationVar(&gcGrace, "gc_grace", 15*time.Second, "Extra time after expiry before GC deletes a response queue.")
+	flags.BoolVar(&runGC, "run-gc", true, "Run a local GC loop scoped to this sidecar's --queue prefix. On by default for now; will default off once the backends run GC server-side.")
+	flags.DurationVar(&gcInterval, "gc_interval", 10*time.Minute, "How often to run the local GC scan (only when --run-gc is set).")
+	flags.DurationVar(&responseGrace, "response_grace", 15*time.Second, "Margin added past --request_timeout when stamping the response queue's collectable-at time, so GC does not delete a response still being awaited. Size to worst-case sender/GC clock skew.")
 	flags.BoolVar(&auditLog, "audit-log", false, "Emit structured JSON audit events to stderr for every request mediated (request_enqueued, request_handled, response_received).")
 	flags.DurationVar(&tokenReloadInterval, "token-reload-interval", 5*time.Minute, "How often to stat the --authz-token-file and reload it if changed. Handles k8s projected token rotation.")
 	runCmd.MarkFlagRequired("queue")

@@ -12,16 +12,16 @@ import (
 
 var (
 	gcInterval  time.Duration
-	gcGrace     time.Duration
 	gcQueueRoot string
 )
 
 var gcCmd = &cobra.Command{
 	Use:   "gc",
 	Short: "Run the global GC: cleans up stale response queues left by crashed or removed sidecars.",
-	Long: `Periodically scans for stale response queues (<root>/*/response/exp=<timestamp>/*)
-where the expiry timestamp has passed (plus a grace period), and deletes any
-tasks still in those queues.
+	Long: `Periodically scans queues under the given prefix for a garbage-collection
+directive in the name (a /gc=<timestamp> or legacy /exp=<timestamp> component)
+whose time has passed, and deletes the claimable tasks in them. Async response
+queues (<root>/*/response/exp=<timestamp>) are the primary case.
 
 Run one instance of this command per EntroQ deployment for global coverage.
 Each "eqlink run" sidecar also runs a local GC scoped to its own queue.`,
@@ -34,9 +34,9 @@ Each "eqlink run" sidecar also runs a local GC scoped to its own queue.`,
 		}
 		defer eq.Close()
 
-		return async.RunGCLoop(ctx, eq, gcQueueRoot,
+		return async.RunGCLoop(ctx, eq,
+			async.WithGCMatch(entroq.MatchPrefix(gcQueueRoot)),
 			async.WithGCInterval(gcInterval),
-			async.WithGCGrace(gcGrace),
 		)
 	},
 }
@@ -44,8 +44,7 @@ Each "eqlink run" sidecar also runs a local GC scoped to its own queue.`,
 func init() {
 	flags := gcCmd.Flags()
 	flags.DurationVar(&gcInterval, "interval", 10*time.Minute, "How often to run the GC scan.")
-	flags.DurationVar(&gcGrace, "grace", 15*time.Second, "Extra time after expiry before GC deletes a response queue.")
-	flags.StringVar(&gcQueueRoot, "root", "/", "Queue name prefix root to scan.")
+	flags.StringVar(&gcQueueRoot, "root", "/", "Queue name prefix to scan.")
 
 	rootCmd.AddCommand(gcCmd)
 }

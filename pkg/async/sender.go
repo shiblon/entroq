@@ -22,7 +22,10 @@ import (
 	"google.golang.org/grpc/metadata"
 )
 
-const defaultRequestTimeout = 30 * time.Second
+const (
+	defaultRequestTimeout = 30 * time.Second
+	defaultResponseGrace  = 15 * time.Second
+)
 
 // Sender is an http.Handler that accepts outgoing HTTP calls from a local
 // service and routes them through EntroQ task queues. Each request is
@@ -63,6 +66,7 @@ type Sender struct {
 	name           string
 	auditLog       *slog.Logger
 	requestTimeout time.Duration
+	responseGrace  time.Duration
 	addr           string
 	mp             metric.MeterProvider
 	tlsConfig      *tls.Config
@@ -79,12 +83,24 @@ type Sender struct {
 // SenderOption configures a Sender.
 type SenderOption func(*Sender)
 
-// WithSenderRequestTimeout sets how long ServeHTTP waits for a response task before
-// returning 504. Also used as the exp= value in the response queue name.
-// Defaults to 30 seconds.
+// WithSenderRequestTimeout sets how long ServeHTTP waits for a response task
+// before returning 504. This is the sender's own give-up deadline. Defaults to
+// 30 seconds.
 func WithSenderRequestTimeout(d time.Duration) SenderOption {
 	return func(s *Sender) {
 		s.requestTimeout = d
+	}
+}
+
+// WithSenderResponseGrace sets the margin added past the request timeout when
+// stamping the exp= value in the response queue name. The sender gives up at
+// the request timeout but names the queue collectable only timeout+grace later,
+// so GC never deletes a response this sender might still be awaiting. Size it to
+// the worst-case clock skew between this sender and whatever collects the queue;
+// with well-synchronized clocks it can be small. Defaults to 15 seconds.
+func WithSenderResponseGrace(d time.Duration) SenderOption {
+	return func(s *Sender) {
+		s.responseGrace = d
 	}
 }
 
@@ -150,6 +166,7 @@ func NewSender(eq *entroq.EntroQ, addr string, opts ...SenderOption) *Sender {
 		addr:           addr,
 		domainSuffix:   ".localhost",
 		requestTimeout: defaultRequestTimeout,
+		responseGrace:  defaultResponseGrace,
 		mp:             noop.NewMeterProvider(),
 	}
 	for _, o := range opts {
@@ -306,9 +323,12 @@ func (s *Sender) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	headers := copyHeaders(r.Header)
 
-	expiry := time.Now().Add(s.requestTimeout)
+	// The sender gives up at requestTimeout, but stamps the queue collectable
+	// only requestTimeout+responseGrace later, so GC never deletes a response
+	// this sender might still be awaiting. See WithSenderResponseGrace.
+	collectAt := time.Now().Add(s.requestTimeout + s.responseGrace)
 	responseQueue := path.Join(queuePrefix, "response",
-		fmt.Sprintf("exp=%d", expiry.Unix()),
+		fmt.Sprintf("exp=%d", collectAt.Unix()),
 		entroq.GenHex16())
 
 	env := Envelope{
