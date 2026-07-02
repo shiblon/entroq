@@ -74,11 +74,10 @@ func PathParams(qname string) map[string][]string {
 		// Remove the prefix, which we know uses 1 byte, now:
 		keyVal := component[1:]
 
-		pieces := strings.SplitN(keyVal, "=", 2)
-		if len(pieces) != 2 {
+		key, val, found := strings.Cut(keyVal, "=")
+		if !found {
 			continue
 		}
-		key, val := pieces[0], pieces[1]
 		params[key] = append(params[key], val)
 	}
 	if len(params) == 0 {

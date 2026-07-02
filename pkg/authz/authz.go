@@ -82,13 +82,11 @@ type Authorization struct {
 
 // NewHeaderAuthorization creates an authorization structure from a header value.
 func NewHeaderAuthorization(val string) *Authorization {
-	pieces := strings.SplitN(val, " ", 2)
 	az := new(Authorization)
-	switch len(pieces) {
-	case 1:
-		az.Credentials = pieces[0]
-	case 2:
-		az.Type, az.Credentials = pieces[0], pieces[1]
+	if typ, creds, found := strings.Cut(val, " "); found {
+		az.Type, az.Credentials = typ, creds
+	} else {
+		az.Credentials = val
 	}
 	return az
 }
