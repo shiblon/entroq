@@ -25,24 +25,42 @@ import (
 	"github.com/shiblon/entroq/pkg/queues"
 )
 
-const defaultInterval = time.Minute
+const (
+	defaultInterval   = time.Minute
+	defaultMaxSize    = 100
+	maxBatchSize      = 1000
+	defaultBatchPause = 100 * time.Millisecond
+)
 
 // Option configures RunLoop and Run.
 type Option func(*config)
 
 type config struct {
-	match    []entroq.QueuesOpt
-	interval time.Duration
-	mp       metric.MeterProvider
+	match      []entroq.QueuesOpt
+	interval   time.Duration
+	maxSize    int
+	batchPause time.Duration
+	mp         metric.MeterProvider
 }
 
 func newConfig(opts []Option) config {
 	c := config{
-		interval: defaultInterval,
-		mp:       noop.NewMeterProvider(),
+		interval:   defaultInterval,
+		maxSize:    defaultMaxSize,
+		batchPause: defaultBatchPause,
+		mp:         noop.NewMeterProvider(),
 	}
 	for _, o := range opts {
 		o(&c)
+	}
+	if c.maxSize <= 0 {
+		c.maxSize = defaultMaxSize
+	}
+	if c.maxSize > maxBatchSize {
+		c.maxSize = maxBatchSize
+	}
+	if c.batchPause < 0 {
+		c.batchPause = 0
 	}
 	return c
 }
@@ -51,6 +69,24 @@ func newConfig(opts []Option) config {
 func WithInterval(d time.Duration) Option {
 	return func(c *config) {
 		c.interval = d
+	}
+}
+
+// WithMaxSize sets the maximum number of tasks GC claims and deletes per batch
+// within a single queue before it pauses. Values above 1000 are capped;
+// non-positive values fall back to the default of 100.
+func WithMaxSize(n int) Option {
+	return func(c *config) {
+		c.maxSize = n
+	}
+}
+
+// WithBatchPause sets how long GC rests between full batches while draining a
+// single queue, so a large backlog does not monopolize the backend. The pause
+// honors context cancellation. Defaults to 100ms; zero disables it.
+func WithBatchPause(d time.Duration) Option {
+	return func(c *config) {
+		c.batchPause = d
 	}
 }
 
@@ -189,31 +225,7 @@ func scan(ctx context.Context, eq *entroq.EntroQ, c config, m *metrics) error {
 			continue
 		}
 
-		var deleted int64
-		success := true
-		for {
-			task, err := eq.TryClaim(ctx, entroq.From(qname))
-			if err != nil {
-				log.Printf("gc claim %s: %v", qname, err)
-				m.addError(ctx, qname, "claim")
-				success = false
-				break
-			}
-			if task == nil {
-				break
-			}
-			if _, err := eq.Modify(ctx, task.Delete()); err != nil {
-				log.Printf("gc delete task in %s: %v", qname, err)
-				m.addError(ctx, qname, "delete")
-				success = false
-				continue
-			}
-			deleted++
-		}
-		if deleted > 0 {
-			m.deleted.Add(ctx, deleted, metric.WithAttributes(queueAttrs(qname)...))
-		}
-		if success {
+		if drainQueue(ctx, eq, c, m, qname) {
 			cleaned++
 		}
 	}
@@ -223,4 +235,55 @@ func scan(ctx context.Context, eq *entroq.EntroQ, c config, m *metrics) error {
 	}
 
 	return nil
+}
+
+// drainQueue claims and deletes the claimable tasks in qname in batches of at
+// most c.maxSize, committing each batch in a single Modify. Every task in a
+// batch is held by this claimant, so the atomic delete cannot be tripped by a
+// stale version. Between full batches it rests for c.batchPause so a large
+// backlog does not monopolize the backend. It returns true if it finished
+// without a claim or delete error.
+func drainQueue(ctx context.Context, eq *entroq.EntroQ, c config, m *metrics, qname string) bool {
+	for {
+		var batch []entroq.ModifyArg
+		claimErr := false
+		for len(batch) < c.maxSize {
+			task, err := eq.TryClaim(ctx, entroq.From(qname))
+			if err != nil {
+				log.Printf("gc claim %s: %v", qname, err)
+				m.addError(ctx, qname, "claim")
+				claimErr = true
+				break
+			}
+			if task == nil {
+				break
+			}
+			batch = append(batch, task.Delete())
+		}
+
+		// Delete whatever we managed to claim, even if claiming then errored;
+		// we hold those leases and abandoning them just delays their cleanup.
+		if len(batch) > 0 {
+			if _, err := eq.Modify(ctx, batch...); err != nil {
+				log.Printf("gc delete batch in %s: %v", qname, err)
+				m.addError(ctx, qname, "delete")
+				return false
+			}
+			m.deleted.Add(ctx, int64(len(batch)), metric.WithAttributes(queueAttrs(qname)...))
+		}
+
+		if claimErr {
+			return false
+		}
+		// A partial batch means the queue is drained; a full one may have left
+		// more behind, so rest and continue.
+		if len(batch) < c.maxSize {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return true
+		case <-time.After(c.batchPause):
+		}
+	}
 }

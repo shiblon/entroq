@@ -71,6 +71,39 @@ func TestRun(t *testing.T) {
 	}
 }
 
+// TestRunBatches verifies that a queue holding more tasks than one batch is
+// fully drained across multiple batches (with a pause between them).
+func TestRunBatches(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	eq := newTestEQ(ctx, t)
+
+	past := time.Now().Add(-time.Hour).Unix()
+	q := fmt.Sprintf("/svc/gc=%d", past)
+
+	const n = 5
+	for i := 0; i < n; i++ {
+		if _, err := eq.Modify(ctx, entroq.InsertingInto(q, entroq.WithRawValue([]byte("{}")))); err != nil {
+			t.Fatalf("insert %d into %q: %v", i, q, err)
+		}
+	}
+
+	// MaxSize below the task count forces multiple batches; a tiny pause keeps
+	// the test fast while still exercising the between-batch rest path.
+	if err := gc.Run(ctx, eq, gc.WithMaxSize(2), gc.WithBatchPause(time.Millisecond)); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	sizes, err := eq.Queues(ctx)
+	if err != nil {
+		t.Fatalf("Queues: %v", err)
+	}
+	if got := sizes[q]; got != 0 {
+		t.Errorf("queue %q should be fully drained across batches, has %d task(s)", q, got)
+	}
+}
+
 // TestRunRespectsMatch verifies that WithMatch scopes the scan: an expired
 // queue outside the match is not collected.
 func TestRunRespectsMatch(t *testing.T) {
