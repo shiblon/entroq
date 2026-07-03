@@ -26,7 +26,7 @@ import (
 // mustStartEntroQ starts a real gRPC server on a loopback TCP port backed by
 // the given opener. Returns a connected EntroQ client and a stop function.
 // Calls t.Fatal on any setup error.
-func mustStartEntroQ(ctx context.Context, t testing.TB, opener entroq.BackendOpener) (*entroq.EntroQ, func()) {
+func mustStartEntroQ(ctx context.Context, t testing.TB, opener entroq.BackendOpener, opts ...eqsvcgrpc.Option) (*entroq.EntroQ, func()) {
 	t.Helper()
 
 	lis, err := net.Listen("tcp", "localhost:0")
@@ -34,7 +34,7 @@ func mustStartEntroQ(ctx context.Context, t testing.TB, opener entroq.BackendOpe
 		t.Fatalf("listen: %v", err)
 	}
 
-	svc, err := eqsvcgrpc.New(ctx, opener)
+	svc, err := eqsvcgrpc.New(ctx, opener, opts...)
 	if err != nil {
 		lis.Close()
 		t.Fatalf("eqsvcgrpc: %v", err)

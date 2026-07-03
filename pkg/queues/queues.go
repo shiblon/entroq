@@ -38,6 +38,25 @@ func PathComponents(qname string) []string {
 	return components
 }
 
+// PathLabels returns up to three cumulative path labels for a queue name,
+// suitable for grouping metrics by hierarchy: for "/a/b/c/d" it returns "/a",
+// "/a/b", and "/a/b/c". Components beyond the third are ignored, and unused
+// levels are empty. It uses the same escape-aware splitting as PathComponents,
+// so an escaped slash within a component does not begin a new level.
+func PathLabels(qname string) (l1, l2, l3 string) {
+	c := PathComponents(qname)
+	if len(c) > 0 {
+		l1 = c[0]
+	}
+	if len(c) > 1 {
+		l2 = l1 + c[1]
+	}
+	if len(c) > 2 {
+		l3 = l2 + c[2]
+	}
+	return l1, l2, l3
+}
+
 // PathParams returns a map from strings to slices of values. It looks
 // through the queue name, assuing that it is basically structured like a path,
 // with some `/key=value/` components, and extracts those key/value pairs into
@@ -55,11 +74,10 @@ func PathParams(qname string) map[string][]string {
 		// Remove the prefix, which we know uses 1 byte, now:
 		keyVal := component[1:]
 
-		pieces := strings.SplitN(keyVal, "=", 2)
-		if len(pieces) != 2 {
+		key, val, found := strings.Cut(keyVal, "=")
+		if !found {
 			continue
 		}
-		key, val := pieces[0], pieces[1]
 		params[key] = append(params[key], val)
 	}
 	if len(params) == 0 {
