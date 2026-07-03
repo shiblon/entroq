@@ -38,13 +38,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/golang/protobuf/proto"
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/authz"
+	"github.com/shiblon/entroq/pkg/gc"
+	"github.com/shiblon/entroq/pkg/queues"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
@@ -72,6 +73,11 @@ type QSvc struct {
 
 	authzHeader string
 	az          authz.Authorizer
+
+	gcEnabled  bool
+	gcInterval time.Duration
+	gcCancel   context.CancelFunc
+	gcDone     chan struct{}
 }
 
 // Option allows QSvc creation options to be defined.
@@ -95,6 +101,24 @@ func WithMetricInterval(d time.Duration) Option {
 			d = 5 * time.Second
 		}
 		s.metricInterval = d
+	}
+}
+
+// WithGC enables a background garbage-collection loop that drains queues opted
+// in by name (a /gc= component). It is off by default: the
+// service deletes nothing unless a caller enables it. Server binaries typically
+// enable it and expose their own opt-out flag.
+func WithGC() Option {
+	return func(s *QSvc) {
+		s.gcEnabled = true
+	}
+}
+
+// WithGCInterval overrides how often the background GC loop scans when GC is
+// enabled via WithGC. Zero (the default) uses the pkg/gc default.
+func WithGCInterval(d time.Duration) Option {
+	return func(s *QSvc) {
+		s.gcInterval = d
 	}
 }
 
@@ -132,6 +156,25 @@ func New(ctx context.Context, opener entroq.BackendOpener, opts ...Option) (*QSv
 
 	if err := svc.initMetrics(); err != nil {
 		return nil, fmt.Errorf("eqsvcgrpc init metrics: %w", err)
+	}
+
+	if svc.gcEnabled {
+		// GC runs against this service's own backend, over every queue. Close
+		// cancels gcCtx and waits on gcDone before closing the backend, so the
+		// loop never touches a closed client.
+		gcCtx, cancel := context.WithCancel(ctx)
+		svc.gcCancel = cancel
+		svc.gcDone = make(chan struct{})
+		gcOpts := []gc.Option{gc.WithMeterProvider(svc.mp)}
+		if svc.gcInterval > 0 {
+			gcOpts = append(gcOpts, gc.WithInterval(svc.gcInterval))
+		}
+		go func() {
+			defer close(svc.gcDone)
+			if err := gc.RunLoop(gcCtx, impl, gcOpts...); err != nil {
+				log.Printf("eqsvcgrpc: gc loop stopped: %v", err)
+			}
+		}()
 	}
 
 	return svc, nil
@@ -178,17 +221,7 @@ func (s *QSvc) initMetrics() error {
 // with s.mu held.
 func (s *QSvc) observeStats(o metric.Observer, gauge metric.Float64ObservableGauge, stats map[string]*entroq.QueueStat) {
 	for name, stat := range stats {
-		segments := strings.Split(strings.TrimPrefix(name, "/"), "/")
-		l1, l2, l3 := "", "", ""
-		if len(segments) > 0 {
-			l1 = "/" + segments[0]
-		}
-		if len(segments) > 1 {
-			l2 = l1 + "/" + segments[1]
-		}
-		if len(segments) > 2 {
-			l3 = l2 + "/" + segments[2]
-		}
+		l1, l2, l3 := queues.PathLabels(name)
 
 		base := []attribute.KeyValue{
 			attribute.String("queue", name),
@@ -209,8 +242,13 @@ func (s *QSvc) observeStats(o metric.Observer, gauge metric.Float64ObservableGau
 	}
 }
 
-// Close closes the backend connections.
+// Close stops the GC loop, if any, waits for it to exit, and closes the backend
+// connections.
 func (s *QSvc) Close() error {
+	if s.gcCancel != nil {
+		s.gcCancel()
+		<-s.gcDone
+	}
 	if err := s.impl.Close(); err != nil {
 		return fmt.Errorf("eqsvcgrpc close: %w", err)
 	}

@@ -49,12 +49,14 @@
 // interrupts the worker between delivery and that cleanup.
 //
 // Those orphans are reaped by arrival time: each tombstone is inserted At = now
-// + TTL, and a plain delete-reaper claims and removes any whose time has come
-// (point one at the tombstone queue). The TTL is the dedup-retention window and
-// the single safety knob: a duplicate is only possible if a tombstone is reaped
-// while a crashed pull can still re-attempt -- i.e. only if recovery takes longer
-// than the TTL. Size it well above worst-case recovery. The reaper is the safety
-// net for crash orphans, not the primary cleanup path.
+// + TTL, and the destination server's built-in garbage collector removes any
+// whose time has come -- the tombstone queue carries a gc= marker (see
+// TombstoneQueue), so no separate reaper is needed as long as that server runs
+// GC, which is the default. The TTL is the dedup-retention window and the single
+// safety knob: a duplicate is only possible if a tombstone is reaped while a
+// crashed pull can still re-attempt -- i.e. only if recovery takes longer than
+// the TTL. Size it well above worst-case recovery. GC is the safety net for
+// crash orphans, not the primary cleanup path.
 package pullworker
 
 import (
@@ -109,8 +111,9 @@ func WithInbox(q string) Option {
 	}
 }
 
-// WithTombstoneQueue overrides the tombstone queue (default <inbox>/_tombstone).
-// This is the queue a delete-reaper should be pointed at.
+// WithTombstoneQueue overrides the tombstone queue (default from TombstoneQueue).
+// An override should include a gc= component (see TombstoneQueue) so the
+// destination server's GC reaps its orphans; otherwise point your own reaper at it.
 func WithTombstoneQueue(q string) Option {
 	return func(w *Worker, _ *[]worker.Option[json.RawMessage], _ *[]worker.RunOption) {
 		w.tombstone = q
@@ -171,11 +174,12 @@ func (w *Worker) transferID(t *entroq.Task) string {
 	return "xfer-" + base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
-// TombstoneQueue returns the default tombstone queue for an inbox. A
-// delete-reaper should watch this queue (or whatever WithTombstoneQueue
-// overrides it to) to reap crash orphans.
+// TombstoneQueue returns the default tombstone queue for an inbox. Its name
+// carries a gc=0 component so the destination server's built-in garbage
+// collector reaps crash orphans once their TTL (arrival time) elapses; no
+// separate reaper is needed as long as that server runs GC, which is the default.
 func TombstoneQueue(inbox string) string {
-	return path.Join(inbox, "_tombstone")
+	return path.Join(inbox, "_tombstone", "gc=0")
 }
 
 // New creates a pull Worker ready to be configured by Run.
@@ -187,9 +191,9 @@ func New() *Worker {
 // (the instance tasks are claimed from); WithDest supplies the destination
 // client. Blocks until ctx is canceled or an unrecoverable error occurs.
 //
-// Run delivers and cleans up its own tombstones on the happy path, but a
-// delete-reaper should still be pointed at the tombstone queue (WithTombstoneQueue,
-// default <inbox>/_tombstone) to reap orphans left by crashes.
+// Run delivers and cleans up its own tombstones on the happy path; crash orphans
+// are reaped by the destination server's built-in GC, since the tombstone queue
+// (see TombstoneQueue) carries a gc= marker.
 func Run(ctx context.Context, src *entroq.EntroQ, opts ...Option) error {
 	w := New()
 	var workerOpts []worker.Option[json.RawMessage]

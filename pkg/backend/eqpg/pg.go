@@ -1,5 +1,17 @@
 // Package eqpg provides an entroq.Backend using PostgreSQL. Use Opener with
 // entroq.New to create a task client that talks to a PostgreSQL backend.
+//
+// # Garbage collection
+//
+// EntroQ's built-in GC -- which reaps queues that opt in by name with a /gc=
+// component -- runs inside the eqsvcgrpc server, not in this backend. A client
+// that talks directly to PostgreSQL with this package (the many-clients,
+// one-database model, with no "eqpg serve" in front) therefore gets NO built-in
+// GC, and any gc=-marked queues (async response queues, eqlink dedup tombstones,
+// and the like) will accumulate. Such deployments must run a collector
+// themselves: point pkg/gc (gc.RunLoop) at the database, run a dedicated
+// "eqlink gc", or enable the per-command reapers (e.g. "eqlink pull/push
+// --run-gc"). Deployments that go through "eqpg serve" get GC on by default.
 package eqpg
 
 import (
