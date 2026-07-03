@@ -7,6 +7,50 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.5.0] - 2026-07-02
+
+Go module `v1.5.0`. Built-in, best-effort garbage collection: EntroQ servers now
+reap queues that opt in by name, so fault-tolerance recipes no longer need a side
+process for cleanup.
+
+### Added
+
+- **Server-side garbage collection.** `eqpg`, `eqmem`, and `eqredis serve` run a
+  background loop that drains any queue whose name carries a `/gc=<timestamp>`
+  component once that time passes, using ordinary claim/delete so it never removes
+  a task a worker holds. On by default; `--no_gc` opts out and `--gc_interval`
+  tunes the scan period (default 1m). Emits OTel metrics (`entroq_gc_deleted_total`,
+  `entroq_gc_errors_total`, `entroq_gc_sweep_duration_seconds`) with Grafana panels.
+  GC lives in the server: a client that talks directly to a backend (notably the
+  direct-to-PostgreSQL, many-clients model with no server in front) gets no
+  built-in GC and must run its own collector -- see the `eqpg` package docs.
+- **`pkg/gc` and `queues.GCActivation`.** A reusable, matcher-scoped collector and
+  the `gc=` naming convention (empty/`0`/Unix-seconds/RFC3339), usable standalone
+  as well as embedded in a server.
+
+### Changed
+
+- **`eqlink run --run-gc` now defaults off.** The server collects garbage, so the
+  sidecar no longer needs its own loop. Enable it only against a server run with
+  `--no_gc`.
+- **Async response queues use `gc=` instead of `exp=`.** One naming convention. The
+  sender bakes its clock-skew grace into the `gc=` timestamp (`--response_grace`),
+  and the collector simply obeys the timestamp it sees.
+- **`eqlink pull`/`push` tombstones are reaped by the destination server's GC.**
+  The dedup tombstone queue now carries a `gc=0` marker, so the built-in server GC
+  collects crash orphans once their TTL elapses. The bespoke sidecar reaper is
+  replaced by an opt-in `--run-gc` on each command: leave it off when the
+  destination server runs GC (the default), set it when it does not (e.g. a
+  direct-to-PostgreSQL destination).
+
+### Removed
+
+- **GC no longer recognizes the `exp=` alias.** Response queues left in flight by a
+  pre-1.5.0 sender will not be collected by the new GC; they are ephemeral, so this
+  is a one-time, low-impact gap during upgrade.
+
+---
+
 ## [1.4.1] - 2026-07-01
 
 Go module `v1.4.1`. Secures the `eqlink pull`/`push` local connection (TLS + token).
