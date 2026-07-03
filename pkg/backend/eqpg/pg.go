@@ -445,12 +445,11 @@ func (b *EQPG) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[string]i
 
 // QueueStats returns a mapping from queue names to their statistics.
 func (b *EQPG) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[string]*entroq.QueueStat, error) {
-	// Hybrid Strategy:
-	// We use Index-Only Scans for all metrics. These are read-only and non-blocking.
-	// 1. Total: O(N) index-only scan (fast but scale-dependent).
-	// 2. Claimed: Fast index-only range scan (at > now AND claimant != '').
-	// 3. Available: Fast index-only range scan (at <= now AND claimant = '').
-	// 4. MaxClaims: O(1) index-seek per queue via byQueueClaims index.
+	// All metrics come from one index-only grouped scan: a single pass grouped by
+	// queue over a covering index on (queue, at, claims), with FILTERs deriving
+	// the claimed/future/available counts and MAX(claims) folded into the same
+	// aggregate. Read-only and non-blocking -- no heap access -- as long as that
+	// covering index exists; without it this degrades to a full heap scan.
 	q := `SELECT
 			queue,
 			COUNT(*) AS count,
