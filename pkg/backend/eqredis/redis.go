@@ -90,13 +90,16 @@ type EQRedis struct {
 	client *redis.Client
 	nw     entroq.NotifyWaiter
 	stopGC context.CancelFunc
+	gcDone chan struct{}
 }
 
 type redisOptions struct {
-	addr     string
-	password string
-	db       int
-	nw       entroq.NotifyWaiter
+	addr        string
+	password    string
+	db          int
+	nw          entroq.NotifyWaiter
+	gcInterval  time.Duration
+	gcBatchSize int
 }
 
 // RedisOpt configures the Redis backend.
@@ -141,7 +144,9 @@ func Opener(opts ...RedisOpt) entroq.BackendOpener {
 // A background GC goroutine is started automatically and runs until ctx is canceled.
 func Open(ctx context.Context, opts ...RedisOpt) (*EQRedis, error) {
 	o := &redisOptions{
-		addr: "localhost:6379",
+		addr:        "localhost:6379",
+		gcInterval:  defaultGCInterval,
+		gcBatchSize: defaultGCBatchSize,
 	}
 	for _, opt := range opts {
 		opt(o)
@@ -167,14 +172,23 @@ func Open(ctx context.Context, opts ...RedisOpt) (*EQRedis, error) {
 		client: client,
 		nw:     nw,
 		stopGC: gcCancel,
+		gcDone: make(chan struct{}),
 	}
-	b.RunGC(gcCtx)
+	// GC is a first-class, always-on backend behavior. Close cancels it and waits
+	// for it to exit before closing the client, so the loop never touches a closed
+	// connection.
+	go func() {
+		defer close(b.gcDone)
+		b.runGCLoop(gcCtx, o.gcInterval, o.gcBatchSize)
+	}()
 	return b, nil
 }
 
-// Close stops the GC goroutine and closes the underlying Redis connection.
+// Close stops the GC goroutine, waits for it to exit, and closes the underlying
+// Redis connection.
 func (e *EQRedis) Close() error {
 	e.stopGC()
+	<-e.gcDone
 	return e.client.Close()
 }
 
