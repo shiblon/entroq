@@ -62,6 +62,9 @@ type pgOptions struct {
 	nw                entroq.NotifyWaiter
 	mp                metric.MeterProvider
 
+	gcInterval  time.Duration
+	gcBatchSize int
+
 	sslClientKeyFile  string
 	sslClientCertFile string
 	sslServerCAFile   string
@@ -252,6 +255,8 @@ func defaultOptions(opts []PGOpt) *pgOptions {
 		sslMode:           string(SSLDisable),
 		readinessInterval: 0, // 0 == no heartbeat
 		noListen:          false,
+		gcInterval:        defaultGCInterval,
+		gcBatchSize:       defaultGCBatchSize,
 	}
 	for _, o := range opts {
 		o(options)
@@ -336,6 +341,8 @@ type EQPG struct {
 	nw entroq.NotifyWaiter
 
 	stopTicker     func()
+	stopGC         func()
+	gcDone         chan struct{}
 	claimDuration  metric.Float64Histogram
 	modifyDuration metric.Float64Histogram
 }
@@ -370,6 +377,20 @@ func New(ctx context.Context, db *sql.DB, nw entroq.NotifyWaiter, opts *pgOption
 		tickerCtx, stop := context.WithCancel(ctx)
 		b.stopTicker = stop
 		go b.runReadinessTicker(tickerCtx, opts.readinessInterval)
+	}
+
+	// Garbage collection is a first-class, always-on backend behavior: it drains
+	// queues that opt in by name (a /gc= component). Close cancels this and waits
+	// for it to exit before closing the DB, so the loop never touches a closed
+	// connection.
+	if opts.gcInterval > 0 {
+		gcCtx, stop := context.WithCancel(ctx)
+		b.stopGC = stop
+		b.gcDone = make(chan struct{})
+		go func() {
+			defer close(b.gcDone)
+			b.runGCLoop(gcCtx, opts.gcInterval, opts.gcBatchSize)
+		}()
 	}
 
 	mp := opts.mp
@@ -407,6 +428,10 @@ func (b *EQPG) initMetrics(mp metric.MeterProvider) error {
 func (b *EQPG) Close() error {
 	if b.stopTicker != nil {
 		b.stopTicker()
+	}
+	if b.stopGC != nil {
+		b.stopGC()
+		<-b.gcDone // wait for the GC loop to exit before closing the DB
 	}
 	if err := b.DB.Close(); err != nil {
 		return fmt.Errorf("pg backend close: %w", err)
