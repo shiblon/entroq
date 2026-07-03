@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/queues"
 	"github.com/shiblon/entroq/pkg/testing/eqtest"
 )
 
@@ -22,6 +23,74 @@ func gcTestClient(ctx context.Context, t *testing.T, gcInterval time.Duration) *
 		t.Fatalf("open client: %v", err)
 	}
 	return client
+}
+
+// goDue derives, from the Go parser, whether a gc=-marked queue is collectable
+// at now: present with a valid activation time that has passed. This is the Go
+// side of the grammar the SQL gc_due function reimplements.
+func goDue(qname string, now time.Time) bool {
+	at, present, err := queues.GCActivation(qname)
+	if err != nil || !present {
+		return false
+	}
+	return !at.After(now)
+}
+
+// gcGrammarVectors pin the gc= grammar shared by the Go parser
+// (queues.GCActivation) and the SQL gc_due function. Timestamps are far in the
+// past or future so "due" is unambiguous regardless of the exact current time.
+// This is the single source of truth guarding the two implementations against
+// drift; a Python-side check will mirror it when the Python backend gains GC.
+var gcGrammarVectors = []struct {
+	queue string
+	due   bool
+}{
+	{"/q/gc=0", true},                            // always on
+	{"/q/gc=/leaf", true},                        // empty value => always on
+	{"/q/gc=1", true},                            // unix seconds, 1970
+	{"/q/gc=946684800", true},                    // unix seconds, 2000
+	{"/q/gc=4102444800", false},                  // unix seconds, 2100 (future)
+	{"/q/gc=2000-01-01T00:00:00Z", true},         // RFC3339 past
+	{"/q/gc=2999-01-01T00:00:00Z", false},        // RFC3339 future
+	{"/q/gc=2000-01-01T00:00:00.000Z", true},     // JS toISOString, past
+	{"/q/gc=notatime", false},                    // malformed => never collect
+	{"/q/gc=12.5", false},                        // decimal => malformed
+	{"/a/gc=0/b/gc=2999-01-01T00:00:00Z", false}, // last wins: future
+	{"/a/gc=2999-01-01T00:00:00Z/b/gc=0", true},  // last wins: always on
+}
+
+// TestGCGrammarGoMatchesSQL guards against drift between queues.GCActivation
+// (Go) and entroq.gc_due (SQL): for every vector both must agree with each other
+// and with the expected result.
+func TestGCGrammarGoMatchesSQL(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	b, err := Open(ctx, pgHostPort,
+		WithDB("postgres"), WithUsername("postgres"), WithPassword("password"),
+		WithConnectAttempts(10), withGCInterval(time.Hour))
+	if err != nil {
+		t.Fatalf("open backend: %v", err)
+	}
+	defer b.Close()
+
+	now := time.Now()
+	for _, v := range gcGrammarVectors {
+		var sqlDue bool
+		if err := b.DB.QueryRowContext(ctx, "SELECT entroq.gc_due($1)", v.queue).Scan(&sqlDue); err != nil {
+			t.Fatalf("gc_due(%q): %v", v.queue, err)
+		}
+		gDue := goDue(v.queue, now)
+		if gDue != v.due {
+			t.Errorf("%q: Go goDue=%v, want %v", v.queue, gDue, v.due)
+		}
+		if sqlDue != v.due {
+			t.Errorf("%q: SQL gc_due=%v, want %v", v.queue, sqlDue, v.due)
+		}
+		if gDue != sqlDue {
+			t.Errorf("%q: Go/SQL DISAGREE (go=%v sql=%v) -- grammar drift", v.queue, gDue, sqlDue)
+		}
+	}
 }
 
 // TestGCLoopCollects asserts the always-on backend GC loop actually RUNS: built
