@@ -39,6 +39,19 @@ helm-package: helm-sync helm-lint ## Package the chart into a .tgz.
 helm-template: helm-sync ## Render the chart to stdout (useful for reviewing output).
 	helm template entroq $(CHART_DIR)
 
+##@ Schema
+
+# The Go schema is canonical; the Python client ships a byte-identical copy so
+# pip-only users can init a database without a Go toolchain. TestSchemaFilesInSync
+# (pkg/backend/eqpg) fails if they drift or their version constants disagree.
+.PHONY: schema-sync
+schema-sync: ## Copy the canonical Postgres schema into the Python client.
+	cp pkg/backend/eqpg/schema.sql clients/py/src/entroq/pg/schema.sql
+	@echo "schema-sync: Python schema updated from canonical."
+	@echo "If the schema version changed, also align SCHEMA_VERSION in clients/py/src/entroq/pg/__init__.py."
+
+##@ Help
+
 .PHONY: help
 help: ## Show this help.
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \

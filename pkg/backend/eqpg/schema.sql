@@ -66,7 +66,14 @@ CREATE TABLE IF NOT EXISTS entroq.docs (
 CREATE INDEX IF NOT EXISTS byID        ON entroq.tasks (id);
 CREATE INDEX IF NOT EXISTS byVersion   ON entroq.tasks (version);
 CREATE INDEX IF NOT EXISTS byQueue     ON entroq.tasks (queue);
-CREATE INDEX IF NOT EXISTS byQueueAt   ON entroq.tasks (queue, at);
+-- Claim range scans use the (queue, at) prefix; QueueStats additionally reads
+-- claims in the same pass, so one covering index over (queue, at, claims) lets
+-- it run as a single index-only grouped scan rather than a full heap scan. This
+-- supersedes the separate (queue, at) and (queue, claims DESC) indexes; drop the
+-- old names so a re-applied schema converges an existing database.
+DROP INDEX IF EXISTS entroq.byQueueAt;
+DROP INDEX IF EXISTS entroq.byQueueClaims;
+CREATE INDEX IF NOT EXISTS byQueueAtClaims ON entroq.tasks (queue, at, claims);
 
 -- Storage Indexes.
 CREATE INDEX IF NOT EXISTS idx_docs_keys     ON entroq.docs (namespace, key_primary, key_secondary);
@@ -81,9 +88,6 @@ CREATE INDEX IF NOT EXISTS byQueueAtBucket ON entroq.tasks (queue, at, (hashtext
 
 -- Readiness index: supports global range scans for future-bound tasks becoming ready.
 CREATE INDEX IF NOT EXISTS byAt ON entroq.tasks (at, queue);
-
--- Peak claims index: supports O(1) peak detection in QueueStats.
-CREATE INDEX IF NOT EXISTS byQueueClaims ON entroq.tasks (queue, claims DESC);
 
 -- Composite types used by stored procedures.
 -- PostgreSQL has no CREATE TYPE IF NOT EXISTS, so we use DO/EXCEPTION blocks.

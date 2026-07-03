@@ -7,48 +7,21 @@
 --   entroq.try_claim     -- claim a task from one of several queues (pure SQL)
 --   entroq.queues        -- queue statistics
 --   entroq.tasks         -- task listing
+--   entroq.docs       -- resource/state storage
 --   entroq.channel_name  -- convert a queue name to a LISTEN/NOTIFY channel identifier
 --
 -- Internal functions (prefixed with _; used by Go backend or by public functions):
 --   entroq._modify_arrays   -- parallel-array form of modify, called by Go backend
+--   entroq._modify_docs  -- update storage resources
 --   entroq._try_claim_one   -- claim from a single queue with bucket randomization
 --   entroq._try_claim_bucket -- claim from a specific hash bucket range
---   entroq._notify_task     -- trigger function for LISTEN/NOTIFY
+--   entroq._claim_docs   -- claim specific storage resources
+--   entroq.notify_ready_queues -- trigger notifications for tasks that reached their 'at' time
 
 CREATE SCHEMA IF NOT EXISTS entroq;
 
--- pgcrypto provides gen_random_uuid() on PostgreSQL < 13.
+-- pgcrypto provides gen_random_bytes(), used for auto-generating task IDs.
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
-
--- Column additions for databases predating the claims/attempt/err fields.
-ALTER TABLE IF EXISTS entroq.tasks ADD COLUMN IF NOT EXISTS claims  INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE IF EXISTS entroq.tasks ADD COLUMN IF NOT EXISTS attempt INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE IF EXISTS entroq.tasks ADD COLUMN IF NOT EXISTS err     TEXT    NOT NULL DEFAULT '';
-
--- Column type migration: uuid -> text for id and claimant.
--- Every UUID has a canonical text representation so this cast is safe.
--- No-ops if the columns are already text.
-ALTER TABLE IF EXISTS entroq.tasks ALTER COLUMN id       TYPE text USING id::text;
-ALTER TABLE IF EXISTS entroq.tasks ALTER COLUMN claimant TYPE text USING claimant::text;
-
--- ID length constraints. Idempotent: drop then re-add.
-ALTER TABLE IF EXISTS entroq.tasks DROP CONSTRAINT IF EXISTS id_max_len;
-ALTER TABLE IF EXISTS entroq.tasks ADD  CONSTRAINT         id_max_len       CHECK (length(id) <= 64);
-ALTER TABLE IF EXISTS entroq.tasks DROP CONSTRAINT IF EXISTS claimant_max_len;
-ALTER TABLE IF EXISTS entroq.tasks ADD  CONSTRAINT         claimant_max_len CHECK (claimant IS NULL OR length(claimant) <= 64);
-
--- Drop old UUID-typed composite types; recreated below with text id fields.
--- These types are not used in any function signatures, so no CASCADE is needed.
-DROP TYPE IF EXISTS entroq.task_id;
-DROP TYPE IF EXISTS entroq.task_arg;
-
--- Drop any stored procedures incompatible with current table schema. Recreating them is non-disruptive.
-DROP FUNCTION IF EXISTS entroq._try_claim_bucket(text, uuid, interval, timestamptz, integer, integer);
-DROP FUNCTION IF EXISTS entroq._try_claim_one(text, uuid, interval);
-DROP FUNCTION IF EXISTS entroq.try_claim(text[], uuid, interval);
-DROP FUNCTION IF EXISTS entroq._modify_arrays(uuid, uuid[], integer[], uuid[], integer[], uuid[], text[], timestamptz[], jsonb[], integer[], text[], uuid[], integer[], text[], timestamptz[], jsonb[], integer[], text[]);
-DROP FUNCTION IF EXISTS entroq.modify(uuid, jsonb, jsonb, jsonb, jsonb);
-DROP FUNCTION IF EXISTS entroq.tasks(text, integer, boolean);
 
 -- Core table. id and claimant are TEXT with CHECK constraints limiting them
 -- to 64 characters -- long enough for UUIDs, ULIDs, etc.
@@ -63,20 +36,49 @@ CREATE TABLE IF NOT EXISTS entroq.tasks (
     version  INTEGER                  NOT NULL DEFAULT 0,
     queue    TEXT                     NOT NULL DEFAULT '',
     at       TIMESTAMP WITH TIME ZONE NOT NULL,
-    created  TIMESTAMP WITH TIME ZONE,
-    modified TIMESTAMP WITH TIME ZONE NOT NULL,
-    claimant TEXT                     CHECK (claimant IS NULL OR length(claimant) <= 64),
+    created  TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    modified TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    claimant TEXT                     NOT NULL DEFAULT '' CHECK (length(claimant) <= 64),
     value    JSONB,
     claims   INTEGER                  NOT NULL DEFAULT 0,
     attempt  INTEGER                  NOT NULL DEFAULT 0,
     err      TEXT                     NOT NULL DEFAULT ''
 );
 
+-- Resource Storage. Keyed by namespace + id.
+-- key_primary and key_secondary provide range-scan and sorting capabilities.
+-- at is used for claiming (locking).
+CREATE TABLE IF NOT EXISTS entroq.docs (
+    namespace     TEXT                     NOT NULL CHECK (length(namespace) <= 64),
+    id            TEXT                     NOT NULL CHECK (length(id) <= 64),
+    version       INTEGER                  NOT NULL DEFAULT 0,
+    claimant      TEXT                     NOT NULL DEFAULT '' CHECK (length(claimant) <= 64),
+    at            TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    key_primary   TEXT                     NOT NULL DEFAULT '' CHECK (length(key_primary) <= 256),
+    key_secondary TEXT                     NOT NULL DEFAULT '' CHECK (length(key_secondary) <= 256),
+    value         JSONB,
+    created       TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    modified      TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    PRIMARY KEY (namespace, id)
+);
+
 -- Indexes.
 CREATE INDEX IF NOT EXISTS byID        ON entroq.tasks (id);
 CREATE INDEX IF NOT EXISTS byVersion   ON entroq.tasks (version);
 CREATE INDEX IF NOT EXISTS byQueue     ON entroq.tasks (queue);
-CREATE INDEX IF NOT EXISTS byQueueAt   ON entroq.tasks (queue, at);
+-- Claim range scans use the (queue, at) prefix; QueueStats additionally reads
+-- claims in the same pass, so one covering index over (queue, at, claims) lets
+-- it run as a single index-only grouped scan rather than a full heap scan. This
+-- supersedes the separate (queue, at) and (queue, claims DESC) indexes; drop the
+-- old names so a re-applied schema converges an existing database.
+DROP INDEX IF EXISTS entroq.byQueueAt;
+DROP INDEX IF EXISTS entroq.byQueueClaims;
+CREATE INDEX IF NOT EXISTS byQueueAtClaims ON entroq.tasks (queue, at, claims);
+
+-- Storage Indexes.
+CREATE INDEX IF NOT EXISTS idx_docs_keys     ON entroq.docs (namespace, key_primary, key_secondary);
+-- Covers NamespaceStats: GROUP BY namespace with FILTER on at/claimant, index-only.
+CREATE INDEX IF NOT EXISTS idx_docs_ns_stats ON entroq.docs (namespace, at, claimant);
 
 -- Bucket index: supports range-based bucket selection in _try_claim_bucket.
 -- hashtext(id) & 255 gives a stable value in [0, 255] for any text ID.
@@ -84,12 +86,24 @@ CREATE INDEX IF NOT EXISTS byQueueAt   ON entroq.tasks (queue, at);
 -- avoiding a full-queue scan while preserving dynamic bucket count selection.
 CREATE INDEX IF NOT EXISTS byQueueAtBucket ON entroq.tasks (queue, at, (hashtext(id) & 255));
 
+-- Readiness index: supports global range scans for future-bound tasks becoming ready.
+CREATE INDEX IF NOT EXISTS byAt ON entroq.tasks (at, queue);
+
 -- Composite types used by stored procedures.
 -- PostgreSQL has no CREATE TYPE IF NOT EXISTS, so we use DO/EXCEPTION blocks.
 DO $$ BEGIN
     CREATE TYPE entroq.task_id AS (
         id      text,
         version integer
+    );
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE entroq.doc_id AS (
+        namespace text,
+        id        text,
+        version   integer
     );
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
@@ -106,6 +120,19 @@ DO $$ BEGIN
         value   jsonb,
         attempt integer,
         err     text
+    );
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE entroq.doc_arg AS (
+        namespace     text,
+        id            text,
+        version       integer,
+        at            timestamptz,
+        key_primary   text,
+        key_secondary text,
+        value         jsonb
     );
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
@@ -288,7 +315,7 @@ $$;
 
 -- entroq._modify_arrays atomically applies inserts, changes, deletes, and
 -- dependency checks. Uses parallel arrays for efficiency from the Go caller,
--- which avoids composite literal encoding complexity (especially jsonb).
+-- which avoids composite literal encoding complexity (especially bytea).
 --
 -- Raises SQLSTATE EQ001 with a JSON detail on any dependency problem.
 -- The detail has three arrays:
@@ -316,7 +343,7 @@ CREATE OR REPLACE FUNCTION entroq._modify_arrays(
     p_ins_ids      text[],
     p_ins_queues   text[],
     p_ins_ats      timestamptz[],
-    p_ins_values   jsonb[],
+    p_ins_values   text[],
     p_ins_attempts integer[],
     p_ins_errs     text[],
     -- changes: must exist at the given version, then updated
@@ -324,7 +351,7 @@ CREATE OR REPLACE FUNCTION entroq._modify_arrays(
     p_chg_vers     integer[],
     p_chg_queues   text[],
     p_chg_ats      timestamptz[],
-    p_chg_values   jsonb[],
+    p_chg_values   text[],
     p_chg_attempts integer[],
     p_chg_errs     text[]
 ) RETURNS TABLE(
@@ -346,6 +373,8 @@ DECLARE
     v_missing      jsonb;
     v_mismatched   jsonb;
     v_collisions   jsonb;
+    v_qset         text[];
+    v_queue        text;
 BEGIN
     -- Lock all must-exist dependency rows and check their versions.
     -- all_deps covers depends, deletes, and changes.
@@ -410,26 +439,30 @@ BEGIN
     USING unnest(coalesce(p_del_ids, '{}'::text[]), coalesce(p_del_vers, '{}'::integer[])) AS d(del_id, del_ver)
     WHERE entroq.tasks.id = d.del_id AND entroq.tasks.version = d.del_ver;
 
-    -- Inserts: empty string = auto-generate; Go zero time = use v_now.
+    -- Inserts: empty string = auto-generate.
+    -- at: timestamps older than 1 year are treated as "use now". This threshold
+    -- avoids needing a sentinel value for Go's zero time (0001-01-01), which
+    -- arrives as a far-past timestamp. Legitimate past timestamps (within a year)
+    -- are preserved; a past at is harmless -- the task is immediately available.
     -- CTE wraps the INSERT so RETURNING * is unambiguous; the outer SELECT
     -- uses alias r.col to avoid RETURNS TABLE OUT-parameter shadowing.
     RETURN QUERY
         WITH r AS (
             INSERT INTO entroq.tasks (id, version, queue, at, claimant, value, created, modified, attempt, err)
             SELECT
-                CASE WHEN ins_id = '' THEN gen_random_uuid()::text ELSE ins_id END,
+                CASE WHEN ins_id = '' THEN encode(gen_random_bytes(8), 'hex') ELSE ins_id END,
                 0,
                 ins_queue,
-                CASE WHEN ins_at = '0001-01-01 00:00:00+00'::timestamptz THEN v_now ELSE ins_at END,
+                CASE WHEN ins_at < v_now - interval '1 year' THEN v_now ELSE ins_at END,
                 p_claimant,
-                ins_value,
+                ins_value::jsonb,
                 v_now, v_now,
                 ins_attempt, ins_err
             FROM unnest(
                 coalesce(p_ins_ids,      '{}'::text[]),
                 coalesce(p_ins_queues,   '{}'::text[]),
                 coalesce(p_ins_ats,      '{}'::timestamptz[]),
-                coalesce(p_ins_values,   '{}'::jsonb[]),
+                coalesce(p_ins_values,   '{}'::text[]),
                 coalesce(p_ins_attempts, '{}'::integer[]),
                 coalesce(p_ins_errs,     '{}'::text[])
             ) AS ins(ins_id, ins_queue, ins_at, ins_value, ins_attempt, ins_err)
@@ -440,7 +473,9 @@ BEGIN
             r.claims, r.attempt, r.err
         FROM r;
 
-    -- Changes: update each task to its new values, incrementing version.
+    -- Changes: at older than 1 year snaps to v_now (covers Go's zero time);
+    -- otherwise preserved as-is (a past at is harmless). Claimant is set only
+    -- when chg_at is strictly in the future; past/present releases the task.
     -- CTE for the same reason as inserts: avoid RETURNS TABLE OUT-parameter shadowing.
     RETURN QUERY
         WITH r AS (
@@ -449,16 +484,17 @@ BEGIN
                 version  = entroq.tasks.version + 1,
                 modified = v_now,
                 queue    = c.chg_queue,
-                at       = c.chg_at,
-                value    = c.chg_value,
+                at       = CASE WHEN c.chg_at < v_now - interval '1 year' THEN v_now ELSE c.chg_at END,
+                value    = c.chg_value::jsonb,
                 attempt  = c.chg_attempt,
-                err      = c.chg_err
+                err      = c.chg_err,
+                claimant = CASE WHEN c.chg_at > v_now THEN p_claimant ELSE '' END
             FROM unnest(
                 coalesce(p_chg_ids,      '{}'::text[]),
                 coalesce(p_chg_vers,     '{}'::integer[]),
                 coalesce(p_chg_queues,   '{}'::text[]),
                 coalesce(p_chg_ats,      '{}'::timestamptz[]),
-                coalesce(p_chg_values,   '{}'::jsonb[]),
+                coalesce(p_chg_values,   '{}'::text[]),
                 coalesce(p_chg_attempts, '{}'::integer[]),
                 coalesce(p_chg_errs,     '{}'::text[])
             ) AS c(chg_id, chg_version, chg_queue, chg_at, chg_value, chg_attempt, chg_err)
@@ -469,6 +505,22 @@ BEGIN
             r.created, r.modified, r.claimant, r.value,
             r.claims, r.attempt, r.err
         FROM r;
+
+    -- Batch Notifications.
+    -- Fires once per unique queue in the transaction, instead of once per row.
+    -- This deduplicates notifications and eliminates row-trigger overhead.
+    FOR v_queue IN
+        SELECT DISTINCT q FROM (
+            SELECT unnest(coalesce(p_ins_queues, '{}'::text[])) as q, 
+                   unnest(coalesce(p_ins_ats,    '{}'::timestamptz[])) as a
+            UNION ALL
+            SELECT unnest(coalesce(p_chg_queues, '{}'::text[])) as q,
+                   unnest(coalesce(p_chg_ats,    '{}'::timestamptz[])) as a
+        ) sub
+        WHERE sub.a <= v_now
+    LOOP
+        PERFORM pg_notify(entroq.channel_name(v_queue), '');
+    END LOOP;
 END;
 $$;
 
@@ -523,7 +575,7 @@ CREATE OR REPLACE FUNCTION entroq.modify(
         ARRAY(SELECT e->>'queue'              FROM jsonb_array_elements(p_inserts) e),
         ARRAY(SELECT coalesce((e->>'at')::timestamptz, '0001-01-01 00:00:00+00')
               FROM jsonb_array_elements(p_inserts) e),
-        ARRAY(SELECT e->'value'
+        ARRAY(SELECT CASE WHEN e ? 'value' THEN (e->'value')::text ELSE NULL END
               FROM jsonb_array_elements(p_inserts) e),
         ARRAY(SELECT coalesce((e->>'attempt')::integer, 0)
               FROM jsonb_array_elements(p_inserts) e),
@@ -534,12 +586,192 @@ CREATE OR REPLACE FUNCTION entroq.modify(
         ARRAY(SELECT (e->>'version')::integer  FROM jsonb_array_elements(p_changes) e),
         ARRAY(SELECT e->>'queue'              FROM jsonb_array_elements(p_changes) e),
         ARRAY(SELECT (e->>'at')::timestamptz  FROM jsonb_array_elements(p_changes) e),
-        ARRAY(SELECT e->'value'
+        ARRAY(SELECT CASE WHEN e ? 'value' THEN (e->'value')::text ELSE NULL END
               FROM jsonb_array_elements(p_changes) e),
         ARRAY(SELECT coalesce((e->>'attempt')::integer, 0)
               FROM jsonb_array_elements(p_changes) e),
         ARRAY(SELECT coalesce(e->>'err', '')
               FROM jsonb_array_elements(p_changes) e)
+    )
+$$;
+
+-- entroq._modify_docs handles all doc table updates for an atomic modify call.
+-- Used internally by entroq.modify and the Go backend.
+-- Raises EQ001 on dependency failure.
+CREATE OR REPLACE FUNCTION entroq._modify_docs(
+    p_claimant     text,
+    p_dep_ns       text[],
+    p_dep_ids      text[],
+    p_dep_vers     integer[],
+    p_del_ns       text[],
+    p_del_ids      text[],
+    p_del_vers     integer[],
+    p_ins_ns       text[],
+    p_ins_ids      text[],
+    p_ins_pkeys    text[],
+    p_ins_skeys    text[],
+    p_ins_values   text[],
+    p_chg_ns       text[],
+    p_chg_ids      text[],
+    p_chg_vers     integer[],
+    p_chg_pkeys    text[],
+    p_chg_skeys    text[],
+    p_chg_values   text[],
+    p_chg_ats      timestamptz[]
+) RETURNS TABLE(
+    kind          text,
+    namespace     text,
+    id            text,
+    version       integer,
+    claimant      text,
+    at            timestamptz,
+    key_primary   text,
+    key_secondary text,
+    value         jsonb,
+    created       timestamptz,
+    modified      timestamptz
+) LANGUAGE plpgsql AS $$
+DECLARE
+    v_now          timestamptz := now();
+    v_missing      jsonb;
+    v_mismatched   jsonb;
+    v_collisions   jsonb;
+BEGIN
+    -- Dependency Checks
+    WITH all_deps(dep_ns, dep_id, dep_ver) AS (
+        SELECT * FROM unnest(coalesce(p_dep_ns, '{}'::text[]), coalesce(p_dep_ids, '{}'::text[]), coalesce(p_dep_vers, '{}'::integer[]))
+        UNION ALL
+        SELECT * FROM unnest(coalesce(p_del_ns, '{}'::text[]), coalesce(p_del_ids, '{}'::text[]), coalesce(p_del_vers, '{}'::integer[]))
+        UNION ALL
+        SELECT * FROM unnest(coalesce(p_chg_ns, '{}'::text[]), coalesce(p_chg_ids, '{}'::text[]), coalesce(p_chg_vers, '{}'::integer[]))
+    ),
+    locked AS (
+        SELECT s.namespace AS lck_ns, s.id AS lck_id, s.version AS lck_ver, s.claimant AS lck_claimant, s.at AS lck_at
+        FROM entroq.docs s
+        JOIN all_deps d ON s.namespace = d.dep_ns AND s.id = d.dep_id
+        FOR UPDATE
+    )
+    SELECT
+        coalesce(jsonb_agg(jsonb_build_object('ns', d.dep_ns, 'id', d.dep_id, 'version', d.dep_ver)) FILTER (WHERE l.lck_id IS NULL), '[]'::jsonb),
+        coalesce(jsonb_agg(jsonb_build_object('ns', d.dep_ns, 'id', d.dep_id, 'version', d.dep_ver))
+                 FILTER (WHERE l.lck_id IS NOT NULL AND (l.lck_ver != d.dep_ver OR (l.lck_claimant != '' AND l.lck_claimant != p_claimant AND l.lck_at > v_now))),
+                 '[]'::jsonb)
+    INTO v_missing, v_mismatched
+    FROM all_deps d
+    LEFT JOIN locked l ON l.lck_ns = d.dep_ns AND l.lck_id = d.dep_id;
+
+    -- Collision Checks
+    SELECT coalesce(jsonb_agg(jsonb_build_object('ns', i.ins_ns, 'id', i.ins_id)), '[]'::jsonb)
+    INTO v_collisions
+    FROM unnest(coalesce(p_ins_ns, '{}'::text[]), coalesce(p_ins_ids, '{}'::text[])) AS i(ins_ns, ins_id)
+    JOIN entroq.docs s ON s.namespace = i.ins_ns AND s.id = i.ins_id;
+
+    IF v_missing != '[]'::jsonb OR v_mismatched != '[]'::jsonb OR v_collisions != '[]'::jsonb THEN
+        RAISE EXCEPTION 'entroq storage dependency error'
+            USING ERRCODE = 'EQ001',
+                  DETAIL  = jsonb_build_object('missing', v_missing, 'mismatched', v_mismatched, 'collisions', v_collisions)::text;
+    END IF;
+
+    -- Deletes
+    DELETE FROM entroq.docs
+    USING unnest(coalesce(p_del_ns, '{}'::text[]), coalesce(p_del_ids, '{}'::text[])) AS d(del_ns, del_id)
+    WHERE entroq.docs.namespace = d.del_ns AND entroq.docs.id = d.del_id;
+
+    -- Inserts
+    RETURN QUERY
+    WITH r AS (
+        INSERT INTO entroq.docs (namespace, id, version, key_primary, key_secondary, value, created, modified)
+        SELECT ins_ns, ins_id, 0, ins_pk, ins_sk, ins_val::jsonb, v_now, v_now
+        FROM unnest(p_ins_ns, p_ins_ids, p_ins_pkeys, p_ins_skeys, p_ins_values)
+        AS i(ins_ns, ins_id, ins_pk, ins_sk, ins_val)
+        RETURNING *
+    )
+    SELECT 'inserted', r.namespace, r.id, r.version, r.claimant, r.at, r.key_primary, r.key_secondary, r.value, r.created, r.modified FROM r;
+
+    -- Changes: future chg_at means claim/renew; past/zero means release.
+    RETURN QUERY
+    WITH r AS (
+        UPDATE entroq.docs
+        SET
+            version = entroq.docs.version + 1,
+            key_primary = c.chg_pk,
+            key_secondary = c.chg_sk,
+            value = c.chg_val::jsonb,
+            -- at: >1 year old snaps to v_now (covers Go's zero time); otherwise preserved.
+            at = CASE WHEN c.chg_at < v_now - interval '1 year' THEN v_now ELSE c.chg_at END,
+            claimant = CASE WHEN c.chg_at > v_now THEN p_claimant ELSE '' END,
+            modified = v_now
+        FROM unnest(p_chg_ns, p_chg_ids, p_chg_vers, p_chg_pkeys, p_chg_skeys, p_chg_values, p_chg_ats)
+        AS c(chg_ns, chg_id, chg_ver, chg_pk, chg_sk, chg_val, chg_at)
+        WHERE entroq.docs.namespace = c.chg_ns AND entroq.docs.id = c.chg_id
+        RETURNING *
+    )
+    SELECT 'changed', r.namespace, r.id, r.version, r.claimant, r.at, r.key_primary, r.key_secondary, r.value, r.created, r.modified FROM r;
+END;
+$$;
+
+-- entroq.modify_docs is the ergonomic public SQL API for doc operations.
+-- Mirrors entroq.modify but delegates to _modify_docs instead of _modify_arrays.
+-- Callers needing atomic task+doc operations should wrap both in a transaction.
+-- (Open question: whether a combined entroq.modify_all is worth adding.)
+--
+-- Each JSONB array element is an object with fields matching the operation:
+--
+--   depends / deletes:  {"namespace": "<ns>", "id": "<id>", "version": <int>}
+--   inserts:            {"namespace": "<ns>", "id": "<id>",
+--                        "key_primary": "<str>", "key_secondary": "<str>",
+--                        "content": <jsonb>}
+--   changes:            {"namespace": "<ns>", "id": "<id>", "version": <int>,
+--                        "key_primary": "<str>", "key_secondary": "<str>",
+--                        "content": <jsonb>, "at": "<rfc3339>"}
+--
+-- All parameters default to '[]'. Returns tagged rows from _modify_docs:
+--   kind='inserted' or kind='changed', followed by all doc fields.
+CREATE OR REPLACE FUNCTION entroq.modify_docs(
+    p_claimant text,
+    p_depends  jsonb DEFAULT '[]',
+    p_deletes  jsonb DEFAULT '[]',
+    p_inserts  jsonb DEFAULT '[]',
+    p_changes  jsonb DEFAULT '[]'
+) RETURNS TABLE(
+    kind          text,
+    namespace     text,
+    id            text,
+    version       integer,
+    claimant      text,
+    at            timestamptz,
+    key_primary   text,
+    key_secondary text,
+    value         jsonb,
+    created       timestamptz,
+    modified      timestamptz
+) LANGUAGE sql AS $$
+    SELECT * FROM entroq._modify_docs(
+        p_claimant,
+        -- depends
+        ARRAY(SELECT e->>'namespace'             FROM jsonb_array_elements(p_depends) e),
+        ARRAY(SELECT e->>'id'                    FROM jsonb_array_elements(p_depends) e),
+        ARRAY(SELECT (e->>'version')::integer    FROM jsonb_array_elements(p_depends) e),
+        -- deletes
+        ARRAY(SELECT e->>'namespace'             FROM jsonb_array_elements(p_deletes) e),
+        ARRAY(SELECT e->>'id'                    FROM jsonb_array_elements(p_deletes) e),
+        ARRAY(SELECT (e->>'version')::integer    FROM jsonb_array_elements(p_deletes) e),
+        -- inserts
+        ARRAY(SELECT e->>'namespace'             FROM jsonb_array_elements(p_inserts) e),
+        ARRAY(SELECT e->>'id'                    FROM jsonb_array_elements(p_inserts) e),
+        ARRAY(SELECT coalesce(e->>'key_primary',   '') FROM jsonb_array_elements(p_inserts) e),
+        ARRAY(SELECT coalesce(e->>'key_secondary', '') FROM jsonb_array_elements(p_inserts) e),
+        ARRAY(SELECT CASE WHEN e ? 'content' THEN (e->'content')::text ELSE NULL END
+              FROM jsonb_array_elements(p_inserts) e),
+        -- changes
+        ARRAY(SELECT e->>'namespace'             FROM jsonb_array_elements(p_changes) e),
+        ARRAY(SELECT e->>'id'                    FROM jsonb_array_elements(p_changes) e),
+        ARRAY(SELECT (e->>'version')::integer    FROM jsonb_array_elements(p_changes) e),
+        ARRAY(SELECT coalesce(e->>'key_primary',   '') FROM jsonb_array_elements(p_changes) e),
+        ARRAY(SELECT coalesce(e->>'key_secondary', '') FROM jsonb_array_elements(p_changes) e),
+        ARRAY(SELECT CASE WHEN e ? 'content' THEN (e->'content')::text ELSE NULL END
+              FROM jsonb_array_elements(p_changes) e),
+        ARRAY(SELECT (e->>'at')::timestamptz         FROM jsonb_array_elements(p_changes) e)
     )
 $$;
 
@@ -566,7 +798,7 @@ CREATE OR REPLACE FUNCTION entroq.queues(
 $$;
 
 -- entroq.tasks returns tasks ordered by at. p_queue='' means all queues.
--- p_omit_values=true returns empty jsonb for the value column.
+-- p_omit_values=true returns empty bytea for the value column.
 -- p_limit=0 means no limit.
 CREATE OR REPLACE FUNCTION entroq.tasks(
     p_queue        text    DEFAULT '',
@@ -618,40 +850,273 @@ RETURNS text LANGUAGE sql IMMUTABLE STRICT AS $$
     END
 $$;
 
--- entroq._notify_task fires pg_notify on the queue's channel for a task that
--- is immediately available. The WHEN clause on the trigger filters to
--- NEW.at <= now(), so this function is only called when the task is already
--- claimable - no conditional needed inside the body.
-CREATE OR REPLACE FUNCTION entroq._notify_task()
-RETURNS TRIGGER LANGUAGE plpgsql AS $$
+-- entroq.docs lists docs in a namespace, optionally filtered by key range.
+-- p_namespace='' means all namespaces.
+-- p_key_start/p_key_end: half-open range [start, end) on key_primary.
+-- p_key_end='' means no upper bound.
+-- p_omit_values=true returns NULL for the value column.
+CREATE OR REPLACE FUNCTION entroq.docs(
+    p_namespace   text    DEFAULT '',
+    p_key_start   text    DEFAULT '',
+    p_key_end     text    DEFAULT '',
+    p_limit       integer DEFAULT 0,
+    p_omit_values boolean DEFAULT false
+) RETURNS TABLE(
+    namespace     text,
+    id            text,
+    version       integer,
+    claimant      text,
+    at            timestamptz,
+    key_primary   text,
+    key_secondary text,
+    value         jsonb,
+    created       timestamptz,
+    modified      timestamptz
+) LANGUAGE sql AS $$
+    SELECT
+        namespace, id, version, claimant, at,
+        key_primary, key_secondary,
+        CASE WHEN p_omit_values THEN NULL::jsonb ELSE value END AS value,
+        created, modified
+    FROM entroq.docs
+    WHERE (p_namespace = '' OR namespace = p_namespace)
+      AND (p_key_start = '' OR key_primary >= p_key_start)
+      AND (p_key_end   = '' OR key_primary <  p_key_end)
+    ORDER BY namespace, key_primary, key_secondary
+    LIMIT NULLIF(p_limit, 0)
+$$;
+
+-- entroq._claim_docs claims all docs sharing a primary key in a namespace.
+-- Raises EQ001 if any doc with that key is already claimed by another claimant,
+-- with JSON detail {"missing_docs":[], "claimed_docs":[...]}.
+-- Returns 0 rows (not an error) if no docs with the key exist.
+CREATE OR REPLACE FUNCTION entroq._claim_docs(
+    p_namespace text,
+    p_claimant  text,
+    p_duration  interval,
+    p_key       text
+) RETURNS TABLE(
+    namespace     text,
+    id            text,
+    version       integer,
+    claimant      text,
+    at            timestamptz,
+    key_primary   text,
+    key_secondary text,
+    value         jsonb,
+    created       timestamptz,
+    modified      timestamptz
+) LANGUAGE plpgsql AS $$
+DECLARE
+    v_now     timestamptz := now();
+    v_claimed jsonb;
 BEGIN
-    PERFORM pg_notify(entroq.channel_name(NEW.queue), '');
-    RETURN NULL;
+    -- Lock all rows with this primary key to serialize concurrent claims.
+    -- Use alias d to avoid ambiguity with RETURNS TABLE output column names.
+    PERFORM d.id FROM entroq.docs AS d
+    WHERE d.namespace = p_namespace AND d.key_primary = p_key
+    FOR UPDATE;
+
+    -- Detect any already-claimed docs.
+    SELECT coalesce(
+        jsonb_agg(jsonb_build_object('namespace', d.namespace, 'id', d.id, 'version', d.version))
+        FILTER (WHERE d.claimant != '' AND d.at > v_now AND d.claimant <> p_claimant),
+        '[]'::jsonb
+    )
+    INTO v_claimed
+    FROM entroq.docs AS d
+    WHERE d.namespace = p_namespace AND d.key_primary = p_key;
+
+    IF v_claimed != '[]'::jsonb THEN
+        RAISE EXCEPTION 'entroq doc claim dependency error'
+            USING ERRCODE = 'EQ001',
+                  DETAIL  = jsonb_build_object(
+                      'missing_docs', '[]'::jsonb,
+                      'claimed_docs', v_claimed
+                  )::text;
+    END IF;
+
+    -- plpgsql only allows DML in WITH clauses, not as subquery expressions.
+    RETURN QUERY
+        WITH updated AS (
+            UPDATE entroq.docs
+            SET
+                version  = entroq.docs.version + 1,
+                at       = v_now + p_duration,
+                claimant = p_claimant,
+                modified = v_now
+            WHERE entroq.docs.namespace = p_namespace
+              AND entroq.docs.key_primary = p_key
+            RETURNING *
+        )
+        SELECT * FROM updated
+        ORDER BY key_primary, key_secondary;
 END;
 $$;
 
--- Trigger must be dropped before recreating because CREATE OR REPLACE TRIGGER
--- is only available in PostgreSQL 14+.
-DROP TRIGGER IF EXISTS task_notify ON entroq.tasks;
-CREATE TRIGGER task_notify
-AFTER INSERT OR UPDATE OF at ON entroq.tasks
-FOR EACH ROW
-WHEN (NEW.at <= now())
-EXECUTE FUNCTION entroq._notify_task();
+-- entroq.claim_docs is the public interface for claiming docs.
+-- See _claim_docs for parameter semantics.
+CREATE OR REPLACE FUNCTION entroq.claim_docs(
+    p_namespace text,
+    p_claimant  text,
+    p_duration  interval,
+    p_key       text
+) RETURNS TABLE(
+    namespace     text,
+    id            text,
+    version       integer,
+    claimant      text,
+    at            timestamptz,
+    key_primary   text,
+    key_secondary text,
+    value         jsonb,
+    created       timestamptz,
+    modified      timestamptz
+) LANGUAGE sql AS $$
+    SELECT * FROM entroq._claim_docs(p_namespace, p_claimant, p_duration, p_key)
+$$;
 
--- Schema version tracking. Set once on first initialization; never overwritten
--- by subsequent re-runs of this script (ON CONFLICT DO NOTHING). The backend
--- reads this on startup and refuses to operate if it does not match the
--- compiled-in SchemaVersion constant, protecting against accidental use of a
--- mismatched schema.
+-- Global state for readiness notifications. last_at tracks the watermark of
+-- tasks that have already been processed for "silent readiness."
+CREATE TABLE IF NOT EXISTS entroq.notification_state (
+    id      INTEGER     PRIMARY KEY CHECK (id = 1),
+    last_at TIMESTAMPTZ NOT NULL
+);
+
+-- Initialize the watermark if it doesn't exist.
+INSERT INTO entroq.notification_state (id, last_at)
+VALUES (1, now())
+ON CONFLICT (id) DO NOTHING;
+
+
+
+-- entroq.notify_ready_queues atomizes the "Check and Notify" logic by maintaining
+-- a high-watermark of processed 'at' times. This makes the notification system
+-- immune to ticker jitter, overlapping runs, or service restarts.
 --
--- To migrate to a new version: apply the updated schema.sql, then manually
--- bump the stored version:
---   UPDATE entroq.meta SET value = '<new-version>' WHERE key = 'schema_version';
+-- If p_min_interval is specified, the function only proceeds if the
+-- watermark has stagnated for at least that long. This prevents distributed
+-- tickers from flooding the database with redundant updates and signals.
+--
+-- pg_cron tip: if your PostgreSQL instance has pg_cron installed (e.g., RDS,
+-- Cloud SQL, or self-hosted with the extension), you can schedule this function
+-- to cover direct clients (such as entroq_pg.py) that do not run their own
+-- heartbeat loop. Example:
+--
+--   SELECT cron.schedule('entroq-notify', '* * * * *',
+--       $$SELECT entroq.notify_ready_queues('5 seconds')$$);
+--
+-- The p_min_interval argument ('5 seconds' above) prevents redundant work when
+-- multiple backend instances or cron firings overlap within a minute. If the
+-- eqpg gRPC backend is also running, its heartbeat and the cron job will
+-- interleave harmlessly -- the watermark and interval guard ensure only one
+-- caller does real work per interval.
+CREATE OR REPLACE FUNCTION entroq.notify_ready_queues(p_min_interval interval DEFAULT '0 seconds')
+RETURNS SETOF text LANGUAGE plpgsql AS $$
+DECLARE
+    v_old_last_at timestamptz;
+    v_new_last_at timestamptz := now();
+    v_queue       text;
+BEGIN
+    -- Lock the row and read the current watermark atomically.
+    -- FOR UPDATE ensures concurrent callers serialize here; the second caller
+    -- will see the updated last_at and bail out via the interval check below.
+    SELECT last_at INTO v_old_last_at FROM entroq.notification_state WHERE id = 1 FOR UPDATE;
+
+    -- Rate limit: skip if the watermark moved recently enough.
+    -- This prevents distributed tickers from flooding notifications.
+    IF now() - v_old_last_at < p_min_interval THEN
+        RETURN;
+    END IF;
+
+    UPDATE entroq.notification_state SET last_at = v_new_last_at WHERE id = 1;
+    
+    FOR v_queue IN
+        SELECT DISTINCT queue 
+        FROM entroq.tasks 
+        WHERE at > v_old_last_at AND at <= v_new_last_at
+    LOOP
+        PERFORM pg_notify(entroq.channel_name(v_queue), '');
+        RETURN NEXT v_queue;
+    END LOOP;
+END;
+$$;
+
+-- Schema version tracking. Updated on every run of this script so that
+-- re-applying the schema after a minor-version upgrade stamps the new version.
+-- The backend reads this on startup and refuses to operate if it does not match
+-- the compiled-in SchemaVersion constant.
+--
+-- Versioning policy (1.x+):
+--   - Schema version tracks the release minor version (major.minor.0 on each
+--     minor release). A schema change always causes a minor bump; a minor bump
+--     does not always mean the schema changed.
+--   - Minor version changes (1.x -> 1.y) are additive only: new tables,
+--     columns with defaults, indexes, or functions. No column renames, type
+--     changes, or data movement.
+--   - Patch releases never change the schema.
+--   - Upgrading from any 1.x schema to any later 1.y schema is always safe:
+--     re-run this script and the new additions appear without touching existing
+--     data.
+--   - Schemas predating 1.0 (0.x) cannot be migrated. Drain all tasks and
+--     reinitialize: DROP SCHEMA entroq CASCADE, then run eqpg schema init.
+-- Migrations: 1.0.0 → 1.1.0 (see blocks below)
+-- Migrations: 1.1.0 → 1.2.0 (no structural changes)
+-- Each block checks pg_attribute to skip on fresh installs where the column
+-- is already correct, avoiding unnecessary table scans on re-runs.
+
+DO $$
+DECLARE v_not_null boolean;
+BEGIN
+    SELECT attnotnull INTO v_not_null FROM pg_attribute
+    WHERE attrelid = 'entroq.tasks'::regclass AND attname = 'claimant';
+    IF NOT v_not_null THEN
+        UPDATE entroq.tasks SET claimant = '' WHERE claimant IS NULL;
+        ALTER TABLE entroq.tasks ALTER COLUMN claimant SET NOT NULL;
+        ALTER TABLE entroq.tasks ALTER COLUMN claimant SET DEFAULT '';
+    END IF;
+END $$;
+
+DO $$
+DECLARE v_not_null boolean;
+BEGIN
+    SELECT attnotnull INTO v_not_null FROM pg_attribute
+    WHERE attrelid = 'entroq.tasks'::regclass AND attname = 'created';
+    IF NOT v_not_null THEN
+        UPDATE entroq.tasks SET created = modified WHERE created IS NULL;
+        ALTER TABLE entroq.tasks ALTER COLUMN created SET NOT NULL;
+        ALTER TABLE entroq.tasks ALTER COLUMN created SET DEFAULT now();
+    END IF;
+END $$;
+
+DO $$
+DECLARE v_not_null boolean;
+BEGIN
+    SELECT attnotnull INTO v_not_null FROM pg_attribute
+    WHERE attrelid = 'entroq.docs'::regclass AND attname = 'claimant';
+    IF NOT v_not_null THEN
+        UPDATE entroq.docs SET claimant = '' WHERE claimant IS NULL;
+        ALTER TABLE entroq.docs ALTER COLUMN claimant SET NOT NULL;
+        ALTER TABLE entroq.docs ALTER COLUMN claimant SET DEFAULT '';
+    END IF;
+END $$;
+
+DO $$
+DECLARE v_not_null boolean;
+BEGIN
+    SELECT attnotnull INTO v_not_null FROM pg_attribute
+    WHERE attrelid = 'entroq.docs'::regclass AND attname = 'at';
+    IF NOT v_not_null THEN
+        UPDATE entroq.docs SET at = created WHERE at IS NULL;
+        ALTER TABLE entroq.docs ALTER COLUMN at SET NOT NULL;
+        ALTER TABLE entroq.docs ALTER COLUMN at SET DEFAULT now();
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS entroq.meta (
     key   TEXT PRIMARY KEY NOT NULL,
     value TEXT NOT NULL
 );
 
-INSERT INTO entroq.meta (key, value) VALUES ('schema_version', '0.10.0')
-    ON CONFLICT (key) DO NOTHING;
+INSERT INTO entroq.meta (key, value) VALUES ('schema_version', '1.2.0')
+    ON CONFLICT (key) DO UPDATE SET value = '1.2.0' WHERE entroq.meta.key = 'schema_version';
