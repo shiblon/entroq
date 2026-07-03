@@ -75,6 +75,14 @@ DROP INDEX IF EXISTS entroq.byQueueAt;
 DROP INDEX IF EXISTS entroq.byQueueClaims;
 CREATE INDEX IF NOT EXISTS byQueueAtClaims ON entroq.tasks (queue, at, claims);
 
+-- Garbage-collection discovery index. Partial: only rows in queues that opt into
+-- GC via a /gc= name component. Lets gc_collect find due collectable tasks by
+-- scanning O(gc= rows) rather than the whole table -- and, being partial, it is
+-- tiny and cheap to maintain (a per-insert LIKE predicate; non-gc rows never
+-- enter it). The query predicate MUST match this WHERE clause verbatim for the
+-- planner to use it.
+CREATE INDEX IF NOT EXISTS byGCQueueAt ON entroq.tasks (queue, at) WHERE queue LIKE '%/gc=%';
+
 -- Storage Indexes.
 CREATE INDEX IF NOT EXISTS idx_docs_keys     ON entroq.docs (namespace, key_primary, key_secondary);
 -- Covers NamespaceStats: GROUP BY namespace with FILTER on at/claimant, index-only.
@@ -1042,6 +1050,46 @@ BEGIN
 END;
 $$;
 
+-- entroq.gc_due reports whether a queue's garbage-collection activation time has
+-- passed, parsing the last /gc= component of the queue name. Empty/'0'/absent =>
+-- always due; all-digits => Unix seconds; otherwise RFC3339. A malformed value
+-- yields false (never collect) rather than aborting the statement -- so this MUST
+-- be a function with its own EXCEPTION block, not inlined. Kept in lockstep with
+-- the Go parser entroq/pkg/queues.GCActivation (a shared test guards the grammar).
+CREATE OR REPLACE FUNCTION entroq.gc_due(queue text) RETURNS boolean LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE v text := substring(queue from '.*/gc=([^/]*)');
+BEGIN
+    IF v IS NULL OR v IN ('', '0') THEN RETURN true; END IF;
+    IF v ~ '^[0-9]+$' THEN RETURN to_timestamp(v::bigint) <= now(); END IF;
+    RETURN v::timestamptz <= now();
+EXCEPTION WHEN others THEN
+    RETURN false;
+END $$;
+
+-- entroq.gc_collect deletes up to p_limit currently-collectable tasks (arrived,
+-- i.e. at <= now) from queues whose gc activation has passed, and returns the
+-- number deleted. Bounded and race-safe:
+--   - FOR UPDATE SKIP LOCKED makes it mutually exclusive with try_claim per row:
+--     a task being claimed is skipped, not clobbered, and GC never blocks a claim.
+--   - at <= now excludes claimed tasks (claiming pushes at into the future).
+--   - Concurrent callers partition (SKIP LOCKED) rather than duplicate work.
+-- Callers invoke it in a tight loop (each call one bounded, quickly-committed
+-- transaction) until it returns < p_limit, so no single statement holds locks or
+-- accumulates WAL for a large backlog.
+CREATE OR REPLACE FUNCTION entroq.gc_collect(p_limit integer DEFAULT 1000) RETURNS integer LANGUAGE plpgsql AS $$
+DECLARE v_deleted integer;
+BEGIN
+    WITH due AS (
+        SELECT t.id FROM entroq.tasks t
+        WHERE t.queue LIKE '%/gc=%' AND t.at <= now() AND entroq.gc_due(t.queue)
+        LIMIT p_limit
+        FOR UPDATE SKIP LOCKED
+    )
+    DELETE FROM entroq.tasks t USING due WHERE t.id = due.id;
+    GET DIAGNOSTICS v_deleted = ROW_COUNT;
+    RETURN v_deleted;
+END $$;
+
 -- Schema version tracking. Updated on every run of this script so that
 -- re-applying the schema after a minor-version upgrade stamps the new version.
 -- The backend reads this on startup and refuses to operate if it does not match
@@ -1062,6 +1110,8 @@ $$;
 --     reinitialize: DROP SCHEMA entroq CASCADE, then run eqpg schema init.
 -- Migrations: 1.0.0 → 1.1.0 (see blocks below)
 -- Migrations: 1.1.0 → 1.2.0 (no structural changes)
+-- Migrations: 1.2.0 → 1.6.0 (additive: byGCQueueAt partial index, gc_due and
+--   gc_collect functions for built-in garbage collection; no data movement)
 -- Each block checks pg_attribute to skip on fresh installs where the column
 -- is already correct, avoiding unnecessary table scans on re-runs.
 
@@ -1118,5 +1168,5 @@ CREATE TABLE IF NOT EXISTS entroq.meta (
     value TEXT NOT NULL
 );
 
-INSERT INTO entroq.meta (key, value) VALUES ('schema_version', '1.2.0')
-    ON CONFLICT (key) DO UPDATE SET value = '1.2.0' WHERE entroq.meta.key = 'schema_version';
+INSERT INTO entroq.meta (key, value) VALUES ('schema_version', '1.6.0')
+    ON CONFLICT (key) DO UPDATE SET value = '1.6.0' WHERE entroq.meta.key = 'schema_version';
