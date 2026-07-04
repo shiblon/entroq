@@ -8,7 +8,6 @@ import (
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
-	"github.com/shiblon/entroq/pkg/gc"
 	"github.com/shiblon/entroq/pkg/workers/pullworker"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
@@ -26,7 +25,6 @@ var (
 	pushTTL          time.Duration
 	pushSourceName   string
 	pushConcurrency  int
-	pushRunGC        bool
 )
 
 var pushCmd = &cobra.Command{
@@ -40,10 +38,8 @@ central instance.
 
 The dedup tombstone is created on the destination, so with push it lives on the
 remote instance: its eager cleanup crosses the wire, and its crash orphans are
-reaped by the remote server's built-in GC (the tombstone queue carries a gc=
-marker), not by this process. This requires the remote destination server to run
-GC, which is the default; if it does not (e.g. a direct-to-PostgreSQL instance),
-pass --run-gc to reap tombstones from here across the wire.
+reaped by the remote's built-in GC (the tombstone queue carries a gc= marker),
+not by this process.
 
 --source-name MUST be unique per source instance. It is mixed into the
 deterministic transfer id; if two leaves share a name, their tasks can collide on
@@ -101,14 +97,6 @@ falling back to --cert/--key/--ca when none of those are set.`,
 			})
 		}
 
-		if pushRunGC {
-			// Fallback for a destination without built-in GC (e.g. a direct-to-
-			// PostgreSQL instance): reap this inbox's tombstones on the remote.
-			g.Go(func() error {
-				return gc.RunLoop(gCtx, dst, gc.WithMatch(entroq.MatchExact(pullworker.TombstoneQueue(pushInbox))))
-			})
-		}
-
 		return g.Wait()
 	},
 }
@@ -124,7 +112,6 @@ func init() {
 	flags.DurationVar(&pushTTL, "ttl", pullworker.DefaultTTL, "Tombstone retention window; must exceed worst-case recovery time.")
 	flags.StringVar(&pushSourceName, "source-name", "", "Stable identifier for this source instance, unique across all pushers to the same destination (required).")
 	flags.IntVar(&pushConcurrency, "concurrency", 1, "Number of concurrent push workers.")
-	flags.BoolVar(&pushRunGC, "run-gc", false, "Reap this inbox's dedup tombstones with a local GC loop against the remote destination. Off by default: the destination server collects them. Enable when the remote has no built-in GC (e.g. a direct-to-PostgreSQL instance, or a server run with --no_gc).")
 
 	pushCmd.MarkFlagRequired("dest-entroq")
 	pushCmd.MarkFlagRequired("source-queue")

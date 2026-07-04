@@ -7,6 +7,37 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.6.0] - 2026-07-04
+
+Go module `v1.6.0`. Garbage collection becomes a first-class, always-on property
+of every backend, superseding the server-side GC layer introduced in 1.5.0. If
+you can write a `gc=` queue, it gets collected -- whether you run a server or
+talk to a backend directly. Requires an `eqpg schema init` (adds the `gc_collect`
+stored procedure and a partial index; schema version 1.2.0 -> 1.6.0).
+
+### Changed
+
+- **GC now runs inside each backend, always on.** `eqpg`, `eqredis`, and `eqmem`
+  each start a background collector when opened and stop it on close. There is no
+  GC configuration: the interval and batch are internal to each backend (tuned to
+  its storage engine). A direct-to-PostgreSQL client now collects `gc=` queues on
+  its own, exactly as a server does -- no side process, no flags.
+- **eqpg collects via a stored procedure.** `entroq.gc_collect` (a bounded,
+  `FOR UPDATE SKIP LOCKED` delete over a partial index scoped to `gc=` rows) does
+  discovery and deletion in one race-safe pass; the backend drives it on a loop.
+
+### Removed
+
+- **Server GC flags `--no_gc` and `--gc_interval`** (`eqpg`/`eqmem`/`eqredis
+  serve`). GC is always on and self-tuning; there is nothing to toggle.
+- **`eqlink gc`** and the **`--run-gc`** flags on `eqlink run`/`pull`/`push`. The
+  destination backend collects gc= queues (including `pull`/`push` dedup
+  tombstones, which keep their `gc=0` naming) with no sidecar loop.
+- **`pkg/gc`** and `eqsvcgrpc`'s `WithGC`/`WithGCInterval`. The reusable
+  claim-loop collector is gone; collection is a backend responsibility now.
+
+---
+
 ## [1.5.0] - 2026-07-02
 
 Go module `v1.5.0`. Built-in, best-effort garbage collection: EntroQ servers now

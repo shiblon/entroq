@@ -16,7 +16,6 @@ import (
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/async"
 	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
-	"github.com/shiblon/entroq/pkg/gc"
 	"github.com/shiblon/entroq/pkg/worker"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
@@ -34,23 +33,23 @@ var (
 	namespace           string
 	auditLog            bool
 	tokenReloadInterval time.Duration
-	runGC               bool
 	responseGrace       time.Duration
 )
 
 var runCmd = &cobra.Command{
 	Use:   "run",
-	Short: "Run the full eqlink sidecar: sender, receiver, and GC.",
-	Long: `Starts all three components:
+	Short: "Run the full eqlink sidecar: sender and receiver.",
+	Long: `Starts both components:
 
   Sender:   listens on --addr, proxies outgoing HTTP calls into queues.
   Receiver: claims tasks from --queue, forwards them to --upstream.
-  GC:       scans for stale response queues under --queue and cleans them up.
+
+Stale response queues are garbage-collected by the EntroQ server itself, so the
+sidecar runs no GC of its own.
 
 Graceful shutdown on SIGINT/SIGTERM:
   1. Receiver workers stop claiming new tasks and finish any in-progress handler.
-  2. Sender drains: waits for all in-flight requests to complete.
-  3. GC shuts down.`,
+  2. Sender drains: waits for all in-flight requests to complete.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := context.Background()
 
@@ -132,17 +131,6 @@ Graceful shutdown on SIGINT/SIGTERM:
 			})
 		}
 
-		gcCtx, gcCancel := context.WithCancel(gCtx)
-		defer gcCancel()
-		if runGC {
-			g.Go(func() error {
-				return gc.RunLoop(gcCtx, eq,
-					gc.WithMatch(entroq.MatchPrefix(myQueue)),
-					gc.WithInterval(gcInterval),
-				)
-			})
-		}
-
 		// Token reload: reload the bearer token on rotation (SIGHUP or mtime).
 		hupCtx, hupCancel := context.WithCancel(gCtx)
 		if creds != nil {
@@ -150,9 +138,8 @@ Graceful shutdown on SIGINT/SIGTERM:
 		}
 
 		// Signal handler: staged shutdown. Also fires when any goroutine fails
-		// (gCtx cancelled), ensuring the sender and GC are always cleaned up.
+		// (gCtx cancelled), ensuring the sender is always cleaned up.
 		g.Go(func() error {
-			defer gcCancel()
 			defer hupCancel()
 			select {
 			case <-gCtx.Done():
@@ -190,9 +177,7 @@ func init() {
 	flags.IntVar(&concurrency, "concurrency", 1, "Number of concurrent receiver goroutines.")
 	flags.DurationVar(&requestTimeout, "request_timeout", 30*time.Second, "Sender request timeout.")
 	flags.DurationVar(&drainTimeout, "drain_timeout", 35*time.Second, "How long to wait for in-flight requests to finish on shutdown.")
-	flags.BoolVar(&runGC, "run-gc", false, "Run a local GC loop scoped to this sidecar's --queue prefix. Off by default; the EntroQ server collects gc= queues itself. Enable only if the server runs with --no_gc.")
-	flags.DurationVar(&gcInterval, "gc_interval", 10*time.Minute, "How often to run the local GC scan (only when --run-gc is set).")
-	flags.DurationVar(&responseGrace, "response_grace", 15*time.Second, "Margin added past --request_timeout when stamping the response queue's collectable-at time, so GC does not delete a response still being awaited. Size to worst-case sender/GC clock skew.")
+	flags.DurationVar(&responseGrace, "response_grace", 15*time.Second, "Margin added past --request_timeout when stamping the response queue's collectable-at time, so GC does not delete a response still being awaited. Size to worst-case server-side GC clock skew.")
 	flags.BoolVar(&auditLog, "audit-log", false, "Emit structured JSON audit events to stderr for every request mediated (request_enqueued, request_handled, response_received).")
 	flags.DurationVar(&tokenReloadInterval, "token-reload-interval", 5*time.Minute, "How often to stat the --authz-token-file and reload it if changed. Handles k8s projected token rotation.")
 	runCmd.MarkFlagRequired("queue")

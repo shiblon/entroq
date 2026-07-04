@@ -3,15 +3,14 @@
 //
 // # Garbage collection
 //
-// EntroQ's built-in GC -- which reaps queues that opt in by name with a /gc=
-// component -- runs inside the eqsvcgrpc server, not in this backend. A client
-// that talks directly to PostgreSQL with this package (the many-clients,
-// one-database model, with no "eqpg serve" in front) therefore gets NO built-in
-// GC, and any gc=-marked queues (async response queues, eqlink dedup tombstones,
-// and the like) will accumulate. Such deployments must run a collector
-// themselves: point pkg/gc (gc.RunLoop) at the database, run a dedicated
-// "eqlink gc", or enable the per-command reapers (e.g. "eqlink pull/push
-// --run-gc"). Deployments that go through "eqpg serve" get GC on by default.
+// This backend garbage-collects on its own. Queues that opt in by name (a /gc=
+// component) have their arrived tasks reaped by an always-on background loop
+// started when the backend is opened -- driven by the gc_collect stored
+// procedure. It is a first-class backend behavior, not a separate process, so a
+// client talking directly to PostgreSQL with this package (the many-clients,
+// one-database model, with no "eqpg serve" in front) collects gc=-marked queues
+// -- async response queues, eqlink dedup tombstones, and the like -- exactly as
+// a server does, with no side process or configuration required.
 package eqpg
 
 import (

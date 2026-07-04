@@ -8,7 +8,6 @@ import (
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
-	"github.com/shiblon/entroq/pkg/gc"
 	"github.com/shiblon/entroq/pkg/workers/pullworker"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
@@ -26,7 +25,6 @@ var (
 	pullTTL          time.Duration
 	pullSourceName   string
 	pullConcurrency  int
-	pullRunGC        bool
 )
 
 var pullCmd = &cobra.Command{
@@ -39,11 +37,9 @@ the local instance, then deletes the source task. A crash that re-delivers
 collides on the tombstone, so no duplicate inbox task is produced.
 
 Run this next to the destination instance: only the claim from the source crosses
-the wire. Spent tombstones are reaped by the destination server's built-in GC once
-their TTL elapses (the tombstone queue carries a gc= marker); the happy path
-deletes its own tombstone immediately, so GC only handles crash orphans. This
-requires the destination server to run GC, which is the default; if it does not
-(e.g. a direct-to-PostgreSQL instance), pass --run-gc to reap tombstones locally.
+the wire. Spent tombstones are reaped by the destination's built-in GC once their
+TTL elapses (the tombstone queue carries a gc= marker); the happy path deletes its
+own tombstone immediately, so GC only handles crash orphans.
 
 The local (--entroq) connection secures with --cert/--key/--ca and authenticates
 with --authz-token-file; the remote source uses --source-cert/--source-key/--source-ca,
@@ -101,14 +97,6 @@ falling back to --cert/--key/--ca when none of those are set.`,
 			})
 		}
 
-		if pullRunGC {
-			// Fallback for a destination without built-in GC (e.g. a direct-to-
-			// PostgreSQL instance): reap this inbox's tombstones locally.
-			g.Go(func() error {
-				return gc.RunLoop(gCtx, dst, gc.WithMatch(entroq.MatchExact(pullworker.TombstoneQueue(pullInbox))))
-			})
-		}
-
 		return g.Wait()
 	},
 }
@@ -124,7 +112,6 @@ func init() {
 	flags.DurationVar(&pullTTL, "ttl", pullworker.DefaultTTL, "Tombstone retention window; must exceed worst-case recovery time.")
 	flags.StringVar(&pullSourceName, "source-name", "", "Stable source identifier mixed into the transfer ID (defaults to --source-entroq).")
 	flags.IntVar(&pullConcurrency, "concurrency", 1, "Number of concurrent pull workers.")
-	flags.BoolVar(&pullRunGC, "run-gc", false, "Reap this inbox's dedup tombstones with a local GC loop. Off by default: the destination server collects them. Enable when the destination has no built-in GC (e.g. a direct-to-PostgreSQL instance, or a server run with --no_gc).")
 
 	pullCmd.MarkFlagRequired("source-entroq")
 	pullCmd.MarkFlagRequired("source-queue")
