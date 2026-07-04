@@ -251,6 +251,14 @@ func WaitTryClaim(ctx context.Context, eq *ClaimQuery, tc BackendClaimFunc, w Wa
 // equivalent to a worker doing claim-then-delete on a ready GC queue.
 //
 // See pkg/queues for details on how /gc= parameter sections are parsed.
+//
+// Metric export is ambient and expected in the same way. Given an OTel
+// MeterProvider (a backend-specific option; a nil provider defaults to noop), a
+// backend emits its operational metrics under its own meter scope (e.g.
+// entroq.pg, entroq.mem, entroq.redis) using metric names shared across
+// backends, so one dashboard is portable. Like GC, this is expected behavior
+// rather than a method here, and needs no calls from the caller beyond
+// configuring the provider.
 type Backend interface {
 	// Queues returns a mapping from all known queues to their task counts.
 	Queues(ctx context.Context, qq *QueuesQuery) (map[string]int, error)
