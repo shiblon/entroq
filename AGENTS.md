@@ -30,3 +30,19 @@ This is enforced by `TestSchemaFilesInSync` in `pkg/backend/eqpg` (runs under
 `go test`): it fails if the two files differ or the version constants disagree.
 After editing the canonical Go schema, run `make schema-sync` to regenerate the
 Python copy, and update `SCHEMA_VERSION` to match if the stamped version changed.
+
+## Releasing goes through the scripts, off `develop`
+
+Do not hand-roll a release. Releases are cut from `develop` (not `main`, which
+is unused), and the tooling exists:
+
+- `scripts/tag-release.sh <version>` — runs pre-flight guards (clean tree, no
+  `go.mod` `replace`, a `CHANGELOG.md` entry, `SchemaVersion` major.minor
+  matching the tag) then creates and pushes `v<version>`. Prefer it over a bare
+  `git tag` so the guards run.
+- `scripts/build-docker.sh <version> --push` — builds and pushes the service
+  images to `ghcr.io`.
+- Python/JS clients version and publish independently (`scripts/publish-py.sh`,
+  `scripts/publish-js.sh`).
+
+The full checklist is [scripts/RELEASE.md](scripts/RELEASE.md).

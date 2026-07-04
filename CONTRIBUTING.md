@@ -72,15 +72,19 @@ Versions are **git-tag-driven**. There is no version constant to edit:
 
 To cut a release from `develop`:
 
-1. In the release PR, finalize the changelog: rename `## [Unreleased]` to
-   `## [X.Y.Z] - YYYY-MM-DD`.
-2. Merge to `develop`.
-3. Tag the merged commit and push the tag:
+1. Finalize the changelog: rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD`,
+   and bump the schema / client versions if they changed. Commit to `develop`.
+2. Tag with the release script (it runs pre-flight guards, clean tree, changelog
+   entry, `SchemaVersion` major.minor matching the tag, then pushes the tag):
    ```
    git checkout develop && git pull
-   git tag -a vX.Y.Z -m "vX.Y.Z: short summary"
-   git push origin vX.Y.Z
+   ./scripts/tag-release.sh X.Y.Z
    ```
+3. Publish the images: `./scripts/build-docker.sh X.Y.Z --push`.
+
+See [scripts/RELEASE.md](scripts/RELEASE.md) for the full checklist (client
+publishing, prerequisites). Prefer `tag-release.sh` over a bare `git tag` so the
+guards run.
 
 ### Versioning stance
 
