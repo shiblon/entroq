@@ -374,12 +374,6 @@ func New(ctx context.Context, db *sql.DB, nw entroq.NotifyWaiter, opts *pgOption
 		return nil, fmt.Errorf("failed to initialize database: %w", err)
 	}
 
-	if opts.readinessInterval > 0 {
-		tickerCtx, stop := context.WithCancel(ctx)
-		b.stopTicker = stop
-		go b.runReadinessTicker(tickerCtx, opts.readinessInterval)
-	}
-
 	mp := opts.mp
 	if mp == nil {
 		mp = noop.NewMeterProvider()
@@ -388,17 +382,24 @@ func New(ctx context.Context, db *sql.DB, nw entroq.NotifyWaiter, opts *pgOption
 		return nil, fmt.Errorf("eqpg init metrics: %w", err)
 	}
 
-	// Garbage collection is a first-class, always-on backend behavior: it drains
-	// queues that opt in by name (a /gc= component). It reports through gcMetrics,
-	// so metrics must be initialized first.
+	// Background loops start last, after every fallible step, so an error return
+	// from New can never leak a goroutine: New either starts nothing and returns
+	// an error, or starts everything and returns a backend whose Close stops them.
 	//
-	// Its context is rooted at context.Background(), NOT the constructor's ctx.
-	// The loop's lifetime is the backend's, ended by Close; the constructor ctx
-	// scopes only construction. Callers idiomatically bound New with a timeout and
-	// defer cancel(), so deriving from ctx would silently stop GC the instant the
-	// caller returned while the backend kept serving. Close cancels and waits for
-	// the loop to exit before closing the DB, so it never touches a closed
+	// Each loop's context is rooted at context.Background(), NOT the constructor's
+	// ctx. Its lifetime is the backend's, ended by Close; the constructor ctx
+	// scopes only construction, and callers idiomatically bound New with a timeout
+	// and defer cancel(), so deriving from ctx would silently stop the loop the
+	// instant New returned while the backend kept serving. (The notify listener in
+	// pgnotify.go follows the same rule.) Close cancels each loop and, for GC,
+	// waits for it to exit before closing the DB, so it never touches a closed
 	// connection.
+	if opts.readinessInterval > 0 {
+		tickerCtx, stop := context.WithCancel(context.Background())
+		b.stopTicker = stop
+		go b.runReadinessTicker(tickerCtx, opts.readinessInterval)
+	}
+
 	if opts.gcInterval > 0 {
 		gcCtx, stop := context.WithCancel(context.Background())
 		b.stopGC = stop
