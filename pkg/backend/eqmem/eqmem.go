@@ -258,11 +258,12 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 	}
 
 	// Garbage collection is a first-class, always-on backend behavior. It is not
-	// started in snapshot-and-quit mode (a load-dump-exit tool). Close cancels it
-	// and waits for it to exit. The context is independent of the constructor's
-	// so the loop lives until Close, not until a caller-scoped ctx is canceled.
+	// started in snapshot-and-quit mode (a load-dump-exit tool). Its lifecycle is
+	// tied to the client: the loop runs on a context derived from the
+	// constructor's, so canceling that context stops it, as does Close (which
+	// cancels and waits for the loop to exit).
 	if !m.outputSnapshot {
-		gcCtx, cancel := context.WithCancel(context.Background())
+		gcCtx, cancel := context.WithCancel(ctx)
 		m.stopGC = cancel
 		m.gcDone = make(chan struct{})
 		go func() {
