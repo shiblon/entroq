@@ -43,7 +43,10 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/backend/internal/gcmetrics"
 	"github.com/shiblon/entroq/pkg/subq"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/noop"
 )
 
 const (
@@ -87,16 +90,21 @@ const namespacesKey = keyPrefix + "ns"
 
 // EQRedis implements entroq.Backend using Redis.
 type EQRedis struct {
-	client *redis.Client
-	nw     entroq.NotifyWaiter
-	stopGC context.CancelFunc
+	client    *redis.Client
+	nw        entroq.NotifyWaiter
+	stopGC    context.CancelFunc
+	gcDone    chan struct{}
+	gcMetrics *gcmetrics.Metrics
 }
 
 type redisOptions struct {
-	addr     string
-	password string
-	db       int
-	nw       entroq.NotifyWaiter
+	addr        string
+	password    string
+	db          int
+	nw          entroq.NotifyWaiter
+	gcInterval  time.Duration
+	gcBatchSize int
+	mp          metric.MeterProvider
 }
 
 // RedisOpt configures the Redis backend.
@@ -130,6 +138,14 @@ func WithNotifyWaiter(nw entroq.NotifyWaiter) RedisOpt {
 	}
 }
 
+// WithMeterProvider sets the OTel MeterProvider used for GC telemetry (metrics
+// are reported under the "entroq.redis" meter). Defaults to a noop provider.
+func WithMeterProvider(mp metric.MeterProvider) RedisOpt {
+	return func(o *redisOptions) {
+		o.mp = mp
+	}
+}
+
 // Opener returns a BackendOpener for use with entroq.New.
 func Opener(opts ...RedisOpt) entroq.BackendOpener {
 	return func(ctx context.Context) (entroq.Backend, error) {
@@ -141,7 +157,9 @@ func Opener(opts ...RedisOpt) entroq.BackendOpener {
 // A background GC goroutine is started automatically and runs until ctx is canceled.
 func Open(ctx context.Context, opts ...RedisOpt) (*EQRedis, error) {
 	o := &redisOptions{
-		addr: "localhost:6379",
+		addr:        "localhost:6379",
+		gcInterval:  defaultGCInterval,
+		gcBatchSize: defaultGCBatchSize,
 	}
 	for _, opt := range opts {
 		opt(o)
@@ -162,19 +180,42 @@ func Open(ctx context.Context, opts ...RedisOpt) (*EQRedis, error) {
 		nw = subq.New()
 	}
 
+	mp := o.mp
+	if mp == nil {
+		mp = noop.NewMeterProvider()
+	}
+	gcMetrics, err := gcmetrics.New(mp.Meter("entroq.redis"))
+	if err != nil {
+		client.Close()
+		return nil, fmt.Errorf("eqredis open: gc metrics: %w", err)
+	}
+
+	// GC's context is rooted at context.Background(), NOT the constructor's ctx:
+	// the loop's lifetime is the backend's, ended by Close, whereas the
+	// constructor ctx scopes only construction (a caller may bound Open with a
+	// timeout and defer cancel()). Close cancels it and waits for it to exit
+	// before closing the client, so the loop never touches a closed connection.
 	gcCtx, gcCancel := context.WithCancel(context.Background())
 	b := &EQRedis{
-		client: client,
-		nw:     nw,
-		stopGC: gcCancel,
+		client:    client,
+		nw:        nw,
+		stopGC:    gcCancel,
+		gcDone:    make(chan struct{}),
+		gcMetrics: gcMetrics,
 	}
-	b.RunGC(gcCtx)
+	// GC is a first-class, always-on backend behavior.
+	go func() {
+		defer close(b.gcDone)
+		b.runGCLoop(gcCtx, o.gcInterval, o.gcBatchSize)
+	}()
 	return b, nil
 }
 
-// Close stops the GC goroutine and closes the underlying Redis connection.
+// Close stops the GC goroutine, waits for it to exit, and closes the underlying
+// Redis connection.
 func (e *EQRedis) Close() error {
 	e.stopGC()
+	<-e.gcDone
 	return e.client.Close()
 }
 

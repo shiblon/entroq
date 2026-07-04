@@ -13,6 +13,7 @@ by the Go qtest suite run against the same stored procedures.
 
 import asyncio
 import time
+from datetime import datetime, timedelta, timezone
 
 import psycopg
 import pytest
@@ -413,3 +414,79 @@ async def test_worker_continues_after_dependency_error(eq: EntroQ):
     assert calls[0] == 2, f'expected 2 calls (1 dep error + 1 success), got {calls[0]}'
     assert outcomes == ['work']
     assert await eq.tasks(queue=QUEUE) == []
+
+
+# ---------------------------------------------------------------------------
+# Built-in garbage collection
+#
+# The direct-PostgreSQL client is the backend, so it carries GC itself. Discovery
+# (gc_queues) and collection (gc_collect) live in SQL; the client relays rows
+# between them without parsing. A NULL activation marks a malformed gc= value.
+# A worker wired to this client drives the two-step loop invisibly.
+# ---------------------------------------------------------------------------
+
+async def test_gc_queues_and_collect(eq: EntroQ):
+    """gc_queues reports activations (NULL=malformed); gc_collect reaps only due."""
+    past = datetime.now(timezone.utc) - timedelta(minutes=1)
+
+    DUE      = '/test/gc/reap/gc=0'  # gc=0 -> always due
+    NOT_DUE  = '/test/gc/later/gc=%d' % int((datetime.now(timezone.utc) + timedelta(hours=1)).timestamp())
+    BAD      = '/test/gc/bad/gc=notatime'  # opted in but malformed -> NULL activation
+    NO_GC    = '/test/gc/keep'             # no /gc= component -> never discovered
+
+    await eq.modify(Modification(
+        Modification.inserting(TaskData(queue=DUE, value='doomed', at=past)),
+        Modification.inserting(TaskData(queue=NOT_DUE, value='pending', at=past)),
+        Modification.inserting(TaskData(queue=BAD, value='orphan', at=past)),
+        Modification.inserting(TaskData(queue=NO_GC, value='safe', at=past)),
+    ))
+
+    rows = await eq.gc_queues()
+    by_queue = dict(rows)
+    assert by_queue.get(BAD) is None, 'malformed gc= value must yield NULL activation'
+    assert by_queue.get(DUE) is not None
+    assert by_queue.get(NOT_DUE) is not None
+    assert NO_GC not in by_queue, 'a queue without /gc= must not be discovered'
+
+    # Relay everything, malformed included; gc_collect discards NULL and future.
+    queues = [q for q, _ in rows]
+    activations = [a for _, a in rows]
+    n = await eq.gc_collect(queues, activations)
+    assert n == 1, f'expected only the due eligible task collected, got {n}'
+    assert await eq.tasks(queue=DUE) == []
+    assert len(await eq.tasks(queue=NOT_DUE)) == 1  # pending (future activation)
+    assert len(await eq.tasks(queue=BAD)) == 1      # malformed, never collected
+    assert len(await eq.tasks(queue=NO_GC)) == 1    # not a gc queue
+
+
+async def test_worker_ambient_gc_reaps(eq: EntroQ):
+    """A pg-backed worker reaps due GC-eligible tasks in the background."""
+    past = datetime.now(timezone.utc) - timedelta(minutes=1)
+
+    GC_QUEUE   = '/test/gc/ambient/gc=0'
+    WORK_QUEUE = '/test/gc/ambient/work'  # stays empty; worker just idles here
+
+    await eq.modify(Modification(
+        Modification.inserting(TaskData(queue=GC_QUEUE, value='doomed', at=past)),
+    ))
+
+    worker = EntroQWorker(eq, WORK_QUEUE)
+
+    @EntroQWorker.handler
+    async def handle(task, docs):
+        return Modification(Modification.deleting(task))
+
+    run_task = asyncio.create_task(worker.run(handle))
+    try:
+        # The first GC pass fires immediately on run(); poll until it lands.
+        for _ in range(50):
+            if not await eq.tasks(queue=GC_QUEUE):
+                break
+            await asyncio.sleep(0.1)
+        else:
+            pytest.fail('ambient GC did not reap the due task within 5s')
+    finally:
+        worker.stop()
+        await run_task
+
+    assert await eq.tasks(queue=GC_QUEUE) == []

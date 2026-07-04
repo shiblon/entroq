@@ -3,15 +3,14 @@
 //
 // # Garbage collection
 //
-// EntroQ's built-in GC -- which reaps queues that opt in by name with a /gc=
-// component -- runs inside the eqsvcgrpc server, not in this backend. A client
-// that talks directly to PostgreSQL with this package (the many-clients,
-// one-database model, with no "eqpg serve" in front) therefore gets NO built-in
-// GC, and any gc=-marked queues (async response queues, eqlink dedup tombstones,
-// and the like) will accumulate. Such deployments must run a collector
-// themselves: point pkg/gc (gc.RunLoop) at the database, run a dedicated
-// "eqlink gc", or enable the per-command reapers (e.g. "eqlink pull/push
-// --run-gc"). Deployments that go through "eqpg serve" get GC on by default.
+// This backend garbage-collects on its own. Queues that opt in by name (a /gc=
+// component) have their arrived tasks reaped by an always-on background loop
+// started when the backend is opened -- driven by the gc_collect stored
+// procedure. It is a first-class backend behavior, not a separate process, so a
+// client talking directly to PostgreSQL with this package (the many-clients,
+// one-database model, with no "eqpg serve" in front) collects gc=-marked queues
+// -- async response queues, eqlink dedup tombstones, and the like -- exactly as
+// a server does, with no side process or configuration required.
 package eqpg
 
 import (
@@ -29,6 +28,7 @@ import (
 
 	"github.com/lib/pq"
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/backend/internal/gcmetrics"
 	"github.com/shiblon/entroq/pkg/subq"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
@@ -61,6 +61,9 @@ type pgOptions struct {
 	initSchema        bool
 	nw                entroq.NotifyWaiter
 	mp                metric.MeterProvider
+
+	gcInterval  time.Duration
+	gcBatchSize int
 
 	sslClientKeyFile  string
 	sslClientCertFile string
@@ -252,6 +255,8 @@ func defaultOptions(opts []PGOpt) *pgOptions {
 		sslMode:           string(SSLDisable),
 		readinessInterval: 0, // 0 == no heartbeat
 		noListen:          false,
+		gcInterval:        defaultGCInterval,
+		gcBatchSize:       defaultGCBatchSize,
 	}
 	for _, o := range opts {
 		o(options)
@@ -336,8 +341,11 @@ type EQPG struct {
 	nw entroq.NotifyWaiter
 
 	stopTicker     func()
+	stopGC         func()
+	gcDone         chan struct{}
 	claimDuration  metric.Float64Histogram
 	modifyDuration metric.Float64Histogram
+	gcMetrics      *gcmetrics.Metrics
 }
 
 // New creates a new postgres backend that attaches to the given database.
@@ -366,18 +374,40 @@ func New(ctx context.Context, db *sql.DB, nw entroq.NotifyWaiter, opts *pgOption
 		return nil, fmt.Errorf("failed to initialize database: %w", err)
 	}
 
-	if opts.readinessInterval > 0 {
-		tickerCtx, stop := context.WithCancel(ctx)
-		b.stopTicker = stop
-		go b.runReadinessTicker(tickerCtx, opts.readinessInterval)
-	}
-
 	mp := opts.mp
 	if mp == nil {
 		mp = noop.NewMeterProvider()
 	}
 	if err := b.initMetrics(mp); err != nil {
 		return nil, fmt.Errorf("eqpg init metrics: %w", err)
+	}
+
+	// Background loops start last, after every fallible step, so an error return
+	// from New can never leak a goroutine: New either starts nothing and returns
+	// an error, or starts everything and returns a backend whose Close stops them.
+	//
+	// Each loop's context is rooted at context.Background(), NOT the constructor's
+	// ctx. Its lifetime is the backend's, ended by Close; the constructor ctx
+	// scopes only construction, and callers idiomatically bound New with a timeout
+	// and defer cancel(), so deriving from ctx would silently stop the loop the
+	// instant New returned while the backend kept serving. (The notify listener in
+	// pgnotify.go follows the same rule.) Close cancels each loop and, for GC,
+	// waits for it to exit before closing the DB, so it never touches a closed
+	// connection.
+	if opts.readinessInterval > 0 {
+		tickerCtx, stop := context.WithCancel(context.Background())
+		b.stopTicker = stop
+		go b.runReadinessTicker(tickerCtx, opts.readinessInterval)
+	}
+
+	if opts.gcInterval > 0 {
+		gcCtx, stop := context.WithCancel(context.Background())
+		b.stopGC = stop
+		b.gcDone = make(chan struct{})
+		go func() {
+			defer close(b.gcDone)
+			b.runGCLoop(gcCtx, opts.gcInterval, opts.gcBatchSize)
+		}()
 	}
 
 	return b, nil
@@ -400,6 +430,9 @@ func (b *EQPG) initMetrics(mp metric.MeterProvider) error {
 	if err != nil {
 		return fmt.Errorf("modify duration histogram: %w", err)
 	}
+	if b.gcMetrics, err = gcmetrics.New(meter); err != nil {
+		return fmt.Errorf("gc metrics: %w", err)
+	}
 	return nil
 }
 
@@ -407,6 +440,10 @@ func (b *EQPG) initMetrics(mp metric.MeterProvider) error {
 func (b *EQPG) Close() error {
 	if b.stopTicker != nil {
 		b.stopTicker()
+	}
+	if b.stopGC != nil {
+		b.stopGC()
+		<-b.gcDone // wait for the GC loop to exit before closing the DB
 	}
 	if err := b.DB.Close(); err != nil {
 		return fmt.Errorf("pg backend close: %w", err)

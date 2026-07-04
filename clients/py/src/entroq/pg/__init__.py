@@ -231,7 +231,7 @@ class Transaction:
 # Schema version check (sync: runs once at startup)
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = "1.2.0"
+SCHEMA_VERSION = "1.6.0"
 
 _INIT_HINT = (
     "Initialize the database with:\n\n"
@@ -361,6 +361,40 @@ class EntroQ(EntroQBase):
                         collisions=detail.get('claimed_docs', []),
                     ) from e
                 raise
+
+    async def gc_queues(self) -> list[tuple[str, datetime | None]]:
+        """Discover queues that opt into garbage collection, with activation times.
+
+        Returns one ``(queue, activate_at)`` pair per queue whose name carries a
+        ``/gc=`` component. A ``None`` activate_at marks a malformed gc= value:
+        the queue opted into collection but its timestamp will not parse, so it
+        is never collected and should be surfaced as a misconfiguration. The gc=
+        grammar lives entirely in the SQL (``gc_activation``); this client never
+        parses it. Feed these rows straight to :meth:`gc_collect`.
+        """
+        async with await psycopg.AsyncConnection.connect(self._connstr, autocommit=True, row_factory=dict_row, options=_OPTS) as conn:
+            rows = await (await conn.execute('SELECT queue, activate_at FROM gc_queues()')).fetchall()
+            return [(r['queue'], r['activate_at']) for r in rows]
+
+    async def gc_collect(self, queues: list[str], activations: list[datetime | None], batch: int = 1000) -> int:
+        """Delete up to ``batch`` due, collectable tasks from the given queues.
+
+        Pass the ``(queue, activate_at)`` pairs from :meth:`gc_queues` verbatim,
+        malformed ones included: ``gc_collect`` only collects where
+        ``activate_at <= now()`` on the database clock, which discards both
+        malformed queues (NULL activation) and not-yet-due ones (future
+        activation). This client does no parsing or clock arithmetic. Returns the
+        number deleted; drain by calling until the result is ``< batch``.
+
+        Exposed so a direct-PostgreSQL worker can reap on the backend's behalf
+        (a Go server GCs itself; a worker talking to it must not).
+        """
+        async with await psycopg.AsyncConnection.connect(self._connstr, autocommit=True, row_factory=dict_row, options=_OPTS) as conn:
+            rows = await (await conn.execute(
+                'SELECT deleted FROM gc_collect(%s::text[], %s::timestamptz[], %s)',
+                (queues, activations, batch),
+            )).fetchall()
+            return sum(r['deleted'] for r in rows)
 
     async def pop_all(self, queue: str, force: bool = False) -> AsyncIterator[Task]:
         """Claim and delete every task in queue, yielding each."""

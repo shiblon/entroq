@@ -31,9 +31,6 @@ var serve struct {
 	authzStrategy string
 	opaURL        string
 	opaPath       string
-
-	noGC       bool
-	gcInterval time.Duration
 }
 
 var serveCmd = &cobra.Command{
@@ -67,18 +64,14 @@ var serveCmd = &cobra.Command{
 			eqredis.WithAddr(redisAddr),
 			eqredis.WithPassword(redisPwd),
 			eqredis.WithRedisDB(redisDB),
+			eqredis.WithMeterProvider(mp),
 		)
 
-		svcOpts := []eqsvcgrpc.Option{
+		svc, err := eqsvcgrpc.New(ctx, opener,
 			authzOpt,
-			eqsvcgrpc.WithMetricInterval(5 * time.Second),
+			eqsvcgrpc.WithMetricInterval(5*time.Second),
 			eqsvcgrpc.WithMeterProvider(mp),
-		}
-		if !serve.noGC {
-			svcOpts = append(svcOpts, eqsvcgrpc.WithGC(), eqsvcgrpc.WithGCInterval(serve.gcInterval))
-		}
-
-		svc, err := eqsvcgrpc.New(ctx, opener, svcOpts...)
+		)
 		if err != nil {
 			return fmt.Errorf("open eqredis backend: %w", err)
 		}
@@ -119,8 +112,6 @@ func init() {
 	f.StringVar(&serve.authzStrategy, "authz", "none", "Authorization strategy: none, opahttp.")
 	f.StringVar(&serve.opaURL, "opa_url", "", fmt.Sprintf("OPA base URL. Default: %s.", opahttp.DefaultHostURL))
 	f.StringVar(&serve.opaPath, "opa_path", "", fmt.Sprintf("OPA API path. Default: %s.", opahttp.DefaultAPIPath))
-	f.BoolVar(&serve.noGC, "no_gc", false, "Disable the built-in GC loop that drains queues opted in by name (a gc= component).")
-	f.DurationVar(&serve.gcInterval, "gc_interval", time.Minute, "How often the built-in GC scans for collectable queues (when GC is enabled).")
 
 	rootCmd.AddCommand(serveCmd)
 }

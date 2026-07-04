@@ -2,9 +2,8 @@
 // Services communicate through task queues rather than direct connections,
 // gaining fault tolerance and load balancing without changing their HTTP code.
 //
-// Run "eqlink run" to start the full sidecar (sender + receiver + GC).
-// Individual components can be run separately with "eqlink send", "eqlink recv",
-// and "eqlink gc".
+// Run "eqlink run" to start the full sidecar (sender + receiver). Individual
+// components can be run separately with "eqlink send" and "eqlink recv".
 //
 // "eqlink pull" and "eqlink push" link two EntroQ instances directly, moving
 // tasks between them exactly once (pull claims from a remote instance into a

@@ -14,6 +14,22 @@ from .base import EntroQBase
 
 
 # ---------------------------------------------------------------------------
+# Ambient garbage collection
+#
+# GC is a first-class, always-on EntroQ behavior owned by the backend. The Go
+# server GCs itself, so a worker talking to it over HTTP/gRPC must not. A worker
+# wired to a *direct* backend (the PostgreSQL client) is the only thing running
+# against that database, so it carries GC on the backend's behalf. We detect
+# that case by capability -- the client exposes gc_queues() (the discovery entry
+# point) -- and drive it invisibly from run(); no config, no knobs. These
+# internal tunings mirror the Go backends' defaultGCInterval / defaultGCBatchSize.
+# ---------------------------------------------------------------------------
+
+_GC_INTERVAL_S = 60.0
+_GC_BATCH = 1000
+
+
+# ---------------------------------------------------------------------------
 # Public exception types
 # ---------------------------------------------------------------------------
 
@@ -398,6 +414,53 @@ class EntroQWorker:
         at the next await point.
         """
         self._stop_event.clear()
+        gc_task = (
+            asyncio.create_task(self._gc_loop())
+            if hasattr(self._client, 'gc_queues')
+            else None
+        )
+        try:
+            await self._run_loop(handler)
+        finally:
+            if gc_task is not None:
+                gc_task.cancel()
+                await asyncio.gather(gc_task, return_exceptions=True)
+
+    async def _gc_loop(self) -> None:
+        """Garbage-collect gc= queues on the backend's behalf until stopped.
+
+        Runs only when the client is a direct backend exposing gc_queues (see the
+        module note above). Each sweep discovers the gc= queues, logs any with a
+        malformed activation (which are never collected, so would otherwise pile
+        up silently), then tight-drains the due ones, staying interruptible on
+        stop(). The client does no gc= parsing or clock arithmetic; the SQL
+        decides both. Errors are logged, never fatal: GC is best-effort.
+        """
+        while not self._stop_event.is_set():
+            try:
+                rows = await self._client.gc_queues()
+                for queue, activate_at in rows:
+                    if activate_at is None:
+                        logging.warning(
+                            "gc: queue %r has a malformed gc= value; it will never be collected",
+                            queue,
+                        )
+                queues = [q for q, _ in rows]
+                activations = [a for _, a in rows]  # relay all; gc_collect discards NULL/future
+                while (queues
+                       and await self._client.gc_collect(queues, activations, _GC_BATCH) >= _GC_BATCH
+                       and not self._stop_event.is_set()):
+                    pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logging.exception("GC failed, will retry: %s", e)
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=_GC_INTERVAL_S)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _run_loop(self, handler: Handler) -> None:
         while not self._stop_event.is_set():
             # Race claim() against the stop signal so stop() can unblock a
             # claim() that is waiting indefinitely for a task to appear.

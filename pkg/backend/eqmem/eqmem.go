@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/backend/internal/gcmetrics"
 	"github.com/shiblon/entroq/pkg/subq"
 	"github.com/shiblon/stuffedio/wal"
 	"go.opentelemetry.io/otel/metric"
@@ -64,6 +65,12 @@ type EQMem struct {
 
 	claimDuration  metric.Float64Histogram
 	modifyDuration metric.Float64Histogram
+	gcMetrics      *gcmetrics.Metrics
+
+	gcInterval  time.Duration
+	gcBatchSize int
+	stopGC      func()
+	gcDone      chan struct{}
 }
 
 type qLock struct {
@@ -162,6 +169,7 @@ func WithMeterProvider(mp metric.MeterProvider) Option {
 			metric.WithDescription("Duration of Modify calls in the in-memory backend."),
 			metric.WithUnit("s"),
 		)
+		m.gcMetrics, _ = gcmetrics.New(mp.Meter("entroq.mem"))
 	}
 }
 
@@ -170,6 +178,7 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 	noopMeter := noop.NewMeterProvider().Meter("entroq.mem")
 	claimDuration, _ := noopMeter.Float64Histogram("entroq.claim.duration")
 	modifyDuration, _ := noopMeter.Float64Histogram("entroq.modify.duration")
+	gcMetrics, _ := gcmetrics.New(noopMeter)
 
 	m := &EQMem{
 		nw:                 subq.New(),
@@ -180,6 +189,9 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 		locksSuperUnsafeNS: make(map[string]*nsLock),
 		claimDuration:      claimDuration,
 		modifyDuration:     modifyDuration,
+		gcMetrics:          gcMetrics,
+		gcInterval:         defaultGCInterval,
+		gcBatchSize:        defaultGCBatchSize,
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -243,6 +255,22 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 				return nil, fmt.Errorf("output snapshot: %w", err)
 			}
 		}
+	}
+
+	// Garbage collection is a first-class, always-on backend behavior. It is not
+	// started in snapshot-and-quit mode (a load-dump-exit tool). Its context is
+	// rooted at context.Background(), NOT the constructor's ctx: the loop's
+	// lifetime is the backend's, ended by Close, whereas the constructor ctx
+	// scopes only construction (a caller may bound New with a timeout and defer
+	// cancel()). Close cancels it and waits for it to exit.
+	if !m.outputSnapshot {
+		gcCtx, cancel := context.WithCancel(context.Background())
+		m.stopGC = cancel
+		m.gcDone = make(chan struct{})
+		go func() {
+			defer close(m.gcDone)
+			m.runGCLoop(gcCtx, m.gcInterval, m.gcBatchSize)
+		}()
 	}
 
 	return m, nil
@@ -986,6 +1014,10 @@ func (m *EQMem) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[str
 
 // Close cleans up this implementation.
 func (m *EQMem) Close() error {
+	if m.stopGC != nil {
+		m.stopGC()
+		<-m.gcDone // wait for the GC loop to exit before tearing down
+	}
 	if m.journal != nil {
 		err := m.journal.Close()
 		m.journal = nil

@@ -587,3 +587,159 @@ def test_renewing_dep_error_sets_state_error():
         return state.error
 
     assert isinstance(asyncio.run(run()), DependencyError)
+
+
+# ---------------------------------------------------------------------------
+# Ambient garbage collection
+#
+# The worker drives GC only when its client exposes gc_queues (the direct
+# PostgreSQL backend's discovery entry point). Talking to a Go server, the client
+# lacks that capability and the server GCs itself, so the worker stays out of the
+# way. Each sweep discovers gc= queues, logs malformed ones (NULL activation), and
+# relays all of them to gc_collect, which discards the malformed and not-yet-due.
+# ---------------------------------------------------------------------------
+
+_PAST = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+
+class GCFakeClient(FakeClient):
+    """FakeClient exposing the gc_queues/gc_collect capability, counting collect calls."""
+
+    def __init__(self, *args, queues=None, gc_returns=(0,), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.gc_calls = 0
+        self._gc_returns = list(gc_returns)
+        # (queue, activate_at) pairs gc_queues returns; None activate_at = malformed.
+        self._gc_queues = list(queues) if queues is not None else [('/q/gc=0', _PAST)]
+        self.last_collect_args = None
+
+    async def gc_queues(self):
+        return list(self._gc_queues)
+
+    async def gc_collect(self, queues, activations, batch=1000):
+        self.gc_calls += 1
+        self.last_collect_args = (queues, activations, batch)
+        return self._gc_returns.pop(0) if self._gc_returns else 0
+
+
+def test_worker_no_gc_without_capability():
+    """A client lacking gc_queues must not trip up run(); no GC is attempted."""
+    client = FakeClient()
+    assert not hasattr(client, 'gc_queues')  # gate is off for non-pg clients
+
+    worker = EntroQWorker(client, 'q')
+    client._task_q.put_nowait(_task())
+
+    @EntroQWorker.handler
+    async def handle(task, docs):
+        worker.stop()
+        return Modification(Modification.deleting(task))
+
+    asyncio.run(worker.run(handle))  # completes cleanly, no missing-attr error
+
+
+def test_worker_drives_gc_when_capable(monkeypatch):
+    """A gc_queues-capable client gets its GC loop driven while the worker runs."""
+    import entroq.worker as w
+    monkeypatch.setattr(w, '_GC_INTERVAL_S', 0.01)
+
+    client = GCFakeClient()
+    worker = EntroQWorker(client, 'q')
+
+    @EntroQWorker.handler
+    async def handle(task, docs):
+        return Modification(Modification.deleting(task))
+
+    async def drive():
+        run_task = asyncio.create_task(worker.run(handle))
+        for _ in range(200):  # up to ~2s for at least one GC pass
+            if client.gc_calls >= 1:
+                break
+            await asyncio.sleep(0.01)
+        worker.stop()
+        await run_task
+
+    asyncio.run(drive())
+    assert client.gc_calls >= 1
+
+
+def test_gc_loop_tight_drains_full_batches(monkeypatch):
+    """One pass keeps collecting while batches come back full, stopping on a short one."""
+    import entroq.worker as w
+    monkeypatch.setattr(w, '_GC_INTERVAL_S', 0.01)
+
+    # Two full batches then a short one: the inner drain should make all three
+    # calls in a single pass before idling.
+    client = GCFakeClient(gc_returns=[w._GC_BATCH, w._GC_BATCH, 3])
+    worker = EntroQWorker(client, 'q')
+
+    async def drive():
+        loop = asyncio.create_task(worker._gc_loop())
+        for _ in range(200):
+            if client.gc_calls >= 3:
+                break
+            await asyncio.sleep(0.005)
+        worker._stop_event.set()
+        await loop
+
+    asyncio.run(drive())
+    assert client.gc_calls >= 3
+
+
+def test_gc_loop_survives_errors(monkeypatch):
+    """A failed gc_collect is logged and retried, never fatal to the loop."""
+    import entroq.worker as w
+    monkeypatch.setattr(w, '_GC_INTERVAL_S', 0.01)
+
+    class BoomThenOK(GCFakeClient):
+        async def gc_collect(self, queues, activations, batch=1000):
+            self.gc_calls += 1
+            if self.gc_calls == 1:
+                raise RuntimeError("transient db blip")
+            return 0
+
+    client = BoomThenOK()
+    worker = EntroQWorker(client, 'q')
+
+    async def drive():
+        loop = asyncio.create_task(worker._gc_loop())
+        for _ in range(200):
+            if client.gc_calls >= 2:  # recovered and ran again after the error
+                break
+            await asyncio.sleep(0.01)
+        worker._stop_event.set()
+        await loop
+
+    asyncio.run(drive())
+    assert client.gc_calls >= 2
+
+
+def test_gc_loop_reports_malformed(monkeypatch, caplog):
+    """A queue with a NULL (malformed) activation is logged and relayed, not fatal."""
+    import logging
+    import entroq.worker as w
+    monkeypatch.setattr(w, '_GC_INTERVAL_S', 0.01)
+
+    client = GCFakeClient(queues=[
+        ('/bad/gc=notatime', None),  # malformed
+        ('/ok/gc=0', _PAST),         # valid, due
+    ])
+    worker = EntroQWorker(client, 'q')
+
+    async def drive():
+        loop = asyncio.create_task(worker._gc_loop())
+        for _ in range(200):
+            if client.gc_calls >= 1:
+                break
+            await asyncio.sleep(0.01)
+        worker._stop_event.set()
+        await loop
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(drive())
+
+    assert any('malformed' in r.getMessage() and '/bad/gc=notatime' in r.getMessage()
+               for r in caplog.records), "malformed queue should be logged"
+    # The malformed queue is relayed to gc_collect verbatim (it discards it).
+    assert client.last_collect_args is not None
+    assert '/bad/gc=notatime' in client.last_collect_args[0]

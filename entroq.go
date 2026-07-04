@@ -240,6 +240,21 @@ func WaitTryClaim(ctx context.Context, eq *ClaimQuery, tc BackendClaimFunc, w Wa
 
 // Backend describes all of the functions that any backend has to implement
 // to be used as the storage for task queues.
+//
+// Beyond these methods, a backend is expected to honor the /gc= path
+// convention for garbage-collected queues. Each backend starts its own GC loop
+// that pays attention to any queue whose /gc=<ts> activation has fired (ts <=
+// now). On such a queue it does the equivalent of claiming every available task
+// (At <= now) and deleting it.
+//
+// Backends MAY implement GC loops more efficiently so long as the behavior is
+// equivalent to a worker doing claim-then-delete on a ready GC queue.
+//
+// See pkg/queues for details on how /gc= parameter sections are parsed.
+//
+// Backends are also expected to export metrics. Given an OTel MeterProvider,
+// the backend must emit metrics uniformly. Check canonical backends like
+// pkg/backend/eqmem or pkg/backend/eqpg for parity.
 type Backend interface {
 	// Queues returns a mapping from all known queues to their task counts.
 	Queues(ctx context.Context, qq *QueuesQuery) (map[string]int, error)

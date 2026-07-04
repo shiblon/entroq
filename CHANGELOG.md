@@ -7,6 +7,64 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.6.0] - 2026-07-04
+
+Go module `v1.6.0`. Garbage collection becomes a first-class, always-on property
+of every backend, superseding the server-side GC layer introduced in 1.5.0. If
+you can write a `gc=` queue, it gets collected -- whether you run a server or
+talk to a backend directly. Requires an `eqpg schema init` (adds the
+`gc_activation` / `gc_queues` / `gc_collect` functions and a partial index;
+schema version 1.2.0 -> 1.6.0).
+
+### Changed
+
+- **GC now runs inside each backend, always on.** `eqpg`, `eqredis`, and `eqmem`
+  each start a background collector when opened and stop it on close. There is no
+  GC configuration: the interval and batch are internal to each backend (tuned to
+  its storage engine). A direct-to-PostgreSQL client now collects `gc=` queues on
+  its own, exactly as a server does -- no side process, no flags.
+- **`gc=` timestamps are parsed strictly.** A `gc=` value is empty/`0` (always
+  active), Unix seconds, or strict `RFC3339Nano` (a `T` separator and an explicit
+  `Z` or `+hh:mm` offset -- what Go's `time.Parse`, JavaScript's `toISOString`,
+  and a timezone-aware Python `isoformat` emit). Non-strict forms (space
+  separator, bare date, missing zone) are treated as malformed by every backend,
+  so behavior no longer diverges between them.
+- **Malformed `gc=` queues are surfaced, not silently ignored.** A queue that
+  opts into GC but whose timestamp will not parse is never collected (as before),
+  but each sweep now logs it and increments `entroq_gc_errors_total{kind=malformed}`
+  -- so a fat-fingered `gc=` value shows up loudly instead of quietly piling up.
+- **eqpg GC is a two-function protocol.** `entroq.gc_queues()` enumerates `gc=`
+  queues with their activation time (`NULL` = malformed); `entroq.gc_collect(queues,
+  activations, limit)` deletes a bounded batch (`FOR UPDATE SKIP LOCKED`) from the
+  supplied queues whose activation has passed, returning per-queue counts. Parsing
+  lives only in `gc_activation`; collection is grammar-agnostic and clock-correct
+  (due-ness is evaluated against the database clock). Replaces the interim
+  `gc_due` + single `gc_collect` scan.
+- **GC telemetry moved into the backends.** The `entroq_gc_deleted_total`,
+  `entroq_gc_errors_total`, and `entroq_gc_sweep_duration_seconds` metrics (and
+  their Grafana panels) are preserved, now emitted by each backend's own collector
+  under its meter scope (`entroq.pg`, `entroq.mem`, `entroq.redis`) with the same
+  names, so one dashboard still covers all backends. `eqredis` gained a
+  `WithMeterProvider` option to match `eqpg` and `eqmem`.
+- **Python: the worker carries GC for direct-PostgreSQL clients.** An
+  `EntroQWorker` wired to the `entroq.pg` client drives the `gc_queues` +
+  `gc_collect` loop on a background task for as long as it runs -- invisibly, no
+  config, no parsing (the SQL decides everything). Workers talking to a Go server
+  over HTTP/gRPC do not (the server GCs itself); the worker gates on whether its
+  client exposes `gc_queues`.
+
+### Removed
+
+- **Server GC flags `--no_gc` and `--gc_interval`** (`eqpg`/`eqmem`/`eqredis
+  serve`). GC is always on and self-tuning; there is nothing to toggle.
+- **`eqlink gc`** and the **`--run-gc`** flags on `eqlink run`/`pull`/`push`. The
+  destination backend collects gc= queues (including `pull`/`push` dedup
+  tombstones, which keep their `gc=0` naming) with no sidecar loop.
+- **`pkg/gc`** and `eqsvcgrpc`'s `WithGC`/`WithGCInterval`. The reusable
+  claim-loop collector is gone; collection is a backend responsibility now.
+
+---
+
 ## [1.5.0] - 2026-07-02
 
 Go module `v1.5.0`. Built-in, best-effort garbage collection: EntroQ servers now
