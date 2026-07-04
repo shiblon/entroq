@@ -390,13 +390,17 @@ func New(ctx context.Context, db *sql.DB, nw entroq.NotifyWaiter, opts *pgOption
 
 	// Garbage collection is a first-class, always-on backend behavior: it drains
 	// queues that opt in by name (a /gc= component). It reports through gcMetrics,
-	// so metrics must be initialized first. Its lifecycle is tied to the client:
-	// the loop runs on a context derived from the constructor's (like the
-	// readiness ticker above), so canceling that context stops it, as does Close.
-	// Close cancels and waits for the loop to exit before closing the DB, so it
-	// never touches a closed connection.
+	// so metrics must be initialized first.
+	//
+	// Its context is rooted at context.Background(), NOT the constructor's ctx.
+	// The loop's lifetime is the backend's, ended by Close; the constructor ctx
+	// scopes only construction. Callers idiomatically bound New with a timeout and
+	// defer cancel(), so deriving from ctx would silently stop GC the instant the
+	// caller returned while the backend kept serving. Close cancels and waits for
+	// the loop to exit before closing the DB, so it never touches a closed
+	// connection.
 	if opts.gcInterval > 0 {
-		gcCtx, stop := context.WithCancel(ctx)
+		gcCtx, stop := context.WithCancel(context.Background())
 		b.stopGC = stop
 		b.gcDone = make(chan struct{})
 		go func() {

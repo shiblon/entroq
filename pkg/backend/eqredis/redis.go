@@ -190,7 +190,12 @@ func Open(ctx context.Context, opts ...RedisOpt) (*EQRedis, error) {
 		return nil, fmt.Errorf("eqredis open: gc metrics: %w", err)
 	}
 
-	gcCtx, gcCancel := context.WithCancel(ctx)
+	// GC's context is rooted at context.Background(), NOT the constructor's ctx:
+	// the loop's lifetime is the backend's, ended by Close, whereas the
+	// constructor ctx scopes only construction (a caller may bound Open with a
+	// timeout and defer cancel()). Close cancels it and waits for it to exit
+	// before closing the client, so the loop never touches a closed connection.
+	gcCtx, gcCancel := context.WithCancel(context.Background())
 	b := &EQRedis{
 		client:    client,
 		nw:        nw,
@@ -198,10 +203,7 @@ func Open(ctx context.Context, opts ...RedisOpt) (*EQRedis, error) {
 		gcDone:    make(chan struct{}),
 		gcMetrics: gcMetrics,
 	}
-	// GC is a first-class, always-on backend behavior; its lifecycle is tied to
-	// the client, so it runs on a context derived from the constructor's. Close
-	// cancels it and waits for it to exit before closing the client, so the loop
-	// never touches a closed connection.
+	// GC is a first-class, always-on backend behavior.
 	go func() {
 		defer close(b.gcDone)
 		b.runGCLoop(gcCtx, o.gcInterval, o.gcBatchSize)
