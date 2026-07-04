@@ -1050,44 +1050,78 @@ BEGIN
 END;
 $$;
 
--- entroq.gc_due reports whether a queue's garbage-collection activation time has
--- passed, parsing the last /gc= component of the queue name. Empty/'0'/absent =>
--- always due; all-digits => Unix seconds; otherwise RFC3339. A malformed value
--- yields false (never collect) rather than aborting the statement -- so this MUST
--- be a function with its own EXCEPTION block, not inlined. Kept in lockstep with
--- the Go parser entroq/pkg/queues.GCActivation (a shared test guards the grammar).
-CREATE OR REPLACE FUNCTION entroq.gc_due(queue text) RETURNS boolean LANGUAGE plpgsql IMMUTABLE AS $$
+-- entroq.gc_activation parses the last /gc= component of a queue name into the
+-- time after which the queue's arrived tasks may be collected:
+--   - empty         => the epoch (always active)
+--   - all digits    => Unix seconds ('0' is thus also the epoch)
+--   - otherwise     => STRICT RFC3339Nano: a 'T' separator and an explicit Z or
+--                      +hh:mm offset, matching Go's time.Parse(time.RFC3339Nano).
+-- Returns NULL when the value is absent or malformed. NULL is the single signal
+-- for "opted into GC but the timestamp will not parse": callers must never
+-- collect such a queue and should surface it as a misconfiguration. The strict
+-- regex gates the shape; the cast still validates ranges, and the EXCEPTION block
+-- turns any residual cast failure into NULL rather than aborting the statement.
+-- The epoch (not -infinity) marks always-active so the value scans cleanly into a
+-- client time type; both lib/pq and psycopg reject infinity timestamps by default.
+-- Kept in lockstep with the Go parser entroq/pkg/queues.GCActivation (a shared
+-- test guards the grammar).
+CREATE OR REPLACE FUNCTION entroq.gc_activation(queue text) RETURNS timestamptz LANGUAGE plpgsql IMMUTABLE AS $$
 DECLARE v text := substring(queue from '.*/gc=([^/]*)');
 BEGIN
-    IF v IS NULL OR v IN ('', '0') THEN RETURN true; END IF;
-    IF v ~ '^[0-9]+$' THEN RETURN to_timestamp(v::bigint) <= now(); END IF;
-    RETURN v::timestamptz <= now();
+    IF v IS NULL THEN RETURN NULL; END IF;
+    IF v = '' THEN RETURN to_timestamp(0); END IF;
+    IF v ~ '^[0-9]+$' THEN RETURN to_timestamp(v::bigint); END IF;
+    IF v !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$' THEN
+        RETURN NULL;
+    END IF;
+    RETURN v::timestamptz;
 EXCEPTION WHEN others THEN
-    RETURN false;
+    RETURN NULL;
 END $$;
 
--- entroq.gc_collect deletes up to p_limit currently-collectable tasks (arrived,
--- i.e. at <= now) from queues whose gc activation has passed, and returns one
--- row per affected queue with the number deleted from it. Sum the counts for the
--- total. Bounded and race-safe:
+-- entroq.gc_queues enumerates every queue that opts into garbage collection (its
+-- name carries a /gc= component), paired with its activation time. A NULL
+-- activate_at marks a malformed gc= value -- the queue opted in but its timestamp
+-- will not parse. This is the mandatory discovery step: callers feed these rows
+-- straight to gc_collect (which ignores NULL and future activations) and
+-- separately report the NULL ones as misconfigurations. It runs once per GC
+-- sweep and enumerates distinct queues over the byGCQueueAt partial index, not
+-- raw task rows repeatedly.
+CREATE OR REPLACE FUNCTION entroq.gc_queues() RETURNS TABLE (queue text, activate_at timestamptz) LANGUAGE sql STABLE AS $$
+    SELECT q.queue, entroq.gc_activation(q.queue)
+    FROM (SELECT DISTINCT t.queue FROM entroq.tasks t WHERE t.queue LIKE '%/gc=%') q;
+$$;
+
+-- entroq.gc_collect deletes up to p_limit arrived tasks (at <= now) from the
+-- supplied queues whose activation has passed, and returns one row per affected
+-- queue with the number deleted. The caller passes queues and their activation
+-- times from gc_queues; this function does NO grammar parsing. It collects where
+-- the supplied activate_at <= now(), which naturally excludes both malformed
+-- queues (NULL activation) and not-yet-due queues (future activation), evaluated
+-- against the database clock. Sum the returned counts for the total. Bounded and
+-- race-safe:
 --   - FOR UPDATE SKIP LOCKED makes it mutually exclusive with try_claim per row:
 --     a task being claimed is skipped, not clobbered, and GC never blocks a claim.
 --   - at <= now excludes claimed tasks (claiming pushes at into the future).
---   - Concurrent callers partition (SKIP LOCKED) rather than duplicate work.
--- The per-queue breakdown feeds GC telemetry (deleted counts by queue hierarchy)
--- from the same statement, with no second pass. Callers invoke it in a tight loop
--- (each call one bounded, quickly-committed transaction) until the summed count
--- is < p_limit, so no single statement holds locks or accumulates WAL for a large
--- backlog.
-CREATE OR REPLACE FUNCTION entroq.gc_collect(p_limit integer DEFAULT 1000)
+--   - Concurrent collectors partition (SKIP LOCKED) rather than duplicate work.
+-- The per-queue breakdown feeds GC telemetry (deleted counts by queue hierarchy).
+-- Callers invoke it in a tight loop (each call one bounded, quickly-committed
+-- transaction) until the summed count is < p_limit, so no single statement holds
+-- locks or accumulates WAL for a large backlog.
+CREATE OR REPLACE FUNCTION entroq.gc_collect(p_queues text[], p_activations timestamptz[], p_limit integer DEFAULT 1000)
     RETURNS TABLE (queue_name text, deleted bigint) LANGUAGE plpgsql AS $$
 BEGIN
     RETURN QUERY
-    WITH due AS (
+    WITH due_queues AS (
+        SELECT u.queue FROM unnest(p_queues, p_activations) AS u(queue, activate_at)
+        WHERE u.activate_at <= now()
+    ),
+    due AS (
         SELECT t.id, t.queue FROM entroq.tasks t
-        WHERE t.queue LIKE '%/gc=%' AND t.at <= now() AND entroq.gc_due(t.queue)
+        JOIN due_queues dq ON t.queue = dq.queue
+        WHERE t.at <= now()
         LIMIT p_limit
-        FOR UPDATE SKIP LOCKED
+        FOR UPDATE OF t SKIP LOCKED
     ),
     del AS (
         DELETE FROM entroq.tasks t USING due WHERE t.id = due.id
@@ -1095,6 +1129,11 @@ BEGIN
     )
     SELECT del.queue, count(*)::bigint FROM del GROUP BY del.queue;
 END $$;
+
+-- entroq.gc_due is retired: superseded by gc_activation (NULL vs timestamp) plus
+-- the client-driven gc_queues/gc_collect protocol. Dropped so a stale definition
+-- can't linger on upgraded databases.
+DROP FUNCTION IF EXISTS entroq.gc_due(text);
 
 -- Schema version tracking. Updated on every run of this script so that
 -- re-applying the schema after a minor-version upgrade stamps the new version.
@@ -1116,8 +1155,9 @@ END $$;
 --     reinitialize: DROP SCHEMA entroq CASCADE, then run eqpg schema init.
 -- Migrations: 1.0.0 → 1.1.0 (see blocks below)
 -- Migrations: 1.1.0 → 1.2.0 (no structural changes)
--- Migrations: 1.2.0 → 1.6.0 (additive: byGCQueueAt partial index, gc_due and
---   gc_collect functions for built-in garbage collection; no data movement)
+-- Migrations: 1.2.0 → 1.6.0 (additive: byGCQueueAt partial index and the
+--   gc_activation / gc_queues / gc_collect functions for built-in garbage
+--   collection; drops the interim gc_due function; no data movement)
 -- Each block checks pg_attribute to skip on fresh installs where the column
 -- is already correct, avoiding unnecessary table scans on re-runs.
 

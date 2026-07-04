@@ -159,6 +159,70 @@ func TestGCMetricsEmitted(t *testing.T) {
 	}
 }
 
+// TestGCReportsMalformed pins the loud-on-misconfiguration behavior: a queue that
+// opts into GC with an unparseable gc= value is never collected (would otherwise
+// pile up silently) but is surfaced via entroq.gc.errors_total{kind=malformed}.
+func TestGCReportsMalformed(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+
+	b, err := New(ctx, WithMeterProvider(mp), withGCInterval(time.Hour))
+	if err != nil {
+		t.Fatalf("new backend: %v", err)
+	}
+	defer b.Close()
+
+	// A task in a malformed gc= queue: opted in, but the value won't parse.
+	past := time.Now().Add(-time.Hour)
+	const bad = "/bad/gc=notatime"
+	if _, err := b.Modify(ctx, entroq.NewModification("",
+		entroq.InsertingInto(bad, entroq.WithID("x1"), entroq.WithArrivalTime(past), entroq.WithRawValue([]byte("{}"))))); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	b.reportMalformed(ctx)
+
+	// It must NOT be collected.
+	if n, err := b.collectOnce(ctx, 100); err != nil || n != 0 {
+		t.Fatalf("collectOnce = (%d, %v), want (0, nil): malformed queue must not be collected", n, err)
+	}
+	if got, err := b.Tasks(ctx, &entroq.TasksQuery{Queue: bad}); err != nil || len(got) != 1 {
+		t.Fatalf("malformed queue task count = %d (err %v), want 1 (survives)", len(got), err)
+	}
+
+	// It must be reported via errors_total{kind=malformed}.
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &rm); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+	var malformed int64
+	for _, sm := range rm.ScopeMetrics {
+		if sm.Scope.Name != "entroq.mem" {
+			continue
+		}
+		for _, md := range sm.Metrics {
+			if md.Name != "entroq.gc.errors_total" {
+				continue
+			}
+			sum, ok := md.Data.(metricdata.Sum[int64])
+			if !ok {
+				t.Fatalf("errors_total data is %T, want Sum[int64]", md.Data)
+			}
+			for _, dp := range sum.DataPoints {
+				if kind, ok := dp.Attributes.Value(attribute.Key("kind")); ok && kind.AsString() == "malformed" {
+					malformed += dp.Value
+				}
+			}
+		}
+	}
+	if malformed < 1 {
+		t.Errorf("errors_total{kind=malformed} = %d, want >= 1", malformed)
+	}
+}
+
 // TestGCLoopCollects asserts the always-on backend GC loop actually RUNS: built
 // with a short interval, it auto-collects a due gc= task with no manual trigger.
 func TestGCLoopCollects(t *testing.T) {

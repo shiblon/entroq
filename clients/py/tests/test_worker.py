@@ -592,28 +592,40 @@ def test_renewing_dep_error_sets_state_error():
 # ---------------------------------------------------------------------------
 # Ambient garbage collection
 #
-# The worker drives GC only when its client exposes gc_collect (the direct
-# PostgreSQL backend). Talking to a Go server, the client lacks that capability
-# and the server GCs itself, so the worker must stay out of the way.
+# The worker drives GC only when its client exposes gc_queues (the direct
+# PostgreSQL backend's discovery entry point). Talking to a Go server, the client
+# lacks that capability and the server GCs itself, so the worker stays out of the
+# way. Each sweep discovers gc= queues, logs malformed ones (NULL activation), and
+# relays all of them to gc_collect, which discards the malformed and not-yet-due.
 # ---------------------------------------------------------------------------
 
-class GCFakeClient(FakeClient):
-    """FakeClient that also exposes the gc_collect capability, and counts it."""
+_PAST = datetime(2000, 1, 1, tzinfo=timezone.utc)
 
-    def __init__(self, *args, gc_returns=(0,), **kwargs):
+
+class GCFakeClient(FakeClient):
+    """FakeClient exposing the gc_queues/gc_collect capability, counting collect calls."""
+
+    def __init__(self, *args, queues=None, gc_returns=(0,), **kwargs):
         super().__init__(*args, **kwargs)
         self.gc_calls = 0
         self._gc_returns = list(gc_returns)
+        # (queue, activate_at) pairs gc_queues returns; None activate_at = malformed.
+        self._gc_queues = list(queues) if queues is not None else [('/q/gc=0', _PAST)]
+        self.last_collect_args = None
 
-    async def gc_collect(self, batch=1000):
+    async def gc_queues(self):
+        return list(self._gc_queues)
+
+    async def gc_collect(self, queues, activations, batch=1000):
         self.gc_calls += 1
+        self.last_collect_args = (queues, activations, batch)
         return self._gc_returns.pop(0) if self._gc_returns else 0
 
 
 def test_worker_no_gc_without_capability():
-    """A client lacking gc_collect must not trip up run(); no GC is attempted."""
+    """A client lacking gc_queues must not trip up run(); no GC is attempted."""
     client = FakeClient()
-    assert not hasattr(client, 'gc_collect')  # gate is off for non-pg clients
+    assert not hasattr(client, 'gc_queues')  # gate is off for non-pg clients
 
     worker = EntroQWorker(client, 'q')
     client._task_q.put_nowait(_task())
@@ -627,7 +639,7 @@ def test_worker_no_gc_without_capability():
 
 
 def test_worker_drives_gc_when_capable(monkeypatch):
-    """A gc_collect-capable client gets its GC loop driven while the worker runs."""
+    """A gc_queues-capable client gets its GC loop driven while the worker runs."""
     import entroq.worker as w
     monkeypatch.setattr(w, '_GC_INTERVAL_S', 0.01)
 
@@ -680,7 +692,7 @@ def test_gc_loop_survives_errors(monkeypatch):
     monkeypatch.setattr(w, '_GC_INTERVAL_S', 0.01)
 
     class BoomThenOK(GCFakeClient):
-        async def gc_collect(self, batch=1000):
+        async def gc_collect(self, queues, activations, batch=1000):
             self.gc_calls += 1
             if self.gc_calls == 1:
                 raise RuntimeError("transient db blip")
@@ -700,3 +712,34 @@ def test_gc_loop_survives_errors(monkeypatch):
 
     asyncio.run(drive())
     assert client.gc_calls >= 2
+
+
+def test_gc_loop_reports_malformed(monkeypatch, caplog):
+    """A queue with a NULL (malformed) activation is logged and relayed, not fatal."""
+    import logging
+    import entroq.worker as w
+    monkeypatch.setattr(w, '_GC_INTERVAL_S', 0.01)
+
+    client = GCFakeClient(queues=[
+        ('/bad/gc=notatime', None),  # malformed
+        ('/ok/gc=0', _PAST),         # valid, due
+    ])
+    worker = EntroQWorker(client, 'q')
+
+    async def drive():
+        loop = asyncio.create_task(worker._gc_loop())
+        for _ in range(200):
+            if client.gc_calls >= 1:
+                break
+            await asyncio.sleep(0.01)
+        worker._stop_event.set()
+        await loop
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(drive())
+
+    assert any('malformed' in r.getMessage() and '/bad/gc=notatime' in r.getMessage()
+               for r in caplog.records), "malformed queue should be logged"
+    # The malformed queue is relayed to gc_collect verbatim (it discards it).
+    assert client.last_collect_args is not None
+    assert '/bad/gc=notatime' in client.last_collect_args[0]

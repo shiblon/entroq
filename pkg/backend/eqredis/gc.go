@@ -41,6 +41,7 @@ func (e *EQRedis) runGCLoop(ctx context.Context, interval time.Duration, batch i
 			return
 		case <-t.C:
 			start := time.Now()
+			e.reportMalformed(ctx) // once per sweep, before draining
 			for {
 				n, err := e.collectOnce(ctx, batch)
 				if err != nil {
@@ -103,6 +104,29 @@ func (e *EQRedis) collectOnce(ctx context.Context, batch int) (int, error) {
 		total += n
 	}
 	return total, nil
+}
+
+// reportMalformed surfaces queues that opted into GC (a /gc= component) but whose
+// activation value will not parse: they are never collected, so without this they
+// would pile up silently. Runs once per sweep, emitting the metric and a log line
+// for each malformed queue.
+func (e *EQRedis) reportMalformed(ctx context.Context) {
+	names, err := e.client.SMembers(ctx, queuesKey).Result()
+	if err != nil {
+		if ctx.Err() == nil {
+			log.Printf("eqredis gc: list queues: %v", err)
+			e.gcMetrics.Error(ctx, "", "list")
+		}
+		return
+	}
+	for _, q := range names {
+		_, present, perr := queues.GCActivation(q)
+		if !present || perr == nil {
+			continue // not a gc= queue, or a well-formed one
+		}
+		e.gcMetrics.Error(ctx, q, "malformed")
+		log.Printf("eqredis gc: queue %q has a malformed gc= value; it will never be collected", q)
+	}
 }
 
 // collectQueue deletes up to limit arrived (score = at <= nowMs) tasks from a

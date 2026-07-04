@@ -419,30 +419,44 @@ async def test_worker_continues_after_dependency_error(eq: EntroQ):
 # ---------------------------------------------------------------------------
 # Built-in garbage collection
 #
-# The direct-PostgreSQL client is the backend, so it carries GC itself: the
-# gc_collect stored procedure reaps due, /gc=-eligible tasks, and a worker
-# wired to this client drives it invisibly in the background.
+# The direct-PostgreSQL client is the backend, so it carries GC itself. Discovery
+# (gc_queues) and collection (gc_collect) live in SQL; the client relays rows
+# between them without parsing. A NULL activation marks a malformed gc= value.
+# A worker wired to this client drives the two-step loop invisibly.
 # ---------------------------------------------------------------------------
 
-async def test_gc_collect_deletes_only_due_eligible(eq: EntroQ):
-    """gc_collect reaps due, GC-eligible tasks and leaves everything else alone."""
+async def test_gc_queues_and_collect(eq: EntroQ):
+    """gc_queues reports activations (NULL=malformed); gc_collect reaps only due."""
     past = datetime.now(timezone.utc) - timedelta(minutes=1)
 
     DUE      = '/test/gc/reap/gc=0'  # gc=0 -> always due
     NOT_DUE  = '/test/gc/later/gc=%d' % int((datetime.now(timezone.utc) + timedelta(hours=1)).timestamp())
-    NO_GC    = '/test/gc/keep'       # no /gc= component -> never collected
+    BAD      = '/test/gc/bad/gc=notatime'  # opted in but malformed -> NULL activation
+    NO_GC    = '/test/gc/keep'             # no /gc= component -> never discovered
 
     await eq.modify(Modification(
         Modification.inserting(TaskData(queue=DUE, value='doomed', at=past)),
         Modification.inserting(TaskData(queue=NOT_DUE, value='pending', at=past)),
+        Modification.inserting(TaskData(queue=BAD, value='orphan', at=past)),
         Modification.inserting(TaskData(queue=NO_GC, value='safe', at=past)),
     ))
 
-    n = await eq.gc_collect()
-    assert n == 1, f'expected exactly the due eligible task collected, got {n}'
+    rows = await eq.gc_queues()
+    by_queue = dict(rows)
+    assert by_queue.get(BAD) is None, 'malformed gc= value must yield NULL activation'
+    assert by_queue.get(DUE) is not None
+    assert by_queue.get(NOT_DUE) is not None
+    assert NO_GC not in by_queue, 'a queue without /gc= must not be discovered'
+
+    # Relay everything, malformed included; gc_collect discards NULL and future.
+    queues = [q for q, _ in rows]
+    activations = [a for _, a in rows]
+    n = await eq.gc_collect(queues, activations)
+    assert n == 1, f'expected only the due eligible task collected, got {n}'
     assert await eq.tasks(queue=DUE) == []
-    assert len(await eq.tasks(queue=NOT_DUE)) == 1
-    assert len(await eq.tasks(queue=NO_GC)) == 1
+    assert len(await eq.tasks(queue=NOT_DUE)) == 1  # pending (future activation)
+    assert len(await eq.tasks(queue=BAD)) == 1      # malformed, never collected
+    assert len(await eq.tasks(queue=NO_GC)) == 1    # not a gc queue
 
 
 async def test_worker_ambient_gc_reaps(eq: EntroQ):

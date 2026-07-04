@@ -362,17 +362,38 @@ class EntroQ(EntroQBase):
                     ) from e
                 raise
 
-    async def gc_collect(self, batch: int = 1000) -> int:
-        """Delete up to ``batch`` due, GC-eligible tasks; return how many went.
+    async def gc_queues(self) -> list[tuple[str, datetime | None]]:
+        """Discover queues that opt into garbage collection, with activation times.
 
-        A task is eligible when its queue name carries a ``/gc=`` activation
-        whose timestamp has passed (see entroq.gc_collect in schema.sql). This
-        is the same stored procedure the Go eqpg backend drives on its own GC
-        loop, exposed here so a direct-PostgreSQL worker can reap on its behalf
-        (the Go server GCs itself; a Python worker talking to it must not).
+        Returns one ``(queue, activate_at)`` pair per queue whose name carries a
+        ``/gc=`` component. A ``None`` activate_at marks a malformed gc= value:
+        the queue opted into collection but its timestamp will not parse, so it
+        is never collected and should be surfaced as a misconfiguration. The gc=
+        grammar lives entirely in the SQL (``gc_activation``); this client never
+        parses it. Feed these rows straight to :meth:`gc_collect`.
         """
         async with await psycopg.AsyncConnection.connect(self._connstr, autocommit=True, row_factory=dict_row, options=_OPTS) as conn:
-            rows = await (await conn.execute('SELECT deleted FROM gc_collect(%s)', (batch,))).fetchall()
+            rows = await (await conn.execute('SELECT queue, activate_at FROM gc_queues()')).fetchall()
+            return [(r['queue'], r['activate_at']) for r in rows]
+
+    async def gc_collect(self, queues: list[str], activations: list[datetime | None], batch: int = 1000) -> int:
+        """Delete up to ``batch`` due, collectable tasks from the given queues.
+
+        Pass the ``(queue, activate_at)`` pairs from :meth:`gc_queues` verbatim,
+        malformed ones included: ``gc_collect`` only collects where
+        ``activate_at <= now()`` on the database clock, which discards both
+        malformed queues (NULL activation) and not-yet-due ones (future
+        activation). This client does no parsing or clock arithmetic. Returns the
+        number deleted; drain by calling until the result is ``< batch``.
+
+        Exposed so a direct-PostgreSQL worker can reap on the backend's behalf
+        (a Go server GCs itself; a worker talking to it must not).
+        """
+        async with await psycopg.AsyncConnection.connect(self._connstr, autocommit=True, row_factory=dict_row, options=_OPTS) as conn:
+            rows = await (await conn.execute(
+                'SELECT deleted FROM gc_collect(%s::text[], %s::timestamptz[], %s)',
+                (queues, activations, batch),
+            )).fetchall()
             return sum(r['deleted'] for r in rows)
 
     async def pop_all(self, queue: str, force: bool = False) -> AsyncIterator[Task]:

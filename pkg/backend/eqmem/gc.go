@@ -45,6 +45,7 @@ func (m *EQMem) runGCLoop(ctx context.Context, interval time.Duration, batch int
 			return
 		case <-t.C:
 			start := time.Now()
+			m.reportMalformed(ctx) // once per sweep, before draining
 			for {
 				n, err := m.collectOnce(ctx, batch)
 				if err != nil {
@@ -62,6 +63,21 @@ func (m *EQMem) runGCLoop(ctx context.Context, interval time.Duration, batch int
 			}
 			m.gcMetrics.Sweep(ctx, time.Since(start))
 		}
+	}
+}
+
+// reportMalformed surfaces queues that opted into GC (a /gc= component) but whose
+// activation value will not parse: they are never collected, so without this they
+// would pile up silently. Runs once per sweep, emitting the metric and a log line
+// for each malformed queue.
+func (m *EQMem) reportMalformed(ctx context.Context) {
+	for _, q := range m.gcCandidateQueues() {
+		_, present, err := queues.GCActivation(q)
+		if !present || err == nil {
+			continue // not a gc= queue, or a well-formed one
+		}
+		m.gcMetrics.Error(ctx, q, "malformed")
+		log.Printf("eqmem gc: queue %q has a malformed gc= value; it will never be collected", q)
 	}
 }
 
