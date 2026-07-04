@@ -64,6 +64,11 @@ type EQMem struct {
 
 	claimDuration  metric.Float64Histogram
 	modifyDuration metric.Float64Histogram
+
+	gcInterval  time.Duration
+	gcBatchSize int
+	stopGC      func()
+	gcDone      chan struct{}
 }
 
 type qLock struct {
@@ -180,6 +185,8 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 		locksSuperUnsafeNS: make(map[string]*nsLock),
 		claimDuration:      claimDuration,
 		modifyDuration:     modifyDuration,
+		gcInterval:         defaultGCInterval,
+		gcBatchSize:        defaultGCBatchSize,
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -243,6 +250,20 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 				return nil, fmt.Errorf("output snapshot: %w", err)
 			}
 		}
+	}
+
+	// Garbage collection is a first-class, always-on backend behavior. It is not
+	// started in snapshot-and-quit mode (a load-dump-exit tool). Close cancels it
+	// and waits for it to exit. The context is independent of the constructor's
+	// so the loop lives until Close, not until a caller-scoped ctx is canceled.
+	if !m.outputSnapshot {
+		gcCtx, cancel := context.WithCancel(context.Background())
+		m.stopGC = cancel
+		m.gcDone = make(chan struct{})
+		go func() {
+			defer close(m.gcDone)
+			m.runGCLoop(gcCtx, m.gcInterval, m.gcBatchSize)
+		}()
 	}
 
 	return m, nil
@@ -986,6 +1007,10 @@ func (m *EQMem) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[str
 
 // Close cleans up this implementation.
 func (m *EQMem) Close() error {
+	if m.stopGC != nil {
+		m.stopGC()
+		<-m.gcDone // wait for the GC loop to exit before tearing down
+	}
 	if m.journal != nil {
 		err := m.journal.Close()
 		m.journal = nil

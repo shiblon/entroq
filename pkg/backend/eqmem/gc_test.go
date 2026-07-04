@@ -1,0 +1,164 @@
+package eqmem
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/testing/eqtest"
+)
+
+// TestGCUnderConcurrentLoad runs the GC loop at a tight interval against a live
+// concurrent workload (producers inserting into gc= queues, consumers
+// claiming/deleting from work queues) to shake out data races between GC and
+// normal operations. Meant to be run with -race.
+func TestGCUnderConcurrentLoad(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	client, err := entroq.New(ctx, Opener(withGCInterval(time.Millisecond)))
+	if err != nil {
+		t.Fatalf("open client: %v", err)
+	}
+	defer client.Close()
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Producers: continuously insert immediately-collectable tasks into gc=0
+	// queues, racing the GC loop that is draining them.
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			q := fmt.Sprintf("/loadtest/p%d/gc=0", i)
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if _, err := client.Modify(ctx, entroq.InsertingInto(q, entroq.WithRawValue([]byte("{}")))); err != nil {
+					return
+				}
+			}
+		}(i)
+	}
+
+	// Consumers: claim and delete from non-gc work queues, exercising the normal
+	// claim/modify paths concurrently with GC.
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			wq := fmt.Sprintf("/loadtest/work%d", i)
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if _, err := client.Modify(ctx, entroq.InsertingInto(wq, entroq.WithRawValue([]byte("{}")))); err != nil {
+					return
+				}
+				task, err := client.TryClaim(ctx, entroq.From(wq), entroq.ClaimFor(time.Second))
+				if err != nil {
+					return
+				}
+				if task != nil {
+					if _, err := client.Modify(ctx, task.Delete()); err != nil {
+						continue
+					}
+				}
+			}
+		}(i)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}
+
+// TestGCLoopCollects asserts the always-on backend GC loop actually RUNS: built
+// with a short interval, it auto-collects a due gc= task with no manual trigger.
+func TestGCLoopCollects(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	client, err := entroq.New(ctx, Opener(withGCInterval(20*time.Millisecond)))
+	if err != nil {
+		t.Fatalf("open client: %v", err)
+	}
+	defer client.Close()
+
+	eqtest.GCCollectsInLoop(ctx, t, client, "/test/gcloop")
+}
+
+// TestGCCollectOnce drives collectOnce directly (white-box) to pin the semantics:
+// due gc= tasks are collected; not-yet-due activation, future arrival
+// (claimed-equivalent), and non-gc queues are left alone. The backend is a fresh,
+// isolated in-memory store, so the deleted count is exact. The GC interval is set
+// long so the background loop does not collect out from under the assertions.
+func TestGCCollectOnce(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	b, err := New(ctx, withGCInterval(time.Hour))
+	if err != nil {
+		t.Fatalf("new backend: %v", err)
+	}
+	defer b.Close()
+
+	const p = "/test/collectonce"
+	past := time.Now().Add(-time.Hour)
+	future := time.Now().Add(time.Hour)
+	futureGC := fmt.Sprintf("%s/c/gc=%d", p, future.Unix())
+
+	cases := []struct {
+		id, queue string
+		at        time.Time
+		collected bool
+	}{
+		{"co_due0", p + "/a/gc=0", past, true},       // always-active, arrived => collected
+		{"co_past", p + "/b/gc=100", past, true},     // activation long past, arrived => collected
+		{"co_future", futureGC, past, false},         // activation in the future => not due
+		{"co_claimed", p + "/a/gc=0", future, false}, // arrival in the future => not collectable
+		{"co_plain", p + "/plain", past, false},      // not a gc= queue
+	}
+	for _, c := range cases {
+		if _, err := b.Modify(ctx, entroq.NewModification("",
+			entroq.InsertingInto(c.queue, entroq.WithID(c.id), entroq.WithArrivalTime(c.at), entroq.WithRawValue([]byte("{}"))))); err != nil {
+			t.Fatalf("insert %s: %v", c.id, err)
+		}
+	}
+
+	n, err := b.collectOnce(ctx, 100)
+	if err != nil {
+		t.Fatalf("collectOnce: %v", err)
+	}
+	if want := 2; n != want {
+		t.Errorf("collectOnce deleted %d, want %d (co_due0, co_past)", n, want)
+	}
+
+	for _, c := range cases {
+		got, err := b.Tasks(ctx, &entroq.TasksQuery{Queue: c.queue})
+		if err != nil {
+			t.Fatalf("tasks %q: %v", c.queue, err)
+		}
+		present := false
+		for _, tk := range got {
+			if tk.ID == c.id {
+				present = true
+			}
+		}
+		if c.collected && present {
+			t.Errorf("%s should have been collected but is still present", c.id)
+		}
+		if !c.collected && !present {
+			t.Errorf("%s should have survived but was collected", c.id)
+		}
+	}
+}
