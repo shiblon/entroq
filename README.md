@@ -72,7 +72,13 @@ go install github.com/shiblon/entroq/cmd/eqc@latest
 eqc --help
 ```
 
-The Python client installs from the `clients/py` subdirectory:
+The Python client is on PyPI:
+```bash
+python3 -m pip install entroq            # client + async worker
+python3 -m pip install "entroq[pg]"      # adds the direct-PostgreSQL backend
+```
+
+To install an unreleased version straight from the `clients/py` subdirectory:
 ```bash
 python3 -m pip install "git+https://github.com/shiblon/entroq#subdirectory=clients/py"
 ```
