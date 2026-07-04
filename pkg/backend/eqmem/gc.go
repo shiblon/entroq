@@ -44,6 +44,7 @@ func (m *EQMem) runGCLoop(ctx context.Context, interval time.Duration, batch int
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			start := time.Now()
 			for {
 				n, err := m.collectOnce(ctx, batch)
 				if err != nil {
@@ -59,6 +60,7 @@ func (m *EQMem) runGCLoop(ctx context.Context, interval time.Duration, batch int
 					return
 				}
 			}
+			m.gcMetrics.Sweep(ctx, time.Since(start))
 		}
 	}
 }
@@ -97,6 +99,15 @@ func (m *EQMem) collectOnce(ctx context.Context, batch int) (int, error) {
 	}
 	rand.Shuffle(len(due), func(i, j int) { due[i], due[j] = due[j], due[i] })
 
+	// Report per-queue deletions on every exit path (including errors) so a
+	// partial pass still shows the work it did.
+	perQueue := make(map[string]int)
+	defer func() {
+		for q, c := range perQueue {
+			m.gcMetrics.Deleted(ctx, q, c)
+		}
+	}()
+
 	deleted := 0
 	for _, q := range due {
 		for deleted < batch {
@@ -106,14 +117,17 @@ func (m *EQMem) collectOnce(ctx context.Context, batch int) (int, error) {
 				Duration: entroq.DefaultClaimDuration,
 			})
 			if err != nil {
+				m.gcMetrics.Error(ctx, q, "claim")
 				return deleted, fmt.Errorf("gc claim %q: %w", q, err)
 			}
 			if task == nil {
 				break // nothing more collectable in this queue right now
 			}
 			if _, err := m.Modify(ctx, entroq.NewModification(gcClaimant, task.Delete())); err != nil {
+				m.gcMetrics.Error(ctx, q, "delete")
 				return deleted, fmt.Errorf("gc delete %v: %w", task.IDVersion(), err)
 			}
+			perQueue[q]++
 			deleted++
 		}
 		if deleted >= batch {

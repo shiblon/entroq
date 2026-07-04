@@ -25,6 +25,20 @@ stored procedure and a partial index; schema version 1.2.0 -> 1.6.0).
 - **eqpg collects via a stored procedure.** `entroq.gc_collect` (a bounded,
   `FOR UPDATE SKIP LOCKED` delete over a partial index scoped to `gc=` rows) does
   discovery and deletion in one race-safe pass; the backend drives it on a loop.
+  It returns one row per affected queue with that queue's deleted count (summed
+  for the total), so the backend can attribute GC telemetry per queue hierarchy
+  without a second query.
+- **GC telemetry moved into the backends.** The `entroq_gc_deleted_total`,
+  `entroq_gc_errors_total`, and `entroq_gc_sweep_duration_seconds` metrics (and
+  their Grafana panels) are preserved, now emitted by each backend's own collector
+  under its meter scope (`entroq.pg`, `entroq.mem`, `entroq.redis`) with the same
+  names, so one dashboard still covers all backends. `eqredis` gained a
+  `WithMeterProvider` option to match `eqpg` and `eqmem`.
+- **Python: the worker carries GC for direct-PostgreSQL clients.** An
+  `EntroQWorker` wired to the `entroq.pg` client drives `gc_collect` on a
+  background loop for as long as it runs -- invisibly, no config. Workers talking
+  to a Go server over HTTP/gRPC do not (the server GCs itself); the worker gates
+  on whether its client exposes `gc_collect`.
 
 ### Removed
 

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/backend/internal/gcmetrics"
 	"github.com/shiblon/entroq/pkg/subq"
 	"github.com/shiblon/stuffedio/wal"
 	"go.opentelemetry.io/otel/metric"
@@ -64,6 +65,7 @@ type EQMem struct {
 
 	claimDuration  metric.Float64Histogram
 	modifyDuration metric.Float64Histogram
+	gcMetrics      *gcmetrics.Metrics
 
 	gcInterval  time.Duration
 	gcBatchSize int
@@ -167,6 +169,7 @@ func WithMeterProvider(mp metric.MeterProvider) Option {
 			metric.WithDescription("Duration of Modify calls in the in-memory backend."),
 			metric.WithUnit("s"),
 		)
+		m.gcMetrics, _ = gcmetrics.New(mp.Meter("entroq.mem"))
 	}
 }
 
@@ -175,6 +178,7 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 	noopMeter := noop.NewMeterProvider().Meter("entroq.mem")
 	claimDuration, _ := noopMeter.Float64Histogram("entroq.claim.duration")
 	modifyDuration, _ := noopMeter.Float64Histogram("entroq.modify.duration")
+	gcMetrics, _ := gcmetrics.New(noopMeter)
 
 	m := &EQMem{
 		nw:                 subq.New(),
@@ -185,6 +189,7 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 		locksSuperUnsafeNS: make(map[string]*nsLock),
 		claimDuration:      claimDuration,
 		modifyDuration:     modifyDuration,
+		gcMetrics:          gcMetrics,
 		gcInterval:         defaultGCInterval,
 		gcBatchSize:        defaultGCBatchSize,
 	}

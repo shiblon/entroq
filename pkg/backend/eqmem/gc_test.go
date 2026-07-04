@@ -9,6 +9,9 @@ import (
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/testing/eqtest"
+	"go.opentelemetry.io/otel/attribute"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 // TestGCUnderConcurrentLoad runs the GC loop at a tight interval against a live
@@ -80,6 +83,80 @@ func TestGCUnderConcurrentLoad(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	close(stop)
 	wg.Wait()
+}
+
+// TestGCMetricsEmitted pins the GC telemetry contract the Grafana dashboard
+// depends on: collecting reports entroq.gc.deleted_total under the entroq.mem
+// meter, attributed by the bounded queue hierarchy (l1). Driven white-box via
+// collectOnce so the counts are exact.
+func TestGCMetricsEmitted(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+
+	b, err := New(ctx, WithMeterProvider(mp), withGCInterval(time.Hour))
+	if err != nil {
+		t.Fatalf("new backend: %v", err)
+	}
+	defer b.Close()
+
+	// Three due tasks across two queues that share an l1 of "/metrics".
+	past := time.Now().Add(-time.Hour)
+	inserts := []struct{ id, queue string }{
+		{"m1", "/metrics/a/gc=0"},
+		{"m2", "/metrics/a/gc=0"},
+		{"m3", "/metrics/b/gc=0"},
+	}
+	for _, c := range inserts {
+		if _, err := b.Modify(ctx, entroq.NewModification("",
+			entroq.InsertingInto(c.queue, entroq.WithID(c.id), entroq.WithArrivalTime(past), entroq.WithRawValue([]byte("{}"))))); err != nil {
+			t.Fatalf("insert %s: %v", c.id, err)
+		}
+	}
+
+	if n, err := b.collectOnce(ctx, 100); err != nil || n != 3 {
+		t.Fatalf("collectOnce = (%d, %v), want (3, nil)", n, err)
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &rm); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+
+	var total int64
+	found := false
+	for _, sm := range rm.ScopeMetrics {
+		if sm.Scope.Name != "entroq.mem" {
+			continue
+		}
+		for _, md := range sm.Metrics {
+			if md.Name != "entroq.gc.deleted_total" {
+				continue
+			}
+			found = true
+			sum, ok := md.Data.(metricdata.Sum[int64])
+			if !ok {
+				t.Fatalf("deleted_total data is %T, want Sum[int64]", md.Data)
+			}
+			for _, dp := range sum.DataPoints {
+				total += dp.Value
+				l1, ok := dp.Attributes.Value(attribute.Key("l1"))
+				if !ok {
+					t.Errorf("data point missing l1 attribute: %v", dp.Attributes.ToSlice())
+				} else if l1.AsString() != "/metrics" {
+					t.Errorf("l1 = %q, want %q", l1.AsString(), "/metrics")
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("entroq.gc.deleted_total not reported under the entroq.mem meter")
+	}
+	if total != 3 {
+		t.Errorf("deleted_total sum = %d, want 3", total)
+	}
 }
 
 // TestGCLoopCollects asserts the always-on backend GC loop actually RUNS: built

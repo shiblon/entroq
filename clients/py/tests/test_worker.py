@@ -587,3 +587,116 @@ def test_renewing_dep_error_sets_state_error():
         return state.error
 
     assert isinstance(asyncio.run(run()), DependencyError)
+
+
+# ---------------------------------------------------------------------------
+# Ambient garbage collection
+#
+# The worker drives GC only when its client exposes gc_collect (the direct
+# PostgreSQL backend). Talking to a Go server, the client lacks that capability
+# and the server GCs itself, so the worker must stay out of the way.
+# ---------------------------------------------------------------------------
+
+class GCFakeClient(FakeClient):
+    """FakeClient that also exposes the gc_collect capability, and counts it."""
+
+    def __init__(self, *args, gc_returns=(0,), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.gc_calls = 0
+        self._gc_returns = list(gc_returns)
+
+    async def gc_collect(self, batch=1000):
+        self.gc_calls += 1
+        return self._gc_returns.pop(0) if self._gc_returns else 0
+
+
+def test_worker_no_gc_without_capability():
+    """A client lacking gc_collect must not trip up run(); no GC is attempted."""
+    client = FakeClient()
+    assert not hasattr(client, 'gc_collect')  # gate is off for non-pg clients
+
+    worker = EntroQWorker(client, 'q')
+    client._task_q.put_nowait(_task())
+
+    @EntroQWorker.handler
+    async def handle(task, docs):
+        worker.stop()
+        return Modification(Modification.deleting(task))
+
+    asyncio.run(worker.run(handle))  # completes cleanly, no missing-attr error
+
+
+def test_worker_drives_gc_when_capable(monkeypatch):
+    """A gc_collect-capable client gets its GC loop driven while the worker runs."""
+    import entroq.worker as w
+    monkeypatch.setattr(w, '_GC_INTERVAL_S', 0.01)
+
+    client = GCFakeClient()
+    worker = EntroQWorker(client, 'q')
+
+    @EntroQWorker.handler
+    async def handle(task, docs):
+        return Modification(Modification.deleting(task))
+
+    async def drive():
+        run_task = asyncio.create_task(worker.run(handle))
+        for _ in range(200):  # up to ~2s for at least one GC pass
+            if client.gc_calls >= 1:
+                break
+            await asyncio.sleep(0.01)
+        worker.stop()
+        await run_task
+
+    asyncio.run(drive())
+    assert client.gc_calls >= 1
+
+
+def test_gc_loop_tight_drains_full_batches(monkeypatch):
+    """One pass keeps collecting while batches come back full, stopping on a short one."""
+    import entroq.worker as w
+    monkeypatch.setattr(w, '_GC_INTERVAL_S', 0.01)
+
+    # Two full batches then a short one: the inner drain should make all three
+    # calls in a single pass before idling.
+    client = GCFakeClient(gc_returns=[w._GC_BATCH, w._GC_BATCH, 3])
+    worker = EntroQWorker(client, 'q')
+
+    async def drive():
+        loop = asyncio.create_task(worker._gc_loop())
+        for _ in range(200):
+            if client.gc_calls >= 3:
+                break
+            await asyncio.sleep(0.005)
+        worker._stop_event.set()
+        await loop
+
+    asyncio.run(drive())
+    assert client.gc_calls >= 3
+
+
+def test_gc_loop_survives_errors(monkeypatch):
+    """A failed gc_collect is logged and retried, never fatal to the loop."""
+    import entroq.worker as w
+    monkeypatch.setattr(w, '_GC_INTERVAL_S', 0.01)
+
+    class BoomThenOK(GCFakeClient):
+        async def gc_collect(self, batch=1000):
+            self.gc_calls += 1
+            if self.gc_calls == 1:
+                raise RuntimeError("transient db blip")
+            return 0
+
+    client = BoomThenOK()
+    worker = EntroQWorker(client, 'q')
+
+    async def drive():
+        loop = asyncio.create_task(worker._gc_loop())
+        for _ in range(200):
+            if client.gc_calls >= 2:  # recovered and ran again after the error
+                break
+            await asyncio.sleep(0.01)
+        worker._stop_event.set()
+        await loop
+
+    asyncio.run(drive())
+    assert client.gc_calls >= 2

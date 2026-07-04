@@ -40,6 +40,7 @@ func (e *EQRedis) runGCLoop(ctx context.Context, interval time.Duration, batch i
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			start := time.Now()
 			for {
 				n, err := e.collectOnce(ctx, batch)
 				if err != nil {
@@ -58,8 +59,10 @@ func (e *EQRedis) runGCLoop(ctx context.Context, interval time.Duration, batch i
 			if err := e.gc(ctx); err != nil {
 				if ctx.Err() == nil {
 					log.Printf("eqredis gc cleanup: %v", err)
+					e.gcMetrics.Error(ctx, "", "cleanup")
 				}
 			}
+			e.gcMetrics.Sweep(ctx, time.Since(start))
 		}
 	}
 }
@@ -74,6 +77,7 @@ func (e *EQRedis) collectOnce(ctx context.Context, batch int) (int, error) {
 
 	names, err := e.client.SMembers(ctx, queuesKey).Result()
 	if err != nil {
+		e.gcMetrics.Error(ctx, "", "list")
 		return 0, fmt.Errorf("gc list queues: %w", err)
 	}
 
@@ -88,8 +92,10 @@ func (e *EQRedis) collectOnce(ctx context.Context, batch int) (int, error) {
 		}
 		n, err := e.collectQueue(ctx, q, nowMs, batch-total)
 		if err != nil {
+			e.gcMetrics.Error(ctx, q, "collect")
 			return total, fmt.Errorf("gc collect %q: %w", q, err)
 		}
+		e.gcMetrics.Deleted(ctx, q, n)
 		total += n
 	}
 	return total, nil

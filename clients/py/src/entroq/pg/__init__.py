@@ -362,6 +362,19 @@ class EntroQ(EntroQBase):
                     ) from e
                 raise
 
+    async def gc_collect(self, batch: int = 1000) -> int:
+        """Delete up to ``batch`` due, GC-eligible tasks; return how many went.
+
+        A task is eligible when its queue name carries a ``/gc=`` activation
+        whose timestamp has passed (see entroq.gc_collect in schema.sql). This
+        is the same stored procedure the Go eqpg backend drives on its own GC
+        loop, exposed here so a direct-PostgreSQL worker can reap on its behalf
+        (the Go server GCs itself; a Python worker talking to it must not).
+        """
+        async with await psycopg.AsyncConnection.connect(self._connstr, autocommit=True, row_factory=dict_row, options=_OPTS) as conn:
+            rows = await (await conn.execute('SELECT deleted FROM gc_collect(%s)', (batch,))).fetchall()
+            return sum(r['deleted'] for r in rows)
+
     async def pop_all(self, queue: str, force: bool = False) -> AsyncIterator[Task]:
         """Claim and delete every task in queue, yielding each."""
         if force:

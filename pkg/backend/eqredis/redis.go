@@ -43,7 +43,10 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/backend/internal/gcmetrics"
 	"github.com/shiblon/entroq/pkg/subq"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/noop"
 )
 
 const (
@@ -87,10 +90,11 @@ const namespacesKey = keyPrefix + "ns"
 
 // EQRedis implements entroq.Backend using Redis.
 type EQRedis struct {
-	client *redis.Client
-	nw     entroq.NotifyWaiter
-	stopGC context.CancelFunc
-	gcDone chan struct{}
+	client    *redis.Client
+	nw        entroq.NotifyWaiter
+	stopGC    context.CancelFunc
+	gcDone    chan struct{}
+	gcMetrics *gcmetrics.Metrics
 }
 
 type redisOptions struct {
@@ -100,6 +104,7 @@ type redisOptions struct {
 	nw          entroq.NotifyWaiter
 	gcInterval  time.Duration
 	gcBatchSize int
+	mp          metric.MeterProvider
 }
 
 // RedisOpt configures the Redis backend.
@@ -130,6 +135,14 @@ func WithRedisDB(db int) RedisOpt {
 func WithNotifyWaiter(nw entroq.NotifyWaiter) RedisOpt {
 	return func(o *redisOptions) {
 		o.nw = nw
+	}
+}
+
+// WithMeterProvider sets the OTel MeterProvider used for GC telemetry (metrics
+// are reported under the "entroq.redis" meter). Defaults to a noop provider.
+func WithMeterProvider(mp metric.MeterProvider) RedisOpt {
+	return func(o *redisOptions) {
+		o.mp = mp
 	}
 }
 
@@ -167,12 +180,23 @@ func Open(ctx context.Context, opts ...RedisOpt) (*EQRedis, error) {
 		nw = subq.New()
 	}
 
+	mp := o.mp
+	if mp == nil {
+		mp = noop.NewMeterProvider()
+	}
+	gcMetrics, err := gcmetrics.New(mp.Meter("entroq.redis"))
+	if err != nil {
+		client.Close()
+		return nil, fmt.Errorf("eqredis open: gc metrics: %w", err)
+	}
+
 	gcCtx, gcCancel := context.WithCancel(context.Background())
 	b := &EQRedis{
-		client: client,
-		nw:     nw,
-		stopGC: gcCancel,
-		gcDone: make(chan struct{}),
+		client:    client,
+		nw:        nw,
+		stopGC:    gcCancel,
+		gcDone:    make(chan struct{}),
+		gcMetrics: gcMetrics,
 	}
 	// GC is a first-class, always-on backend behavior. Close cancels it and waits
 	// for it to exit before closing the client, so the loop never touches a closed

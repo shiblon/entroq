@@ -28,6 +28,7 @@ import (
 
 	"github.com/lib/pq"
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/backend/internal/gcmetrics"
 	"github.com/shiblon/entroq/pkg/subq"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
@@ -344,6 +345,7 @@ type EQPG struct {
 	gcDone         chan struct{}
 	claimDuration  metric.Float64Histogram
 	modifyDuration metric.Float64Histogram
+	gcMetrics      *gcmetrics.Metrics
 }
 
 // New creates a new postgres backend that attaches to the given database.
@@ -378,10 +380,18 @@ func New(ctx context.Context, db *sql.DB, nw entroq.NotifyWaiter, opts *pgOption
 		go b.runReadinessTicker(tickerCtx, opts.readinessInterval)
 	}
 
+	mp := opts.mp
+	if mp == nil {
+		mp = noop.NewMeterProvider()
+	}
+	if err := b.initMetrics(mp); err != nil {
+		return nil, fmt.Errorf("eqpg init metrics: %w", err)
+	}
+
 	// Garbage collection is a first-class, always-on backend behavior: it drains
-	// queues that opt in by name (a /gc= component). Close cancels this and waits
-	// for it to exit before closing the DB, so the loop never touches a closed
-	// connection.
+	// queues that opt in by name (a /gc= component). It reports through gcMetrics,
+	// so metrics must be initialized first. Close cancels this and waits for it to
+	// exit before closing the DB, so the loop never touches a closed connection.
 	if opts.gcInterval > 0 {
 		gcCtx, stop := context.WithCancel(ctx)
 		b.stopGC = stop
@@ -390,14 +400,6 @@ func New(ctx context.Context, db *sql.DB, nw entroq.NotifyWaiter, opts *pgOption
 			defer close(b.gcDone)
 			b.runGCLoop(gcCtx, opts.gcInterval, opts.gcBatchSize)
 		}()
-	}
-
-	mp := opts.mp
-	if mp == nil {
-		mp = noop.NewMeterProvider()
-	}
-	if err := b.initMetrics(mp); err != nil {
-		return nil, fmt.Errorf("eqpg init metrics: %w", err)
 	}
 
 	return b, nil
@@ -419,6 +421,9 @@ func (b *EQPG) initMetrics(mp metric.MeterProvider) error {
 	)
 	if err != nil {
 		return fmt.Errorf("modify duration histogram: %w", err)
+	}
+	if b.gcMetrics, err = gcmetrics.New(meter); err != nil {
+		return fmt.Errorf("gc metrics: %w", err)
 	}
 	return nil
 }

@@ -1067,27 +1067,33 @@ EXCEPTION WHEN others THEN
 END $$;
 
 -- entroq.gc_collect deletes up to p_limit currently-collectable tasks (arrived,
--- i.e. at <= now) from queues whose gc activation has passed, and returns the
--- number deleted. Bounded and race-safe:
+-- i.e. at <= now) from queues whose gc activation has passed, and returns one
+-- row per affected queue with the number deleted from it. Sum the counts for the
+-- total. Bounded and race-safe:
 --   - FOR UPDATE SKIP LOCKED makes it mutually exclusive with try_claim per row:
 --     a task being claimed is skipped, not clobbered, and GC never blocks a claim.
 --   - at <= now excludes claimed tasks (claiming pushes at into the future).
 --   - Concurrent callers partition (SKIP LOCKED) rather than duplicate work.
--- Callers invoke it in a tight loop (each call one bounded, quickly-committed
--- transaction) until it returns < p_limit, so no single statement holds locks or
--- accumulates WAL for a large backlog.
-CREATE OR REPLACE FUNCTION entroq.gc_collect(p_limit integer DEFAULT 1000) RETURNS integer LANGUAGE plpgsql AS $$
-DECLARE v_deleted integer;
+-- The per-queue breakdown feeds GC telemetry (deleted counts by queue hierarchy)
+-- from the same statement, with no second pass. Callers invoke it in a tight loop
+-- (each call one bounded, quickly-committed transaction) until the summed count
+-- is < p_limit, so no single statement holds locks or accumulates WAL for a large
+-- backlog.
+CREATE OR REPLACE FUNCTION entroq.gc_collect(p_limit integer DEFAULT 1000)
+    RETURNS TABLE (queue_name text, deleted bigint) LANGUAGE plpgsql AS $$
 BEGIN
+    RETURN QUERY
     WITH due AS (
-        SELECT t.id FROM entroq.tasks t
+        SELECT t.id, t.queue FROM entroq.tasks t
         WHERE t.queue LIKE '%/gc=%' AND t.at <= now() AND entroq.gc_due(t.queue)
         LIMIT p_limit
         FOR UPDATE SKIP LOCKED
+    ),
+    del AS (
+        DELETE FROM entroq.tasks t USING due WHERE t.id = due.id
+        RETURNING t.queue
     )
-    DELETE FROM entroq.tasks t USING due WHERE t.id = due.id;
-    GET DIAGNOSTICS v_deleted = ROW_COUNT;
-    RETURN v_deleted;
+    SELECT del.queue, count(*)::bigint FROM del GROUP BY del.queue;
 END $$;
 
 -- Schema version tracking. Updated on every run of this script so that
