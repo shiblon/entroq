@@ -77,7 +77,9 @@ func (e *EQRedis) collectOnce(ctx context.Context, batch int) (int, error) {
 
 	names, err := e.client.SMembers(ctx, queuesKey).Result()
 	if err != nil {
-		e.gcMetrics.Error(ctx, "", "list")
+		if ctx.Err() == nil { // don't count shutdown cancellation as a GC error
+			e.gcMetrics.Error(ctx, "", "list")
+		}
 		return 0, fmt.Errorf("gc list queues: %w", err)
 	}
 
@@ -92,7 +94,9 @@ func (e *EQRedis) collectOnce(ctx context.Context, batch int) (int, error) {
 		}
 		n, err := e.collectQueue(ctx, q, nowMs, batch-total)
 		if err != nil {
-			e.gcMetrics.Error(ctx, q, "collect")
+			if ctx.Err() == nil {
+				e.gcMetrics.Error(ctx, q, "collect")
+			}
 			return total, fmt.Errorf("gc collect %q: %w", q, err)
 		}
 		e.gcMetrics.Deleted(ctx, q, n)

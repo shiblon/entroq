@@ -64,6 +64,7 @@ var serveCmd = &cobra.Command{
 			eqredis.WithAddr(redisAddr),
 			eqredis.WithPassword(redisPwd),
 			eqredis.WithRedisDB(redisDB),
+			eqredis.WithMeterProvider(mp),
 		)
 
 		svc, err := eqsvcgrpc.New(ctx, opener,

@@ -17,7 +17,7 @@ var sendCmd = &cobra.Command{
 tasks on the target queue and the sender blocks waiting for a Response task on
 an ephemeral per-request response queue.
 
-Use "eqlink run" to start the full sidecar (sender + receiver + GC).`,
+Use "eqlink run" to start the full sidecar (sender + receiver).`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 

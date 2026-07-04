@@ -294,9 +294,9 @@ destination and point it at the remote source; it claims there and delivers here
 Each delivery atomically inserts the inbox task and a value-stripped dedup
 tombstone keyed by a deterministic transfer ID, then deletes the source task. If a
 crash re-delivers, the insert collides on the tombstone and no duplicate is
-produced; the happy path cleans up its own tombstone, and a reaper sweeps crash
-orphans once their TTL elapses. Inbox consumers need no special handling; they
-see ordinary tasks.
+produced; the happy path cleans up its own tombstone, and the destination
+backend's built-in GC sweeps crash orphans once their TTL elapses. Inbox
+consumers need no special handling; they see ordinary tasks.
 
 ## Production Deployment (Helm)
 

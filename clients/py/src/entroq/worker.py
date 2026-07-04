@@ -437,7 +437,10 @@ class EntroQWorker:
         gc_collect = self._client.gc_collect
         while not self._stop_event.is_set():
             try:
-                while await gc_collect(_GC_BATCH) >= _GC_BATCH:
+                # Tight-drain full batches, but stay interruptible on stop() so
+                # the loop ends promptly on its own terms rather than depending
+                # on run() to cancel it mid-drain.
+                while await gc_collect(_GC_BATCH) >= _GC_BATCH and not self._stop_event.is_set():
                     pass
             except asyncio.CancelledError:
                 raise

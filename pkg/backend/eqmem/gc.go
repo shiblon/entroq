@@ -117,14 +117,18 @@ func (m *EQMem) collectOnce(ctx context.Context, batch int) (int, error) {
 				Duration: entroq.DefaultClaimDuration,
 			})
 			if err != nil {
-				m.gcMetrics.Error(ctx, q, "claim")
+				if ctx.Err() == nil { // don't count shutdown cancellation as a GC error
+					m.gcMetrics.Error(ctx, q, "claim")
+				}
 				return deleted, fmt.Errorf("gc claim %q: %w", q, err)
 			}
 			if task == nil {
 				break // nothing more collectable in this queue right now
 			}
 			if _, err := m.Modify(ctx, entroq.NewModification(gcClaimant, task.Delete())); err != nil {
-				m.gcMetrics.Error(ctx, q, "delete")
+				if ctx.Err() == nil {
+					m.gcMetrics.Error(ctx, q, "delete")
+				}
 				return deleted, fmt.Errorf("gc delete %v: %w", task.IDVersion(), err)
 			}
 			perQueue[q]++

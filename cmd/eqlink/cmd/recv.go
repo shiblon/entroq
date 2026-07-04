@@ -19,7 +19,7 @@ var recvCmd = &cobra.Command{
 request to the upstream service, and enqueues the Response task back to the
 caller's response queue.
 
-Use "eqlink run" to start the full sidecar (sender + receiver + GC).`,
+Use "eqlink run" to start the full sidecar (sender + receiver).`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
