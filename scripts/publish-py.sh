@@ -49,4 +49,4 @@ docker run --rm \
     -w /work \
     -e PYPI_TOKEN="${PYPI_TOKEN}" \
     python:3.12-slim \
-    sh -c "pip install --quiet build twine && python -m build && twine upload --non-interactive -u __token__ -p \"${PYPI_TOKEN}\" dist/*"
+    sh -c "pip install --quiet build twine && rm -rf dist && python -m build && twine upload --non-interactive --skip-existing -u __token__ -p \"${PYPI_TOKEN}\" dist/*"
