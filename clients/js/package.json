@@ -29,7 +29,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/shiblon/entroq.git",
+    "url": "git+https://github.com/shiblon/entroq.git",
     "directory": "clients/js"
   },
   "devDependencies": {
