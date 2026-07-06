@@ -35,6 +35,19 @@ def _pg_channel_name(queue: str) -> str:
     return 'q_' + sanitized[:25] + '_' + h[:8] + '_' + sanitized[-26:]
 
 
+def _pg_interval(duration_ms: int) -> str:
+    """Format a millisecond duration as a Postgres interval literal.
+
+    Split into whole seconds plus a milliseconds remainder so that no single
+    interval field integer exceeds int32, which Postgres rejects (SQLSTATE
+    22015, "interval field value out of range"). A bare milliseconds field
+    overflows at ~24.8 days (INT32_MAX milliseconds); expressing whole seconds
+    separately pushes that ceiling out to ~68 years.
+    """
+    secs, ms = divmod(duration_ms, 1000)
+    return f'{secs} seconds {ms} milliseconds'
+
+
 # ---------------------------------------------------------------------------
 # Row → dataclass helpers
 # ---------------------------------------------------------------------------
@@ -290,7 +303,7 @@ class EntroQ(EntroQBase):
         async with await psycopg.AsyncConnection.connect(self._connstr, autocommit=True, row_factory=dict_row, options=_OPTS) as conn:
             cur = await conn.execute(
                 "SELECT * FROM try_claim(%s, %s, %s::interval)",
-                (queues, self._claimant, f'{duration_ms} milliseconds'),
+                (queues, self._claimant, _pg_interval(duration_ms)),
             )
             rows = await cur.fetchall()
         return _row_to_task(rows[0]) if rows else None
@@ -349,7 +362,7 @@ class EntroQ(EntroQBase):
             try:
                 cur = await conn.execute(
                     "SELECT * FROM claim_docs(%s, %s, %s::interval, %s)",
-                    (namespace, self._claimant, f'{duration_ms} milliseconds', key),
+                    (namespace, self._claimant, _pg_interval(duration_ms), key),
                 )
                 return [_row_to_doc(r) for r in await cur.fetchall()]
             except psycopg.DatabaseError as e:

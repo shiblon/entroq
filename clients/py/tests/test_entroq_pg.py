@@ -66,6 +66,26 @@ async def test_claim_unblocks_on_notify(eq: EntroQ):
 # renewing -- renewal correctness
 # ---------------------------------------------------------------------------
 
+async def test_claim_long_duration(eq: EntroQ):
+    """A long claim TTL must not overflow the Postgres interval field.
+
+    The duration was formatted as a bare-milliseconds interval literal, which
+    Postgres rejects once the integer exceeds int32 (~24.8 days), erroring
+    before the claim ran. Claim well past that ceiling and confirm the lease
+    is honored.
+    """
+    QUEUE = '/test/long_duration'
+    # ~30 days, comfortably past the ~24.8-day int32 milliseconds ceiling.
+    DURATION_MS = 30 * 24 * 60 * 60 * 1000
+
+    await eq.modify(Modification(Modification.inserting(TaskData(queue=QUEUE, value='work'))))
+    before = datetime.now(timezone.utc)
+    task = await eq.try_claim(QUEUE, duration_ms=DURATION_MS)
+    assert task is not None
+    # Lease should extend ~DURATION_MS into the future; allow generous slack.
+    assert task.at >= before + timedelta(milliseconds=DURATION_MS) - timedelta(minutes=1)
+
+
 async def test_renewal_updates_task_version(eq: EntroQ):
     """Renewer task should bump the task version during the renewing block."""
     QUEUE = '/test/renew'
