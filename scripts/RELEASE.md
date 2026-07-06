@@ -66,9 +66,20 @@ Builds and pushes the `entroq-pg`, `entroq-mem`, `entroq-redis`,
 The Python and JS clients version and publish independently of the Go module:
 
 ```sh
-./scripts/publish-py.sh    # PyPI
-./scripts/publish-js.sh    # npm
+PYPI_TOKEN=<token> ./scripts/publish-py.sh <version>    # PyPI
+NPM_TOKEN=<token>  ./scripts/publish-js.sh <version>    # npm
 ```
+
+Both publishes run non-interactively (the JS one inside a Docker container), so
+the tokens must not require an interactive 2FA prompt:
+
+- **PyPI:** the very first publish of a new project name needs an **account-scoped**
+  token (a project-scoped token can't create a project that doesn't exist yet);
+  scope it down to the project afterward.
+- **npm:** use a classic **Automation** token, or a granular token with **"Bypass
+  2FA"** enabled (and all-packages write for a first publish). A plain "Publish"
+  token fails non-interactive uploads with `E403 ... two-factor authentication ...
+  required`.
 
 ## Version numbering
 

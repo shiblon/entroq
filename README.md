@@ -83,6 +83,11 @@ To install an unreleased version straight from the `clients/py` subdirectory:
 python3 -m pip install "git+https://github.com/shiblon/entroq#subdirectory=clients/py"
 ```
 
+The JavaScript/TypeScript client is on npm:
+```bash
+npm install entroq
+```
+
 ### Shell Workers
 `eqc work` is a small worker protocol for shell scripts and other local
 commands. It is meant for leaf work and simple work-then-respond flows:
