@@ -7,6 +7,37 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.6.1] - 2026-07-06
+
+Go module `v1.6.1`. A bug-fix and performance release for the Redis and
+PostgreSQL backends. No schema change (schema version stays 1.6.0) and no new
+public API. Python client `0.12.1`.
+
+### Fixed
+
+- **PostgreSQL claims longer than ~35 minutes failed.** `eqpg` (and the Python
+  direct-PostgreSQL client) formatted a claim's TTL as an all-microseconds
+  interval literal, which PostgreSQL rejects once the field exceeds int32
+  (SQLSTATE 22015), so any task or doc claim beyond ~35.8 minutes errored before
+  it ran, while `eqmem` and `eqredis` handled it fine. Durations are now split
+  into whole seconds plus a sub-second remainder; any duration works.
+- **`eqredis` claimant-filtered `Tasks` could return too few results, even
+  zero.** The `Limit` was applied before the claimant filter, so a listing could
+  come back short (or empty) while matching tasks sat behind tasks claimed by
+  other workers. `Limit` now bounds matching results, `min(Limit, #matching)`,
+  consistent with `eqpg` and `eqmem`. Claimant-free limited listings are also
+  ~9x faster on large queues (the limit is pushed into the range read instead of
+  scanning the whole queue). The `Claimant`/`Limit` contract is now documented on
+  `TasksQuery`.
+
+### Changed
+
+- **`eqredis` claims run as a single atomic Lua script** rather than a
+  WATCH/MULTI optimistic-retry loop, collapsing a claim to one round-trip
+  (~3x faster, with ~3-5x lower latency under concurrent claimers). The random
+  selection among the most-overdue tasks, EntroQ's anti-starvation guarantee, is
+  preserved and now covered by a cross-backend conformance test.
+
 ## [1.6.0] - 2026-07-04
 
 Go module `v1.6.0`. Garbage collection becomes a first-class, always-on property
