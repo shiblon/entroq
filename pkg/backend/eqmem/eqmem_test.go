@@ -102,6 +102,10 @@ func TestEQMemClaimRandomHead(t *testing.T) {
 	RunQTest(t, eqtest.ClaimRandomHead)
 }
 
+func TestEQMemTasksClaimantLimit(t *testing.T) {
+	RunQTest(t, eqtest.TasksClaimantLimit)
+}
+
 func TestEQMemMapReduce_checkSmall(t *testing.T) {
 	config := &quick.Config{
 		MaxCount: 2,

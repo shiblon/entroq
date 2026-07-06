@@ -224,6 +224,139 @@ func TasksWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	}
 }
 
+// TasksClaimantLimit pins down the Tasks(Queue, Claimant, Limit) contract, the
+// one no other test covered. A claimant-filtered listing returns tasks that are
+// available/expired (arrival time in the past) OR claimed by that claimant, and
+// Limit caps the count of MATCHING tasks -- min(Limit, #matching) -- not the
+// number of candidates inspected. The distinction matters: a backend that
+// applies Limit before filtering can return fewer than that, even zero, while
+// matching tasks exist. This exercises exactly that trap.
+func TasksClaimantLimit(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	t.Helper()
+
+	const (
+		me    = "worker-me"
+		other = "worker-other"
+	)
+
+	idSet := func(tasks []*entroq.Task) map[string]bool {
+		s := make(map[string]bool, len(tasks))
+		for _, task := range tasks {
+			s[task.ID] = true
+		}
+		return s
+	}
+
+	// Case 1: with only available tasks, Limit caps the count and every result
+	// matches (available tasks always satisfy a claimant filter).
+	t.Run("available_limit", func(t *testing.T) {
+		queue := path.Join(qPrefix, "claimant_limit", "available")
+		past := time.Now().Add(-time.Hour).UTC()
+		var args []entroq.ModifyArg
+		for i := 0; i < 10; i++ {
+			args = append(args, entroq.InsertingInto(queue, entroq.WithArrivalTime(past)))
+		}
+		if _, err := client.Modify(ctx, args...); err != nil {
+			t.Fatalf("insert available: %v", err)
+		}
+
+		tasks, err := client.Tasks(ctx, queue, entroq.ClaimedBy(me), entroq.LimitTasks(4))
+		if err != nil {
+			t.Fatalf("tasks: %v", err)
+		}
+		if len(tasks) != 4 {
+			t.Fatalf("available+limit: want 4 tasks, got %d", len(tasks))
+		}
+
+		// With Limit above the matching count, all 10 come back.
+		tasks, err = client.Tasks(ctx, queue, entroq.ClaimedBy(me), entroq.LimitTasks(50))
+		if err != nil {
+			t.Fatalf("tasks (high limit): %v", err)
+		}
+		if len(tasks) != 10 {
+			t.Fatalf("available+high limit: want 10 tasks, got %d", len(tasks))
+		}
+	})
+
+	// Case 2: the zero-results trap. Fill a queue so that the lowest-arrival
+	// tasks are all claimed by SOMEONE ELSE (nearer expiry), while the querying
+	// claimant's own tasks sit behind them (farther expiry). A backend that
+	// limits candidates before filtering scans only the other-owned wall and
+	// returns nothing; the contract requires min(Limit, #mine) of the querier's
+	// own tasks.
+	t.Run("mine_behind_others", func(t *testing.T) {
+		queue := path.Join(qPrefix, "claimant_limit", "behind")
+		const (
+			nMine      = 5
+			nOther     = 10
+			myClaim    = 20 * time.Second // farther expiry: sorts AFTER others
+			otherClaim = 10 * time.Second // nearer expiry: sorts ahead of mine
+		)
+
+		past := time.Now().Add(-time.Hour).UTC()
+		var args []entroq.ModifyArg
+		for i := 0; i < nMine+nOther; i++ {
+			args = append(args, entroq.InsertingInto(queue, entroq.WithArrivalTime(past)))
+		}
+		if _, err := client.Modify(ctx, args...); err != nil {
+			t.Fatalf("insert pool: %v", err)
+		}
+
+		// Claim nMine as the querying claimant with the farther expiry.
+		mine := make(map[string]bool, nMine)
+		for i := 0; i < nMine; i++ {
+			task, err := client.TryClaim(ctx, entroq.From(queue), entroq.WithClaimant(me), entroq.ClaimFor(myClaim))
+			if err != nil {
+				t.Fatalf("claim mine %d: %v", i, err)
+			}
+			if task == nil {
+				t.Fatalf("claim mine %d: nothing available", i)
+			}
+			mine[task.ID] = true
+		}
+		// Claim the rest as another claimant with a nearer expiry, so they sort
+		// ahead of "mine" by arrival time.
+		for i := 0; i < nOther; i++ {
+			task, err := client.TryClaim(ctx, entroq.From(queue), entroq.WithClaimant(other), entroq.ClaimFor(otherClaim))
+			if err != nil {
+				t.Fatalf("claim other %d: %v", i, err)
+			}
+			if task == nil {
+				t.Fatalf("claim other %d: nothing available", i)
+			}
+		}
+
+		// Limit below nMine: expect exactly Limit, all owned by me.
+		tasks, err := client.Tasks(ctx, queue, entroq.ClaimedBy(me), entroq.LimitTasks(3))
+		if err != nil {
+			t.Fatalf("tasks limited: %v", err)
+		}
+		if len(tasks) != 3 {
+			t.Fatalf("mine-behind-others with Limit=3: want 3, got %d (a pre-filter limit returns 0 here)", len(tasks))
+		}
+		for _, task := range tasks {
+			if !mine[task.ID] {
+				t.Fatalf("returned task %s is not owned by %q", task.ID, me)
+			}
+		}
+
+		// Limit above nMine: expect all nMine of my tasks, and only mine.
+		tasks, err = client.Tasks(ctx, queue, entroq.ClaimedBy(me), entroq.LimitTasks(50))
+		if err != nil {
+			t.Fatalf("tasks high limit: %v", err)
+		}
+		got := idSet(tasks)
+		if len(got) != nMine {
+			t.Fatalf("mine-behind-others with high Limit: want %d, got %d", nMine, len(got))
+		}
+		for id := range mine {
+			if !got[id] {
+				t.Fatalf("expected my task %s in results, missing", id)
+			}
+		}
+	})
+}
+
 // TasksWithIDOnly tests that tasks listed by ID only (no queue) can return from multiple queues.
 func TasksWithIDOnly(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	q1 := path.Join(qPrefix, "id_only_1")

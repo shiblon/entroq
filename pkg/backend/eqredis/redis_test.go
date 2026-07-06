@@ -125,6 +125,10 @@ func TestClaimRandomHead(t *testing.T) {
 	RunQTest(t, eqtest.ClaimRandomHead)
 }
 
+func TestTasksClaimantLimit(t *testing.T) {
+	RunQTest(t, eqtest.TasksClaimantLimit)
+}
+
 func TestWorkerDependencyHandler(t *testing.T) {
 	RunQTest(t, eqtest.WorkerDependencyHandler)
 }

@@ -8,10 +8,21 @@ import (
 
 // TasksQuery holds information for a tasks query.
 type TasksQuery struct {
-	Queue    string
+	Queue string
+
+	// Claimant, when non-empty, filters results to tasks that are available or
+	// expired (arrival time at or before now) OR currently claimed by this
+	// claimant. Empty means no claimant filter: every task is eligible.
 	Claimant string
-	Limit    int
-	IDs      []string
+
+	// Limit, when positive, caps the number of MATCHING tasks returned -- that
+	// is, min(Limit, number of tasks passing the Claimant filter). It bounds the
+	// result count, not the number of candidates a backend inspects; a backend
+	// must not return fewer than this while more matching tasks exist. Zero or
+	// negative means no limit. No ordering of results is guaranteed.
+	Limit int
+
+	IDs []string
 
 	// OmitValues specifies that only metadata should be returned.
 	// Backends are not required to honor this flag, though any
