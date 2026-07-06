@@ -549,4 +549,92 @@ func DeleteMissingTask(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 	}
 }
 
+// ClaimRandomHead verifies EntroQ's anti-starvation contract: when several
+// tasks are equally eligible (same arrival time, all available), TryClaim must
+// NOT deterministically pick the same one every time. A backend that always
+// returns, say, the lowest-ID task would let a persistently-failing task
+// re-claim forever and starve the rest of the queue -- so random selection
+// among the most-overdue available tasks is part of the interface, not an
+// implementation detail. Every backend must satisfy it (eqmem via probabilistic
+// heap descent, eqpg via ID-hash buckets, eqredis via a random window offset).
+//
+// The test runs many independent trials. Each trial uses a FRESH queue and two
+// freshly-inserted tasks with server-assigned IDs and an identical arrival time.
+// Fresh IDs per trial matter: a backend that spreads by hashing the ID (eqpg)
+// would legitimately favor one member of a FIXED pair whose hashes happen to
+// collide in the same bucket, so reusing IDs would make a correct backend look
+// broken. With new IDs each trial, any per-pair skew averages out.
+//
+// We track two labelings of the winner, because a determinism bug could latch
+// onto either: the lexically-smaller ID (the shape of the eqredis regression
+// this test was written to catch) and the first-inserted task (a created-time
+// tiebreak, say). A fair backend lands each near 50%; the band below is loose
+// enough that no fair backend flakes (eqmem's heap skews one metric to ~2/3,
+// still well inside) yet a fully deterministic backend (0% or 100%) always
+// trips it. The band is two-sided on purpose: "smaller ID wins < X%" alone would
+// silently pass a backend that ALWAYS picks the larger ID.
+func ClaimRandomHead(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	t.Helper()
+
+	const (
+		trials  = 300
+		minFrac = 0.10 // deterministic-one-side => 0.0; fair (incl. eqmem ~0.33) stays well above
+		maxFrac = 0.90 // deterministic-other-side => 1.0; fair (incl. eqmem ~0.67) stays well below
+	)
+
+	// A fixed arrival time in the past: both tasks are immediately claimable and
+	// perfectly tied, so nothing but the backend's tiebreak decides the winner.
+	at := time.Now().Add(-time.Hour).UTC()
+
+	var smallerIDWins, firstInsertedWins int
+	for i := 0; i < trials; i++ {
+		queue := path.Join(qPrefix, "claim_random_head", fmt.Sprint(i))
+
+		resp, err := client.Modify(ctx,
+			entroq.InsertingInto(queue, entroq.WithValue("a"), entroq.WithArrivalTime(at)),
+			entroq.InsertingInto(queue, entroq.WithValue("b"), entroq.WithArrivalTime(at)),
+		)
+		if err != nil {
+			t.Fatalf("trial %d: insert pair: %v", i, err)
+		}
+		if len(resp.InsertedTasks) != 2 {
+			t.Fatalf("trial %d: want 2 inserted, got %d", i, len(resp.InsertedTasks))
+		}
+		first := resp.InsertedTasks[0].ID
+		smaller := resp.InsertedTasks[0].ID
+		if resp.InsertedTasks[1].ID < smaller {
+			smaller = resp.InsertedTasks[1].ID
+		}
+
+		claimed, err := client.TryClaim(ctx, entroq.From(queue), entroq.ClaimFor(time.Minute))
+		if err != nil {
+			t.Fatalf("trial %d: try claim: %v", i, err)
+		}
+		if claimed == nil {
+			t.Fatalf("trial %d: nothing claimed from a queue with two available tasks", i)
+		}
+
+		if claimed.ID == smaller {
+			smallerIDWins++
+		}
+		if claimed.ID == first {
+			firstInsertedWins++
+		}
+	}
+
+	smallerFrac := float64(smallerIDWins) / trials
+	firstFrac := float64(firstInsertedWins) / trials
+	t.Logf("over %d trials: smaller-ID won %.1f%%, first-inserted won %.1f%% (each should sit near 50%%)",
+		trials, smallerFrac*100, firstFrac*100)
+
+	if smallerFrac < minFrac || smallerFrac > maxFrac {
+		t.Errorf("claim head selection looks deterministic by ID: smaller-ID won %.1f%% of %d trials, want within [%.0f%%, %.0f%%]",
+			smallerFrac*100, trials, minFrac*100, maxFrac*100)
+	}
+	if firstFrac < minFrac || firstFrac > maxFrac {
+		t.Errorf("claim head selection looks deterministic by insertion order: first-inserted won %.1f%% of %d trials, want within [%.0f%%, %.0f%%]",
+			firstFrac*100, trials, minFrac*100, maxFrac*100)
+	}
+}
+
 // WorkerDependencyHandler tests that the worker calls the dependency handler when a finish modify fails.

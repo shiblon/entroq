@@ -121,6 +121,10 @@ func TestDeleteMissingTask(t *testing.T) {
 	RunQTest(t, eqtest.DeleteMissingTask)
 }
 
+func TestClaimRandomHead(t *testing.T) {
+	RunQTest(t, eqtest.ClaimRandomHead)
+}
+
 func TestWorkerDependencyHandler(t *testing.T) {
 	RunQTest(t, eqtest.WorkerDependencyHandler)
 }

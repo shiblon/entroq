@@ -98,6 +98,10 @@ func TestEQMemDeleteMissingTask(t *testing.T) {
 	RunQTest(t, eqtest.DeleteMissingTask)
 }
 
+func TestEQMemClaimRandomHead(t *testing.T) {
+	RunQTest(t, eqtest.ClaimRandomHead)
+}
+
 func TestEQMemMapReduce_checkSmall(t *testing.T) {
 	config := &quick.Config{
 		MaxCount: 2,
