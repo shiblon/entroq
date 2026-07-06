@@ -16,7 +16,7 @@ import time
 
 from entroq import Modification, TaskData
 from entroq.json import EntroQJSON
-from entroq.pg import EntroQ as EntroQPostgres
+from entroq.experimental.pg import EntroQ as EntroQPostgres
 
 from mr import MapWorker, ReduceWorker
 from chaos import ChaosWorker

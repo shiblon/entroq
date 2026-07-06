@@ -7,9 +7,9 @@ import psycopg
 import pytest
 from testcontainers.postgres import PostgresContainer
 
-from entroq.pg import EntroQ
+from entroq.experimental.pg import EntroQ
 
-_SCHEMA_SQL = importlib.resources.files('entroq.pg').joinpath('schema.sql')
+_SCHEMA_SQL = importlib.resources.files('entroq.experimental.pg').joinpath('schema.sql')
 
 _PG_IMAGE    = 'postgres:11'
 _PG_PASSWORD = 'password'

@@ -10,7 +10,7 @@ file collects the things that are easy to get wrong here.
 The PostgreSQL schema exists in two copies:
 
 - `pkg/backend/eqpg/schema.sql` — **canonical** (applied by `eqpg schema init`).
-- `clients/py/src/entroq/pg/schema.sql` — a vendored copy bundled in the Python
+- `clients/py/src/entroq/experimental/pg/schema.sql` — a vendored copy bundled in the Python
   wheel so a pip-only user can prepare a database without a Go toolchain.
 
 Treat the Go file as the source of truth and the Python file as a copy of it.
@@ -19,7 +19,7 @@ byte-identical — and keep the schema-version constants in lockstep:
 
 - the schema stamps `schema_version` into `entroq.meta`,
 - `pkg/backend/eqpg/schema.go` declares `SchemaVersion`,
-- `clients/py/src/entroq/pg/__init__.py` declares `SCHEMA_VERSION`,
+- `clients/py/src/entroq/experimental/pg/__init__.py` declares `SCHEMA_VERSION`,
 
 and all three must equal the same value. Each client checks the stamped version
 on connect, so a mismatch makes the client refuse to connect, and any schema

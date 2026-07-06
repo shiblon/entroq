@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 import psycopg
 import pytest
 
-from entroq.pg import EntroQ
+from entroq.experimental.pg import EntroQ
 from entroq.types import DependencyError, Modification, TaskData, TaskID
 from entroq.worker import EntroQWorker, Handler, _renewing
 

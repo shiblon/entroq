@@ -46,9 +46,9 @@ helm-template: helm-sync ## Render the chart to stdout (useful for reviewing out
 # (pkg/backend/eqpg) fails if they drift or their version constants disagree.
 .PHONY: schema-sync
 schema-sync: ## Copy the canonical Postgres schema into the Python client.
-	cp pkg/backend/eqpg/schema.sql clients/py/src/entroq/pg/schema.sql
+	cp pkg/backend/eqpg/schema.sql clients/py/src/entroq/experimental/pg/schema.sql
 	@echo "schema-sync: Python schema updated from canonical."
-	@echo "If the schema version changed, also align SCHEMA_VERSION in clients/py/src/entroq/pg/__init__.py."
+	@echo "If the schema version changed, also align SCHEMA_VERSION in clients/py/src/entroq/experimental/pg/__init__.py."
 
 ##@ Help
 

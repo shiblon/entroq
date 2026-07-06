@@ -75,7 +75,7 @@ eqc --help
 The Python client is on PyPI:
 ```bash
 python3 -m pip install entroq            # client + async worker
-python3 -m pip install "entroq[pg]"      # adds the direct-PostgreSQL backend
+python3 -m pip install "entroq[pg]"      # + experimental direct-PostgreSQL client (entroq.experimental.pg)
 ```
 
 To install an unreleased version straight from the `clients/py` subdirectory:

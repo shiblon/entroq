@@ -17,7 +17,7 @@ import (
 func TestSchemaFilesInSync(t *testing.T) {
 	const (
 		canonical = "schema.sql"
-		pyDir     = "../../../clients/py/src/entroq/pg"
+		pyDir     = "../../../clients/py/src/entroq/experimental/pg"
 	)
 	pySchema := pyDir + "/schema.sql"
 

@@ -17,8 +17,8 @@ from typing import AsyncIterator
 import psycopg
 from psycopg.rows import dict_row
 
-from ..types import Task, Doc, DependencyError, Modification, ModifyResult, _DOC_RELEASE_AT
-from ..base import EntroQBase
+from ...types import Task, Doc, DependencyError, Modification, ModifyResult, _DOC_RELEASE_AT
+from ...base import EntroQBase
 
 
 # ---------------------------------------------------------------------------

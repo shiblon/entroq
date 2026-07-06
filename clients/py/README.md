@@ -9,10 +9,15 @@ EntroQ two ways:
 
 - **`EntroQJSON`** — talks to a Go EntroQ server over its HTTP/Connect API. Use
   this when a server is already running (`eqpg`/`eqmem`/`eqredis serve`).
-- **`EntroQ`** (in `entroq.pg`) — talks **directly to PostgreSQL**, no Go server
-  in the path. It uses the same stored procedures the Go `eqpg` backend does, and
-  bundles the canonical schema so a pip-only environment can initialize a database
-  without a Go toolchain. Requires the `pg` extra.
+- **`EntroQ`** (in `entroq.experimental.pg`) — talks **directly to PostgreSQL**,
+  no Go server in the path. It uses the same stored procedures the Go `eqpg`
+  backend does, and bundles the canonical schema so a pip-only environment can
+  initialize a database without a Go toolchain. Requires the `pg` extra.
+
+  > **Experimental.** Anything under `entroq.experimental` has no stability
+  > guarantee and may change or be removed in any release, including patches. The
+  > stable, supported path is `EntroQJSON` against a Go server. Pin an exact
+  > version if you depend on the direct client.
 
 ## Install
 
@@ -40,10 +45,10 @@ async def process(task, docs):
 asyncio.run(EntroQWorker(eq, "my-queue").run(process))
 ```
 
-Talking straight to PostgreSQL instead of a server:
+Talking straight to PostgreSQL instead of a server (experimental, see above):
 
 ```python
-from entroq.pg import EntroQ
+from entroq.experimental.pg import EntroQ
 
 eq = EntroQ("host=localhost dbname=entroq user=entroq password=secret")
 ```
