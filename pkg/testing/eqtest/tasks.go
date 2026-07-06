@@ -357,6 +357,41 @@ func TasksClaimantLimit(ctx context.Context, t *testing.T, client *entroq.EntroQ
 	})
 }
 
+// ClaimLongDuration guards against a backend that cannot represent a long claim
+// TTL. A claim duration is just a lease length; nothing in the contract caps it.
+// eqpg formatted the TTL as a Postgres interval literal in microseconds, and the
+// interval parser rejects any single field integer above INT32_MAX (~35.8
+// minutes' worth of microseconds), so a claim longer than that errored before it
+// ran. eqmem and eqredis take a raw duration and never hit that wall; this test
+// keeps all three honest.
+func ClaimLongDuration(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	t.Helper()
+	queue := path.Join(qPrefix, "claim_long_duration")
+
+	if _, err := client.Modify(ctx, entroq.InsertingInto(queue)); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	// Comfortably past the ~35.8 minute microsecond-field ceiling.
+	const dur = time.Hour
+	before := time.Now().UTC()
+	task, err := client.TryClaim(ctx, entroq.From(queue), entroq.ClaimFor(dur))
+	if err != nil {
+		t.Fatalf("claim for %v: %v", dur, err)
+	}
+	if task == nil {
+		t.Fatalf("claim for %v: nothing claimed from a queue with one available task", dur)
+	}
+
+	// The lease should extend roughly dur into the future; allow slack for
+	// clock skew and round-trip time.
+	wantMin := before.Add(dur - time.Minute)
+	if task.At.Before(wantMin) {
+		t.Fatalf("claim TTL not honored: At=%s, want at least %s",
+			task.At.Format(time.RFC3339Nano), wantMin.Format(time.RFC3339Nano))
+	}
+}
+
 // TasksWithIDOnly tests that tasks listed by ID only (no queue) can return from multiple queues.
 func TasksWithIDOnly(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	q1 := path.Join(qPrefix, "id_only_1")

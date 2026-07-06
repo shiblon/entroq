@@ -453,6 +453,18 @@ func (b *EQPG) Close() error {
 
 // runReadinessTicker examines the task table to see what queues had tasks
 // become recently available to notify on them for the passage of time.
+// pgInterval formats a duration as a Postgres interval literal, split into
+// seconds and microseconds so that no single interval field integer exceeds
+// int32, which Postgres rejects with SQLSTATE 22015. A bare microseconds field
+// overflows at ~35.8 minutes (INT32_MAX microseconds); expressing whole seconds
+// separately pushes that ceiling out to ~68 years while preserving full
+// microsecond precision.
+func pgInterval(d time.Duration) string {
+	secs := d / time.Second
+	usec := (d % time.Second) / time.Microsecond
+	return fmt.Sprintf("%d seconds %d microseconds", secs, usec)
+}
+
 func (b *EQPG) runReadinessTicker(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -465,7 +477,7 @@ func (b *EQPG) runReadinessTicker(ctx context.Context, interval time.Duration) {
 			// notify_ready_queues atomically updates its own watermark state.
 			// We use a safety interval of half the ticker interval to prevent
 			// accidental double-flushing if tickers drift.
-			rows, err := b.DB.QueryContext(ctx, "SELECT entroq.notify_ready_queues($1)", fmt.Sprintf("%d microseconds", interval/(2*time.Microsecond)))
+			rows, err := b.DB.QueryContext(ctx, "SELECT entroq.notify_ready_queues($1)", pgInterval(interval/2))
 			if err != nil {
 				log.Printf("pg readiness ticker: %v", err)
 				continue
@@ -649,7 +661,7 @@ func (b *EQPG) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 	err := b.DB.QueryRowContext(ctx,
 		`SELECT id, version, queue, at, created, modified, claimant, value, claims, attempt, err
 		 FROM try_claim($1, $2, $3)`,
-		pq.Array(cq.Queues), cq.Claimant, fmt.Sprintf("%d microseconds", cq.Duration/time.Microsecond),
+		pq.Array(cq.Queues), cq.Claimant, pgInterval(cq.Duration),
 	).Scan(
 		&task.ID, &task.Version, &task.Queue, &task.At,
 		&task.Created, &task.Modified, &task.Claimant,
@@ -1214,7 +1226,7 @@ func (b *EQPG) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.Do
 		return nil, fmt.Errorf("claim docs: %w", err)
 	}
 
-	dur := fmt.Sprintf("%d microseconds", cq.Duration.Microseconds())
+	dur := pgInterval(cq.Duration)
 	rows, err := b.DB.QueryContext(ctx,
 		`SELECT namespace, id, version, claimant, at, key_primary, key_secondary, value, created, modified
 		 FROM entroq._claim_docs($1, $2, $3::interval, $4)`,

@@ -106,6 +106,10 @@ func TestEQMemTasksClaimantLimit(t *testing.T) {
 	RunQTest(t, eqtest.TasksClaimantLimit)
 }
 
+func TestEQMemClaimLongDuration(t *testing.T) {
+	RunQTest(t, eqtest.ClaimLongDuration)
+}
+
 func TestEQMemMapReduce_checkSmall(t *testing.T) {
 	config := &quick.Config{
 		MaxCount: 2,

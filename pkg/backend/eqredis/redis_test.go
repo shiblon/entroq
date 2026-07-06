@@ -129,6 +129,10 @@ func TestTasksClaimantLimit(t *testing.T) {
 	RunQTest(t, eqtest.TasksClaimantLimit)
 }
 
+func TestClaimLongDuration(t *testing.T) {
+	RunQTest(t, eqtest.ClaimLongDuration)
+}
+
 func TestWorkerDependencyHandler(t *testing.T) {
 	RunQTest(t, eqtest.WorkerDependencyHandler)
 }
