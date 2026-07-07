@@ -1,6 +1,6 @@
 {
   "name": "entroq",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "description": "EntroQ Task Queue Node Client",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
