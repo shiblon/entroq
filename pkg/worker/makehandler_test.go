@@ -14,7 +14,7 @@ import (
 // run DoWork. With a fresh handler constructed per task (the contract), every
 // task observes a count of 1. If the worker reused one handler instance across
 // tasks (the pre-fix once-per-Run behavior), the count would climb 1, 2, 3, ...
-// which is exactly the per-task state leak that produced the pullworker
+// which is exactly the per-task state leak that produced the handoffworker
 // stale-tombstone bug.
 type countingHandler struct {
 	eqc      *entroq.EntroQ
@@ -40,7 +40,7 @@ func (h *countingHandler) Finish(ctx context.Context, task *entroq.Task, _ strin
 // TestWorker_FreshHandlerPerTask locks in the contract that makeHandler runs
 // once per task, so per-task handler state is isolated by construction and can
 // never leak across the Run loop. This is the regression guard for the
-// pullworker stale-state bug: the worker package, not each caller, owns per-task
+// handoffworker stale-state bug: the worker package, not each caller, owns per-task
 // freshness. Revert makeHandler to once-per-Run and this test goes red (the
 // observed counts become 1, 2, 3 instead of all 1).
 func TestWorker_FreshHandlerPerTask(t *testing.T) {

@@ -1,15 +1,16 @@
-// Package pullworker provides a worker that pulls tasks from a queue on one
-// EntroQ instance and delivers them, exactly once in effect, into a queue on
-// another instance.
+// Package handoffworker provides a worker that hands a task off from a queue on
+// one EntroQ instance to a queue on another, exactly once in effect.
 //
-// # Why "pull"
+// # Handoff, not push or pull
 //
-// EntroQ has no push: every task acquisition is a Claim. This worker runs next
-// to the destination instance, reaches up to the source instance, and claims
-// tasks out of it -- so from the operator's vantage it pulls work down from
-// upstream, the same intuition as "git pull". Running it beside the destination
-// also keeps the delivery work local; only the claim from the source crosses the
-// wire.
+// EntroQ has no push: every task acquisition is a Claim. This worker always
+// claims from a source instance and delivers to a destination instance, so the
+// data flows one way, source to destination. "Push" and "pull" are only
+// deployment vantages of that same handoff: run it next to the source and it
+// looks like pushing work upstream; run it next to the destination and it looks
+// like pulling work down (the "git pull" intuition). Where you run it decides
+// only which leg crosses the wire, not what the worker does, so the worker is
+// named for the operation rather than for one of its vantages.
 //
 // # Exactly-once delivery
 //
@@ -51,13 +52,13 @@
 // Those orphans are reaped by arrival time: each tombstone is inserted At = now
 // + TTL, and the destination server's built-in garbage collector removes any
 // whose time has come -- the tombstone queue ("graveyard") carries a /gc=
-// marker (see Graveyard), so no separate reaper is needed as long as that
+// marker (see defaultGraveyard), so no separate reaper is needed as long as that
 // server runs GC, which is the default. The TTL is the dedup-retention window
 // and the single safety knob: a duplicate is only possible if a tombstone is
-// reaped while a crashed pull can still re-attempt -- i.e. only if recovery
+// reaped while a crashed handoff can still re-attempt -- i.e. only if recovery
 // takes longer than the TTL. Size it well above worst-case recovery. GC is the
 // safety net for crash orphans, not the primary cleanup path.
-package pullworker
+package handoffworker
 
 import (
 	"context"
@@ -78,21 +79,21 @@ import (
 // crash; see the package doc.
 const DefaultTTL = time.Hour
 
-// pullHandler is the handler for the pull worker, specified using the full
+// handoffHandler is the handler for the handoff worker, specified using the full
 // approach because it requires variable sharing between work and finish
 // functions.
-type pullHandler struct {
+type handoffHandler struct {
 	eq     *entroq.EntroQ
 	worker *Worker
 
 	tombstone *entroq.Task
 }
 
-func (h *pullHandler) TakeDocs(context.Context, *entroq.Task, json.RawMessage) ([]*entroq.DocClaim, error) {
+func (h *handoffHandler) TakeDocs(context.Context, *entroq.Task, json.RawMessage) ([]*entroq.DocClaim, error) {
 	return nil, nil
 }
 
-func (h *pullHandler) DoWork(ctx context.Context, task *entroq.Task, value json.RawMessage, docs []*entroq.Doc) error {
+func (h *handoffHandler) DoWork(ctx context.Context, task *entroq.Task, value json.RawMessage, docs []*entroq.Doc) error {
 	tombstoneID := h.worker.transferID(task)
 	resp, err := h.worker.dst.Modify(ctx,
 		entroq.InsertingInto(h.worker.graveyard,
@@ -111,19 +112,19 @@ func (h *pullHandler) DoWork(ctx context.Context, task *entroq.Task, value json.
 	return nil
 }
 
-func (h *pullHandler) Finish(ctx context.Context, task *entroq.Task, value json.RawMessage, docs []*entroq.Doc) error {
+func (h *handoffHandler) Finish(ctx context.Context, task *entroq.Task, value json.RawMessage, docs []*entroq.Doc) error {
 	if _, err := h.eq.Modify(ctx, task.Delete()); err != nil {
-		return fmt.Errorf("pull worker finish: %w", err)
+		return fmt.Errorf("handoff worker finish: %w", err)
 	}
 	if h.tombstone != nil {
 		if _, err := h.worker.dst.Modify(ctx, h.tombstone.Delete()); err != nil {
-			log.Printf("pull: tombstone cleanup %v (left for destination gc): %v", h.tombstone.IDVersion(), err)
+			log.Printf("handoff: tombstone cleanup %v (left for destination gc): %v", h.tombstone.IDVersion(), err)
 		}
 	}
 	return nil
 }
 
-// Worker pulls tasks from a source instance (the one it claims from) into an
+// Worker hands tasks off from a source instance (the one it claims from) into an
 // inbox on a destination instance, delivering each exactly once in effect via a
 // dedup tombstone. See the package doc for the protocol.
 type Worker struct {
@@ -134,7 +135,7 @@ type Worker struct {
 	source    string
 }
 
-// Option configures a pull Worker and the underlying worker.Worker. Following
+// Option configures a handoff Worker and the underlying worker.Worker. Following
 // the convention of the other standard workers, an option may set Worker fields
 // and/or append core worker and run options.
 type Option func(*Worker, *[]worker.Option[json.RawMessage], *[]worker.RunOption)
@@ -156,10 +157,10 @@ func WithInbox(q string) Option {
 	}
 }
 
-// WithGraveyard overrides the graveyard queue (default from DefaultGraveyard).
-// An override should include a /gc= component (as is true for DefaultGraveyard) so the
+// WithGraveyard overrides the graveyard queue (default from defaultGraveyard).
+// An override should include a /gc= component (as is true for defaultGraveyard) so the
 // destination server's GC reaps its orphans; otherwise point your own reaper at it.
-func WithTomb(q string) Option {
+func WithGraveyard(q string) Option {
 	return func(w *Worker, _ *[]worker.Option[json.RawMessage], _ *[]worker.RunOption) {
 		w.graveyard = q
 	}
@@ -219,26 +220,26 @@ func (w *Worker) transferID(t *entroq.Task) string {
 	return "xfer-" + base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
-// DefaultGraveyard returns the default graveyard queue for an inbox. Its name
+// defaultGraveyard returns the default graveyard queue for an inbox. Its name
 // carries a gc=0 component so the destination server's built-in garbage
 // collector reaps crash orphans once their TTL (arrival time) elapses; no
 // separate reaper is needed as long as that server runs GC, which is the default.
-func DefaultGraveyard(inbox string) string {
+func defaultGraveyard(inbox string) string {
 	return path.Join(inbox, "_graveyard", "gc=0")
 }
 
-// New creates a pull Worker ready to be configured by Run.
+// New creates a handoff Worker ready to be configured by Run.
 func New() *Worker {
 	return &Worker{ttl: DefaultTTL}
 }
 
-// Run creates and runs a pull worker in a single call. src is the source client
+// Run creates and runs a handoff worker in a single call. src is the source client
 // (the instance tasks are claimed from); WithDest supplies the destination
 // client. Blocks until ctx is canceled or an unrecoverable error occurs.
 //
 // Run delivers and cleans up its own tombstones on the happy path; crash orphans
 // are reaped by the destination server's built-in GC, since the graveyard queue
-// (see DefaultGraveyard) carries a /gc= marker.
+// (see defaultGraveyard) carries a /gc= marker.
 func Run(ctx context.Context, src *entroq.EntroQ, opts ...Option) error {
 	w := New()
 	var workerOpts []worker.Option[json.RawMessage]
@@ -248,21 +249,21 @@ func Run(ctx context.Context, src *entroq.EntroQ, opts ...Option) error {
 	}
 
 	if w.dst == nil {
-		return fmt.Errorf("pull worker: destination client required (WithDest)")
+		return fmt.Errorf("handoff worker: destination client required (WithDest)")
 	}
 	if w.inbox == "" {
-		return fmt.Errorf("pull worker: inbox queue required (WithInbox)")
+		return fmt.Errorf("handoff worker: inbox queue required (WithInbox)")
 	}
 	if w.graveyard == "" {
-		w.graveyard = DefaultGraveyard(w.inbox)
+		w.graveyard = defaultGraveyard(w.inbox)
 	}
 	if w.ttl <= 0 {
-		return fmt.Errorf("pull worker: tombstone TTL must be positive")
+		return fmt.Errorf("handoff worker: tombstone TTL must be positive")
 	}
 
 	return worker.New(src,
 		worker.WithMakeHandler(func() (worker.Handler[json.RawMessage], error) {
-			return &pullHandler{eq: src, worker: w}, nil
+			return &handoffHandler{eq: src, worker: w}, nil
 		}),
 	).Run(ctx, runOpts...)
 }

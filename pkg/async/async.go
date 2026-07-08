@@ -32,7 +32,7 @@
 //
 // When each datacenter needs its own EQ instance, moving tasks between instances
 // is a separate concern handled by the pull worker (package
-// github.com/shiblon/entroq/pkg/workers/pullworker, exposed as "eqlink pull"):
+// github.com/shiblon/entroq/pkg/workers/handoffworker, exposed as "eqlink pull"):
 // it claims from a queue on a source instance and delivers into an inbox on the
 // destination, exactly once in effect. This package is the sender/receiver
 // sidecar; for request-response across datacenters the single-EQ approach (the

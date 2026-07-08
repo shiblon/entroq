@@ -19,18 +19,18 @@ import (
 	"google.golang.org/grpc/credentials"
 )
 
-// localEQ opens the local EntroQ instance (--entroq) with optional transport
-// security (--cert/--key/--ca) and bearer-token auth (--authz-token-file). When
-// a token file is given, the token is reloaded on rotation (SIGHUP or mtime
-// change) by a goroutine spawned on g, and the token's subject becomes the
-// client's claimant.
+// openEntroq opens an EntroQ instance at addr with optional transport security
+// (certF/keyF/caF) and bearer-token auth (tokenFile); label names it in errors
+// and logs (e.g. "local", "from", "to"). When a token file is given, the token
+// is reloaded on rotation (SIGHUP or mtime change) by a goroutine spawned on g,
+// and the token's subject becomes the client's claimant.
 //
-// It exists so that "eqlink pull" and "eqlink push" can reach a secured local
-// instance, not only an insecure loopback one.
-func localEQ(ctx context.Context, g *errgroup.Group) (*entroq.EntroQ, error) {
-	tlsCfg, err := loadTLSConfig(certFile, keyFile, caFile)
+// It backs both the single-instance commands (via localEQ) and "eqlink handoff",
+// which opens two instances symmetrically, so neither endpoint is privileged.
+func openEntroq(ctx context.Context, g *errgroup.Group, label, addr, certF, keyF, caF, tokenFile string) (*entroq.EntroQ, error) {
+	tlsCfg, err := loadTLSConfig(certF, keyF, caF)
 	if err != nil {
-		return nil, fmt.Errorf("local tls: %w", err)
+		return nil, fmt.Errorf("%s tls: %w", label, err)
 	}
 	var opts []eqgrpc.Option
 	if tlsCfg != nil {
@@ -40,8 +40,8 @@ func localEQ(ctx context.Context, g *errgroup.Group) (*entroq.EntroQ, error) {
 	}
 
 	var eqOpts []entroq.Option
-	if authzTokenFile != "" {
-		creds, err := newTokenFileCreds(authzTokenFile)
+	if tokenFile != "" {
+		creds, err := newTokenFileCreds(tokenFile)
 		if err != nil {
 			return nil, err
 		}
@@ -50,11 +50,19 @@ func localEQ(ctx context.Context, g *errgroup.Group) (*entroq.EntroQ, error) {
 		watchTokenReload(ctx, g, creds)
 	}
 
-	eq, err := entroq.New(ctx, eqgrpc.Opener(entroqAddr, opts...), eqOpts...)
+	eq, err := entroq.New(ctx, eqgrpc.Opener(addr, opts...), eqOpts...)
 	if err != nil {
-		return nil, fmt.Errorf("local entroq: %w", err)
+		return nil, fmt.Errorf("%s entroq: %w", label, err)
 	}
 	return eq, nil
+}
+
+// localEQ opens the local EntroQ instance (--entroq) with optional transport
+// security (--cert/--key/--ca) and bearer-token auth (--authz-token-file). It is
+// used by the single-instance sidecar commands (send/recv/run/gc); "eqlink
+// handoff" opens its two endpoints directly via openEntroq.
+func localEQ(ctx context.Context, g *errgroup.Group) (*entroq.EntroQ, error) {
+	return openEntroq(ctx, g, "local", entroqAddr, certFile, keyFile, caFile, authzTokenFile)
 }
 
 // remoteTLS builds the TLS config for a remote connection (label names it, e.g.

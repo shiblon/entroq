@@ -1,4 +1,4 @@
-package pullworker
+package handoffworker
 
 import (
 	"testing"
@@ -12,7 +12,7 @@ import (
 // reaps crash orphans without a separate reaper. Actual collection is exercised
 // by each backend's own GC tests; here we only pin the naming contract.
 func TestDefaultGraveyardGCEligible(t *testing.T) {
-	q := DefaultGraveyard("/svc/inbox")
+	q := defaultGraveyard("/svc/inbox")
 	at, present, err := queues.GCActivation(q)
 	if err != nil {
 		t.Fatalf("GCActivation(%q): %v", q, err)

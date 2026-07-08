@@ -1,4 +1,4 @@
-package pullworker
+package handoffworker
 
 import (
 	"context"
@@ -73,7 +73,7 @@ func TestPullDelivers(t *testing.T) {
 
 	// Given the tombstone was created (above), an empty graveyard means the
 	// happy path eager-cleaned it.
-	if err := dst.WaitQueuesEmpty(gctx, entroq.MatchExact(DefaultGraveyard(inbox))); err != nil {
+	if err := dst.WaitQueuesEmpty(gctx, entroq.MatchExact(defaultGraveyard(inbox))); err != nil {
 		t.Fatalf("wait tombstone cleanup: %v", err)
 	}
 
@@ -112,7 +112,7 @@ func TestPullDedupOnRedelivery(t *testing.T) {
 	// seeded version so we can prove afterward that the worker collided on this
 	// exact tombstone rather than inserting a fresh one.
 	tombID := (&Worker{source: source}).transferID(srcTask)
-	seedResp, err := dst.Modify(ctx, entroq.InsertingInto(DefaultGraveyard(inbox),
+	seedResp, err := dst.Modify(ctx, entroq.InsertingInto(defaultGraveyard(inbox),
 		entroq.WithID(tombID), entroq.WithArrivalTimeIn(time.Hour)))
 	if err != nil {
 		t.Fatalf("seed tombstone: %v", err)
@@ -131,7 +131,7 @@ func TestPullDedupOnRedelivery(t *testing.T) {
 	// The collision was actually exercised: the seeded tombstone is still the only
 	// one present and untouched. A non-collision (e.g. a transferID change) would
 	// have inserted a second tombstone under a different id.
-	tombs, err := dst.Tasks(ctx, DefaultGraveyard(inbox))
+	tombs, err := dst.Tasks(ctx, defaultGraveyard(inbox))
 	if err != nil {
 		t.Fatalf("list tombstones: %v", err)
 	}
