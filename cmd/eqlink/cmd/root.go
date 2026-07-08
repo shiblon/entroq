@@ -37,7 +37,7 @@ source instance and delivering them into a destination instance, exactly once.`,
 // Execute is the entry point called from main.
 func Execute() {
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Println(err)
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
