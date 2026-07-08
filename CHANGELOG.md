@@ -7,6 +7,46 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.6.3] - 2026-07-08
+
+Go module `v1.6.3`. A rename/refactor release for the cross-instance task handoff
+worker and its `eqlink` command. No schema change (schema version stays 1.6.0)
+and no client changes.
+
+### Changed
+
+- **The `pullworker` package is renamed to `handoffworker`.** The worker is
+  direction-neutral: it claims from a source instance and delivers to a
+  destination exactly once, so it is now named for the operation rather than for
+  one deployment vantage. `pullHandler` becomes `handoffHandler`, and the default
+  graveyard-queue helper is no longer exported.
+- **`eqlink push` and `eqlink pull` are replaced by a single `eqlink handoff`.**
+  Direction is expressed by explicit `--from`/`--to` endpoints, each with its own
+  TLS and bearer-token flags, instead of two mirror-image subcommands. There are
+  no external consumers and the handoff service behavior is unchanged, so this
+  ships as a patch.
+
+## [1.6.2] - 2026-07-08
+
+Go module `v1.6.2`. A worker-framework bug-fix release. No schema change (schema
+version stays 1.6.0) and no client changes.
+
+### Fixed
+
+- **Worker handlers are built fresh per task, not once per `Run`.** Per-task
+  handler state was accidentally shared across tasks in a `Run` loop, which let a
+  stateful handler act on a previous task's leftover state. `makeHandler` now
+  runs per task, isolating state by construction; deliberate cross-task state
+  belongs in the handler's closure.
+
+### Changed
+
+- **The cross-instance delivery worker delivers during the work phase.** It now
+  performs its remote delivery in `DoWork` (renewal-protected and retryable) and
+  finalizes the source delete in `Finish`, rather than doing everything after
+  renewal had stopped, so a transient delivery failure retries instead of
+  crashing the worker.
+
 ## [1.6.1] - 2026-07-06
 
 Go module `v1.6.1`. A bug-fix and performance release for the Redis and
