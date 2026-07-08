@@ -27,6 +27,8 @@ require (
 	gopkg.in/yaml.v2 v2.4.0
 )
 
+require github.com/coder/websocket v1.8.15 // indirect
+
 require (
 	cel.dev/expr v0.25.1 // indirect
 	dario.cat/mergo v1.0.2 // indirect

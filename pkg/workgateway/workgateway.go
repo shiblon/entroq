@@ -45,30 +45,54 @@ type result struct {
 	To      string `json:"to,omitempty"`      // move: destination queue
 }
 
-// Bridge speaks the work protocol over a reader/writer pair: it writes phase
-// messages to w and reads responses from r. Since one connection handles one
-// task at a time, no locking is needed.
+// Conn carries the protocol's JSON messages over some transport, one message
+// per Send and per Recv. A stdio pipe (PipeConn) and a WebSocket are both just
+// Conns; that is what keeps the Bridge transport-agnostic.
+type Conn interface {
+	Send(ctx context.Context, v any) error // marshal and write one protocol message
+	Recv(ctx context.Context, v any) error // read and unmarshal the next message into v
+}
+
+// Bridge speaks the work protocol over a Conn. One connection handles one task
+// at a time, so no locking is needed.
 type Bridge struct {
+	conn Conn
+}
+
+// NewBridge builds a Bridge over conn.
+func NewBridge(conn Conn) *Bridge {
+	return &Bridge{conn: conn}
+}
+
+// PipeConn carries the protocol over a byte stream as newline-delimited JSON
+// (json.Encoder appends the newline), e.g. a stdio pipe.
+type PipeConn struct {
 	enc *json.Encoder
 	dec *json.Decoder
 }
 
-// NewBridge builds a Bridge that reads worker responses from r and writes phase
-// messages to w.
-func NewBridge(r io.Reader, w io.Writer) *Bridge {
-	return &Bridge{enc: json.NewEncoder(w), dec: json.NewDecoder(r)}
+// NewPipeConn reads messages from r and writes them to w.
+func NewPipeConn(r io.Reader, w io.Writer) *PipeConn {
+	return &PipeConn{enc: json.NewEncoder(w), dec: json.NewDecoder(r)}
 }
+
+// Send writes v as one newline-terminated JSON message. It ignores ctx: the
+// json encoder is not context-aware, and a stdio pipe is canceled by closing it.
+func (c *PipeConn) Send(_ context.Context, v any) error { return c.enc.Encode(v) }
+
+// Recv decodes the next JSON message into v. It ignores ctx (see Send).
+func (c *PipeConn) Recv(_ context.Context, v any) error { return c.dec.Decode(v) }
 
 // DoWork is the worker.DoModifyRun for the gateway. It hands the task to the
 // worker over the wire and translates the reply into modifications or a
 // structured worker error. A broken pipe (worker gone) surfaces as an error
 // that ends the loop, leaving the claimed task to time out and be reclaimed.
 func (b *Bridge) DoWork(ctx context.Context, task *entroq.Task, _ json.RawMessage, _ []*entroq.Doc) ([]entroq.ModifyArg, error) {
-	if err := b.enc.Encode(workMsg{Type: "work", Task: task}); err != nil {
+	if err := b.conn.Send(ctx, workMsg{Type: "work", Task: task}); err != nil {
 		return nil, fmt.Errorf("send work: %w", err)
 	}
 	var res result
-	if err := b.dec.Decode(&res); err != nil {
+	if err := b.conn.Recv(ctx, &res); err != nil {
 		return nil, fmt.Errorf("read result: %w", err)
 	}
 

@@ -36,7 +36,7 @@ func TestBridge_OK(t *testing.T) {
 	// writes results to clientW (gateway reads gatewayR).
 	clientR, gatewayW := io.Pipe()
 	gatewayR, clientW := io.Pipe()
-	bridge := NewBridge(gatewayR, gatewayW)
+	bridge := NewBridge(NewPipeConn(gatewayR, gatewayW))
 
 	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
