@@ -84,8 +84,8 @@ type Handler[T any] interface {
 	//
 	// On any other error, Finish is skipped and the worker exits. Backoff and
 	// restart are the responsibility of the process orchestrator (e.g.
-	// Kubernetes, systemd). To retry or quarantine the task instead, return an
-	// error wrapping RetryError or MoveError explicitly.
+	// Kubernetes, systemd). To retry or quarantine the task instead, return a
+	// RetryError or MoveError (see RetryErrorf and MoveErrorf).
 	DoWork(context.Context, *entroq.Task, T, []*entroq.Doc) error
 
 	// Finish is called after DoWork returns nil and renewal has stopped. It
@@ -107,9 +107,10 @@ type MakeHandler[T any] func() (Handler[T], error)
 // in a Finish function. The docs parameter carries any docs claimed by
 // WithTakeDocs, and can be empty.
 //
-// Return nil on success. To retry the task wrap RetryError; to quarantine it
-// wrap MoveError. Any other non-nil error causes the worker to exit — backoff
-// and restart are the responsibility of the process orchestrator.
+// Return nil on success. To retry the task return a RetryError (RetryErrorf);
+// to move it return a MoveError (MoveErrorf). Any other non-nil error causes the
+// worker to exit -- backoff and restart are the responsibility of the process
+// orchestrator.
 type DoModifyRun[T any] func(context.Context, *entroq.Task, T, []*entroq.Doc) ([]entroq.ModifyArg, error)
 
 // TakeRun[T] is a function that inspects a newly claimed task and
@@ -160,7 +161,7 @@ func (h *funcHandler[T]) TakeDocs(ctx context.Context, task *entroq.Task, value 
 // DoWork runs the specified "do" function.
 func (h *funcHandler[T]) DoWork(ctx context.Context, task *entroq.Task, value T, docs []*entroq.Doc) error {
 	if h.do == nil {
-		return fmt.Errorf("no work function specified: %w", FatalError)
+		return FatalErrorf("no work function specified")
 	}
 	return h.do(ctx, task, value, docs)
 }
@@ -204,7 +205,7 @@ func (h *doModifyHandler[T]) DoWork(ctx context.Context, task *entroq.Task, val 
 		h.initialTask = task
 	}
 	if h.doModify == nil {
-		return fmt.Errorf("No work function specified: %w", FatalError)
+		return FatalErrorf("no work function specified")
 	}
 	h.modArgs, err = h.doModify(ctx, task, val, docs)
 	return err
@@ -212,7 +213,7 @@ func (h *doModifyHandler[T]) DoWork(ctx context.Context, task *entroq.Task, val 
 
 func (h *doModifyHandler[T]) Finish(ctx context.Context, finalTask *entroq.Task, val T, finalDocs []*entroq.Doc) error {
 	if h.initialTask == nil {
-		return fmt.Errorf("unexpected nil initial task in doModify finish: %w", FatalError)
+		return FatalErrorf("unexpected nil initial task in doModify finish")
 	}
 	if len(h.modArgs) == 0 {
 		// Nothing to do!
@@ -462,22 +463,32 @@ func WithErrQMap[T any](f ErrQMap) Option[T] {
 }
 
 func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, task *entroq.Task, errQ string, opts *runOpt) (isSentinel bool, err error) {
-	if errors.Is(sentinel, RetryError) {
-		_, err := w.eqc.Modify(ctx, task.RetryOrQuarantine(sentinel.Error(), errQ, opts.maxAttempts, entroq.ArrivalTimeBy(opts.baseRetryDelay)))
-		if err != nil {
+	if re, ok := AsRetry(sentinel); ok {
+		delay := opts.baseRetryDelay
+		if re.hasAfter {
+			delay = re.after
+		}
+		q := errQ
+		if re.moveTo != "" {
+			q = re.moveTo
+		}
+		if _, err := w.eqc.Modify(ctx, task.RetryOrQuarantine(re.Error(), q, opts.maxAttempts, entroq.ArrivalTimeBy(delay))); err != nil {
 			return true, fmt.Errorf("retry or quarantine modify: %w", err)
 		}
 		return true, nil
 	}
-	if errors.Is(sentinel, MoveError) {
-		_, err := w.eqc.Modify(ctx, task.Quarantine(sentinel.Error(), errQ))
-		if err != nil {
+	if me, ok := AsMove(sentinel); ok {
+		q := errQ
+		if me.to != "" {
+			q = me.to
+		}
+		if _, err := w.eqc.Modify(ctx, task.Quarantine(me.Error(), q)); err != nil {
 			return true, fmt.Errorf("quarantine modify: %w", err)
 		}
 		return true, nil
 	}
-	if errors.Is(sentinel, FatalError) {
-		return true, sentinel
+	if fe, ok := AsFatal(sentinel); ok {
+		return true, fe
 	}
 	return false, nil
 }
@@ -528,7 +539,7 @@ func acquireDocs[T any](ctx context.Context, eqc *entroq.EntroQ, task *entroq.Ta
 func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt) error {
 	handler, err := w.makeHandler()
 	if err != nil {
-		return fmt.Errorf("failed to make handler: %v: %w", err, FatalError)
+		return FatalErrorf("failed to make handler: %v", err)
 	}
 
 	// Note: do NOT cancel rCtx from inside the work function. If rCtx is
@@ -556,9 +567,9 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt) error {
 		if de, ok := entroq.AsDependency(err); ok {
 			var sentinelErr error
 			if de.HasMissingDocs() {
-				sentinelErr = fmt.Errorf("required doc missing: %w", MoveError)
+				sentinelErr = MoveErrorf("required doc missing")
 			} else {
-				sentinelErr = fmt.Errorf("doc contention: %w", RetryError)
+				sentinelErr = RetryErrorf("doc contention")
 			}
 			errQ := w.ErrorQueueFor(task.Queue)
 			if _, herr := w.handleSentinelErrors(ctx, sentinelErr, task, errQ, opts); herr != nil {
@@ -678,8 +689,15 @@ func WithBaseRetryDelay(d time.Duration) RunOption {
 	}
 }
 
-func isSentinelError(sentinel error) bool {
-	return errors.Is(sentinel, RetryError) || errors.Is(sentinel, MoveError) || errors.Is(sentinel, FatalError)
+func isSentinelError(err error) bool {
+	if _, ok := AsRetry(err); ok {
+		return true
+	}
+	if _, ok := AsMove(err); ok {
+		return true
+	}
+	_, ok := AsFatal(err)
+	return ok
 }
 
 // Run claims tasks from the worker queues and processes them in a loop until
@@ -707,42 +725,97 @@ func (w *Worker[T]) Run(ctx context.Context, opts ...RunOption) error {
 	}
 }
 
-var (
-	// RetryError can be returned from a worker to cause its claimed task to be
-	// marked as attempted again, and to cause its At to be at a time in the
-	// future. Convenient for work that fails due to likely transient causes.
-	RetryError = errors.New("worker retry")
-
-	// MoveError can be returned from a worker to cause its claimed task to
-	// move, e.g., to a quarantine queue for inspection. Helpful if operating
-	// on a task seems to have non-retriable errors, but the task is important.
-	MoveError = errors.New("worker move")
-
-	// FatalError can be returned from a worker to cause it to stop immediately.
-	// This is useful if a task handler determines that the worker cannot or
-	// should not continue processing tasks.
-	FatalError = errors.New("worker fatal")
-)
-
-// RetryErrorf is a convenience wrapper for making a retry error for workers.
-// Workers will retry a task with this error up to a threshold, then quarantine
-// it.
-func RetryErrorf(fstr string, args ...any) error {
-	return fmt.Errorf(fstr+": %w", append(args, RetryError)...)
+// RetryError, returned from a worker handler, retries the claimed task: its
+// attempt count is incremented and its arrival time is pushed into the future.
+// Once the task exhausts its attempts (see WithMaxAttempts) it is moved to a
+// quarantine queue instead. By default the delay is the worker's
+// WithBaseRetryDelay and the quarantine queue comes from its ErrQMap; After and
+// OrMoveTo override those per failure. Detect it with AsRetry.
+type RetryError struct {
+	msg      string
+	after    time.Duration
+	hasAfter bool
+	moveTo   string
 }
 
-// MoveErrorf is a convenience wrapper for making a move error for workers.
-// These are errors with a task that is not going to do better with a retry
-// (malformed, for example).
-func MoveErrorf(fstr string, args ...any) error {
-	return fmt.Errorf(fstr+": %w", append(args, MoveError)...)
+// Error implements the error interface.
+func (e *RetryError) Error() string { return e.msg }
+
+// RetryErrorf builds a RetryError with a printf-formatted message.
+func RetryErrorf(format string, args ...any) *RetryError {
+	return &RetryError{msg: fmt.Sprintf(format, args...)}
 }
 
-// FatalErrorf is a convenience wrapper for making a fatal error for workers.
-// These are errors the worker is not expected to recover from, so it should
-// crash.
-func FatalErrorf(fstr string, args ...any) error {
-	return fmt.Errorf(fstr+": %w", append(args, FatalError)...)
+// After overrides the delay before this task is retried, in place of the
+// worker's WithBaseRetryDelay. It is chainable.
+func (e *RetryError) After(d time.Duration) *RetryError {
+	e.after, e.hasAfter = d, true
+	return e
+}
+
+// OrMoveTo overrides the queue this task is moved to once it exhausts its
+// retries, in place of the worker's ErrQMap. It is chainable.
+func (e *RetryError) OrMoveTo(queue string) *RetryError {
+	e.moveTo = queue
+	return e
+}
+
+// AsRetry reports whether err is, or wraps, a *RetryError.
+func AsRetry(err error) (*RetryError, bool) {
+	var e *RetryError
+	return e, errors.As(err, &e)
+}
+
+// MoveError, returned from a worker handler, moves the claimed task to another
+// queue immediately: its attempt count is incremented, the error is recorded,
+// and it is requeued for inspection. Use it for a task that will not do better
+// with a retry. By default the destination is the worker's ErrQMap; To
+// overrides it. Detect it with AsMove.
+type MoveError struct {
+	msg string
+	to  string
+}
+
+// Error implements the error interface.
+func (e *MoveError) Error() string { return e.msg }
+
+// MoveErrorf builds a MoveError with a printf-formatted message.
+func MoveErrorf(format string, args ...any) *MoveError {
+	return &MoveError{msg: fmt.Sprintf(format, args...)}
+}
+
+// To overrides the queue this task is moved to, in place of the worker's
+// ErrQMap. It is chainable.
+func (e *MoveError) To(queue string) *MoveError {
+	e.to = queue
+	return e
+}
+
+// AsMove reports whether err is, or wraps, a *MoveError.
+func AsMove(err error) (*MoveError, bool) {
+	var e *MoveError
+	return e, errors.As(err, &e)
+}
+
+// FatalError, returned from a worker handler, stops the worker immediately. Use
+// it when the worker cannot or should not keep processing tasks. Detect it with
+// AsFatal.
+type FatalError struct {
+	msg string
+}
+
+// Error implements the error interface.
+func (e *FatalError) Error() string { return e.msg }
+
+// FatalErrorf builds a FatalError with a printf-formatted message.
+func FatalErrorf(format string, args ...any) *FatalError {
+	return &FatalError{msg: fmt.Sprintf(format, args...)}
+}
+
+// AsFatal reports whether err is, or wraps, a *FatalError.
+func AsFatal(err error) (*FatalError, bool) {
+	var e *FatalError
+	return e, errors.As(err, &e)
 }
 
 // Renewal Machinery

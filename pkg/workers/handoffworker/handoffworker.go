@@ -106,7 +106,7 @@ func (h *handoffHandler) DoWork(ctx context.Context, task *entroq.Task, value js
 			log.Printf("task %v already delivered to remote, cleaning up", task.IDVersion())
 			return nil
 		}
-		return fmt.Errorf("delivery to remote %q: %v: %w", h.worker.inbox, err, worker.RetryError)
+		return worker.RetryErrorf("delivery to remote %q: %v", h.worker.inbox, err)
 	}
 	h.tombstone = resp.InsertedTasks[0]
 	return nil

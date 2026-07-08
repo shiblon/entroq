@@ -176,7 +176,7 @@ func TestDoModify_DocVersionFixedAfterRenewal(t *testing.T) {
 			}),
 			WithDoModify(func(_ context.Context, task *entroq.Task, _ string, docs []*entroq.Doc) ([]entroq.ModifyArg, error) {
 				if len(docs) == 0 {
-					return nil, fmt.Errorf("expected claimed doc: %w", FatalError)
+					return nil, FatalErrorf("expected claimed doc")
 				}
 				// Sleep past at least one renewal cycle so the doc's version bumps.
 				// Finish must fix the version up from docs[0].Version (original) to

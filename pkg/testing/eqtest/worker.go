@@ -281,7 +281,7 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 			input:       newTask("retry"),
 			maxAttempt:  0,
 			wantAttempt: 1,
-			wantErr:     `worker error ("retry"): worker retry`,
+			wantErr:     `worker error ("retry")`,
 			wantMove:    false,
 		},
 		{
@@ -289,7 +289,7 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 			input:       newTask("with max"),
 			maxAttempt:  3,
 			wantAttempt: 1,
-			wantErr:     `worker error ("with max"): worker retry`,
+			wantErr:     `worker error ("with max")`,
 			wantMove:    false,
 		},
 		{
@@ -297,7 +297,7 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 			input:       newTask("too many"),
 			maxAttempt:  1,
 			wantAttempt: 1,
-			wantErr:     `worker error ("too many"): worker retry`,
+			wantErr:     `worker error ("too many")`,
 			wantMove:    true,
 		},
 	}
@@ -314,7 +314,7 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 			worker.WithDoWork(func(ctx context.Context, task *entroq.Task, s string, _ []*entroq.Doc) error {
 				// Only attempt this again if it's the first time.
 				if task.Attempt == 0 {
-					return fmt.Errorf("worker error (%q): %w", s, worker.RetryError)
+					return worker.RetryErrorf("worker error (%q)", s)
 				}
 				// Save it so we know what happened with the retry error.
 				retriedTaskCh <- task
@@ -440,13 +440,13 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 			worker.WithDoWork(func(ctx context.Context, task *entroq.Task, cmd string, _ []*entroq.Doc) error {
 				switch cmd {
 				case "die":
-					return fmt.Errorf("task asked to die: %w", worker.FatalError)
+					return worker.FatalErrorf("task asked to die")
 				case "move":
-					return fmt.Errorf("task asked to move: %w", worker.MoveError)
+					return worker.MoveErrorf("task asked to move")
 				case "move-wait":
 					select {
 					case <-time.After(leaseTime):
-						return fmt.Errorf("task asked to move after renewal: %w", worker.MoveError)
+						return worker.MoveErrorf("task asked to move after renewal")
 					case <-ctx.Done():
 						return fmt.Errorf("oops - test %q took too long, gave up before finishing: %w", c.name, ctx.Err())
 					}
