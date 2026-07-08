@@ -211,10 +211,6 @@ func (h *doModifyHandler[T]) DoWork(ctx context.Context, task *entroq.Task, val 
 }
 
 func (h *doModifyHandler[T]) Finish(ctx context.Context, finalTask *entroq.Task, val T, finalDocs []*entroq.Doc) error {
-	defer func() {
-		h.initialTask = nil
-		h.modArgs = nil
-	}()
 	if h.initialTask == nil {
 		return fmt.Errorf("unexpected nil initial task in doModify finish: %w", FatalError)
 	}
@@ -325,7 +321,9 @@ type workerOpts[T any] struct {
 //
 // Options should be presented to, at a minimum, define the work to be done
 // when a task is acquired. At least one of WithDoWork or WithDoModify should be
-// specified, or WithMakeHandler if you have advanced needs.
+// specified, or WithMakeHandler if you have advanced needs (such as variable
+// sharing between handler functions, which is not safe if specifying them as
+// closures).
 func New[T any](eq *entroq.EntroQ, opts ...Option[T]) *Worker[T] {
 	wOpts := new(workerOpts[T])
 	for _, opt := range opts {
@@ -425,17 +423,25 @@ func WithTakeDocs[T any](f TakeRun[T]) Option[T] {
 }
 
 // WithMakeHandler sets a "new" function to create a handler.
-// Why use this instead of just setting a handler? If you are going to call Run in
-// multiple goroutines, your handler will be shared between them. Stateful
-// handlers will not work properly. Here you can specify a function that
-// returns a new handler when called, side-stepping that issue by ensuring that
-// every call to Run has its own handler instance. The other pattern you can
-// use is to specify functions to call (taking care to keep state local!):
+// Why use this instead of just setting a handler? If you are going to share
+// any variables between docs, work, and finish functions, you want them to be
+// fresh for each task, allowing concurrent Run calls and no surprises with
+// internal handler state variables. Without specifying this, your handler will
+// simply be used as is, all state shared not only between task loops, but also
+// between Run calls. If you are calling Run multiple times to instantiate
+// multipler concurrent workers, and you have any mutatable handler state, you
+// MUST use this function for safety, or you MUST manage variables with
+// mutexes.
+//
+// If you don't need this because you have no shared state, or you don't mind
+// closure variable sharing, you can use more convenient approaches.
 //
 // Always available:
+//
 //   - WithTakeDocs - specifies how to identify documents for a particular task.
 //
 // Two approaches to defining work/finishing:
+//
 //   - WithDoModify - a single function that does work, then returns desired modifications to be handled by the worker.
 //   - WithDoWork, WithFinish - two functions to specify work, then to do modifications.
 //
@@ -519,7 +525,12 @@ func acquireDocs[T any](ctx context.Context, eqc *entroq.EntroQ, task *entroq.Ta
 
 // runOne claims one task, unmarshals its value into T, runs the work function
 // with renewal, and applies any resulting modification.
-func (w *Worker[T]) runOne(ctx context.Context, handler Handler[T], opts *runOpt) error {
+func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt) error {
+	handler, err := w.makeHandler()
+	if err != nil {
+		return fmt.Errorf("failed to make handler: %v: %w", err, FatalError)
+	}
+
 	// Note: do NOT cancel rCtx from inside the work function. If rCtx is
 	// canceled while a renewal Modify is in flight over gRPC, the client sees
 	// context.Canceled but the server may have already committed the renewal.
@@ -685,13 +696,8 @@ func (w *Worker[T]) Run(ctx context.Context, opts ...RunOption) error {
 	if len(ro.qs) == 0 {
 		return fmt.Errorf("no queues specified to work on")
 	}
-	handler, err := w.makeHandler()
-	if err != nil {
-		return fmt.Errorf("failed to make handler: %v: %w", err, FatalError)
-	}
-
 	for {
-		if err := w.runOne(ctx, handler, ro); err != nil {
+		if err := w.runOne(ctx, ro); err != nil {
 			if entroq.IsCanceled(err) || entroq.IsTimeout(err) {
 				log.Printf("worker was asked to quit: %v", ctx.Err())
 				return nil

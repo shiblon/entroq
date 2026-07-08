@@ -50,13 +50,13 @@
 //
 // Those orphans are reaped by arrival time: each tombstone is inserted At = now
 // + TTL, and the destination server's built-in garbage collector removes any
-// whose time has come -- the tombstone queue carries a gc= marker (see
-// TombstoneQueue), so no separate reaper is needed as long as that server runs
-// GC, which is the default. The TTL is the dedup-retention window and the single
-// safety knob: a duplicate is only possible if a tombstone is reaped while a
-// crashed pull can still re-attempt -- i.e. only if recovery takes longer than
-// the TTL. Size it well above worst-case recovery. GC is the safety net for
-// crash orphans, not the primary cleanup path.
+// whose time has come -- the tombstone queue ("graveyard") carries a /gc=
+// marker (see Graveyard), so no separate reaper is needed as long as that
+// server runs GC, which is the default. The TTL is the dedup-retention window
+// and the single safety knob: a duplicate is only possible if a tombstone is
+// reaped while a crashed pull can still re-attempt -- i.e. only if recovery
+// takes longer than the TTL. Size it well above worst-case recovery. GC is the
+// safety net for crash orphans, not the primary cleanup path.
 package pullworker
 
 import (
@@ -78,13 +78,58 @@ import (
 // crash; see the package doc.
 const DefaultTTL = time.Hour
 
+// pullHandler is the handler for the pull worker, specified using the full
+// approach because it requires variable sharing between work and finish
+// functions.
+type pullHandler struct {
+	eq     *entroq.EntroQ
+	worker *Worker
+
+	tombstone *entroq.Task
+}
+
+func (h *pullHandler) TakeDocs(context.Context, *entroq.Task, json.RawMessage) ([]*entroq.DocClaim, error) {
+	return nil, nil
+}
+
+func (h *pullHandler) DoWork(ctx context.Context, task *entroq.Task, value json.RawMessage, docs []*entroq.Doc) error {
+	tombstoneID := h.worker.transferID(task)
+	resp, err := h.worker.dst.Modify(ctx,
+		entroq.InsertingInto(h.worker.graveyard,
+			entroq.WithID(tombstoneID),
+			entroq.WithArrivalTimeIn(h.worker.ttl)),
+		entroq.InsertingInto(h.worker.inbox, entroq.WithRawValue(value)),
+	)
+	if err != nil {
+		if de, isDep := entroq.AsDependency(err); isDep && de.HasCollisions() {
+			log.Printf("task %v already delivered to remote, cleaning up", task.IDVersion())
+			return nil
+		}
+		return fmt.Errorf("delivery to remote %q: %v: %w", h.worker.inbox, err, worker.RetryError)
+	}
+	h.tombstone = resp.InsertedTasks[0]
+	return nil
+}
+
+func (h *pullHandler) Finish(ctx context.Context, task *entroq.Task, value json.RawMessage, docs []*entroq.Doc) error {
+	if _, err := h.eq.Modify(ctx, task.Delete()); err != nil {
+		return fmt.Errorf("pull worker finish: %w", err)
+	}
+	if h.tombstone != nil {
+		if _, err := h.worker.dst.Modify(ctx, h.tombstone.Delete()); err != nil {
+			log.Printf("pull: tombstone cleanup %v (left for destination gc): %v", h.tombstone.IDVersion(), err)
+		}
+	}
+	return nil
+}
+
 // Worker pulls tasks from a source instance (the one it claims from) into an
 // inbox on a destination instance, delivering each exactly once in effect via a
 // dedup tombstone. See the package doc for the protocol.
 type Worker struct {
 	dst       *entroq.EntroQ
 	inbox     string
-	tombstone string
+	graveyard string // queue for tombstones
 	ttl       time.Duration
 	source    string
 }
@@ -103,20 +148,20 @@ func WithDest(dst *entroq.EntroQ) Option {
 }
 
 // WithInbox sets the destination inbox queue that delivered tasks land in.
-// Required. The tombstone queue defaults to <inbox>/_tombstone unless overridden
-// with WithTombstoneQueue.
+// Required. The graveyard queue defaults to <inbox>/_graveyard unless overridden
+// with WithGraveyard.
 func WithInbox(q string) Option {
 	return func(w *Worker, _ *[]worker.Option[json.RawMessage], _ *[]worker.RunOption) {
 		w.inbox = q
 	}
 }
 
-// WithTombstoneQueue overrides the tombstone queue (default from TombstoneQueue).
-// An override should include a gc= component (see TombstoneQueue) so the
+// WithGraveyard overrides the graveyard queue (default from DefaultGraveyard).
+// An override should include a /gc= component (as is true for DefaultGraveyard) so the
 // destination server's GC reaps its orphans; otherwise point your own reaper at it.
-func WithTombstoneQueue(q string) Option {
+func WithTomb(q string) Option {
 	return func(w *Worker, _ *[]worker.Option[json.RawMessage], _ *[]worker.RunOption) {
-		w.tombstone = q
+		w.graveyard = q
 	}
 }
 
@@ -174,12 +219,12 @@ func (w *Worker) transferID(t *entroq.Task) string {
 	return "xfer-" + base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
-// TombstoneQueue returns the default tombstone queue for an inbox. Its name
+// DefaultGraveyard returns the default graveyard queue for an inbox. Its name
 // carries a gc=0 component so the destination server's built-in garbage
 // collector reaps crash orphans once their TTL (arrival time) elapses; no
 // separate reaper is needed as long as that server runs GC, which is the default.
-func TombstoneQueue(inbox string) string {
-	return path.Join(inbox, "_tombstone", "gc=0")
+func DefaultGraveyard(inbox string) string {
+	return path.Join(inbox, "_graveyard", "gc=0")
 }
 
 // New creates a pull Worker ready to be configured by Run.
@@ -192,8 +237,8 @@ func New() *Worker {
 // client. Blocks until ctx is canceled or an unrecoverable error occurs.
 //
 // Run delivers and cleans up its own tombstones on the happy path; crash orphans
-// are reaped by the destination server's built-in GC, since the tombstone queue
-// (see TombstoneQueue) carries a gc= marker.
+// are reaped by the destination server's built-in GC, since the graveyard queue
+// (see DefaultGraveyard) carries a /gc= marker.
 func Run(ctx context.Context, src *entroq.EntroQ, opts ...Option) error {
 	w := New()
 	var workerOpts []worker.Option[json.RawMessage]
@@ -208,60 +253,16 @@ func Run(ctx context.Context, src *entroq.EntroQ, opts ...Option) error {
 	if w.inbox == "" {
 		return fmt.Errorf("pull worker: inbox queue required (WithInbox)")
 	}
-	if w.tombstone == "" {
-		w.tombstone = TombstoneQueue(w.inbox)
+	if w.graveyard == "" {
+		w.graveyard = DefaultGraveyard(w.inbox)
 	}
 	if w.ttl <= 0 {
 		return fmt.Errorf("pull worker: tombstone TTL must be positive")
 	}
 
-	// No work phase -- the whole job is in finalization, where the source task
-	// has a stable version safe to delete. For each claimed source task, in order:
-	//   1. deliver: one atomic Modify on the destination inserting the fresh inbox
-	//      task and the dedup tombstone. A collision means a prior attempt already
-	//      delivered it (its rolled-back inbox insert did not duplicate it); any
-	//      other error returns so the task retries with the source intact.
-	//   2. delete the source task (on src). A returned error leaves it to retry.
-	//   3. delete our own tombstone -- only ours, only now that the source is gone.
-	//      Best effort; an orphan is left for the reaper.
-	finish := func(ctx context.Context, t *entroq.Task, value json.RawMessage, _ []*entroq.Doc) error {
-		tombID := w.transferID(t)
-		resp, err := w.dst.Modify(ctx,
-			entroq.InsertingInto(w.inbox, entroq.WithRawValue(value)),
-			entroq.InsertingInto(w.tombstone,
-				entroq.WithID(tombID),
-				entroq.WithArrivalTimeIn(w.ttl)),
-		)
-		var tomb *entroq.Task
-		if err != nil {
-			if de, ok := entroq.AsDependency(err); !ok || !de.HasCollisions() {
-				return fmt.Errorf("pull deliver to %q: %w", w.inbox, err)
-			}
-			// Collision: already delivered by a prior attempt; not ours to clean up.
-		} else if ins := resp.InsertedTasks[1]; ins.ID == tombID {
-			// InsertedTasks come back in insertion order ([inbox, tombstone]). The id
-			// check guards against a future reorder turning the cleanup below into a
-			// delete of the inbox task: on mismatch we skip and let the reaper handle it.
-			tomb = ins
-		} else {
-			log.Printf("pull: tombstone not at expected response position (got %q, want %q); leaving cleanup to the reaper", ins.ID, tombID)
-		}
-
-		if _, err := src.Modify(ctx, t.Delete()); err != nil {
-			return fmt.Errorf("pull source delete %v: %w", t.IDVersion(), err)
-		}
-
-		if tomb != nil {
-			if _, err := w.dst.Modify(ctx, tomb.Delete()); err != nil {
-				log.Printf("pull tombstone cleanup %v (left for reaper): %v", tomb.IDVersion(), err)
-			}
-		}
-		return nil
-	}
-
-	workerOpts = append(workerOpts,
-		worker.WithDoWork(worker.NoWork[json.RawMessage]),
-		worker.WithFinish[json.RawMessage](finish),
-	)
-	return worker.New(src, workerOpts...).Run(ctx, runOpts...)
+	return worker.New(src,
+		worker.WithMakeHandler(func() (worker.Handler[json.RawMessage], error) {
+			return &pullHandler{eq: src, worker: w}, nil
+		}),
+	).Run(ctx, runOpts...)
 }

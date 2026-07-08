@@ -61,7 +61,7 @@ func TestPullDelivers(t *testing.T) {
 
 	// The inbox task and the tombstone are inserted in one atomic Modify, so the
 	// delivered task's presence proves the tombstone was created. Claim it first
-	// to establish that, which makes the subsequent "tombstone empty" check mean
+	// to establish that, which makes the subsequent "graveyard empty" check mean
 	// "created then cleaned" rather than "never created".
 	task, err := dst.Claim(gctx, entroq.From(inbox), entroq.ClaimFor(10*time.Second))
 	if err != nil {
@@ -71,9 +71,9 @@ func TestPullDelivers(t *testing.T) {
 		t.Errorf("delivered value = %s, want %s", got, want)
 	}
 
-	// Given the tombstone was created (above), an empty tombstone queue means the
+	// Given the tombstone was created (above), an empty graveyard means the
 	// happy path eager-cleaned it.
-	if err := dst.WaitQueuesEmpty(gctx, entroq.MatchExact(TombstoneQueue(inbox))); err != nil {
+	if err := dst.WaitQueuesEmpty(gctx, entroq.MatchExact(DefaultGraveyard(inbox))); err != nil {
 		t.Fatalf("wait tombstone cleanup: %v", err)
 	}
 
@@ -112,7 +112,7 @@ func TestPullDedupOnRedelivery(t *testing.T) {
 	// seeded version so we can prove afterward that the worker collided on this
 	// exact tombstone rather than inserting a fresh one.
 	tombID := (&Worker{source: source}).transferID(srcTask)
-	seedResp, err := dst.Modify(ctx, entroq.InsertingInto(TombstoneQueue(inbox),
+	seedResp, err := dst.Modify(ctx, entroq.InsertingInto(DefaultGraveyard(inbox),
 		entroq.WithID(tombID), entroq.WithArrivalTimeIn(time.Hour)))
 	if err != nil {
 		t.Fatalf("seed tombstone: %v", err)
@@ -131,7 +131,7 @@ func TestPullDedupOnRedelivery(t *testing.T) {
 	// The collision was actually exercised: the seeded tombstone is still the only
 	// one present and untouched. A non-collision (e.g. a transferID change) would
 	// have inserted a second tombstone under a different id.
-	tombs, err := dst.Tasks(ctx, TombstoneQueue(inbox))
+	tombs, err := dst.Tasks(ctx, DefaultGraveyard(inbox))
 	if err != nil {
 		t.Fatalf("list tombstones: %v", err)
 	}
