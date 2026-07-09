@@ -87,7 +87,7 @@ func (c *PipeConn) Recv(_ context.Context, v any) error { return c.dec.Decode(v)
 // worker over the wire and translates the reply into modifications or a
 // structured worker error. A broken pipe (worker gone) surfaces as an error
 // that ends the loop, leaving the claimed task to time out and be reclaimed.
-func (b *Bridge) DoWork(ctx context.Context, task *entroq.Task, _ json.RawMessage, _ []*entroq.Doc) ([]entroq.ModifyArg, error) {
+func (b *Bridge) DoWork(ctx context.Context, task *entroq.Task, _ json.RawMessage, _ []*entroq.Doc) (*worker.Result, error) {
 	if err := b.conn.Send(ctx, workMsg{Type: "work", Task: task}); err != nil {
 		return nil, fmt.Errorf("send work: %w", err)
 	}
@@ -100,7 +100,7 @@ func (b *Bridge) DoWork(ctx context.Context, task *entroq.Task, _ json.RawMessag
 	case "ok":
 		// Skeleton: success means consume the input. Full declarative
 		// modifications land here later.
-		return []entroq.ModifyArg{task.Delete()}, nil
+		return worker.Modify(task.Delete()), nil
 	case "retry":
 		re := worker.RetryErrorf("%s", orDefault(res.Message, "worker requested retry"))
 		if res.After != "" {

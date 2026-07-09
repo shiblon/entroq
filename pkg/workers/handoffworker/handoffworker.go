@@ -34,11 +34,10 @@
 // without persisting anything. It must fit EntroQ's 64-character id limit, so it
 // is a hash rather than a prefix of the (already up-to-64-char) source id.
 //
-// This worker does no work in the work phase: moving tasks between queues is the
-// whole job, so the queue topology is the state machine. Everything happens in
-// finalization, where the source task has a stable (renewed) version safe to
-// delete. Deliver, delete source, clean up tombstone -- in that order -- as one
-// straight-line sequence.
+// The whole job is a single DoModify: deliver to the destination, hand the
+// worker the source-task delete to commit at the stable (renewed) version, and
+// reap the tombstone in an after-commit step. Deliver, delete source, clean up
+// tombstone -- in that order.
 //
 // # Tombstone lifetime
 //
@@ -78,51 +77,6 @@ import (
 // It must exceed the worst-case time to recover and finish a delivery after a
 // crash; see the package doc.
 const DefaultTTL = time.Hour
-
-// handoffHandler is the handler for the handoff worker, specified using the full
-// approach because it requires variable sharing between work and finish
-// functions.
-type handoffHandler struct {
-	eq     *entroq.EntroQ
-	worker *Worker
-
-	tombstone *entroq.Task
-}
-
-func (h *handoffHandler) TakeDocs(context.Context, *entroq.Task, json.RawMessage) ([]*entroq.DocClaim, error) {
-	return nil, nil
-}
-
-func (h *handoffHandler) DoWork(ctx context.Context, task *entroq.Task, value json.RawMessage, docs []*entroq.Doc) error {
-	tombstoneID := h.worker.transferID(task)
-	resp, err := h.worker.dst.Modify(ctx,
-		entroq.InsertingInto(h.worker.graveyard,
-			entroq.WithID(tombstoneID),
-			entroq.WithArrivalTimeIn(h.worker.ttl)),
-		entroq.InsertingInto(h.worker.inbox, entroq.WithRawValue(value)),
-	)
-	if err != nil {
-		if de, isDep := entroq.AsDependency(err); isDep && de.HasCollisions() {
-			log.Printf("task %v already delivered to remote, cleaning up", task.IDVersion())
-			return nil
-		}
-		return worker.RetryErrorf("delivery to remote %q: %v", h.worker.inbox, err)
-	}
-	h.tombstone = resp.InsertedTasks[0]
-	return nil
-}
-
-func (h *handoffHandler) Finish(ctx context.Context, task *entroq.Task, value json.RawMessage, docs []*entroq.Doc) error {
-	if _, err := h.eq.Modify(ctx, task.Delete()); err != nil {
-		return fmt.Errorf("handoff worker finish: %w", err)
-	}
-	if h.tombstone != nil {
-		if _, err := h.worker.dst.Modify(ctx, h.tombstone.Delete()); err != nil {
-			log.Printf("handoff: tombstone cleanup %v (left for destination gc): %v", h.tombstone.IDVersion(), err)
-		}
-	}
-	return nil
-}
 
 // Worker hands tasks off from a source instance (the one it claims from) into an
 // inbox on a destination instance, delivering each exactly once in effect via a
@@ -262,8 +216,33 @@ func Run(ctx context.Context, src *entroq.EntroQ, opts ...Option) error {
 	}
 
 	return worker.New(src,
-		worker.WithMakeHandler(func() (worker.Handler[json.RawMessage], error) {
-			return &handoffHandler{eq: src, worker: w}, nil
+		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, value json.RawMessage, _ []*entroq.Doc) (*worker.Result, error) {
+			// Deliver to the destination: insert the inbox task and a dedup
+			// tombstone in one atomic Modify. tombstone is a per-invocation local,
+			// so the after-commit closure below is fresh for every task.
+			resp, err := w.dst.Modify(ctx,
+				entroq.InsertingInto(w.graveyard,
+					entroq.WithID(w.transferID(task)),
+					entroq.WithArrivalTimeIn(w.ttl)),
+				entroq.InsertingInto(w.inbox, entroq.WithRawValue(value)),
+			)
+			if err != nil {
+				if de, isDep := entroq.AsDependency(err); isDep && de.HasCollisions() {
+					// Already delivered on a prior attempt: just delete the source.
+					log.Printf("task %v already delivered to remote, cleaning up", task.IDVersion())
+					return worker.Modify(task.Delete()), nil
+				}
+				return nil, worker.RetryErrorf("delivery to remote %q: %v", w.inbox, err)
+			}
+			tombstone := resp.InsertedTasks[0]
+			// The worker commits the source delete at the stable version; reap the
+			// tombstone once the handoff succeeds (crash orphans fall to destination GC).
+			return worker.Modify(task.Delete()).OnSuccess(func(ctx context.Context) error {
+				if _, err := w.dst.Modify(ctx, tombstone.Delete()); err != nil {
+					return fmt.Errorf("handoff: tombstone cleanup %v (left for destination gc): %w", tombstone.IDVersion(), err)
+				}
+				return nil
+			}), nil
 		}),
 	).Run(ctx, runOpts...)
 }

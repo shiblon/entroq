@@ -230,7 +230,7 @@ func Example() {
 			fmt.Println(s)
 			return nil
 		}),
-		worker.WithFinish(func(ctx context.Context, final *entroq.Task, _ string, _ []*entroq.Doc) error {
+		worker.WithFinish(func(ctx context.Context, mod worker.Modifier, final *entroq.Task, _ string, _ []*entroq.Doc) error {
 			// Delete the task to "commit" the work.
 			// At this point, you can also call directly into eqpg.ModifyOpts and
 			// hand it a function to call that has a transaction. That transaction
@@ -238,7 +238,7 @@ func Example() {
 			// database operations in it for fully atomic commits. This is a good
 			// pattern for updating state data while handling tasks, to ensure that
 			// it all happens at once.
-			if _, err := client.Modify(ctx, final.Delete()); err != nil {
+			if _, err := mod.Modify(ctx, final.Delete()); err != nil {
 				return fmt.Errorf("Failed to delete/commit task: %w", err)
 			}
 			return nil
@@ -305,7 +305,7 @@ func Example_inTransaction() {
 			fmt.Println(s)
 			return nil
 		}),
-		worker.WithFinish(func(ctx context.Context, final *entroq.Task, _ string, _ []*entroq.Doc) error {
+		worker.WithFinish(func(ctx context.Context, mod worker.Modifier, final *entroq.Task, _ string, _ []*entroq.Doc) error {
 			// Delete the task to "commit" the work.
 
 			// The counter is updated in the same transaction as the entroq modification.
@@ -315,7 +315,7 @@ func Example_inTransaction() {
 				_, err := tx.ExecContext(ctx, "UPDATE exampleCounter SET id = id + 1")
 				return err
 			}
-			if _, err := client.Modify(ctx, final.Delete(), entroq.WithModifyOption(RunningInTx(inTx))); err != nil {
+			if _, err := mod.Modify(ctx, final.Delete(), entroq.WithModifyOption(RunningInTx(inTx))); err != nil {
 				return fmt.Errorf("Failed to delete/commit task: %w", err)
 			}
 			return nil

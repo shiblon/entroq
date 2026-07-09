@@ -65,7 +65,7 @@ func (cw *ConfigWorker) handleDependencyError(ctx context.Context, task *entroq.
 }
 
 // doWork processes a single numeric task using the current local multiplier.
-func (cw *ConfigWorker) doWork(ctx context.Context, t *entroq.Task, val int, _ []*entroq.Doc) ([]entroq.ModifyArg, error) {
+func (cw *ConfigWorker) doWork(ctx context.Context, t *entroq.Task, val int, _ []*entroq.Doc) (*worker.Result, error) {
 	// We use the LOCAL state here. Even if another worker instance refreshed
 	// their own config, ours stays what it was when it was read.
 	multiplier := cw.config.Multiplier
@@ -73,11 +73,11 @@ func (cw *ConfigWorker) doWork(ctx context.Context, t *entroq.Task, val int, _ [
 	result := val * multiplier
 	log.Printf("[Worker] Processing: %v * %v = %v (ver %v)", val, multiplier, result, cw.cID)
 
-	return []entroq.ModifyArg{
+	return worker.Modify(
 		t.Delete(),
 		cw.cID.Depend(),
 		entroq.InsertingInto(outboxQueue, entroq.WithValue(result)),
-	}, nil
+	), nil
 }
 
 func main() {

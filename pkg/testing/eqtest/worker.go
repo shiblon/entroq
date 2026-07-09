@@ -67,8 +67,8 @@ func simpleWorkerOnce(ctx context.Context, t *testing.T, client *entroq.EntroQ, 
 				consumed = append(consumed, task)
 				return nil
 			}),
-			worker.WithFinish(func(ctx context.Context, task *entroq.Task, _ json.RawMessage, _ []*entroq.Doc) error {
-				_, err := client.Modify(ctx, task.Delete())
+			worker.WithFinish(func(ctx context.Context, mod worker.Modifier, task *entroq.Task, _ json.RawMessage, _ []*entroq.Doc) error {
+				_, err := mod.Modify(ctx, task.Delete())
 				return err
 			}),
 		).Run(ctx, worker.Watching(queue))
@@ -171,8 +171,8 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 					consumedCh <- task
 					return nil
 				}),
-				worker.WithFinish(func(ctx context.Context, task *entroq.Task, _ json.RawMessage, _ []*entroq.Doc) error {
-					_, err := client.Modify(ctx, task.Delete())
+				worker.WithFinish(func(ctx context.Context, mod worker.Modifier, task *entroq.Task, _ json.RawMessage, _ []*entroq.Doc) error {
+					_, err := mod.Modify(ctx, task.Delete())
 					return err
 				}),
 			)
@@ -320,8 +320,8 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 				retriedTaskCh <- task
 				return nil
 			}),
-			worker.WithFinish(func(ctx context.Context, task *entroq.Task, _ string, _ []*entroq.Doc) error {
-				_, err := client.Modify(ctx, task.Delete())
+			worker.WithFinish(func(ctx context.Context, mod worker.Modifier, task *entroq.Task, _ string, _ []*entroq.Doc) error {
+				_, err := mod.Modify(ctx, task.Delete())
 				return err
 			}),
 		)
@@ -453,8 +453,8 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 				}
 				return nil
 			}),
-			worker.WithFinish(func(ctx context.Context, task *entroq.Task, _ string, _ []*entroq.Doc) error {
-				if _, err := client.Modify(ctx, task.Delete()); err != nil {
+			worker.WithFinish(func(ctx context.Context, mod worker.Modifier, task *entroq.Task, _ string, _ []*entroq.Doc) error {
+				if _, err := mod.Modify(ctx, task.Delete()); err != nil {
 					return fmt.Errorf("task deletion failed: %w", err)
 				}
 				return nil
@@ -575,9 +575,9 @@ func WorkerDependencyHandler(ctx context.Context, t *testing.T, client *entroq.E
 			<-letFinish
 			return nil
 		}),
-		worker.WithFinish(func(ctx context.Context, task *entroq.Task, val string, _ []*entroq.Doc) error {
+		worker.WithFinish(func(ctx context.Context, mod worker.Modifier, task *entroq.Task, val string, _ []*entroq.Doc) error {
 			// Try to delete the task. This will fail because we'll modify it in the main thread.
-			_, err := client.Modify(ctx, task.Delete(), confTask.Depend())
+			_, err := mod.Modify(ctx, task.Delete(), confTask.Depend())
 			return err
 		}),
 	)
@@ -643,10 +643,10 @@ func WorkerCompactDependencyHandler(ctx context.Context, t *testing.T, client *e
 	handlerCalled := make(chan bool, 1)
 
 	w := worker.New(client,
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, val string, _ []*entroq.Doc) ([]entroq.ModifyArg, error) {
+		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, val string, _ []*entroq.Doc) (*worker.Result, error) {
 			inWork <- true
 			<-letFinish
-			return []entroq.ModifyArg{task.Delete(), confTask.Depend()}, nil
+			return worker.Modify(task.Delete(), confTask.Depend()), nil
 		}),
 	)
 

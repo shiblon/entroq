@@ -59,9 +59,9 @@ func Example() {
 		// When ready to commit changes to the task (including deletion), the second
 		// function passes the version-stable task after the renewer is stopped,
 		// making it safe to use it in modification transactions.
-		worker.WithFinish(func(ctx context.Context, final *entroq.Task, v string, _ []*entroq.Doc) error {
+		worker.WithFinish(func(ctx context.Context, mod worker.Modifier, final *entroq.Task, v string, _ []*entroq.Doc) error {
 			fmt.Printf("Deleting task %q\n", v)
-			_, err := eq.Modify(ctx, final.Delete())
+			_, err := mod.Modify(ctx, final.Delete())
 			if err != nil {
 				return err
 			}
@@ -118,12 +118,12 @@ func Example_dependencies() {
 			// ... do work with initial and config ...
 			return nil
 		}),
-		worker.WithFinish(func(ctx context.Context, final *entroq.Task, _ json.RawMessage, _ []*entroq.Doc) error {
+		worker.WithFinish(func(ctx context.Context, mod worker.Modifier, final *entroq.Task, _ json.RawMessage, _ []*entroq.Doc) error {
 			if config == nil {
 				return fmt.Errorf("config missing during finalize")
 			}
 
-			_, err := eq.Modify(ctx, final.Delete(), config.Depend())
+			_, err := mod.Modify(ctx, final.Delete(), config.Depend())
 			if err != nil {
 				if depErr, ok := entroq.AsDependency(err); ok {
 					if len(depErr.Depends) > 0 {
@@ -135,7 +135,7 @@ func Example_dependencies() {
 						// Or we could force a retry and increment it's attempts
 						// (return RetryError). But there's nothing wrong with the task
 						// so far as we know, so make it immediately available.
-						if _, err := eq.Modify(ctx, final.Change(entroq.ArrivalTimeBy(0))); err != nil {
+						if _, err := mod.Modify(ctx, final.Change(entroq.ArrivalTimeBy(0))); err != nil {
 							// NOW it's our task that's the problem. Just bail.
 							return fmt.Errorf("task reset after config change: %w", err)
 						}

@@ -37,8 +37,8 @@ func TestWorker_Basic(t *testing.T) {
 				}
 				return nil
 			}),
-			WithFinish(func(ctx context.Context, task *entroq.Task, _ string, _ []*entroq.Doc) error {
-				if _, err := client.Modify(ctx, task.Delete()); err != nil {
+			WithFinish(func(ctx context.Context, mod Modifier, task *entroq.Task, _ string, _ []*entroq.Doc) error {
+				if _, err := mod.Modify(ctx, task.Delete()); err != nil {
 					return err
 				}
 				done <- true
@@ -174,7 +174,7 @@ func TestDoModify_DocVersionFixedAfterRenewal(t *testing.T) {
 			WithTakeDocs(func(_ context.Context, _ *entroq.Task, _ string) ([]*entroq.DocClaim, error) {
 				return []*entroq.DocClaim{entroq.ClaimKey("ns", "k")}, nil
 			}),
-			WithDoModify(func(_ context.Context, task *entroq.Task, _ string, docs []*entroq.Doc) ([]entroq.ModifyArg, error) {
+			WithDoModify(func(_ context.Context, task *entroq.Task, _ string, docs []*entroq.Doc) (*Result, error) {
 				if len(docs) == 0 {
 					return nil, FatalErrorf("expected claimed doc")
 				}
@@ -182,7 +182,7 @@ func TestDoModify_DocVersionFixedAfterRenewal(t *testing.T) {
 				// Finish must fix the version up from docs[0].Version (original) to
 				// the renewed version before calling Modify.
 				time.Sleep(lease * 3 / 2)
-				return []entroq.ModifyArg{task.Delete(), docs[0].Delete()}, nil
+				return Modify(task.Delete(), docs[0].Delete()), nil
 			}),
 		).Run(runCtx, Watching("q"), WithLease(lease))
 		worked <- err

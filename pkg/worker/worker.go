@@ -8,21 +8,21 @@
 //
 // # Quick Start
 //
-// A worker is typically created with a set of options that define its behavior.
-// Below is a minimal example using a "DoModify" pattern, which accepts a single
-// function to run, and that function does work and returns modifications it
-// wants to make:
+// A worker is created with a client and a set of options, then run against one
+// or more queues. Below is a minimal example using the "DoModify" pattern: a
+// single function that does the work and returns a Result describing the
+// modifications to apply.
 //
-//		client, _ := entroq.New(ctx, mem.Opener()) // Open an in-memory EntroQ backend.
-//		if err := worker.Run(ctx,
-//	 		WithQueues("/my/inbox"),
-//			WithDoModify(func(ctx context.Context, task *entroq.Task, value json.RawMessage, docs []*entroq.Doc) ([]entroq.ModifyArg, error) {
-//		    	log.Printf("Working on task %v", task.ID)
-//		    	return []entroq.ModifyArg{task.Delete()}, nil
-//			}),
-//		); err != nil {
-//		    log.Fatalf("Worker failed: %v", err)
-//		}
+//	client, _ := entroq.New(ctx, mem.Opener()) // Open an in-memory EntroQ backend.
+//	w := worker.New[json.RawMessage](client,
+//		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, value json.RawMessage, docs []*entroq.Doc) (*worker.Result, error) {
+//			log.Printf("Working on task %v", task.ID)
+//			return worker.Modify(task.Delete()), nil
+//		}),
+//	)
+//	if err := w.Run(ctx, worker.Watching("/my/inbox")); err != nil {
+//		log.Fatalf("Worker failed: %v", err)
+//	}
 package worker
 
 import (
@@ -46,6 +46,16 @@ type ErrQMap func(inbox string) string
 // DefaultRetryDelay is the amount by which to advance the arrival time when a
 // worker task errors out as retryable. This is an exponential backoff baseline.
 const DefaultRetryDelay = 30 * time.Second
+
+// Modifier is the modification-capable subset of *entroq.EntroQ handed to a
+// handler's Finish phase (and to WithFinish functions). Finish runs after
+// renewal has stopped, so committing the task is safe, and committing is all it
+// needs -- reads, claims, and renewals are neither required there nor offered.
+// A handler that needs more implements Handler via WithMakeHandler and captures
+// a full client.
+type Modifier interface {
+	Modify(ctx context.Context, modArgs ...entroq.ModifyArg) (*entroq.ModifyResponse, error)
+}
 
 // Handler[T] is an interface that can be implemented to define work to be done.
 // The value T is the pre-unmarshaled task value. Use T = json.RawMessage to
@@ -89,11 +99,20 @@ type Handler[T any] interface {
 	DoWork(context.Context, *entroq.Task, T, []*entroq.Doc) error
 
 	// Finish is called after DoWork returns nil and renewal has stopped. It
-	// receives the stable (final renewed) task version, the same value passed
-	// to DoWork, and the same docs. Use it to apply task modifications --
-	// deletion, requeueing, doc changes, etc. Finish is skipped when DoWork
-	// returns a non-nil error of any kind.
-	Finish(context.Context, *entroq.Task, T, []*entroq.Doc) error
+	// receives a Modifier (the worker's client, narrowed to modification), the
+	// stable (final renewed) task version, the same value passed to DoWork, and
+	// the same docs. Use it to apply task modifications -- deletion, requeueing,
+	// doc changes, etc. Finish is skipped when DoWork returns a non-nil error of
+	// any kind.
+	//
+	// Finish is the ONLY phase handed a client, and only a Modifier, by design:
+	// it runs after renewal has stopped, so modifying the claimed task here is
+	// safe, and committing is all it needs to do. TakeDocs and DoWork run under
+	// background renewal, where mutating the claimed task would race the renewer,
+	// so they are given no client. A handler that needs more than a commit here
+	// (or a client in the earlier phases) implements Handler via WithMakeHandler
+	// and captures a full client in a closure.
+	Finish(context.Context, Modifier, *entroq.Task, T, []*entroq.Doc) error
 }
 
 // MakeHandler defines a function that can be called to make a new handler.
@@ -102,16 +121,55 @@ type Handler[T any] interface {
 // invocation of Run.
 type MakeHandler[T any] func() (Handler[T], error)
 
-// DoModifyRun[T] is a function type that allows a work handler to be defined
-// that passes modifications out instead of making those modifications itself
-// in a Finish function. The docs parameter carries any docs claimed by
-// WithTakeDocs, and can be empty.
+// DoModifyRun[T] is the common worker pattern: do the work, then return a Result
+// describing the modifications the worker should apply (and, optionally, work to
+// run once it succeeds) rather than committing them yourself in a Finish
+// function. It is not handed a client: it runs under renewal, and its output is
+// the returned Result, which the worker commits in Finish at the stable version.
+// The docs parameter carries any docs claimed by WithTakeDocs, and can be empty.
 //
-// Return nil on success. To retry the task return a RetryError (RetryErrorf);
-// to move it return a MoveError (MoveErrorf). Any other non-nil error causes the
-// worker to exit -- backoff and restart are the responsibility of the process
+// Return the Result (built with Modify) and a nil error on success; a nil Result
+// is a valid no-op. To retry the task return a RetryError (RetryErrorf); to move
+// it return a MoveError (MoveErrorf). Any other non-nil error causes the worker
+// to exit -- backoff and restart are the responsibility of the process
 // orchestrator.
-type DoModifyRun[T any] func(context.Context, *entroq.Task, T, []*entroq.Doc) ([]entroq.ModifyArg, error)
+type DoModifyRun[T any] func(context.Context, *entroq.Task, T, []*entroq.Doc) (*Result, error)
+
+// Result is what a DoModifyRun returns: the modifications the worker applies
+// after work completes, plus optional work to run when the task is handled
+// successfully. Build it with Modify, then chain OnSuccess for a post-success
+// step.
+type Result struct {
+	mods      []entroq.ModifyArg
+	onSuccess func(context.Context) error
+}
+
+// Modify begins a Result that applies args after work completes. The worker
+// commits them at the stable (renewed) task version. Chain OnSuccess for an
+// optimistic step that runs once the task is handled successfully.
+func Modify(args ...entroq.ModifyArg) *Result {
+	return &Result{mods: args}
+}
+
+// OnSuccess attaches fn to run after the task is handled successfully: the
+// handler returned no error and any modifications it requested committed. It
+// does NOT run if the handler returns an error or the commit fails -- the
+// transaction is canceled and there is no success to build on. It is
+// best-effort: its error is logged and never fails the task. To escalate a
+// post-success failure, return a FatalError (FatalErrorf) and the worker stops
+// after this task; RetryError/MoveError are meaningless here (nothing left to
+// retry or move) and are treated as ordinary logged errors. fn receives only a
+// context by design -- it is for optimistic post-success side effects (releasing
+// a lock, deleting a self-owned marker), so retain anything it needs via a
+// closure.
+//
+// OnSuccess is NOT a "finally" block: for cleanup that must run regardless of
+// outcome, use a plain defer inside your handler function, which runs when the
+// handler returns, before the worker commits.
+func (r *Result) OnSuccess(fn func(context.Context) error) *Result {
+	r.onSuccess = fn
+	return r
+}
 
 // TakeRun[T] is a function that inspects a newly claimed task and
 // declares what resources the worker needs before doing work. Returning a nil
@@ -127,27 +185,22 @@ type DoModifyRun[T any] func(context.Context, *entroq.Task, T, []*entroq.Doc) ([
 // Then it makes sense to hold a full exclusive lock on them all.
 type TakeRun[T any] func(context.Context, *entroq.Task, T) ([]*entroq.DocClaim, error)
 
-// DoFinishRun[T] defines a function shape that is called during the work and
-// finish portions of task handling. In both cases, you are given a task, a
-// value of that task properly typed, and if relevant, a document response with
-// all required documents.
-//
-// In the finish phase, the same information is available but all objects will
-// have current version numbers for safe modification.
-type DoFinishRun[T any] func(context.Context, *entroq.Task, T, []*entroq.Doc) error
+// DoRun[T] is the WithDoWork function shape: the work phase. It is given the
+// task, its typed value, and any claimed docs, but no client -- it runs under
+// renewal, so it must not modify the claimed task (see Handler.Finish). Return a
+// RetryError/MoveError to retry/move, or any other error to exit.
+type DoRun[T any] func(context.Context, *entroq.Task, T, []*entroq.Doc) error
 
-// NoWork is a no-op work function for finalize-only workers -- those whose
-// entire job is moving tasks between queues, so the queue topology is the state
-// machine and there is no work phase, only a commit. Pass it to WithDoWork and
-// put the real logic in WithFinish, which runs with a stable (renewed) task
-// version safe to modify.
-func NoWork[T any](context.Context, *entroq.Task, T, []*entroq.Doc) error { return nil }
+// FinishRun[T] is the WithFinish function shape: the commit phase. It runs after
+// renewal has stopped and is handed a Modifier, so committing the (now stable)
+// task is safe. It receives the same value and docs as DoRun.
+type FinishRun[T any] func(context.Context, Modifier, *entroq.Task, T, []*entroq.Doc) error
 
 // funcHandler[T] is a Handler[T] backed by plain functions.
 type funcHandler[T any] struct {
-	take   func(context.Context, *entroq.Task, T) ([]*entroq.DocClaim, error)
-	do     func(context.Context, *entroq.Task, T, []*entroq.Doc) error
-	finish func(context.Context, *entroq.Task, T, []*entroq.Doc) error
+	take   TakeRun[T]
+	do     DoRun[T]
+	finish FinishRun[T]
 }
 
 // TakeDocs runs the specified take function if set, otherwise returns nil.
@@ -167,11 +220,11 @@ func (h *funcHandler[T]) DoWork(ctx context.Context, task *entroq.Task, value T,
 }
 
 // Finish runs the specified "finish" function if it has been defined.
-func (h *funcHandler[T]) Finish(ctx context.Context, task *entroq.Task, value T, docs []*entroq.Doc) error {
+func (h *funcHandler[T]) Finish(ctx context.Context, mod Modifier, task *entroq.Task, value T, docs []*entroq.Doc) error {
 	if h.finish == nil {
 		return nil
 	}
-	return h.finish(ctx, task, value, docs)
+	return h.finish(ctx, mod, task, value, docs)
 }
 
 // doModifyhandler is a special handler that keeps track of "desired
@@ -183,12 +236,11 @@ func (h *funcHandler[T]) Finish(ctx context.Context, task *entroq.Task, value T,
 // convenient, so it's the most common way to define work, but it requires a
 // little state handling to pass requested modifications to the finish function.
 type doModifyHandler[T any] struct {
-	eqc      *entroq.EntroQ
 	take     TakeRun[T]
 	doModify DoModifyRun[T]
 
 	initialTask *entroq.Task
-	modArgs     []entroq.ModifyArg
+	result      *Result
 }
 
 func (h *doModifyHandler[T]) TakeDocs(ctx context.Context, task *entroq.Task, val T) ([]*entroq.DocClaim, error) {
@@ -200,81 +252,98 @@ func (h *doModifyHandler[T]) TakeDocs(ctx context.Context, task *entroq.Task, va
 }
 
 func (h *doModifyHandler[T]) DoWork(ctx context.Context, task *entroq.Task, val T, docs []*entroq.Doc) error {
-	var err error
-	if h.initialTask == nil {
-		h.initialTask = task
-	}
 	if h.doModify == nil {
 		return FatalErrorf("no work function specified")
 	}
-	h.modArgs, err = h.doModify(ctx, task, val, docs)
-	return err
+	result, err := h.doModify(ctx, task, val, docs)
+	if err != nil {
+		return err
+	}
+	h.result = result
+	return nil
 }
 
-func (h *doModifyHandler[T]) Finish(ctx context.Context, finalTask *entroq.Task, val T, finalDocs []*entroq.Doc) error {
-	if h.initialTask == nil {
-		return FatalErrorf("unexpected nil initial task in doModify finish")
-	}
-	if len(h.modArgs) == 0 {
-		// Nothing to do!
+func (h *doModifyHandler[T]) Finish(ctx context.Context, mod Modifier, finalTask *entroq.Task, val T, finalDocs []*entroq.Doc) error {
+	// initialTask is set unconditionally by TakeDocs, which always runs before
+	// Finish, so it is non-nil here by construction.
+	if h.result == nil {
+		// Handler returned no Result: nothing to commit, nothing to run.
 		return nil
 	}
 
-	modification := entroq.NewModification("", h.modArgs...)
+	if len(h.result.mods) > 0 {
+		if finalTask == nil {
+			return FatalErrorf("doModify finish: nil finalized task with modifications to apply")
+		}
 
-	if h.initialTask.Version > finalTask.Version {
-		return fmt.Errorf("task updated inside worker body, expected version <= %v, got %v", finalTask.Version, h.initialTask.Version)
+		modification := entroq.NewModification("", h.result.mods...)
+
+		if h.initialTask.Version > finalTask.Version {
+			return fmt.Errorf("task updated inside worker body, expected version <= %v, got %v", finalTask.Version, h.initialTask.Version)
+		}
+
+		// Fix up task modification versions to reflect the final renewed state.
+		for _, t := range modification.Changes {
+			if t.ID == finalTask.ID {
+				t.Version = finalTask.Version
+			}
+		}
+		for _, t := range modification.Depends {
+			if t.ID == finalTask.ID {
+				t.Version = finalTask.Version
+			}
+		}
+		for _, t := range modification.Deletes {
+			if t.ID == finalTask.ID {
+				t.Version = finalTask.Version
+			}
+		}
+
+		// Fix up doc modification versions to reflect the final renewed state.
+		type nsID = [2]string
+		docVers := make(map[nsID]int32, len(finalDocs))
+		for _, d := range finalDocs {
+			docVers[nsID{d.Namespace, d.ID}] = d.Version
+		}
+		for _, dc := range modification.DocChanges {
+			if v, ok := docVers[nsID{dc.Namespace, dc.ID}]; ok {
+				dc.Version = v
+			}
+		}
+		for _, dd := range modification.DocDeletes {
+			if v, ok := docVers[nsID{dd.Namespace, dd.ID}]; ok {
+				dd.Version = v
+			}
+		}
+		for _, dd := range modification.DocDepends {
+			if v, ok := docVers[nsID{dd.Namespace, dd.ID}]; ok {
+				dd.Version = v
+			}
+		}
+
+		if _, err := mod.Modify(ctx, entroq.WithModification(modification)); err != nil {
+			if _, ok := entroq.AsDependency(err); ok {
+				log.Printf("Worker ack failed, throwing away: %v", err)
+				return fmt.Errorf("worker doModify finish dependency: %w", err)
+			}
+			if entroq.IsCanceled(err) || entroq.IsTimeout(err) {
+				log.Printf("Worker exiting cleanly instead of acking: %v", err)
+				return fmt.Errorf("canceled doModify finish: %w", err)
+			}
+			return fmt.Errorf("worker doModify finish: %w", err)
+		}
 	}
 
-	// Fix up task modification versions to reflect the final renewed state.
-	for _, t := range modification.Changes {
-		if t.ID == finalTask.ID {
-			t.Version = finalTask.Version
+	// The task was handled successfully (no error; any modifications committed).
+	// OnSuccess is the optimistic post-success step: best-effort (its error is
+	// logged), unless it returns a FatalError, which stops the worker.
+	if h.result.onSuccess != nil {
+		if err := h.result.onSuccess(ctx); err != nil {
+			if _, ok := AsFatal(err); ok {
+				return err
+			}
+			log.Printf("worker on-success: %v", err)
 		}
-	}
-	for _, t := range modification.Depends {
-		if t.ID == finalTask.ID {
-			t.Version = finalTask.Version
-		}
-	}
-	for _, t := range modification.Deletes {
-		if t.ID == finalTask.ID {
-			t.Version = finalTask.Version
-		}
-	}
-
-	// Fix up doc modification versions to reflect the final renewed state.
-	type nsID = [2]string
-	docVers := make(map[nsID]int32, len(finalDocs))
-	for _, d := range finalDocs {
-		docVers[nsID{d.Namespace, d.ID}] = d.Version
-	}
-	for _, dc := range modification.DocChanges {
-		if v, ok := docVers[nsID{dc.Namespace, dc.ID}]; ok {
-			dc.Version = v
-		}
-	}
-	for _, dd := range modification.DocDeletes {
-		if v, ok := docVers[nsID{dd.Namespace, dd.ID}]; ok {
-			dd.Version = v
-		}
-	}
-	for _, dd := range modification.DocDepends {
-		if v, ok := docVers[nsID{dd.Namespace, dd.ID}]; ok {
-			dd.Version = v
-		}
-	}
-
-	if _, err := h.eqc.Modify(ctx, entroq.WithModification(modification)); err != nil {
-		if _, ok := entroq.AsDependency(err); ok {
-			log.Printf("Worker ack failed, throwing away: %v", err)
-			return fmt.Errorf("worker doModify finish dependency: %w", err)
-		}
-		if entroq.IsCanceled(err) || entroq.IsTimeout(err) {
-			log.Printf("Worker exiting cleanly instead of acking: %v", err)
-			return fmt.Errorf("canceled doModify finish: %w", err)
-		}
-		return fmt.Errorf("worker doModify finish: %w", err)
 	}
 	return nil
 }
@@ -299,7 +368,8 @@ type Worker[T any] struct {
 
 	errQMap ErrQMap
 
-	// Creates a new handler. Called once per Run.
+	// Creates a new handler. Called once per task, in runOne, so per-task
+	// handler state is isolated by construction.
 	makeHandler MakeHandler[T]
 }
 
@@ -308,11 +378,11 @@ type Worker[T any] struct {
 type workerOpts[T any] struct {
 	makeHandler MakeHandler[T]
 
-	// These are all potential inputs to create a MakeHandler.
+	// These are all potential inputs to create the default handler.
 	take     TakeRun[T]
 	doModify DoModifyRun[T]
-	do       DoFinishRun[T]
-	finish   DoFinishRun[T]
+	do       DoRun[T]
+	finish   FinishRun[T]
 
 	errQMap ErrQMap
 }
@@ -346,7 +416,6 @@ func New[T any](eq *entroq.EntroQ, opts ...Option[T]) *Worker[T] {
 	if wOpts.doModify != nil {
 		worker.makeHandler = func() (Handler[T], error) {
 			return &doModifyHandler[T]{
-				eqc:      eq,
 				take:     wOpts.take,
 				doModify: wOpts.doModify,
 			}, nil
@@ -381,9 +450,10 @@ func DefaultErrQMap(inbox string) string {
 	return inbox + "/err"
 }
 
-// WithDoWork sets the primary work function for a worker. Overwrites any
+// WithDoWork sets the primary work function for a worker. It runs under
+// background renewal and is given no client (see Handler.Finish). Overwrites any
 // previous handler configuration.
-func WithDoWork[T any](f DoFinishRun[T]) Option[T] {
+func WithDoWork[T any](f DoRun[T]) Option[T] {
 	return func(wo *workerOpts[T]) {
 		wo.do = f
 	}
@@ -391,9 +461,11 @@ func WithDoWork[T any](f DoFinishRun[T]) Option[T] {
 
 // WithFinish sets the finalization function for a worker, called after DoWork
 // completes successfully and renewal has stopped. The function receives the
-// stable (finally-renewed) task, the original unmarshaled value, and any docs
-// acquired by WithTakeDocs. Overwrites any previous handler configuration.
-func WithFinish[T any](f DoFinishRun[T]) Option[T] {
+// worker's client, the stable (finally-renewed) task, the original unmarshaled
+// value, and any docs acquired by WithTakeDocs. Because it runs after renewal
+// stops, modifying the task through the client is safe. Overwrites any previous
+// handler configuration.
+func WithFinish[T any](f FinishRun[T]) Option[T] {
 	return func(wo *workerOpts[T]) {
 		wo.finish = f
 	}
@@ -622,7 +694,7 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt) error {
 	}
 
 	// Phase 4: Finish with stable versions — renewal has stopped.
-	if err := handler.Finish(ctx, finalTask, value, finalDocs); err != nil {
+	if err := handler.Finish(ctx, w.eqc, finalTask, value, finalDocs); err != nil {
 		if de, ok := entroq.AsDependency(err); ok {
 			if opts.onDepError != nil {
 				if err := opts.onDepError(ctx, finalTask, de); err != nil {

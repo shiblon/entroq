@@ -34,10 +34,10 @@ func Example_simpleWorker() {
 	done := make(chan struct{})
 
 	w := worker.New[json.RawMessage](eq,
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, value json.RawMessage, _ []*entroq.Doc) ([]entroq.ModifyArg, error) {
+		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, value json.RawMessage, _ []*entroq.Doc) (*worker.Result, error) {
 			fmt.Printf("processing task with value %s\n", value)
 			// Return the modifications to apply atomically after work completes.
-			return []entroq.ModifyArg{task.Delete()}, nil
+			return worker.Modify(task.Delete()), nil
 		}),
 	)
 
@@ -113,7 +113,7 @@ func Example_workerWithDocs() {
 				Key:       val.Key,
 			}}, nil
 		}),
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, val jobValue, docs []*entroq.Doc) ([]entroq.ModifyArg, error) {
+		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, val jobValue, docs []*entroq.Doc) (*worker.Result, error) {
 			// docs are sorted by (primary key, secondary key).
 			for _, d := range docs {
 				fmt.Printf("doc key=%s secondary=%s\n", d.Key, d.SecondaryKey)
@@ -123,10 +123,10 @@ func Example_workerWithDocs() {
 			if err := json.Unmarshal(docs[0].Content, &n); err != nil {
 				return nil, fmt.Errorf("unmarshal: %w", err)
 			}
-			return []entroq.ModifyArg{
+			return worker.Modify(
 				task.Delete(),
-				docs[0].Change(entroq.WithContent(n + 1)),
-			}, nil
+				docs[0].Change(entroq.WithContent(n+1)),
+			), nil
 		}),
 	)
 
