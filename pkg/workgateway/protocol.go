@@ -135,21 +135,14 @@ type done struct {
 // successful outcome; a client that wants to consume the input task lists it in
 // Deletes, exactly as a Go worker returns task.Delete().
 //
-// Two categories are deliberately reserved for a follow-up and are not
-// represented here yet:
-//
-//   - Task CHANGES. A Go change copies the full task and applies deltas, so
-//     preserving the fields a client does not restate needs the task's current
-//     state, which the wire ref (id, version, queue) does not carry. Getting the
-//     semantics right (delta vs full-state; the claimed task, whose state the
-//     gateway holds, vs an arbitrary task) is its own design question. Until
-//     then a move is expressible as delete + insert.
-//   - Doc modifications (insert/change/delete/depend on docs). Doc CLAIMS
-//     already work via the takeDocs phase; writing docs back does not yet.
-//
-// See the WIP note in the wiki proposal.
+// A change carries the full task rather than a delta (see change), which is how
+// it preserves the fields the client does not restate and keeps a task's ID
+// stable across a move. Doc modifications (insert/change/delete/depend on docs)
+// remain reserved for a follow-up: doc CLAIMS work via the takeDocs phase, but
+// writing docs back does not yet. See the WIP note in the wiki proposal.
 type modification struct {
 	Inserts []insertArg `json:"inserts,omitempty"`
+	Changes []change    `json:"changes,omitempty"`
 	Deletes []taskRef   `json:"deletes,omitempty"`
 	Depends []taskRef   `json:"depends,omitempty"`
 }
@@ -163,6 +156,24 @@ type insertArg struct {
 	Value json.RawMessage `json:"value,omitempty"`
 	ID    string          `json:"id,omitempty"`
 	At    *time.Time      `json:"at,omitempty"`
+}
+
+// change updates an existing task. It carries the full base Task (the client
+// echoes the task it received in doWork, which is why any field it does not
+// restate keeps its current value) plus the deltas to apply. The claimed task's
+// version is fixed up by the gateway to the stable renewed value, so echoing the
+// version seen in doWork is fine.
+//
+//   - ToQueue moves the task, preserving its ID and bumping only its version
+//     (EntroQ's move semantics).
+//   - At sets a new arrival time; omitting it keeps the task's current At rather
+//     than releasing the task to "now" (the raw entroq default for a change).
+//   - Value replaces the task's value; omitting it keeps the current value.
+type change struct {
+	Task    *entroq.Task    `json:"task"`
+	ToQueue string          `json:"toQueue,omitempty"`
+	At      *time.Time      `json:"at,omitempty"`
+	Value   json.RawMessage `json:"value,omitempty"`
 }
 
 // taskRef identifies a task for a delete or a depend. Queue is optional metadata
@@ -197,6 +208,26 @@ func (m *modification) modifyArgs() ([]entroq.ModifyArg, error) {
 			opts = append(opts, entroq.WithArrivalTime(*ins.At))
 		}
 		args = append(args, entroq.InsertingInto(ins.Queue, opts...))
+	}
+	for _, ch := range m.Changes {
+		if ch.Task == nil || ch.Task.ID == "" {
+			return nil, fmt.Errorf("change: a task with an id is required")
+		}
+		opts := []entroq.ChangeArg{}
+		if ch.ToQueue != "" {
+			opts = append(opts, entroq.QueueTo(ch.ToQueue))
+		}
+		// A raw entroq change releases the task to "now"; preserve the base
+		// arrival time unless the client explicitly sets a new one.
+		if ch.At != nil {
+			opts = append(opts, entroq.ArrivalTimeTo(*ch.At))
+		} else {
+			opts = append(opts, entroq.ArrivalTimeTo(ch.Task.At))
+		}
+		if ch.Value != nil {
+			opts = append(opts, entroq.RawValueTo(ch.Value))
+		}
+		args = append(args, entroq.Changing(ch.Task, opts...))
 	}
 	for _, d := range m.Deletes {
 		if d.ID == "" {

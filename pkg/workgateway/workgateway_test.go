@@ -212,6 +212,93 @@ func TestBridge_Insert(t *testing.T) {
 	s.stop()
 }
 
+// TestBridge_ChangeMovePreservesID moves the claimed task to another queue via a
+// change. The ID stays the same (only the version bumps), and the value, which
+// the client does not restate, is preserved because the change carries the full
+// base task.
+func TestBridge_ChangeMovePreservesID(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	eq := newEQ(t, ctx)
+	insertTask(t, ctx, eq, "in", "hello")
+
+	s := newSession(t, ctx, eq, workCfg(), time.Second)
+
+	var dw doWorkMsg
+	s.c.recv(&dw)
+	s.c.send(result{
+		Type:    msgResult,
+		Outcome: outcomeOK,
+		Modification: &modification{
+			Changes: []change{{Task: dw.Task, ToQueue: "moved"}},
+		},
+	})
+
+	if err := eq.WaitQueuesEmpty(ctx, entroq.MatchExact("in")); err != nil {
+		t.Fatalf("input not drained by move: %v", err)
+	}
+	moved, err := eq.Tasks(ctx, "moved")
+	if err != nil {
+		t.Fatalf("tasks moved: %v", err)
+	}
+	if len(moved) != 1 {
+		t.Fatalf("moved has %d tasks, want 1", len(moved))
+	}
+	if moved[0].ID != dw.Task.ID {
+		t.Errorf("moved task ID = %q, want %q: a move must preserve the ID", moved[0].ID, dw.Task.ID)
+	}
+	if got := string(moved[0].Value); got != `"hello"` {
+		t.Errorf("moved value = %s, want %q: an unrestated field must be preserved", got, `"hello"`)
+	}
+	if moved[0].Version <= dw.Task.Version {
+		t.Errorf("moved version = %d, want > %d: a move must bump the version", moved[0].Version, dw.Task.Version)
+	}
+	s.stop()
+}
+
+// TestBridge_ChangeDefers changes the claimed task's arrival time (leaving it in
+// place), the fundamental "run this later" operation. The task stays in its
+// queue, keeps its ID and value, and is no longer immediately due.
+func TestBridge_ChangeDefers(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	eq := newEQ(t, ctx)
+	insertTask(t, ctx, eq, "in", "hello")
+
+	s := newSession(t, ctx, eq, workCfg(), time.Second)
+
+	var dw doWorkMsg
+	s.c.recv(&dw)
+	future := time.Now().Add(time.Hour)
+	s.c.send(result{
+		Type:    msgResult,
+		Outcome: outcomeOK,
+		Modification: &modification{
+			Changes: []change{{Task: dw.Task, At: &future}},
+		},
+	})
+
+	// The task stays in "in" but deferred, so it is not immediately reclaimed.
+	time.Sleep(200 * time.Millisecond)
+	tasks, err := eq.Tasks(ctx, "in")
+	if err != nil {
+		t.Fatalf("tasks: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("in has %d tasks, want 1 (deferred, still present)", len(tasks))
+	}
+	if tasks[0].ID != dw.Task.ID {
+		t.Errorf("deferred task ID = %q, want %q", tasks[0].ID, dw.Task.ID)
+	}
+	if got := string(tasks[0].Value); got != `"hello"` {
+		t.Errorf("deferred value = %s, want %q", got, `"hello"`)
+	}
+	if !tasks[0].At.After(time.Now().Add(30 * time.Minute)) {
+		t.Errorf("deferred At = %v, want well into the future", tasks[0].At)
+	}
+	s.stop()
+}
+
 // TestBridge_TakeDocs exercises the optional doc-claim phase: the worker asks for
 // a doc, the gateway claims it and passes it into doWork.
 func TestBridge_TakeDocs(t *testing.T) {
