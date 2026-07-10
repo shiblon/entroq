@@ -2,18 +2,14 @@ package workgateway
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
-	"strconv"
 	"time"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/pkg/worker"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -32,10 +28,10 @@ func (w *WSConn) Send(ctx context.Context, v any) error { return wsjson.Write(ct
 // Recv reads the next JSON WebSocket message into v.
 func (w *WSConn) Recv(ctx context.Context, v any) error { return wsjson.Read(ctx, w.c, v) }
 
-// Handler returns the work gateway's HTTP handler. A worker connects to /work
-// and declares its listen config in the query string (?queue=... repeated, and
-// optional maxAttempts=N); the handler upgrades to WebSocket and runs one
-// worker.Run over a WSConn Bridge. Canceling ctx stops every connection.
+// Handler returns the work gateway's HTTP handler. A worker connects to /work,
+// the handler upgrades to WebSocket, and one Bridge runs the protocol over it:
+// the worker's first message is a register declaring queues and phases, exactly
+// as over any other transport. Canceling ctx stops every connection.
 //
 // Liveness: a connection dropped mid-task surfaces as a Send/Recv error, which
 // ends that worker and reclaims its task. An idle connection (blocked claiming)
@@ -44,16 +40,6 @@ func (w *WSConn) Recv(ctx context.Context, v any) error { return wsjson.Read(ctx
 func Handler(ctx context.Context, eq *entroq.EntroQ, lease time.Duration) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/work", func(rw http.ResponseWriter, r *http.Request) {
-		queues := r.URL.Query()["queue"]
-		if len(queues) == 0 {
-			http.Error(rw, "at least one ?queue= is required", http.StatusBadRequest)
-			return
-		}
-		maxAttempts, err := queryInt32(r, "maxAttempts")
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusBadRequest)
-			return
-		}
 		// These are worker clients, not browsers, so origin checks do not apply.
 		c, err := websocket.Accept(rw, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
 		if err != nil {
@@ -62,8 +48,7 @@ func Handler(ctx context.Context, eq *entroq.EntroQ, lease time.Duration) http.H
 		defer c.CloseNow()
 
 		bridge := NewBridge(NewWSConn(c))
-		wk := worker.New(eq, worker.WithDoModify[json.RawMessage](bridge.DoWork))
-		switch err := wk.Run(ctx, worker.Watching(queues...), worker.WithLease(lease), worker.WithMaxAttempts(maxAttempts)); {
+		switch err := bridge.Run(ctx, eq, lease); {
 		case err == nil || errors.Is(err, context.Canceled):
 			c.Close(websocket.StatusNormalClosure, "")
 		default:
@@ -92,16 +77,4 @@ func Serve(ctx context.Context, addr string, eq *entroq.EntroQ, lease time.Durat
 		return nil
 	})
 	return g.Wait()
-}
-
-func queryInt32(r *http.Request, key string) (int32, error) {
-	s := r.URL.Query().Get(key)
-	if s == "" {
-		return 0, nil
-	}
-	n, err := strconv.ParseInt(s, 10, 32)
-	if err != nil {
-		return 0, fmt.Errorf("bad %s %q: %w", key, s, err)
-	}
-	return int32(n), nil
 }

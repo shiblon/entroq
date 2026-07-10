@@ -1,17 +1,17 @@
 // Package workgateway bridges EntroQ's worker loop to a language-agnostic worker
-// spoken to over a simple newline-delimited JSON protocol. eqlink runs the hard
-// part (claim, renew, commit) and, for each claimed task, sends the worker a
-// "work" message and reads back one "result"; the worker never touches EntroQ,
-// gRPC, or the queue protocol. A client is therefore trivial to implement in any
-// language: read a tagged JSON object, do the work, write a tagged JSON object.
+// spoken to over a small newline-delimited JSON protocol. eqlink runs the hard,
+// stateful part (claim, renew at half the lease, stop-and-freeze before commit,
+// version fix-up, retry/move/backoff, doc-claim ordering) once, in Go; a worker
+// in any language connects, registers the queues it serves and the phases it
+// implements, and then answers phase messages. It never touches EntroQ, gRPC, or
+// the queue protocol. See protocol.go for the full wire contract.
 //
-// The protocol is transport-agnostic. This skeleton carries it over a stdio pipe
-// (eqlink work as a child process); a WebSocket transport will carry the same
-// messages later. Because json.Encoder appends a newline, the wire is one
-// compact JSON object per line (ndjson), which every language reads trivially.
-//
-// One connection is one worker slot: exactly one task in flight, strict
-// request/response, no correlation ids. Concurrency is more connections.
+// The protocol is transport-agnostic: a Conn is any one-message-per-Send,
+// one-message-per-Recv channel. PipeConn carries it over a stdio pipe (the
+// primary transport, e.g. eqlink work as a child process) and WSConn carries the
+// identical messages over a WebSocket. One connection is one worker slot:
+// exactly one task in flight, strict request/response, no correlation ids;
+// concurrency is more connections.
 package workgateway
 
 import (
@@ -25,43 +25,146 @@ import (
 	"github.com/shiblon/entroq/pkg/worker"
 )
 
-// workMsg is sent to the worker for each claimed task (the "work" phase). The
-// task is the full entroq.Task, the identical value an in-process Go worker's
-// DoWork receives (its Value stays raw JSON), so a wire worker in any language
-// sees exactly what a native one does, down to fields like FromQueue and
-// Attempt that a reaper or authorizer might care about.
-type workMsg struct {
-	Type string       `json:"type"` // always "work"
-	Task *entroq.Task `json:"task"`
-}
-
-// result is the worker's reply to a work message: exactly one outcome.
-type result struct {
-	Type    string `json:"type"`              // "result"
-	Outcome string `json:"outcome"`           // ok | retry | move | fatal
-	Message string `json:"message,omitempty"` // error detail for retry/move/fatal
-	After   string `json:"after,omitempty"`   // retry: delay before re-arrival, e.g. "30s"
-	OrMove  string `json:"orMove,omitempty"`  // retry: quarantine queue once attempts exhaust
-	To      string `json:"to,omitempty"`      // move: destination queue
-}
-
-// Conn carries the protocol's JSON messages over some transport, one message
-// per Send and per Recv. A stdio pipe (PipeConn) and a WebSocket are both just
-// Conns; that is what keeps the Bridge transport-agnostic.
+// Conn carries the protocol's JSON messages over some transport, one message per
+// Send and per Recv. A stdio pipe (PipeConn) and a WebSocket (WSConn) are both
+// just Conns; that is what keeps the Bridge transport-agnostic.
 type Conn interface {
 	Send(ctx context.Context, v any) error // marshal and write one protocol message
 	Recv(ctx context.Context, v any) error // read and unmarshal the next message into v
 }
 
-// Bridge speaks the work protocol over a Conn. One connection handles one task
-// at a time, so no locking is needed.
+// Bridge drives one worker connection. Run reads the client's registration, then
+// runs the Go worker loop, translating each lifecycle phase into a protocol
+// message and the reply back into worker behavior. One connection handles one
+// task at a time, so the Bridge needs no locking; after Run begins its only
+// state is the immutable registration, and all per-task state lives in a fresh
+// handler the worker builds per task.
 type Bridge struct {
 	conn Conn
+	reg  register
 }
 
 // NewBridge builds a Bridge over conn.
 func NewBridge(conn Conn) *Bridge {
 	return &Bridge{conn: conn}
+}
+
+// Run reads the client's register message, constructs a worker implementing
+// exactly the phases the client declared, and runs it against eq until ctx is
+// done or the worker stops. The lease (renewal cadence and reclaim latency) is
+// gateway config, not client-chosen. It returns nil on a clean context
+// cancellation.
+func (b *Bridge) Run(ctx context.Context, eq *entroq.EntroQ, lease time.Duration) error {
+	if err := b.conn.Recv(ctx, &b.reg); err != nil {
+		return fmt.Errorf("read register: %w", err)
+	}
+	if b.reg.Type != msgRegister {
+		return fmt.Errorf("first message must be %q, got %q", msgRegister, b.reg.Type)
+	}
+	if len(b.reg.Queues) == 0 {
+		return fmt.Errorf("register: at least one queue is required")
+	}
+
+	opts := []worker.Option[json.RawMessage]{}
+	if b.reg.TakeDocs {
+		opts = append(opts, worker.WithTakeDocs[json.RawMessage](b.takeDocs))
+	}
+	opts = append(opts, worker.WithDoModify[json.RawMessage](b.doWork))
+
+	w := worker.New(eq, opts...)
+	return w.Run(ctx,
+		worker.Watching(b.reg.Queues...),
+		worker.WithLease(lease),
+		worker.WithMaxAttempts(b.reg.MaxAttempts),
+	)
+}
+
+// takeDocs runs the TakeDocs phase: ask the client which docs the task needs and
+// return them for the gateway to claim. Wired only when the client registered
+// takeDocs.
+func (b *Bridge) takeDocs(ctx context.Context, task *entroq.Task, _ json.RawMessage) ([]*entroq.DocClaim, error) {
+	if err := b.conn.Send(ctx, takeDocsMsg{Type: msgTakeDocs, Task: task}); err != nil {
+		return nil, fmt.Errorf("send takeDocs: %w", err)
+	}
+	var d docsMsg
+	if err := b.conn.Recv(ctx, &d); err != nil {
+		return nil, fmt.Errorf("read docs: %w", err)
+	}
+	claims := make([]*entroq.DocClaim, 0, len(d.Claims))
+	for _, c := range d.Claims {
+		claims = append(claims, entroq.ClaimKey(c.Namespace, c.Key))
+	}
+	return claims, nil
+}
+
+// doWork runs the DoWork phase: hand the task and any docs to the client and
+// translate its reply into a modification to commit or a structured worker
+// error. When the client registered cleanup, a successful result chains an
+// OnSuccess step that runs the cleanup phase after the commit.
+func (b *Bridge) doWork(ctx context.Context, task *entroq.Task, _ json.RawMessage, docs []*entroq.Doc) (*worker.Result, error) {
+	if err := b.conn.Send(ctx, doWorkMsg{Type: msgDoWork, Task: task, Docs: docs}); err != nil {
+		return nil, fmt.Errorf("send doWork: %w", err)
+	}
+	var res result
+	if err := b.conn.Recv(ctx, &res); err != nil {
+		return nil, fmt.Errorf("read result: %w", err)
+	}
+
+	switch res.Outcome {
+	case outcomeOK:
+		args, err := res.Modification.modifyArgs()
+		if err != nil {
+			// A malformed modification is a client bug, not a transient fault:
+			// retrying would only replay the same bad message, so stop the worker.
+			return nil, worker.FatalErrorf("invalid modification from worker: %v", err)
+		}
+		r := worker.Modify(args...)
+		if b.reg.Cleanup {
+			r = r.OnSuccess(b.cleanup)
+		}
+		return r, nil
+	case outcomeRetry:
+		re := worker.RetryErrorf("%s", orDefault(res.Message, "worker requested retry"))
+		if res.After != "" {
+			d, err := time.ParseDuration(res.After)
+			if err != nil {
+				return nil, worker.FatalErrorf("bad retry 'after' %q: %v", res.After, err)
+			}
+			re = re.After(d)
+		}
+		if res.OrMove != "" {
+			re = re.OrMoveTo(res.OrMove)
+		}
+		return nil, re
+	case outcomeMove:
+		me := worker.MoveErrorf("%s", orDefault(res.Message, "worker requested move"))
+		if res.To != "" {
+			me = me.To(res.To)
+		}
+		return nil, me
+	case outcomeFatal:
+		return nil, worker.FatalErrorf("%s", orDefault(res.Message, "worker requested fatal"))
+	default:
+		return nil, worker.FatalErrorf("unknown result outcome %q", res.Outcome)
+	}
+}
+
+// cleanup runs the Cleanup phase after a successful commit: tell the client the
+// task committed and let it run a best-effort post-commit step. A "fatal" reply
+// stops the worker (OnSuccess returning a FatalError); anything else continues.
+// The task is already committed, so this step is at-most-once by nature.
+func (b *Bridge) cleanup(ctx context.Context) error {
+	if err := b.conn.Send(ctx, cleanupMsg{Type: msgCleanup}); err != nil {
+		return fmt.Errorf("send cleanup: %w", err)
+	}
+	var d done
+	if err := b.conn.Recv(ctx, &d); err != nil {
+		return fmt.Errorf("read done: %w", err)
+	}
+	if d.Outcome == outcomeFatal {
+		return worker.FatalErrorf("%s", orDefault(d.Message, "worker cleanup requested fatal"))
+	}
+	return nil
 }
 
 // PipeConn carries the protocol over a byte stream as newline-delimited JSON
@@ -76,56 +179,12 @@ func NewPipeConn(r io.Reader, w io.Writer) *PipeConn {
 	return &PipeConn{enc: json.NewEncoder(w), dec: json.NewDecoder(r)}
 }
 
-// Send writes v as one newline-terminated JSON message. It ignores ctx: the
-// json encoder is not context-aware, and a stdio pipe is canceled by closing it.
+// Send writes v as one newline-terminated JSON message. It ignores ctx: the json
+// encoder is not context-aware, and a stdio pipe is canceled by closing it.
 func (c *PipeConn) Send(_ context.Context, v any) error { return c.enc.Encode(v) }
 
 // Recv decodes the next JSON message into v. It ignores ctx (see Send).
 func (c *PipeConn) Recv(_ context.Context, v any) error { return c.dec.Decode(v) }
-
-// DoWork is the worker.DoModifyRun for the gateway. It hands the task to the
-// worker over the wire and translates the reply into modifications or a
-// structured worker error. A broken pipe (worker gone) surfaces as an error
-// that ends the loop, leaving the claimed task to time out and be reclaimed.
-func (b *Bridge) DoWork(ctx context.Context, task *entroq.Task, _ json.RawMessage, _ []*entroq.Doc) (*worker.Result, error) {
-	if err := b.conn.Send(ctx, workMsg{Type: "work", Task: task}); err != nil {
-		return nil, fmt.Errorf("send work: %w", err)
-	}
-	var res result
-	if err := b.conn.Recv(ctx, &res); err != nil {
-		return nil, fmt.Errorf("read result: %w", err)
-	}
-
-	switch res.Outcome {
-	case "ok":
-		// Skeleton: success means consume the input. Full declarative
-		// modifications land here later.
-		return worker.Modify(task.Delete()), nil
-	case "retry":
-		re := worker.RetryErrorf("%s", orDefault(res.Message, "worker requested retry"))
-		if res.After != "" {
-			d, err := time.ParseDuration(res.After)
-			if err != nil {
-				return nil, worker.FatalErrorf("bad retry 'after' %q: %v", res.After, err)
-			}
-			re = re.After(d)
-		}
-		if res.OrMove != "" {
-			re = re.OrMoveTo(res.OrMove)
-		}
-		return nil, re
-	case "move":
-		me := worker.MoveErrorf("%s", orDefault(res.Message, "worker requested move"))
-		if res.To != "" {
-			me = me.To(res.To)
-		}
-		return nil, me
-	case "fatal":
-		return nil, worker.FatalErrorf("%s", orDefault(res.Message, "worker requested fatal"))
-	default:
-		return nil, worker.FatalErrorf("unknown result outcome %q", res.Outcome)
-	}
-}
 
 func orDefault(s, def string) string {
 	if s == "" {

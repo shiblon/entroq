@@ -1,43 +1,51 @@
 package cmd
 
 import (
-	"encoding/json"
-	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/pkg/worker"
 	"github.com/shiblon/entroq/pkg/workgateway"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
 )
 
 var (
-	workAddr        string
-	workQueues      []string
-	workLease       time.Duration
-	workMaxAttempts int32
+	workAddr  string
+	workLease time.Duration
 )
 
 var workCmd = &cobra.Command{
-	Use:   "work --queue Q [--queue Q...]",
-	Short: "Run a worker gateway: drive a language-agnostic worker over stdio.",
-	Long: `Claims tasks from the given queues on --entroq and hands each to a worker over
-stdin/stdout using a small newline-delimited JSON protocol, so the worker can be
-written in any language without touching EntroQ, gRPC, or the queue API.
+	Use:   "work",
+	Short: "Run a worker gateway: drive a language-agnostic worker over a JSON protocol.",
+	Long: `Runs the EntroQ worker loop (claim, renew, commit) on behalf of a worker written
+in any language, which speaks a small newline-delimited JSON protocol and never
+touches EntroQ, gRPC, or the queue API.
 
-Skeleton: implements only the "work" phase. For each claimed task it writes
-{"type":"work","task":{...}} to stdout and reads one
-{"type":"result","outcome":"ok|retry|move|fatal", ...} from stdin. "ok" consumes
-the task; "retry"/"move"/"fatal" map to the worker's structured errors (with
-optional "after"/"orMove"/"to"). Diagnostics go to stderr; stdout carries only
-the protocol.
+The worker's first message is a register declaring the queues it serves and which
+optional phases it implements:
 
-Concurrency is more processes; killing this one (or closing its stdin) stops
-renewal and the in-flight task is reclaimed.`,
+    {"type":"register","queues":["/my/inbox"],"maxAttempts":5,"takeDocs":false,"cleanup":false}
+
+Then, per claimed task, the gateway sends the registered phases and reads a reply:
+
+    gateway -> {"type":"takeDocs","task":{...}}          # only if takeDocs registered
+    client  -> {"type":"docs","claims":[{"namespace":..,"key":..}]}
+    gateway -> {"type":"doWork","task":{...},"docs":[...]}
+    client  -> {"type":"result","outcome":"ok","modification":{...}}
+    gateway -> {"type":"cleanup"}                        # only if cleanup registered
+    client  -> {"type":"done"}
+
+"ok" commits the (possibly empty) modification; "ok" alone does not delete the
+task. "retry"/"move"/"fatal" map to the worker's structured errors. Diagnostics
+go to stderr; stdout carries only the protocol.
+
+By default one worker runs over this process's stdin/stdout. With --addr, the
+gateway serves WebSocket instead and each connecting worker is one slot.
+Concurrency is more connections; dropping a connection stops renewal and the
+in-flight task is reclaimed on lease expiry.`,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -52,31 +60,21 @@ renewal and the in-flight task is reclaimed.`,
 		}
 		defer eq.Close()
 
-		// WebSocket serve mode: workers connect and declare queues in the URL.
+		// WebSocket serve mode: many workers connect, each registering its own queues.
 		if workAddr != "" {
 			return workgateway.Serve(gctx, workAddr, eq, workLease)
 		}
 
 		// stdio mode: one worker over this process's stdin/stdout.
-		if len(workQueues) == 0 {
-			return fmt.Errorf("--queue is required in stdio mode (or set --addr to serve WebSocket)")
-		}
 		bridge := workgateway.NewBridge(workgateway.NewPipeConn(os.Stdin, os.Stdout))
-		w := worker.New(eq, worker.WithDoModify[json.RawMessage](bridge.DoWork))
-		return w.Run(gctx,
-			worker.Watching(workQueues...),
-			worker.WithLease(workLease),
-			worker.WithMaxAttempts(workMaxAttempts),
-		)
+		return bridge.Run(gctx, eq, workLease)
 	},
 }
 
 func init() {
 	flags := workCmd.Flags()
-	flags.StringVar(&workAddr, "addr", "", "If set, serve the gateway over WebSocket on this address; workers connect with /work?queue=... . Otherwise run one worker over stdio.")
-	flags.StringArrayVar(&workQueues, "queue", nil, "Queue to listen on in stdio mode (repeatable). In --addr mode, queues come from the connection URL.")
-	flags.DurationVar(&workLease, "lease", entroq.DefaultClaimDuration, "Claim lease and renewal interval (gateway-owned).")
-	flags.Int32Var(&workMaxAttempts, "max-attempts", 0, "Max attempts before a retry is quarantined in stdio mode; 0 means unlimited.")
+	flags.StringVar(&workAddr, "addr", "", "If set, serve the gateway over WebSocket on this address (workers connect to /work). Otherwise run one worker over stdio.")
+	flags.DurationVar(&workLease, "lease", entroq.DefaultClaimDuration, "Claim lease and renewal interval (gateway-owned; not client-chosen).")
 
 	rootCmd.AddCommand(workCmd)
 }
