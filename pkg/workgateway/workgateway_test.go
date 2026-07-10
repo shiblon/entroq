@@ -17,6 +17,8 @@ import (
 // test itself plays the worker on the other end of an in-memory pipe. Because
 // the test is in package workgateway, it builds and reads the wire types
 // directly, so the assertions double as documentation of the exact protocol.
+// Registration is out-of-band (a Config passed to Run), so the tests never send
+// a wire register message.
 
 // codec is the worker side of the wire in a test: send a message, receive the
 // next one.
@@ -40,7 +42,8 @@ func (c *codec) recv(v any) {
 	}
 }
 
-// session runs a Bridge over pipes against eq, with the test playing the worker.
+// session runs a Bridge over pipes against eq with the given registration, and
+// the test plays the worker.
 type session struct {
 	t      *testing.T
 	c      *codec
@@ -48,7 +51,7 @@ type session struct {
 	errc   chan error
 }
 
-func newSession(t *testing.T, ctx context.Context, eq *entroq.EntroQ, lease time.Duration) *session {
+func newSession(t *testing.T, ctx context.Context, eq *entroq.EntroQ, cfg Config, lease time.Duration) *session {
 	t.Helper()
 	clientR, gatewayW := io.Pipe()
 	gatewayR, clientW := io.Pipe()
@@ -56,7 +59,7 @@ func newSession(t *testing.T, ctx context.Context, eq *entroq.EntroQ, lease time
 
 	rctx, cancel := context.WithCancel(ctx)
 	errc := make(chan error, 1)
-	go func() { errc <- bridge.Run(rctx, eq, lease) }()
+	go func() { errc <- bridge.Run(rctx, eq, cfg, lease) }()
 
 	return &session{
 		t:      t,
@@ -77,7 +80,7 @@ func (s *session) stop() {
 }
 
 // wait returns the bridge's Run error, for tests where the worker is expected to
-// stop on its own (a fatal or a registration error).
+// stop on its own (a fatal or a bad registration).
 func (s *session) wait() error {
 	s.t.Helper()
 	select {
@@ -106,16 +109,23 @@ func insertTask(t *testing.T, ctx context.Context, eq *entroq.EntroQ, q, value s
 	}
 }
 
-// TestBridge_OKDeletes is the happy path: register, receive the task, reply ok
-// with a delete of the claimed task, and confirm the queue drains.
+// workCfg is the common registration: serve "in" with a work handler.
+func workCfg(queues ...string) Config {
+	if len(queues) == 0 {
+		queues = []string{"in"}
+	}
+	return Config{Queues: queues, Work: true}
+}
+
+// TestBridge_OKDeletes is the happy path: receive the task, reply ok with a
+// delete of the claimed task, and confirm the queue drains.
 func TestBridge_OKDeletes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	eq := newEQ(t, ctx)
 	insertTask(t, ctx, eq, "in", "hello")
 
-	s := newSession(t, ctx, eq, time.Second)
-	s.c.send(register{Type: msgRegister, Queues: []string{"in"}})
+	s := newSession(t, ctx, eq, workCfg(), time.Second)
 
 	var dw doWorkMsg
 	s.c.recv(&dw)
@@ -147,8 +157,7 @@ func TestBridge_OKEmptyDoesNotDelete(t *testing.T) {
 	eq := newEQ(t, ctx)
 	insertTask(t, ctx, eq, "in", "hello")
 
-	s := newSession(t, ctx, eq, time.Second)
-	s.c.send(register{Type: msgRegister, Queues: []string{"in"}})
+	s := newSession(t, ctx, eq, workCfg(), time.Second)
 
 	var dw doWorkMsg
 	s.c.recv(&dw)
@@ -174,8 +183,7 @@ func TestBridge_Insert(t *testing.T) {
 	eq := newEQ(t, ctx)
 	insertTask(t, ctx, eq, "in", "hello")
 
-	s := newSession(t, ctx, eq, time.Second)
-	s.c.send(register{Type: msgRegister, Queues: []string{"in"}})
+	s := newSession(t, ctx, eq, workCfg(), time.Second)
 
 	var dw doWorkMsg
 	s.c.recv(&dw)
@@ -217,8 +225,9 @@ func TestBridge_TakeDocs(t *testing.T) {
 		t.Fatalf("insert task+doc: %v", err)
 	}
 
-	s := newSession(t, ctx, eq, time.Second)
-	s.c.send(register{Type: msgRegister, Queues: []string{"in"}, TakeDocs: true})
+	cfg := workCfg()
+	cfg.TakeDocs = true
+	s := newSession(t, ctx, eq, cfg, time.Second)
 
 	var td takeDocsMsg
 	s.c.recv(&td)
@@ -255,8 +264,9 @@ func TestBridge_Cleanup(t *testing.T) {
 	eq := newEQ(t, ctx)
 	insertTask(t, ctx, eq, "in", "hello")
 
-	s := newSession(t, ctx, eq, time.Second)
-	s.c.send(register{Type: msgRegister, Queues: []string{"in"}, Cleanup: true})
+	cfg := workCfg()
+	cfg.Cleanup = true
+	s := newSession(t, ctx, eq, cfg, time.Second)
 
 	var dw doWorkMsg
 	s.c.recv(&dw)
@@ -287,8 +297,9 @@ func TestBridge_CleanupFatal(t *testing.T) {
 	eq := newEQ(t, ctx)
 	insertTask(t, ctx, eq, "in", "hello")
 
-	s := newSession(t, ctx, eq, time.Second)
-	s.c.send(register{Type: msgRegister, Queues: []string{"in"}, Cleanup: true})
+	cfg := workCfg()
+	cfg.Cleanup = true
+	s := newSession(t, ctx, eq, cfg, time.Second)
 
 	var dw doWorkMsg
 	s.c.recv(&dw)
@@ -301,9 +312,8 @@ func TestBridge_CleanupFatal(t *testing.T) {
 	s.c.recv(&cu)
 	s.c.send(done{Type: msgDone, Outcome: outcomeFatal, Message: "cleanup blew up"})
 
-	err := s.wait()
-	if _, ok := worker.AsFatal(err); !ok {
-		t.Fatalf("expected a fatal error to stop the worker, got %v", err)
+	if _, ok := worker.AsFatal(s.wait()); !ok {
+		t.Fatal("expected a fatal error to stop the worker")
 	}
 	// The task committed before the fatal cleanup, so the queue is empty.
 	if err := eq.WaitQueuesEmpty(ctx, entroq.MatchExact("in")); err != nil {
@@ -320,8 +330,9 @@ func TestBridge_RetryMoves(t *testing.T) {
 	eq := newEQ(t, ctx)
 	insertTask(t, ctx, eq, "in", "hello")
 
-	s := newSession(t, ctx, eq, time.Second)
-	s.c.send(register{Type: msgRegister, Queues: []string{"in"}, MaxAttempts: 1})
+	cfg := workCfg()
+	cfg.MaxAttempts = 1
+	s := newSession(t, ctx, eq, cfg, time.Second)
 
 	var dw doWorkMsg
 	s.c.recv(&dw)
@@ -352,8 +363,7 @@ func TestBridge_Fatal(t *testing.T) {
 	eq := newEQ(t, ctx)
 	insertTask(t, ctx, eq, "in", "hello")
 
-	s := newSession(t, ctx, eq, time.Second)
-	s.c.send(register{Type: msgRegister, Queues: []string{"in"}})
+	s := newSession(t, ctx, eq, workCfg(), time.Second)
 
 	var dw doWorkMsg
 	s.c.recv(&dw)
@@ -364,31 +374,27 @@ func TestBridge_Fatal(t *testing.T) {
 	}
 }
 
-// TestBridge_RegisterRequiresQueue rejects a registration with no queues.
-func TestBridge_RegisterRequiresQueue(t *testing.T) {
+// TestBridge_RequiresQueue rejects a registration with no queues.
+func TestBridge_RequiresQueue(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	eq := newEQ(t, ctx)
 
-	s := newSession(t, ctx, eq, time.Second)
-	s.c.send(register{Type: msgRegister}) // no queues
-
+	s := newSession(t, ctx, eq, Config{Work: true}, time.Second) // no queues
 	if err := s.wait(); err == nil {
 		t.Fatal("expected an error for a registration with no queues")
 	}
 }
 
-// TestBridge_FirstMessageMustRegister rejects any first message that is not a
-// register.
-func TestBridge_FirstMessageMustRegister(t *testing.T) {
+// TestBridge_RequiresWorkHandler rejects a registration with no work handler:
+// the gateway would have nothing to do.
+func TestBridge_RequiresWorkHandler(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	eq := newEQ(t, ctx)
 
-	s := newSession(t, ctx, eq, time.Second)
-	s.c.send(result{Type: msgResult, Outcome: outcomeOK}) // wrong first message
-
+	s := newSession(t, ctx, eq, Config{Queues: []string{"in"}}, time.Second) // Work:false
 	if err := s.wait(); err == nil {
-		t.Fatal("expected an error when the first message is not a register")
+		t.Fatal("expected an error for a registration with no work handler")
 	}
 }

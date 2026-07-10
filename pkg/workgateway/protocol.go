@@ -13,17 +13,24 @@ import (
 // modify arguments. It is deliberately small and self-describing so a worker can
 // be written in any language without importing entroq, gRPC, or the queue API.
 //
+// # Registration is out-of-band
+//
+// The queues a worker serves, its max-attempts, and which phases it implements
+// (takeDocs, work, cleanup) are connection-scoped and fixed for the session, so
+// they are supplied at connection time out-of-band, not as a wire message: flags
+// or env when a client spawns the gateway over a pipe, URL params or headers when
+// a client opens a WebSocket. Those are the same idea (a connection preamble) in
+// each transport, which keeps the transports alike. See workgateway.Config.
+//
 // # Lifecycle
 //
 // A connection is one worker slot: exactly one task in flight, strict
-// request/response, no correlation ids (concurrency is more connections). The
-// client sends exactly one register message, then the gateway drives a loop that
-// mirrors the Go worker lifecycle, sending each phase message only if the client
-// registered for that phase:
+// request/response, no correlation ids (concurrency is more connections). Once
+// connected the gateway drives a loop that mirrors the Go worker lifecycle,
+// sending each phase message only if the worker registered for that phase:
 //
-//	client  -> register {queues, maxAttempts?, takeDocs?, cleanup?}
 //	  (gateway claims a task and begins renewing it)
-//	gateway -> takeDocs {task}            # only if the client registered takeDocs
+//	gateway -> takeDocs {task}            # only if the worker registered takeDocs
 //	client  -> docs {claims: [...]}
 //	  (gateway claims the docs, sorted, and passes them along)
 //	gateway -> doWork {task, docs}
@@ -41,7 +48,6 @@ import (
 
 // Message type tags. Every protocol message is a JSON object with a "type".
 const (
-	msgRegister = "register"
 	msgTakeDocs = "takeDocs"
 	msgDocs     = "docs"
 	msgDoWork   = "doWork"
@@ -59,19 +65,6 @@ const (
 	outcomeMove  = "move"  // send straight to a destination (error) queue
 	outcomeFatal = "fatal" // stop the whole worker
 )
-
-// register is the first and only setup message, sent by the client. It declares
-// the queues the worker serves and which optional phases the worker implements.
-// The lease is deliberately absent: it governs renewal cadence and reclaim
-// latency, operational concerns owned by whoever runs the gateway, not by a
-// connecting client (a client must not be able to tie tasks up after a crash).
-type register struct {
-	Type        string   `json:"type"`
-	Queues      []string `json:"queues"`
-	MaxAttempts int32    `json:"maxAttempts,omitempty"` // 0 means unlimited
-	TakeDocs    bool     `json:"takeDocs,omitempty"`    // worker implements the takeDocs phase
-	Cleanup     bool     `json:"cleanup,omitempty"`     // worker implements the cleanup phase
-}
 
 // takeDocsMsg asks the client which docs the claimed task needs. The doc set is
 // a function of the task, so it cannot be static config; it has to be a

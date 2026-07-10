@@ -33,15 +33,29 @@ type Conn interface {
 	Recv(ctx context.Context, v any) error // read and unmarshal the next message into v
 }
 
-// Bridge drives one worker connection. Run reads the client's registration, then
-// runs the Go worker loop, translating each lifecycle phase into a protocol
-// message and the reply back into worker behavior. One connection handles one
-// task at a time, so the Bridge needs no locking; after Run begins its only
-// state is the immutable registration, and all per-task state lives in a fresh
+// Config is a worker's registration, supplied by the transport out-of-band at
+// connection time (flags/env for a spawned pipe gateway, URL params/headers for
+// a WebSocket connection), never as a wire message. It is connection-scoped and
+// fixed for the session. The lease is deliberately not here: it governs renewal
+// cadence and reclaim latency, operational concerns owned by whoever runs the
+// gateway, not by a connecting client.
+type Config struct {
+	Queues      []string // queues the worker serves (at least one required)
+	MaxAttempts int32    // 0 means unlimited
+	TakeDocs    bool     // worker implements the takeDocs phase
+	Work        bool     // worker implements the work phase (required)
+	Cleanup     bool     // worker implements the cleanup phase
+}
+
+// Bridge drives one worker connection. Run takes the worker's registration
+// (Config) and runs the Go worker loop, translating each lifecycle phase into a
+// protocol message and the reply back into worker behavior. One connection
+// handles one task at a time, so the Bridge needs no locking; after Run begins
+// its only state is the immutable Config, and all per-task state lives in a fresh
 // handler the worker builds per task.
 type Bridge struct {
 	conn Conn
-	reg  register
+	cfg  Config
 }
 
 // NewBridge builds a Bridge over conn.
@@ -49,33 +63,31 @@ func NewBridge(conn Conn) *Bridge {
 	return &Bridge{conn: conn}
 }
 
-// Run reads the client's register message, constructs a worker implementing
-// exactly the phases the client declared, and runs it against eq until ctx is
-// done or the worker stops. The lease (renewal cadence and reclaim latency) is
-// gateway config, not client-chosen. It returns nil on a clean context
-// cancellation.
-func (b *Bridge) Run(ctx context.Context, eq *entroq.EntroQ, lease time.Duration) error {
-	if err := b.conn.Recv(ctx, &b.reg); err != nil {
-		return fmt.Errorf("read register: %w", err)
+// Run constructs a worker implementing exactly the phases the registration
+// declares and runs it against eq until ctx is done or the worker stops. It
+// fails loudly on a registration that cannot do useful work (no queues, or no
+// work handler) rather than silently churning tasks. It returns nil on a clean
+// context cancellation.
+func (b *Bridge) Run(ctx context.Context, eq *entroq.EntroQ, cfg Config, lease time.Duration) error {
+	if len(cfg.Queues) == 0 {
+		return fmt.Errorf("gateway registration: at least one queue is required")
 	}
-	if b.reg.Type != msgRegister {
-		return fmt.Errorf("first message must be %q, got %q", msgRegister, b.reg.Type)
+	if !cfg.Work {
+		return fmt.Errorf("gateway registration: a work handler is required (the gateway has nothing to do without one)")
 	}
-	if len(b.reg.Queues) == 0 {
-		return fmt.Errorf("register: at least one queue is required")
-	}
+	b.cfg = cfg
 
 	opts := []worker.Option[json.RawMessage]{}
-	if b.reg.TakeDocs {
+	if cfg.TakeDocs {
 		opts = append(opts, worker.WithTakeDocs[json.RawMessage](b.takeDocs))
 	}
 	opts = append(opts, worker.WithDoModify[json.RawMessage](b.doWork))
 
 	w := worker.New(eq, opts...)
 	return w.Run(ctx,
-		worker.Watching(b.reg.Queues...),
+		worker.Watching(cfg.Queues...),
 		worker.WithLease(lease),
-		worker.WithMaxAttempts(b.reg.MaxAttempts),
+		worker.WithMaxAttempts(cfg.MaxAttempts),
 	)
 }
 
@@ -119,7 +131,7 @@ func (b *Bridge) doWork(ctx context.Context, task *entroq.Task, _ json.RawMessag
 			return nil, worker.FatalErrorf("invalid modification from worker: %v", err)
 		}
 		r := worker.Modify(args...)
-		if b.reg.Cleanup {
+		if b.cfg.Cleanup {
 			r = r.OnSuccess(b.cleanup)
 		}
 		return r, nil

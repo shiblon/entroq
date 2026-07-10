@@ -3,8 +3,10 @@ package workgateway
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/coder/websocket"
@@ -28,10 +30,11 @@ func (w *WSConn) Send(ctx context.Context, v any) error { return wsjson.Write(ct
 // Recv reads the next JSON WebSocket message into v.
 func (w *WSConn) Recv(ctx context.Context, v any) error { return wsjson.Read(ctx, w.c, v) }
 
-// Handler returns the work gateway's HTTP handler. A worker connects to /work,
-// the handler upgrades to WebSocket, and one Bridge runs the protocol over it:
-// the worker's first message is a register declaring queues and phases, exactly
-// as over any other transport. Canceling ctx stops every connection.
+// Handler returns the work gateway's HTTP handler. A worker connects to /work
+// and declares its registration in the URL query string (?queue=... repeated,
+// plus optional maxAttempts=N, takeDocs=1, work=1, cleanup=1), the same
+// connection preamble a pipe worker supplies via flags. The handler upgrades to
+// WebSocket and runs one Bridge over it. Canceling ctx stops every connection.
 //
 // Liveness: a connection dropped mid-task surfaces as a Send/Recv error, which
 // ends that worker and reclaims its task. An idle connection (blocked claiming)
@@ -40,6 +43,19 @@ func (w *WSConn) Recv(ctx context.Context, v any) error { return wsjson.Read(ctx
 func Handler(ctx context.Context, eq *entroq.EntroQ, lease time.Duration) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/work", func(rw http.ResponseWriter, r *http.Request) {
+		maxAttempts, err := queryInt32(r, "maxAttempts")
+		if err != nil {
+			http.Error(rw, err.Error(), http.StatusBadRequest)
+			return
+		}
+		cfg := Config{
+			Queues:      r.URL.Query()["queue"],
+			MaxAttempts: maxAttempts,
+			TakeDocs:    queryBool(r, "takeDocs"),
+			Work:        queryBool(r, "work"),
+			Cleanup:     queryBool(r, "cleanup"),
+		}
+
 		// These are worker clients, not browsers, so origin checks do not apply.
 		c, err := websocket.Accept(rw, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
 		if err != nil {
@@ -48,7 +64,7 @@ func Handler(ctx context.Context, eq *entroq.EntroQ, lease time.Duration) http.H
 		defer c.CloseNow()
 
 		bridge := NewBridge(NewWSConn(c))
-		switch err := bridge.Run(ctx, eq, lease); {
+		switch err := bridge.Run(ctx, eq, cfg, lease); {
 		case err == nil || errors.Is(err, context.Canceled):
 			c.Close(websocket.StatusNormalClosure, "")
 		default:
@@ -57,6 +73,27 @@ func Handler(ctx context.Context, eq *entroq.EntroQ, lease time.Duration) http.H
 		}
 	})
 	return mux
+}
+
+// queryInt32 parses an optional int32 query parameter, defaulting to 0 when
+// absent.
+func queryInt32(r *http.Request, key string) (int32, error) {
+	s := r.URL.Query().Get(key)
+	if s == "" {
+		return 0, nil
+	}
+	n, err := strconv.ParseInt(s, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("bad %s %q: %w", key, s, err)
+	}
+	return int32(n), nil
+}
+
+// queryBool reports whether a boolean query parameter is present and truthy
+// (e.g. takeDocs=1 or work=true). An absent or unparseable value is false.
+func queryBool(r *http.Request, key string) bool {
+	b, _ := strconv.ParseBool(r.URL.Query().Get(key))
+	return b
 }
 
 // Serve runs Handler on addr until ctx is done, then shuts the server down.

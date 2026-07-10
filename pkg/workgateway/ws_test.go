@@ -26,16 +26,12 @@ func TestWS_OK(t *testing.T) {
 	srv := httptest.NewServer(Handler(srvCtx, eq, 30*time.Second))
 	defer srv.Close()
 
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/work"
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/work?queue=in&work=1"
 	c, _, err := websocket.Dial(ctx, wsURL, nil)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	defer c.CloseNow()
-
-	if err := wsjson.Write(ctx, c, register{Type: msgRegister, Queues: []string{"in"}}); err != nil {
-		t.Fatalf("register: %v", err)
-	}
 
 	var dw doWorkMsg
 	if err := wsjson.Read(ctx, c, &dw); err != nil {
