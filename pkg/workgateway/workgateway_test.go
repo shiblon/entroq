@@ -343,6 +343,97 @@ func TestBridge_TakeDocs(t *testing.T) {
 	s.stop()
 }
 
+// TestBridge_DocInsert covers writing a doc back: the result inserts a new doc
+// and deletes the input task in one atomic modification.
+func TestBridge_DocInsert(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	eq := newEQ(t, ctx)
+	insertTask(t, ctx, eq, "in", "hello")
+
+	s := newSession(t, ctx, eq, workCfg(), time.Second)
+
+	var dw doWorkMsg
+	s.c.recv(&dw)
+	s.c.send(result{
+		Type:    msgResult,
+		Outcome: outcomeOK,
+		Modification: &modification{
+			DocInserts: []docInsert{{Namespace: "ns", Key: "k", Content: json.RawMessage(`"docval"`)}},
+			Deletes:    []taskRef{{ID: dw.Task.ID, Version: dw.Task.Version}},
+		},
+	})
+
+	if err := eq.WaitQueuesEmpty(ctx, entroq.MatchExact("in")); err != nil {
+		t.Fatalf("wait input drained: %v", err)
+	}
+	docs, err := eq.Docs(ctx, &entroq.DocQuery{Namespace: "ns"})
+	if err != nil {
+		t.Fatalf("docs: %v", err)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("ns has %d docs, want 1", len(docs))
+	}
+	if docs[0].Key != "k" {
+		t.Errorf("doc key = %q, want %q", docs[0].Key, "k")
+	}
+	if got := string(docs[0].Content); got != `"docval"` {
+		t.Errorf("doc content = %s, want %q", got, `"docval"`)
+	}
+	s.stop()
+}
+
+// TestBridge_DocChange claims a doc via takeDocs, then updates its content with a
+// doc change that echoes the received doc, the doc analog of a task change.
+func TestBridge_DocChange(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	eq := newEQ(t, ctx)
+	if _, err := eq.Modify(ctx,
+		entroq.InsertingInto("in", entroq.WithValue("hello")),
+		entroq.InsertingDoc(&entroq.DocData{Namespace: "ns", Key: "k", Content: json.RawMessage(`"old"`)}),
+	); err != nil {
+		t.Fatalf("insert task+doc: %v", err)
+	}
+
+	cfg := workCfg()
+	cfg.TakeDocs = true
+	s := newSession(t, ctx, eq, cfg, time.Second)
+
+	var td takeDocsMsg
+	s.c.recv(&td)
+	s.c.send(docsMsg{Type: msgDocs, Claims: []docClaim{{Namespace: "ns", Key: "k"}}})
+
+	var dw doWorkMsg
+	s.c.recv(&dw)
+	if len(dw.Docs) != 1 {
+		t.Fatalf("doWork carried %d docs, want 1", len(dw.Docs))
+	}
+	s.c.send(result{
+		Type:    msgResult,
+		Outcome: outcomeOK,
+		Modification: &modification{
+			DocChanges: []docChange{{Doc: dw.Docs[0], Content: json.RawMessage(`"new"`)}},
+			Deletes:    []taskRef{{ID: dw.Task.ID, Version: dw.Task.Version}},
+		},
+	})
+
+	if err := eq.WaitQueuesEmpty(ctx, entroq.MatchExact("in")); err != nil {
+		t.Fatalf("wait input drained: %v", err)
+	}
+	docs, err := eq.Docs(ctx, &entroq.DocQuery{Namespace: "ns"})
+	if err != nil {
+		t.Fatalf("docs: %v", err)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("ns has %d docs, want 1", len(docs))
+	}
+	if got := string(docs[0].Content); got != `"new"` {
+		t.Errorf("doc content = %s, want %q (change must update content)", got, `"new"`)
+	}
+	s.stop()
+}
+
 // TestBridge_Cleanup exercises the optional post-commit phase: after the commit,
 // the gateway sends cleanup and the worker acknowledges with done.
 func TestBridge_Cleanup(t *testing.T) {

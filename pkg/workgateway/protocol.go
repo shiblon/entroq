@@ -137,14 +137,19 @@ type done struct {
 //
 // A change carries the full task rather than a delta (see change), which is how
 // it preserves the fields the client does not restate and keeps a task's ID
-// stable across a move. Doc modifications (insert/change/delete/depend on docs)
-// remain reserved for a follow-up: doc CLAIMS work via the takeDocs phase, but
-// writing docs back does not yet. See the WIP note in the wiki proposal.
+// stable across a move. The Doc* lists give docs the identical four operations,
+// so a wire worker has the same modification vocabulary an in-process DoModify
+// worker does: insert, change, delete, depend on both tasks and docs.
 type modification struct {
 	Inserts []insertArg `json:"inserts,omitempty"`
 	Changes []change    `json:"changes,omitempty"`
 	Deletes []taskRef   `json:"deletes,omitempty"`
 	Depends []taskRef   `json:"depends,omitempty"`
+
+	DocInserts []docInsert `json:"docInserts,omitempty"`
+	DocChanges []docChange `json:"docChanges,omitempty"`
+	DocDeletes []docRef    `json:"docDeletes,omitempty"`
+	DocDepends []docRef    `json:"docDepends,omitempty"`
 }
 
 // insertArg inserts a new task. Only Queue is required: omit Value for an empty
@@ -182,6 +187,33 @@ type taskRef struct {
 	ID      string `json:"id"`
 	Version int32  `json:"version"`
 	Queue   string `json:"queue,omitempty"`
+}
+
+// docInsert inserts a new doc. Namespace and Key are required; omit ID to let the
+// backend assign one, omit Content for an empty doc.
+type docInsert struct {
+	Namespace    string          `json:"namespace"`
+	Key          string          `json:"key"`
+	SecondaryKey string          `json:"secondaryKey,omitempty"`
+	Content      json.RawMessage `json:"content,omitempty"`
+	ID           string          `json:"id,omitempty"`
+}
+
+// docChange updates an existing doc. Like a task change it carries the full base
+// Doc (the client echoes the doc it received in doWork), so an unrestated field
+// keeps its value. Only Content and At are mutable; a doc's namespace and keys
+// are immutable. The claimed doc's version is fixed up to the renewed value.
+type docChange struct {
+	Doc     *entroq.Doc     `json:"doc"`
+	Content json.RawMessage `json:"content,omitempty"`
+	At      *time.Time      `json:"at,omitempty"`
+}
+
+// docRef identifies a doc for a delete or a depend.
+type docRef struct {
+	Namespace string `json:"namespace"`
+	ID        string `json:"id"`
+	Version   int32  `json:"version"`
 }
 
 // modifyArgs translates a wire modification into entroq modify arguments. It is
@@ -240,6 +272,43 @@ func (m *modification) modifyArgs() ([]entroq.ModifyArg, error) {
 			return nil, fmt.Errorf("depend: id is required")
 		}
 		args = append(args, entroq.DependingOn(d.ID, d.Version, entroq.WithIDQueue(d.Queue)))
+	}
+	for _, di := range m.DocInserts {
+		if di.Namespace == "" || di.Key == "" {
+			return nil, fmt.Errorf("docInsert: namespace and key are required")
+		}
+		args = append(args, entroq.InsertingDoc(&entroq.DocData{
+			Namespace:    di.Namespace,
+			ID:           di.ID,
+			Key:          di.Key,
+			SecondaryKey: di.SecondaryKey,
+			Content:      di.Content,
+		}))
+	}
+	for _, dc := range m.DocChanges {
+		if dc.Doc == nil || dc.Doc.ID == "" {
+			return nil, fmt.Errorf("docChange: a doc with an id is required")
+		}
+		var opts []entroq.DocOpt
+		if dc.Content != nil {
+			opts = append(opts, entroq.WithRawContent(dc.Content))
+		}
+		if dc.At != nil {
+			opts = append(opts, entroq.WithDocArrivalTime(*dc.At))
+		}
+		args = append(args, dc.Doc.Change(opts...))
+	}
+	for _, dd := range m.DocDeletes {
+		if dd.ID == "" {
+			return nil, fmt.Errorf("docDelete: id is required")
+		}
+		args = append(args, entroq.DeletingDocID(dd.Namespace, dd.ID, dd.Version))
+	}
+	for _, dd := range m.DocDepends {
+		if dd.ID == "" {
+			return nil, fmt.Errorf("docDepend: id is required")
+		}
+		args = append(args, entroq.DependingOnDocID(dd.Namespace, dd.ID, dd.Version))
 	}
 	return args, nil
 }
