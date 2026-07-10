@@ -270,11 +270,12 @@ func TestBridge_ChangeDefers(t *testing.T) {
 	var dw doWorkMsg
 	s.c.recv(&dw)
 	future := time.Now().Add(time.Hour)
+	dw.Task.At = future // edit the echoed task; the change carries full state
 	s.c.send(result{
 		Type:    msgResult,
 		Outcome: outcomeOK,
 		Modification: &modification{
-			Changes: []change{{Task: dw.Task, At: &future}},
+			Changes: []change{{Task: dw.Task}},
 		},
 	})
 
@@ -295,6 +296,44 @@ func TestBridge_ChangeDefers(t *testing.T) {
 	}
 	if !tasks[0].At.After(time.Now().Add(30 * time.Minute)) {
 		t.Errorf("deferred At = %v, want well into the future", tasks[0].At)
+	}
+	s.stop()
+}
+
+// TestBridge_ChangeSetsValue shows a change carries the full desired state: the
+// committed value is the one on the echoed task, not the original, so the gateway
+// does not force-preserve. Clearing a field works the same way, by sending it
+// empty.
+func TestBridge_ChangeSetsValue(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	eq := newEQ(t, ctx)
+	insertTask(t, ctx, eq, "in", "hello")
+
+	s := newSession(t, ctx, eq, workCfg(), time.Second)
+
+	var dw doWorkMsg
+	s.c.recv(&dw)
+	dw.Task.Value = json.RawMessage(`"changed"`) // edit the echoed task
+	s.c.send(result{
+		Type:    msgResult,
+		Outcome: outcomeOK,
+		// Move as well, so it lands in a queue this worker does not re-claim.
+		Modification: &modification{Changes: []change{{Task: dw.Task, ToQueue: "moved"}}},
+	})
+
+	if err := eq.WaitQueuesEmpty(ctx, entroq.MatchExact("in")); err != nil {
+		t.Fatalf("input not drained: %v", err)
+	}
+	moved, err := eq.Tasks(ctx, "moved")
+	if err != nil {
+		t.Fatalf("tasks moved: %v", err)
+	}
+	if len(moved) != 1 {
+		t.Fatalf("moved has %d tasks, want 1", len(moved))
+	}
+	if got := string(moved[0].Value); got != `"changed"` {
+		t.Errorf("moved value = %s, want %q: a change must commit the echoed value", got, `"changed"`)
 	}
 	s.stop()
 }
@@ -409,11 +448,12 @@ func TestBridge_DocChange(t *testing.T) {
 	if len(dw.Docs) != 1 {
 		t.Fatalf("doWork carried %d docs, want 1", len(dw.Docs))
 	}
+	dw.Docs[0].Content = json.RawMessage(`"new"`) // edit the echoed doc
 	s.c.send(result{
 		Type:    msgResult,
 		Outcome: outcomeOK,
 		Modification: &modification{
-			DocChanges: []docChange{{Doc: dw.Docs[0], Content: json.RawMessage(`"new"`)}},
+			DocChanges: []docChange{{Doc: dw.Docs[0]}},
 			Deletes:    []taskRef{{ID: dw.Task.ID, Version: dw.Task.Version}},
 		},
 	})

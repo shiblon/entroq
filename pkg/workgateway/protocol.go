@@ -135,11 +135,12 @@ type done struct {
 // successful outcome; a client that wants to consume the input task lists it in
 // Deletes, exactly as a Go worker returns task.Delete().
 //
-// A change carries the full task rather than a delta (see change), which is how
-// it preserves the fields the client does not restate and keeps a task's ID
-// stable across a move. The Doc* lists give docs the identical four operations,
-// so a wire worker has the same modification vocabulary an in-process DoModify
-// worker does: insert, change, delete, depend on both tasks and docs.
+// A change carries the full desired task or doc state (see change / docChange),
+// not a delta, so a field the client clears is committed cleared; there is no
+// "leave this alone" marker on the wire. The Doc* lists give docs the identical
+// four operations, so a wire worker has the same modification vocabulary an
+// in-process DoModify worker does: insert, change, delete, depend on both tasks
+// and docs.
 type modification struct {
 	Inserts []insertArg `json:"inserts,omitempty"`
 	Changes []change    `json:"changes,omitempty"`
@@ -163,22 +164,20 @@ type insertArg struct {
 	At    *time.Time      `json:"at,omitempty"`
 }
 
-// change updates an existing task. It carries the full base Task (the client
-// echoes the task it received in doWork, which is why any field it does not
-// restate keeps its current value) plus the deltas to apply. The claimed task's
-// version is fixed up by the gateway to the stable renewed value, so echoing the
-// version seen in doWork is fine.
+// change updates an existing task to the full state carried in Task: the client
+// echoes the task it received in doWork, edits the fields it wants, and the task
+// becomes exactly that. There is no "leave this field alone" marker, so a field
+// the client clears (its value, say) is committed cleared; only server-managed
+// metadata (created/modified times) is not the client's to set. The claimed
+// task's version is fixed up to the stable renewed value, so echoing the version
+// seen in doWork is fine.
 //
-//   - ToQueue moves the task, preserving its ID and bumping only its version
-//     (EntroQ's move semantics).
-//   - At sets a new arrival time; omitting it keeps the task's current At rather
-//     than releasing the task to "now" (the raw entroq default for a change).
-//   - Value replaces the task's value; omitting it keeps the current value.
+// ToQueue is the one separate field: a move must record both the source and
+// destination queue for authorization, so leave Task.Queue as the current queue
+// and set ToQueue to move (the ID is preserved, only the version bumps).
 type change struct {
-	Task    *entroq.Task    `json:"task"`
-	ToQueue string          `json:"toQueue,omitempty"`
-	At      *time.Time      `json:"at,omitempty"`
-	Value   json.RawMessage `json:"value,omitempty"`
+	Task    *entroq.Task `json:"task"`
+	ToQueue string       `json:"toQueue,omitempty"`
 }
 
 // taskRef identifies a task for a delete or a depend. Queue is optional metadata
@@ -199,14 +198,13 @@ type docInsert struct {
 	ID           string          `json:"id,omitempty"`
 }
 
-// docChange updates an existing doc. Like a task change it carries the full base
-// Doc (the client echoes the doc it received in doWork), so an unrestated field
-// keeps its value. Only Content and At are mutable; a doc's namespace and keys
-// are immutable. The claimed doc's version is fixed up to the renewed value.
+// docChange updates an existing doc to the full state carried in Doc: the client
+// echoes the doc it received in doWork, edits it, and the doc becomes exactly
+// that (a cleared content is committed cleared). A doc's namespace and keys are
+// immutable, and server-managed metadata (created/modified) is not the client's
+// to set. The claimed doc's version is fixed up to the renewed value.
 type docChange struct {
-	Doc     *entroq.Doc     `json:"doc"`
-	Content json.RawMessage `json:"content,omitempty"`
-	At      *time.Time      `json:"at,omitempty"`
+	Doc *entroq.Doc `json:"doc"`
 }
 
 // docRef identifies a doc for a delete or a depend.
@@ -245,19 +243,13 @@ func (m *modification) modifyArgs() ([]entroq.ModifyArg, error) {
 		if ch.Task == nil || ch.Task.ID == "" {
 			return nil, fmt.Errorf("change: a task with an id is required")
 		}
-		opts := []entroq.ChangeArg{}
+		// Changing copies the full task (value, attempt, err, ...) as the new
+		// state, so a field the client cleared is committed cleared. It defaults
+		// the arrival time to "now", so restate the carried At explicitly; QueueTo
+		// records the source queue for a move.
+		opts := []entroq.ChangeArg{entroq.ArrivalTimeTo(ch.Task.At)}
 		if ch.ToQueue != "" {
 			opts = append(opts, entroq.QueueTo(ch.ToQueue))
-		}
-		// A raw entroq change releases the task to "now"; preserve the base
-		// arrival time unless the client explicitly sets a new one.
-		if ch.At != nil {
-			opts = append(opts, entroq.ArrivalTimeTo(*ch.At))
-		} else {
-			opts = append(opts, entroq.ArrivalTimeTo(ch.Task.At))
-		}
-		if ch.Value != nil {
-			opts = append(opts, entroq.RawValueTo(ch.Value))
 		}
 		args = append(args, entroq.Changing(ch.Task, opts...))
 	}
@@ -289,14 +281,10 @@ func (m *modification) modifyArgs() ([]entroq.ModifyArg, error) {
 		if dc.Doc == nil || dc.Doc.ID == "" {
 			return nil, fmt.Errorf("docChange: a doc with an id is required")
 		}
-		var opts []entroq.DocOpt
-		if dc.Content != nil {
-			opts = append(opts, entroq.WithRawContent(dc.Content))
-		}
-		if dc.At != nil {
-			opts = append(opts, entroq.WithDocArrivalTime(*dc.At))
-		}
-		args = append(args, dc.Doc.Change(opts...))
+		// (*Doc).Change copies the carried doc as the new state (content and
+		// arrival time included), so the doc becomes exactly what the client sent,
+		// a cleared content included.
+		args = append(args, dc.Doc.Change())
 	}
 	for _, dd := range m.DocDeletes {
 		if dd.ID == "" {
