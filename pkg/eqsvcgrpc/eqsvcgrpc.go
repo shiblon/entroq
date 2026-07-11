@@ -381,50 +381,81 @@ func (s *QSvc) tasksAuthz(ctx context.Context, req *pb.TasksRequest) *authz.Requ
 	return authReq
 }
 
-func (s *QSvc) modifyAuthz(ctx context.Context, req *pb.ModifyRequest) *authz.Request {
+// modifyAuthz builds the authorization request for a Modify. Every task op
+// contributes a (queue, action) requirement and every doc op a (namespace,
+// action) one, so the request represents exactly the operations' claimed
+// targets. Whether a caller lied about a target (named a queue/namespace the
+// task/doc does not actually live in) is caught later by the backend, which
+// binds each operation to the target's real location.
+//
+// An empty target is a fail-closed error: there is no way to be granted rights
+// on an unnamed queue or namespace, so an operation that names one can never be
+// authorized. (A change with an empty destination is not this case; the
+// destination defaults to the source, which is the "no move" reading.)
+func (s *QSvc) modifyAuthz(ctx context.Context, req *pb.ModifyRequest) (*authz.Request, error) {
 	authReq := s.newAuthzRequest(ctx)
 	authReq.ClaimantId = req.ClaimantId
 
-	for _, ins := range req.Inserts {
-		authReq.Queues = append(authReq.Queues, &authz.Queue{
-			Exact:   ins.Queue,
-			Actions: []authz.Action{authz.Insert},
-		})
-	}
-	for _, chg := range req.Changes {
-		oldQueue, newQueue := chg.GetOldId().Queue, chg.GetNewData().Queue
-		if oldQueue == newQueue {
-			authReq.Queues = append(authReq.Queues, &authz.Queue{
-				Exact:   newQueue,
-				Actions: []authz.Action{authz.Change},
-			})
-		} else {
-			authReq.Queues = append(authReq.Queues,
-				&authz.Queue{
-					Exact:   oldQueue,
-					Actions: []authz.Action{authz.Delete},
-				},
-				&authz.Queue{
-					Exact:   newQueue,
-					Actions: []authz.Action{authz.Insert},
-				},
-			)
+	var empty bool
+	q := func(name string, a authz.Action) {
+		if name == "" {
+			empty = true
+			return
 		}
+		authReq.Queues = append(authReq.Queues, &authz.Queue{Exact: name, Actions: []authz.Action{a}})
 	}
-	for _, del := range req.Deletes {
-		authReq.Queues = append(authReq.Queues, &authz.Queue{
-			Exact:   del.Queue,
-			Actions: []authz.Action{authz.Delete},
-		})
+	n := func(name string, a authz.Action) {
+		if name == "" {
+			empty = true
+			return
+		}
+		authReq.Namespaces = append(authReq.Namespaces, &authz.Namespace{Exact: name, Actions: []authz.Action{a}})
 	}
-	for _, dep := range req.Depends {
-		authReq.Queues = append(authReq.Queues, &authz.Queue{
-			Exact:   dep.Queue,
-			Actions: []authz.Action{authz.Read},
-		})
+	// change emits the authz requirement(s) for a task or doc change via add (q
+	// for queues, n for namespaces). The source (from) is always required. An
+	// empty destination (to), or one equal to the source, means "no move" and
+	// requires Change on the source; a different, non-empty destination is a
+	// move, needing delete on the source and insert on the destination. Queue and
+	// namespace changes share this shape exactly. Namespace moves are not yet
+	// implemented, but the protocol can express one, so authz is ready for it.
+	change := func(from, to string, add func(string, authz.Action)) {
+		if to == "" || to == from {
+			add(from, authz.Change)
+			return
+		}
+		add(from, authz.Delete)
+		add(to, authz.Insert)
 	}
 
-	return authReq
+	for _, ins := range req.Inserts {
+		q(ins.Queue, authz.Insert)
+	}
+	for _, chg := range req.Changes {
+		change(chg.GetOldId().Queue, chg.GetNewData().Queue, q)
+	}
+	for _, del := range req.Deletes {
+		q(del.Queue, authz.Delete)
+	}
+	for _, dep := range req.Depends {
+		q(dep.Queue, authz.Read)
+	}
+	for _, di := range req.DocInserts {
+		n(di.Namespace, authz.Insert)
+	}
+	for _, dc := range req.DocChanges {
+		change(dc.GetOldId().GetNamespace(), dc.GetNewData().GetNamespace(), n)
+	}
+	for _, dd := range req.DocDeletes {
+		n(dd.Namespace, authz.Delete)
+	}
+	for _, ddep := range req.DocDepends {
+		n(ddep.Namespace, authz.Read)
+	}
+
+	if empty {
+		return nil, fmt.Errorf("modification names an empty queue or namespace, which can never be authorized")
+	}
+	return authReq, nil
 }
 
 // Claim is the blocking version of TryClaim.
@@ -495,8 +526,17 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 // reconstruct an entroq.DependencyError, or directly to find out which IDs
 // caused the dependency failure. Code UNKNOWN is returned on other errors.
 func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyResponse, error) {
-	if err := s.Authorize(ctx, s.modifyAuthz(ctx, req)); err != nil {
-		return nil, err // don't wrap, has status codes
+	// Authorization is enforced only when an authorizer is configured (admins may
+	// run open). When it is, a modification naming an empty queue/namespace fails
+	// closed here before reaching the backend.
+	if s.az != nil {
+		authReq, err := s.modifyAuthz(ctx, req)
+		if err != nil {
+			return nil, codeErrorf(codes.PermissionDenied, "modify authz: %v", err)
+		}
+		if err := s.Authorize(ctx, authReq); err != nil {
+			return nil, err // don't wrap, has status codes
+		}
 	}
 
 	modArgs := []entroq.ModifyArg{
@@ -727,6 +767,11 @@ func (s *QSvc) StreamTasks(req *pb.TasksRequest, stream pb.EntroQ_StreamTasksSer
 }
 
 // Queues returns a mapping from queue names to queue sizes.
+//
+// TODO(listing-authz): currently UNGATED even when an authorizer is configured.
+// Enumerating queue names/prefixes is a listing capability we intend to gate on
+// a dedicated authz action (distinct from Read on task content). That lands in a
+// follow-up because it also requires an authz-policy/CRD schema change.
 func (s *QSvc) Queues(ctx context.Context, req *pb.QueuesRequest) (*pb.QueuesResponse, error) {
 	queueMap, err := s.impl.Queues(ctx,
 		entroq.MatchPrefix(req.MatchPrefix...),
@@ -746,6 +791,9 @@ func (s *QSvc) Queues(ctx context.Context, req *pb.QueuesRequest) (*pb.QueuesRes
 }
 
 // QueueStats returns a mapping from queue names to queue stats.
+//
+// TODO(listing-authz): currently UNGATED. Same listing capability as Queues;
+// see that method. Gated in the follow-up.
 func (s *QSvc) QueueStats(ctx context.Context, req *pb.QueuesRequest) (*pb.QueuesResponse, error) {
 	queueMap, err := s.impl.QueueStats(ctx,
 		entroq.MatchPrefix(req.MatchPrefix...),
@@ -769,6 +817,9 @@ func (s *QSvc) QueueStats(ctx context.Context, req *pb.QueuesRequest) (*pb.Queue
 }
 
 // Time returns the current time in milliseconds since the Epoch.
+//
+// Intentionally UNAUTHENTICATED: it is the server clock, carries no queue or
+// task data, and clients need it to reason about arrival times.
 func (s *QSvc) Time(ctx context.Context, req *pb.TimeRequest) (*pb.TimeResponse, error) {
 	return &pb.TimeResponse{TimeMs: toMS(time.Now().UTC())}, nil
 }
@@ -818,6 +869,21 @@ func docClaimDepDetails(depErr *entroq.DependencyError) []proto.Message {
 // Docs returns a listing of docs matching the given query.
 func (s *QSvc) Docs(ctx context.Context, req *pb.DocsRequest) (*pb.DocsResponse, error) {
 	q := req.GetQuery()
+	// Reading doc content is gated on Read for the namespace (unlike queue/
+	// namespace metadata, which is open). Enforced only when an authorizer is set.
+	if s.az != nil {
+		if q.GetNamespace() == "" {
+			return nil, codeErrorf(codes.PermissionDenied, "docs: a namespace is required")
+		}
+		authReq := s.newAuthzRequest(ctx)
+		authReq.Namespaces = append(authReq.Namespaces, &authz.Namespace{
+			Exact:   q.GetNamespace(),
+			Actions: []authz.Action{authz.Read},
+		})
+		if err := s.Authorize(ctx, authReq); err != nil {
+			return nil, err // don't wrap, has status codes
+		}
+	}
 	docs, err := s.impl.Docs(ctx, &entroq.DocQuery{
 		Namespace:  q.GetNamespace(),
 		IDs:        q.GetIds(),
@@ -842,6 +908,11 @@ func (s *QSvc) Docs(ctx context.Context, req *pb.DocsRequest) (*pb.DocsResponse,
 }
 
 // NamespaceStats returns statistics for doc namespaces matching the query.
+//
+// TODO(listing-authz): currently UNGATED. Enumerating namespace names/prefixes
+// is the doc-side analog of Queues listing and will be gated on the same
+// dedicated listing action in the follow-up (needs an authz-policy/CRD change).
+// Doc content (Docs) is already gated.
 func (s *QSvc) NamespaceStats(ctx context.Context, req *pb.NamespacesRequest) (*pb.NamespacesResponse, error) {
 	nsMap, err := s.impl.NamespaceStats(ctx,
 		entroq.MatchPrefix(req.MatchPrefix...),
@@ -866,6 +937,22 @@ func (s *QSvc) NamespaceStats(ctx context.Context, req *pb.NamespacesRequest) (*
 // already claimed.
 func (s *QSvc) ClaimDocs(ctx context.Context, req *pb.ClaimDocsRequest) (*pb.ClaimDocsResponse, error) {
 	cq := req.GetClaimQuery()
+	// Claiming a doc is gated on Claim for the namespace. Enforced only when an
+	// authorizer is set.
+	if s.az != nil {
+		if cq.GetNamespace() == "" {
+			return nil, codeErrorf(codes.PermissionDenied, "claim docs: a namespace is required")
+		}
+		authReq := s.newAuthzRequest(ctx)
+		authReq.ClaimantId = cq.GetClaimant()
+		authReq.Namespaces = append(authReq.Namespaces, &authz.Namespace{
+			Exact:   cq.GetNamespace(),
+			Actions: []authz.Action{authz.Claim},
+		})
+		if err := s.Authorize(ctx, authReq); err != nil {
+			return nil, err // don't wrap, has status codes
+		}
+	}
 	claimed, err := s.impl.ClaimDocs(ctx, &entroq.DocClaim{
 		Namespace: cq.GetNamespace(),
 		Claimant:  cq.GetClaimant(),
