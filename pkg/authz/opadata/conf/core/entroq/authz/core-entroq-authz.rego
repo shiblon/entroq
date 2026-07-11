@@ -36,6 +36,20 @@ failed_namespaces contains n if {
 	some n in namespaces.disallowed(input.namespaces, permissions.allowed_namespaces)
 }
 
+# A request naming no queue can never be authorized: there is nothing to hold a
+# grant on. Deny it outright, without consulting grants, so an empty value can
+# never slip through by matching a wildcard prefix. Wildcard grants still match
+# any named queue. Same for namespaces.
+failed contains q if {
+	some q in input.queues
+	not queues.is_named(q)
+}
+
+failed_namespaces contains n if {
+	some n in input.namespaces
+	not namespaces.is_named(n)
+}
+
 # claimant_mismatch is true when the caller supplies a claimant_id that does
 # not begin with their authenticated identity (user.name + "#"). This prevents
 # cross-identity impersonation while allowing per-process nonces within the

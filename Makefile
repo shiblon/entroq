@@ -13,14 +13,21 @@ REGO_SOURCES := \
 	$(REGO_SRC)/providers/k8s/user/k8s-entroq-user.rego
 CRD_SOURCES  := $(wildcard $(CRD_SRC)/*.yaml)
 
+# The Rego sources under $(REGO_SRC) and the CRD bases under $(CRD_SRC) are
+# canonical. This target copies them into the (gitignored) chart tree, prefixing
+# each with a DO-NOT-EDIT banner so a generated copy is never mistaken for an
+# editable file. Always edit the sources and re-run helm-sync, never the copies.
+#
 # Stamp file: touched after a successful sync.
 # Make re-syncs only when a source file is newer than the stamp.
 HELM_SYNC_STAMP := $(CHART_DIR)/files/.sync-stamp
 
+# Each source is copied with a leading "generated, do not edit" banner. Rego and
+# the CRD YAML both use '#', so a leading comment is inert in each.
 $(HELM_SYNC_STAMP): $(REGO_SOURCES) $(CRD_SOURCES)
 	@mkdir -p $(CHART_DIR)/files/rego $(CHART_DIR)/crds
-	cp $(REGO_SOURCES) $(CHART_DIR)/files/rego/
-	cp $(CRD_SOURCES)  $(CHART_DIR)/crds/
+	@for f in $(REGO_SOURCES); do d=$(CHART_DIR)/files/rego/$$(basename $$f); { echo "# GENERATED FILE. DO NOT EDIT. Source: $$f"; echo "# Regenerate: make helm-sync"; echo; cat $$f; } > $$d; done
+	@for f in $(CRD_SOURCES);  do d=$(CHART_DIR)/crds/$$(basename $$f);       { echo "# GENERATED FILE. DO NOT EDIT. Source: $$f"; echo "# Regenerate: make helm-sync"; echo; cat $$f; } > $$d; done
 	@touch $@
 	@echo "helm-sync: chart files up to date."
 
