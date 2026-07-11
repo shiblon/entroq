@@ -48,3 +48,4 @@ charts/entroq/crds/
 charts/*.tgz
 
 /eqc
+/eqlink
