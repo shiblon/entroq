@@ -87,6 +87,48 @@ func TaskChangeFutureArrival(ctx context.Context, t *testing.T, client *entroq.E
 	}
 }
 
+// TaskChangeFarPastArrivalNormalized verifies the arrival-time half of the
+// backend Modify contract: an arrival time far in the past (beyond
+// entroq.ArrivalPastWindow, which is how an unset time round-trips) is capped up
+// to now, so the task is available immediately and ordered at now rather than in
+// the distant past. Every backend must behave identically here.
+func TaskChangeFarPastArrivalNormalized(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	queue := path.Join(qPrefix, "task_change_far_past_arrival")
+
+	resp, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue("v")))
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	inserted := resp.InsertedTasks[0]
+
+	before, err := client.Time(ctx)
+	if err != nil {
+		t.Fatalf("time: %v", err)
+	}
+	// Two windows in the past: well beyond the far-past cap.
+	farPast := before.Add(-2 * entroq.ArrivalPastWindow)
+	resp, err = client.Modify(ctx, inserted.Change(entroq.ArrivalTimeTo(farPast)))
+	if err != nil {
+		t.Fatalf("change far-past arrival: %v", err)
+	}
+	changed := resp.ChangedTasks[0]
+
+	// The far-past arrival must be capped up to ~now, not left in the past.
+	if changed.At.Before(before.Add(-time.Minute)) {
+		t.Fatalf("far-past arrival was not capped to now: got %s, want about %s",
+			changed.At.Format(time.RFC3339Nano), before.Format(time.RFC3339Nano))
+	}
+
+	// And the task must be immediately claimable.
+	claimed, err := client.TryClaim(ctx, entroq.From(queue), entroq.ClaimFor(time.Minute))
+	if err != nil {
+		t.Fatalf("try claim: %v", err)
+	}
+	if claimed == nil {
+		t.Fatalf("task with far-past (normalized) arrival was not immediately claimable")
+	}
+}
+
 // SimpleWorker tests basic worker functionality while tasks are coming in and
 // being waited on.
 func ClaimUnblocksOnNotify(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {

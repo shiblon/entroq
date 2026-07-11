@@ -62,6 +62,10 @@ func TestEQMemTaskChangeFutureArrival(t *testing.T) {
 	RunQTest(t, eqtest.TaskChangeFutureArrival)
 }
 
+func TestEQMemTaskChangeFarPastArrivalNormalized(t *testing.T) {
+	RunQTest(t, eqtest.TaskChangeFarPastArrivalNormalized)
+}
+
 func TestEQMemSimpleWorker(t *testing.T) {
 	RunQTest(t, eqtest.SimpleWorker)
 }

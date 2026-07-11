@@ -113,6 +113,10 @@ func TestGRPCTaskChangeFutureArrival(t *testing.T) {
 	RunQTest(t, eqtest.TaskChangeFutureArrival)
 }
 
+func TestGRPCTaskChangeFarPastArrivalNormalized(t *testing.T) {
+	RunQTest(t, eqtest.TaskChangeFarPastArrivalNormalized)
+}
+
 func TestGRPCSimpleWorker(t *testing.T) {
 	RunQTest(t, eqtest.SimpleWorker)
 }

@@ -747,6 +747,9 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 	for _, c := range mod.Changes {
 		newTask := c.Copy()
 		newTask.Version++
+		// Cap a far-past arrival to now (backend Modify contract): an omitted At
+		// arrives now and is ordered at now, not in the distant past.
+		newTask.At = entroq.NormalizeArrival(newTask.At, now)
 		// Preserve claimant on renewal (At pushed to future); clear otherwise.
 		if !newTask.At.After(now) {
 			newTask.Claimant = ""
@@ -775,7 +778,7 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 		newTask := &entroq.Task{
 			ID:       id,
 			Queue:    td.Queue,
-			At:       td.At,
+			At:       entroq.NormalizeArrival(td.At, now),
 			Value:    td.Value,
 			Claimant: mod.Claimant,
 			Created:  created,
@@ -791,6 +794,8 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 	for _, c := range mod.DocChanges {
 		newRes := c.Copy()
 		newRes.Version++
+		// Cap a far-past arrival to now (backend Modify contract), same as tasks.
+		newRes.At = entroq.NormalizeArrival(newRes.At, now)
 		// Claim/renew if requested.At is in the future; release otherwise.
 		if newRes.At.After(now) {
 			newRes.Claimant = mod.Claimant

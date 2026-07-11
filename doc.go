@@ -204,6 +204,12 @@ func (r *Doc) Copy() *Doc {
 
 // Change returns a ModifyArg that changes this doc. Accepts WithContent,
 // WithDocArrivalTime, and WithDocArrivalTimeBy. WithIDKeys is ignored (keys are immutable).
+//
+// Like Changing for tasks, a change releases by default: the arrival time is
+// reset (so the backend substitutes now(), see Backend.Modify) unless an
+// explicit WithDocArrivalTime / WithDocArrivalTimeBy pushes it into the future
+// to keep the doc claimed. Callers therefore do not silently keep a claim just
+// by omitting the arrival time.
 func (r *Doc) Change(opts ...DocOpt) ModifyArg {
 	return func(m *Modification) {
 		o := &docOpts{}
@@ -211,6 +217,7 @@ func (r *Doc) Change(opts ...DocOpt) ModifyArg {
 			opt(o)
 		}
 		nr := r.Copy()
+		nr.At = time.Time{}
 		if len(o.content) > 0 {
 			nr.Content = o.content
 		}

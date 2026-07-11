@@ -374,6 +374,10 @@ func TestSimpleChange(t *testing.T) {
 	RunQTest(t, eqtest.SimpleChange)
 }
 
+func TestTaskChangeFarPastArrivalNormalized(t *testing.T) {
+	RunQTest(t, eqtest.TaskChangeFarPastArrivalNormalized)
+}
+
 func TestSimpleWorker(t *testing.T) {
 	RunQTest(t, eqtest.SimpleWorker)
 }

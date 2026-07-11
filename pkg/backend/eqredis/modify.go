@@ -284,10 +284,8 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 				if newQueue == "" {
 					newQueue = oldQueue
 				}
-				newAtMs := t.At.UnixMilli()
-				if t.At.IsZero() {
-					newAtMs = nowMs
-				}
+				// Cap a far-past arrival to now (backend Modify contract).
+				newAtMs := entroq.NormalizeArrival(t.At, now).UnixMilli()
 
 				// Future at: claim/renew (set claimant to modifier).
 				// Past/zero at: release (clear claimant).
@@ -333,10 +331,7 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 				if id == "" {
 					id = entroq.GenHex16()
 				}
-				atMs := (td.At).UnixMilli()
-				if td.At.IsZero() {
-					atMs = nowMs
-				}
+				atMs := entroq.NormalizeArrival(td.At, now).UnixMilli()
 
 				f := &taskFields{
 					ID:       id,
@@ -408,10 +403,8 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 				}
 				k := d.Namespace + "/" + d.ID
 				st := docStates[k]
-				newAtMs := int64(0)
-				if !d.At.IsZero() {
-					newAtMs = (d.At).UnixMilli()
-				}
+				// Cap a far-past arrival to now (backend Modify contract), same as tasks.
+				newAtMs := entroq.NormalizeArrival(d.At, now).UnixMilli()
 				newClaimant := ""
 				if newAtMs > nowMs {
 					newClaimant = claimant

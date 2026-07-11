@@ -628,9 +628,12 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 			Key:          nd.GetKey(),
 			SecondaryKey: nd.GetSecondaryKey(),
 			Content:      val,
-			At:           fromMS(nd.GetAtMs()),
 		}
-		modArgs = append(modArgs, d.Change())
+		// Pass the wire arrival time as an option: Change resets At by default
+		// (release), so an explicit time must come through the option to survive.
+		// Mirrors the task change path's ArrivalTimeTo. A far-past value (an unset
+		// wire time) is capped to now by the backend.
+		modArgs = append(modArgs, d.Change(entroq.WithDocArrivalTime(fromMS(nd.GetAtMs()))))
 	}
 	for _, dd := range req.DocDeletes {
 		modArgs = append(modArgs, entroq.DeletingDocID(dd.Namespace, dd.Id, dd.Version))

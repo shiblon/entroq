@@ -238,6 +238,27 @@ func WaitTryClaim(ctx context.Context, eq *ClaimQuery, tc BackendClaimFunc, w Wa
 	return task, nil
 }
 
+// ArrivalPastWindow bounds how far before a backend's now() an arrival time may
+// be before the backend treats it as "unset" and substitutes now(). Clients and
+// the wire cannot represent Go's zero time reliably (it round-trips into a
+// year-1 timestamp, not an exact zero), so "far in the past", not "exactly
+// zero", is the portable sentinel meaning "arrive now". One year is the shared
+// window across all backends; eqpg enforces the same bound in SQL.
+const ArrivalPastWindow = 365 * 24 * time.Hour
+
+// NormalizeArrival implements the arrival-time half of the backend Modify
+// contract (see Backend.Modify): it caps a far-past arrival time up to now, so
+// the task is available immediately and ordered at now rather than in the
+// distant past. A present or future time is returned unchanged. Backends that
+// keep time as Go values call this directly; SQL backends mirror it in query
+// text (interval '1 year').
+func NormalizeArrival(at, now time.Time) time.Time {
+	if at.Before(now.Add(-ArrivalPastWindow)) {
+		return now
+	}
+	return at
+}
+
 // Backend describes all of the functions that any backend has to implement
 // to be used as the storage for task queues.
 //
@@ -293,6 +314,31 @@ type Backend interface {
 	// function is intended to return a DependencyError if the transaction could
 	// not proceed because dependencies were missing or already claimed (and
 	// not expired) by another claimant.
+	//
+	// Backends MUST honor two behavioral contracts, applied identically to tasks
+	// (keyed by queue) and docs (keyed by namespace):
+	//
+	// 1. The queue/namespace is part of the modify key. A delete, dependency, or
+	// change identifies its target by (id, version, queue) for tasks and (id,
+	// version, namespace) for docs, never by (id, version) alone. The named
+	// queue/namespace MUST match the target's current location, or the operation
+	// fails with a DependencyError; a backend MUST NOT substitute the stored
+	// location for a missing or mismatched one (that silent fill-in is exactly
+	// what defeats the check). A change's source is its current location; a move
+	// to a different, non-empty destination is expressed by the new location,
+	// while an empty destination means "no move" (stay put). This is what makes
+	// the queue/namespace an enforceable authorization boundary: authorization
+	// checks the claimed location and the backend binds the operation to it, so a
+	// caller cannot reach a target outside its granted queues by lying about
+	// where that target lives.
+	//
+	// 2. Arrival time is normalized (see NormalizeArrival). An arrival time more
+	// than ArrivalPastWindow before the backend's now() is treated as "unset" and
+	// replaced with now(), capping far-past times up. Because the wire cannot
+	// carry Go's zero time reliably, "far in the past" is the portable "arrive
+	// now" sentinel; this keeps an omitted At immediately available and ordered
+	// at now across every backend and proxy hop, and a present/future At is
+	// preserved.
 	Modify(ctx context.Context, mod *Modification) (*ModifyResponse, error)
 
 	// Docs returns a list of docs matching the given query.
