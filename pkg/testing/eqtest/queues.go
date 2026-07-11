@@ -244,12 +244,12 @@ func NamespaceStats(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 
 	// Insert 2 docs in ns1, 3 in ns2, 1 in ns3.
 	if _, err := client.Modify(ctx,
-		entroq.CreatingIn(ns1, entroq.WithKeys(key, "a")),
-		entroq.CreatingIn(ns1, entroq.WithKeys(key, "b")),
-		entroq.CreatingIn(ns2, entroq.WithKeys(key, "a")),
-		entroq.CreatingIn(ns2, entroq.WithKeys(key, "b")),
-		entroq.CreatingIn(ns2, entroq.WithKeys(key, "c")),
-		entroq.CreatingIn(ns3, entroq.WithKeys(key, "a")),
+		entroq.PuttingDocInto(ns1, entroq.WithKeys(key, "a")),
+		entroq.PuttingDocInto(ns1, entroq.WithKeys(key, "b")),
+		entroq.PuttingDocInto(ns2, entroq.WithKeys(key, "a")),
+		entroq.PuttingDocInto(ns2, entroq.WithKeys(key, "b")),
+		entroq.PuttingDocInto(ns2, entroq.WithKeys(key, "c")),
+		entroq.PuttingDocInto(ns3, entroq.WithKeys(key, "a")),
 	); err != nil {
 		t.Fatalf("insert: %v", err)
 	}

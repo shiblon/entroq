@@ -3,6 +3,7 @@ package entroq
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 )
@@ -22,24 +23,11 @@ type TaskID struct {
 }
 
 // NewTaskID creates a new TaskID with given options.
-func NewTaskID(id string, version int32, opts ...IDOption) *TaskID {
-	tID := &TaskID{
+func NewTaskID(id string, version int32, queue string) *TaskID {
+	return &TaskID{
 		ID:      id,
 		Version: version,
-	}
-	for _, o := range opts {
-		o(tID)
-	}
-	return tID
-}
-
-// IDOption is an option for things that require task ID information. Allows additional ID-related metadata to be passed.
-type IDOption func(id *TaskID)
-
-// WithIDQueue specifies the queue for a particular task ID.
-func WithIDQueue(q string) IDOption {
-	return func(id *TaskID) {
-		id.Queue = q
+		Queue: queue,
 	}
 }
 
@@ -50,12 +38,16 @@ func (t TaskID) String() string {
 
 // Delete produces an appropriate ModifyArg to delete the task with this ID.
 func (t TaskID) Delete() ModifyArg {
-	return Deleting(t.ID, t.Version, WithIDQueue(t.Queue))
+	return func(m *Modification) {
+		m.Deletes = append(m.Deletes, &t)
+	}
 }
 
 // Depend produces an appropriate ModifyArg to depend on this task ID.
 func (t TaskID) Depend() ModifyArg {
-	return DependingOn(t.ID, t.Version, WithIDQueue(t.Queue))
+	return func(m *Modification) {
+		m.Depends = append(m.Depends, &t)
+	}
 }
 
 // TaskData contains just the data, not the identifier or metadata. Used for insertions.
@@ -103,9 +95,170 @@ func (t *TaskData) String() string {
 	return s
 }
 
-// Insert returns a ModifyArg that can be used in the Modify function to insert this task data.
-func (t *TaskData) Insert() ModifyArg {
-	return Inserting(t)
+// InsertArg is an argument to task insertion.
+type InsertArg func(*Modification, *TaskData)
+
+// WithArrivalTime changes the arrival time to a fixed moment during task insertion.
+// The time is taken as-is from the caller. If tight synchronization with the
+// backend clock is required, use EntroQ.Time to obtain the reference time first.
+func WithArrivalTime(at time.Time) InsertArg {
+	return func(_ *Modification, d *TaskData) {
+		d.At = at
+	}
+}
+
+// WithArrivalTimeIn computes the arrival time based on the duration from now, e.g.,
+//
+//	cli.Modify(ctx,
+//	  InsertingInto("my queue",
+//	    WithTimeIn(2 * time.Minute)))
+//
+// The duration is added to Go's wall clock time at the point of Modify. If tight
+// synchronization with the backend clock is required, use EntroQ.Time and
+// WithArrivalTime instead.
+func WithArrivalTimeIn(duration time.Duration) InsertArg {
+	return func(m *Modification, d *TaskData) {
+		d.At = m.now.Add(duration)
+	}
+}
+
+// WithRawValue sets the task's JSON value during insertion from pre-marshaled
+// bytes. The value must be valid JSON; nil is allowed and represents an absent
+// value. Use WithValue to marshal a Go value on the fly.
+//
+//	cli.Modify(ctx,
+//	  InsertingInto("my queue",
+//	    WithRawValue(json.RawMessage(`"hi there"`))))
+func WithRawValue(value json.RawMessage) InsertArg {
+	return func(_ *Modification, d *TaskData) {
+		d.Value = value
+	}
+}
+
+// WithValue marshals v as JSON and uses it as the task value. It is a
+// "Must"-style function: if v cannot be marshaled (channels, functions,
+// cycles), it calls log.Fatal. These are programmer errors, not runtime
+// conditions -- the type being marshaled is known at compile time. Use
+// WithRawValue for pre-marshaled data.
+//
+//	cli.Modify(ctx,
+//	  InsertingInto("my queue",
+//	    WithValue(MyStruct{Field: "hello"})))
+func WithValue(v any) InsertArg {
+	b, err := json.Marshal(v)
+	if err != nil {
+		log.Fatalf("entroq: WithValue: %v", err)
+	}
+	return WithRawValue(b)
+}
+
+// WithAttempt sets the number of attempts for this task. Usually not needed,
+// handled automatically by the worker.
+func WithAttempt(value int32) InsertArg {
+	return func(_ *Modification, d *TaskData) {
+		d.Attempt = value
+	}
+}
+
+// WithErr sets the error field of a task during insertion. Usually not needed,
+// as tasks are typically modified to add errors, not inserted with them.
+func WithErr(value string) InsertArg {
+	return func(_ *Modification, d *TaskData) {
+		d.Err = value
+	}
+}
+
+// WithID sets the task's ID for insertion. This is not normally needed, as the backend
+// will assign a new, unique ID for this task if none is specified. There are cases
+// where assigning an explicit insertion ID (always being careful that it is
+// unique) can be useful, however.
+//
+// NOTE: IDs must be <= 64 characters in length for some backends.
+//
+// For example, a not uncommon need is for a worker to do the following:
+//
+//   - Claim a task,
+//   - Make database entries corresponding to downstream work,
+//   - Insert tasks for the downstream work and delete claimed task.
+//
+// If the database entries need to reference the tasks that have not yet been
+// inserted (e.g., if they need to be used to get at the status of a task), it
+// is not safe to simply update the database after insertion, as this introduces
+// a race condition. If, for example, the following strategy is employed, then
+// the task IDs may never make it into the database:
+//
+//   - Claim a task,
+//   - Make database entries
+//   - Insert tasks and delete claimed task
+//   - Update database with new task IDs
+//
+// In this event, it is entirely possible to successfully process the incoming
+// task and create the outgoing tasks, then lose network connectivity and fail
+// to add those IDs to the databse. Now it is no longer possible to update the
+// database appropriately: the task information is simply lost.
+//
+// Instead, it is safe to do the following:
+//
+//   - Claim a task
+//   - Make database entries, including with to-be-created task IDs
+//   - Insert tasks with those IDs and delete claimed task.
+//
+// This avoids the potential data loss condition entirely.
+//
+// There are other workarounds for this situation, like using a two-step
+// creation process and taking advantage of the ability to move tasks between
+// queues without disturbing their ID (only their version), but this is not
+// uncommon enough to warrant requiring the extra worker logic just to get a
+// task ID into the database.
+func WithID(id string) InsertArg {
+	return func(_ *Modification, d *TaskData) {
+		d.ID = id
+	}
+}
+
+// WithSkipColliding sets the insert argument to allow itself to be removed if
+// the only error encountered is an ID collision. This can help when it is
+// desired to insert multiple tasks, but a previous subset was already inserted
+// with similar IDs. Sometimes you want to specify a superset to "catch what we
+// missed".
+func WithSkipColliding(s bool) InsertArg {
+	return func(_ *Modification, d *TaskData) {
+		d.skipCollidingID = s
+	}
+}
+
+// Inserting creates an insert modification from TaskData:
+//
+//	cli.Modify(ctx,
+//		Inserting(&TaskData{
+//			Queue: "myqueue",
+//			At:    time.Now.Add(1 * time.Minute),
+//			Value: json.RawMessage(`"hi there"`),
+//		}))
+//
+// Or, preferred:
+//
+//	cli.Modify(ctx,
+//		InsertingInto("myqueue",
+//		    WithArrivalTimeIn(1 * time.Minute),
+//		    WithValue(json.RawMessage(`"hi there"`))))
+func Inserting(tds ...*TaskData) ModifyArg {
+	return func(m *Modification) {
+		m.Inserts = append(m.Inserts, tds...)
+	}
+}
+
+// InsertingInto creates an insert modification. Use like this:
+//
+//	cli.Modify(InsertingInto("my queue name", WithValue(json.RawMessage(`"hi there"`))))
+func InsertingInto(q string, insertArgs ...InsertArg) ModifyArg {
+	return func(m *Modification) {
+		data := &TaskData{Queue: q}
+		for _, arg := range insertArgs {
+			arg(m, data)
+		}
+		m.Inserts = append(m.Inserts, data)
+	}
 }
 
 // Task represents a unit of work, with a byte slice value payload.
@@ -152,35 +305,133 @@ func (t *Task) String() string {
 // Delete returns a ModifyArg that can be used in the Modify function, e.g.,
 //
 //	cli.Modify(ctx, task1.Delete())
-//
-// The above would cause the given task to be deleted, if it can be. It is
-// shorthand for
-//
-//	cli.Modify(ctx, Deleting(task1.ID, task1.Version, WithIDQueue(task1.Queue)))
 func (t *Task) Delete() ModifyArg {
-	return Deleting(t.ID, t.Version, WithIDQueue(t.Queue))
+	return t.IDVersion().Delete()
+}
+
+// ChangeArg is an argument to the Task.Change function used to create arguments
+// for Modify, e.g., to change the queue and set the expiry time of a task to
+// 5 minutes in the future, you would do something like this:
+//
+//	  cli.Modify(ctx,
+//	    myTask.Change(
+//	      QueueTo("a new queue"),
+//		  ArrivalTimeBy(5 * time.Minute)))
+type ChangeArg func(m *Modification, t *Task)
+
+// QueueTo creates an option to modify a task's queue in Task.Change.
+func QueueTo(q string) ChangeArg {
+	return func(_ *Modification, t *Task) {
+		// Save the old queue for authorization to move this from one to another.
+		t.FromQueue = t.Queue
+		t.Queue = q
+	}
+}
+
+// ArrivalTimeTo sets a specific arrival time on a changed task in Task.Change.
+func ArrivalTimeTo(at time.Time) ChangeArg {
+	return func(_ *Modification, t *Task) {
+		t.At = at
+	}
+}
+
+// ArrivalTimeBy sets the arrival time to a time in the future, by the given duration.
+// The duration is added to Go's wall clock time at the point of Modify. If tight
+// synchronization with the backend clock is required, use EntroQ.Time and
+// WithArrivalTime instead. Send a duration of 0 for immediate availability.
+func ArrivalTimeBy(d time.Duration) ChangeArg {
+	return func(m *Modification, t *Task) {
+		t.At = m.now.Add(d)
+	}
+}
+
+// RawValueTo sets the changing task's JSON value from pre-marshaled bytes.
+// The value must be valid JSON; nil is allowed and represents an absent value.
+func RawValueTo(v json.RawMessage) ChangeArg {
+	return func(_ *Modification, t *Task) {
+		t.Value = v
+	}
+}
+
+// ValueTo sets the changing task's JSON value by marshaling what is passed in
+// first.
+func ValueTo(v any) ChangeArg {
+	// Errors are code errors if something unmarshalable is passed (like chan).
+	b, err := json.Marshal(v)
+	if err != nil {
+		log.Fatalf("unmarshalable type ValueTo: %v", err)
+	}
+	return func(_ *Modification, t *Task) {
+		t.Value = b
+	}
+}
+
+// AppendingErr appends the given error to Err in the task.
+func AppendingErr(e string) ChangeArg {
+	return func(_ *Modification, t *Task) {
+		var strs []string
+		if t.Err != "" {
+			strs = append(strs, t.Err)
+		}
+		if e != "" {
+			strs = append(strs, e)
+		}
+		if len(strs) != 0 {
+			t.Err = strings.Join(strs, "\n")
+		}
+	}
+}
+
+// ErrTo sets the Err field in the task.
+func ErrTo(e string) ChangeArg {
+	return func(_ *Modification, t *Task) {
+		t.Err = e
+	}
+}
+
+// ErrToZero sets the Err field to its zero value (clears the error).
+func ErrToZero() ChangeArg {
+	return ErrTo("")
+}
+
+// AttemptToNext sets the Attempt field in Task to the next value (increments it).
+func AttemptToNext() ChangeArg {
+	return func(_ *Modification, t *Task) {
+		t.Attempt++
+	}
+}
+
+// AttemptToZero resets the Attempt field to zero.
+func AttemptToZero() ChangeArg {
+	return func(_ *Modification, t *Task) {
+		t.Attempt = 0
+	}
 }
 
 // Change returns a ModifyArg that can be used in the Modify function, e.g.,
 //
 //	cli.Modify(ctx, task1.Change(ArrivalTimeBy(2 * time.Minute)))
-//
-// The above is shorthand for
-//
-//	cli.Modify(ctx, Changing(task1, ArrivalTimeBy(2 * time.Minute)))
 func (t *Task) Change(args ...ChangeArg) ModifyArg {
-	return Changing(t, args...)
+	return func(m *Modification) {
+		newTask := *t
+		// From queue is always the current queue.
+		newTask.FromQueue = t.Queue
+		// Zero time signals the backend to use its own "now" and clear the
+		// claimant (t is released). Callers may override via ArrivalTimeTo
+		// or ArrivalTimeBy to renew or defer.
+		newTask.At = time.Time{}
+		for _, a := range args {
+			a(m, &newTask)
+		}
+		m.Changes = append(m.Changes, &newTask)
+	}
 }
 
 // Depend returns a ModifyArg that can be used to create a Modify dependency, e.g.,
 //
 //	cli.Modify(ctx, task.Depend())
-//
-// That is shorthand for
-//
-//	cli.Modify(ctx, DependingOn(task.ID, task.Version, WithIDQueue(task.Queue)))
 func (t *Task) Depend() ModifyArg {
-	return DependingOn(t.ID, t.Version, WithIDQueue(t.Queue))
+	return t.IDVersion().Depend()
 }
 
 // RetryOrQuarantine returns a ModifyArg for cases where a task has an error that seems retriable.
@@ -195,7 +446,7 @@ func (t *Task) RetryOrQuarantine(errMsg, quarantineTo string, afterMaxAttempts i
 		args = append(args, QueueTo(quarantineTo))
 	}
 	args = append(args, overrides...)
-	return Changing(t, args...)
+	return t.Change(args...)
 }
 
 // Retry adds an error and increments attempts while adding time to At.
@@ -213,7 +464,7 @@ func (t *Task) Quarantine(errMsg, toQ string, overrides ...ChangeArg) ModifyArg 
 
 // ID returns a Task ID from this task.
 func (t *Task) IDVersion() *TaskID {
-	return NewTaskID(t.ID, t.Version, WithIDQueue(t.Queue))
+	return NewTaskID(t.ID, t.Version, t.Queue)
 }
 
 // Data returns the data for this task.

@@ -564,7 +564,7 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 		// task's CURRENT queue (see eqmem's queue-integrity check), so we must
 		// build the task in that queue and let QueueTo move it. The wire splits
 		// the two queues into OldId.Queue (the source, i.e. current) and
-		// NewData.Queue (the destination). Changing always derives FromQueue from
+		// NewData.Queue (the destination). Task.Change always derives FromQueue from
 		// the task's Queue field, so if we set Queue to the destination up front,
 		// every move would report its source as its own target and fail the
 		// integrity check. Setting Queue to the source and applying QueueTo only
@@ -581,7 +581,7 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 			ID:       change.GetOldId().Id,
 			Version:  change.GetOldId().Version,
 			Claimant: req.ClaimantId,
-			Queue:    oldQueue, // current queue; Changing derives FromQueue from it
+			Queue:    oldQueue, // current queue; Task.Change derives FromQueue from it
 			Value:    val,
 			Attempt:  change.GetNewData().Attempt,
 			Err:      change.GetNewData().Err,
@@ -591,20 +591,20 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 			changeArgs = append(changeArgs, entroq.QueueTo(newQueue))
 		}
 		changeArgs = append(changeArgs, entroq.ArrivalTimeTo(fromMS(change.GetNewData().AtMs)))
-		modArgs = append(modArgs, entroq.Changing(t, changeArgs...))
+		modArgs = append(modArgs, t.Change(changeArgs...))
 	}
 	for _, del := range req.Deletes {
-		modArgs = append(modArgs, entroq.Deleting(del.Id, del.Version, entroq.WithIDQueue(del.Queue)))
+		modArgs = append(modArgs, entroq.NewTaskID(del.Id, del.Version, del.Queue).Delete())
 	}
 	for _, dep := range req.Depends {
-		modArgs = append(modArgs, entroq.DependingOn(dep.Id, dep.Version, entroq.WithIDQueue(dep.Queue)))
+		modArgs = append(modArgs, entroq.NewTaskID(dep.Id, dep.Version, dep.Queue).Depend())
 	}
 	for _, di := range req.DocInserts {
 		val, err := protoToJSON(di.Content)
 		if err != nil {
 			return nil, autoCodeErrorf("doc insert content: %w", err)
 		}
-		modArgs = append(modArgs, entroq.InsertingDoc(&entroq.DocData{
+		modArgs = append(modArgs, entroq.PuttingDoc(&entroq.DocData{
 			Namespace:    di.Namespace,
 			ID:           di.Id,
 			Key:          di.Key,
@@ -636,10 +636,10 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 		modArgs = append(modArgs, d.Change(entroq.WithDocArrivalTime(fromMS(nd.GetAtMs()))))
 	}
 	for _, dd := range req.DocDeletes {
-		modArgs = append(modArgs, entroq.DeletingDocID(dd.Namespace, dd.Id, dd.Version))
+		modArgs = append(modArgs, entroq.NewDocID(dd.Namespace, dd.Id, dd.Version).Delete())
 	}
 	for _, ddep := range req.DocDepends {
-		modArgs = append(modArgs, entroq.DependingOnDocID(ddep.Namespace, ddep.Id, ddep.Version))
+		modArgs = append(modArgs, entroq.NewDocID(ddep.Namespace, ddep.Id, ddep.Version).Depend())
 	}
 	resp, err := s.impl.Modify(ctx, modArgs...)
 	if err != nil {

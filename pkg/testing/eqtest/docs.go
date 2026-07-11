@@ -21,7 +21,7 @@ func SimpleDocLifecycle(ctx context.Context, t *testing.T, client *entroq.EntroQ
 	val := json.RawMessage(`{"foo":"bar"}`)
 
 	// Insert a doc
-	resp, err := client.Modify(ctx, entroq.CreatingIn(ns,
+	resp, err := client.Modify(ctx, entroq.PuttingDocInto(ns,
 		entroq.WithIDKeys(id, "", ""),
 		entroq.WithContent(val),
 	))
@@ -75,7 +75,7 @@ func SimpleDocLifecycle(ctx context.Context, t *testing.T, client *entroq.EntroQ
 	}
 
 	// Delete the doc
-	_, err = client.Modify(ctx, entroq.DeletingDoc(changed))
+	_, err = client.Modify(ctx, changed.Delete())
 	if err != nil {
 		t.Fatalf("Delete doc: %v", err)
 	}
@@ -98,7 +98,7 @@ func DocMultiOp(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefi
 	// Atomic insert of a task and its associated state doc.
 	resp, err := client.Modify(ctx,
 		entroq.InsertingInto(q, entroq.WithValue("task body")),
-		entroq.CreatingIn(ns,
+		entroq.PuttingDocInto(ns,
 			entroq.WithIDKeys("state-1", "", ""),
 			entroq.WithContent("initial state"),
 		),
@@ -146,7 +146,7 @@ func DocListing(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefi
 
 	var args []entroq.ModifyArg
 	for _, d := range data {
-		args = append(args, entroq.CreatingIn(ns,
+		args = append(args, entroq.PuttingDocInto(ns,
 			entroq.WithIDKeys(d.ID, d.PK, ""),
 			entroq.WithContent(nil),
 		))
@@ -196,7 +196,7 @@ func DocConcurrencyStress(ctx context.Context, t *testing.T, client *entroq.Entr
 	// Setup: Create docs with an initial counter value of 0.
 	var setupArgs []entroq.ModifyArg
 	for i := 0; i < numDocs; i++ {
-		setupArgs = append(setupArgs, entroq.CreatingIn(ns,
+		setupArgs = append(setupArgs, entroq.PuttingDocInto(ns,
 			entroq.WithIDKeys(fmt.Sprintf("doc-%d", i), "", ""),
 			entroq.WithContent(0),
 		))
@@ -297,7 +297,7 @@ func MixedAtomicStress(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		id := fmt.Sprintf("item-%d", i)
 		if _, err := client.Modify(ctx,
 			entroq.InsertingInto(q, entroq.WithID(id), entroq.WithValue(0)),
-			entroq.CreatingIn(ns,
+			entroq.PuttingDocInto(ns,
 				entroq.WithIDKeys(id, "", ""),
 				entroq.WithContent(0),
 			),
@@ -418,8 +418,8 @@ func DocClaimLocking(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 
 	// Insert two docs with the same primary key.
 	if _, err := client.Modify(ctx,
-		entroq.CreatingIn(ns, entroq.WithKeys(key, "a"), entroq.WithContent(1)),
-		entroq.CreatingIn(ns, entroq.WithKeys(key, "b"), entroq.WithContent(2)),
+		entroq.PuttingDocInto(ns, entroq.WithKeys(key, "a"), entroq.WithContent(1)),
+		entroq.PuttingDocInto(ns, entroq.WithKeys(key, "b"), entroq.WithContent(2)),
 	); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
@@ -482,7 +482,7 @@ func DocInsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 	knownID := client.GenID()
 
 	// Insert a doc with an explicit ID -- should succeed.
-	resp, err := client.Modify(ctx, entroq.CreatingIn(ns,
+	resp, err := client.Modify(ctx, entroq.PuttingDocInto(ns,
 		entroq.WithIDKeys(knownID, "pk", "sk"),
 		entroq.WithContent("first"),
 	))
@@ -498,7 +498,7 @@ func DocInsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 
 	// Inserting the same explicit ID again must return DependencyError with
 	// DocInserts populated -- not silently overwrite, not misroute to Changes.
-	_, err = client.Modify(ctx, entroq.CreatingIn(ns,
+	_, err = client.Modify(ctx, entroq.PuttingDocInto(ns,
 		entroq.WithIDKeys(knownID, "pk", "sk"),
 		entroq.WithContent("second"),
 	))
@@ -529,7 +529,7 @@ func DocInsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 	}
 
 	// Inserting with WithSkipCollidingDoc must succeed and leave the original intact.
-	_, err = client.Modify(ctx, entroq.CreatingIn(ns,
+	_, err = client.Modify(ctx, entroq.PuttingDocInto(ns,
 		entroq.WithIDKeys(knownID, "pk", "sk"),
 		entroq.WithContent("overwrite-attempt"),
 		entroq.WithSkipCollidingDoc(true),
@@ -553,12 +553,12 @@ func DocInsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 	// real operation while dropping the colliding insert.
 	otherID := client.GenID()
 	_, err = client.Modify(ctx,
-		entroq.CreatingIn(ns,
+		entroq.PuttingDocInto(ns,
 			entroq.WithIDKeys(knownID, "pk", "sk"),
 			entroq.WithContent("overwrite-attempt"),
 			entroq.WithSkipCollidingDoc(true),
 		),
-		entroq.CreatingIn(ns,
+		entroq.PuttingDocInto(ns,
 			entroq.WithIDKeys(otherID, "pk2", "sk2"),
 			entroq.WithContent("new-doc"),
 		),
@@ -586,7 +586,7 @@ func DocClaimantBehavior(ctx context.Context, t *testing.T, client *entroq.Entro
 	ns := path.Join(qPrefix, "doc_claimant_behavior")
 
 	// Insert: claimant must be empty; at defaults to now (past by query time).
-	resp, err := client.Modify(ctx, entroq.CreatingIn(ns, entroq.WithKeys("k", "")))
+	resp, err := client.Modify(ctx, entroq.PuttingDocInto(ns, entroq.WithKeys("k", "")))
 	if err != nil {
 		t.Fatalf("insert: %v", err)
 	}

@@ -723,39 +723,41 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 
 // QueueMatch tests various queue matching functions against a client.
 func DeleteMissingTask(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	//queue := path.Join(qPrefix, "delete_missing")
+	queue := path.Join(qPrefix, "delete_missing")
 
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	if _, err := client.Modify(ctx, entroq.Deleting("fake_task_id", 0)); err != nil {
+	// Insert a real task so the queue actually exists. Queues are ephemeral
+	// (they exist only while they hold tasks), so this decoy isolates "task ID
+	// not found" from "queue not found": the probes below fail solely because
+	// the target isn't there, in a valid, populated queue.
+	resp, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue("real")))
+	if err != nil {
+		t.Fatalf("Error inserting decoy task: %v", err)
+	}
+	decoy := resp.InsertedTasks[0]
+
+	// A genuinely-absent id in that valid queue is not found.
+	if _, err := client.Modify(ctx, entroq.NewTaskID("fake_task_id", 0, queue).Delete()); err != nil {
 		if depErr, ok := entroq.AsDependency(err); !ok {
 			t.Fatalf("Expected dependency error when deleting missing task, got: %v", err)
-		} else {
-			if want, got := 1, len(depErr.Deletes); want != got {
-				t.Fatalf("Expected 1 delete, got: %v", got)
-			}
+		} else if want, got := 1, len(depErr.Deletes); want != got {
+			t.Fatalf("Expected 1 delete, got: %v", got)
 		}
 	} else {
-		t.Fatalf("Expected error when deleting missing task, got: %v", err)
+		t.Fatalf("Expected error when deleting missing task, got nil")
 	}
 
-	resp, err := client.Modify(ctx, entroq.InsertingInto("my queue", entroq.WithValue("hi")))
-	if err != nil {
-		t.Fatalf("Error inserting task for delete missing test: %v", err)
-	}
-	ins := resp.InsertedTasks
-
-	if _, err := client.Modify(ctx, entroq.Deleting(ins[0].ID, 1 /* wrong version */)); err != nil {
+	// A real id at the wrong version, in its real queue, is not found either.
+	if _, err := client.Modify(ctx, entroq.NewTaskID(decoy.ID, decoy.Version+1, decoy.Queue).Delete()); err != nil {
 		if depErr, ok := entroq.AsDependency(err); !ok {
 			t.Fatalf("Expected dependency error when deleting with wrong version, got: %v", err)
-		} else {
-			if want, got := 1, len(depErr.Deletes); want != got {
-				t.Fatalf("Expected 1 delete, got: %v", got)
-			}
+		} else if want, got := 1, len(depErr.Deletes); want != got {
+			t.Fatalf("Expected 1 delete, got: %v", got)
 		}
 	} else {
-		t.Fatalf("Expected error when deleting with wrong version, got: %v", err)
+		t.Fatalf("Expected error when deleting with wrong version, got nil")
 	}
 }
 

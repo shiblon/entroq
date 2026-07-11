@@ -447,19 +447,19 @@ func ensureModQueues(mod *entroq.Modification, qByID map[string]string) error {
 	depErr := new(entroq.DependencyError)
 	for _, d := range mod.Deletes {
 		if d.Queue == "" || d.Queue != qByID[d.ID] {
-			depErr.Deletes = append(depErr.Deletes, entroq.NewTaskID(d.ID, d.Version, entroq.WithIDQueue(d.Queue)))
+			depErr.Deletes = append(depErr.Deletes, entroq.NewTaskID(d.ID, d.Version, d.Queue))
 		}
 	}
 
 	for _, d := range mod.Depends {
 		if d.Queue == "" || d.Queue != qByID[d.ID] {
-			depErr.Depends = append(depErr.Depends, entroq.NewTaskID(d.ID, d.Version, entroq.WithIDQueue(d.Queue)))
+			depErr.Depends = append(depErr.Depends, entroq.NewTaskID(d.ID, d.Version, d.Queue))
 		}
 	}
 
 	for _, c := range mod.Changes {
 		if c.FromQueue == "" || c.FromQueue != qByID[c.ID] {
-			depErr.Changes = append(depErr.Changes, entroq.NewTaskID(c.ID, c.Version, entroq.WithIDQueue(c.FromQueue)))
+			depErr.Changes = append(depErr.Changes, entroq.NewTaskID(c.ID, c.Version, c.FromQueue))
 		}
 	}
 	if len(depErr.Deletes)+len(depErr.Depends)+len(depErr.Changes) != 0 {

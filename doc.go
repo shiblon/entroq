@@ -99,18 +99,26 @@ type DocID struct {
 	Version   int32  `json:"version"`
 }
 
+func NewDocID(ns string, id string, version int32) *DocID {
+	return &DocID{ns, id, version}
+}
+
 func (r DocID) String() string {
 	return fmt.Sprintf("%s/%s:v%d", r.Namespace, r.ID, r.Version)
 }
 
 // Delete returns a ModifyArg that deletes the doc identified by this DocID.
 func (r DocID) Delete() ModifyArg {
-	return DeletingDocID(r.Namespace, r.ID, r.Version)
+	return func(m *Modification) {
+		m.DocDeletes = append(m.DocDeletes, &r)
+	}
 }
 
 // Depend returns a ModifyArg that adds a version-pinned dependency on this DocID.
 func (r DocID) Depend() ModifyArg {
-	return DependingOnDocID(r.Namespace, r.ID, r.Version)
+	return func(m *Modification) {
+		m.DocDepends = append(m.DocDepends, &r)
+	}
 }
 
 // DocData contains just the data portion of a storage doc, used for
@@ -205,7 +213,7 @@ func (r *Doc) Copy() *Doc {
 // Change returns a ModifyArg that changes this doc. Accepts WithContent,
 // WithDocArrivalTime, and WithDocArrivalTimeBy. WithIDKeys is ignored (keys are immutable).
 //
-// Like Changing for tasks, a change releases by default: the arrival time is
+// Much like Task.Change, a change releases by default: the arrival time is
 // reset (so the backend substitutes now(), see Backend.Modify) unless an
 // explicit WithDocArrivalTime / WithDocArrivalTimeBy pushes it into the future
 // to keep the doc claimed. Callers therefore do not silently keep a claim just
@@ -239,71 +247,27 @@ func (r *Doc) IDVersion() *DocID {
 
 // Delete returns a ModifyArg that deletes this doc.
 func (r *Doc) Delete() ModifyArg {
-	return DeletingDoc(r)
+	return r.IDVersion().Delete()
 }
 
 // Depend returns a ModifyArg that adds a version-pinned dependency on this doc.
 func (r *Doc) Depend() ModifyArg {
-	return DependingOnDoc(r)
+	return r.IDVersion().Depend()
 }
 
-// DeletingDoc returns a ModifyArg that deletes the given doc.
-func DeletingDoc(r *Doc) ModifyArg {
-	return func(m *Modification) {
-		m.DocDeletes = append(m.DocDeletes, &DocID{
-			Namespace: r.Namespace,
-			ID:        r.ID,
-			Version:   r.Version,
-		})
-	}
-}
-
-// DeletingDocID returns a ModifyArg that deletes the doc by namespace, ID and version.
-func DeletingDocID(ns, id string, version int32) ModifyArg {
-	return func(m *Modification) {
-		m.DocDeletes = append(m.DocDeletes, &DocID{
-			Namespace: ns,
-			ID:        id,
-			Version:   version,
-		})
-	}
-}
-
-// DependingOnDoc returns a ModifyArg that adds a dependency on the given doc.
-func DependingOnDoc(r *Doc) ModifyArg {
-	return func(m *Modification) {
-		m.DocDepends = append(m.DocDepends, &DocID{
-			Namespace: r.Namespace,
-			ID:        r.ID,
-			Version:   r.Version,
-		})
-	}
-}
-
-// DependingOnDocID returns a ModifyArg that adds a dependency on a doc by namespace, ID and version.
-func DependingOnDocID(ns, id string, version int32) ModifyArg {
-	return func(m *Modification) {
-		m.DocDepends = append(m.DocDepends, &DocID{
-			Namespace: ns,
-			ID:        id,
-			Version:   version,
-		})
-	}
-}
-
-// InsertingDoc returns a ModifyArg that inserts the given doc data directly.
-// Prefer CreatingIn for new code.
-func InsertingDoc(rd *DocData) ModifyArg {
+// PuttingDoc returns a ModifyArg that inserts the given doc data directly.
+// Prefer PuttingDocInto for most use cases.
+func PuttingDoc(rd *DocData) ModifyArg {
 	return func(m *Modification) {
 		m.DocInserts = append(m.DocInserts, rd)
 	}
 }
 
-// CreatingIn returns a ModifyArg that creates a doc in the given namespace.
+// PuttingDocInto returns a ModifyArg that creates a doc in the given namespace.
 // Use WithKeys to set the primary and secondary keys, WithContent/WithRawContent
 // to set the payload. Use WithIDKeys only when explicit ID control is required.
 // Use WithSkipCollidingDoc to allow the insert to be silently dropped on ID collision.
-func CreatingIn(ns string, opts ...DocOpt) ModifyArg {
+func PuttingDocInto(ns string, opts ...DocOpt) ModifyArg {
 	return func(m *Modification) {
 		o := &docOpts{}
 		for _, opt := range opts {
