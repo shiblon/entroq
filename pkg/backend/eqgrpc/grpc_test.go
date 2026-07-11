@@ -117,6 +117,10 @@ func TestGRPCTaskChangeFarPastArrivalNormalized(t *testing.T) {
 	RunQTest(t, eqtest.TaskChangeFarPastArrivalNormalized)
 }
 
+func TestGRPCModifyRejectsWrongQueue(t *testing.T) {
+	RunQTest(t, eqtest.ModifyRejectsWrongQueue)
+}
+
 func TestGRPCSimpleWorker(t *testing.T) {
 	RunQTest(t, eqtest.SimpleWorker)
 }

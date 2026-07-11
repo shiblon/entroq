@@ -29,11 +29,18 @@ class TaskData:
 
 @dataclass
 class TaskChange:
-    """Specifies new values for an existing task (identified by id + version)."""
+    """Specifies new values for an existing task (identified by id + version).
+
+    from_queue is the task's current queue: the source, part of the modify key,
+    which the backend matches against stored state. queue is the destination
+    (equal to from_queue for a plain change, different for a move). Prefer
+    Task.as_change, which fills from_queue from the task automatically.
+    """
     id: str
     version: int
     queue: str
     at: Optional[datetime]          # required - set explicitly or copy from Task
+    from_queue: str = ''
     value: Any = None
     attempt: int = 0
     err: str = ''
@@ -57,10 +64,15 @@ class Task:
         return TaskID(self.id, self.version, self.queue)
 
     def as_change(self, **overrides) -> TaskChange:
-        """Return a TaskChange for this task with optional field overrides."""
+        """Return a TaskChange for this task with optional field overrides.
+
+        from_queue is fixed to the task's current queue (the source); overriding
+        'queue' moves the task to a new destination.
+        """
         return TaskChange(
             id=self.id,
             version=self.version,
+            from_queue=self.queue,
             queue=overrides.get('queue', self.queue),
             at=overrides.get('at', self.at),
             value=overrides.get('value', self.value),

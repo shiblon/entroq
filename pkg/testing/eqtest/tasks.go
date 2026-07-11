@@ -129,6 +129,86 @@ func TaskChangeFarPastArrivalNormalized(ctx context.Context, t *testing.T, clien
 	}
 }
 
+// ModifyRejectsWrongQueue verifies the queue-as-modify-key contract: an
+// operation that names a queue the task does not live in fails with a
+// DependencyError and leaves the task untouched. This is the cross-backend
+// guarantee that the queue is an enforceable authorization boundary; a caller
+// cannot reach a task outside a queue it holds rights to by lying about where
+// the task lives.
+func ModifyRejectsWrongQueue(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	realQ := path.Join(qPrefix, "wrong_queue_real")
+	otherQ := path.Join(qPrefix, "wrong_queue_other")
+
+	resp, err := client.Modify(ctx, entroq.InsertingInto(realQ, entroq.WithValue("v")))
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	inserted := resp.InsertedTasks[0]
+
+	// A delete naming the wrong queue must fail as a dependency error.
+	_, err = client.Modify(ctx, entroq.NewTaskID(inserted.ID, inserted.Version, otherQ).Delete())
+	if depErr, ok := entroq.AsDependency(err); !ok {
+		t.Fatalf("wrong-queue delete: got err %v, want a DependencyError", err)
+	} else if len(depErr.Deletes) == 0 {
+		t.Errorf("wrong-queue delete: DependencyError missing a Deletes entry: %+v", depErr)
+	}
+
+	// A change lying about the source (from) queue must also fail. Task.Change
+	// derives FromQueue from the task's Queue, so a task built in otherQ claims
+	// the wrong source.
+	lie := &entroq.Task{ID: inserted.ID, Version: inserted.Version, Queue: otherQ, Value: inserted.Value}
+	_, err = client.Modify(ctx, lie.Change())
+	if depErr, ok := entroq.AsDependency(err); !ok {
+		t.Fatalf("wrong-queue change: got err %v, want a DependencyError", err)
+	} else if len(depErr.Changes) == 0 {
+		t.Errorf("wrong-queue change: DependencyError missing a Changes entry: %+v", depErr)
+	}
+
+	// A dependency naming the wrong queue must fail too.
+	_, err = client.Modify(ctx, entroq.NewTaskID(inserted.ID, inserted.Version, otherQ).Depend())
+	if depErr, ok := entroq.AsDependency(err); !ok {
+		t.Fatalf("wrong-queue depend: got err %v, want a DependencyError", err)
+	} else if len(depErr.Depends) == 0 {
+		t.Errorf("wrong-queue depend: DependencyError missing a Depends entry: %+v", depErr)
+	}
+
+	// An empty queue is rejected as well: there is no silent fill-in from stored
+	// state, which is exactly what would defeat the check.
+	_, err = client.Modify(ctx, entroq.NewTaskID(inserted.ID, inserted.Version, "").Delete())
+	if _, ok := entroq.AsDependency(err); !ok {
+		t.Fatalf("empty-queue delete: got err %v, want a DependencyError", err)
+	}
+
+	// The task must be untouched: still present in its real queue at its
+	// original version.
+	tasks, err := client.Tasks(ctx, realQ)
+	if err != nil {
+		t.Fatalf("tasks: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("task should be untouched: got %d tasks in %q, want 1", len(tasks), realQ)
+	}
+	if tasks[0].Version != inserted.Version {
+		t.Errorf("task version changed after rejected ops: got %d, want %d", tasks[0].Version, inserted.Version)
+	}
+
+	// The legitimate case still works: naming the correct source queue, a move
+	// to a different destination succeeds and relocates the task.
+	if _, err := client.Modify(ctx, inserted.Change(entroq.QueueTo(otherQ))); err != nil {
+		t.Fatalf("correct-queue move: %v", err)
+	}
+	if got, err := client.Tasks(ctx, realQ); err != nil {
+		t.Fatalf("tasks realQ: %v", err)
+	} else if len(got) != 0 {
+		t.Errorf("source queue not emptied by move: got %d tasks in %q, want 0", len(got), realQ)
+	}
+	if got, err := client.Tasks(ctx, otherQ); err != nil {
+		t.Fatalf("tasks otherQ: %v", err)
+	} else if len(got) != 1 {
+		t.Errorf("destination queue did not receive the move: got %d tasks in %q, want 1", len(got), otherQ)
+	}
+}
+
 // SimpleWorker tests basic worker functionality while tasks are coming in and
 // being waited on.
 func ClaimUnblocksOnNotify(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {

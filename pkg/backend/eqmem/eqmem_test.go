@@ -66,6 +66,10 @@ func TestEQMemTaskChangeFarPastArrivalNormalized(t *testing.T) {
 	RunQTest(t, eqtest.TaskChangeFarPastArrivalNormalized)
 }
 
+func TestEQMemModifyRejectsWrongQueue(t *testing.T) {
+	RunQTest(t, eqtest.ModifyRejectsWrongQueue)
+}
+
 func TestEQMemSimpleWorker(t *testing.T) {
 	RunQTest(t, eqtest.SimpleWorker)
 }

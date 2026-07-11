@@ -50,7 +50,7 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 	type watchedTask struct {
 		id      string
 		version int32
-		queue   string // known for deletes and changes; empty for depends
+		queue   string // claimed current queue for depends and deletes, matched against stored state (changes match their FromQueue on mod.Changes directly)
 	}
 
 	var watchKeys []string
@@ -59,7 +59,7 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 
 	for _, t := range mod.Depends {
 		watchKeys = append(watchKeys, taskKey(t.ID))
-		deps = append(deps, watchedTask{id: t.ID, version: t.Version})
+		deps = append(deps, watchedTask{id: t.ID, version: t.Version, queue: t.Queue})
 	}
 	for _, t := range mod.Deletes {
 		watchKeys = append(watchKeys, taskKey(t.ID))
@@ -192,12 +192,18 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 		// Step 2: verify versions -- semantic failure, no retry.
 		depErr := &entroq.DependencyError{}
 
+		// The queue is part of the modify key: an op must name the task's current
+		// queue (a change names its FromQueue), or it fails like a missing task.
+		// An empty or mismatched queue is rejected; there is no fill-in from
+		// stored state, which is exactly what would defeat the check.
 		for _, t := range deps {
 			st := states[t.id]
 			if !st.found {
 				depErr.Depends = append(depErr.Depends, &entroq.TaskID{ID: t.id, Version: t.version})
 			} else if st.fields.Version != t.version {
 				depErr.Depends = append(depErr.Depends, &entroq.TaskID{ID: t.id, Version: t.version})
+			} else if t.queue == "" || t.queue != st.fields.Queue {
+				depErr.Depends = append(depErr.Depends, &entroq.TaskID{ID: t.id, Version: t.version, Queue: t.queue})
 			}
 		}
 		for _, t := range dels {
@@ -206,6 +212,8 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 				depErr.Deletes = append(depErr.Deletes, &entroq.TaskID{ID: t.id, Version: t.version})
 			} else if st.fields.Version != t.version {
 				depErr.Deletes = append(depErr.Deletes, &entroq.TaskID{ID: t.id, Version: t.version})
+			} else if t.queue == "" || t.queue != st.fields.Queue {
+				depErr.Deletes = append(depErr.Deletes, &entroq.TaskID{ID: t.id, Version: t.version, Queue: t.queue})
 			} else if heldByOther(st.fields, mod.Claimant, nowMs) {
 				depErr.Claims = append(depErr.Claims, &entroq.TaskID{ID: t.id, Version: t.version})
 			}
@@ -216,6 +224,8 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 				depErr.Changes = append(depErr.Changes, &entroq.TaskID{ID: t.ID, Version: t.Version})
 			} else if st.fields.Version != t.Version {
 				depErr.Changes = append(depErr.Changes, &entroq.TaskID{ID: t.ID, Version: t.Version})
+			} else if t.FromQueue == "" || t.FromQueue != st.fields.Queue {
+				depErr.Changes = append(depErr.Changes, &entroq.TaskID{ID: t.ID, Version: t.Version, Queue: t.FromQueue})
 			} else if heldByOther(st.fields, mod.Claimant, nowMs) {
 				depErr.Claims = append(depErr.Claims, &entroq.TaskID{ID: t.ID, Version: t.Version})
 			}
