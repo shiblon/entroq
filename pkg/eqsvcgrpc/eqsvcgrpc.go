@@ -520,18 +520,38 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 		if err != nil {
 			return nil, autoCodeErrorf("change value: %w", err)
 		}
-		t := &entroq.Task{
-			ID:        change.GetOldId().Id,
-			Version:   change.GetOldId().Version,
-			Claimant:  req.ClaimantId,
-			Queue:     change.GetNewData().Queue,
-			Value:     val,
-			At:        fromMS(change.GetNewData().AtMs),
-			Attempt:   change.GetNewData().Attempt,
-			Err:       change.GetNewData().Err,
-			FromQueue: change.GetOldId().Queue,
+		// The queue is part of the modify key: the backend binds a change to the
+		// task's CURRENT queue (see eqmem's queue-integrity check), so we must
+		// build the task in that queue and let QueueTo move it. The wire splits
+		// the two queues into OldId.Queue (the source, i.e. current) and
+		// NewData.Queue (the destination). Changing always derives FromQueue from
+		// the task's Queue field, so if we set Queue to the destination up front,
+		// every move would report its source as its own target and fail the
+		// integrity check. Setting Queue to the source and applying QueueTo only
+		// on an actual move yields the correct FromQueue for both cases.
+		oldQueue, newQueue := change.GetOldId().Queue, change.GetNewData().Queue
+		// An empty destination means "no move": normalize it to the current queue
+		// so a plain change stays put, and only a different, non-empty destination
+		// moves the task. Normalizing here, at the service where authorization is
+		// decided, keeps the authz check and the applied operation on the same value.
+		if newQueue == "" {
+			newQueue = oldQueue
 		}
-		modArgs = append(modArgs, entroq.Changing(t, entroq.ArrivalTimeTo(t.At)))
+		t := &entroq.Task{
+			ID:       change.GetOldId().Id,
+			Version:  change.GetOldId().Version,
+			Claimant: req.ClaimantId,
+			Queue:    oldQueue, // current queue; Changing derives FromQueue from it
+			Value:    val,
+			Attempt:  change.GetNewData().Attempt,
+			Err:      change.GetNewData().Err,
+		}
+		var changeArgs []entroq.ChangeArg
+		if newQueue != oldQueue {
+			changeArgs = append(changeArgs, entroq.QueueTo(newQueue))
+		}
+		changeArgs = append(changeArgs, entroq.ArrivalTimeTo(fromMS(change.GetNewData().AtMs)))
+		modArgs = append(modArgs, entroq.Changing(t, changeArgs...))
 	}
 	for _, del := range req.Deletes {
 		modArgs = append(modArgs, entroq.Deleting(del.Id, del.Version, entroq.WithIDQueue(del.Queue)))
