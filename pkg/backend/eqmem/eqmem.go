@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -972,12 +973,7 @@ func matchesQuery(val string, qq *entroq.QueuesQuery) bool {
 			return true
 		}
 	}
-	for _, e := range qq.MatchExact {
-		if e == val {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(qq.MatchExact, val)
 }
 
 // Queues returns the list of queue and their sizes, based on query contents.
