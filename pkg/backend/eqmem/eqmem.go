@@ -435,23 +435,38 @@ func (m *EQMem) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Ta
 	return nil, nil
 }
 
-func ensureModQueues(mod *entroq.Modification, qByID map[string]string) {
+// ensureModQueues enforces that every task operation names the queue the task
+// actually lives in. Queues are EntroQ's authorization boundary, and authz runs
+// against the queue the caller *names*, so if the operation could then act on a
+// task in some other queue the ACL would be bypassable. We reject a mismatch
+// (or an empty queue) rather than "helpfully" filling it in, since filling would
+// defeat the check. A mismatch is reported as a DependencyError so an idempotent
+// caller (e.g. re-deleting an already-gone task) sees the same "missing" signal
+// it already handles, and a liar and a gone task look identical (no leak).
+func ensureModQueues(mod *entroq.Modification, qByID map[string]string) error {
+	depErr := new(entroq.DependencyError)
 	for _, d := range mod.Deletes {
-		if d.Queue == "" {
-			d.Queue = qByID[d.ID]
+		if d.Queue == "" || d.Queue != qByID[d.ID] {
+			depErr.Deletes = append(depErr.Deletes, entroq.NewTaskID(d.ID, d.Version, entroq.WithIDQueue(d.Queue)))
 		}
 	}
 
 	for _, d := range mod.Depends {
-		if d.Queue == "" {
-			d.Queue = qByID[d.ID]
+		if d.Queue == "" || d.Queue != qByID[d.ID] {
+			depErr.Depends = append(depErr.Depends, entroq.NewTaskID(d.ID, d.Version, entroq.WithIDQueue(d.Queue)))
 		}
 	}
 
 	for _, c := range mod.Changes {
-		// Always from where it already is. Always.
-		c.FromQueue = qByID[c.ID]
+		if c.FromQueue == "" || c.FromQueue != qByID[c.ID] {
+			depErr.Changes = append(depErr.Changes, entroq.NewTaskID(c.ID, c.Version, entroq.WithIDQueue(c.FromQueue)))
+		}
 	}
+	if len(depErr.Deletes)+len(depErr.Depends)+len(depErr.Changes) != 0 {
+		depErr.Message = "modification queue does not match the task's current queue"
+		return depErr
+	}
+	return nil
 }
 
 // modPrep finds all queues from a particular modification request. If any of
@@ -463,14 +478,16 @@ func ensureModQueues(mod *entroq.Modification, qByID map[string]string) {
 // only IDs will get a queue here if they can be found).
 //
 // Also, if any queue indexes don't have a queue represented, that is fixed here.
-func (m *EQMem) modPrep(mod *entroq.Modification) (sortedQueues, sortedNamespaces []string, misplacedInsIDs map[string]string) {
+func (m *EQMem) modPrep(mod *entroq.Modification) (sortedQueues, sortedNamespaces []string, misplacedInsIDs map[string]string, err error) {
 	// This has to be locked the whole time so that IDs and queues are matched
 	// properly if queues are missing somewhere.
 	defer un(lock(m))
 
 	misplacedInsIDs = make(map[string]string)
 
-	ensureModQueues(mod, m.qByID)
+	if err := ensureModQueues(mod, m.qByID); err != nil {
+		return nil, nil, nil, fmt.Errorf("mod prep: %w", err)
+	}
 	queues := make(map[string]bool)
 	for _, ins := range mod.Inserts {
 		// If we have an ID to insert, find the queue for that task to return it.
@@ -502,6 +519,7 @@ func (m *EQMem) modPrep(mod *entroq.Modification) (sortedQueues, sortedNamespace
 	}
 	sort.Strings(sortedQueues)
 
+	// TODO
 	namespaces := make(map[string]bool)
 	for _, ins := range mod.DocInserts {
 		namespaces[ins.Namespace] = true
@@ -523,7 +541,7 @@ func (m *EQMem) modPrep(mod *entroq.Modification) (sortedQueues, sortedNamespace
 	}
 	sort.Strings(sortedNamespaces)
 
-	return sortedQueues, sortedNamespaces, misplacedInsIDs
+	return sortedQueues, sortedNamespaces, misplacedInsIDs, nil
 }
 
 // queueUnsafeInsertTask performs queue-level operations on a task, then
@@ -603,7 +621,10 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 	// Get queues that are involved in this modification so we can grab locks.
 	// Also find any insertion requests with IDs, where the ID is in a queue
 	// different from the one requested.
-	queues, namespaces, misplacedInsIDs := m.modPrep(mod)
+	queues, namespaces, misplacedInsIDs, err := m.modPrep(mod)
+	if err != nil {
+		return nil, fmt.Errorf("modify: %w", err)
+	}
 	// We can short-circuit if there are no known queues or namespaces to lock.
 	if len(queues) == 0 && len(namespaces) == 0 && len(mod.Deletes) == 0 && len(mod.Depends) == 0 {
 		return resp, nil
