@@ -49,6 +49,7 @@ import (
 	"github.com/shiblon/entroq/pkg/authz"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/shiblon/entroq/api"
@@ -173,7 +174,20 @@ func Opener(addr string, opts ...Option) entroq.BackendOpener {
 	}
 
 	return func(ctx context.Context) (entroq.Backend, error) {
-		conn, err := grpc.DialContext(ctx, addr, options.dialOpts...)
+		// Keepalive lets the client notice a dead connection during a long-held
+		// Claim RPC and fail it, so the retry loop re-dials rather than blocking
+		// on a silently-broken connection. This matters because Claim no longer
+		// bounds each attempt with a per-attempt deadline (see backend.Claim).
+		// PermitWithoutStream stays false, so pings go only while a Claim stream
+		// is active, which a default server tolerates. Prepended so a caller's
+		// WithDialOpts can override it.
+		dialOpts := append([]grpc.DialOption{
+			grpc.WithKeepaliveParams(keepalive.ClientParameters{
+				Time:    30 * time.Second,
+				Timeout: 20 * time.Second,
+			}),
+		}, options.dialOpts...)
+		conn, err := grpc.DialContext(ctx, addr, dialOpts...)
 		if err != nil {
 			return nil, fmt.Errorf("dial %q: %w", addr, err)
 		}
@@ -393,26 +407,32 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 			return nil, fmt.Errorf("grpc claim caller: %w", ctx.Err())
 		default:
 		}
-		ctx, cancel := context.WithTimeout(ctx, b.claimRetryInterval)
+		// Bound each attempt server-side: the server holds the claim open for at
+		// most claimRetryInterval and then returns an empty response, at which
+		// point we re-issue. We deliberately do NOT impose a shorter per-attempt
+		// context deadline here. Canceling an in-flight Claim races the server's
+		// delivery of a task it has already committed: a committed-but-undelivered
+		// claim strands that task (claimed, unavailable) for its full claim
+		// duration, so a rapidly re-issuing client could silently lose claims.
+		// Letting the server end each attempt keeps the retry loop transparent.
+		// Dead connections are caught by keepalive (see New), not by canceling.
 		resp, err := pb.NewEntroQClient(b.conn).Claim(ctx, &pb.ClaimRequest{
 			ClaimantId: cq.Claimant,
 			Queues:     cq.Queues,
 			DurationMs: int64(cq.Duration / time.Millisecond),
-			PollMs:     int64(cq.PollTime / time.Millisecond),
+			PollMs:     int64(b.claimRetryInterval / time.Millisecond),
 		})
-		cancel() // cleanup just in case.
 		if err != nil {
 			if entroq.IsTimeout(err) || isGRPCTimeout(err) {
-				// If we just timed out on our little request context, then
-				// we can go around again.
-				// It's possible that the *parent* context timed out, which
-				// is why we check that at the beginning of the loop, as well.
+				// The parent context ended; go around and let the top-of-loop
+				// check translate it into a clean caller error.
 				continue
 			}
 			return nil, fmt.Errorf("grpc claim response: %w", unpackGRPCError(err))
 		}
 		if resp.Task == nil {
-			return nil, fmt.Errorf("no task returned from backend Claim")
+			// The server's poll window elapsed with nothing available. Re-issue.
+			continue
 		}
 		return fromTaskProto(resp.Task)
 	}
