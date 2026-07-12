@@ -102,6 +102,9 @@ func (b *Bridge) takeDocs(ctx context.Context, task *entroq.Task, _ json.RawMess
 	if err := b.conn.Recv(ctx, &d); err != nil {
 		return nil, fmt.Errorf("read docs: %w", err)
 	}
+	if d.Type != msgDocs {
+		return nil, fmt.Errorf("expected %q message, got %q", msgDocs, d.Type)
+	}
 	claims := make([]*entroq.DocClaim, 0, len(d.Claims))
 	for _, c := range d.Claims {
 		claims = append(claims, entroq.ClaimKey(c.Namespace, c.Key))
@@ -120,6 +123,10 @@ func (b *Bridge) doWork(ctx context.Context, task *entroq.Task, _ json.RawMessag
 	var res result
 	if err := b.conn.Recv(ctx, &res); err != nil {
 		return nil, fmt.Errorf("read result: %w", err)
+	}
+	if res.Type != msgResult {
+		// A wrong message type is a client protocol bug, not a transient fault.
+		return nil, worker.FatalErrorf("expected %q message, got %q", msgResult, res.Type)
 	}
 
 	switch res.Outcome {
@@ -172,6 +179,9 @@ func (b *Bridge) cleanup(ctx context.Context) error {
 	var d done
 	if err := b.conn.Recv(ctx, &d); err != nil {
 		return fmt.Errorf("read done: %w", err)
+	}
+	if d.Type != msgDone {
+		return worker.FatalErrorf("expected %q message, got %q", msgDone, d.Type)
 	}
 	if d.Outcome == outcomeFatal {
 		return worker.FatalErrorf("%s", orDefault(d.Message, "worker cleanup requested fatal"))

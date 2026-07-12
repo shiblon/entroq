@@ -290,11 +290,17 @@ func (m *modification) modifyArgs() ([]entroq.ModifyArg, error) {
 		if dd.ID == "" {
 			return nil, fmt.Errorf("docDelete: id is required")
 		}
+		if dd.Namespace == "" {
+			return nil, fmt.Errorf("docDelete: namespace is required")
+		}
 		args = append(args, entroq.DeletingDocID(dd.Namespace, dd.ID, dd.Version))
 	}
 	for _, dd := range m.DocDepends {
 		if dd.ID == "" {
 			return nil, fmt.Errorf("docDepend: id is required")
+		}
+		if dd.Namespace == "" {
+			return nil, fmt.Errorf("docDepend: namespace is required")
 		}
 		args = append(args, entroq.DependingOnDocID(dd.Namespace, dd.ID, dd.Version))
 	}
