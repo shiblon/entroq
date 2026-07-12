@@ -55,6 +55,17 @@ func Handler(ctx context.Context, eq *entroq.EntroQ, lease time.Duration) http.H
 			Work:        queryBool(r, "work"),
 			Cleanup:     queryBool(r, "cleanup"),
 		}
+		// Validate the registration before upgrading, so a misconfigured worker
+		// gets a plain 400 instead of a successful upgrade followed by an immediate
+		// close. Bridge.Run enforces the same invariants once connected.
+		if len(cfg.Queues) == 0 {
+			http.Error(rw, "work gateway: at least one queue is required", http.StatusBadRequest)
+			return
+		}
+		if !cfg.Work {
+			http.Error(rw, "work gateway: work=1 is required", http.StatusBadRequest)
+			return
+		}
 
 		// These are worker clients, not browsers, so origin checks do not apply.
 		c, err := websocket.Accept(rw, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
