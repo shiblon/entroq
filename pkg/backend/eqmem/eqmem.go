@@ -10,7 +10,6 @@ import (
 	"log"
 	"math/rand"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -479,7 +478,7 @@ func ensureModQueues(mod *entroq.Modification, qByID map[string]string) error {
 // only IDs will get a queue here if they can be found).
 //
 // Also, if any queue indexes don't have a queue represented, that is fixed here.
-func (m *EQMem) modPrep(mod *entroq.Modification) (sortedQueues, sortedNamespaces []string, misplacedInsIDs map[string]string, err error) {
+func (m *EQMem) modPrep(mod *entroq.Modification) (queueNames, namespaceNames []string, misplacedInsIDs map[string]string, err error) {
 	// This has to be locked the whole time so that IDs and queues are matched
 	// properly if queues are missing somewhere.
 	defer un(lock(m))
@@ -514,11 +513,11 @@ func (m *EQMem) modPrep(mod *entroq.Modification) (sortedQueues, sortedNamespace
 
 	delete(queues, "") // in case there's an empty queue in there.
 
-	// We have all of the locks we need. Sort to avoid dining philosophers problems.
+	// Collect the queue names to lock. lockQueues sorts them into a consistent
+	// order to avoid dining-philosophers deadlock, so we do not sort here.
 	for q := range queues {
-		sortedQueues = append(sortedQueues, q)
+		queueNames = append(queueNames, q)
 	}
-	sort.Strings(sortedQueues)
 
 	// TODO
 	namespaces := make(map[string]bool)
@@ -538,11 +537,10 @@ func (m *EQMem) modPrep(mod *entroq.Modification) (sortedQueues, sortedNamespace
 	delete(namespaces, "")
 
 	for n := range namespaces {
-		sortedNamespaces = append(sortedNamespaces, n)
+		namespaceNames = append(namespaceNames, n)
 	}
-	sort.Strings(sortedNamespaces)
 
-	return sortedQueues, sortedNamespaces, misplacedInsIDs, nil
+	return queueNames, namespaceNames, misplacedInsIDs, nil
 }
 
 // queueUnsafeInsertTask performs queue-level operations on a task, then
@@ -1101,6 +1099,12 @@ func (m *EQMem) lockQueues(qs []string) ([]*qLock, func()) {
 	if len(qs) == 0 {
 		return nil, func() {}
 	}
+	// Lock in a consistent (sorted) order so concurrent multi-queue modifies can
+	// never deadlock (dining philosophers). Sorting here, rather than trusting
+	// callers to pre-sort, makes the invariant impossible to get wrong. qs is
+	// sorted in place; every caller passes a slice it owns (a fresh
+	// single-element slice, or modPrep's result), so reordering it is harmless.
+	slices.Sort(qs)
 	qls := m.locksForQueues(qs)
 	for _, ql := range qls {
 		ql.Lock()
@@ -1169,6 +1173,9 @@ func (m *EQMem) lockNamespaces(ns []string) ([]*nsLock, func()) {
 	if len(ns) == 0 {
 		return nil, func() {}
 	}
+	// Sorted lock order, same dining-philosophers reasoning as lockQueues. ns is
+	// sorted in place; callers own the slice they pass.
+	slices.Sort(ns)
 	nls := m.locksForNamespaces(ns)
 	for _, nl := range nls {
 		nl.Lock()
