@@ -99,6 +99,8 @@ type DocID struct {
 	Version   int32  `json:"version"`
 }
 
+// NewDocID creates a DocID for the given namespace, id, and version. The
+// namespace is part of the doc's modify key, the way a queue is for a task.
 func NewDocID(ns string, id string, version int32) *DocID {
 	return &DocID{ns, id, version}
 }

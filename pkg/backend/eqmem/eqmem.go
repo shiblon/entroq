@@ -361,9 +361,16 @@ func (m *EQMem) mustTryClaimOne(q string, now time.Time, cq *entroq.ClaimQuery) 
 		// Update for claim. Note that we need the final state, not the
 		// original version. Journal playback decrements the version number by
 		// 1 when applying modifications.
+		//
+		// The journaled change must name the task's current queue as its source
+		// (FromQueue) so replay passes the queue-as-modify-key check: a claim
+		// does not move the task, so source == destination. Journal a copy so the
+		// task returned to the caller is not given a spurious FromQueue.
+		jChange := found.Copy()
+		jChange.FromQueue = jChange.Queue
 		mod := &entroq.Modification{
 			Claimant: cq.Claimant,
-			Changes:  []*entroq.Task{found},
+			Changes:  []*entroq.Task{jChange},
 		}
 		// Marshal mod and store in journal.
 		b, err := json.Marshal(mod)
@@ -519,7 +526,8 @@ func (m *EQMem) modPrep(mod *entroq.Modification) (queueNames, namespaceNames []
 		queueNames = append(queueNames, q)
 	}
 
-	// TODO
+	// Collect the namespaces involved in doc operations, mirroring the queue
+	// collection above; lockNamespaces sorts them for consistent lock ordering.
 	namespaces := make(map[string]bool)
 	for _, ins := range mod.DocInserts {
 		namespaces[ins.Namespace] = true

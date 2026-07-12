@@ -22,12 +22,14 @@ type TaskID struct {
 	Queue string `json:"queue,omitempty"`
 }
 
-// NewTaskID creates a new TaskID with given options.
+// NewTaskID creates a TaskID for the given id, version, and queue. The queue is
+// required because it is part of the modify key: delete and depend operations
+// must name the queue the task actually lives in.
 func NewTaskID(id string, version int32, queue string) *TaskID {
 	return &TaskID{
 		ID:      id,
 		Version: version,
-		Queue: queue,
+		Queue:   queue,
 	}
 }
 

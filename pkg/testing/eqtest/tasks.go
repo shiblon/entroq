@@ -801,7 +801,10 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	}
 }
 
-// QueueMatch tests various queue matching functions against a client.
+// DeleteMissingTask verifies that deleting a task that is not present fails with
+// a DependencyError. It keeps a decoy real task around so the "id not found"
+// case stays distinct from a queue mismatch (both surface as the same missing
+// signal, by design).
 func DeleteMissingTask(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	queue := path.Join(qPrefix, "delete_missing")
 

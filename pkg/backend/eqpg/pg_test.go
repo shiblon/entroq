@@ -410,6 +410,10 @@ func TestQueuePrefixMatchLiteral(t *testing.T) {
 	RunQTest(t, eqtest.QueuePrefixMatchLiteral)
 }
 
+func TestPGNamespacePrefixMatchLiteral(t *testing.T) {
+	RunQTest(t, eqtest.NamespacePrefixMatchLiteral)
+}
+
 func TestQueueStats(t *testing.T) {
 	RunQTest(t, eqtest.QueueStats)
 }

@@ -116,6 +116,10 @@ func TestQueuePrefixMatchLiteral(t *testing.T) {
 	RunQTest(t, eqtest.QueuePrefixMatchLiteral)
 }
 
+func TestNamespacePrefixMatchLiteral(t *testing.T) {
+	RunQTest(t, eqtest.NamespacePrefixMatchLiteral)
+}
+
 // TestQueueStats is skipped for eqredis because QueueStats intentionally
 // returns MaxClaims=0. Computing it requires a full linear scan of task hashes
 // per queue (O(tasks), not O(queues)), which is inappropriate for a stats call.

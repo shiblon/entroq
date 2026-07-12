@@ -1263,10 +1263,12 @@ END $$;
 -- eqredis) and with Go's byte-order string comparison for keys containing
 -- punctuation: "shard/0" is < "shard0" by byte ('/'=0x2F < '0'=0x30) but not
 -- under many locales, so a byte-order-intended doc key range missed such keys.
--- "C" makes these columns byte-ordered (matching every other backend) and lets
--- anchored LIKE prefix scans use the index. Each block is guarded on the current
--- collation so a re-run is a no-op; ALTER COLUMN TYPE rewrites the table and
--- rebuilds the affected primary keys and indexes.
+-- "C" makes these columns byte-ordered (matching every other backend) and also
+-- lets an anchored LIKE over a literal prefix use the index (a parameterized
+-- pattern still cannot be folded to an index range, so prefix stats over a bind
+-- parameter do not gain that particular benefit). Each block is guarded on the
+-- current collation so a re-run is a no-op; ALTER COLUMN TYPE rewrites the table
+-- and rebuilds the affected primary keys and indexes.
 DO $$
 BEGIN
     IF (SELECT co.collname FROM pg_attribute a
