@@ -165,6 +165,10 @@ func TestDocListing(t *testing.T) {
 	RunQTest(t, eqtest.DocListing)
 }
 
+func TestDocKeyRangeByteOrder(t *testing.T) {
+	RunQTest(t, eqtest.DocKeyRangeByteOrder)
+}
+
 func TestDocClaimLocking(t *testing.T) {
 	RunQTest(t, eqtest.DocClaimLocking)
 }

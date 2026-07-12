@@ -497,6 +497,10 @@ func TestPGDocListing(t *testing.T) {
 	RunQTest(t, eqtest.DocListing)
 }
 
+func TestPGDocKeyRangeByteOrder(t *testing.T) {
+	RunQTest(t, eqtest.DocKeyRangeByteOrder)
+}
+
 func TestPGDocClaimLocking(t *testing.T) {
 	RunQTest(t, eqtest.DocClaimLocking)
 }

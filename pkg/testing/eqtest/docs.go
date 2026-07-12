@@ -636,3 +636,49 @@ func EqualDocs(a, b *entroq.Doc, versionDiff int32) string {
 	copyA.Modified = b.Modified
 	return cmp.Diff(&copyA, b)
 }
+
+// DocKeyRangeByteOrder verifies that doc key range queries compare keys in byte
+// order, not the storage engine's locale collation, and that every backend
+// agrees. Keys with punctuation are the tell: '/' (0x2F) sorts before '0'
+// (0x30), so "shard/N" falls inside the half-open range [shard/, shard0), while
+// "shard0" (the exclusive upper bound) does not. A locale-collated backend would
+// drop the punctuated keys, so this pins byte-order semantics across backends.
+func DocKeyRangeByteOrder(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	ns := path.Join(qPrefix, "keyrange_ns")
+
+	// "shard0" is the exclusive upper bound and must not match the range.
+	for _, k := range []string{"shard/0", "shard/1", "shard/2", "shard0"} {
+		if _, err := client.Modify(ctx, entroq.PuttingDocInto(ns,
+			entroq.WithKeys(k, ""), entroq.WithContent(nil))); err != nil {
+			t.Fatalf("create doc %q: %v", k, err)
+		}
+	}
+
+	res, err := client.Docs(ctx, &entroq.DocQuery{
+		Namespace: ns, KeyStart: "shard/", KeyEnd: "shard0", OmitValues: true,
+	})
+	if err != nil {
+		t.Fatalf("range query: %v", err)
+	}
+
+	got := make(map[string]bool, len(res))
+	for _, d := range res {
+		got[d.Key] = true
+	}
+	want := []string{"shard/0", "shard/1", "shard/2"}
+	if len(res) != len(want) {
+		var keys []string
+		for _, d := range res {
+			keys = append(keys, d.Key)
+		}
+		t.Errorf("byte-order range [shard/, shard0): got %d docs %v, want %d %v", len(res), keys, len(want), want)
+	}
+	for _, w := range want {
+		if !got[w] {
+			t.Errorf("byte-order range missing %q (a locale collation drops punctuated keys)", w)
+		}
+	}
+	if got["shard0"] {
+		t.Errorf("byte-order range wrongly included the exclusive upper bound %q", "shard0")
+	}
+}

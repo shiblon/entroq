@@ -520,6 +520,10 @@ func TestEQMemDocListing(t *testing.T) {
 	RunQTest(t, eqtest.DocListing)
 }
 
+func TestEQMemDocKeyRangeByteOrder(t *testing.T) {
+	RunQTest(t, eqtest.DocKeyRangeByteOrder)
+}
+
 func TestEQMemDocClaimLocking(t *testing.T) {
 	RunQTest(t, eqtest.DocClaimLocking)
 }

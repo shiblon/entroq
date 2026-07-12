@@ -32,9 +32,9 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 -- with an index on (queue, at, (hashtext(id) & 255)) for efficient range scans.
 -- hashtext() is IMMUTABLE and available in all supported PostgreSQL versions.
 CREATE TABLE IF NOT EXISTS entroq.tasks (
-    id       TEXT                     PRIMARY KEY NOT NULL CHECK (length(id) <= 64),
+    id       TEXT COLLATE "C"         PRIMARY KEY NOT NULL CHECK (length(id) <= 64),
     version  INTEGER                  NOT NULL DEFAULT 0,
-    queue    TEXT                     NOT NULL DEFAULT '',
+    queue    TEXT COLLATE "C"         NOT NULL DEFAULT '',
     at       TIMESTAMP WITH TIME ZONE NOT NULL,
     created  TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
     modified TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
@@ -49,13 +49,13 @@ CREATE TABLE IF NOT EXISTS entroq.tasks (
 -- key_primary and key_secondary provide range-scan and sorting capabilities.
 -- at is used for claiming (locking).
 CREATE TABLE IF NOT EXISTS entroq.docs (
-    namespace     TEXT                     NOT NULL CHECK (length(namespace) <= 64),
-    id            TEXT                     NOT NULL CHECK (length(id) <= 64),
+    namespace     TEXT COLLATE "C"         NOT NULL CHECK (length(namespace) <= 64),
+    id            TEXT COLLATE "C"         NOT NULL CHECK (length(id) <= 64),
     version       INTEGER                  NOT NULL DEFAULT 0,
     claimant      TEXT                     NOT NULL DEFAULT '' CHECK (length(claimant) <= 64),
     at            TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
-    key_primary   TEXT                     NOT NULL DEFAULT '' CHECK (length(key_primary) <= 256),
-    key_secondary TEXT                     NOT NULL DEFAULT '' CHECK (length(key_secondary) <= 256),
+    key_primary   TEXT COLLATE "C"         NOT NULL DEFAULT '' CHECK (length(key_primary) <= 256),
+    key_secondary TEXT COLLATE "C"         NOT NULL DEFAULT '' CHECK (length(key_secondary) <= 256),
     value         JSONB,
     created       TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
     modified      TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
@@ -1190,6 +1190,10 @@ DROP FUNCTION IF EXISTS entroq.gc_due(text);
 -- Migrations: 1.6.0 → 1.7.0 (the queue joins the modify key: _modify_arrays
 --   gains per-op queue arrays and checks them; drops+recreates _modify_arrays
 --   for the new signature; no data movement)
+-- Migrations: 1.7.0 → 1.8.0 (task id/queue and doc namespace/id/key_primary/
+--   key_secondary to byte-order COLLATE "C" so key ranges and prefix scans
+--   match the other backends; rewrites the tasks and docs tables and rebuilds
+--   their keys/indexes)
 -- Each block checks pg_attribute to skip on fresh installs where the column
 -- is already correct, avoiding unnecessary table scans on re-runs.
 
@@ -1241,10 +1245,44 @@ BEGIN
     END IF;
 END $$;
 
+-- Migrations: 1.7.0 -> 1.8.0 (key/id/queue columns to byte-order "C" collation).
+-- Range and prefix comparisons on these columns previously used the database's
+-- default (locale) collation, which disagrees with the other backends (eqmem,
+-- eqredis) and with Go's byte-order string comparison for keys containing
+-- punctuation: "shard/0" is < "shard0" by byte ('/'=0x2F < '0'=0x30) but not
+-- under many locales, so a byte-order-intended doc key range missed such keys.
+-- "C" makes these columns byte-ordered (matching every other backend) and lets
+-- anchored LIKE prefix scans use the index. Each block is guarded on the current
+-- collation so a re-run is a no-op; ALTER COLUMN TYPE rewrites the table and
+-- rebuilds the affected primary keys and indexes.
+DO $$
+BEGIN
+    IF (SELECT co.collname FROM pg_attribute a
+          JOIN pg_collation co ON co.oid = a.attcollation
+         WHERE a.attrelid = 'entroq.tasks'::regclass AND a.attname = 'queue') <> 'C' THEN
+        ALTER TABLE entroq.tasks
+            ALTER COLUMN id    TYPE text COLLATE "C",
+            ALTER COLUMN queue TYPE text COLLATE "C";
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF (SELECT co.collname FROM pg_attribute a
+          JOIN pg_collation co ON co.oid = a.attcollation
+         WHERE a.attrelid = 'entroq.docs'::regclass AND a.attname = 'key_primary') <> 'C' THEN
+        ALTER TABLE entroq.docs
+            ALTER COLUMN namespace     TYPE text COLLATE "C",
+            ALTER COLUMN id            TYPE text COLLATE "C",
+            ALTER COLUMN key_primary   TYPE text COLLATE "C",
+            ALTER COLUMN key_secondary TYPE text COLLATE "C";
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS entroq.meta (
     key   TEXT PRIMARY KEY NOT NULL,
     value TEXT NOT NULL
 );
 
-INSERT INTO entroq.meta (key, value) VALUES ('schema_version', '1.7.0')
-    ON CONFLICT (key) DO UPDATE SET value = '1.7.0' WHERE entroq.meta.key = 'schema_version';
+INSERT INTO entroq.meta (key, value) VALUES ('schema_version', '1.8.0')
+    ON CONFLICT (key) DO UPDATE SET value = '1.8.0' WHERE entroq.meta.key = 'schema_version';
