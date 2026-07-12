@@ -326,6 +326,34 @@ func NamespaceStats(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	}
 }
 
+// QueuePrefixMatchLiteral verifies that queue prefix matching treats the prefix
+// literally rather than as a pattern: SQL LIKE metacharacters (_ % \) appearing
+// in a queue name must match themselves, not act as wildcards. Backends that
+// translate prefix matching to LIKE must escape them; the others compare by byte
+// prefix and are literal already.
+func QueuePrefixMatchLiteral(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	// lit contains a literal underscore; decoy holds a different character in that
+	// position and would match only if '_' were treated as a single-char wildcard.
+	lit := path.Join(qPrefix, "lit_x")
+	decoy := path.Join(qPrefix, "litYx")
+	for _, q := range []string{lit, decoy} {
+		if _, err := client.Modify(ctx, entroq.InsertingInto(q, entroq.WithValue("x"))); err != nil {
+			t.Fatalf("insert into %q: %v", q, err)
+		}
+	}
+
+	got, err := client.Queues(ctx, entroq.MatchPrefix(lit))
+	if err != nil {
+		t.Fatalf("queues match prefix %q: %v", lit, err)
+	}
+	if _, ok := got[lit]; !ok {
+		t.Errorf("prefix %q did not match its own queue; got %v", lit, got)
+	}
+	if _, ok := got[decoy]; ok {
+		t.Errorf("prefix %q matched decoy %q: the underscore acted as a wildcard (unescaped LIKE)", lit, decoy)
+	}
+}
+
 type taskQueueVersionValue struct {
 	Queue   string
 	Version int32

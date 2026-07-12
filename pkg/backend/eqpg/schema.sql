@@ -812,6 +812,18 @@ CREATE OR REPLACE FUNCTION entroq.modify_docs(
     )
 $$;
 
+-- entroq.like_prefix turns a literal prefix into a LIKE pattern matching exactly
+-- that prefix followed by anything, escaping the LIKE metacharacters (\ % _) so
+-- callers pass a raw prefix and never carry the escaping burden themselves. This
+-- keeps prefix matching correct and identical for every client (the Go backend
+-- and the pg-native Python client) with the escaping defined in exactly one
+-- place. Use with: queue LIKE entroq.like_prefix($1) ESCAPE '\'. Escape the
+-- backslash first so the backslashes introduced for % and _ are not re-escaped.
+CREATE OR REPLACE FUNCTION entroq.like_prefix(p text)
+RETURNS text LANGUAGE sql IMMUTABLE AS $$
+    SELECT replace(replace(replace(p, '\', '\\'), '%', '\%'), '_', '\_') || '%'
+$$;
+
 -- entroq.queues returns queue statistics. If p_exact is non-empty it takes
 -- precedence over p_prefix. p_limit=0 means no limit.
 CREATE OR REPLACE FUNCTION entroq.queues(
@@ -826,7 +838,7 @@ CREATE OR REPLACE FUNCTION entroq.queues(
     FROM entroq.tasks
     WHERE CASE
         WHEN cardinality(p_exact) > 0 THEN queue = ANY(p_exact)
-        WHEN p_prefix != ''           THEN queue LIKE p_prefix || '%'
+        WHEN p_prefix != ''           THEN queue LIKE entroq.like_prefix(p_prefix) ESCAPE '\'
         ELSE true
     END
     GROUP BY queue

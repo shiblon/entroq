@@ -406,6 +406,10 @@ func TestQueueMatch(t *testing.T) {
 	RunQTest(t, eqtest.QueueMatch)
 }
 
+func TestQueuePrefixMatchLiteral(t *testing.T) {
+	RunQTest(t, eqtest.QueuePrefixMatchLiteral)
+}
+
 func TestQueueStats(t *testing.T) {
 	RunQTest(t, eqtest.QueueStats)
 }
