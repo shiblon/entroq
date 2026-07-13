@@ -32,18 +32,17 @@ import (
 // rapidly re-issuing client would appear to hang for ~30s.
 //
 // We force the race deterministically with a server interceptor that delays a
-// successful claim's response well past the retry interval. With the fix (the
-// client lets the server bound each attempt via PollMs and never cancels an
-// in-flight claim) the task is delivered and claimed. Before the fix this hangs
-// until the context deadline.
+// successful claim's response. The client issues a single blocking Claim with no
+// per-attempt deadline, so a slow delivery is simply waited out and the task is
+// delivered and claimed. Before the fix (a per-attempt deadline that canceled
+// the RPC) this hung until the context deadline.
 func TestGRPCClaimNotLostWhenDeliverySlow(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	const (
-		retry     = 50 * time.Millisecond  // client retry interval
-		respDelay = 300 * time.Millisecond // delivery delay, deliberately >> retry
-	)
+	// Stall a committed claim's delivery well past what the old per-attempt
+	// deadline (~50ms) would have tolerated; a blocking Claim must just wait.
+	const respDelay = 300 * time.Millisecond
 
 	svc, err := eqsvcgrpc.New(ctx, eqmem.Opener())
 	if err != nil {
@@ -76,7 +75,6 @@ func TestGRPCClaimNotLostWhenDeliverySlow(t *testing.T) {
 	client, err := entroq.New(ctx, eqgrpc.Opener("bufnet",
 		eqgrpc.WithNiladicDialer(lis.Dial),
 		eqgrpc.WithInsecure(),
-		eqgrpc.WithClaimRetryInterval(retry),
 	))
 	if err != nil {
 		t.Fatalf("new client: %v", err)

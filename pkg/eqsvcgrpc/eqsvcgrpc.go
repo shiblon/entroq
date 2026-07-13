@@ -434,33 +434,22 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 	}
 
 	duration := time.Duration(req.DurationMs) * time.Millisecond
-	pollTime := time.Duration(req.PollMs) * time.Millisecond
-
-	// When the client supplies a poll window, bound the blocking claim to it and
-	// return an empty response once it elapses, so the client can re-issue
-	// WITHOUT canceling the RPC. A client-side cancel races claim delivery: the
-	// backend can commit a claim whose response never reaches the client, which
-	// strands that task (claimed, unavailable) for its whole claim duration. A
-	// zero poll window keeps the old behavior (block until a task or the caller's
-	// context ends) for older clients that treat an empty response as an error.
-	claimCtx := ctx
-	if pollTime > 0 {
-		var cancel context.CancelFunc
-		claimCtx, cancel = context.WithTimeout(ctx, pollTime)
-		defer cancel()
+	pollTime := time.Duration(0)
+	if req.PollMs > 0 {
+		pollTime = time.Duration(req.PollMs) * time.Millisecond
 	}
 
-	task, err := s.impl.Claim(claimCtx,
+	// Block until a task is available or the caller's context ends, re-checking
+	// the store every pollTime (so time-passage-ready tasks are caught). The
+	// client holds this open on a single RPC with no per-attempt deadline; a dead
+	// connection is surfaced by client keepalive, not by racing claim delivery
+	// with a cancel. See pkg/backend/eqgrpc backend.Claim.
+	task, err := s.impl.Claim(ctx,
 		entroq.From(req.Queues...),
 		entroq.ClaimFor(duration),
 		entroq.WithClaimant(req.ClaimantId),
 		entroq.ClaimPollTime(pollTime))
 	if err != nil {
-		// Our own poll window elapsing (while the caller is still connected) is a
-		// normal empty long-poll return, not an error.
-		if pollTime > 0 && ctx.Err() == nil && claimCtx.Err() != nil {
-			return new(pb.ClaimResponse), nil
-		}
 		return nil, autoCodeErrorf("eqsvcgrpc claim: %w", err)
 	}
 	if task == nil {

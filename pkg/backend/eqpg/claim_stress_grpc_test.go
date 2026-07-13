@@ -44,13 +44,10 @@ func TestClaimContentionOverGRPCPostgres(t *testing.T) {
 	}
 	defer s.Stop()
 
-	// Each client uses a short retry interval so the client cycles Claim
-	// attempts aggressively, maximizing the delivery-vs-deadline pressure.
 	newClient := func() (*entroq.EntroQ, error) {
 		return entroq.New(ctx, eqgrpc.Opener("bufnet",
 			eqgrpc.WithNiladicDialer(dial),
 			eqgrpc.WithInsecure(),
-			eqgrpc.WithClaimRetryInterval(50*time.Millisecond),
 		))
 	}
 
