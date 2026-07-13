@@ -31,6 +31,13 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 -- Bucketing uses hashtext(id) & 255 -- a stable 8-bit hash value in [0,255] --
 -- with an index on (queue, at, (hashtext(id) & 255)) for efficient range scans.
 -- hashtext() is IMMUTABLE and available in all supported PostgreSQL versions.
+-- DIRECT-PG PARITY NOTE: the eqpg Go backend rejects writes to an empty queue or
+-- namespace (via entroq.Modification.EnsureModifyKeys, as every entroq.Backend
+-- does). That guard lives in the backend, not in this schema: queue and namespace
+-- carry only a length CHECK, not a non-empty one. A client that bypasses the eqpg
+-- backend and talks to Postgres directly is not a supported path, so this is
+-- intentional. If direct-pg support is ever revived, add CHECK (queue <> '') on
+-- tasks and CHECK (namespace <> '') on docs (a schema migration) to restore it.
 CREATE TABLE IF NOT EXISTS entroq.tasks (
     id       TEXT COLLATE "C"         PRIMARY KEY NOT NULL CHECK (length(id) <= 64),
     version  INTEGER                  NOT NULL DEFAULT 0,
