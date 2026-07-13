@@ -602,3 +602,7 @@ func TestEQMemReplayBackfillsMissingQueue(t *testing.T) {
 func TestEQMemModifyReportsAllFailureClasses(t *testing.T) {
 	RunQTest(t, eqtest.ModifyReportsAllFailureClasses)
 }
+
+func TestEQMemModifyRejectsWrongNamespace(t *testing.T) {
+	RunQTest(t, eqtest.ModifyRejectsWrongNamespace)
+}

@@ -212,3 +212,7 @@ func TestGRPCNamespaceStats(t *testing.T) {
 func TestGRPCModifyReportsAllFailureClasses(t *testing.T) {
 	RunQTest(t, eqtest.ModifyReportsAllFailureClasses)
 }
+
+func TestGRPCModifyRejectsWrongNamespace(t *testing.T) {
+	RunQTest(t, eqtest.ModifyRejectsWrongNamespace)
+}

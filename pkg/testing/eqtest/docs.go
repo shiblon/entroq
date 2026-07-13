@@ -682,3 +682,56 @@ func DocKeyRangeByteOrder(ctx context.Context, t *testing.T, client *entroq.Entr
 		t.Errorf("byte-order range wrongly included the exclusive upper bound %q", "shard0")
 	}
 }
+
+// ModifyRejectsWrongNamespace is the doc analog of ModifyRejectsWrongQueue: a
+// doc operation must name the namespace the doc actually lives in. The found map
+// is keyed by (namespace, id), so naming the wrong namespace makes the doc look
+// missing (a DependencyError), and a caller cannot reach a doc outside its
+// authorized namespaces by naming a different one.
+func ModifyRejectsWrongNamespace(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	realNS := path.Join(qPrefix, "wrong_ns_real")
+	otherNS := path.Join(qPrefix, "wrong_ns_other")
+
+	resp, err := client.Modify(ctx, entroq.PuttingDocInto(realNS,
+		entroq.WithIDKeys("doc-1", "", ""),
+		entroq.WithContent(json.RawMessage(`"v"`)),
+	))
+	if err != nil {
+		t.Fatalf("insert doc: %v", err)
+	}
+	doc := resp.InsertedDocs[0]
+
+	// A delete naming the wrong namespace fails as a dependency error.
+	_, err = client.Modify(ctx, entroq.NewDocID(otherNS, doc.ID, doc.Version).Delete())
+	if depErr, ok := entroq.AsDependency(err); !ok {
+		t.Fatalf("wrong-namespace doc delete: got err %v, want a DependencyError", err)
+	} else if len(depErr.DocDeletes) == 0 {
+		t.Errorf("wrong-namespace doc delete: DependencyError missing a DocDeletes entry: %+v", depErr)
+	}
+
+	// A dependency naming the wrong namespace fails too.
+	_, err = client.Modify(ctx, entroq.NewDocID(otherNS, doc.ID, doc.Version).Depend())
+	if depErr, ok := entroq.AsDependency(err); !ok {
+		t.Fatalf("wrong-namespace doc depend: got err %v, want a DependencyError", err)
+	} else if len(depErr.DocDepends) == 0 {
+		t.Errorf("wrong-namespace doc depend: DependencyError missing a DocDepends entry: %+v", depErr)
+	}
+
+	// A change lying about the namespace fails: the doc is not found in otherNS.
+	lie := &entroq.Doc{Namespace: otherNS, ID: doc.ID, Version: doc.Version, Key: doc.Key, Content: doc.Content}
+	_, err = client.Modify(ctx, lie.Change())
+	if depErr, ok := entroq.AsDependency(err); !ok {
+		t.Fatalf("wrong-namespace doc change: got err %v, want a DependencyError", err)
+	} else if len(depErr.DocChanges) == 0 {
+		t.Errorf("wrong-namespace doc change: DependencyError missing a DocChanges entry: %+v", depErr)
+	}
+
+	// The doc is untouched: still present in its real namespace at its version.
+	docs, err := client.Docs(ctx, &entroq.DocQuery{Namespace: realNS, IDs: []string{doc.ID}})
+	if err != nil {
+		t.Fatalf("docs: %v", err)
+	}
+	if len(docs) != 1 || docs[0].Version != doc.Version {
+		t.Errorf("doc should be untouched in %q at v%d: got %+v", realNS, doc.Version, docs)
+	}
+}

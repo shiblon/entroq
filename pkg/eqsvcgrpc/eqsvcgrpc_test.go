@@ -6,6 +6,9 @@ import (
 
 	pb "github.com/shiblon/entroq/api"
 	"github.com/shiblon/entroq/pkg/authz"
+	"github.com/shiblon/entroq/pkg/backend/eqmem"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // TestModifyAuthzCoversEveryOp is a completeness guard: every task and doc
@@ -115,21 +118,19 @@ func TestModifyAuthzFailsClosedOnEmptyTarget(t *testing.T) {
 	}
 }
 
-// TestModifyAuthzMoveRequiresDeleteAndInsert verifies that a change whose
-// destination differs from its source is authorized as a move: delete on the
-// source, insert on the destination. This holds for queues and, for
-// authz-readiness, for namespaces too, even though namespace moves are not yet
-// implemented in any backend.
+// TestModifyAuthzMoveRequiresDeleteAndInsert verifies that a task change whose
+// destination queue differs from its source is authorized as a move: Delete on
+// the source, Insert on the destination. Only tasks move; docs are authorized in
+// place (see TestModifyAuthzEmptyDestIsNoMove and TestModifyRejectsDocNamespaceChange).
 func TestModifyAuthzMoveRequiresDeleteAndInsert(t *testing.T) {
 	s := &QSvc{}
+	// Only tasks move (between queues). Docs cannot move namespaces, so a doc
+	// change is authorized in place (covered by TestModifyAuthzEmptyDestIsNoMove)
+	// and a cross-namespace one is rejected (TestModifyRejectsDocNamespaceChange).
 	req := &pb.ModifyRequest{
 		Changes: []*pb.TaskChange{{
 			OldId:   &pb.TaskID{Queue: "q-from"},
 			NewData: &pb.TaskData{Queue: "q-to"},
-		}},
-		DocChanges: []*pb.DocChange{{
-			OldId:   &pb.DocID{Namespace: "ns-from"},
-			NewData: &pb.DocData{Namespace: "ns-to"},
 		}},
 	}
 	authReq, err := s.modifyAuthz(context.Background(), req)
@@ -145,17 +146,6 @@ func TestModifyAuthzMoveRequiresDeleteAndInsert(t *testing.T) {
 	for name, want := range wantQueues {
 		if got := gotQueues[name]; got != want {
 			t.Errorf("move queue %q: got action %q, want %q", name, got, want)
-		}
-	}
-
-	wantNS := map[string]authz.Action{"ns-from": authz.Delete, "ns-to": authz.Insert}
-	gotNS := map[string]authz.Action{}
-	for _, n := range authReq.Namespaces {
-		gotNS[n.Exact] = n.Actions[0]
-	}
-	for name, want := range wantNS {
-		if got := gotNS[name]; got != want {
-			t.Errorf("move namespace %q: got action %q, want %q", name, got, want)
 		}
 	}
 }
@@ -186,5 +176,36 @@ func TestModifyAuthzEmptyDestIsNoMove(t *testing.T) {
 	}
 	if len(authReq.Namespaces) != 1 || authReq.Namespaces[0].Exact != "ns" || authReq.Namespaces[0].Actions[0] != authz.Change {
 		t.Errorf("namespace change: got %+v, want a single Change on %q", authReq.Namespaces, "ns")
+	}
+}
+
+// TestModifyRejectsDocNamespaceChange verifies that a doc change naming a
+// destination namespace different from its source is rejected with
+// InvalidArgument rather than silently applied in the source namespace. Docs do
+// not move between namespaces; this is the only path that can express such a
+// change (the Go fluent API cannot). The rejection lives in Modify's conversion,
+// so it holds even with no authorizer configured.
+func TestModifyRejectsDocNamespaceChange(t *testing.T) {
+	ctx := context.Background()
+	svc, err := New(ctx, eqmem.Opener())
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+
+	req := &pb.ModifyRequest{
+		DocChanges: []*pb.DocChange{{
+			OldId:   &pb.DocID{Namespace: "ns-a", Id: "d1"},
+			NewData: &pb.DocData{Namespace: "ns-b"},
+		}},
+	}
+	if _, err := svc.Modify(ctx, req); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("cross-namespace doc change: got err %v (code %v), want InvalidArgument", err, status.Code(err))
+	}
+
+	// A same-namespace change (empty destination = unspecified) is NOT rejected
+	// for the namespace reason; it fails only because the doc does not exist.
+	req.DocChanges[0].NewData.Namespace = ""
+	if _, err := svc.Modify(ctx, req); status.Code(err) == codes.InvalidArgument {
+		t.Errorf("same-namespace doc change should not be an InvalidArgument, got %v", err)
 	}
 }

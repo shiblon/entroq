@@ -411,13 +411,12 @@ func (s *QSvc) modifyAuthz(ctx context.Context, req *pb.ModifyRequest) (*authz.R
 		}
 		authReq.Namespaces = append(authReq.Namespaces, &authz.Namespace{Exact: name, Actions: []authz.Action{a}})
 	}
-	// change emits the authz requirement(s) for a task or doc change via add (q
-	// for queues, n for namespaces). The source (from) is always required. An
-	// empty destination (to), or one equal to the source, means "no move" and
-	// requires Change on the source; a different, non-empty destination is a
-	// move, needing delete on the source and insert on the destination. Queue and
-	// namespace changes share this shape exactly. Namespace moves are not yet
-	// implemented, but the protocol can express one, so authz is ready for it.
+	// change emits the authz requirement(s) for a task change via add. The source
+	// (from) queue is always required. An empty destination (to), or one equal to
+	// the source, means "no move" and requires Change on the source; a different,
+	// non-empty destination is a move, needing Delete on the source and Insert on
+	// the destination. Docs do not use this: they cannot move namespaces, so a doc
+	// change is authorized in place (see the DocChanges loop below).
 	change := func(from, to string, add func(string, authz.Action)) {
 		if to == "" || to == from {
 			add(from, authz.Change)
@@ -445,7 +444,10 @@ func (s *QSvc) modifyAuthz(ctx context.Context, req *pb.ModifyRequest) (*authz.R
 		n(di.Namespace, authz.Insert)
 	}
 	for _, dc := range req.DocChanges {
-		change(dc.GetOldId().GetNamespace(), dc.GetNewData().GetNamespace(), n)
+		// Docs do not move between namespaces, so a doc change is always in place:
+		// authorize Change on the doc's namespace. A cross-namespace change is
+		// rejected in Modify (which runs even when no authorizer is configured).
+		n(dc.GetOldId().GetNamespace(), authz.Change)
 	}
 	for _, dd := range req.DocDeletes {
 		n(dd.Namespace, authz.Delete)
@@ -622,6 +624,13 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 	for _, dc := range req.DocChanges {
 		old := dc.GetOldId()
 		nd := dc.GetNewData()
+		// Docs do not move between namespaces: a change is always in place. A
+		// non-empty destination namespace that differs from the source is rejected
+		// rather than silently applied in the source namespace. (An empty
+		// destination namespace means "unspecified", so the source is used.)
+		if to := nd.GetNamespace(); to != "" && to != old.GetNamespace() {
+			return nil, codeErrorf(codes.InvalidArgument, "doc change cannot move namespaces: %q -> %q", old.GetNamespace(), to)
+		}
 		val, err := protoToJSON(nd.Content)
 		if err != nil {
 			return nil, autoCodeErrorf("doc change content: %w", err)

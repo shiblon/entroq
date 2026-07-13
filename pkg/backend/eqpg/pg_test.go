@@ -613,3 +613,7 @@ func TestSchemaInit(t *testing.T) {
 func TestModifyReportsAllFailureClasses(t *testing.T) {
 	RunQTest(t, eqtest.ModifyReportsAllFailureClasses)
 }
+
+func TestModifyRejectsWrongNamespace(t *testing.T) {
+	RunQTest(t, eqtest.ModifyRejectsWrongNamespace)
+}
