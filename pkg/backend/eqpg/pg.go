@@ -341,6 +341,7 @@ type EQPG struct {
 	nw entroq.NotifyWaiter
 
 	stopTicker     func()
+	tickerDone     chan struct{}
 	stopGC         func()
 	gcDone         chan struct{}
 	claimDuration  metric.Float64Histogram
@@ -391,13 +392,18 @@ func New(ctx context.Context, db *sql.DB, nw entroq.NotifyWaiter, opts *pgOption
 	// scopes only construction, and callers idiomatically bound New with a timeout
 	// and defer cancel(), so deriving from ctx would silently stop the loop the
 	// instant New returned while the backend kept serving. (The notify listener in
-	// pgnotify.go follows the same rule.) Close cancels each loop and, for GC,
-	// waits for it to exit before closing the DB, so it never touches a closed
-	// connection.
+	// pgnotify.go follows the same rule.) Close cancels each loop and waits for it
+	// to exit before closing the DB, so it never touches a closed connection and
+	// never outlives the backend -- a lingering readiness ticker would keep
+	// mutating shared notification state.
 	if opts.readinessInterval > 0 {
 		tickerCtx, stop := context.WithCancel(context.Background())
 		b.stopTicker = stop
-		go b.runReadinessTicker(tickerCtx, opts.readinessInterval)
+		b.tickerDone = make(chan struct{})
+		go func() {
+			defer close(b.tickerDone)
+			b.runReadinessTicker(tickerCtx, opts.readinessInterval)
+		}()
 	}
 
 	if opts.gcInterval > 0 {
@@ -440,6 +446,7 @@ func (b *EQPG) initMetrics(mp metric.MeterProvider) error {
 func (b *EQPG) Close() error {
 	if b.stopTicker != nil {
 		b.stopTicker()
+		<-b.tickerDone // wait for the readiness loop to exit before closing the DB
 	}
 	if b.stopGC != nil {
 		b.stopGC()

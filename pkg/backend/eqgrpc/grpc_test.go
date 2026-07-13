@@ -19,11 +19,11 @@ func TestGRPCClaimRetryLoopTransparent(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	s, dial, err := eqtest.StartService(ctx, eqmem.Opener())
+	stop, dial, err := eqtest.StartService(ctx, eqmem.Opener())
 	if err != nil {
 		t.Fatalf("start service: %v", err)
 	}
-	defer s.Stop()
+	defer stop()
 
 	// Use a very short retry interval so multiple loops fire during the test.
 	client, err := entroq.New(ctx, eqgrpc.Opener("bufnet",

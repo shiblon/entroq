@@ -29,7 +29,7 @@ func TestMapReduceOverGRPCPostgres(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 
-	s, dial, err := eqtest.StartService(ctx, Opener(pgHostPort,
+	stop, dial, err := eqtest.StartService(ctx, Opener(pgHostPort,
 		WithDB("postgres"),
 		WithUsername("postgres"),
 		WithPassword("password"),
@@ -39,7 +39,7 @@ func TestMapReduceOverGRPCPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start gRPC service over postgres: %v", err)
 	}
-	defer s.Stop()
+	defer stop()
 
 	client, err := entroq.New(ctx, eqgrpc.Opener("bufnet",
 		eqgrpc.WithNiladicDialer(dial),
