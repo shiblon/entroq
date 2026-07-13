@@ -362,7 +362,7 @@ type Backend interface {
 // and claimant IDs when they are not specified. By default, this is
 // GenHex16
 // NOTE: any ID generated must be <= 64 characters in length to
-// maintain compatibility with all some backends.
+// maintain compatibility with some backends.
 type IDGenerator func() string
 
 // GenHex16 is an ID generator that produces 16-character random

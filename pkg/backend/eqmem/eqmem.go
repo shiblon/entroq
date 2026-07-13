@@ -485,12 +485,37 @@ func ensureModQueues(mod *entroq.Modification, qByID map[string]string) error {
 // only IDs will get a queue here if they can be found).
 //
 // Also, if any queue indexes don't have a queue represented, that is fixed here.
-func (m *EQMem) modPrep(mod *entroq.Modification) (queueNames, namespaceNames []string, misplacedInsIDs map[string]string, err error) {
+func (m *EQMem) modPrep(mod *entroq.Modification, replay bool) (queueNames, namespaceNames []string, misplacedInsIDs map[string]string, err error) {
 	// This has to be locked the whole time so that IDs and queues are matched
 	// properly if queues are missing somewhere.
 	defer un(lock(m))
 
 	misplacedInsIDs = make(map[string]string)
+
+	// Journal replay re-applies the backend's own committed record, not an
+	// external authorized request, so it is trusted. Journals written before the
+	// queue-as-modify-key requirement (and claim changes in general) may omit an
+	// op's queue; backfill it from stored state so the op both passes the
+	// integrity check below and locates the right task when applied. Backfilling
+	// is exactly what we forbid on the live write path (there it would defeat
+	// authorization), which is why it is gated on replay only.
+	if replay {
+		for _, c := range mod.Changes {
+			if c.FromQueue == "" {
+				c.FromQueue = m.qByID[c.ID]
+			}
+		}
+		for _, d := range mod.Deletes {
+			if d.Queue == "" {
+				d.Queue = m.qByID[d.ID]
+			}
+		}
+		for _, d := range mod.Depends {
+			if d.Queue == "" {
+				d.Queue = m.qByID[d.ID]
+			}
+		}
+	}
 
 	if err := ensureModQueues(mod, m.qByID); err != nil {
 		return nil, nil, nil, fmt.Errorf("mod prep: %w", err)
@@ -591,7 +616,11 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (*entroq.M
 	return m.modifyImpl(ctx, mod, false)
 }
 
-func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignoreClaimant bool) (*entroq.ModifyResponse, error) {
+// replay is true only when the journal player re-applies our own committed
+// record (the sole such caller). Because that record is trusted rather than an
+// external authorized request, replay both skips the claimant check and lets
+// modPrep backfill queues that older journals omitted.
+func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay bool) (*entroq.ModifyResponse, error) {
 	// Double check that IDs are assigned.
 	for _, t := range mod.Inserts {
 		if t.ID == "" {
@@ -627,8 +656,9 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 
 	// Get queues that are involved in this modification so we can grab locks.
 	// Also find any insertion requests with IDs, where the ID is in a queue
-	// different from the one requested.
-	queues, namespaces, misplacedInsIDs, err := m.modPrep(mod)
+	// different from the one requested. On replay, modPrep also backfills queues
+	// that older journals omitted.
+	queues, namespaces, misplacedInsIDs, err := m.modPrep(mod, replay)
 	if err != nil {
 		return nil, fmt.Errorf("modify: %w", err)
 	}
@@ -708,7 +738,7 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 
 	if err := mod.DependencyError(found, foundDocs); err != nil {
 		depErr, ok := entroq.AsDependency(err)
-		if !ignoreClaimant || !ok || !depErr.OnlyClaims() {
+		if !replay || !ok || !depErr.OnlyClaims() {
 			return nil, fmt.Errorf("eqmem modify: %w", err)
 		}
 	}
