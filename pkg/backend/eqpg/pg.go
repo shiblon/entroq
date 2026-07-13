@@ -341,6 +341,7 @@ type EQPG struct {
 	nw entroq.NotifyWaiter
 
 	stopTicker     func()
+	tickerDone     chan struct{}
 	stopGC         func()
 	gcDone         chan struct{}
 	claimDuration  metric.Float64Histogram
@@ -391,13 +392,18 @@ func New(ctx context.Context, db *sql.DB, nw entroq.NotifyWaiter, opts *pgOption
 	// scopes only construction, and callers idiomatically bound New with a timeout
 	// and defer cancel(), so deriving from ctx would silently stop the loop the
 	// instant New returned while the backend kept serving. (The notify listener in
-	// pgnotify.go follows the same rule.) Close cancels each loop and, for GC,
-	// waits for it to exit before closing the DB, so it never touches a closed
-	// connection.
+	// pgnotify.go follows the same rule.) Close cancels each loop and waits for it
+	// to exit before closing the DB, so it never touches a closed connection and
+	// never outlives the backend -- a lingering readiness ticker would keep
+	// mutating shared notification state.
 	if opts.readinessInterval > 0 {
 		tickerCtx, stop := context.WithCancel(context.Background())
 		b.stopTicker = stop
-		go b.runReadinessTicker(tickerCtx, opts.readinessInterval)
+		b.tickerDone = make(chan struct{})
+		go func() {
+			defer close(b.tickerDone)
+			b.runReadinessTicker(tickerCtx, opts.readinessInterval)
+		}()
 	}
 
 	if opts.gcInterval > 0 {
@@ -440,6 +446,7 @@ func (b *EQPG) initMetrics(mp metric.MeterProvider) error {
 func (b *EQPG) Close() error {
 	if b.stopTicker != nil {
 		b.stopTicker()
+		<-b.tickerDone // wait for the readiness loop to exit before closing the DB
 	}
 	if b.stopGC != nil {
 		b.stopGC()
@@ -527,8 +534,11 @@ func (b *EQPG) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[stri
 
 	var matchFragments []string
 	for _, m := range qq.MatchPrefix {
-		matchFragments = append(matchFragments, fmt.Sprintf(" queue LIKE $%d", len(values)+1))
-		values = append(values, m+"%")
+		// Escaping lives in the SQL helper (entroq.like_prefix), so the raw prefix
+		// is passed as-is and LIKE metacharacters (%, _, \) in a queue name are
+		// matched literally rather than acting as wildcards.
+		matchFragments = append(matchFragments, fmt.Sprintf(" queue LIKE entroq.like_prefix($%d) ESCAPE '\\'", len(values)+1))
+		values = append(values, m)
 	}
 	for _, m := range qq.MatchExact {
 		matchFragments = append(matchFragments, fmt.Sprintf(" queue = $%d", len(values)+1))
@@ -722,6 +732,11 @@ func RunningInTx(f func(context.Context, *sql.Tx) error) entroq.ModifyOption {
 // Modify attempts to apply an atomic modification to the task store. Either
 // all succeeds or all fails.
 func (b *EQPG) Modify(ctx context.Context, mod *entroq.Modification) (*entroq.ModifyResponse, error) {
+	// Reject writes to an empty queue/namespace before touching the database, so
+	// an empty queue is never written.
+	if err := mod.EnsureModifyKeys(); err != nil {
+		return nil, fmt.Errorf("eqpg modify: %w", err)
+	}
 	start := time.Now()
 	defer func() {
 		b.modifyDuration.Record(ctx, time.Since(start).Seconds())
@@ -784,10 +799,10 @@ func (b *EQPG) modifyHandlingRetriable(ctx context.Context, doModify func() (*en
 // dependency constraint is violated.
 func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *modifyConfig) (*entroq.ModifyResponse, error) {
 	// Build parallel arrays for task operation set.
-	depIDs, depVers := taskIDArrays(mod.Depends)
-	delIDs, delVers := taskIDArrays(mod.Deletes)
+	depIDs, depVers, depQueues := taskIDArrays(mod.Depends)
+	delIDs, delVers, delQueues := taskIDArrays(mod.Deletes)
 	insIDs, insQueues, insAts, insValues, insAttempts, insErrs := insertArrays(mod.Inserts)
-	chgIDs, chgVers, chgQueues, chgAts, chgValues, chgAttempts, chgErrs := changeArrays(mod.Changes)
+	chgIDs, chgVers, chgFromQueues, chgQueues, chgAts, chgValues, chgAttempts, chgErrs := changeArrays(mod.Changes)
 
 	// Build parallel arrays for resource operation set.
 	rDepNS, rDepIDs, rDepVers := resourceIDArrays(mod.DocDepends)
@@ -868,16 +883,16 @@ func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *mo
 		SELECT kind, id, version, queue, at, created, modified, claimant, value, claims, attempt, err
 		FROM _modify_arrays(
 			$1,
-			$2::text[], $3::integer[],
-			$4::text[], $5::integer[],
-			$6::text[], $7::text[], $8::timestamptz[], $9::text[], $10::integer[], $11::text[],
-			$12::text[], $13::integer[], $14::text[], $15::timestamptz[], $16::text[], $17::integer[], $18::text[]
+			$2::text[], $3::integer[], $4::text[],
+			$5::text[], $6::integer[], $7::text[],
+			$8::text[], $9::text[], $10::timestamptz[], $11::text[], $12::integer[], $13::text[],
+			$14::text[], $15::integer[], $16::text[], $17::text[], $18::timestamptz[], $19::text[], $20::integer[], $21::text[]
 		)`,
 		mod.Claimant,
-		pq.Array(depIDs), pq.Array(depVers),
-		pq.Array(delIDs), pq.Array(delVers),
+		pq.Array(depIDs), pq.Array(depVers), pq.Array(depQueues),
+		pq.Array(delIDs), pq.Array(delVers), pq.Array(delQueues),
 		pq.Array(insIDs), pq.Array(insQueues), pq.Array(insAts), pq.Array(insValues), pq.Array(insAttempts), pq.Array(insErrs),
-		pq.Array(chgIDs), pq.Array(chgVers), pq.Array(chgQueues), pq.Array(chgAts), pq.Array(chgValues), pq.Array(chgAttempts), pq.Array(chgErrs),
+		pq.Array(chgIDs), pq.Array(chgVers), pq.Array(chgFromQueues), pq.Array(chgQueues), pq.Array(chgAts), pq.Array(chgValues), pq.Array(chgAttempts), pq.Array(chgErrs),
 	)
 	if err != nil {
 		return nil, parseModifyError(err, mod)
@@ -1044,12 +1059,14 @@ func parseModifyDocsError(err error, mod *entroq.Modification) error {
 }
 
 // taskIDArrays splits a slice of TaskIDs into parallel ID string and version slices.
-func taskIDArrays(tids []*entroq.TaskID) (ids []string, versions []int32) {
+func taskIDArrays(tids []*entroq.TaskID) (ids []string, versions []int32, queues []string) {
 	ids = make([]string, len(tids))
 	versions = make([]int32, len(tids))
+	queues = make([]string, len(tids))
 	for i, t := range tids {
 		ids[i] = t.ID
 		versions[i] = t.Version
+		queues[i] = t.Queue // claimed current queue; part of the modify key
 	}
 	return
 }
@@ -1083,10 +1100,14 @@ func insertArrays(inserts []*entroq.TaskData) (ids []string, queues []string, at
 	return
 }
 
-// changeArrays splits a slice of Task changes into parallel arrays for the stored procedure.
-func changeArrays(changes []*entroq.Task) (ids []string, versions []int32, queues []string, ats []time.Time, values []*string, attempts []int32, errs []string) {
+// changeArrays splits a slice of Task changes into parallel arrays for the
+// stored procedure. fromQueues is the source (current) queue matched by the
+// modify key; queues is the destination the task moves to (equal for a plain
+// change).
+func changeArrays(changes []*entroq.Task) (ids []string, versions []int32, fromQueues []string, queues []string, ats []time.Time, values []*string, attempts []int32, errs []string) {
 	ids = make([]string, len(changes))
 	versions = make([]int32, len(changes))
+	fromQueues = make([]string, len(changes))
 	queues = make([]string, len(changes))
 	ats = make([]time.Time, len(changes))
 	values = make([]*string, len(changes))
@@ -1095,6 +1116,7 @@ func changeArrays(changes []*entroq.Task) (ids []string, versions []int32, queue
 	for i, chg := range changes {
 		ids[i] = chg.ID
 		versions[i] = chg.Version
+		fromQueues[i] = chg.FromQueue
 		queues[i] = chg.Queue
 		ats[i] = chg.At
 		values[i] = jsonTextVal(chg.Value)

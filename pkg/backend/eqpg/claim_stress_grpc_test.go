@@ -32,7 +32,7 @@ func TestClaimContentionOverGRPCPostgres(t *testing.T) {
 	defer cancel()
 
 	// A gRPC service backed by the shared Postgres instance.
-	s, dial, err := eqtest.StartService(ctx, Opener(pgHostPort,
+	stop, dial, err := eqtest.StartService(ctx, Opener(pgHostPort,
 		WithDB("postgres"),
 		WithUsername("postgres"),
 		WithPassword("password"),
@@ -42,7 +42,7 @@ func TestClaimContentionOverGRPCPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start gRPC service over postgres: %v", err)
 	}
-	defer s.Stop()
+	defer stop()
 
 	newClient := func() (*entroq.EntroQ, error) {
 		return entroq.New(ctx, eqgrpc.Opener("bufnet",

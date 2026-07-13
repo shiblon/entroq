@@ -23,18 +23,25 @@ CREATE SCHEMA IF NOT EXISTS entroq;
 -- pgcrypto provides gen_random_bytes(), used for auto-generating task IDs.
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
--- Core table. id and claimant are TEXT with CHECK constraints limiting them
--- to 64 characters -- long enough for UUIDs, ULIDs, etc.
--- ID representation: task IDs and claimant IDs are stored as TEXT with a
--- CHECK constraint limiting them to 64 characters. 64 accommodates UUIDs (36),
--- ULIDs (26), and similar schemes while keeping indexes efficient.
+-- Core table. Task IDs and claimant IDs are arbitrary TEXT with a CHECK
+-- constraint limiting them to 64 characters. They are NOT UUIDs: the default
+-- generator emits short random strings. The 64-char ceiling simply leaves room
+-- for callers who elect to supply their own UUIDs (36 chars), ULIDs (26), or
+-- similar schemes, while keeping indexes efficient.
 -- Bucketing uses hashtext(id) & 255 -- a stable 8-bit hash value in [0,255] --
 -- with an index on (queue, at, (hashtext(id) & 255)) for efficient range scans.
 -- hashtext() is IMMUTABLE and available in all supported PostgreSQL versions.
+-- DIRECT-PG PARITY NOTE: the eqpg Go backend rejects writes to an empty queue or
+-- namespace (via entroq.Modification.EnsureModifyKeys, as every entroq.Backend
+-- does). That guard lives in the backend, not in this schema: queue and namespace
+-- carry only a length CHECK, not a non-empty one. A client that bypasses the eqpg
+-- backend and talks to Postgres directly is not a supported path, so this is
+-- intentional. If direct-pg support is ever revived, add CHECK (queue <> '') on
+-- tasks and CHECK (namespace <> '') on docs (a schema migration) to restore it.
 CREATE TABLE IF NOT EXISTS entroq.tasks (
-    id       TEXT                     PRIMARY KEY NOT NULL CHECK (length(id) <= 64),
+    id       TEXT COLLATE "C"         PRIMARY KEY NOT NULL CHECK (length(id) <= 64),
     version  INTEGER                  NOT NULL DEFAULT 0,
-    queue    TEXT                     NOT NULL DEFAULT '',
+    queue    TEXT COLLATE "C"         NOT NULL DEFAULT '',
     at       TIMESTAMP WITH TIME ZONE NOT NULL,
     created  TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
     modified TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
@@ -49,13 +56,13 @@ CREATE TABLE IF NOT EXISTS entroq.tasks (
 -- key_primary and key_secondary provide range-scan and sorting capabilities.
 -- at is used for claiming (locking).
 CREATE TABLE IF NOT EXISTS entroq.docs (
-    namespace     TEXT                     NOT NULL CHECK (length(namespace) <= 64),
-    id            TEXT                     NOT NULL CHECK (length(id) <= 64),
+    namespace     TEXT COLLATE "C"         NOT NULL CHECK (length(namespace) <= 64),
+    id            TEXT COLLATE "C"         NOT NULL CHECK (length(id) <= 64),
     version       INTEGER                  NOT NULL DEFAULT 0,
     claimant      TEXT                     NOT NULL DEFAULT '' CHECK (length(claimant) <= 64),
     at            TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
-    key_primary   TEXT                     NOT NULL DEFAULT '' CHECK (length(key_primary) <= 256),
-    key_secondary TEXT                     NOT NULL DEFAULT '' CHECK (length(key_secondary) <= 256),
+    key_primary   TEXT COLLATE "C"         NOT NULL DEFAULT '' CHECK (length(key_primary) <= 256),
+    key_secondary TEXT COLLATE "C"         NOT NULL DEFAULT '' CHECK (length(key_secondary) <= 256),
     value         JSONB,
     created       TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
     modified      TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
@@ -339,29 +346,50 @@ $$;
 -- Timestamp sentinel: Go's zero time ('0001-01-01 00:00:00+00') means use now().
 --
 -- For a more ergonomic SQL interface, use entroq.modify (JSONB).
+--
+-- The queue is part of the modify key: depends and deletes must name the task's
+-- current queue, and a change must name its source (from) queue, with
+-- p_chg_queues carrying the destination. A mismatched or empty queue fails the
+-- operation as a missing dependency (the queue authorizes access, so it must
+-- not be silently filled in from stored state).
+--
+-- The signature gained the queue arrays in schema 1.7.0; drop the prior overload
+-- first, since a changed argument list would otherwise leave the old function
+-- behind on a re-applied schema.
+DROP FUNCTION IF EXISTS entroq._modify_arrays(
+    text,
+    text[], integer[],
+    text[], integer[],
+    text[], text[], timestamptz[], text[], integer[], text[],
+    text[], integer[], text[], timestamptz[], text[], integer[], text[]
+);
 CREATE OR REPLACE FUNCTION entroq._modify_arrays(
-    p_claimant     text,
-    -- depends: must exist at the given version
-    p_dep_ids      text[],
-    p_dep_vers     integer[],
-    -- deletes: must exist at the given version, then removed
-    p_del_ids      text[],
-    p_del_vers     integer[],
+    p_claimant        text,
+    -- depends: must exist at the given (version, queue)
+    p_dep_ids         text[],
+    p_dep_vers        integer[],
+    p_dep_queues      text[],
+    -- deletes: must exist at the given (version, queue), then removed
+    p_del_ids         text[],
+    p_del_vers        integer[],
+    p_del_queues      text[],
     -- inserts: empty string = auto-generate, zero timestamptz = now()
-    p_ins_ids      text[],
-    p_ins_queues   text[],
-    p_ins_ats      timestamptz[],
-    p_ins_values   text[],
-    p_ins_attempts integer[],
-    p_ins_errs     text[],
-    -- changes: must exist at the given version, then updated
-    p_chg_ids      text[],
-    p_chg_vers     integer[],
-    p_chg_queues   text[],
-    p_chg_ats      timestamptz[],
-    p_chg_values   text[],
-    p_chg_attempts integer[],
-    p_chg_errs     text[]
+    p_ins_ids         text[],
+    p_ins_queues      text[],
+    p_ins_ats         timestamptz[],
+    p_ins_values      text[],
+    p_ins_attempts    integer[],
+    p_ins_errs        text[],
+    -- changes: must exist at the given (version, from-queue), then updated.
+    -- p_chg_from_queues is the source (matched); p_chg_queues is the destination.
+    p_chg_ids         text[],
+    p_chg_vers        integer[],
+    p_chg_from_queues text[],
+    p_chg_queues      text[],
+    p_chg_ats         timestamptz[],
+    p_chg_values      text[],
+    p_chg_attempts    integer[],
+    p_chg_errs        text[]
 ) RETURNS TABLE(
     kind     text,
     id       text,
@@ -393,15 +421,19 @@ BEGIN
     -- All CTE column aliases use prefixed names (dep_*, lck_*, etc.) to avoid
     -- ambiguity with the RETURNS TABLE OUT parameters (id, version, queue, ...)
     -- that PL/pgSQL puts in scope for the entire function body.
-    WITH all_deps(dep_id, dep_ver) AS (
-        SELECT * FROM unnest(coalesce(p_dep_ids, '{}'::text[]), coalesce(p_dep_vers, '{}'::integer[]))
+    -- all_deps carries the claimed queue per op: the task's current queue for
+    -- depends/deletes, the source (from) queue for changes. The queue is part of
+    -- the key, so the LEFT JOIN matches on (id, queue); a queue mismatch fails to
+    -- join and surfaces as missing, indistinguishable from an absent task.
+    WITH all_deps(dep_id, dep_ver, dep_queue) AS (
+        SELECT * FROM unnest(coalesce(p_dep_ids, '{}'::text[]), coalesce(p_dep_vers, '{}'::integer[]), coalesce(p_dep_queues, '{}'::text[]))
         UNION ALL
-        SELECT * FROM unnest(coalesce(p_del_ids, '{}'::text[]), coalesce(p_del_vers, '{}'::integer[]))
+        SELECT * FROM unnest(coalesce(p_del_ids, '{}'::text[]), coalesce(p_del_vers, '{}'::integer[]), coalesce(p_del_queues, '{}'::text[]))
         UNION ALL
-        SELECT * FROM unnest(coalesce(p_chg_ids, '{}'::text[]), coalesce(p_chg_vers, '{}'::integer[]))
+        SELECT * FROM unnest(coalesce(p_chg_ids, '{}'::text[]), coalesce(p_chg_vers, '{}'::integer[]), coalesce(p_chg_from_queues, '{}'::text[]))
     ),
     locked AS (
-        SELECT t.id AS lck_id, t.version AS lck_ver FROM entroq.tasks t
+        SELECT t.id AS lck_id, t.version AS lck_ver, t.queue AS lck_queue FROM entroq.tasks t
         WHERE t.id = ANY(ARRAY(SELECT dep_id FROM all_deps))
         FOR UPDATE
     )
@@ -418,7 +450,7 @@ BEGIN
         )
     INTO v_missing, v_mismatched
     FROM all_deps d
-    LEFT JOIN locked l ON l.lck_id = d.dep_id;
+    LEFT JOIN locked l ON l.lck_id = d.dep_id AND l.lck_queue = d.dep_queue;
 
     -- Check explicit insert ID conflicts: these must not already exist.
     -- No locking needed; the INSERT's PRIMARY KEY constraint handles races.
@@ -444,8 +476,8 @@ BEGIN
 
     -- Deletes: versions already verified; delete by id+version for safety.
     DELETE FROM entroq.tasks
-    USING unnest(coalesce(p_del_ids, '{}'::text[]), coalesce(p_del_vers, '{}'::integer[])) AS d(del_id, del_ver)
-    WHERE entroq.tasks.id = d.del_id AND entroq.tasks.version = d.del_ver;
+    USING unnest(coalesce(p_del_ids, '{}'::text[]), coalesce(p_del_vers, '{}'::integer[]), coalesce(p_del_queues, '{}'::text[])) AS d(del_id, del_ver, del_queue)
+    WHERE entroq.tasks.id = d.del_id AND entroq.tasks.version = d.del_ver AND entroq.tasks.queue = d.del_queue;
 
     -- Inserts: empty string = auto-generate.
     -- at: timestamps older than 1 year are treated as "use now". This threshold
@@ -498,15 +530,16 @@ BEGIN
                 err      = c.chg_err,
                 claimant = CASE WHEN c.chg_at > v_now THEN p_claimant ELSE '' END
             FROM unnest(
-                coalesce(p_chg_ids,      '{}'::text[]),
-                coalesce(p_chg_vers,     '{}'::integer[]),
-                coalesce(p_chg_queues,   '{}'::text[]),
-                coalesce(p_chg_ats,      '{}'::timestamptz[]),
-                coalesce(p_chg_values,   '{}'::text[]),
-                coalesce(p_chg_attempts, '{}'::integer[]),
-                coalesce(p_chg_errs,     '{}'::text[])
-            ) AS c(chg_id, chg_version, chg_queue, chg_at, chg_value, chg_attempt, chg_err)
-            WHERE entroq.tasks.id = c.chg_id AND entroq.tasks.version = c.chg_version
+                coalesce(p_chg_ids,         '{}'::text[]),
+                coalesce(p_chg_vers,        '{}'::integer[]),
+                coalesce(p_chg_from_queues, '{}'::text[]),
+                coalesce(p_chg_queues,      '{}'::text[]),
+                coalesce(p_chg_ats,         '{}'::timestamptz[]),
+                coalesce(p_chg_values,      '{}'::text[]),
+                coalesce(p_chg_attempts,    '{}'::integer[]),
+                coalesce(p_chg_errs,        '{}'::text[])
+            ) AS c(chg_id, chg_version, chg_from_queue, chg_queue, chg_at, chg_value, chg_attempt, chg_err)
+            WHERE entroq.tasks.id = c.chg_id AND entroq.tasks.version = c.chg_version AND entroq.tasks.queue = c.chg_from_queue
             RETURNING *
         )
         SELECT 'changed'::text, r.id, r.version, r.queue, r.at,
@@ -572,12 +605,14 @@ CREATE OR REPLACE FUNCTION entroq.modify(
 ) LANGUAGE sql AS $$
     SELECT * FROM entroq._modify_arrays(
         p_claimant,
-        -- depends
+        -- depends (queue is part of the key)
         ARRAY(SELECT e->>'id'                 FROM jsonb_array_elements(p_depends) e),
         ARRAY(SELECT (e->>'version')::integer  FROM jsonb_array_elements(p_depends) e),
-        -- deletes
+        ARRAY(SELECT e->>'queue'              FROM jsonb_array_elements(p_depends) e),
+        -- deletes (queue is part of the key)
         ARRAY(SELECT e->>'id'                 FROM jsonb_array_elements(p_deletes) e),
         ARRAY(SELECT (e->>'version')::integer  FROM jsonb_array_elements(p_deletes) e),
+        ARRAY(SELECT e->>'queue'              FROM jsonb_array_elements(p_deletes) e),
         -- inserts: empty string triggers auto-generate in _modify_arrays
         ARRAY(SELECT coalesce(e->>'id', '')   FROM jsonb_array_elements(p_inserts) e),
         ARRAY(SELECT e->>'queue'              FROM jsonb_array_elements(p_inserts) e),
@@ -589,9 +624,10 @@ CREATE OR REPLACE FUNCTION entroq.modify(
               FROM jsonb_array_elements(p_inserts) e),
         ARRAY(SELECT coalesce(e->>'err', '')
               FROM jsonb_array_elements(p_inserts) e),
-        -- changes
+        -- changes (from_queue is the source, matched; queue is the destination)
         ARRAY(SELECT e->>'id'                 FROM jsonb_array_elements(p_changes) e),
         ARRAY(SELECT (e->>'version')::integer  FROM jsonb_array_elements(p_changes) e),
+        ARRAY(SELECT e->>'from_queue'         FROM jsonb_array_elements(p_changes) e),
         ARRAY(SELECT e->>'queue'              FROM jsonb_array_elements(p_changes) e),
         ARRAY(SELECT (e->>'at')::timestamptz  FROM jsonb_array_elements(p_changes) e),
         ARRAY(SELECT CASE WHEN e ? 'value' THEN (e->'value')::text ELSE NULL END
@@ -783,6 +819,18 @@ CREATE OR REPLACE FUNCTION entroq.modify_docs(
     )
 $$;
 
+-- entroq.like_prefix turns a literal prefix into a LIKE pattern matching exactly
+-- that prefix followed by anything, escaping the LIKE metacharacters (\ % _) so
+-- callers pass a raw prefix and never carry the escaping burden themselves. This
+-- keeps prefix matching correct and identical for every client (the Go backend
+-- and the pg-native Python client) with the escaping defined in exactly one
+-- place. Use with: queue LIKE entroq.like_prefix($1) ESCAPE '\'. Escape the
+-- backslash first so the backslashes introduced for % and _ are not re-escaped.
+CREATE OR REPLACE FUNCTION entroq.like_prefix(p text)
+RETURNS text LANGUAGE sql IMMUTABLE AS $$
+    SELECT replace(replace(replace(p, '\', '\\'), '%', '\%'), '_', '\_') || '%'
+$$;
+
 -- entroq.queues returns queue statistics. If p_exact is non-empty it takes
 -- precedence over p_prefix. p_limit=0 means no limit.
 CREATE OR REPLACE FUNCTION entroq.queues(
@@ -797,7 +845,7 @@ CREATE OR REPLACE FUNCTION entroq.queues(
     FROM entroq.tasks
     WHERE CASE
         WHEN cardinality(p_exact) > 0 THEN queue = ANY(p_exact)
-        WHEN p_prefix != ''           THEN queue LIKE p_prefix || '%'
+        WHEN p_prefix != ''           THEN queue LIKE entroq.like_prefix(p_prefix) ESCAPE '\'
         ELSE true
     END
     GROUP BY queue
@@ -1158,6 +1206,13 @@ DROP FUNCTION IF EXISTS entroq.gc_due(text);
 -- Migrations: 1.2.0 → 1.6.0 (additive: byGCQueueAt partial index and the
 --   gc_activation / gc_queues / gc_collect functions for built-in garbage
 --   collection; drops the interim gc_due function; no data movement)
+-- Migrations: 1.6.0 → 1.7.0 (the queue joins the modify key: _modify_arrays
+--   gains per-op queue arrays and checks them; drops+recreates _modify_arrays
+--   for the new signature; no data movement)
+-- Migrations: 1.7.0 → 1.8.0 (task id/queue and doc namespace/id/key_primary/
+--   key_secondary to byte-order COLLATE "C" so key ranges and prefix scans
+--   match the other backends; rewrites the tasks and docs tables and rebuilds
+--   their keys/indexes)
 -- Each block checks pg_attribute to skip on fresh installs where the column
 -- is already correct, avoiding unnecessary table scans on re-runs.
 
@@ -1209,10 +1264,46 @@ BEGIN
     END IF;
 END $$;
 
+-- Migrations: 1.7.0 -> 1.8.0 (key/id/queue columns to byte-order "C" collation).
+-- Range and prefix comparisons on these columns previously used the database's
+-- default (locale) collation, which disagrees with the other backends (eqmem,
+-- eqredis) and with Go's byte-order string comparison for keys containing
+-- punctuation: "shard/0" is < "shard0" by byte ('/'=0x2F < '0'=0x30) but not
+-- under many locales, so a byte-order-intended doc key range missed such keys.
+-- "C" makes these columns byte-ordered (matching every other backend) and also
+-- lets an anchored LIKE over a literal prefix use the index (a parameterized
+-- pattern still cannot be folded to an index range, so prefix stats over a bind
+-- parameter do not gain that particular benefit). Each block is guarded on the
+-- current collation so a re-run is a no-op; ALTER COLUMN TYPE rewrites the table
+-- and rebuilds the affected primary keys and indexes.
+DO $$
+BEGIN
+    IF (SELECT co.collname FROM pg_attribute a
+          JOIN pg_collation co ON co.oid = a.attcollation
+         WHERE a.attrelid = 'entroq.tasks'::regclass AND a.attname = 'queue') <> 'C' THEN
+        ALTER TABLE entroq.tasks
+            ALTER COLUMN id    TYPE text COLLATE "C",
+            ALTER COLUMN queue TYPE text COLLATE "C";
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF (SELECT co.collname FROM pg_attribute a
+          JOIN pg_collation co ON co.oid = a.attcollation
+         WHERE a.attrelid = 'entroq.docs'::regclass AND a.attname = 'key_primary') <> 'C' THEN
+        ALTER TABLE entroq.docs
+            ALTER COLUMN namespace     TYPE text COLLATE "C",
+            ALTER COLUMN id            TYPE text COLLATE "C",
+            ALTER COLUMN key_primary   TYPE text COLLATE "C",
+            ALTER COLUMN key_secondary TYPE text COLLATE "C";
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS entroq.meta (
     key   TEXT PRIMARY KEY NOT NULL,
     value TEXT NOT NULL
 );
 
-INSERT INTO entroq.meta (key, value) VALUES ('schema_version', '1.6.0')
-    ON CONFLICT (key) DO UPDATE SET value = '1.6.0' WHERE entroq.meta.key = 'schema_version';
+INSERT INTO entroq.meta (key, value) VALUES ('schema_version', '1.8.0')
+    ON CONFLICT (key) DO UPDATE SET value = '1.8.0' WHERE entroq.meta.key = 'schema_version';

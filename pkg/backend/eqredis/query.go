@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -15,12 +16,7 @@ import (
 // matchesQueuesQuery returns true if the queue name passes the filter in qq.
 func matchesQueuesQuery(name string, qq *entroq.QueuesQuery) bool {
 	if len(qq.MatchExact) > 0 {
-		for _, e := range qq.MatchExact {
-			if name == e {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(qq.MatchExact, name)
 	}
 	if len(qq.MatchPrefix) > 0 {
 		for _, p := range qq.MatchPrefix {

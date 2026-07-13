@@ -105,7 +105,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"math/rand"
 	"strings"
 	"time"
@@ -238,6 +237,27 @@ func WaitTryClaim(ctx context.Context, eq *ClaimQuery, tc BackendClaimFunc, w Wa
 	return task, nil
 }
 
+// ArrivalPastWindow bounds how far before a backend's now() an arrival time may
+// be before the backend treats it as "unset" and substitutes now(). Clients and
+// the wire cannot represent Go's zero time reliably (it round-trips into a
+// year-1 timestamp, not an exact zero), so "far in the past", not "exactly
+// zero", is the portable sentinel meaning "arrive now". One year is the shared
+// window across all backends; eqpg enforces the same bound in SQL.
+const ArrivalPastWindow = 365 * 24 * time.Hour
+
+// NormalizeArrival implements the arrival-time half of the backend Modify
+// contract (see Backend.Modify): it caps a far-past arrival time up to now, so
+// the task is available immediately and ordered at now rather than in the
+// distant past. A present or future time is returned unchanged. Backends that
+// keep time as Go values call this directly; SQL backends mirror it in query
+// text (interval '1 year').
+func NormalizeArrival(at, now time.Time) time.Time {
+	if at.Before(now.Add(-ArrivalPastWindow)) {
+		return now
+	}
+	return at
+}
+
 // Backend describes all of the functions that any backend has to implement
 // to be used as the storage for task queues.
 //
@@ -293,6 +313,41 @@ type Backend interface {
 	// function is intended to return a DependencyError if the transaction could
 	// not proceed because dependencies were missing or already claimed (and
 	// not expired) by another claimant.
+	//
+	// Backends MUST honor two behavioral contracts, applied identically to tasks
+	// (keyed by queue) and docs (keyed by namespace):
+	//
+	// 1. The queue/namespace is part of the modify key. A delete, dependency, or
+	// change identifies its target by (id, version, queue) for tasks and (id,
+	// version, namespace) for docs, never by (id, version) alone. The named
+	// queue/namespace MUST match the target's current location, or the operation
+	// fails with a DependencyError; a backend MUST NOT substitute the stored
+	// location for a missing or mismatched one (that silent fill-in is exactly
+	// what defeats the check). A change's source is its current location; a move
+	// to a different, non-empty destination is expressed by the new location,
+	// while an empty destination means "no move" (stay put). This is what makes
+	// the queue/namespace an enforceable authorization boundary: authorization
+	// checks the claimed location and the backend binds the operation to it, so a
+	// caller cannot reach a target outside its granted queues by lying about
+	// where that target lives.
+	//
+	// 2. Arrival time is normalized (see NormalizeArrival). An arrival time more
+	// than ArrivalPastWindow before the backend's now() is treated as "unset" and
+	// replaced with now(), capping far-past times up. Because the wire cannot
+	// carry Go's zero time reliably, "far in the past" is the portable "arrive
+	// now" sentinel; this keeps an omitted At immediately available and ordered
+	// at now across every backend and proxy hop, and a present/future At is
+	// preserved.
+	//
+	// 3. A DependencyError reports EVERY failing operation. When a modification
+	// cannot proceed, the returned DependencyError MUST enumerate all failures
+	// across all classes -- insert/doc-insert collisions, missing or
+	// version-mismatched changes/deletes/depends, claimed targets, and
+	// queue/namespace mismatches -- not merely the first class encountered. A
+	// caller acts on the full set: skip-colliding inserts in particular depend on
+	// collisions always being reported, even alongside other failures.
+	// (*DependencyError).Merge helps a backend that discovers failures in more
+	// than one pass fold them into a single such error.
 	Modify(ctx context.Context, mod *Modification) (*ModifyResponse, error)
 
 	// Docs returns a list of docs matching the given query.
@@ -317,7 +372,7 @@ type Backend interface {
 // and claimant IDs when they are not specified. By default, this is
 // GenHex16
 // NOTE: any ID generated must be <= 64 characters in length to
-// maintain compatibility with all some backends.
+// maintain compatibility with some backends.
 type IDGenerator func() string
 
 // GenHex16 is an ID generator that produces 16-character random
@@ -655,7 +710,7 @@ func (c *EntroQ) RenewAllFor(ctx context.Context, tasks []*Task, duration time.D
 	var modArgs []ModifyArg
 	var taskIDs []string
 	for _, t := range tasks {
-		modArgs = append(modArgs, Changing(t, ArrivalTimeBy(duration)))
+		modArgs = append(modArgs, t.Change(ArrivalTimeBy(duration)))
 		taskIDs = append(taskIDs, t.IDVersion().String())
 	}
 	resp, err := c.Modify(ctx, modArgs...)
@@ -829,40 +884,6 @@ func ModifyAs(id string) ModifyArg {
 	}
 }
 
-// Inserting creates an insert modification from TaskData:
-//
-//	cli.Modify(ctx,
-//		Inserting(&TaskData{
-//			Queue: "myqueue",
-//			At:    time.Now.Add(1 * time.Minute),
-//			Value: json.RawMessage(`"hi there"`),
-//		}))
-//
-// Or, better still,
-//
-//	cli.Modify(ctx,
-//		InsertingInto("myqueue",
-//		    WithArrivalTimeIn(1 * time.Minute),
-//		    WithValue(json.RawMessage(`"hi there"`))))
-func Inserting(tds ...*TaskData) ModifyArg {
-	return func(m *Modification) {
-		m.Inserts = append(m.Inserts, tds...)
-	}
-}
-
-// InsertingInto creates an insert modification. Use like this:
-//
-//	cli.Modify(InsertingInto("my queue name", WithValue(json.RawMessage(`"hi there"`))))
-func InsertingInto(q string, insertArgs ...InsertArg) ModifyArg {
-	return func(m *Modification) {
-		data := &TaskData{Queue: q}
-		for _, arg := range insertArgs {
-			arg(m, data)
-		}
-		m.Inserts = append(m.Inserts, data)
-	}
-}
-
 // ModifyOption is an option that can be passed through to a backend's Modify
 // implementation. Backend-specific options use IsModifyBackend to validate that
 // the correct backend is in use; generic options return nil unconditionally.
@@ -879,280 +900,6 @@ type ModifyOption interface {
 func WithModifyOption(opt ModifyOption) ModifyArg {
 	return func(m *Modification) {
 		m.options = append(m.options, opt)
-	}
-}
-
-// InsertArg is an argument to task insertion.
-type InsertArg func(*Modification, *TaskData)
-
-// WithArrivalTime changes the arrival time to a fixed moment during task insertion.
-// The time is taken as-is from the caller. If tight synchronization with the
-// backend clock is required, use EntroQ.Time to obtain the reference time first.
-func WithArrivalTime(at time.Time) InsertArg {
-	return func(_ *Modification, d *TaskData) {
-		d.At = at
-	}
-}
-
-// WithArrivalTimeIn computes the arrival time based on the duration from now, e.g.,
-//
-//	cli.Modify(ctx,
-//	  InsertingInto("my queue",
-//	    WithTimeIn(2 * time.Minute)))
-//
-// The duration is added to Go's wall clock time at the point of Modify. If tight
-// synchronization with the backend clock is required, use EntroQ.Time and
-// WithArrivalTime instead.
-func WithArrivalTimeIn(duration time.Duration) InsertArg {
-	return func(m *Modification, d *TaskData) {
-		d.At = m.now.Add(duration)
-	}
-}
-
-// WithRawValue sets the task's JSON value during insertion from pre-marshaled
-// bytes. The value must be valid JSON; nil is allowed and represents an absent
-// value. Use WithValue to marshal a Go value on the fly.
-//
-//	cli.Modify(ctx,
-//	  InsertingInto("my queue",
-//	    WithRawValue(json.RawMessage(`"hi there"`))))
-func WithRawValue(value json.RawMessage) InsertArg {
-	return func(_ *Modification, d *TaskData) {
-		d.Value = value
-	}
-}
-
-// WithValue marshals v as JSON and uses it as the task value. It is a
-// "Must"-style function: if v cannot be marshaled (channels, functions,
-// cycles), it calls log.Fatal. These are programmer errors, not runtime
-// conditions -- the type being marshaled is known at compile time. Use
-// WithRawValue for pre-marshaled data.
-//
-//	cli.Modify(ctx,
-//	  InsertingInto("my queue",
-//	    WithValue(MyStruct{Field: "hello"})))
-func WithValue(v any) InsertArg {
-	b, err := json.Marshal(v)
-	if err != nil {
-		log.Fatalf("entroq: WithValue: %v", err)
-	}
-	return WithRawValue(b)
-}
-
-// WithAttempt sets the number of attempts for this task. Usually not needed,
-// handled automatically by the worker.
-func WithAttempt(value int32) InsertArg {
-	return func(_ *Modification, d *TaskData) {
-		d.Attempt = value
-	}
-}
-
-// WithErr sets the error field of a task during insertion. Usually not needed,
-// as tasks are typically modified to add errors, not inserted with them.
-func WithErr(value string) InsertArg {
-	return func(_ *Modification, d *TaskData) {
-		d.Err = value
-	}
-}
-
-// WithID sets the task's ID for insertion. This is not normally needed, as the backend
-// will assign a new, unique ID for this task if none is specified. There are cases
-// where assigning an explicit insertion ID (always being careful that it is
-// unique) can be useful, however.
-//
-// NOTE: IDs must be <= 64 characters in length for some backends.
-//
-// For example, a not uncommon need is for a worker to do the following:
-//
-//   - Claim a task,
-//   - Make database entries corresponding to downstream work,
-//   - Insert tasks for the downstream work and delete claimed task.
-//
-// If the database entries need to reference the tasks that have not yet been
-// inserted (e.g., if they need to be used to get at the status of a task), it
-// is not safe to simply update the database after insertion, as this introduces
-// a race condition. If, for example, the following strategy is employed, then
-// the task IDs may never make it into the database:
-//
-//   - Claim a task,
-//   - Make database entries
-//   - Insert tasks and delete claimed task
-//   - Update database with new task IDs
-//
-// In this event, it is entirely possible to successfully process the incoming
-// task and create the outgoing tasks, then lose network connectivity and fail
-// to add those IDs to the databse. Now it is no longer possible to update the
-// database appropriately: the task information is simply lost.
-//
-// Instead, it is safe to do the following:
-//
-//   - Claim a task
-//   - Make database entries, including with to-be-created task IDs
-//   - Insert tasks with those IDs and delete claimed task.
-//
-// This avoids the potential data loss condition entirely.
-//
-// There are other workarounds for this situation, like using a two-step
-// creation process and taking advantage of the ability to move tasks between
-// queues without disturbing their ID (only their version), but this is not
-// uncommon enough to warrant requiring the extra worker logic just to get a
-// task ID into the database.
-func WithID(id string) InsertArg {
-	return func(_ *Modification, d *TaskData) {
-		d.ID = id
-	}
-}
-
-// WithSkipColliding sets the insert argument to allow itself to be removed if
-// the only error encountered is an ID collision. This can help when it is
-// desired to insert multiple tasks, but a previous subset was already inserted
-// with similar IDs. Sometimes you want to specify a superset to "catch what we
-// missed".
-func WithSkipColliding(s bool) InsertArg {
-	return func(_ *Modification, d *TaskData) {
-		d.skipCollidingID = s
-	}
-}
-
-// Deleting adds a deletion to a Modify call, e.g.,
-//
-//	cli.Modify(ctx, Deleting(id, version))
-func Deleting(id string, version int32, opts ...IDOption) ModifyArg {
-	return func(m *Modification) {
-		m.Deletes = append(m.Deletes, NewTaskID(id, version, opts...))
-	}
-}
-
-// DependingOn adds a dependency to a Modify call, e.g., to insert a task into
-// "my queue" with data "hey", but only succeeding if a task with anotherID and
-// someVersion exists:
-//
-//	cli.Modify(ctx,
-//	  InsertingInto("my queue",
-//	    WithValue(json.RawMessage(`"hey"`))),
-//	    DependingOn(anotherID, someVersion))
-func DependingOn(id string, version int32, opts ...IDOption) ModifyArg {
-	return func(m *Modification) {
-		m.Depends = append(m.Depends, NewTaskID(id, version, opts...))
-	}
-}
-
-// Changing adds a task update to a Modify call, e.g., to modify
-// the queue a task belongs in:
-//
-//	cli.Modify(ctx, Changing(myTask, QueueTo("a different queue name")))
-func Changing(task *Task, changeArgs ...ChangeArg) ModifyArg {
-	return func(m *Modification) {
-		newTask := *task
-		// From queue is always the current queue.
-		newTask.FromQueue = task.Queue
-		// Zero time signals the backend to use its own "now" and clear the
-		// claimant (task is released). Callers may override via ArrivalTimeTo
-		// or ArrivalTimeBy to renew or defer.
-		newTask.At = time.Time{}
-		for _, a := range changeArgs {
-			a(m, &newTask)
-		}
-		m.Changes = append(m.Changes, &newTask)
-	}
-}
-
-// ChangeArg is an argument to the Changing function used to create arguments
-// for Modify, e.g., to change the queue and set the expiry time of a task to
-// 5 minutes in the future, you would do something like this:
-//
-//	  cli.Modify(ctx,
-//	    Changing(myTask,
-//	      QueueTo("a new queue"),
-//		  ArrivalTimeBy(5 * time.Minute)))
-type ChangeArg func(m *Modification, t *Task)
-
-// QueueTo creates an option to modify a task's queue in the Changing function.
-func QueueTo(q string) ChangeArg {
-	return func(_ *Modification, t *Task) {
-		// Save the old queue for authorization to move this from one to another.
-		t.FromQueue = t.Queue
-		t.Queue = q
-	}
-}
-
-// ArrivalTimeTo sets a specific arrival time on a changed task in the Changing function.
-func ArrivalTimeTo(at time.Time) ChangeArg {
-	return func(_ *Modification, t *Task) {
-		t.At = at
-	}
-}
-
-// ArrivalTimeBy sets the arrival time to a time in the future, by the given duration.
-// The duration is added to Go's wall clock time at the point of Modify. If tight
-// synchronization with the backend clock is required, use EntroQ.Time and
-// WithArrivalTime instead. Send a duration of 0 for immediate availability.
-func ArrivalTimeBy(d time.Duration) ChangeArg {
-	return func(m *Modification, t *Task) {
-		t.At = m.now.Add(d)
-	}
-}
-
-// RawValueTo sets the changing task's JSON value from pre-marshaled bytes.
-// The value must be valid JSON; nil is allowed and represents an absent value.
-func RawValueTo(v json.RawMessage) ChangeArg {
-	return func(_ *Modification, t *Task) {
-		t.Value = v
-	}
-}
-
-// ValueTo sets the changing task's JSON value by marshaling what is passed in
-// first.
-func ValueTo(v any) ChangeArg {
-	// Errors are code errors if something unmarshalable is passed (like chan).
-	b, err := json.Marshal(v)
-	if err != nil {
-		log.Fatalf("unmarshalable type ValueTo: %v", err)
-	}
-	return func(_ *Modification, t *Task) {
-		t.Value = b
-	}
-}
-
-// AppendingErr appends the given error to Err in the task.
-func AppendingErr(e string) ChangeArg {
-	return func(_ *Modification, t *Task) {
-		var strs []string
-		if t.Err != "" {
-			strs = append(strs, t.Err)
-		}
-		if e != "" {
-			strs = append(strs, e)
-		}
-		if len(strs) != 0 {
-			t.Err = strings.Join(strs, "\n")
-		}
-	}
-}
-
-// ErrTo sets the Err field in the task.
-func ErrTo(e string) ChangeArg {
-	return func(_ *Modification, t *Task) {
-		t.Err = e
-	}
-}
-
-// ErrToZero sets the Err field to its zero value (clears the error).
-func ErrToZero() ChangeArg {
-	return ErrTo("")
-}
-
-// AttemptToNext sets the Attempt field in Task to the next value (increments it).
-func AttemptToNext() ChangeArg {
-	return func(_ *Modification, t *Task) {
-		t.Attempt++
-	}
-}
-
-// AttemptToZero resets the Attempt field to zero.
-func AttemptToZero() ChangeArg {
-	return func(_ *Modification, t *Task) {
-		t.Attempt = 0
 	}
 }
 
@@ -1237,6 +984,41 @@ func NewModification(claimant string, modArgs ...ModifyArg) *Modification {
 // change how an individual call to Modify operates.
 func (m *Modification) Options() []ModifyOption {
 	return m.options
+}
+
+// EnsureModifyKeys rejects a modification that would write to an empty queue or
+// namespace. The write targets are the operations with no prior record to look
+// up, so an empty key would otherwise be silently written to "": a task insert
+// and a task change must name a non-empty destination queue, and a doc insert
+// must name a non-empty namespace.
+//
+// It deliberately does not touch the other modify keys -- a delete's or depend's
+// queue, a change's source (FromQueue), and any doc namespace used to locate an
+// existing record. Those are not write targets: an empty one matches no stored
+// record and is already reported (a dependency error for tasks, a missing
+// dependency for docs).
+//
+// This is a pure check; the "empty destination means no move" ergonomic lives at
+// the gRPC service, where authorization is decided. Backends call this at the
+// start of Modify. Because direct-to-backend clients are not a supported path,
+// enforcing in the Go backend is sufficient: every supported write reaches one.
+func (m *Modification) EnsureModifyKeys() error {
+	for _, ins := range m.Inserts {
+		if ins.Queue == "" {
+			return fmt.Errorf("modify: insert of task %q must name a queue", ins.ID)
+		}
+	}
+	for _, c := range m.Changes {
+		if c.Queue == "" {
+			return fmt.Errorf("modify: change of task %q must name a destination queue", c.ID)
+		}
+	}
+	for _, ins := range m.DocInserts {
+		if ins.Namespace == "" {
+			return fmt.Errorf("modify: doc insert %q must name a namespace", ins.ID)
+		}
+	}
+	return nil
 }
 
 // modDependencies returns a dependency map for all modified task dependencies
@@ -1563,6 +1345,79 @@ func (m *DependencyError) HasAny() bool {
 // this particular error.
 func (m *DependencyError) OnlyClaims() bool {
 	return !m.HasMissing() && !m.HasCollisions() && !m.HasMissingDocs()
+}
+
+// Merge returns a new DependencyError combining the failures of m and other,
+// reporting each operation at most once per class -- deduplicated by task ID (or
+// namespaced doc ID), keeping m's entry on a tie so a more specific queue is
+// preserved. Either receiver or argument may be nil; it returns nil when the
+// combined result has no failures.
+//
+// This lets a backend that discovers failures in more than one pass (e.g. eqmem
+// computes queue-integrity failures under a global lock, then found-based
+// version/claim/collision failures under per-queue locks) report every failure
+// class in a single error, as Backend.Modify requires.
+func (m *DependencyError) Merge(other *DependencyError) *DependencyError {
+	if m == nil {
+		m = &DependencyError{}
+	}
+	if other == nil {
+		other = &DependencyError{}
+	}
+	cat := func(a, b []*TaskID) []*TaskID { return append(append([]*TaskID{}, a...), b...) }
+	catDoc := func(a, b []*DocID) []*DocID { return append(append([]*DocID{}, a...), b...) }
+	merged := &DependencyError{
+		Inserts:    dedupTaskIDs(cat(m.Inserts, other.Inserts)),
+		Depends:    dedupTaskIDs(cat(m.Depends, other.Depends)),
+		Deletes:    dedupTaskIDs(cat(m.Deletes, other.Deletes)),
+		Changes:    dedupTaskIDs(cat(m.Changes, other.Changes)),
+		Claims:     dedupTaskIDs(cat(m.Claims, other.Claims)),
+		DocInserts: dedupDocIDs(catDoc(m.DocInserts, other.DocInserts)),
+		DocDepends: dedupDocIDs(catDoc(m.DocDepends, other.DocDepends)),
+		DocDeletes: dedupDocIDs(catDoc(m.DocDeletes, other.DocDeletes)),
+		DocChanges: dedupDocIDs(catDoc(m.DocChanges, other.DocChanges)),
+		DocClaims:  dedupDocIDs(catDoc(m.DocClaims, other.DocClaims)),
+		Message:    m.Message,
+	}
+	if merged.Message == "" {
+		merged.Message = other.Message
+	}
+	if !merged.HasAny() {
+		return nil
+	}
+	return merged
+}
+
+// dedupTaskIDs keeps the first TaskID seen for each task ID, preserving order.
+func dedupTaskIDs(ids []*TaskID) []*TaskID {
+	seen := make(map[string]bool, len(ids))
+	var out []*TaskID
+	for _, id := range ids {
+		if id == nil || seen[id.ID] {
+			continue
+		}
+		seen[id.ID] = true
+		out = append(out, id)
+	}
+	return out
+}
+
+// dedupDocIDs keeps the first DocID seen for each namespaced doc ID.
+func dedupDocIDs(ids []*DocID) []*DocID {
+	seen := make(map[string]bool, len(ids))
+	var out []*DocID
+	for _, id := range ids {
+		if id == nil {
+			continue
+		}
+		k := DocKey(id.Namespace, id.ID)
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, id)
+	}
+	return out
 }
 
 // Error produces a helpful error string indicating what was missing.

@@ -77,7 +77,7 @@ func RunContentionBenchmark(b *testing.B, client *entroq.EntroQ, queues []string
 					}
 					if t != nil {
 						dist.Add(time.Since(t0))
-						client.Modify(gctx, entroq.Deleting(t.ID, t.Version))
+						client.Modify(gctx, t.Delete())
 					}
 				}
 			}
@@ -103,7 +103,7 @@ func RunContentionBenchmark(b *testing.B, client *entroq.EntroQ, queues []string
 		t, err := client.TryClaim(ctx, entroq.From(queues[0]), entroq.ClaimFor(time.Second))
 		if err == nil && t != nil {
 			dist.Add(time.Since(t0))
-			client.Modify(ctx, entroq.Deleting(t.ID, t.Version))
+			client.Modify(ctx, t.Delete())
 		}
 	}
 

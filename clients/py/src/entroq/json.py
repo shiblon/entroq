@@ -73,7 +73,9 @@ def _task_insert_json(i: TaskData) -> dict:
 
 def _task_change_json(c: TaskChange) -> dict:
     return {
-        "oldId": {"id": c.id, "version": c.version, "queue": c.queue},
+        # oldId.queue is the source (from_queue), part of the modify key that the
+        # service matches; newData.queue is the destination (equal for no move).
+        "oldId": {"id": c.id, "version": c.version, "queue": c.from_queue},
         "newData": {
             "queue": c.queue,
             "atMs": _to_ms(c.at),

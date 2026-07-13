@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"sort"
 	"testing"
@@ -37,13 +38,13 @@ type Tester func(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 // The opener is used by the service to connect to storage. The client always
 // uses a grpc opener.
 func ClientService(ctx context.Context, opener entroq.BackendOpener) (client *entroq.EntroQ, stop func(), err error) {
-	s, dial, err := StartService(ctx, opener)
+	stopSvc, dial, err := StartService(ctx, opener)
 	if err != nil {
 		return nil, nil, fmt.Errorf("client service: %w", err)
 	}
 	defer func() {
 		if err != nil {
-			s.Stop()
+			stopSvc()
 		}
 	}()
 
@@ -56,12 +57,18 @@ func ClientService(ctx context.Context, opener entroq.BackendOpener) (client *en
 
 	return client, func() {
 		client.Close()
-		s.Stop()
+		stopSvc()
 	}, nil
 }
 
-// StartService starts an in-memory gRPC network service and returns a function for creating client connections to it.
-func StartService(ctx context.Context, opener entroq.BackendOpener) (*grpc.Server, Dialer, error) {
+// StartService starts an in-memory gRPC network service and returns a Dialer
+// for creating client connections to it and a stop function for cleanup. Callers
+// must defer stop: it stops the gRPC server AND closes the service, which closes
+// the backend and its background loops. Closing the service matters because the
+// backend's readiness/GC loops are rooted at context.Background(), so a service
+// left unclosed leaks a heartbeat ticker that keeps mutating shared state (e.g.
+// eqpg's notification watermark) and can perturb later tests.
+func StartService(ctx context.Context, opener entroq.BackendOpener) (stop func(), dial Dialer, err error) {
 	lis := bufconn.Listen(bufSize)
 	svc, err := eqsvcgrpc.New(ctx, opener)
 	if err != nil {
@@ -72,7 +79,13 @@ func StartService(ctx context.Context, opener entroq.BackendOpener) (*grpc.Serve
 	pb.RegisterEntroQServer(s, svc)
 	go s.Serve(lis)
 
-	return s, lis.Dial, nil
+	stop = func() {
+		s.Stop()
+		if err := svc.Close(); err != nil {
+			log.Printf("eqtest StartService cleanup: close service: %v", err)
+		}
+	}
+	return stop, lis.Dial, nil
 }
 
 func newTaskQueueVersionValue(t *entroq.Task) *taskQueueVersionValue {

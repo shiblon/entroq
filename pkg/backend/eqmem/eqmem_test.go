@@ -2,6 +2,7 @@ package eqmem
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"os"
@@ -62,6 +63,18 @@ func TestEQMemTaskChangeFutureArrival(t *testing.T) {
 	RunQTest(t, eqtest.TaskChangeFutureArrival)
 }
 
+func TestEQMemTaskChangeFarPastArrivalNormalized(t *testing.T) {
+	RunQTest(t, eqtest.TaskChangeFarPastArrivalNormalized)
+}
+
+func TestEQMemModifyRejectsWrongQueue(t *testing.T) {
+	RunQTest(t, eqtest.ModifyRejectsWrongQueue)
+}
+
+func TestEQMemEmptyWriteTargetRejected(t *testing.T) {
+	RunQTest(t, eqtest.EmptyWriteTargetRejected)
+}
+
 func TestEQMemSimpleWorker(t *testing.T) {
 	RunQTest(t, eqtest.SimpleWorker)
 }
@@ -84,6 +97,14 @@ func TestEQMemClaimUnblocksOnNotify(t *testing.T) {
 
 func TestEQMemQueueMatch(t *testing.T) {
 	RunQTest(t, eqtest.QueueMatch)
+}
+
+func TestEQMemQueuePrefixMatchLiteral(t *testing.T) {
+	RunQTest(t, eqtest.QueuePrefixMatchLiteral)
+}
+
+func TestEQMemNamespacePrefixMatchLiteral(t *testing.T) {
+	RunQTest(t, eqtest.NamespacePrefixMatchLiteral)
 }
 
 func TestEQMemQueueStats(t *testing.T) {
@@ -508,6 +529,10 @@ func TestEQMemDocListing(t *testing.T) {
 	RunQTest(t, eqtest.DocListing)
 }
 
+func TestEQMemDocKeyRangeByteOrder(t *testing.T) {
+	RunQTest(t, eqtest.DocKeyRangeByteOrder)
+}
+
 func TestEQMemDocClaimLocking(t *testing.T) {
 	RunQTest(t, eqtest.DocClaimLocking)
 }
@@ -526,4 +551,58 @@ func TestEQMemQueueStatsAccuracy(t *testing.T) {
 
 func TestEQMemNamespaceStats(t *testing.T) {
 	RunQTest(t, eqtest.NamespaceStats)
+}
+
+// TestEQMemReplayBackfillsMissingQueue covers the journal read path for older
+// journals: a change recorded before the queue-as-modify-key requirement carries
+// its queue but an empty FromQueue. Such an op must be rejected on the live write
+// path (the queue is the modify key and an external request must name it) yet
+// backfilled from stored state and applied on trusted replay, so old journals
+// still replay cleanly.
+func TestEQMemReplayBackfillsMissingQueue(t *testing.T) {
+	ctx := context.Background()
+	m, err := New(ctx)
+	if err != nil {
+		t.Fatalf("new eqmem: %v", err)
+	}
+	defer m.Close()
+
+	const q = "/replay/backfill"
+	// The backend Modify does not generate IDs (the entroq client does), so supply one.
+	ins, err := m.Modify(ctx, entroq.NewModification("", entroq.InsertingInto(q, entroq.WithID("backfill-task"), entroq.WithValue("x"))))
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	task := ins.InsertedTasks[0]
+
+	// A change as an older journal recorded it: queue present, FromQueue empty.
+	// Rebuilt per call because a successful apply advances the stored version.
+	oldStyle := func() *entroq.Modification {
+		return &entroq.Modification{
+			Changes: []*entroq.Task{{ID: task.ID, Version: task.Version, Queue: q, Value: json.RawMessage(`"y"`)}},
+		}
+	}
+
+	// Live (non-replay) rejects the empty FromQueue.
+	if _, err := m.modifyImpl(ctx, oldStyle(), false); err == nil {
+		t.Error("live change with empty FromQueue should be rejected, got nil error")
+	}
+
+	// Replay backfills FromQueue from stored state (qByID) and applies the change.
+	if _, err := m.modifyImpl(ctx, oldStyle(), true); err != nil {
+		t.Fatalf("replay of a queue-less change should backfill and succeed: %v", err)
+	}
+
+	// Proof it applied: replaying the same (now stale) version fails the version check.
+	if _, err := m.modifyImpl(ctx, oldStyle(), true); err == nil {
+		t.Error("second replay at the stale version should fail the version check, got nil error")
+	}
+}
+
+func TestEQMemModifyReportsAllFailureClasses(t *testing.T) {
+	RunQTest(t, eqtest.ModifyReportsAllFailureClasses)
+}
+
+func TestEQMemModifyRejectsWrongNamespace(t *testing.T) {
+	RunQTest(t, eqtest.ModifyRejectsWrongNamespace)
 }

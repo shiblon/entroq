@@ -39,6 +39,15 @@ name_match(want, can) if {
 	startswith(want.prefix, can.prefix)
 }
 
+# is_named reports whether a queue spec actually names something: a non-empty
+# exact name or a non-empty prefix. A spec that names nothing can never be
+# authorized (there is nothing to hold a grant on), and an empty value would
+# otherwise match a wildcard prefix via startswith("", ""). Callers use this to
+# reject empty requests outright.
+is_named(spec) if spec.exact != ""
+
+is_named(spec) if spec.prefix != ""
+
 # has_wildcard indicates whether a set contains a wildcard, like ALL, ANY, or *.
 has_wildcard(actions) if {
 	some wildcard in ["*", "ALL", "ANY"]

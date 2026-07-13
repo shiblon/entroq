@@ -19,11 +19,11 @@ func TestGRPCBlockingClaimUnblocksOnInsert(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	s, dial, err := eqtest.StartService(ctx, eqmem.Opener())
+	stop, dial, err := eqtest.StartService(ctx, eqmem.Opener())
 	if err != nil {
 		t.Fatalf("start service: %v", err)
 	}
-	defer s.Stop()
+	defer stop()
 
 	client, err := entroq.New(ctx, eqgrpc.Opener("bufnet",
 		eqgrpc.WithNiladicDialer(dial),
@@ -111,6 +111,18 @@ func TestGRPCTaskChangeFutureArrival(t *testing.T) {
 	RunQTest(t, eqtest.TaskChangeFutureArrival)
 }
 
+func TestGRPCTaskChangeFarPastArrivalNormalized(t *testing.T) {
+	RunQTest(t, eqtest.TaskChangeFarPastArrivalNormalized)
+}
+
+func TestGRPCModifyRejectsWrongQueue(t *testing.T) {
+	RunQTest(t, eqtest.ModifyRejectsWrongQueue)
+}
+
+func TestGRPCEmptyWriteTargetRejected(t *testing.T) {
+	RunQTest(t, eqtest.EmptyWriteTargetRejected)
+}
+
 func TestGRPCSimpleWorker(t *testing.T) {
 	RunQTest(t, eqtest.SimpleWorker)
 }
@@ -193,4 +205,12 @@ func TestGRPCQueueStatsAccuracy(t *testing.T) {
 
 func TestGRPCNamespaceStats(t *testing.T) {
 	RunQTest(t, eqtest.NamespaceStats)
+}
+
+func TestGRPCModifyReportsAllFailureClasses(t *testing.T) {
+	RunQTest(t, eqtest.ModifyReportsAllFailureClasses)
+}
+
+func TestGRPCModifyRejectsWrongNamespace(t *testing.T) {
+	RunQTest(t, eqtest.ModifyRejectsWrongNamespace)
 }

@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -361,9 +361,16 @@ func (m *EQMem) mustTryClaimOne(q string, now time.Time, cq *entroq.ClaimQuery) 
 		// Update for claim. Note that we need the final state, not the
 		// original version. Journal playback decrements the version number by
 		// 1 when applying modifications.
+		//
+		// The journaled change must name the task's current queue as its source
+		// (FromQueue) so replay passes the queue-as-modify-key check: a claim
+		// does not move the task, so source == destination. Journal a copy so the
+		// task returned to the caller is not given a spurious FromQueue.
+		jChange := found.Copy()
+		jChange.FromQueue = jChange.Queue
 		mod := &entroq.Modification{
 			Claimant: cq.Claimant,
-			Changes:  []*entroq.Task{found},
+			Changes:  []*entroq.Task{jChange},
 		}
 		// Marshal mod and store in journal.
 		b, err := json.Marshal(mod)
@@ -435,23 +442,38 @@ func (m *EQMem) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Ta
 	return nil, nil
 }
 
-func ensureModQueues(mod *entroq.Modification, qByID map[string]string) {
+// ensureModQueues enforces that every task operation names the queue the task
+// actually lives in. Queues are EntroQ's authorization boundary, and authz runs
+// against the queue the caller *names*, so if the operation could then act on a
+// task in some other queue the ACL would be bypassable. We reject a mismatch
+// (or an empty queue) rather than "helpfully" filling it in, since filling would
+// defeat the check. A mismatch is reported as a DependencyError so an idempotent
+// caller (e.g. re-deleting an already-gone task) sees the same "missing" signal
+// it already handles, and a liar and a gone task look identical (no leak).
+func ensureModQueues(mod *entroq.Modification, qByID map[string]string) *entroq.DependencyError {
+	depErr := new(entroq.DependencyError)
 	for _, d := range mod.Deletes {
-		if d.Queue == "" {
-			d.Queue = qByID[d.ID]
+		if d.Queue == "" || d.Queue != qByID[d.ID] {
+			depErr.Deletes = append(depErr.Deletes, entroq.NewTaskID(d.ID, d.Version, d.Queue))
 		}
 	}
 
 	for _, d := range mod.Depends {
-		if d.Queue == "" {
-			d.Queue = qByID[d.ID]
+		if d.Queue == "" || d.Queue != qByID[d.ID] {
+			depErr.Depends = append(depErr.Depends, entroq.NewTaskID(d.ID, d.Version, d.Queue))
 		}
 	}
 
 	for _, c := range mod.Changes {
-		// Always from where it already is. Always.
-		c.FromQueue = qByID[c.ID]
+		if c.FromQueue == "" || c.FromQueue != qByID[c.ID] {
+			depErr.Changes = append(depErr.Changes, entroq.NewTaskID(c.ID, c.Version, c.FromQueue))
+		}
 	}
+	if len(depErr.Deletes)+len(depErr.Depends)+len(depErr.Changes) != 0 {
+		depErr.Message = "modification queue does not match the task's current queue"
+		return depErr
+	}
+	return nil
 }
 
 // modPrep finds all queues from a particular modification request. If any of
@@ -463,14 +485,45 @@ func ensureModQueues(mod *entroq.Modification, qByID map[string]string) {
 // only IDs will get a queue here if they can be found).
 //
 // Also, if any queue indexes don't have a queue represented, that is fixed here.
-func (m *EQMem) modPrep(mod *entroq.Modification) (sortedQueues, sortedNamespaces []string, misplacedInsIDs map[string]string) {
+func (m *EQMem) modPrep(mod *entroq.Modification, replay bool) (queueNames, namespaceNames []string, misplacedInsIDs map[string]string, queueDeps *entroq.DependencyError) {
 	// This has to be locked the whole time so that IDs and queues are matched
 	// properly if queues are missing somewhere.
 	defer un(lock(m))
 
 	misplacedInsIDs = make(map[string]string)
 
-	ensureModQueues(mod, m.qByID)
+	// Journal replay re-applies the backend's own committed record, not an
+	// external authorized request, so it is trusted. Journals written before the
+	// queue-as-modify-key requirement (and claim changes in general) may omit an
+	// op's queue; backfill it from stored state so the op both passes the
+	// integrity check below and locates the right task when applied. Backfilling
+	// is exactly what we forbid on the live write path (there it would defeat
+	// authorization), which is why it is gated on replay only.
+	if replay {
+		for _, c := range mod.Changes {
+			if c.FromQueue == "" {
+				c.FromQueue = m.qByID[c.ID]
+			}
+		}
+		for _, d := range mod.Deletes {
+			if d.Queue == "" {
+				d.Queue = m.qByID[d.ID]
+			}
+		}
+		for _, d := range mod.Depends {
+			if d.Queue == "" {
+				d.Queue = m.qByID[d.ID]
+			}
+		}
+	}
+
+	// Queue-integrity failures are computed here, under the global lock where
+	// qByID is authoritative, but NOT returned as an early error: modifyImpl
+	// merges them with the found-based failures so one DependencyError reports
+	// every failure class. We still collect queues to lock below, so the found
+	// pass runs even when some ops have a bad queue.
+	queueDeps = ensureModQueues(mod, m.qByID)
+
 	queues := make(map[string]bool)
 	for _, ins := range mod.Inserts {
 		// If we have an ID to insert, find the queue for that task to return it.
@@ -496,12 +549,14 @@ func (m *EQMem) modPrep(mod *entroq.Modification) (sortedQueues, sortedNamespace
 
 	delete(queues, "") // in case there's an empty queue in there.
 
-	// We have all of the locks we need. Sort to avoid dining philosophers problems.
+	// Collect the queue names to lock. lockQueues sorts them into a consistent
+	// order to avoid dining-philosophers deadlock, so we do not sort here.
 	for q := range queues {
-		sortedQueues = append(sortedQueues, q)
+		queueNames = append(queueNames, q)
 	}
-	sort.Strings(sortedQueues)
 
+	// Collect the namespaces involved in doc operations, mirroring the queue
+	// collection above; lockNamespaces sorts them for consistent lock ordering.
 	namespaces := make(map[string]bool)
 	for _, ins := range mod.DocInserts {
 		namespaces[ins.Namespace] = true
@@ -519,11 +574,10 @@ func (m *EQMem) modPrep(mod *entroq.Modification) (sortedQueues, sortedNamespace
 	delete(namespaces, "")
 
 	for n := range namespaces {
-		sortedNamespaces = append(sortedNamespaces, n)
+		namespaceNames = append(namespaceNames, n)
 	}
-	sort.Strings(sortedNamespaces)
 
-	return sortedQueues, sortedNamespaces, misplacedInsIDs
+	return queueNames, namespaceNames, misplacedInsIDs, queueDeps
 }
 
 // queueUnsafeInsertTask performs queue-level operations on a task, then
@@ -559,6 +613,12 @@ func (m *EQMem) queueUnsafeUpdateTask(ql *qLock, t *entroq.Task) func() {
 }
 
 func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (*entroq.ModifyResponse, error) {
+	// Reject writes to an empty queue/namespace on the live path. Journal replay
+	// goes straight to modifyImpl and skips this: it is trusted and its ops
+	// already carry valid keys.
+	if err := mod.EnsureModifyKeys(); err != nil {
+		return nil, fmt.Errorf("eqmem modify: %w", err)
+	}
 	start := time.Now()
 	defer func() {
 		m.modifyDuration.Record(ctx, time.Since(start).Seconds())
@@ -566,7 +626,11 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (*entroq.M
 	return m.modifyImpl(ctx, mod, false)
 }
 
-func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignoreClaimant bool) (*entroq.ModifyResponse, error) {
+// replay is true only when the journal player re-applies our own committed
+// record (the sole such caller). Because that record is trusted rather than an
+// external authorized request, replay both skips the claimant check and lets
+// modPrep backfill queues that older journals omitted.
+func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay bool) (*entroq.ModifyResponse, error) {
 	// Double check that IDs are assigned.
 	for _, t := range mod.Inserts {
 		if t.ID == "" {
@@ -602,10 +666,12 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 
 	// Get queues that are involved in this modification so we can grab locks.
 	// Also find any insertion requests with IDs, where the ID is in a queue
-	// different from the one requested.
-	queues, namespaces, misplacedInsIDs := m.modPrep(mod)
-	// We can short-circuit if there are no known queues or namespaces to lock.
-	if len(queues) == 0 && len(namespaces) == 0 && len(mod.Deletes) == 0 && len(mod.Depends) == 0 {
+	// different from the one requested. On replay, modPrep also backfills queues
+	// that older journals omitted.
+	queues, namespaces, misplacedInsIDs, queueDeps := m.modPrep(mod, replay)
+	// We can short-circuit if there is nothing to lock and no queue-integrity
+	// failure to report.
+	if queueDeps == nil && len(queues) == 0 && len(namespaces) == 0 && len(mod.Deletes) == 0 && len(mod.Depends) == 0 {
 		return resp, nil
 	}
 
@@ -678,10 +744,21 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 		addFoundDoc(t.Namespace, t.ID)
 	}
 
+	var foundDeps *entroq.DependencyError
 	if err := mod.DependencyError(found, foundDocs); err != nil {
-		depErr, ok := entroq.AsDependency(err)
-		if !ignoreClaimant || !ok || !depErr.OnlyClaims() {
+		fd, ok := entroq.AsDependency(err)
+		if !ok {
 			return nil, fmt.Errorf("eqmem modify: %w", err)
+		}
+		foundDeps = fd
+	}
+	// Merge the queue-integrity failures (computed under the global lock in
+	// modPrep) with the found-based failures so a single DependencyError reports
+	// every failure class -- notably, insert collisions are still reported even
+	// when some other op named a wrong queue.
+	if depErr := queueDeps.Merge(foundDeps); depErr != nil {
+		if !replay || !depErr.OnlyClaims() {
+			return nil, fmt.Errorf("eqmem modify: %w", depErr)
 		}
 	}
 
@@ -726,6 +803,9 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 	for _, c := range mod.Changes {
 		newTask := c.Copy()
 		newTask.Version++
+		// Cap a far-past arrival to now (backend Modify contract): an omitted At
+		// arrives now and is ordered at now, not in the distant past.
+		newTask.At = entroq.NormalizeArrival(newTask.At, now)
 		// Preserve claimant on renewal (At pushed to future); clear otherwise.
 		if !newTask.At.After(now) {
 			newTask.Claimant = ""
@@ -754,7 +834,7 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 		newTask := &entroq.Task{
 			ID:       id,
 			Queue:    td.Queue,
-			At:       td.At,
+			At:       entroq.NormalizeArrival(td.At, now),
 			Value:    td.Value,
 			Claimant: mod.Claimant,
 			Created:  created,
@@ -770,6 +850,8 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, ignore
 	for _, c := range mod.DocChanges {
 		newRes := c.Copy()
 		newRes.Version++
+		// Cap a far-past arrival to now (backend Modify contract), same as tasks.
+		newRes.At = entroq.NormalizeArrival(newRes.At, now)
 		// Claim/renew if requested.At is in the future; release otherwise.
 		if newRes.At.After(now) {
 			newRes.Claimant = mod.Claimant
@@ -946,12 +1028,7 @@ func matchesQuery(val string, qq *entroq.QueuesQuery) bool {
 			return true
 		}
 	}
-	for _, e := range qq.MatchExact {
-		if e == val {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(qq.MatchExact, val)
 }
 
 // Queues returns the list of queue and their sizes, based on query contents.
@@ -1079,6 +1156,12 @@ func (m *EQMem) lockQueues(qs []string) ([]*qLock, func()) {
 	if len(qs) == 0 {
 		return nil, func() {}
 	}
+	// Lock in a consistent (sorted) order so concurrent multi-queue modifies can
+	// never deadlock (dining philosophers). Sorting here, rather than trusting
+	// callers to pre-sort, makes the invariant impossible to get wrong. qs is
+	// sorted in place; every caller passes a slice it owns (a fresh
+	// single-element slice, or modPrep's result), so reordering it is harmless.
+	slices.Sort(qs)
 	qls := m.locksForQueues(qs)
 	for _, ql := range qls {
 		ql.Lock()
@@ -1147,6 +1230,9 @@ func (m *EQMem) lockNamespaces(ns []string) ([]*nsLock, func()) {
 	if len(ns) == 0 {
 		return nil, func() {}
 	}
+	// Sorted lock order, same dining-philosophers reasoning as lockQueues. ns is
+	// sorted in place; callers own the slice they pass.
+	slices.Sort(ns)
 	nls := m.locksForNamespaces(ns)
 	for _, nl := range nls {
 		nl.Lock()

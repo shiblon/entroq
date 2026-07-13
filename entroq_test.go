@@ -180,7 +180,7 @@ func TestDependencyErrorDocFields(t *testing.T) {
 	claimant := "test-claimant"
 
 	// Insert a real doc so we have a valid version to depend on.
-	resp, err := eq.Modify(ctx, entroq.ModifyAs(claimant), entroq.CreatingIn(ns,
+	resp, err := eq.Modify(ctx, entroq.ModifyAs(claimant), entroq.PuttingDocInto(ns,
 		entroq.WithIDKeys("real-doc", "", ""),
 		entroq.WithContent(json.RawMessage(`"present"`)),
 	))
@@ -191,7 +191,7 @@ func TestDependencyErrorDocFields(t *testing.T) {
 
 	// Attempt a Modify that depends on a nonexistent doc.
 	_, err = eq.Modify(ctx, entroq.ModifyAs(claimant),
-		entroq.DependingOnDocID(ns, "ghost-doc", 0),
+		entroq.NewDocID(ns, "ghost-doc", 0).Depend(),
 		// Also depend on real doc at wrong version to trigger missing-change path.
 		realDoc.Change(entroq.WithContent(json.RawMessage(`"updated"`))),
 	)
@@ -255,7 +255,7 @@ func Example_docBasics() {
 	// the doc in queries and claims. Use WithIDKeys only when you need an
 	// explicit ID (e.g. journal replay or cross-service references).
 	resp, err := eq.Modify(ctx,
-		entroq.CreatingIn("config",
+		entroq.PuttingDocInto("config",
 			entroq.WithKeys("server", ""),
 			entroq.WithContent(map[string]any{"port": 8080}),
 		),
@@ -284,7 +284,7 @@ func Example_docBasics() {
 	fmt.Printf("updated doc key=%s to version %d\n", updated.Key, updated.Version)
 
 	// Delete it.
-	if _, err := eq.Modify(ctx, entroq.DeletingDoc(updated)); err != nil {
+	if _, err := eq.Modify(ctx, updated.Delete()); err != nil {
 		log.Fatalf("delete: %v", err)
 	}
 
@@ -314,7 +314,7 @@ func Example_docKeyRange() {
 	// Insert docs whose primary keys are sortable timestamps.
 	for _, k := range []string{"2024-01-01", "2024-06-15", "2025-03-10"} {
 		if _, err := eq.Modify(ctx,
-			entroq.CreatingIn(ns,
+			entroq.PuttingDocInto(ns,
 				entroq.WithKeys(k, ""),
 				entroq.WithContent(k),
 			),
@@ -348,7 +348,7 @@ func Example_docAtomicTaskCommit() {
 
 	// Create a shared state doc and a work task.
 	resp, err := eq.Modify(ctx,
-		entroq.CreatingIn("state",
+		entroq.PuttingDocInto("state",
 			entroq.WithKeys("counter", ""),
 			entroq.WithContent(0),
 		),
@@ -434,8 +434,8 @@ func Example_docClaimContention() {
 
 	// Create two docs sharing the same primary key.
 	if _, err := eq.Modify(ctx,
-		entroq.CreatingIn(ns, entroq.WithKeys(key, "shard-0"), entroq.WithContent(0)),
-		entroq.CreatingIn(ns, entroq.WithKeys(key, "shard-1"), entroq.WithContent(0)),
+		entroq.PuttingDocInto(ns, entroq.WithKeys(key, "shard-0"), entroq.WithContent(0)),
+		entroq.PuttingDocInto(ns, entroq.WithKeys(key, "shard-1"), entroq.WithContent(0)),
 	); err != nil {
 		log.Fatalf("create: %v", err)
 	}
@@ -464,7 +464,7 @@ func Example_docClaimContention() {
 	// contention: IsDependency=true
 }
 
-// Example_docVersionPin demonstrates DependingOnDoc as an optimistic-lock
+// Example_docVersionPin demonstrates DocID.Depend as an optimistic-lock
 // check. The dependency pins a Modify to a specific doc version without
 // modifying the doc: the operation succeeds only when the doc is still at the
 // expected version. HasMissingDocs is true when any version-pinned dependency
@@ -479,7 +479,7 @@ func Example_docVersionPin() {
 
 	// Create a config doc.
 	resp, err := eq.Modify(ctx,
-		entroq.CreatingIn("config",
+		entroq.PuttingDocInto("config",
 			entroq.WithKeys("limits", ""),
 			entroq.WithContent(map[string]any{"max": 100}),
 		),
@@ -538,15 +538,15 @@ func Example_docQueryByID() {
 
 	// Create docs with known IDs for stable querying.
 	if _, err := eq.Modify(ctx,
-		entroq.CreatingIn("items",
+		entroq.PuttingDocInto("items",
 			entroq.WithIDKeys("id-alpha", "item", "0"),
 			entroq.WithContent("first"),
 		),
-		entroq.CreatingIn("items",
+		entroq.PuttingDocInto("items",
 			entroq.WithIDKeys("id-beta", "item", "1"),
 			entroq.WithContent("second"),
 		),
-		entroq.CreatingIn("items",
+		entroq.PuttingDocInto("items",
 			entroq.WithIDKeys("id-gamma", "item", "2"),
 			entroq.WithContent("third"),
 		),
