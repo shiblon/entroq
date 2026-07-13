@@ -609,3 +609,7 @@ func TestSchemaInit(t *testing.T) {
 		t.Logf("drop test database (non-fatal): %v", err)
 	}
 }
+
+func TestModifyReportsAllFailureClasses(t *testing.T) {
+	RunQTest(t, eqtest.ModifyReportsAllFailureClasses)
+}

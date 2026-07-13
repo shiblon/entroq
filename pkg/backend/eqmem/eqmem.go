@@ -450,7 +450,7 @@ func (m *EQMem) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Ta
 // defeat the check. A mismatch is reported as a DependencyError so an idempotent
 // caller (e.g. re-deleting an already-gone task) sees the same "missing" signal
 // it already handles, and a liar and a gone task look identical (no leak).
-func ensureModQueues(mod *entroq.Modification, qByID map[string]string) error {
+func ensureModQueues(mod *entroq.Modification, qByID map[string]string) *entroq.DependencyError {
 	depErr := new(entroq.DependencyError)
 	for _, d := range mod.Deletes {
 		if d.Queue == "" || d.Queue != qByID[d.ID] {
@@ -485,7 +485,7 @@ func ensureModQueues(mod *entroq.Modification, qByID map[string]string) error {
 // only IDs will get a queue here if they can be found).
 //
 // Also, if any queue indexes don't have a queue represented, that is fixed here.
-func (m *EQMem) modPrep(mod *entroq.Modification, replay bool) (queueNames, namespaceNames []string, misplacedInsIDs map[string]string, err error) {
+func (m *EQMem) modPrep(mod *entroq.Modification, replay bool) (queueNames, namespaceNames []string, misplacedInsIDs map[string]string, queueDeps *entroq.DependencyError) {
 	// This has to be locked the whole time so that IDs and queues are matched
 	// properly if queues are missing somewhere.
 	defer un(lock(m))
@@ -517,9 +517,13 @@ func (m *EQMem) modPrep(mod *entroq.Modification, replay bool) (queueNames, name
 		}
 	}
 
-	if err := ensureModQueues(mod, m.qByID); err != nil {
-		return nil, nil, nil, fmt.Errorf("mod prep: %w", err)
-	}
+	// Queue-integrity failures are computed here, under the global lock where
+	// qByID is authoritative, but NOT returned as an early error: modifyImpl
+	// merges them with the found-based failures so one DependencyError reports
+	// every failure class. We still collect queues to lock below, so the found
+	// pass runs even when some ops have a bad queue.
+	queueDeps = ensureModQueues(mod, m.qByID)
+
 	queues := make(map[string]bool)
 	for _, ins := range mod.Inserts {
 		// If we have an ID to insert, find the queue for that task to return it.
@@ -573,7 +577,7 @@ func (m *EQMem) modPrep(mod *entroq.Modification, replay bool) (queueNames, name
 		namespaceNames = append(namespaceNames, n)
 	}
 
-	return queueNames, namespaceNames, misplacedInsIDs, nil
+	return queueNames, namespaceNames, misplacedInsIDs, queueDeps
 }
 
 // queueUnsafeInsertTask performs queue-level operations on a task, then
@@ -664,12 +668,10 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 	// Also find any insertion requests with IDs, where the ID is in a queue
 	// different from the one requested. On replay, modPrep also backfills queues
 	// that older journals omitted.
-	queues, namespaces, misplacedInsIDs, err := m.modPrep(mod, replay)
-	if err != nil {
-		return nil, fmt.Errorf("modify: %w", err)
-	}
-	// We can short-circuit if there are no known queues or namespaces to lock.
-	if len(queues) == 0 && len(namespaces) == 0 && len(mod.Deletes) == 0 && len(mod.Depends) == 0 {
+	queues, namespaces, misplacedInsIDs, queueDeps := m.modPrep(mod, replay)
+	// We can short-circuit if there is nothing to lock and no queue-integrity
+	// failure to report.
+	if queueDeps == nil && len(queues) == 0 && len(namespaces) == 0 && len(mod.Deletes) == 0 && len(mod.Depends) == 0 {
 		return resp, nil
 	}
 
@@ -742,10 +744,21 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 		addFoundDoc(t.Namespace, t.ID)
 	}
 
+	var foundDeps *entroq.DependencyError
 	if err := mod.DependencyError(found, foundDocs); err != nil {
-		depErr, ok := entroq.AsDependency(err)
-		if !replay || !ok || !depErr.OnlyClaims() {
+		fd, ok := entroq.AsDependency(err)
+		if !ok {
 			return nil, fmt.Errorf("eqmem modify: %w", err)
+		}
+		foundDeps = fd
+	}
+	// Merge the queue-integrity failures (computed under the global lock in
+	// modPrep) with the found-based failures so a single DependencyError reports
+	// every failure class -- notably, insert collisions are still reported even
+	// when some other op named a wrong queue.
+	if depErr := queueDeps.Merge(foundDeps); depErr != nil {
+		if !replay || !depErr.OnlyClaims() {
+			return nil, fmt.Errorf("eqmem modify: %w", depErr)
 		}
 	}
 

@@ -208,3 +208,7 @@ func TestGRPCQueueStatsAccuracy(t *testing.T) {
 func TestGRPCNamespaceStats(t *testing.T) {
 	RunQTest(t, eqtest.NamespaceStats)
 }
+
+func TestGRPCModifyReportsAllFailureClasses(t *testing.T) {
+	RunQTest(t, eqtest.ModifyReportsAllFailureClasses)
+}

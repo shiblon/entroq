@@ -962,3 +962,55 @@ func EmptyWriteTargetRejected(ctx context.Context, t *testing.T, client *entroq.
 		t.Errorf("insert into %q: unexpected error: %v", realQ, err)
 	}
 }
+
+// ModifyReportsAllFailureClasses verifies the Backend.Modify contract that a
+// failed modification reports EVERY failing operation across all classes in a
+// single DependencyError, not just the first class encountered. A caller's
+// skip-colliding insert logic in particular depends on collisions always being
+// reported even alongside other failures.
+func ModifyReportsAllFailureClasses(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	q := path.Join(qPrefix, "all_failures")
+	wrongQ := path.Join(qPrefix, "all_failures_wrong")
+
+	// Seed three real tasks to fail against, with explicit IDs so we can name them.
+	ins, err := client.Modify(ctx,
+		entroq.InsertingInto(q, entroq.WithValue("chg"), entroq.WithID("f-chg")),
+		entroq.InsertingInto(q, entroq.WithValue("del"), entroq.WithID("f-del")),
+		entroq.InsertingInto(q, entroq.WithValue("collide"), entroq.WithID("f-collide")),
+	)
+	if err != nil {
+		t.Fatalf("seed insert: %v", err)
+	}
+	byID := make(map[string]*entroq.Task)
+	for _, tk := range ins.InsertedTasks {
+		byID[tk.ID] = tk
+	}
+
+	// One modification with four distinct failures:
+	//   - an insert colliding with an existing ID,
+	//   - a change at the wrong version (right queue),
+	//   - a delete naming the wrong queue,
+	//   - a delete of a task that does not exist.
+	// The queue-mismatch delete is what historically short-circuited eqmem before
+	// it computed the collision and the wrong-version change.
+	chgWrongVer := &entroq.Task{ID: "f-chg", Version: byID["f-chg"].Version + 7, Queue: q, Value: json.RawMessage(`"x"`)}
+	_, err = client.Modify(ctx,
+		entroq.InsertingInto(q, entroq.WithValue("y"), entroq.WithID("f-collide")),
+		chgWrongVer.Change(),
+		entroq.NewTaskID("f-del", byID["f-del"].Version, wrongQ).Delete(),
+		entroq.NewTaskID("ghost", 0, q).Delete(),
+	)
+	depErr, ok := entroq.AsDependency(err)
+	if !ok {
+		t.Fatalf("expected a DependencyError, got %v", err)
+	}
+	if !depErr.HasCollisions() {
+		t.Errorf("insert collision (f-collide) not reported: %+v", depErr)
+	}
+	if len(depErr.Changes) == 0 {
+		t.Errorf("wrong-version change (f-chg) not reported: %+v", depErr)
+	}
+	if len(depErr.Deletes) < 2 {
+		t.Errorf("both bad deletes (f-del wrong-queue, ghost missing) not reported: got Deletes=%v", depErr.Deletes)
+	}
+}

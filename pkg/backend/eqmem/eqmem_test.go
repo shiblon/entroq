@@ -598,3 +598,7 @@ func TestEQMemReplayBackfillsMissingQueue(t *testing.T) {
 		t.Error("second replay at the stale version should fail the version check, got nil error")
 	}
 }
+
+func TestEQMemModifyReportsAllFailureClasses(t *testing.T) {
+	RunQTest(t, eqtest.ModifyReportsAllFailureClasses)
+}

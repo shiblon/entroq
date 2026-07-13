@@ -200,3 +200,7 @@ func TestQueueStatsAccuracy(t *testing.T) {
 func TestNamespaceStats(t *testing.T) {
 	RunQTest(t, eqtest.NamespaceStats)
 }
+
+func TestModifyReportsAllFailureClasses(t *testing.T) {
+	RunQTest(t, eqtest.ModifyReportsAllFailureClasses)
+}

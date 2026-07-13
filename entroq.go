@@ -338,6 +338,16 @@ type Backend interface {
 	// now" sentinel; this keeps an omitted At immediately available and ordered
 	// at now across every backend and proxy hop, and a present/future At is
 	// preserved.
+	//
+	// 3. A DependencyError reports EVERY failing operation. When a modification
+	// cannot proceed, the returned DependencyError MUST enumerate all failures
+	// across all classes -- insert/doc-insert collisions, missing or
+	// version-mismatched changes/deletes/depends, claimed targets, and
+	// queue/namespace mismatches -- not merely the first class encountered. A
+	// caller acts on the full set: skip-colliding inserts in particular depend on
+	// collisions always being reported, even alongside other failures.
+	// (*DependencyError).Merge helps a backend that discovers failures in more
+	// than one pass fold them into a single such error.
 	Modify(ctx context.Context, mod *Modification) (*ModifyResponse, error)
 
 	// Docs returns a list of docs matching the given query.
@@ -1335,6 +1345,79 @@ func (m *DependencyError) HasAny() bool {
 // this particular error.
 func (m *DependencyError) OnlyClaims() bool {
 	return !m.HasMissing() && !m.HasCollisions() && !m.HasMissingDocs()
+}
+
+// Merge returns a new DependencyError combining the failures of m and other,
+// reporting each operation at most once per class -- deduplicated by task ID (or
+// namespaced doc ID), keeping m's entry on a tie so a more specific queue is
+// preserved. Either receiver or argument may be nil; it returns nil when the
+// combined result has no failures.
+//
+// This lets a backend that discovers failures in more than one pass (e.g. eqmem
+// computes queue-integrity failures under a global lock, then found-based
+// version/claim/collision failures under per-queue locks) report every failure
+// class in a single error, as Backend.Modify requires.
+func (m *DependencyError) Merge(other *DependencyError) *DependencyError {
+	if m == nil {
+		m = &DependencyError{}
+	}
+	if other == nil {
+		other = &DependencyError{}
+	}
+	cat := func(a, b []*TaskID) []*TaskID { return append(append([]*TaskID{}, a...), b...) }
+	catDoc := func(a, b []*DocID) []*DocID { return append(append([]*DocID{}, a...), b...) }
+	merged := &DependencyError{
+		Inserts:    dedupTaskIDs(cat(m.Inserts, other.Inserts)),
+		Depends:    dedupTaskIDs(cat(m.Depends, other.Depends)),
+		Deletes:    dedupTaskIDs(cat(m.Deletes, other.Deletes)),
+		Changes:    dedupTaskIDs(cat(m.Changes, other.Changes)),
+		Claims:     dedupTaskIDs(cat(m.Claims, other.Claims)),
+		DocInserts: dedupDocIDs(catDoc(m.DocInserts, other.DocInserts)),
+		DocDepends: dedupDocIDs(catDoc(m.DocDepends, other.DocDepends)),
+		DocDeletes: dedupDocIDs(catDoc(m.DocDeletes, other.DocDeletes)),
+		DocChanges: dedupDocIDs(catDoc(m.DocChanges, other.DocChanges)),
+		DocClaims:  dedupDocIDs(catDoc(m.DocClaims, other.DocClaims)),
+		Message:    m.Message,
+	}
+	if merged.Message == "" {
+		merged.Message = other.Message
+	}
+	if !merged.HasAny() {
+		return nil
+	}
+	return merged
+}
+
+// dedupTaskIDs keeps the first TaskID seen for each task ID, preserving order.
+func dedupTaskIDs(ids []*TaskID) []*TaskID {
+	seen := make(map[string]bool, len(ids))
+	var out []*TaskID
+	for _, id := range ids {
+		if id == nil || seen[id.ID] {
+			continue
+		}
+		seen[id.ID] = true
+		out = append(out, id)
+	}
+	return out
+}
+
+// dedupDocIDs keeps the first DocID seen for each namespaced doc ID.
+func dedupDocIDs(ids []*DocID) []*DocID {
+	seen := make(map[string]bool, len(ids))
+	var out []*DocID
+	for _, id := range ids {
+		if id == nil {
+			continue
+		}
+		k := DocKey(id.Namespace, id.ID)
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, id)
+	}
+	return out
 }
 
 // Error produces a helpful error string indicating what was missing.
