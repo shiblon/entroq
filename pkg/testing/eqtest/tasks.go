@@ -933,3 +933,32 @@ func ClaimRandomHead(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 }
 
 // WorkerDependencyHandler tests that the worker calls the dependency handler when a finish modify fails.
+
+// EmptyWriteTargetRejected verifies that a modification which would write to an
+// empty queue or namespace is rejected. An insert's queue and a doc insert's
+// namespace are write targets with no prior record to look up, so an empty one
+// would otherwise be silently written to "". Every backend enforces this via
+// Modification.EnsureModifyKeys, so it holds over gRPC too. (An empty change
+// destination is deliberately not asserted here: the gRPC service reads it as
+// "no move", so the behavior is path-dependent rather than a uniform invariant.)
+func EmptyWriteTargetRejected(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	// A task insert with no queue is rejected.
+	if _, err := client.Modify(ctx, entroq.InsertingInto("", entroq.WithValue("v"))); err == nil {
+		t.Errorf("insert into empty queue: got nil error, want rejection")
+	}
+
+	// A doc insert with no namespace is rejected.
+	if _, err := client.Modify(ctx, entroq.PuttingDocInto("",
+		entroq.WithIDKeys("empty-ns-doc", "", ""),
+		entroq.WithContent(json.RawMessage(`"v"`)),
+	)); err == nil {
+		t.Errorf("doc insert into empty namespace: got nil error, want rejection")
+	}
+
+	// A well-formed insert into a real queue still works: the guard is not
+	// over-broad.
+	realQ := path.Join(qPrefix, "empty_target_real")
+	if _, err := client.Modify(ctx, entroq.InsertingInto(realQ, entroq.WithValue("v"))); err != nil {
+		t.Errorf("insert into %q: unexpected error: %v", realQ, err)
+	}
+}

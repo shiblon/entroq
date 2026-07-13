@@ -25,6 +25,11 @@ import (
 // On success, changed tasks have their claimant field cleared: a task that
 // has been successfully modified is by definition no longer claimed.
 func (e *EQRedis) Modify(ctx context.Context, mod *entroq.Modification) (*entroq.ModifyResponse, error) {
+	// Reject writes to an empty queue/namespace once, before the WATCH/retry
+	// loop, so an empty queue is never written.
+	if err := mod.EnsureModifyKeys(); err != nil {
+		return nil, fmt.Errorf("eqredis modify: %w", err)
+	}
 	for {
 		resp, err := e.modifyOnce(ctx, mod)
 		if errors.Is(err, redis.TxFailedErr) {
@@ -290,10 +295,9 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 			for _, t := range mod.Changes {
 				st := states[t.ID]
 				oldQueue := st.fields.Queue
+				// EnsureModifyKeys (called at Modify entry) rejects an empty change
+				// destination, so t.Queue is non-empty here.
 				newQueue := t.Queue
-				if newQueue == "" {
-					newQueue = oldQueue
-				}
 				// Cap a far-past arrival to now (backend Modify contract).
 				newAtMs := entroq.NormalizeArrival(t.At, now).UnixMilli()
 

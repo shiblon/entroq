@@ -382,6 +382,10 @@ func TestModifyRejectsWrongQueue(t *testing.T) {
 	RunQTest(t, eqtest.ModifyRejectsWrongQueue)
 }
 
+func TestEmptyWriteTargetRejected(t *testing.T) {
+	RunQTest(t, eqtest.EmptyWriteTargetRejected)
+}
+
 func TestSimpleWorker(t *testing.T) {
 	RunQTest(t, eqtest.SimpleWorker)
 }

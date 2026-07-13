@@ -976,6 +976,41 @@ func (m *Modification) Options() []ModifyOption {
 	return m.options
 }
 
+// EnsureModifyKeys rejects a modification that would write to an empty queue or
+// namespace. The write targets are the operations with no prior record to look
+// up, so an empty key would otherwise be silently written to "": a task insert
+// and a task change must name a non-empty destination queue, and a doc insert
+// must name a non-empty namespace.
+//
+// It deliberately does not touch the other modify keys -- a delete's or depend's
+// queue, a change's source (FromQueue), and any doc namespace used to locate an
+// existing record. Those are not write targets: an empty one matches no stored
+// record and is already reported (a dependency error for tasks, a missing
+// dependency for docs).
+//
+// This is a pure check; the "empty destination means no move" ergonomic lives at
+// the gRPC service, where authorization is decided. Backends call this at the
+// start of Modify. Because direct-to-backend clients are not a supported path,
+// enforcing in the Go backend is sufficient: every supported write reaches one.
+func (m *Modification) EnsureModifyKeys() error {
+	for _, ins := range m.Inserts {
+		if ins.Queue == "" {
+			return fmt.Errorf("modify: insert of task %q must name a queue", ins.ID)
+		}
+	}
+	for _, c := range m.Changes {
+		if c.Queue == "" {
+			return fmt.Errorf("modify: change of task %q must name a destination queue", c.ID)
+		}
+	}
+	for _, ins := range m.DocInserts {
+		if ins.Namespace == "" {
+			return fmt.Errorf("modify: doc insert %q must name a namespace", ins.ID)
+		}
+	}
+	return nil
+}
+
 // modDependencies returns a dependency map for all modified task dependencies
 // (deletes and changes), and a parallel doc dependency map.
 func (m *Modification) modDependencies() (tasks map[string]int32, docs map[string]int32, err error) {

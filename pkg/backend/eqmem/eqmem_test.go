@@ -71,6 +71,10 @@ func TestEQMemModifyRejectsWrongQueue(t *testing.T) {
 	RunQTest(t, eqtest.ModifyRejectsWrongQueue)
 }
 
+func TestEQMemEmptyWriteTargetRejected(t *testing.T) {
+	RunQTest(t, eqtest.EmptyWriteTargetRejected)
+}
+
 func TestEQMemSimpleWorker(t *testing.T) {
 	RunQTest(t, eqtest.SimpleWorker)
 }

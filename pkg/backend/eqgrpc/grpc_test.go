@@ -121,6 +121,10 @@ func TestGRPCModifyRejectsWrongQueue(t *testing.T) {
 	RunQTest(t, eqtest.ModifyRejectsWrongQueue)
 }
 
+func TestGRPCEmptyWriteTargetRejected(t *testing.T) {
+	RunQTest(t, eqtest.EmptyWriteTargetRejected)
+}
+
 func TestGRPCSimpleWorker(t *testing.T) {
 	RunQTest(t, eqtest.SimpleWorker)
 }

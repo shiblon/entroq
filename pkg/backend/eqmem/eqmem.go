@@ -609,6 +609,12 @@ func (m *EQMem) queueUnsafeUpdateTask(ql *qLock, t *entroq.Task) func() {
 }
 
 func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (*entroq.ModifyResponse, error) {
+	// Reject writes to an empty queue/namespace on the live path. Journal replay
+	// goes straight to modifyImpl and skips this: it is trusted and its ops
+	// already carry valid keys.
+	if err := mod.EnsureModifyKeys(); err != nil {
+		return nil, fmt.Errorf("eqmem modify: %w", err)
+	}
 	start := time.Now()
 	defer func() {
 		m.modifyDuration.Record(ctx, time.Since(start).Seconds())

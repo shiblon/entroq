@@ -725,6 +725,11 @@ func RunningInTx(f func(context.Context, *sql.Tx) error) entroq.ModifyOption {
 // Modify attempts to apply an atomic modification to the task store. Either
 // all succeeds or all fails.
 func (b *EQPG) Modify(ctx context.Context, mod *entroq.Modification) (*entroq.ModifyResponse, error) {
+	// Reject writes to an empty queue/namespace before touching the database, so
+	// an empty queue is never written.
+	if err := mod.EnsureModifyKeys(); err != nil {
+		return nil, fmt.Errorf("eqpg modify: %w", err)
+	}
 	start := time.Now()
 	defer func() {
 		b.modifyDuration.Record(ctx, time.Since(start).Seconds())
