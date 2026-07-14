@@ -755,10 +755,14 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 	// Merge the queue-integrity failures (computed under the global lock in
 	// modPrep) with the found-based failures so a single DependencyError reports
 	// every failure class -- notably, insert collisions are still reported even
-	// when some other op named a wrong queue.
-	if depErr := queueDeps.Merge(foundDeps); depErr != nil {
-		if !replay || !depErr.OnlyClaims() {
-			return nil, fmt.Errorf("eqmem modify: %w", depErr)
+	// when some other op named a wrong queue. Guarded so the common success path
+	// (both nil) skips Merge entirely rather than allocating slices and dedup
+	// maps just to produce a nil error.
+	if queueDeps != nil || foundDeps != nil {
+		if depErr := queueDeps.Merge(foundDeps); depErr != nil {
+			if !replay || !depErr.OnlyClaims() {
+				return nil, fmt.Errorf("eqmem modify: %w", depErr)
+			}
 		}
 	}
 
