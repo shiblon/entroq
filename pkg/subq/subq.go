@@ -42,7 +42,7 @@ func (s *sub) Add() {
 func (s *sub) Done() {
 	defer un(lock(s))
 	if s.listeners == 0 {
-		log.Fatal("Done before Add")
+		log.Panic("Done before Add")
 	}
 	s.listeners--
 }

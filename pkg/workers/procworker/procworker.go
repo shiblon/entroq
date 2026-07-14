@@ -43,7 +43,7 @@ type Input struct {
 func (p *Input) JSON() []byte {
 	out, err := json.Marshal(p)
 	if err != nil {
-		log.Fatalf("Failed to marshal: %v", err)
+		log.Panicf("Failed to marshal: %v", err)
 	}
 	return out
 }
@@ -93,7 +93,7 @@ type Output struct {
 func (p *Output) JSON() []byte {
 	out, err := json.Marshal(p)
 	if err != nil {
-		log.Fatalf("Failed to marshal: %v", err)
+		log.Panicf("Failed to marshal: %v", err)
 	}
 	return out
 }

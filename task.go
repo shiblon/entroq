@@ -139,7 +139,7 @@ func WithRawValue(value json.RawMessage) InsertArg {
 
 // WithValue marshals v as JSON and uses it as the task value. It is a
 // "Must"-style function: if v cannot be marshaled (channels, functions,
-// cycles), it calls log.Fatal. These are programmer errors, not runtime
+// cycles), it calls log.Panicf. These are programmer errors, not runtime
 // conditions -- the type being marshaled is known at compile time. Use
 // WithRawValue for pre-marshaled data.
 //
@@ -149,7 +149,7 @@ func WithRawValue(value json.RawMessage) InsertArg {
 func WithValue(v any) InsertArg {
 	b, err := json.Marshal(v)
 	if err != nil {
-		log.Fatalf("entroq: WithValue: %v", err)
+		log.Panicf("entroq: WithValue: %v", err)
 	}
 	return WithRawValue(b)
 }
@@ -361,7 +361,7 @@ func ValueTo(v any) ChangeArg {
 	// Errors are code errors if something unmarshalable is passed (like chan).
 	b, err := json.Marshal(v)
 	if err != nil {
-		log.Fatalf("unmarshalable type ValueTo: %v", err)
+		log.Panicf("unmarshalable type ValueTo: %v", err)
 	}
 	return func(_ *Modification, t *Task) {
 		t.Value = b
