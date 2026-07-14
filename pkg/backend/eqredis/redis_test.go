@@ -153,16 +153,8 @@ func TestClaimLongDuration(t *testing.T) {
 	RunQTest(t, eqtest.ClaimLongDuration)
 }
 
-func TestWorkerDependencyHandler(t *testing.T) {
-	RunQTest(t, eqtest.WorkerDependencyHandler)
-}
-
 func TestWorkerCompactDependencyHandler(t *testing.T) {
 	RunQTest(t, eqtest.WorkerCompactDependencyHandler)
-}
-
-func TestWorkerRenewalNoDependencyHandler(t *testing.T) {
-	RunQTest(t, eqtest.WorkerRenewalNoDependencyHandler)
 }
 
 func TestSimpleDocLifecycle(t *testing.T) {

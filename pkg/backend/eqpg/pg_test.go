@@ -485,16 +485,8 @@ func Example_disableListenNotify() {
 	// notifications disabled
 }
 
-func TestWorkerDependencyHandler(t *testing.T) {
-	RunQTest(t, eqtest.WorkerDependencyHandler)
-}
-
 func TestWorkerCompactDependencyHandler(t *testing.T) {
 	RunQTest(t, eqtest.WorkerCompactDependencyHandler)
-}
-
-func TestWorkerRenewalNoDependencyHandler(t *testing.T) {
-	RunQTest(t, eqtest.WorkerRenewalNoDependencyHandler)
 }
 
 func TestPGSimpleDocLifecycle(t *testing.T) {

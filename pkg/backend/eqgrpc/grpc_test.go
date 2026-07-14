@@ -155,16 +155,8 @@ func TestGRPCDeleteMissingTask(t *testing.T) {
 	RunQTest(t, eqtest.DeleteMissingTask)
 }
 
-func TestGRPCWorkerDependencyHandler(t *testing.T) {
-	RunQTest(t, eqtest.WorkerDependencyHandler)
-}
-
 func TestGRPCWorkerCompactDependencyHandler(t *testing.T) {
 	RunQTest(t, eqtest.WorkerCompactDependencyHandler)
-}
-
-func TestGRPCWorkerRenewalNoDependencyHandler(t *testing.T) {
-	RunQTest(t, eqtest.WorkerRenewalNoDependencyHandler)
 }
 
 func TestGRPCSimpleDocLifecycle(t *testing.T) {

@@ -142,6 +142,7 @@ type DoModifyRun[T any] func(context.Context, *entroq.Task, T, []*entroq.Doc) (*
 type Result struct {
 	mods      []entroq.ModifyArg
 	onSuccess func(context.Context) error
+	onDependency func(context.Context, *entroq.DependencyError) error
 }
 
 // Modify begins a Result that applies args after work completes. The worker
@@ -168,6 +169,19 @@ func Modify(args ...entroq.ModifyArg) *Result {
 // handler returns, before the worker commits.
 func (r *Result) OnSuccess(fn func(context.Context) error) *Result {
 	r.onSuccess = fn
+	return r
+}
+
+// OnDependency attaches fn to run when there is a dependency error (task
+// missing, already claimed, etc.). This function runs after DoModify
+// completes, so within a window that is less than a full claim period, but
+// probably not much less than half the claim period for the task if it is not
+// implicated (if the result would have succeeded but for some *other* task or
+// document).
+//
+// Any operations attempted on the task at this point are purely optimistic.
+func (r *Result) OnDependency(fn func(context.Context, *entroq.DependencyError) error) *Result {
+	r.onDependency = fn
 	return r
 }
 
@@ -322,8 +336,13 @@ func (h *doModifyHandler[T]) Finish(ctx context.Context, mod Modifier, finalTask
 		}
 
 		if _, err := mod.Modify(ctx, entroq.WithModification(modification)); err != nil {
-			if _, ok := entroq.AsDependency(err); ok {
-				log.Printf("Worker ack failed, throwing away: %v", err)
+			if depErr, ok := entroq.AsDependency(err); ok {
+				log.Printf("Worker ack failed: %v", err)
+				if fn := h.result.onDependency; fn != nil {
+					if err := fn(ctx, depErr); err != nil {
+						return fmt.Errorf("on dependency handler: %w", err)
+					}
+				}
 				return fmt.Errorf("worker doModify finish dependency: %w", err)
 			}
 			if entroq.IsCanceled(err) || entroq.IsTimeout(err) {
@@ -696,11 +715,6 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt) error {
 	// Phase 4: Finish with stable versions — renewal has stopped.
 	if err := handler.Finish(ctx, w.eqc, finalTask, value, finalDocs); err != nil {
 		if de, ok := entroq.AsDependency(err); ok {
-			if opts.onDepError != nil {
-				if err := opts.onDepError(ctx, finalTask, de); err != nil {
-					return fmt.Errorf("on dependency handler: %w", err)
-				}
-			}
 			log.Printf("Worker finish failed (%q), throwing away: %v", opts.qs, de)
 			return nil
 		}
@@ -721,21 +735,12 @@ type runOpt struct {
 	baseRetryDelay time.Duration
 	maxAttempts    int32
 	lease          time.Duration
-	onDepError     func(context.Context, *entroq.Task, *entroq.DependencyError) error
 }
 
 // Watching specifies the queues Run will watch.
 func Watching(qs ...string) RunOption {
 	return func(ro *runOpt) {
 		ro.qs = qs
-	}
-}
-
-// WithDependencyHandler specifies the function to call when a task dependency
-// fails. Use to, for example, reload stale config tasks.
-func WithDependencyHandler(f func(ctx context.Context, task *entroq.Task, de *entroq.DependencyError) error) RunOption {
-	return func(ro *runOpt) {
-		ro.onDepError = f
 	}
 }
 

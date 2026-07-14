@@ -544,84 +544,6 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 	}
 }
 
-// ClaimUnblocksOnNotify verifies that Claim wakes promptly when a task is
-// inserted rather than waiting the full poll interval. Backends that implement
-// a NotifyWaiter (eqpg via LISTEN/NOTIFY, eqmem via in-process signaling)
-// should pass easily; a poll-only backend would time out.
-func WorkerDependencyHandler(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	queue := path.Join(qPrefix, "worker_dep_handler")
-	confQueue := path.Join(queue, "config")
-
-	// Insert a task.
-	resp, err := client.Modify(ctx,
-		entroq.InsertingInto(queue, entroq.WithValue("dep-task")),
-		entroq.InsertingInto(confQueue), // empty task to depend on
-	)
-	if err != nil {
-		t.Fatalf("Insert: %v", err)
-	}
-	inserted := resp.InsertedTasks
-	_ = inserted[0]
-	confTask := inserted[1]
-
-	// Signaling channels.
-	inWork := make(chan bool)
-	letFinish := make(chan bool)
-	handlerCalled := make(chan bool, 1)
-
-	w := worker.New(client,
-		worker.WithDoWork(func(ctx context.Context, task *entroq.Task, val string, _ []*entroq.Doc) error {
-			inWork <- true
-			<-letFinish
-			return nil
-		}),
-		worker.WithFinish(func(ctx context.Context, mod worker.Modifier, task *entroq.Task, val string, _ []*entroq.Doc) error {
-			// Try to delete the task. This will fail because we'll modify it in the main thread.
-			_, err := mod.Modify(ctx, task.Delete(), confTask.Depend())
-			return err
-		}),
-	)
-
-	runCtx, runCancel := context.WithCancel(ctx)
-	defer runCancel()
-
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- w.Run(runCtx, worker.Watching(queue),
-			worker.WithDependencyHandler(func(ctx context.Context, task *entroq.Task, de *entroq.DependencyError) error {
-				handlerCalled <- true
-				return nil
-			}))
-	}()
-
-	// Wait for worker to be in work.
-	select {
-	case <-inWork:
-	case <-ctx.Done():
-		t.Fatal("Timeout waiting for work to start")
-	}
-
-	// Now modify the config task in the main thread to force a version mismatch for the worker.
-	if _, err := client.Modify(ctx, confTask.Change(entroq.ArrivalTimeBy(2*time.Second))); err != nil {
-		t.Fatalf("Main thread modify: %v", err)
-	}
-
-	// Release the worker to let it try to finish.
-	letFinish <- true
-
-	// Verify handler is called.
-	select {
-	case <-handlerCalled:
-	case err := <-errCh:
-		t.Fatalf("Worker exited before handler called: %v", err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("Timeout waiting for dependency handler")
-	}
-
-	runCancel()
-	<-errCh
-}
-
 // WorkerCompactDependencyHandler tests that the bubble-up logic works for WithDoModify.
 func WorkerCompactDependencyHandler(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	queue := path.Join(qPrefix, "worker_compact_dep_handler")
@@ -646,7 +568,12 @@ func WorkerCompactDependencyHandler(ctx context.Context, t *testing.T, client *e
 		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, val string, _ []*entroq.Doc) (*worker.Result, error) {
 			inWork <- true
 			<-letFinish
-			return worker.Modify(task.Delete(), confTask.Depend()), nil
+			return worker.
+				Modify(task.Delete(), confTask.Depend()).
+				OnDependency(func(context.Context, *entroq.DependencyError) error {
+					handlerCalled <- true
+					return nil
+				}), nil
 		}),
 	)
 
@@ -655,11 +582,7 @@ func WorkerCompactDependencyHandler(ctx context.Context, t *testing.T, client *e
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- w.Run(runCtx, worker.Watching(queue),
-			worker.WithDependencyHandler(func(ctx context.Context, task *entroq.Task, de *entroq.DependencyError) error {
-				handlerCalled <- true
-				return nil
-			}))
+		errCh <- w.Run(runCtx, worker.Watching(queue))
 	}()
 
 	select {
@@ -686,78 +609,5 @@ func WorkerCompactDependencyHandler(ctx context.Context, t *testing.T, client *e
 	runCancel()
 	if err := <-errCh; err != nil && !entroq.IsCanceled(err) {
 		t.Errorf("worker exit: %v", err)
-	}
-}
-
-// WorkerRenewalNoDependencyHandler verifies that renewal failures don't trigger the hook.
-func WorkerRenewalNoDependencyHandler(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	queue := path.Join(qPrefix, "worker_renewal_no_dep")
-
-	resp, err := client.Modify(ctx, entroq.InsertingInto(queue))
-	if err != nil {
-		t.Fatalf("Insert: %v", err)
-	}
-	task := resp.InsertedTasks[0]
-
-	inWork := make(chan bool)
-	handlerCalled := make(chan bool, 1)
-
-	// Lease shorter than our wait time to force renewal.
-	const lease = 2 * time.Second
-
-	w := worker.New(client,
-		worker.WithDoWork(func(ctx context.Context, task *entroq.Task, val string, _ []*entroq.Doc) error {
-			inWork <- true
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(4 * time.Second): // Wait long enough for renewal attempt.
-			}
-			return nil
-		}),
-	)
-
-	runCtx, runCancel := context.WithCancel(ctx)
-	defer runCancel()
-
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- w.Run(runCtx, worker.Watching(queue),
-			worker.WithDependencyHandler(func(ctx context.Context, task *entroq.Task, de *entroq.DependencyError) error {
-				t.Errorf("Dependency handler should NOT be called for renewal failure!")
-				handlerCalled <- true
-				return nil
-			}))
-	}()
-
-	select {
-	case <-inWork:
-	case <-ctx.Done():
-		t.Fatal("Timeout waiting for work to start")
-	}
-
-	// Modify the task to break renewal.
-	tasks, err := client.Tasks(ctx, queue)
-	if err != nil {
-		t.Fatalf("Tasks: %v", err)
-	}
-	if len(tasks) == 0 {
-		t.Fatal("No tasks found to modify")
-	}
-	task = tasks[0]
-
-	if _, err := client.Modify(ctx, task.Change(entroq.RawValueTo([]byte("\"broken-renewal\"")))); err != nil {
-		t.Fatalf("Main thread modify: %v", err)
-	}
-
-	// Wait for renewal to fail and worker to notice.
-	// Since we expect NO handler call, we just wait for a bit.
-	select {
-	case <-handlerCalled:
-		t.Fatal("Dependency handler called for renewal failure!")
-	case err := <-errCh:
-		t.Fatalf("Worker exited before handler called: %v", err)
-	case <-time.After(5 * time.Second):
-		// Success: handler wasn't called.
 	}
 }
