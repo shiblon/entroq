@@ -489,6 +489,10 @@ func TestWorkerCompactDependencyHandler(t *testing.T) {
 	RunQTest(t, eqtest.WorkerCompactDependencyHandler)
 }
 
+func TestWorkerDependencyMove(t *testing.T) {
+	RunQTest(t, eqtest.WorkerDependencyMove)
+}
+
 func TestPGSimpleDocLifecycle(t *testing.T) {
 	RunQTest(t, eqtest.SimpleDocLifecycle)
 }

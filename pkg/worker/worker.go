@@ -172,14 +172,25 @@ func (r *Result) OnSuccess(fn func(context.Context) error) *Result {
 	return r
 }
 
-// OnDependency attaches fn to run when there is a dependency error (task
-// missing, already claimed, etc.). This function runs after DoModify
-// completes, so within a window that is less than a full claim period, but
-// probably not much less than half the claim period for the task if it is not
-// implicated (if the result would have succeeded but for some *other* task or
+// OnDependency attaches fn to run when the commit fails with a dependency error
+// (task missing, already claimed, a depended-on doc gone, etc.). It runs after
+// DoModify completes, so within a window that is less than a full claim period,
+// but probably not much less than half of it for the task itself if the task was
+// not implicated (the result would have succeeded but for some *other* task or
 // document).
 //
-// Any operations attempted on the task at this point are purely optimistic.
+// The return value selects the task's disposition using the same sentinels as
+// the work phase: a RetryError (optionally with After/OrMoveTo) re-queues with
+// backoff and quarantines once attempts are exhausted; a MoveError quarantines
+// immediately; a FatalError stops the worker; nil leaves the task to be
+// reclaimed on lease expiry. Because the commit already failed and renewal has
+// stopped, any such disposition is itself optimistic: it lands only if the task
+// was not itself implicated in the failure (and so is still validly claimed).
+//
+// Returning any other (non-sentinel) error stops the worker: an unclassified
+// failure leaves the loop in an unknown state, and crashing for the orchestrator
+// to restart is safer than continuing from it. Classify the failures you
+// understand as Retry/Move so only genuine surprises bring the worker down.
 func (r *Result) OnDependency(fn func(context.Context, *entroq.DependencyError) error) *Result {
 	r.onDependency = fn
 	return r
@@ -339,8 +350,12 @@ func (h *doModifyHandler[T]) Finish(ctx context.Context, mod Modifier, finalTask
 			if depErr, ok := entroq.AsDependency(err); ok {
 				log.Printf("Worker ack failed: %v", err)
 				if fn := h.result.onDependency; fn != nil {
-					if err := fn(ctx, depErr); err != nil {
-						return fmt.Errorf("on dependency handler: %w", err)
+					// A returned Retry/Move/Fatal sentinel is honored by runOne
+					// via handleSentinelErrors, exactly like a work-phase sentinel;
+					// any other non-nil error stops the worker. A nil return falls
+					// through to the default reclaim below.
+					if ferr := fn(ctx, depErr); ferr != nil {
+						return ferr
 					}
 				}
 				return fmt.Errorf("worker doModify finish dependency: %w", err)
@@ -564,6 +579,12 @@ func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, ta
 			q = re.moveTo
 		}
 		if _, err := w.eqc.Modify(ctx, task.RetryOrQuarantine(re.Error(), q, opts.maxAttempts, entroq.ArrivalTimeBy(delay))); err != nil {
+			if _, ok := entroq.AsDependency(err); ok {
+				// Optimistic: the task moved out from under us (already reclaimed
+				// or handled elsewhere). Known state, not fatal -- log and continue.
+				log.Printf("retry/quarantine skipped, task no longer ours: %v", err)
+				return true, nil
+			}
 			return true, fmt.Errorf("retry or quarantine modify: %w", err)
 		}
 		return true, nil
@@ -574,6 +595,12 @@ func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, ta
 			q = me.to
 		}
 		if _, err := w.eqc.Modify(ctx, task.Quarantine(me.Error(), q)); err != nil {
+			if _, ok := entroq.AsDependency(err); ok {
+				// Optimistic: the task moved out from under us (already reclaimed
+				// or handled elsewhere). Known state, not fatal -- log and continue.
+				log.Printf("quarantine skipped, task no longer ours: %v", err)
+				return true, nil
+			}
 			return true, fmt.Errorf("quarantine modify: %w", err)
 		}
 		return true, nil
@@ -714,6 +741,13 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt) error {
 
 	// Phase 4: Finish with stable versions — renewal has stopped.
 	if err := handler.Finish(ctx, w.eqc, finalTask, value, finalDocs); err != nil {
+		// A post-commit hook (OnDependency) may return a Retry/Move/Fatal
+		// sentinel; route it through the same machinery as a work-phase sentinel
+		// before falling back to the default dependency reclaim.
+		errQ := w.ErrorQueueFor(task.Queue)
+		if isSentinel, serr := w.handleSentinelErrors(ctx, err, finalTask, errQ, opts); isSentinel {
+			return serr
+		}
 		if de, ok := entroq.AsDependency(err); ok {
 			log.Printf("Worker finish failed (%q), throwing away: %v", opts.qs, de)
 			return nil
@@ -777,8 +811,26 @@ func isSentinelError(err error) bool {
 	return ok
 }
 
-// Run claims tasks from the worker queues and processes them in a loop until
-// its context is canceled or an unrecoverable error is encountered.
+// Run claims tasks from the worker queues and processes them in a loop until its
+// context is canceled or an unclassified error forces it to exit.
+//
+// Error disposition is a deliberate ladder, applied in order to whatever a
+// handler or the commit returns:
+//
+//   - Sentinel (RetryError/MoveError/FatalError): acted on. Retry re-queues the
+//     task with backoff, quarantining once max-attempts is reached; Move
+//     quarantines it immediately; Fatal stops the worker. Retry and Move keep the
+//     loop running, Fatal exits.
+//   - DependencyError: reclaimed. The commit cleanly did not apply (a version
+//     moved, a dependency was lost), a known state, so the task is left to be
+//     re-claimed on lease expiry and the loop continues. See OnDependency to
+//     inspect and redirect this case.
+//   - Context cancellation or timeout: a clean stop; Run returns nil.
+//   - Anything else: the worker exits. An unclassified error leaves the loop in an
+//     unknown state, and crashing for an orchestrator to restart is safer, and
+//     louder and thus more fixable, than continuing from state neither the author
+//     nor the framework reasoned about. Classify the failures you understand as
+//     Retry/Move so only genuine surprises bring the worker down.
 func (w *Worker[T]) Run(ctx context.Context, opts ...RunOption) error {
 	ro := &runOpt{
 		lease:          entroq.DefaultClaimDuration,

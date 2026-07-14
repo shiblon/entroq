@@ -509,6 +509,10 @@ func TestEQMemWorkerCompactDependencyHandler(t *testing.T) {
 	RunQTest(t, eqtest.WorkerCompactDependencyHandler)
 }
 
+func TestEQMemWorkerDependencyMove(t *testing.T) {
+	RunQTest(t, eqtest.WorkerDependencyMove)
+}
+
 func TestEQMemSimpleDocLifecycle(t *testing.T) {
 	RunQTest(t, eqtest.SimpleDocLifecycle)
 }

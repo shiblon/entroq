@@ -611,3 +611,86 @@ func WorkerCompactDependencyHandler(ctx context.Context, t *testing.T, client *e
 		t.Errorf("worker exit: %v", err)
 	}
 }
+
+// WorkerDependencyMove verifies that an OnDependency handler returning a
+// MoveError quarantines the still-claimed input task. The commit fails on some
+// OTHER dependency (a separate config task), so the input task is not implicated
+// and remains validly claimed; the handler judges the failure unrecoverable and
+// moves the task to the error queue rather than leaving it to be reclaimed.
+func WorkerDependencyMove(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	queue := path.Join(qPrefix, "worker_dep_move")
+	confQueue := path.Join(queue, "config")
+	errQueue := path.Join(queue, "errors")
+
+	resp, err := client.Modify(ctx,
+		entroq.InsertingInto(queue, entroq.WithValue("dep-move-task")),
+		entroq.InsertingInto(confQueue), // a separate task to depend on
+	)
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	inputTask := resp.InsertedTasks[0]
+	confTask := resp.InsertedTasks[1]
+
+	inWork := make(chan bool)
+	letFinish := make(chan bool)
+
+	w := worker.New(client,
+		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, val string, _ []*entroq.Doc) (*worker.Result, error) {
+			inWork <- true
+			<-letFinish
+			return worker.
+				Modify(task.Delete(), confTask.Depend()).
+				OnDependency(func(context.Context, *entroq.DependencyError) error {
+					return worker.MoveErrorf("dependency gone, quarantining").To(errQueue)
+				}), nil
+		}),
+	)
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- w.Run(runCtx, worker.Watching(queue)) }()
+
+	select {
+	case <-inWork:
+	case <-ctx.Done():
+		t.Fatal("Timeout waiting for work to start")
+	}
+
+	// Break the OTHER dependency, leaving the input task validly claimed, so the
+	// commit fails but the input task can still be moved by the handler.
+	if _, err := client.Modify(ctx, confTask.Change(entroq.ArrivalTimeBy(2*time.Second))); err != nil {
+		t.Fatalf("Modify dependency: %v", err)
+	}
+
+	letFinish <- true
+
+	// The handler's MoveError should quarantine the input task into errQueue.
+	deadline := time.After(5 * time.Second)
+	for {
+		tasks, err := client.Tasks(ctx, errQueue)
+		if err != nil {
+			t.Fatalf("Tasks(%q): %v", errQueue, err)
+		}
+		if len(tasks) == 1 {
+			if tasks[0].ID != inputTask.ID {
+				t.Errorf("quarantined task ID = %q, want %q", tasks[0].ID, inputTask.ID)
+			}
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("input task was not quarantined to the error queue")
+		case err := <-errCh:
+			t.Fatalf("worker exited before quarantine: %v", err)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+
+	runCancel()
+	if err := <-errCh; err != nil && !entroq.IsCanceled(err) {
+		t.Errorf("worker exit: %v", err)
+	}
+}
