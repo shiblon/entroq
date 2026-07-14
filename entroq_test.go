@@ -241,6 +241,35 @@ func TestOnlyClaimsIgnoresMissingDocs(t *testing.T) {
 	}
 }
 
+func TestDependencyErrorImplicates(t *testing.T) {
+	const target = "task-1"
+	self := &entroq.TaskID{ID: target, Version: 5}
+	other := &entroq.TaskID{ID: "task-2", Version: 3}
+
+	for _, tc := range []struct {
+		name string
+		err  *entroq.DependencyError
+		want bool
+	}{
+		{"empty", &entroq.DependencyError{}, false},
+		{"in changes", &entroq.DependencyError{Changes: []*entroq.TaskID{self}}, true},
+		{"in deletes", &entroq.DependencyError{Deletes: []*entroq.TaskID{self}}, true},
+		{"in depends", &entroq.DependencyError{Depends: []*entroq.TaskID{self}}, true},
+		{"in claims (scooped)", &entroq.DependencyError{Claims: []*entroq.TaskID{self}}, true},
+		{"in inserts (collision)", &entroq.DependencyError{Inserts: []*entroq.TaskID{self}}, true},
+		{"only another task", &entroq.DependencyError{Changes: []*entroq.TaskID{other}}, false},
+		// Task-scoped: a doc sharing the id must not implicate the task.
+		{"only a doc with same id", &entroq.DependencyError{DocDeletes: []*entroq.DocID{{Namespace: "ns", ID: target, Version: 1}}}, false},
+		{"mixed, self present", &entroq.DependencyError{Depends: []*entroq.TaskID{other}, Claims: []*entroq.TaskID{self}}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.err.Implicates(target); got != tc.want {
+				t.Errorf("Implicates(%q) = %v, want %v", target, got, tc.want)
+			}
+		})
+	}
+}
+
 // Example_docBasics demonstrates creating, reading, updating, and deleting a doc.
 func Example_docBasics() {
 	ctx := context.Background()
