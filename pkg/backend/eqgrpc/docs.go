@@ -7,13 +7,14 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/pbconv"
 
 	pb "github.com/shiblon/entroq/api"
 )
 
 // fromDocProto converts a proto Doc to an entroq.Doc.
 func fromDocProto(d *pb.Doc) *entroq.Doc {
-	content, err := protoToJSON(d.Content)
+	content, err := pbconv.ProtoToJSON(d.Content)
 	if err != nil {
 		log.Printf("ERROR: doc content conversion: %v", err)
 	}
@@ -22,12 +23,12 @@ func fromDocProto(d *pb.Doc) *entroq.Doc {
 		ID:           d.Id,
 		Version:      d.Version,
 		Claimant:     d.Claimant,
-		At:           fromMS(d.AtMs),
+		At:           pbconv.FromMS(d.AtMs),
 		Key:          d.Key,
 		SecondaryKey: d.SecondaryKey,
 		Content:      content,
-		Created:      fromMS(d.CreatedMs),
-		Modified:     fromMS(d.ModifiedMs),
+		Created:      pbconv.FromMS(d.CreatedMs),
+		Modified:     pbconv.FromMS(d.ModifiedMs),
 	}
 }
 
