@@ -268,26 +268,6 @@ func (s *QSvc) Authorize(ctx context.Context, req *authz.Request) error {
 	return nil
 }
 
-func protoFromTask(t *entroq.Task) (*pb.Task, error) {
-	val, err := pbconv.JSONToProto(t.Value)
-	if err != nil {
-		return nil, fmt.Errorf("task value: %w", err)
-	}
-	return &pb.Task{
-		Queue:      t.Queue,
-		Id:         t.ID,
-		Version:    t.Version,
-		AtMs:       pbconv.ToMS(t.At),
-		ClaimantId: t.Claimant,
-		Claims:     t.Claims,
-		Value:      val,
-		CreatedMs:  pbconv.ToMS(t.Created),
-		ModifiedMs: pbconv.ToMS(t.Modified),
-		Attempt:    t.Attempt,
-		Err:        t.Err,
-	}, nil
-}
-
 func autoCodeErrorf(format string, vals ...any) error {
 	err := fmt.Errorf(format, vals...)
 	if entroq.IsTimeout(err) {
@@ -454,7 +434,7 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 	if task == nil {
 		return new(pb.ClaimResponse), nil
 	}
-	pt, err := protoFromTask(task)
+	pt, err := pbconv.TaskToProto(task)
 	if err != nil {
 		return nil, autoCodeErrorf("claim task proto: %w", err)
 	}
@@ -484,7 +464,7 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 	if task == nil {
 		return new(pb.ClaimResponse), nil
 	}
-	pt, err := protoFromTask(task)
+	pt, err := pbconv.TaskToProto(task)
 	if err != nil {
 		return nil, autoCodeErrorf("try-claim task proto: %w", err)
 	}
@@ -540,28 +520,28 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 	// Assemble the response.
 	pbResp := new(pb.ModifyResponse)
 	for _, task := range resp.InsertedTasks {
-		pt, err := protoFromTask(task)
+		pt, err := pbconv.TaskToProto(task)
 		if err != nil {
 			return nil, autoCodeErrorf("modify inserted task proto: %w", err)
 		}
 		pbResp.Inserted = append(pbResp.Inserted, pt)
 	}
 	for _, task := range resp.ChangedTasks {
-		pt, err := protoFromTask(task)
+		pt, err := pbconv.TaskToProto(task)
 		if err != nil {
 			return nil, autoCodeErrorf("modify changed task proto: %w", err)
 		}
 		pbResp.Changed = append(pbResp.Changed, pt)
 	}
 	for _, d := range resp.InsertedDocs {
-		pd, err := protoFromDoc(d)
+		pd, err := pbconv.DocToProto(d)
 		if err != nil {
 			return nil, autoCodeErrorf("modify inserted doc proto: %w", err)
 		}
 		pbResp.InsertedDocs = append(pbResp.InsertedDocs, pd)
 	}
 	for _, d := range resp.ChangedDocs {
-		pd, err := protoFromDoc(d)
+		pd, err := pbconv.DocToProto(d)
 		if err != nil {
 			return nil, autoCodeErrorf("modify changed doc proto: %w", err)
 		}
@@ -591,7 +571,7 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 	}
 	resp := new(pb.TasksResponse)
 	for _, task := range tasks {
-		pt, err := protoFromTask(task)
+		pt, err := pbconv.TaskToProto(task)
 		if err != nil {
 			return nil, autoCodeErrorf("tasks task proto: %w", err)
 		}
@@ -676,25 +656,6 @@ func (s *QSvc) Time(ctx context.Context, req *pb.TimeRequest) (*pb.TimeResponse,
 }
 
 // protoFromDoc converts an entroq.Doc to its proto representation.
-func protoFromDoc(d *entroq.Doc) (*pb.Doc, error) {
-	content, err := pbconv.JSONToProto(d.Content)
-	if err != nil {
-		return nil, fmt.Errorf("doc content: %w", err)
-	}
-	return &pb.Doc{
-		Namespace:    d.Namespace,
-		Id:           d.ID,
-		Version:      d.Version,
-		Claimant:     d.Claimant,
-		AtMs:         pbconv.ToMS(d.At),
-		Key:          d.Key,
-		SecondaryKey: d.SecondaryKey,
-		Content:      content,
-		CreatedMs:    pbconv.ToMS(d.Created),
-		ModifiedMs:   pbconv.ToMS(d.Modified),
-	}, nil
-}
-
 // docClaimDepDetails converts a DependencyError's doc fields into ModifyDep
 // detail messages for transport over gRPC status.
 func docClaimDepDetails(depErr *entroq.DependencyError) []proto.Message {
@@ -749,7 +710,7 @@ func (s *QSvc) Docs(ctx context.Context, req *pb.DocsRequest) (*pb.DocsResponse,
 	}
 	resp := new(pb.DocsResponse)
 	for _, d := range docs {
-		pd, err := protoFromDoc(d)
+		pd, err := pbconv.DocToProto(d)
 		if err != nil {
 			return nil, autoCodeErrorf("docs doc proto: %w", err)
 		}
@@ -823,7 +784,7 @@ func (s *QSvc) ClaimDocs(ctx context.Context, req *pb.ClaimDocsRequest) (*pb.Cla
 	}
 	resp := new(pb.ClaimDocsResponse)
 	for _, d := range claimed {
-		pd, err := protoFromDoc(d)
+		pd, err := pbconv.DocToProto(d)
 		if err != nil {
 			return nil, autoCodeErrorf("claim docs doc proto: %w", err)
 		}

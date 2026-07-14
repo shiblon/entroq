@@ -250,65 +250,6 @@ func (b *backend) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[s
 	return qs, nil
 }
 
-func fromTaskProto(t *pb.Task) (*entroq.Task, error) {
-	val, err := pbconv.ProtoToJSON(t.Value)
-	if err != nil {
-		return nil, fmt.Errorf("task value: %w", err)
-	}
-	return &entroq.Task{
-		Queue:    t.Queue,
-		ID:       t.Id,
-		Version:  t.Version,
-		At:       pbconv.FromMS(t.AtMs),
-		Claimant: t.ClaimantId,
-		Claims:   t.Claims,
-		Value:    val,
-		Created:  pbconv.FromMS(t.CreatedMs),
-		Modified: pbconv.FromMS(t.ModifiedMs),
-		// Omit FromQueue - not needed here.
-		Attempt: t.Attempt,
-		Err:     t.Err,
-	}, nil
-}
-
-func protoFromTaskData(td *entroq.TaskData) (*pb.TaskData, error) {
-	val, err := pbconv.JSONToProto(td.Value)
-	if err != nil {
-		return nil, fmt.Errorf("task data value: %w", err)
-	}
-	return &pb.TaskData{
-		Queue:   td.Queue,
-		AtMs:    pbconv.ToMS(td.At),
-		Value:   val,
-		Attempt: td.Attempt,
-		Err:     td.Err,
-		Id:      td.ID,
-	}, nil
-}
-
-func changeProtoFromTask(t *entroq.Task) (*pb.TaskChange, error) {
-	nd, err := protoFromTaskData(t.Data())
-	if err != nil {
-		return nil, fmt.Errorf("change task %s: %w", t.ID, err)
-	}
-	return &pb.TaskChange{
-		OldId: &pb.TaskID{
-			Id:      t.ID,
-			Version: t.Version,
-			Queue:   t.FromQueue, // old queue goes in the ID for changes.
-		},
-		NewData: nd,
-	}, nil
-}
-
-func fromTaskIDProto(tid *pb.TaskID) (*entroq.TaskID, error) {
-	return &entroq.TaskID{
-		ID:      tid.Id,
-		Version: tid.Version,
-		Queue:   tid.Queue,
-	}, nil
-}
-
 // Tasks produces a list of tasks in a given queue, possibly limited by claimant.
 func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Task, error) {
 	stream, err := pb.NewEntroQClient(b.conn).StreamTasks(ctx, &pb.TasksRequest{
@@ -331,7 +272,7 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 			return nil, fmt.Errorf("receive tasks: %w", unpackGRPCError(err))
 		}
 		for _, t := range resp.Tasks {
-			task, err := fromTaskProto(t)
+			task, err := pbconv.TaskFromProto(t)
 			if err != nil {
 				return nil, fmt.Errorf("parse tasks: %w", err)
 			}
@@ -369,7 +310,7 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 	if resp.Task == nil {
 		return nil, fmt.Errorf("no task returned from backend Claim")
 	}
-	return fromTaskProto(resp.Task)
+	return pbconv.TaskFromProto(resp.Task)
 }
 
 // TryClaim attempts to claim a task from the queue. Normally returns both a
@@ -386,7 +327,7 @@ func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 	if resp.Task == nil {
 		return nil, nil
 	}
-	return fromTaskProto(resp.Task)
+	return pbconv.TaskFromProto(resp.Task)
 }
 
 func authzErrFromStat(stat *status.Status) error {
@@ -462,10 +403,7 @@ func depErrorFromStat(stat *status.Status) error {
 			continue
 		}
 
-		tid, err := fromTaskIDProto(detail.Id)
-		if err != nil {
-			return fmt.Errorf("grpc dependency from proto: %w", err)
-		}
+		tid := pbconv.TaskIDFromProto(detail.Id)
 		switch detail.Type {
 		case pb.ActionType_CLAIM:
 			depErr.Claims = append(depErr.Claims, tid)
@@ -512,14 +450,14 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (*entroq
 		ClaimantId: mod.Claimant,
 	}
 	for _, ins := range mod.Inserts {
-		pd, err := protoFromTaskData(ins)
+		pd, err := pbconv.TaskDataToProto(ins)
 		if err != nil {
 			return nil, fmt.Errorf("grpc modify insert value: %w", err)
 		}
 		req.Inserts = append(req.Inserts, pd)
 	}
 	for _, task := range mod.Changes {
-		pc, err := changeProtoFromTask(task)
+		pc, err := pbconv.TaskChangeToProto(task)
 		if err != nil {
 			return nil, fmt.Errorf("grpc modify change value: %w", err)
 		}
@@ -592,24 +530,24 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (*entroq
 
 	mResp := new(entroq.ModifyResponse)
 	for _, t := range resp.GetInserted() {
-		task, err := fromTaskProto(t)
+		task, err := pbconv.TaskFromProto(t)
 		if err != nil {
 			return nil, fmt.Errorf("grpc modify task proto: %w", err)
 		}
 		mResp.InsertedTasks = append(mResp.InsertedTasks, task)
 	}
 	for _, t := range resp.GetChanged() {
-		task, err := fromTaskProto(t)
+		task, err := pbconv.TaskFromProto(t)
 		if err != nil {
 			return nil, fmt.Errorf("grpc modify changed: %w", err)
 		}
 		mResp.ChangedTasks = append(mResp.ChangedTasks, task)
 	}
 	for _, d := range resp.GetInsertedDocs() {
-		mResp.InsertedDocs = append(mResp.InsertedDocs, fromDocProto(d))
+		mResp.InsertedDocs = append(mResp.InsertedDocs, pbconv.MustDocFromProto(d))
 	}
 	for _, d := range resp.GetChangedDocs() {
-		mResp.ChangedDocs = append(mResp.ChangedDocs, fromDocProto(d))
+		mResp.ChangedDocs = append(mResp.ChangedDocs, pbconv.MustDocFromProto(d))
 	}
 
 	return mResp, nil
