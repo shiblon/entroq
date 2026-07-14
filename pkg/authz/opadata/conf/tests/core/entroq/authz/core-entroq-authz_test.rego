@@ -193,3 +193,35 @@ test_claimant_set_no_user_allow if {
 		with input.queues as [{"exact": "/q", "actions": ["CLAIM"]}]
 		with input.claimant_id as "anyone#abc123"
 }
+
+# A request naming an empty queue is denied outright, even for an admin holding
+# a wildcard (empty-prefix) grant: no queue, no perms.
+test_empty_queue_request_denied_even_with_wildcard if {
+	not allow with data.entroq.user.name as "admin"
+		with data.entroq.permissions.allowed_queues as [{"prefix": "", "actions": ["ALL"]}]
+		with data.entroq.permissions.allowed_namespaces as set()
+		with input.queues as [{"exact": "", "actions": ["DELETE"]}]
+}
+
+# The wildcard grant is untouched: it still authorizes any actually-named queue.
+test_wildcard_still_allows_named_queue if {
+	allow with data.entroq.user.name as "admin"
+		with data.entroq.permissions.allowed_queues as [{"prefix": "", "actions": ["ALL"]}]
+		with data.entroq.permissions.allowed_namespaces as set()
+		with input.queues as [{"exact": "/real/queue", "actions": ["DELETE", "CLAIM"]}]
+}
+
+# Same for namespaces: an empty namespace request is denied even with a wildcard.
+test_empty_namespace_request_denied_even_with_wildcard if {
+	not allow with data.entroq.user.name as "admin"
+		with data.entroq.permissions.allowed_queues as set()
+		with data.entroq.permissions.allowed_namespaces as [{"prefix": "", "actions": ["ALL"]}]
+		with input.namespaces as [{"exact": "", "actions": ["READ"]}]
+}
+
+test_wildcard_still_allows_named_namespace if {
+	allow with data.entroq.user.name as "admin"
+		with data.entroq.permissions.allowed_queues as set()
+		with data.entroq.permissions.allowed_namespaces as [{"prefix": "", "actions": ["ALL"]}]
+		with input.namespaces as [{"exact": "/real/ns", "actions": ["READ"]}]
+}

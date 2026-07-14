@@ -160,7 +160,7 @@ func TestDoModify_DocVersionFixedAfterRenewal(t *testing.T) {
 
 	if _, err := client.Modify(ctx,
 		entroq.InsertingInto("q", entroq.WithValue("work")),
-		entroq.InsertingDoc(&entroq.DocData{Namespace: "ns", Key: "k"}),
+		entroq.PuttingDoc(&entroq.DocData{Namespace: "ns", Key: "k"}),
 	); err != nil {
 		t.Fatalf("Insert task+doc: %v", err)
 	}

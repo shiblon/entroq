@@ -25,6 +25,11 @@ import (
 // On success, changed tasks have their claimant field cleared: a task that
 // has been successfully modified is by definition no longer claimed.
 func (e *EQRedis) Modify(ctx context.Context, mod *entroq.Modification) (*entroq.ModifyResponse, error) {
+	// Reject writes to an empty queue/namespace once, before the WATCH/retry
+	// loop, so an empty queue is never written.
+	if err := mod.EnsureModifyKeys(); err != nil {
+		return nil, fmt.Errorf("eqredis modify: %w", err)
+	}
 	for {
 		resp, err := e.modifyOnce(ctx, mod)
 		if errors.Is(err, redis.TxFailedErr) {
@@ -50,7 +55,7 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 	type watchedTask struct {
 		id      string
 		version int32
-		queue   string // known for deletes and changes; empty for depends
+		queue   string // claimed current queue for depends and deletes, matched against stored state (changes match their FromQueue on mod.Changes directly)
 	}
 
 	var watchKeys []string
@@ -59,7 +64,7 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 
 	for _, t := range mod.Depends {
 		watchKeys = append(watchKeys, taskKey(t.ID))
-		deps = append(deps, watchedTask{id: t.ID, version: t.Version})
+		deps = append(deps, watchedTask{id: t.ID, version: t.Version, queue: t.Queue})
 	}
 	for _, t := range mod.Deletes {
 		watchKeys = append(watchKeys, taskKey(t.ID))
@@ -192,12 +197,18 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 		// Step 2: verify versions -- semantic failure, no retry.
 		depErr := &entroq.DependencyError{}
 
+		// The queue is part of the modify key: an op must name the task's current
+		// queue (a change names its FromQueue), or it fails like a missing task.
+		// An empty or mismatched queue is rejected; there is no fill-in from
+		// stored state, which is exactly what would defeat the check.
 		for _, t := range deps {
 			st := states[t.id]
 			if !st.found {
 				depErr.Depends = append(depErr.Depends, &entroq.TaskID{ID: t.id, Version: t.version})
 			} else if st.fields.Version != t.version {
 				depErr.Depends = append(depErr.Depends, &entroq.TaskID{ID: t.id, Version: t.version})
+			} else if t.queue == "" || t.queue != st.fields.Queue {
+				depErr.Depends = append(depErr.Depends, &entroq.TaskID{ID: t.id, Version: t.version, Queue: t.queue})
 			}
 		}
 		for _, t := range dels {
@@ -206,6 +217,8 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 				depErr.Deletes = append(depErr.Deletes, &entroq.TaskID{ID: t.id, Version: t.version})
 			} else if st.fields.Version != t.version {
 				depErr.Deletes = append(depErr.Deletes, &entroq.TaskID{ID: t.id, Version: t.version})
+			} else if t.queue == "" || t.queue != st.fields.Queue {
+				depErr.Deletes = append(depErr.Deletes, &entroq.TaskID{ID: t.id, Version: t.version, Queue: t.queue})
 			} else if heldByOther(st.fields, mod.Claimant, nowMs) {
 				depErr.Claims = append(depErr.Claims, &entroq.TaskID{ID: t.id, Version: t.version})
 			}
@@ -216,6 +229,8 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 				depErr.Changes = append(depErr.Changes, &entroq.TaskID{ID: t.ID, Version: t.Version})
 			} else if st.fields.Version != t.Version {
 				depErr.Changes = append(depErr.Changes, &entroq.TaskID{ID: t.ID, Version: t.Version})
+			} else if t.FromQueue == "" || t.FromQueue != st.fields.Queue {
+				depErr.Changes = append(depErr.Changes, &entroq.TaskID{ID: t.ID, Version: t.Version, Queue: t.FromQueue})
 			} else if heldByOther(st.fields, mod.Claimant, nowMs) {
 				depErr.Claims = append(depErr.Claims, &entroq.TaskID{ID: t.ID, Version: t.Version})
 			}
@@ -280,14 +295,11 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 			for _, t := range mod.Changes {
 				st := states[t.ID]
 				oldQueue := st.fields.Queue
+				// EnsureModifyKeys (called at Modify entry) rejects an empty change
+				// destination, so t.Queue is non-empty here.
 				newQueue := t.Queue
-				if newQueue == "" {
-					newQueue = oldQueue
-				}
-				newAtMs := t.At.UnixMilli()
-				if t.At.IsZero() {
-					newAtMs = nowMs
-				}
+				// Cap a far-past arrival to now (backend Modify contract).
+				newAtMs := entroq.NormalizeArrival(t.At, now).UnixMilli()
 
 				// Future at: claim/renew (set claimant to modifier).
 				// Past/zero at: release (clear claimant).
@@ -333,10 +345,7 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 				if id == "" {
 					id = entroq.GenHex16()
 				}
-				atMs := (td.At).UnixMilli()
-				if td.At.IsZero() {
-					atMs = nowMs
-				}
+				atMs := entroq.NormalizeArrival(td.At, now).UnixMilli()
 
 				f := &taskFields{
 					ID:       id,
@@ -408,10 +417,8 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 				}
 				k := d.Namespace + "/" + d.ID
 				st := docStates[k]
-				newAtMs := int64(0)
-				if !d.At.IsZero() {
-					newAtMs = (d.At).UnixMilli()
-				}
+				// Cap a far-past arrival to now (backend Modify contract), same as tasks.
+				newAtMs := entroq.NormalizeArrival(d.At, now).UnixMilli()
 				newClaimant := ""
 				if newAtMs > nowMs {
 					newClaimant = claimant

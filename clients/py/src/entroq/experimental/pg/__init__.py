@@ -87,7 +87,8 @@ def _row_to_doc(row: dict) -> Doc:
 # ---------------------------------------------------------------------------
 
 def _encode_task_ids(items) -> str:
-    return json.dumps([{'id': str(i.id), 'version': i.version} for i in items])
+    # queue is part of the modify key: the backend matches it against stored state.
+    return json.dumps([{'id': str(i.id), 'version': i.version, 'queue': i.queue} for i in items])
 
 def _encode_task_inserts(items) -> str:
     out = []
@@ -105,7 +106,8 @@ def _encode_task_changes(items) -> str:
     for c in items:
         obj: dict = {
             'id': str(c.id), 'version': c.version,
-            'queue': c.queue, 'value': c.value,
+            # from_queue (source) is part of the modify key; queue is the destination.
+            'from_queue': c.from_queue, 'queue': c.queue, 'value': c.value,
         }
         if c.at:        obj['at'] = c.at.isoformat()
         if c.attempt:   obj['attempt'] = c.attempt
@@ -244,7 +246,7 @@ class Transaction:
 # Schema version check (sync: runs once at startup)
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = "1.6.0"
+SCHEMA_VERSION = "1.8.0"
 
 _INIT_HINT = (
     "Initialize the database with:\n\n"

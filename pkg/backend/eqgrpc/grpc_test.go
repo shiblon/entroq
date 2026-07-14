@@ -11,32 +11,30 @@ import (
 	"github.com/shiblon/entroq/pkg/testing/eqtest"
 )
 
-// TestGRPCClaimRetryLoopTransparent verifies that the gRPC client's internal
-// ClaimRetryInterval loop is invisible to callers: multiple retry-interval
-// timeouts fire and the Claim call does not return an error. The caller only
-// unblocks when a task actually becomes available.
-func TestGRPCClaimRetryLoopTransparent(t *testing.T) {
+// TestGRPCBlockingClaimUnblocksOnInsert verifies that a blocking Claim over gRPC
+// holds (no per-attempt deadline, no spurious error) while no task is available
+// and unblocks cleanly once one is inserted. This is the caller-visible contract
+// of the single blocking Claim RPC that replaced the old client retry loop.
+func TestGRPCBlockingClaimUnblocksOnInsert(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	s, dial, err := eqtest.StartService(ctx, eqmem.Opener())
+	stop, dial, err := eqtest.StartService(ctx, eqmem.Opener())
 	if err != nil {
 		t.Fatalf("start service: %v", err)
 	}
-	defer s.Stop()
+	defer stop()
 
-	// Use a very short retry interval so multiple loops fire during the test.
 	client, err := entroq.New(ctx, eqgrpc.Opener("bufnet",
 		eqgrpc.WithNiladicDialer(dial),
 		eqgrpc.WithInsecure(),
-		eqgrpc.WithClaimRetryInterval(50*time.Millisecond),
 	))
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
 	defer client.Close()
 
-	const q = "test/retry-loop"
+	const q = "test/blocking-claim"
 
 	claimDone := make(chan error, 1)
 	go func() {
@@ -44,7 +42,7 @@ func TestGRPCClaimRetryLoopTransparent(t *testing.T) {
 		claimDone <- err
 	}()
 
-	// Let several retry intervals fire with no task present.
+	// Give the blocking claim time to be waiting on the empty queue.
 	time.Sleep(300 * time.Millisecond)
 
 	select {
@@ -111,6 +109,18 @@ func TestGRPCSimpleChange(t *testing.T) {
 
 func TestGRPCTaskChangeFutureArrival(t *testing.T) {
 	RunQTest(t, eqtest.TaskChangeFutureArrival)
+}
+
+func TestGRPCTaskChangeFarPastArrivalNormalized(t *testing.T) {
+	RunQTest(t, eqtest.TaskChangeFarPastArrivalNormalized)
+}
+
+func TestGRPCModifyRejectsWrongQueue(t *testing.T) {
+	RunQTest(t, eqtest.ModifyRejectsWrongQueue)
+}
+
+func TestGRPCEmptyWriteTargetRejected(t *testing.T) {
+	RunQTest(t, eqtest.EmptyWriteTargetRejected)
 }
 
 func TestGRPCSimpleWorker(t *testing.T) {
@@ -195,4 +205,12 @@ func TestGRPCQueueStatsAccuracy(t *testing.T) {
 
 func TestGRPCNamespaceStats(t *testing.T) {
 	RunQTest(t, eqtest.NamespaceStats)
+}
+
+func TestGRPCModifyReportsAllFailureClasses(t *testing.T) {
+	RunQTest(t, eqtest.ModifyReportsAllFailureClasses)
+}
+
+func TestGRPCModifyRejectsWrongNamespace(t *testing.T) {
+	RunQTest(t, eqtest.ModifyRejectsWrongNamespace)
 }

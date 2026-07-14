@@ -49,6 +49,7 @@ import (
 	"github.com/shiblon/entroq/pkg/authz"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/shiblon/entroq/api"
@@ -60,27 +61,13 @@ const (
 	// DefaultAddr is the default listening address for gRPC services.
 	DefaultAddr = ":37706"
 
-	// ClaimRetryInterval is how long a grpc client holds a claim request open
-	// before dropping it and trying again.
-	ClaimRetryInterval = 2 * time.Minute
-
 	// MB helps with conversion to and from megabytes.
 	MB = 1024 * 1024
 )
 
 type backendOptions struct {
-	dialOpts           []grpc.DialOption
-	bearerToken        string
-	claimRetryInterval time.Duration
-}
-
-// WithClaimRetryInterval overrides how long the gRPC client holds a single
-// Claim RPC open before dropping it and retrying. Defaults to ClaimRetryInterval.
-// Primarily useful in tests where 2 minutes is impractical.
-func WithClaimRetryInterval(d time.Duration) Option {
-	return func(opts *backendOptions) {
-		opts.claimRetryInterval = d
-	}
+	dialOpts    []grpc.DialOption
+	bearerToken string
 }
 
 // Option allows grpc-opener-specific options to be sent in Opener.
@@ -173,7 +160,20 @@ func Opener(addr string, opts ...Option) entroq.BackendOpener {
 	}
 
 	return func(ctx context.Context) (entroq.Backend, error) {
-		conn, err := grpc.DialContext(ctx, addr, options.dialOpts...)
+		// Keepalive lets the client notice a dead connection during a long-held
+		// blocking Claim RPC and fail it, so the error surfaces to the caller
+		// instead of hanging on a silently-broken connection. This matters because
+		// Claim has no per-attempt deadline (see backend.Claim): a dead connection
+		// is caught here, by keepalive, not by canceling the RPC. PermitWithoutStream
+		// stays false, so pings go only while a Claim stream is active, which a
+		// default server tolerates. Prepended so a caller's WithDialOpts can override it.
+		dialOpts := append([]grpc.DialOption{
+			grpc.WithKeepaliveParams(keepalive.ClientParameters{
+				Time:    30 * time.Second,
+				Timeout: 20 * time.Second,
+			}),
+		}, options.dialOpts...)
+		conn, err := grpc.DialContext(ctx, addr, dialOpts...)
 		if err != nil {
 			return nil, fmt.Errorf("dial %q: %w", addr, err)
 		}
@@ -190,21 +190,15 @@ func Opener(addr string, opts ...Option) entroq.BackendOpener {
 }
 
 type backend struct {
-	conn               *grpc.ClientConn
-	claimRetryInterval time.Duration
+	conn *grpc.ClientConn
 }
 
 // New creates a new gRPC backend that attaches to the task service via gRPC.
-func New(conn *grpc.ClientConn, opts ...Option) (*backend, error) {
-	options := new(backendOptions)
-	for _, opt := range opts {
-		opt(options)
-	}
-	interval := options.claimRetryInterval
-	if interval <= 0 {
-		interval = ClaimRetryInterval
-	}
-	return &backend{conn: conn, claimRetryInterval: interval}, nil
+// Options are consumed by Opener at dial time (dial options and credentials);
+// the backend itself holds no option-derived state, so opts is accepted for API
+// symmetry but not read here.
+func New(conn *grpc.ClientConn, _ ...Option) (*backend, error) {
+	return &backend{conn: conn}, nil
 }
 
 // Close closes the underlying connection to the gRPC task service.
@@ -386,36 +380,32 @@ func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.T
 // Claim attempts to claim a task and blocks until one is ready or the
 // operation is canceled.
 func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
-	for {
-		// Check whether the parent context was canceled.
-		select {
-		case <-ctx.Done():
-			return nil, fmt.Errorf("grpc claim caller: %w", ctx.Err())
-		default:
+	// A single blocking Claim, bounded only by the caller's context -- no
+	// per-attempt deadline and no retry loop. Canceling an in-flight Claim would
+	// race the server's delivery of a claim it has already committed, stranding
+	// that task (claimed, unavailable) until its claim duration expires. A
+	// silently-dead connection is surfaced by client keepalive (see Opener),
+	// which fails this RPC so the error reaches the caller -- a worker then stops
+	// and lets orchestration restart it -- rather than hanging forever. The
+	// residual two-generals case (a committed claim whose response never arrives)
+	// is a bounded latency cost, not a correctness one: the task self-heals when
+	// its claim duration expires and can be claimed again.
+	resp, err := pb.NewEntroQClient(b.conn).Claim(ctx, &pb.ClaimRequest{
+		ClaimantId: cq.Claimant,
+		Queues:     cq.Queues,
+		DurationMs: int64(cq.Duration / time.Millisecond),
+		PollMs:     int64(cq.PollTime / time.Millisecond),
+	})
+	if err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, fmt.Errorf("grpc claim caller: %w", cerr)
 		}
-		ctx, cancel := context.WithTimeout(ctx, b.claimRetryInterval)
-		resp, err := pb.NewEntroQClient(b.conn).Claim(ctx, &pb.ClaimRequest{
-			ClaimantId: cq.Claimant,
-			Queues:     cq.Queues,
-			DurationMs: int64(cq.Duration / time.Millisecond),
-			PollMs:     int64(cq.PollTime / time.Millisecond),
-		})
-		cancel() // cleanup just in case.
-		if err != nil {
-			if entroq.IsTimeout(err) || isGRPCTimeout(err) {
-				// If we just timed out on our little request context, then
-				// we can go around again.
-				// It's possible that the *parent* context timed out, which
-				// is why we check that at the beginning of the loop, as well.
-				continue
-			}
-			return nil, fmt.Errorf("grpc claim response: %w", unpackGRPCError(err))
-		}
-		if resp.Task == nil {
-			return nil, fmt.Errorf("no task returned from backend Claim")
-		}
-		return fromTaskProto(resp.Task)
+		return nil, fmt.Errorf("grpc claim response: %w", unpackGRPCError(err))
 	}
+	if resp.Task == nil {
+		return nil, fmt.Errorf("no task returned from backend Claim")
+	}
+	return fromTaskProto(resp.Task)
 }
 
 // TryClaim attempts to claim a task from the queue. Normally returns both a
@@ -528,17 +518,6 @@ func depErrorFromStat(stat *status.Status) error {
 		}
 	}
 	return depErr
-}
-
-func isGRPCTimeout(grpcErr error) bool {
-	if grpcErr == nil {
-		return false
-	}
-	stat, ok := status.FromError(grpcErr)
-	if !ok {
-		return false
-	}
-	return stat.Code() == codes.DeadlineExceeded
 }
 
 func unpackGRPCError(grpcErr error) error {

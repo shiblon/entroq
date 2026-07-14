@@ -374,6 +374,18 @@ func TestSimpleChange(t *testing.T) {
 	RunQTest(t, eqtest.SimpleChange)
 }
 
+func TestTaskChangeFarPastArrivalNormalized(t *testing.T) {
+	RunQTest(t, eqtest.TaskChangeFarPastArrivalNormalized)
+}
+
+func TestModifyRejectsWrongQueue(t *testing.T) {
+	RunQTest(t, eqtest.ModifyRejectsWrongQueue)
+}
+
+func TestEmptyWriteTargetRejected(t *testing.T) {
+	RunQTest(t, eqtest.EmptyWriteTargetRejected)
+}
+
 func TestSimpleWorker(t *testing.T) {
 	RunQTest(t, eqtest.SimpleWorker)
 }
@@ -396,6 +408,14 @@ func TestClaimUnblocksOnNotify(t *testing.T) {
 
 func TestQueueMatch(t *testing.T) {
 	RunQTest(t, eqtest.QueueMatch)
+}
+
+func TestQueuePrefixMatchLiteral(t *testing.T) {
+	RunQTest(t, eqtest.QueuePrefixMatchLiteral)
+}
+
+func TestPGNamespacePrefixMatchLiteral(t *testing.T) {
+	RunQTest(t, eqtest.NamespacePrefixMatchLiteral)
 }
 
 func TestQueueStats(t *testing.T) {
@@ -487,6 +507,10 @@ func TestPGDocMultiOp(t *testing.T) {
 
 func TestPGDocListing(t *testing.T) {
 	RunQTest(t, eqtest.DocListing)
+}
+
+func TestPGDocKeyRangeByteOrder(t *testing.T) {
+	RunQTest(t, eqtest.DocKeyRangeByteOrder)
 }
 
 func TestPGDocClaimLocking(t *testing.T) {
@@ -584,4 +608,12 @@ func TestSchemaInit(t *testing.T) {
 	if _, err := adminDB.ExecContext(ctx, "DROP DATABASE "+testDB); err != nil {
 		t.Logf("drop test database (non-fatal): %v", err)
 	}
+}
+
+func TestModifyReportsAllFailureClasses(t *testing.T) {
+	RunQTest(t, eqtest.ModifyReportsAllFailureClasses)
+}
+
+func TestModifyRejectsWrongNamespace(t *testing.T) {
+	RunQTest(t, eqtest.ModifyRejectsWrongNamespace)
 }

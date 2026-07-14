@@ -87,6 +87,128 @@ func TaskChangeFutureArrival(ctx context.Context, t *testing.T, client *entroq.E
 	}
 }
 
+// TaskChangeFarPastArrivalNormalized verifies the arrival-time half of the
+// backend Modify contract: an arrival time far in the past (beyond
+// entroq.ArrivalPastWindow, which is how an unset time round-trips) is capped up
+// to now, so the task is available immediately and ordered at now rather than in
+// the distant past. Every backend must behave identically here.
+func TaskChangeFarPastArrivalNormalized(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	queue := path.Join(qPrefix, "task_change_far_past_arrival")
+
+	resp, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue("v")))
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	inserted := resp.InsertedTasks[0]
+
+	before, err := client.Time(ctx)
+	if err != nil {
+		t.Fatalf("time: %v", err)
+	}
+	// Two windows in the past: well beyond the far-past cap.
+	farPast := before.Add(-2 * entroq.ArrivalPastWindow)
+	resp, err = client.Modify(ctx, inserted.Change(entroq.ArrivalTimeTo(farPast)))
+	if err != nil {
+		t.Fatalf("change far-past arrival: %v", err)
+	}
+	changed := resp.ChangedTasks[0]
+
+	// The far-past arrival must be capped up to ~now, not left in the past.
+	if changed.At.Before(before.Add(-time.Minute)) {
+		t.Fatalf("far-past arrival was not capped to now: got %s, want about %s",
+			changed.At.Format(time.RFC3339Nano), before.Format(time.RFC3339Nano))
+	}
+
+	// And the task must be immediately claimable.
+	claimed, err := client.TryClaim(ctx, entroq.From(queue), entroq.ClaimFor(time.Minute))
+	if err != nil {
+		t.Fatalf("try claim: %v", err)
+	}
+	if claimed == nil {
+		t.Fatalf("task with far-past (normalized) arrival was not immediately claimable")
+	}
+}
+
+// ModifyRejectsWrongQueue verifies the queue-as-modify-key contract: an
+// operation that names a queue the task does not live in fails with a
+// DependencyError and leaves the task untouched. This is the cross-backend
+// guarantee that the queue is an enforceable authorization boundary; a caller
+// cannot reach a task outside a queue it holds rights to by lying about where
+// the task lives.
+func ModifyRejectsWrongQueue(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	realQ := path.Join(qPrefix, "wrong_queue_real")
+	otherQ := path.Join(qPrefix, "wrong_queue_other")
+
+	resp, err := client.Modify(ctx, entroq.InsertingInto(realQ, entroq.WithValue("v")))
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	inserted := resp.InsertedTasks[0]
+
+	// A delete naming the wrong queue must fail as a dependency error.
+	_, err = client.Modify(ctx, entroq.NewTaskID(inserted.ID, inserted.Version, otherQ).Delete())
+	if depErr, ok := entroq.AsDependency(err); !ok {
+		t.Fatalf("wrong-queue delete: got err %v, want a DependencyError", err)
+	} else if len(depErr.Deletes) == 0 {
+		t.Errorf("wrong-queue delete: DependencyError missing a Deletes entry: %+v", depErr)
+	}
+
+	// A change lying about the source (from) queue must also fail. Task.Change
+	// derives FromQueue from the task's Queue, so a task built in otherQ claims
+	// the wrong source.
+	lie := &entroq.Task{ID: inserted.ID, Version: inserted.Version, Queue: otherQ, Value: inserted.Value}
+	_, err = client.Modify(ctx, lie.Change())
+	if depErr, ok := entroq.AsDependency(err); !ok {
+		t.Fatalf("wrong-queue change: got err %v, want a DependencyError", err)
+	} else if len(depErr.Changes) == 0 {
+		t.Errorf("wrong-queue change: DependencyError missing a Changes entry: %+v", depErr)
+	}
+
+	// A dependency naming the wrong queue must fail too.
+	_, err = client.Modify(ctx, entroq.NewTaskID(inserted.ID, inserted.Version, otherQ).Depend())
+	if depErr, ok := entroq.AsDependency(err); !ok {
+		t.Fatalf("wrong-queue depend: got err %v, want a DependencyError", err)
+	} else if len(depErr.Depends) == 0 {
+		t.Errorf("wrong-queue depend: DependencyError missing a Depends entry: %+v", depErr)
+	}
+
+	// An empty queue is rejected as well: there is no silent fill-in from stored
+	// state, which is exactly what would defeat the check.
+	_, err = client.Modify(ctx, entroq.NewTaskID(inserted.ID, inserted.Version, "").Delete())
+	if _, ok := entroq.AsDependency(err); !ok {
+		t.Fatalf("empty-queue delete: got err %v, want a DependencyError", err)
+	}
+
+	// The task must be untouched: still present in its real queue at its
+	// original version.
+	tasks, err := client.Tasks(ctx, realQ)
+	if err != nil {
+		t.Fatalf("tasks: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("task should be untouched: got %d tasks in %q, want 1", len(tasks), realQ)
+	}
+	if tasks[0].Version != inserted.Version {
+		t.Errorf("task version changed after rejected ops: got %d, want %d", tasks[0].Version, inserted.Version)
+	}
+
+	// The legitimate case still works: naming the correct source queue, a move
+	// to a different destination succeeds and relocates the task.
+	if _, err := client.Modify(ctx, inserted.Change(entroq.QueueTo(otherQ))); err != nil {
+		t.Fatalf("correct-queue move: %v", err)
+	}
+	if got, err := client.Tasks(ctx, realQ); err != nil {
+		t.Fatalf("tasks realQ: %v", err)
+	} else if len(got) != 0 {
+		t.Errorf("source queue not emptied by move: got %d tasks in %q, want 0", len(got), realQ)
+	}
+	if got, err := client.Tasks(ctx, otherQ); err != nil {
+		t.Fatalf("tasks otherQ: %v", err)
+	} else if len(got) != 1 {
+		t.Errorf("destination queue did not receive the move: got %d tasks in %q, want 1", len(got), otherQ)
+	}
+}
+
 // SimpleWorker tests basic worker functionality while tasks are coming in and
 // being waited on.
 func ClaimUnblocksOnNotify(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
@@ -679,41 +801,46 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	}
 }
 
-// QueueMatch tests various queue matching functions against a client.
+// DeleteMissingTask verifies that deleting a task that is not present fails with
+// a DependencyError. It keeps a decoy real task around so the "id not found"
+// case stays distinct from a queue mismatch (both surface as the same missing
+// signal, by design).
 func DeleteMissingTask(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
-	//queue := path.Join(qPrefix, "delete_missing")
+	queue := path.Join(qPrefix, "delete_missing")
 
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	if _, err := client.Modify(ctx, entroq.Deleting("fake_task_id", 0)); err != nil {
+	// Insert a real task so the queue actually exists. Queues are ephemeral
+	// (they exist only while they hold tasks), so this decoy isolates "task ID
+	// not found" from "queue not found": the probes below fail solely because
+	// the target isn't there, in a valid, populated queue.
+	resp, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue("real")))
+	if err != nil {
+		t.Fatalf("Error inserting decoy task: %v", err)
+	}
+	decoy := resp.InsertedTasks[0]
+
+	// A genuinely-absent id in that valid queue is not found.
+	if _, err := client.Modify(ctx, entroq.NewTaskID("fake_task_id", 0, queue).Delete()); err != nil {
 		if depErr, ok := entroq.AsDependency(err); !ok {
 			t.Fatalf("Expected dependency error when deleting missing task, got: %v", err)
-		} else {
-			if want, got := 1, len(depErr.Deletes); want != got {
-				t.Fatalf("Expected 1 delete, got: %v", got)
-			}
+		} else if want, got := 1, len(depErr.Deletes); want != got {
+			t.Fatalf("Expected 1 delete, got: %v", got)
 		}
 	} else {
-		t.Fatalf("Expected error when deleting missing task, got: %v", err)
+		t.Fatalf("Expected error when deleting missing task, got nil")
 	}
 
-	resp, err := client.Modify(ctx, entroq.InsertingInto("my queue", entroq.WithValue("hi")))
-	if err != nil {
-		t.Fatalf("Error inserting task for delete missing test: %v", err)
-	}
-	ins := resp.InsertedTasks
-
-	if _, err := client.Modify(ctx, entroq.Deleting(ins[0].ID, 1 /* wrong version */)); err != nil {
+	// A real id at the wrong version, in its real queue, is not found either.
+	if _, err := client.Modify(ctx, entroq.NewTaskID(decoy.ID, decoy.Version+1, decoy.Queue).Delete()); err != nil {
 		if depErr, ok := entroq.AsDependency(err); !ok {
 			t.Fatalf("Expected dependency error when deleting with wrong version, got: %v", err)
-		} else {
-			if want, got := 1, len(depErr.Deletes); want != got {
-				t.Fatalf("Expected 1 delete, got: %v", got)
-			}
+		} else if want, got := 1, len(depErr.Deletes); want != got {
+			t.Fatalf("Expected 1 delete, got: %v", got)
 		}
 	} else {
-		t.Fatalf("Expected error when deleting with wrong version, got: %v", err)
+		t.Fatalf("Expected error when deleting with wrong version, got nil")
 	}
 }
 
@@ -806,3 +933,84 @@ func ClaimRandomHead(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 }
 
 // WorkerDependencyHandler tests that the worker calls the dependency handler when a finish modify fails.
+
+// EmptyWriteTargetRejected verifies that a modification which would write to an
+// empty queue or namespace is rejected. An insert's queue and a doc insert's
+// namespace are write targets with no prior record to look up, so an empty one
+// would otherwise be silently written to "". Every backend enforces this via
+// Modification.EnsureModifyKeys, so it holds over gRPC too. (An empty change
+// destination is deliberately not asserted here: the gRPC service reads it as
+// "no move", so the behavior is path-dependent rather than a uniform invariant.)
+func EmptyWriteTargetRejected(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	// A task insert with no queue is rejected.
+	if _, err := client.Modify(ctx, entroq.InsertingInto("", entroq.WithValue("v"))); err == nil {
+		t.Errorf("insert into empty queue: got nil error, want rejection")
+	}
+
+	// A doc insert with no namespace is rejected.
+	if _, err := client.Modify(ctx, entroq.PuttingDocInto("",
+		entroq.WithIDKeys("empty-ns-doc", "", ""),
+		entroq.WithContent(json.RawMessage(`"v"`)),
+	)); err == nil {
+		t.Errorf("doc insert into empty namespace: got nil error, want rejection")
+	}
+
+	// A well-formed insert into a real queue still works: the guard is not
+	// over-broad.
+	realQ := path.Join(qPrefix, "empty_target_real")
+	if _, err := client.Modify(ctx, entroq.InsertingInto(realQ, entroq.WithValue("v"))); err != nil {
+		t.Errorf("insert into %q: unexpected error: %v", realQ, err)
+	}
+}
+
+// ModifyReportsAllFailureClasses verifies the Backend.Modify contract that a
+// failed modification reports EVERY failing operation across all classes in a
+// single DependencyError, not just the first class encountered. A caller's
+// skip-colliding insert logic in particular depends on collisions always being
+// reported even alongside other failures.
+func ModifyReportsAllFailureClasses(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	q := path.Join(qPrefix, "all_failures")
+	wrongQ := path.Join(qPrefix, "all_failures_wrong")
+
+	// Seed three real tasks to fail against, with explicit IDs so we can name them.
+	ins, err := client.Modify(ctx,
+		entroq.InsertingInto(q, entroq.WithValue("chg"), entroq.WithID("f-chg")),
+		entroq.InsertingInto(q, entroq.WithValue("del"), entroq.WithID("f-del")),
+		entroq.InsertingInto(q, entroq.WithValue("collide"), entroq.WithID("f-collide")),
+	)
+	if err != nil {
+		t.Fatalf("seed insert: %v", err)
+	}
+	byID := make(map[string]*entroq.Task)
+	for _, tk := range ins.InsertedTasks {
+		byID[tk.ID] = tk
+	}
+
+	// One modification with four distinct failures:
+	//   - an insert colliding with an existing ID,
+	//   - a change at the wrong version (right queue),
+	//   - a delete naming the wrong queue,
+	//   - a delete of a task that does not exist.
+	// The queue-mismatch delete is what historically short-circuited eqmem before
+	// it computed the collision and the wrong-version change.
+	chgWrongVer := &entroq.Task{ID: "f-chg", Version: byID["f-chg"].Version + 7, Queue: q, Value: json.RawMessage(`"x"`)}
+	_, err = client.Modify(ctx,
+		entroq.InsertingInto(q, entroq.WithValue("y"), entroq.WithID("f-collide")),
+		chgWrongVer.Change(),
+		entroq.NewTaskID("f-del", byID["f-del"].Version, wrongQ).Delete(),
+		entroq.NewTaskID("ghost", 0, q).Delete(),
+	)
+	depErr, ok := entroq.AsDependency(err)
+	if !ok {
+		t.Fatalf("expected a DependencyError, got %v", err)
+	}
+	if !depErr.HasCollisions() {
+		t.Errorf("insert collision (f-collide) not reported: %+v", depErr)
+	}
+	if len(depErr.Changes) == 0 {
+		t.Errorf("wrong-version change (f-chg) not reported: %+v", depErr)
+	}
+	if len(depErr.Deletes) < 2 {
+		t.Errorf("both bad deletes (f-del wrong-queue, ghost missing) not reported: got Deletes=%v", depErr.Deletes)
+	}
+}

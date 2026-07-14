@@ -53,7 +53,7 @@ var docPutCmd = &cobra.Command{
 		}
 
 		resp, err := eq.Modify(context.Background(),
-			entroq.CreatingIn(flagDocPutNamespace,
+			entroq.PuttingDocInto(flagDocPutNamespace,
 				entroq.WithKeys(flagDocPutKey, flagDocPutSecondaryKey),
 				entroq.WithRawContent(raw),
 			),

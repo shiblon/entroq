@@ -80,6 +80,18 @@ func TestSimpleChange(t *testing.T) {
 	RunQTest(t, eqtest.SimpleChange)
 }
 
+func TestTaskChangeFarPastArrivalNormalized(t *testing.T) {
+	RunQTest(t, eqtest.TaskChangeFarPastArrivalNormalized)
+}
+
+func TestModifyRejectsWrongQueue(t *testing.T) {
+	RunQTest(t, eqtest.ModifyRejectsWrongQueue)
+}
+
+func TestEmptyWriteTargetRejected(t *testing.T) {
+	RunQTest(t, eqtest.EmptyWriteTargetRejected)
+}
+
 func TestSimpleWorker(t *testing.T) {
 	RunQTest(t, eqtest.SimpleWorker)
 }
@@ -102,6 +114,14 @@ func TestClaimUnblocksOnNotify(t *testing.T) {
 
 func TestQueueMatch(t *testing.T) {
 	RunQTest(t, eqtest.QueueMatch)
+}
+
+func TestQueuePrefixMatchLiteral(t *testing.T) {
+	RunQTest(t, eqtest.QueuePrefixMatchLiteral)
+}
+
+func TestNamespacePrefixMatchLiteral(t *testing.T) {
+	RunQTest(t, eqtest.NamespacePrefixMatchLiteral)
 }
 
 // TestQueueStats is skipped for eqredis because QueueStats intentionally
@@ -157,6 +177,10 @@ func TestDocListing(t *testing.T) {
 	RunQTest(t, eqtest.DocListing)
 }
 
+func TestDocKeyRangeByteOrder(t *testing.T) {
+	RunQTest(t, eqtest.DocKeyRangeByteOrder)
+}
+
 func TestDocClaimLocking(t *testing.T) {
 	RunQTest(t, eqtest.DocClaimLocking)
 }
@@ -175,4 +199,12 @@ func TestQueueStatsAccuracy(t *testing.T) {
 
 func TestNamespaceStats(t *testing.T) {
 	RunQTest(t, eqtest.NamespaceStats)
+}
+
+func TestModifyReportsAllFailureClasses(t *testing.T) {
+	RunQTest(t, eqtest.ModifyReportsAllFailureClasses)
+}
+
+func TestModifyRejectsWrongNamespace(t *testing.T) {
+	RunQTest(t, eqtest.ModifyRejectsWrongNamespace)
 }

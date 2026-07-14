@@ -123,7 +123,7 @@ func (c *Controller) Setup(ctx context.Context, input []*KV) error {
 	for i, kv := range input {
 		key := shardDocKey(i)
 		if _, err := c.client.Modify(ctx,
-			entroq.CreatingIn(c.DocNS(), entroq.WithKeys(key, ""), entroq.WithContent(kv)),
+			entroq.PuttingDocInto(c.DocNS(), entroq.WithKeys(key, ""), entroq.WithContent(kv)),
 			entroq.InsertingInto(c.MapQ(), entroq.WithValue(docRef{NS: c.DocNS(), Key: key})),
 		); err != nil {
 			return fmt.Errorf("setup shard %d: %w", i, err)
@@ -163,7 +163,7 @@ func (c *Controller) RunMapPhase(ctx context.Context) error {
 				secondary := fmt.Sprintf("%016x", Fingerprint64([]byte(out.Shard.Key)))
 				modArgs := []entroq.ModifyArg{task.Delete(), docs[0].Delete()}
 				for _, entry := range out.Entries {
-					modArgs = append(modArgs, entroq.CreatingIn(c.DocNS(),
+					modArgs = append(modArgs, entroq.PuttingDocInto(c.DocNS(),
 						entroq.WithKeys(reduceDocKey(entry.Key), secondary),
 						entroq.WithContent(entry),
 					))
@@ -262,7 +262,7 @@ func (c *Controller) RunReducePhase(ctx context.Context) error {
 				for _, d := range docs {
 					modArgs = append(modArgs, d.Delete())
 				}
-				modArgs = append(modArgs, entroq.CreatingIn(c.DocNS(),
+				modArgs = append(modArgs, entroq.PuttingDocInto(c.DocNS(),
 					entroq.WithKeys(resultDocKey(out.MapKey), ""),
 					entroq.WithContent(&keyValues{Key: out.MapKey, Values: [][]byte{out.Result}}),
 				))

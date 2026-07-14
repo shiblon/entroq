@@ -244,12 +244,12 @@ func NamespaceStats(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 
 	// Insert 2 docs in ns1, 3 in ns2, 1 in ns3.
 	if _, err := client.Modify(ctx,
-		entroq.CreatingIn(ns1, entroq.WithKeys(key, "a")),
-		entroq.CreatingIn(ns1, entroq.WithKeys(key, "b")),
-		entroq.CreatingIn(ns2, entroq.WithKeys(key, "a")),
-		entroq.CreatingIn(ns2, entroq.WithKeys(key, "b")),
-		entroq.CreatingIn(ns2, entroq.WithKeys(key, "c")),
-		entroq.CreatingIn(ns3, entroq.WithKeys(key, "a")),
+		entroq.PuttingDocInto(ns1, entroq.WithKeys(key, "a")),
+		entroq.PuttingDocInto(ns1, entroq.WithKeys(key, "b")),
+		entroq.PuttingDocInto(ns2, entroq.WithKeys(key, "a")),
+		entroq.PuttingDocInto(ns2, entroq.WithKeys(key, "b")),
+		entroq.PuttingDocInto(ns2, entroq.WithKeys(key, "c")),
+		entroq.PuttingDocInto(ns3, entroq.WithKeys(key, "a")),
 	); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
@@ -323,6 +323,57 @@ func NamespaceStats(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	}
 	if len(gotLimit) != 2 {
 		t.Errorf("limit=2: want 2 namespaces, got %d", len(gotLimit))
+	}
+}
+
+// QueuePrefixMatchLiteral verifies that queue prefix matching treats the prefix
+// literally rather than as a pattern: SQL LIKE metacharacters (_ % \) appearing
+// in a queue name must match themselves, not act as wildcards. Backends that
+// translate prefix matching to LIKE must escape them; the others compare by byte
+// prefix and are literal already.
+func QueuePrefixMatchLiteral(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	// lit contains a literal underscore; decoy holds a different character in that
+	// position and would match only if '_' were treated as a single-char wildcard.
+	lit := path.Join(qPrefix, "lit_x")
+	decoy := path.Join(qPrefix, "litYx")
+	for _, q := range []string{lit, decoy} {
+		if _, err := client.Modify(ctx, entroq.InsertingInto(q, entroq.WithValue("x"))); err != nil {
+			t.Fatalf("insert into %q: %v", q, err)
+		}
+	}
+
+	got, err := client.Queues(ctx, entroq.MatchPrefix(lit))
+	if err != nil {
+		t.Fatalf("queues match prefix %q: %v", lit, err)
+	}
+	if _, ok := got[lit]; !ok {
+		t.Errorf("prefix %q did not match its own queue; got %v", lit, got)
+	}
+	if _, ok := got[decoy]; ok {
+		t.Errorf("prefix %q matched decoy %q: the underscore acted as a wildcard (unescaped LIKE)", lit, decoy)
+	}
+}
+
+// NamespacePrefixMatchLiteral is the namespace twin of QueuePrefixMatchLiteral:
+// namespace prefix matching must treat the prefix literally, not as a pattern.
+func NamespacePrefixMatchLiteral(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	lit := path.Join(qPrefix, "lit_x")
+	decoy := path.Join(qPrefix, "litYx")
+	for _, ns := range []string{lit, decoy} {
+		if _, err := client.Modify(ctx, entroq.PuttingDocInto(ns, entroq.WithContent("x"))); err != nil {
+			t.Fatalf("create doc in namespace %q: %v", ns, err)
+		}
+	}
+
+	got, err := client.NamespaceStats(ctx, entroq.MatchPrefix(lit))
+	if err != nil {
+		t.Fatalf("namespace stats prefix %q: %v", lit, err)
+	}
+	if _, ok := got[lit]; !ok {
+		t.Errorf("prefix %q did not match its own namespace; got %v", lit, got)
+	}
+	if _, ok := got[decoy]; ok {
+		t.Errorf("prefix %q matched decoy namespace %q: the underscore acted as a wildcard (unescaped LIKE)", lit, decoy)
 	}
 }
 

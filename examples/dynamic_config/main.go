@@ -50,7 +50,7 @@ func (cw *ConfigWorker) reloadConfig(ctx context.Context) error {
 	cw.cID = task.IDVersion()
 
 	// Immediately release the configuration task.
-	if _, err := cw.eqc.Modify(ctx, entroq.Changing(task, entroq.ArrivalTimeBy(0))); err != nil {
+	if _, err := cw.eqc.Modify(ctx, task.Change(entroq.ArrivalTimeBy(0))); err != nil {
 		return fmt.Errorf("reload release: %w", err)
 	}
 

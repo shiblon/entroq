@@ -21,7 +21,7 @@ func SimpleDocLifecycle(ctx context.Context, t *testing.T, client *entroq.EntroQ
 	val := json.RawMessage(`{"foo":"bar"}`)
 
 	// Insert a doc
-	resp, err := client.Modify(ctx, entroq.CreatingIn(ns,
+	resp, err := client.Modify(ctx, entroq.PuttingDocInto(ns,
 		entroq.WithIDKeys(id, "", ""),
 		entroq.WithContent(val),
 	))
@@ -75,7 +75,7 @@ func SimpleDocLifecycle(ctx context.Context, t *testing.T, client *entroq.EntroQ
 	}
 
 	// Delete the doc
-	_, err = client.Modify(ctx, entroq.DeletingDoc(changed))
+	_, err = client.Modify(ctx, changed.Delete())
 	if err != nil {
 		t.Fatalf("Delete doc: %v", err)
 	}
@@ -98,7 +98,7 @@ func DocMultiOp(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefi
 	// Atomic insert of a task and its associated state doc.
 	resp, err := client.Modify(ctx,
 		entroq.InsertingInto(q, entroq.WithValue("task body")),
-		entroq.CreatingIn(ns,
+		entroq.PuttingDocInto(ns,
 			entroq.WithIDKeys("state-1", "", ""),
 			entroq.WithContent("initial state"),
 		),
@@ -146,7 +146,7 @@ func DocListing(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefi
 
 	var args []entroq.ModifyArg
 	for _, d := range data {
-		args = append(args, entroq.CreatingIn(ns,
+		args = append(args, entroq.PuttingDocInto(ns,
 			entroq.WithIDKeys(d.ID, d.PK, ""),
 			entroq.WithContent(nil),
 		))
@@ -196,7 +196,7 @@ func DocConcurrencyStress(ctx context.Context, t *testing.T, client *entroq.Entr
 	// Setup: Create docs with an initial counter value of 0.
 	var setupArgs []entroq.ModifyArg
 	for i := 0; i < numDocs; i++ {
-		setupArgs = append(setupArgs, entroq.CreatingIn(ns,
+		setupArgs = append(setupArgs, entroq.PuttingDocInto(ns,
 			entroq.WithIDKeys(fmt.Sprintf("doc-%d", i), "", ""),
 			entroq.WithContent(0),
 		))
@@ -297,7 +297,7 @@ func MixedAtomicStress(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		id := fmt.Sprintf("item-%d", i)
 		if _, err := client.Modify(ctx,
 			entroq.InsertingInto(q, entroq.WithID(id), entroq.WithValue(0)),
-			entroq.CreatingIn(ns,
+			entroq.PuttingDocInto(ns,
 				entroq.WithIDKeys(id, "", ""),
 				entroq.WithContent(0),
 			),
@@ -418,8 +418,8 @@ func DocClaimLocking(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 
 	// Insert two docs with the same primary key.
 	if _, err := client.Modify(ctx,
-		entroq.CreatingIn(ns, entroq.WithKeys(key, "a"), entroq.WithContent(1)),
-		entroq.CreatingIn(ns, entroq.WithKeys(key, "b"), entroq.WithContent(2)),
+		entroq.PuttingDocInto(ns, entroq.WithKeys(key, "a"), entroq.WithContent(1)),
+		entroq.PuttingDocInto(ns, entroq.WithKeys(key, "b"), entroq.WithContent(2)),
 	); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
@@ -482,7 +482,7 @@ func DocInsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 	knownID := client.GenID()
 
 	// Insert a doc with an explicit ID -- should succeed.
-	resp, err := client.Modify(ctx, entroq.CreatingIn(ns,
+	resp, err := client.Modify(ctx, entroq.PuttingDocInto(ns,
 		entroq.WithIDKeys(knownID, "pk", "sk"),
 		entroq.WithContent("first"),
 	))
@@ -498,7 +498,7 @@ func DocInsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 
 	// Inserting the same explicit ID again must return DependencyError with
 	// DocInserts populated -- not silently overwrite, not misroute to Changes.
-	_, err = client.Modify(ctx, entroq.CreatingIn(ns,
+	_, err = client.Modify(ctx, entroq.PuttingDocInto(ns,
 		entroq.WithIDKeys(knownID, "pk", "sk"),
 		entroq.WithContent("second"),
 	))
@@ -529,7 +529,7 @@ func DocInsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 	}
 
 	// Inserting with WithSkipCollidingDoc must succeed and leave the original intact.
-	_, err = client.Modify(ctx, entroq.CreatingIn(ns,
+	_, err = client.Modify(ctx, entroq.PuttingDocInto(ns,
 		entroq.WithIDKeys(knownID, "pk", "sk"),
 		entroq.WithContent("overwrite-attempt"),
 		entroq.WithSkipCollidingDoc(true),
@@ -553,12 +553,12 @@ func DocInsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 	// real operation while dropping the colliding insert.
 	otherID := client.GenID()
 	_, err = client.Modify(ctx,
-		entroq.CreatingIn(ns,
+		entroq.PuttingDocInto(ns,
 			entroq.WithIDKeys(knownID, "pk", "sk"),
 			entroq.WithContent("overwrite-attempt"),
 			entroq.WithSkipCollidingDoc(true),
 		),
-		entroq.CreatingIn(ns,
+		entroq.PuttingDocInto(ns,
 			entroq.WithIDKeys(otherID, "pk2", "sk2"),
 			entroq.WithContent("new-doc"),
 		),
@@ -586,7 +586,7 @@ func DocClaimantBehavior(ctx context.Context, t *testing.T, client *entroq.Entro
 	ns := path.Join(qPrefix, "doc_claimant_behavior")
 
 	// Insert: claimant must be empty; at defaults to now (past by query time).
-	resp, err := client.Modify(ctx, entroq.CreatingIn(ns, entroq.WithKeys("k", "")))
+	resp, err := client.Modify(ctx, entroq.PuttingDocInto(ns, entroq.WithKeys("k", "")))
 	if err != nil {
 		t.Fatalf("insert: %v", err)
 	}
@@ -635,4 +635,103 @@ func EqualDocs(a, b *entroq.Doc, versionDiff int32) string {
 	copyA.Created = b.Created
 	copyA.Modified = b.Modified
 	return cmp.Diff(&copyA, b)
+}
+
+// DocKeyRangeByteOrder verifies that doc key range queries compare keys in byte
+// order, not the storage engine's locale collation, and that every backend
+// agrees. Keys with punctuation are the tell: '/' (0x2F) sorts before '0'
+// (0x30), so "shard/N" falls inside the half-open range [shard/, shard0), while
+// "shard0" (the exclusive upper bound) does not. A locale-collated backend would
+// drop the punctuated keys, so this pins byte-order semantics across backends.
+func DocKeyRangeByteOrder(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	ns := path.Join(qPrefix, "keyrange_ns")
+
+	// "shard0" is the exclusive upper bound and must not match the range.
+	for _, k := range []string{"shard/0", "shard/1", "shard/2", "shard0"} {
+		if _, err := client.Modify(ctx, entroq.PuttingDocInto(ns,
+			entroq.WithKeys(k, ""), entroq.WithContent(nil))); err != nil {
+			t.Fatalf("create doc %q: %v", k, err)
+		}
+	}
+
+	res, err := client.Docs(ctx, &entroq.DocQuery{
+		Namespace: ns, KeyStart: "shard/", KeyEnd: "shard0", OmitValues: true,
+	})
+	if err != nil {
+		t.Fatalf("range query: %v", err)
+	}
+
+	got := make(map[string]bool, len(res))
+	for _, d := range res {
+		got[d.Key] = true
+	}
+	want := []string{"shard/0", "shard/1", "shard/2"}
+	if len(res) != len(want) {
+		var keys []string
+		for _, d := range res {
+			keys = append(keys, d.Key)
+		}
+		t.Errorf("byte-order range [shard/, shard0): got %d docs %v, want %d %v", len(res), keys, len(want), want)
+	}
+	for _, w := range want {
+		if !got[w] {
+			t.Errorf("byte-order range missing %q (a locale collation drops punctuated keys)", w)
+		}
+	}
+	if got["shard0"] {
+		t.Errorf("byte-order range wrongly included the exclusive upper bound %q", "shard0")
+	}
+}
+
+// ModifyRejectsWrongNamespace is the doc analog of ModifyRejectsWrongQueue: a
+// doc operation must name the namespace the doc actually lives in. The found map
+// is keyed by (namespace, id), so naming the wrong namespace makes the doc look
+// missing (a DependencyError), and a caller cannot reach a doc outside its
+// authorized namespaces by naming a different one.
+func ModifyRejectsWrongNamespace(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	realNS := path.Join(qPrefix, "wrong_ns_real")
+	otherNS := path.Join(qPrefix, "wrong_ns_other")
+
+	resp, err := client.Modify(ctx, entroq.PuttingDocInto(realNS,
+		entroq.WithIDKeys("doc-1", "", ""),
+		entroq.WithContent(json.RawMessage(`"v"`)),
+	))
+	if err != nil {
+		t.Fatalf("insert doc: %v", err)
+	}
+	doc := resp.InsertedDocs[0]
+
+	// A delete naming the wrong namespace fails as a dependency error.
+	_, err = client.Modify(ctx, entroq.NewDocID(otherNS, doc.ID, doc.Version).Delete())
+	if depErr, ok := entroq.AsDependency(err); !ok {
+		t.Fatalf("wrong-namespace doc delete: got err %v, want a DependencyError", err)
+	} else if len(depErr.DocDeletes) == 0 {
+		t.Errorf("wrong-namespace doc delete: DependencyError missing a DocDeletes entry: %+v", depErr)
+	}
+
+	// A dependency naming the wrong namespace fails too.
+	_, err = client.Modify(ctx, entroq.NewDocID(otherNS, doc.ID, doc.Version).Depend())
+	if depErr, ok := entroq.AsDependency(err); !ok {
+		t.Fatalf("wrong-namespace doc depend: got err %v, want a DependencyError", err)
+	} else if len(depErr.DocDepends) == 0 {
+		t.Errorf("wrong-namespace doc depend: DependencyError missing a DocDepends entry: %+v", depErr)
+	}
+
+	// A change lying about the namespace fails: the doc is not found in otherNS.
+	lie := &entroq.Doc{Namespace: otherNS, ID: doc.ID, Version: doc.Version, Key: doc.Key, Content: doc.Content}
+	_, err = client.Modify(ctx, lie.Change())
+	if depErr, ok := entroq.AsDependency(err); !ok {
+		t.Fatalf("wrong-namespace doc change: got err %v, want a DependencyError", err)
+	} else if len(depErr.DocChanges) == 0 {
+		t.Errorf("wrong-namespace doc change: DependencyError missing a DocChanges entry: %+v", depErr)
+	}
+
+	// The doc is untouched: still present in its real namespace at its version.
+	docs, err := client.Docs(ctx, &entroq.DocQuery{Namespace: realNS, IDs: []string{doc.ID}})
+	if err != nil {
+		t.Fatalf("docs: %v", err)
+	}
+	if len(docs) != 1 || docs[0].Version != doc.Version {
+		t.Errorf("doc should be untouched in %q at v%d: got %+v", realNS, doc.Version, docs)
+	}
 }

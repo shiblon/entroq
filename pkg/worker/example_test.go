@@ -81,11 +81,11 @@ func Example_workerWithDocs() {
 
 	// Create state docs and a task referencing their primary key.
 	_, err = eq.Modify(ctx,
-		entroq.CreatingIn("counters",
+		entroq.PuttingDocInto("counters",
 			entroq.WithKeys("totals", "requests"),
 			entroq.WithContent(0),
 		),
-		entroq.CreatingIn("counters",
+		entroq.PuttingDocInto("counters",
 			entroq.WithKeys("totals", "errors"),
 			entroq.WithContent(0),
 		),
