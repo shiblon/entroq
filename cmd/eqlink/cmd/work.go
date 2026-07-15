@@ -98,7 +98,7 @@ WebSocket close codes (1013 transient, 1008 caller, 1011 gateway).`,
 		// WebSocket serve mode: many workers connect, each declaring its own
 		// registration via URL query params.
 		if workAddr != "" {
-			return workgateway.Serve(gctx, workAddr, eq, workLease)
+			return workgateway.Serve(gctx, workAddr, eq, workLease, workEntroQTimeout)
 		}
 
 		// stdio mode: one worker over this process's stdin/stdout, registered by
