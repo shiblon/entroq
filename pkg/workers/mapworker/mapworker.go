@@ -60,7 +60,7 @@ func WithRunOption[T, U any](opt worker.RunOption) Option[T, U] {
 }
 
 // doWork is the internal handler that matches worker.DoModifyRun.
-func (mw *Worker[T, U]) doWork(ctx context.Context, t *entroq.Task, input Input[T], _ []*entroq.Doc) ([]entroq.ModifyArg, error) {
+func (mw *Worker[T, U]) doWork(ctx context.Context, t *entroq.Task, input Input[T], _ []*entroq.Doc) (*worker.Result, error) {
 	outbox := input.Outbox
 	if outbox == "" {
 		outbox = t.Queue + "/done"
@@ -78,10 +78,10 @@ func (mw *Worker[T, U]) doWork(ctx context.Context, t *entroq.Task, input Input[
 		if mErr != nil {
 			return nil, fmt.Errorf("marshal map error output: %w", mErr)
 		}
-		return []entroq.ModifyArg{
+		return worker.Modify(
 			t.Delete(),
 			entroq.InsertingInto(errbox, entroq.WithRawValue(errBytes)),
-		}, nil
+		), nil
 	}
 
 	output := Output[U]{Val: res}
@@ -90,10 +90,10 @@ func (mw *Worker[T, U]) doWork(ctx context.Context, t *entroq.Task, input Input[
 		return nil, fmt.Errorf("marshal map output: %w", err)
 	}
 
-	return []entroq.ModifyArg{
+	return worker.Modify(
 		t.Delete(),
 		entroq.InsertingInto(outbox, entroq.WithRawValue(outBytes)),
-	}, nil
+	), nil
 }
 
 // New creates a new MapWorker ready to be configured.

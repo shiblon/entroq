@@ -151,9 +151,9 @@ svc, _ := entroq.New(ctx, eqgrpc.Opener("localhost:37706", eqgrpc.WithInsecure()
 defer svc.Close()
 
 w := worker.New(svc,
-    worker.WithDoModify(func(ctx context.Context, task *entroq.Task, val json.RawMessage, docs []*entroq.Doc) ([]entroq.ModifyArg, error) {
+    worker.WithDoModify(func(ctx context.Context, task *entroq.Task, val json.RawMessage, docs []*entroq.Doc) (*worker.Result, error) {
         log.Printf("Processing: %s", string(task.Value))
-        return []entroq.ModifyArg{task.Delete()}, nil // finish by deleting
+        return worker.Modify(task.Delete()), nil // finish by deleting
     }),
 )
 w.Run(ctx, worker.Watching("/my/queue"))

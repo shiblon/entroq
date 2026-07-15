@@ -43,7 +43,7 @@ type Input struct {
 func (p *Input) JSON() []byte {
 	out, err := json.Marshal(p)
 	if err != nil {
-		log.Fatalf("Failed to marshal: %v", err)
+		log.Panicf("Failed to marshal: %v", err)
 	}
 	return out
 }
@@ -93,7 +93,7 @@ type Output struct {
 func (p *Output) JSON() []byte {
 	out, err := json.Marshal(p)
 	if err != nil {
-		log.Fatalf("Failed to marshal: %v", err)
+		log.Panicf("Failed to marshal: %v", err)
 	}
 	return out
 }
@@ -155,7 +155,7 @@ func WithRunOption(opt worker.RunOption) Option {
 }
 
 // doWork is the internal handler that matches worker.DoModifyRun.
-func (pw *Worker) doWork(ctx context.Context, t *entroq.Task, input Input, _ []*entroq.Doc) ([]entroq.ModifyArg, error) {
+func (pw *Worker) doWork(ctx context.Context, t *entroq.Task, input Input, _ []*entroq.Doc) (*worker.Result, error) {
 	outbox := input.Outbox
 	if outbox == "" {
 		outbox = t.Queue + "/done"
@@ -168,10 +168,10 @@ func (pw *Worker) doWork(ctx context.Context, t *entroq.Task, input Input, _ []*
 
 	if len(input.Cmd) == 0 {
 		log.Print("Empty command")
-		return []entroq.ModifyArg{
+		return worker.Modify(
 			t.Delete(),
 			entroq.InsertingInto(outbox, entroq.WithRawValue(input.AsOutput().JSON())),
-		}, nil
+		), nil
 	}
 
 	cmd := exec.CommandContext(ctx, input.Cmd[0], input.Cmd[1:]...)
@@ -231,10 +231,10 @@ func (pw *Worker) doWork(ctx context.Context, t *entroq.Task, input Input, _ []*
 		_, ok := err.(*exec.ExitError)
 		if !ok {
 			log.Printf("Non-exit error: %v", err)
-			return []entroq.ModifyArg{
+			return worker.Modify(
 				t.Delete(),
 				entroq.InsertingInto(errbox+"/failed-start", entroq.WithRawValue(output.JSON())),
-			}, nil
+			), nil
 		}
 	}
 
@@ -251,10 +251,10 @@ func (pw *Worker) doWork(ctx context.Context, t *entroq.Task, input Input, _ []*
 		}
 	}
 
-	return []entroq.ModifyArg{
+	return worker.Modify(
 		t.Delete(),
 		entroq.InsertingInto(destQueue, entroq.WithRawValue(output.JSON())),
-	}, nil
+	), nil
 }
 
 // New creates a new proc worker ready to be configured.

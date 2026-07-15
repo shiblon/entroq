@@ -153,10 +153,10 @@ func (c *Controller) RunMapPhase(ctx context.Context) error {
 			worker.WithTakeDocs(func(_ context.Context, _ *entroq.Task, out mapOutput) ([]*entroq.DocClaim, error) {
 				return []*entroq.DocClaim{out.Shard.asClaim()}, nil
 			}),
-			worker.WithDoModify(func(_ context.Context, task *entroq.Task, out mapOutput, docs []*entroq.Doc) ([]entroq.ModifyArg, error) {
+			worker.WithDoModify(func(_ context.Context, task *entroq.Task, out mapOutput, docs []*entroq.Doc) (*worker.Result, error) {
 				if len(docs) == 0 {
 					// Shard doc already gone — duplicate result task; discard it.
-					return []entroq.ModifyArg{task.Delete()}, nil
+					return worker.Modify(task.Delete()), nil
 				}
 				// Secondary key is a fingerprint of the shard key:
 				// unique per shard, deterministic, no shared state needed.
@@ -168,7 +168,7 @@ func (c *Controller) RunMapPhase(ctx context.Context) error {
 						entroq.WithContent(entry),
 					))
 				}
-				return modArgs, nil
+				return worker.Modify(modArgs...), nil
 			}),
 		).Run(gctx, worker.Watching(c.MapResultQ()), worker.WithLease(claimDuration))
 	})
@@ -253,10 +253,10 @@ func (c *Controller) RunReducePhase(ctx context.Context) error {
 			worker.WithTakeDocs(func(_ context.Context, _ *entroq.Task, out reduceOutput) ([]*entroq.DocClaim, error) {
 				return []*entroq.DocClaim{out.Doc.asClaim()}, nil
 			}),
-			worker.WithDoModify(func(_ context.Context, task *entroq.Task, out reduceOutput, docs []*entroq.Doc) ([]entroq.ModifyArg, error) {
+			worker.WithDoModify(func(_ context.Context, task *entroq.Task, out reduceOutput, docs []*entroq.Doc) (*worker.Result, error) {
 				if len(docs) == 0 {
 					// Reduce docs already gone — duplicate result task; discard.
-					return []entroq.ModifyArg{task.Delete()}, nil
+					return worker.Modify(task.Delete()), nil
 				}
 				modArgs := []entroq.ModifyArg{task.Delete()}
 				for _, d := range docs {
@@ -266,7 +266,7 @@ func (c *Controller) RunReducePhase(ctx context.Context) error {
 					entroq.WithKeys(resultDocKey(out.MapKey), ""),
 					entroq.WithContent(&keyValues{Key: out.MapKey, Values: [][]byte{out.Result}}),
 				))
-				return modArgs, nil
+				return worker.Modify(modArgs...), nil
 			}),
 		).Run(gctx, worker.Watching(c.ReduceResultQ()), worker.WithLease(claimDuration))
 	})
@@ -330,14 +330,14 @@ func (s *sliceReducerInput) Next() bool {
 // within each key), and posts a mapOutput to MapResultQ.
 func (c *Controller) MapperWorker(mapFn Mapper) *worker.Worker[docRef] {
 	return worker.New[docRef](c.client,
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, ref docRef, _ []*entroq.Doc) ([]entroq.ModifyArg, error) {
+		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, ref docRef, _ []*entroq.Doc) (*worker.Result, error) {
 			shardDocs, err := c.client.Docs(ctx, ref.asQuery())
 			if err != nil {
 				return nil, fmt.Errorf("mapper read shard: %w", err)
 			}
 			if len(shardDocs) == 0 {
 				// Shard already gone — duplicate task; discard.
-				return []entroq.ModifyArg{task.Delete()}, nil
+				return worker.Modify(task.Delete()), nil
 			}
 			var kv KV
 			if err := json.Unmarshal(shardDocs[0].Content, &kv); err != nil {
@@ -370,13 +370,13 @@ func (c *Controller) MapperWorker(mapFn Mapper) *worker.Worker[docRef] {
 				entries = append(entries, &keyValues{Key: []byte(ks), Values: vals})
 			}
 
-			return []entroq.ModifyArg{
+			return worker.Modify(
 				task.Delete(),
 				entroq.InsertingInto(c.MapResultQ(), entroq.WithValue(mapOutput{
 					Shard:   ref,
 					Entries: entries,
 				})),
-			}, nil
+			), nil
 		}),
 	)
 }
@@ -386,7 +386,7 @@ func (c *Controller) MapperWorker(mapFn Mapper) *worker.Worker[docRef] {
 // and posts a reduceOutput to ReduceResultQ.
 func (c *Controller) ReducerWorker(reduceFn Reducer) *worker.Worker[reduceClaim] {
 	return worker.New[reduceClaim](c.client,
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, rc reduceClaim, _ []*entroq.Doc) ([]entroq.ModifyArg, error) {
+		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, rc reduceClaim, _ []*entroq.Doc) (*worker.Result, error) {
 			docs, err := c.client.Docs(ctx, rc.Doc.asQuery())
 			if err != nil {
 				return nil, fmt.Errorf("reducer read docs %q: %w", rc.Doc.Key, err)
@@ -410,14 +410,14 @@ func (c *Controller) ReducerWorker(reduceFn Reducer) *worker.Worker[reduceClaim]
 				return nil, fmt.Errorf("reducer compute: %w", err)
 			}
 
-			return []entroq.ModifyArg{
+			return worker.Modify(
 				task.Delete(),
 				entroq.InsertingInto(c.ReduceResultQ(), entroq.WithValue(reduceOutput{
 					Doc:    rc.Doc,
 					MapKey: rc.MapKey,
 					Result: result,
 				})),
-			}, nil
+			), nil
 		}),
 	)
 }

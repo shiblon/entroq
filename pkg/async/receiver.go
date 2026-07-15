@@ -97,7 +97,7 @@ func ReceiverHandler(upstream string, opts ...ReceiverOption) worker.DoModifyRun
 		metric.WithDescription("Task handling duration in seconds."),
 		metric.WithUnit("s"),
 	)
-	return func(ctx context.Context, task *entroq.Task, env Envelope, _ []*entroq.Doc) ([]entroq.ModifyArg, error) {
+	return func(ctx context.Context, task *entroq.Task, env Envelope, _ []*entroq.Doc) (*worker.Result, error) {
 		start := time.Now()
 		defer func() {
 			handled.Add(ctx, 1)
@@ -125,10 +125,10 @@ func ReceiverHandler(upstream string, opts ...ReceiverOption) worker.DoModifyRun
 			return nil, fmt.Errorf("receiver marshal response: %w", err)
 		}
 
-		return []entroq.ModifyArg{
+		return worker.Modify(
 			task.Delete(),
 			entroq.InsertingInto(env.ResponseQueue, entroq.WithRawValue(respValue)),
-		}, nil
+		), nil
 	}
 }
 

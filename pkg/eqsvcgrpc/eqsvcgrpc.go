@@ -44,6 +44,7 @@ import (
 	"github.com/golang/protobuf/proto"
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/authz"
+	"github.com/shiblon/entroq/pkg/pbconv"
 	"github.com/shiblon/entroq/pkg/queues"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -51,7 +52,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/types/known/structpb"
 
 	pb "github.com/shiblon/entroq/api"
 )
@@ -268,62 +268,6 @@ func (s *QSvc) Authorize(ctx context.Context, req *authz.Request) error {
 	return nil
 }
 
-func fromMS(ms int64) time.Time {
-	return time.Unix(0, ms*int64(time.Millisecond))
-}
-
-func toMS(t time.Time) int64 {
-	return t.Truncate(time.Millisecond).UnixNano() / 1000000
-}
-
-func jsonToProto(raw []byte) (*structpb.Value, error) {
-	if raw == nil {
-		// nil means "no value" (e.g. OmitValues was set). Return nil so the
-		// proto field is unset and protoToJSON round-trips back to nil.
-		return nil, nil
-	}
-	if len(raw) == 0 {
-		// Empty but non-nil: treat as JSON null.
-		return structpb.NewNullValue(), nil
-	}
-	v := new(structpb.Value)
-	if err := v.UnmarshalJSON(raw); err != nil {
-		return nil, fmt.Errorf("json to proto: %w", err)
-	}
-	return v, nil
-}
-
-func protoToJSON(v *structpb.Value) ([]byte, error) {
-	if v == nil {
-		return nil, nil
-	}
-	b, err := v.MarshalJSON()
-	if err != nil {
-		return nil, fmt.Errorf("proto to json: %w", err)
-	}
-	return b, nil
-}
-
-func protoFromTask(t *entroq.Task) (*pb.Task, error) {
-	val, err := jsonToProto(t.Value)
-	if err != nil {
-		return nil, fmt.Errorf("task value: %w", err)
-	}
-	return &pb.Task{
-		Queue:      t.Queue,
-		Id:         t.ID,
-		Version:    t.Version,
-		AtMs:       toMS(t.At),
-		ClaimantId: t.Claimant,
-		Claims:     t.Claims,
-		Value:      val,
-		CreatedMs:  toMS(t.Created),
-		ModifiedMs: toMS(t.Modified),
-		Attempt:    t.Attempt,
-		Err:        t.Err,
-	}, nil
-}
-
 func autoCodeErrorf(format string, vals ...any) error {
 	err := fmt.Errorf(format, vals...)
 	if entroq.IsTimeout(err) {
@@ -490,7 +434,7 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 	if task == nil {
 		return new(pb.ClaimResponse), nil
 	}
-	pt, err := protoFromTask(task)
+	pt, err := pbconv.TaskToProto(task)
 	if err != nil {
 		return nil, autoCodeErrorf("claim task proto: %w", err)
 	}
@@ -520,7 +464,7 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 	if task == nil {
 		return new(pb.ClaimResponse), nil
 	}
-	pt, err := protoFromTask(task)
+	pt, err := pbconv.TaskToProto(task)
 	if err != nil {
 		return nil, autoCodeErrorf("try-claim task proto: %w", err)
 	}
@@ -548,158 +492,23 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 		}
 	}
 
-	modArgs := []entroq.ModifyArg{
-		entroq.ModifyAs(req.ClaimantId),
-	}
-	for _, insert := range req.Inserts {
-		val, err := protoToJSON(insert.Value)
-		if err != nil {
-			return nil, autoCodeErrorf("insert value: %w", err)
+	modArgs, err := pbconv.ModifyArgsFromProto(req)
+	if err != nil {
+		var inv *pbconv.InvalidRequestError
+		if errors.As(err, &inv) {
+			return nil, codeErrorf(codes.InvalidArgument, "%v", err)
 		}
-		modArgs = append(modArgs,
-			entroq.InsertingInto(insert.Queue,
-				entroq.WithArrivalTime(fromMS(insert.AtMs)),
-				entroq.WithRawValue(val),
-				entroq.WithAttempt(insert.Attempt),
-				entroq.WithErr(insert.Err),
-				entroq.WithID(insert.Id)))
+		return nil, autoCodeErrorf("modify: %w", err)
 	}
-	for _, change := range req.Changes {
-		val, err := protoToJSON(change.GetNewData().GetValue())
-		if err != nil {
-			return nil, autoCodeErrorf("change value: %w", err)
-		}
-		// The queue is part of the modify key: the backend binds a change to the
-		// task's CURRENT queue (see eqmem's queue-integrity check), so we must
-		// build the task in that queue and let QueueTo move it. The wire splits
-		// the two queues into OldId.Queue (the source, i.e. current) and
-		// NewData.Queue (the destination). Task.Change always derives FromQueue from
-		// the task's Queue field, so if we set Queue to the destination up front,
-		// every move would report its source as its own target and fail the
-		// integrity check. Setting Queue to the source and applying QueueTo only
-		// on an actual move yields the correct FromQueue for both cases.
-		// Nil-safe getters throughout: a change with OldId/NewData unset yields
-		// empty fields and fails the queue-integrity check downstream, rather than
-		// panicking the server on a malformed request.
-		oldQueue, newQueue := change.GetOldId().GetQueue(), change.GetNewData().GetQueue()
-		// An empty destination means "no move": normalize it to the current queue
-		// so a plain change stays put, and only a different, non-empty destination
-		// moves the task. Normalizing here, at the service where authorization is
-		// decided, keeps the authz check and the applied operation on the same value.
-		if newQueue == "" {
-			newQueue = oldQueue
-		}
-		t := &entroq.Task{
-			ID:       change.GetOldId().GetId(),
-			Version:  change.GetOldId().GetVersion(),
-			Claimant: req.ClaimantId,
-			Queue:    oldQueue, // current queue; Task.Change derives FromQueue from it
-			Value:    val,
-			Attempt:  change.GetNewData().GetAttempt(),
-			Err:      change.GetNewData().GetErr(),
-		}
-		var changeArgs []entroq.ChangeArg
-		if newQueue != oldQueue {
-			changeArgs = append(changeArgs, entroq.QueueTo(newQueue))
-		}
-		changeArgs = append(changeArgs, entroq.ArrivalTimeTo(fromMS(change.GetNewData().GetAtMs())))
-		modArgs = append(modArgs, t.Change(changeArgs...))
-	}
-	for _, del := range req.Deletes {
-		modArgs = append(modArgs, entroq.NewTaskID(del.Id, del.Version, del.Queue).Delete())
-	}
-	for _, dep := range req.Depends {
-		modArgs = append(modArgs, entroq.NewTaskID(dep.Id, dep.Version, dep.Queue).Depend())
-	}
-	for _, di := range req.DocInserts {
-		val, err := protoToJSON(di.Content)
-		if err != nil {
-			return nil, autoCodeErrorf("doc insert content: %w", err)
-		}
-		modArgs = append(modArgs, entroq.PuttingDoc(&entroq.DocData{
-			Namespace:    di.Namespace,
-			ID:           di.Id,
-			Key:          di.Key,
-			SecondaryKey: di.SecondaryKey,
-			Content:      val,
-			Created:      fromMS(di.CreatedMs),
-			Modified:     fromMS(di.ModifiedMs),
-		}))
-	}
-	for _, dc := range req.DocChanges {
-		old := dc.GetOldId()
-		nd := dc.GetNewData()
-		// Docs do not move between namespaces: a change is always in place. A
-		// non-empty destination namespace that differs from the source is rejected
-		// rather than silently applied in the source namespace. (An empty
-		// destination namespace means "unspecified", so the source is used.)
-		if to := nd.GetNamespace(); to != "" && to != old.GetNamespace() {
-			return nil, codeErrorf(codes.InvalidArgument, "doc change cannot move namespaces: %q -> %q", old.GetNamespace(), to)
-		}
-		val, err := protoToJSON(nd.Content)
-		if err != nil {
-			return nil, autoCodeErrorf("doc change content: %w", err)
-		}
-		d := &entroq.Doc{
-			Namespace:    old.GetNamespace(),
-			ID:           old.GetId(),
-			Version:      old.GetVersion(),
-			Key:          nd.GetKey(),
-			SecondaryKey: nd.GetSecondaryKey(),
-			Content:      val,
-		}
-		// Pass the wire arrival time as an option: Change resets At by default
-		// (release), so an explicit time must come through the option to survive.
-		// Mirrors the task change path's ArrivalTimeTo. A far-past value (an unset
-		// wire time) is capped to now by the backend.
-		modArgs = append(modArgs, d.Change(entroq.WithDocArrivalTime(fromMS(nd.GetAtMs()))))
-	}
-	for _, dd := range req.DocDeletes {
-		modArgs = append(modArgs, entroq.NewDocID(dd.Namespace, dd.Id, dd.Version).Delete())
-	}
-	for _, ddep := range req.DocDepends {
-		modArgs = append(modArgs, entroq.NewDocID(ddep.Namespace, ddep.Id, ddep.Version).Depend())
-	}
+
 	resp, err := s.impl.Modify(ctx, modArgs...)
 	if err != nil {
 		if depErr, ok := entroq.AsDependency(err); ok {
-			tmap := map[pb.ActionType][]*entroq.TaskID{
-				pb.ActionType_INSERT: depErr.Inserts,
-				pb.ActionType_DEPEND: depErr.Depends,
-				pb.ActionType_DELETE: depErr.Deletes,
-				pb.ActionType_CHANGE: depErr.Changes,
-				pb.ActionType_CLAIM:  depErr.Claims,
+			deps := pbconv.DependencyErrorDetails(depErr)
+			details := make([]proto.Message, len(deps))
+			for i, d := range deps {
+				details[i] = d
 			}
-
-			details := []proto.Message{&pb.ModifyDep{
-				Type: pb.ActionType_DETAIL,
-				Msg:  depErr.Message,
-			}}
-			for dtype, dvals := range tmap {
-				for _, tid := range dvals {
-					details = append(details, &pb.ModifyDep{
-						Type: dtype,
-						Id:   &pb.TaskID{Id: tid.ID, Version: tid.Version, Queue: tid.Queue},
-					})
-				}
-			}
-			// Doc dependency details carry DocID instead of TaskID.
-			docMap := map[pb.ActionType][]*entroq.DocID{
-				pb.ActionType_INSERT: depErr.DocInserts,
-				pb.ActionType_DELETE: depErr.DocDeletes,
-				pb.ActionType_DEPEND: depErr.DocDepends,
-				pb.ActionType_CHANGE: depErr.DocChanges,
-				pb.ActionType_CLAIM:  depErr.DocClaims,
-			}
-			for dtype, dvals := range docMap {
-				for _, did := range dvals {
-					details = append(details, &pb.ModifyDep{
-						Type:  dtype,
-						DocId: &pb.DocID{Namespace: did.Namespace, Id: did.ID, Version: did.Version},
-					})
-				}
-			}
-
 			stat, sErr := status.New(codes.NotFound, "modification dependency error").WithDetails(details...)
 			if sErr != nil {
 				return nil, codeErrorf(codes.NotFound, "dependency failed, and failed to add details %v: %w", err, sErr)
@@ -711,28 +520,28 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 	// Assemble the response.
 	pbResp := new(pb.ModifyResponse)
 	for _, task := range resp.InsertedTasks {
-		pt, err := protoFromTask(task)
+		pt, err := pbconv.TaskToProto(task)
 		if err != nil {
 			return nil, autoCodeErrorf("modify inserted task proto: %w", err)
 		}
 		pbResp.Inserted = append(pbResp.Inserted, pt)
 	}
 	for _, task := range resp.ChangedTasks {
-		pt, err := protoFromTask(task)
+		pt, err := pbconv.TaskToProto(task)
 		if err != nil {
 			return nil, autoCodeErrorf("modify changed task proto: %w", err)
 		}
 		pbResp.Changed = append(pbResp.Changed, pt)
 	}
 	for _, d := range resp.InsertedDocs {
-		pd, err := protoFromDoc(d)
+		pd, err := pbconv.DocToProto(d)
 		if err != nil {
 			return nil, autoCodeErrorf("modify inserted doc proto: %w", err)
 		}
 		pbResp.InsertedDocs = append(pbResp.InsertedDocs, pd)
 	}
 	for _, d := range resp.ChangedDocs {
-		pd, err := protoFromDoc(d)
+		pd, err := pbconv.DocToProto(d)
 		if err != nil {
 			return nil, autoCodeErrorf("modify changed doc proto: %w", err)
 		}
@@ -762,7 +571,7 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 	}
 	resp := new(pb.TasksResponse)
 	for _, task := range tasks {
-		pt, err := protoFromTask(task)
+		pt, err := pbconv.TaskToProto(task)
 		if err != nil {
 			return nil, autoCodeErrorf("tasks task proto: %w", err)
 		}
@@ -843,29 +652,10 @@ func (s *QSvc) QueueStats(ctx context.Context, req *pb.QueuesRequest) (*pb.Queue
 // Intentionally UNAUTHENTICATED: it is the server clock, carries no queue or
 // task data, and clients need it to reason about arrival times.
 func (s *QSvc) Time(ctx context.Context, req *pb.TimeRequest) (*pb.TimeResponse, error) {
-	return &pb.TimeResponse{TimeMs: toMS(time.Now().UTC())}, nil
+	return &pb.TimeResponse{TimeMs: pbconv.ToMS(time.Now().UTC())}, nil
 }
 
 // protoFromDoc converts an entroq.Doc to its proto representation.
-func protoFromDoc(d *entroq.Doc) (*pb.Doc, error) {
-	content, err := jsonToProto(d.Content)
-	if err != nil {
-		return nil, fmt.Errorf("doc content: %w", err)
-	}
-	return &pb.Doc{
-		Namespace:    d.Namespace,
-		Id:           d.ID,
-		Version:      d.Version,
-		Claimant:     d.Claimant,
-		AtMs:         toMS(d.At),
-		Key:          d.Key,
-		SecondaryKey: d.SecondaryKey,
-		Content:      content,
-		CreatedMs:    toMS(d.Created),
-		ModifiedMs:   toMS(d.Modified),
-	}, nil
-}
-
 // docClaimDepDetails converts a DependencyError's doc fields into ModifyDep
 // detail messages for transport over gRPC status.
 func docClaimDepDetails(depErr *entroq.DependencyError) []proto.Message {
@@ -920,7 +710,7 @@ func (s *QSvc) Docs(ctx context.Context, req *pb.DocsRequest) (*pb.DocsResponse,
 	}
 	resp := new(pb.DocsResponse)
 	for _, d := range docs {
-		pd, err := protoFromDoc(d)
+		pd, err := pbconv.DocToProto(d)
 		if err != nil {
 			return nil, autoCodeErrorf("docs doc proto: %w", err)
 		}
@@ -994,7 +784,7 @@ func (s *QSvc) ClaimDocs(ctx context.Context, req *pb.ClaimDocsRequest) (*pb.Cla
 	}
 	resp := new(pb.ClaimDocsResponse)
 	for _, d := range claimed {
-		pd, err := protoFromDoc(d)
+		pd, err := pbconv.DocToProto(d)
 		if err != nil {
 			return nil, autoCodeErrorf("claim docs doc proto: %w", err)
 		}

@@ -106,6 +106,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"slices"
 	"strings"
 	"time"
 )
@@ -1345,6 +1346,23 @@ func (m *DependencyError) HasAny() bool {
 // this particular error.
 func (m *DependencyError) OnlyClaims() bool {
 	return !m.HasMissing() && !m.HasCollisions() && !m.HasMissingDocs()
+}
+
+// Implicates reports whether the task with the given id appears in any task-level
+// failure set (a failed change, delete, or depend, an insert collision, or a
+// claim lost to another owner). After a failed commit a worker uses it to tell
+// "my task moved out from under me, or was scooped" from "some other task or doc
+// failed while my task is still validly claimed" -- the latter being when a
+// worker's OnDependency Move or Retry can still land on the task. It is
+// task-scoped: doc failures never implicate a task, even if a doc happens to
+// share the id.
+func (m *DependencyError) Implicates(id string) bool {
+	match := func(t *TaskID) bool { return t.ID == id }
+	return slices.ContainsFunc(m.Inserts, match) ||
+		slices.ContainsFunc(m.Depends, match) ||
+		slices.ContainsFunc(m.Deletes, match) ||
+		slices.ContainsFunc(m.Changes, match) ||
+		slices.ContainsFunc(m.Claims, match)
 }
 
 // Merge returns a new DependencyError combining the failures of m and other,

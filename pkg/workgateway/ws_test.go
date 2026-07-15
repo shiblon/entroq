@@ -10,58 +10,50 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/pkg/backend/eqmem"
+	pb "github.com/shiblon/entroq/api"
 )
 
 // TestWS_OK proves the identical Bridge works over WebSocket: a worker dials in,
-// receives the work message, replies ok, and the input task is committed. Same
-// core as TestBridge_OK, different transport.
+// registers, receives the task, replies ok with a delete, and the input drains.
+// Same core as TestBridge_OKDeletes, different transport.
 func TestWS_OK(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-
-	eq, err := entroq.New(ctx, eqmem.Opener())
-	if err != nil {
-		t.Fatalf("New client: %v", err)
-	}
-	defer eq.Close()
-
-	const q = "in"
-	if _, err := eq.Modify(ctx, entroq.InsertingInto(q, entroq.WithValue("hello"))); err != nil {
-		t.Fatalf("insert: %v", err)
-	}
+	eq := newEQ(t, ctx)
+	insertTask(t, ctx, eq, "in", "hello")
 
 	srvCtx, srvCancel := context.WithCancel(ctx)
 	defer srvCancel()
 	srv := httptest.NewServer(Handler(srvCtx, eq, 30*time.Second))
 	defer srv.Close()
 
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/work?queue=" + q
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/work?queue=in&work=1"
 	c, _, err := websocket.Dial(ctx, wsURL, nil)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	defer c.CloseNow()
 
-	// Play the worker: read the work message, reply ok.
-	var wm struct {
-		Type string      `json:"type"`
-		Task entroq.Task `json:"task"`
+	var dw doWorkMsg
+	if err := wsjson.Read(ctx, c, &dw); err != nil {
+		t.Fatalf("read doWork: %v", err)
 	}
-	if err := wsjson.Read(ctx, c, &wm); err != nil {
-		t.Fatalf("read work: %v", err)
+	if dw.Type != msgDoWork {
+		t.Errorf("got %q, want %q", dw.Type, msgDoWork)
 	}
-	if wm.Type != "work" {
-		t.Errorf("message type = %q, want %q", wm.Type, "work")
+	if got := dw.Task.Value.GetStringValue(); got != "hello" {
+		t.Errorf("task value = %q, want %q", got, "hello")
 	}
-	if got := string(wm.Task.Value); got != `"hello"` {
-		t.Errorf("task value = %s, want %q", got, `"hello"`)
-	}
-	if err := wsjson.Write(ctx, c, map[string]string{"type": "result", "outcome": "ok"}); err != nil {
+	del := &pb.ModifyRequest{Deletes: []*pb.TaskID{{Id: dw.Task.Id, Version: dw.Task.Version, Queue: dw.Task.Queue}}}
+	if err := wsjson.Write(ctx, c, result{
+		Type:         msgResult,
+		disposition:  disposition{Outcome: outcomeOK},
+		Modification: &wireModReq{del},
+	}); err != nil {
 		t.Fatalf("write result: %v", err)
 	}
 
-	if err := eq.WaitQueuesEmpty(ctx, entroq.MatchExact(q)); err != nil {
+	if err := eq.WaitQueuesEmpty(ctx, entroq.MatchExact("in")); err != nil {
 		t.Fatalf("wait queue empty: %v", err)
 	}
 	c.Close(websocket.StatusNormalClosure, "")

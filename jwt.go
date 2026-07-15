@@ -12,7 +12,7 @@ import (
 const ClaimantSeparator = "#"
 
 // MustParseJWTSub extracts the "sub" (subject) claim from a signed JWT (JWS)
-// and returns it as a string. Calls log.Fatalf if the token is malformed or
+// and returns it as a string. Calls log.Panicf if the token is malformed or
 // has no sub claim.
 //
 // Note: this only works with signed JWTs (JWS). Encrypted tokens (JWE) have
@@ -20,20 +20,20 @@ const ClaimantSeparator = "#"
 func MustParseJWTSub(token string) string {
 	parts := strings.SplitN(token, ".", 3)
 	if len(parts) < 2 {
-		log.Fatalf("MustParseJWTSub: not a JWT: %q", token)
+		log.Panicf("MustParseJWTSub: not a JWT: %q", token)
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		log.Fatalf("MustParseJWTSub: decode payload: %v", err)
+		log.Panicf("MustParseJWTSub: decode payload: %v", err)
 	}
 	var claims struct {
 		Sub string `json:"sub"`
 	}
 	if err := json.Unmarshal(payload, &claims); err != nil {
-		log.Fatalf("MustParseJWTSub: unmarshal claims: %v", err)
+		log.Panicf("MustParseJWTSub: unmarshal claims: %v", err)
 	}
 	if claims.Sub == "" {
-		log.Fatalf("MustParseJWTSub: token has no sub claim: %q", fmt.Sprint(token[:min(len(token), 20)]))
+		log.Panicf("MustParseJWTSub: token has no sub claim: %q", fmt.Sprint(token[:min(len(token), 20)]))
 	}
 	return claims.Sub
 }

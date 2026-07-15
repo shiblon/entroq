@@ -92,7 +92,7 @@ func (hw *Worker) Run(ctx context.Context, eq *entroq.EntroQ, opts ...Option) er
 		opt(hw, &workerRunOpts, ro)
 	}
 
-	handler := func(ctx context.Context, task *entroq.Task, reqSpec Request, _ []*entroq.Doc) ([]entroq.ModifyArg, error) {
+	handler := func(ctx context.Context, task *entroq.Task, reqSpec Request, _ []*entroq.Doc) (*worker.Result, error) {
 		outbox := reqSpec.Outbox
 		if outbox == "" {
 			outbox = task.Queue + "/done"
@@ -122,17 +122,17 @@ func (hw *Worker) Run(ctx context.Context, eq *entroq.EntroQ, opts ...Option) er
 				Error:   err.Error(),
 				Elapsed: elapsed,
 			}
-			return []entroq.ModifyArg{
+			return worker.Modify(
 				task.Delete(),
 				entroq.InsertingInto(errbox, entroq.WithValue(resp)),
-			}, nil
+			), nil
 		}
 
 		resp.Elapsed = elapsed
-		return []entroq.ModifyArg{
+		return worker.Modify(
 			task.Delete(),
 			entroq.InsertingInto(outbox, entroq.WithValue(resp)),
-		}, nil
+		), nil
 	}
 
 	return worker.New(eq, worker.WithDoModify(handler)).Run(ctx, workerRunOpts...)

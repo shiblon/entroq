@@ -203,21 +203,21 @@ func newWorkConfig(cmd *cobra.Command, args []string) (*workConfig, error) {
 	}, nil
 }
 
-func (cfg *workConfig) doWork(ctx context.Context, task *entroq.Task, value json.RawMessage, _ []*entroq.Doc) ([]entroq.ModifyArg, error) {
+func (cfg *workConfig) doWork(ctx context.Context, task *entroq.Task, value json.RawMessage, _ []*entroq.Doc) (*worker.Result, error) {
 	result := cfg.runCommand(ctx, task, value)
 	if result.err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return []entroq.ModifyArg{cfg.retryArg(task, workErrorMessage("command failed", result.stderr, result.err))}, nil
+		return worker.Modify(cfg.retryArg(task, workErrorMessage("command failed", result.stderr, result.err))), nil
 	}
 	if result.stdoutExceeded {
-		return []entroq.ModifyArg{cfg.moveArg(task, workErrorMessage(fmt.Sprintf("stdout exceeded --max-output-bytes=%d", cfg.maxOutputBytes), result.stderr, nil))}, nil
+		return worker.Modify(cfg.moveArg(task, workErrorMessage(fmt.Sprintf("stdout exceeded --max-output-bytes=%d", cfg.maxOutputBytes), result.stderr, nil))), nil
 	}
 
 	outputs, err := parseJSONLines(result.stdout)
 	if err != nil {
-		return []entroq.ModifyArg{cfg.moveArg(task, workErrorMessage("parse stdout JSONL", result.stderr, err))}, nil
+		return worker.Modify(cfg.moveArg(task, workErrorMessage("parse stdout JSONL", result.stderr, err))), nil
 	}
 	if len(outputs) != 0 && cfg.outQueue == "" {
 		return nil, worker.FatalErrorf("%s", workErrorMessage("stdout produced tasks but --out-queue is not set", result.stderr, nil))
@@ -237,7 +237,7 @@ func (cfg *workConfig) doWork(ctx context.Context, task *entroq.Task, value json
 			entroq.WithArrivalTimeIn(cfg.recurIn),
 		))
 	}
-	return modArgs, nil
+	return worker.Modify(modArgs...), nil
 }
 
 func (cfg *workConfig) errorQueueFor(task *entroq.Task) string {

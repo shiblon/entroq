@@ -505,16 +505,12 @@ func TestEQMemMixedAtomicStress(t *testing.T) {
 	RunQTest(t, eqtest.MixedAtomicStress)
 }
 
-func TestEQMemWorkerDependencyHandler(t *testing.T) {
-	RunQTest(t, eqtest.WorkerDependencyHandler)
-}
-
 func TestEQMemWorkerCompactDependencyHandler(t *testing.T) {
 	RunQTest(t, eqtest.WorkerCompactDependencyHandler)
 }
 
-func TestEQMemWorkerRenewalNoDependencyHandler(t *testing.T) {
-	RunQTest(t, eqtest.WorkerRenewalNoDependencyHandler)
+func TestEQMemWorkerDependencyMove(t *testing.T) {
+	RunQTest(t, eqtest.WorkerDependencyMove)
 }
 
 func TestEQMemSimpleDocLifecycle(t *testing.T) {

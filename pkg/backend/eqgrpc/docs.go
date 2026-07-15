@@ -3,34 +3,15 @@ package eqgrpc
 import (
 	"context"
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/pbconv"
 
 	pb "github.com/shiblon/entroq/api"
 )
 
 // fromDocProto converts a proto Doc to an entroq.Doc.
-func fromDocProto(d *pb.Doc) *entroq.Doc {
-	content, err := protoToJSON(d.Content)
-	if err != nil {
-		log.Printf("ERROR: doc content conversion: %v", err)
-	}
-	return &entroq.Doc{
-		Namespace:    d.Namespace,
-		ID:           d.Id,
-		Version:      d.Version,
-		Claimant:     d.Claimant,
-		At:           fromMS(d.AtMs),
-		Key:          d.Key,
-		SecondaryKey: d.SecondaryKey,
-		Content:      content,
-		Created:      fromMS(d.CreatedMs),
-		Modified:     fromMS(d.ModifiedMs),
-	}
-}
-
 // Docs returns a slice of docs in a namespace.
 func (b *backend) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, error) {
 	resp, err := pb.NewEntroQClient(b.conn).Docs(ctx, &pb.DocsRequest{
@@ -49,7 +30,7 @@ func (b *backend) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc,
 	}
 	docs := make([]*entroq.Doc, 0, len(resp.Docs))
 	for _, d := range resp.Docs {
-		docs = append(docs, fromDocProto(d))
+		docs = append(docs, pbconv.MustDocFromProto(d))
 	}
 	return docs, nil
 }
@@ -70,7 +51,7 @@ func (b *backend) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq
 	}
 	docs := make([]*entroq.Doc, 0, len(resp.Docs))
 	for _, d := range resp.Docs {
-		docs = append(docs, fromDocProto(d))
+		docs = append(docs, pbconv.MustDocFromProto(d))
 	}
 	return docs, nil
 }

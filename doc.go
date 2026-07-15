@@ -54,13 +54,13 @@ func WithRawContent(val json.RawMessage) DocOpt {
 // WithContent sets the content payload of a doc, marshaling it to JSON first.
 // This is a "must" function in the sense that the value must be marshalable.
 // If this is a data value, it will always work. Things like channels and
-// functions are what would trigger a fatal error here.
+// functions are what would trigger a panic here.
 //
 // Use WithRawContent for pre-marshaled data.
 func WithContent(v any) DocOpt {
 	b, err := json.Marshal(v)
 	if err != nil {
-		log.Fatalf("entroq doc: WithValue: %v", err)
+		log.Panicf("entroq doc: WithValue: %v", err)
 	}
 	return WithRawContent(b)
 }

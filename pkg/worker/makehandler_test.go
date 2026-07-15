@@ -17,7 +17,6 @@ import (
 // which is exactly the per-task state leak that produced the handoffworker
 // stale-tombstone bug.
 type countingHandler struct {
-	eqc      *entroq.EntroQ
 	observed chan<- int
 	uses     int
 }
@@ -32,8 +31,8 @@ func (h *countingHandler) DoWork(ctx context.Context, task *entroq.Task, _ strin
 	return nil
 }
 
-func (h *countingHandler) Finish(ctx context.Context, task *entroq.Task, _ string, _ []*entroq.Doc) error {
-	_, err := h.eqc.Modify(ctx, task.Delete())
+func (h *countingHandler) Finish(ctx context.Context, mod Modifier, task *entroq.Task, _ string, _ []*entroq.Doc) error {
+	_, err := mod.Modify(ctx, task.Delete())
 	return err
 }
 
@@ -68,7 +67,7 @@ func TestWorker_FreshHandlerPerTask(t *testing.T) {
 
 	go func() {
 		w := New(client, WithMakeHandler(func() (Handler[string], error) {
-			return &countingHandler{eqc: client, observed: observed}, nil
+			return &countingHandler{observed: observed}, nil
 		}))
 		if err := w.Run(runCtx, Watching("test_q")); err != nil && !errors.Is(err, context.Canceled) {
 			t.Errorf("worker run: %v", err)

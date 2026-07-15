@@ -58,14 +58,8 @@ func (cw *ConfigWorker) reloadConfig(ctx context.Context) error {
 	return nil
 }
 
-// handleDependencyError is the hook called when a task modification fails.
-func (cw *ConfigWorker) handleDependencyError(ctx context.Context, task *entroq.Task, de *entroq.DependencyError) error {
-	log.Printf("[Worker] Dependency failure! Local version %v is stale. Re-syncing...", cw.cID)
-	return cw.reloadConfig(ctx)
-}
-
 // doWork processes a single numeric task using the current local multiplier.
-func (cw *ConfigWorker) doWork(ctx context.Context, t *entroq.Task, val int, _ []*entroq.Doc) ([]entroq.ModifyArg, error) {
+func (cw *ConfigWorker) doWork(ctx context.Context, t *entroq.Task, val int, _ []*entroq.Doc) (*worker.Result, error) {
 	// We use the LOCAL state here. Even if another worker instance refreshed
 	// their own config, ours stays what it was when it was read.
 	multiplier := cw.config.Multiplier
@@ -73,11 +67,16 @@ func (cw *ConfigWorker) doWork(ctx context.Context, t *entroq.Task, val int, _ [
 	result := val * multiplier
 	log.Printf("[Worker] Processing: %v * %v = %v (ver %v)", val, multiplier, result, cw.cID)
 
-	return []entroq.ModifyArg{
-		t.Delete(),
-		cw.cID.Depend(),
-		entroq.InsertingInto(outboxQueue, entroq.WithValue(result)),
-	}, nil
+	return worker.
+		Modify(
+			t.Delete(),
+			cw.cID.Depend(),
+			entroq.InsertingInto(outboxQueue, entroq.WithValue(result)),
+		).
+		OnDependency(func(ctx context.Context, de *entroq.DependencyError) error {
+			log.Printf("[Worker] Dependency failure! Local version %v is stale. Re-syncing...", cw.cID)
+			return cw.reloadConfig(ctx)
+		}), nil
 }
 
 func main() {
@@ -148,10 +147,7 @@ func main() {
 	// Do work
 	log.Printf("Starting worker...")
 	w := worker.New(client, worker.WithDoModify(cw.doWork))
-	if err := w.Run(ctx,
-		worker.Watching(workQueue),
-		worker.WithDependencyHandler(cw.handleDependencyError),
-	); err != nil {
+	if err := w.Run(ctx, worker.Watching(workQueue)); err != nil {
 		log.Printf("...Worker stopped: %v", err)
 	}
 }
