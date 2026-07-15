@@ -546,6 +546,29 @@ func IsTimeout(err error) bool {
 	return errors.Is(err, context.DeadlineExceeded)
 }
 
+// UnavailableError indicates the backend was temporarily unreachable, e.g. the
+// server is restarting or being relocated by an orchestrator. It is a transient
+// condition: the same operation may well succeed on retry once the backend
+// returns. Backends surface it (the gRPC backend translates codes.Unavailable to
+// it at the boundary) so callers can tell a routine control-plane blip from a
+// genuine failure with IsUnavailable rather than inspecting transport specifics.
+type UnavailableError struct{ msg string }
+
+// Error implements the error interface.
+func (e *UnavailableError) Error() string { return e.msg }
+
+// Unavailablef builds an UnavailableError with a formatted message.
+func Unavailablef(format string, args ...any) *UnavailableError {
+	return &UnavailableError{msg: fmt.Sprintf(format, args...)}
+}
+
+// IsUnavailable reports whether err indicates a temporarily unavailable backend
+// (see UnavailableError). Such errors are safe to retry once the backend returns.
+func IsUnavailable(err error) bool {
+	var u *UnavailableError
+	return errors.As(err, &u)
+}
+
 // claimQueryFromOpts processes ClaimOpt values and produces a claim query.
 func claimQueryFromOpts(claimant string, opts ...ClaimOpt) *ClaimQuery {
 	query := &ClaimQuery{
