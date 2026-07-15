@@ -504,11 +504,7 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 	resp, err := s.impl.Modify(ctx, modArgs...)
 	if err != nil {
 		if depErr, ok := entroq.AsDependency(err); ok {
-			deps := pbconv.DependencyErrorDetails(depErr)
-			details := make([]proto.Message, len(deps))
-			for i, d := range deps {
-				details[i] = d
-			}
+			details := depDetails(depErr)
 			stat, sErr := status.New(codes.NotFound, "modification dependency error").WithDetails(details...)
 			if sErr != nil {
 				return nil, codeErrorf(codes.NotFound, "dependency failed, and failed to add details %v: %w", err, sErr)
@@ -655,25 +651,16 @@ func (s *QSvc) Time(ctx context.Context, req *pb.TimeRequest) (*pb.TimeResponse,
 	return &pb.TimeResponse{TimeMs: pbconv.ToMS(time.Now().UTC())}, nil
 }
 
-// protoFromDoc converts an entroq.Doc to its proto representation.
-// docClaimDepDetails converts a DependencyError's doc fields into ModifyDep
-// detail messages for transport over gRPC status.
-func docClaimDepDetails(depErr *entroq.DependencyError) []proto.Message {
-	details := []proto.Message{&pb.ModifyDep{
-		Type: pb.ActionType_DETAIL,
-		Msg:  depErr.Message,
-	}}
-	for _, did := range depErr.DocDeletes {
-		details = append(details, &pb.ModifyDep{
-			Type:  pb.ActionType_DELETE,
-			DocId: &pb.DocID{Namespace: did.Namespace, Id: did.ID, Version: did.Version},
-		})
-	}
-	for _, did := range depErr.DocClaims {
-		details = append(details, &pb.ModifyDep{
-			Type:  pb.ActionType_CLAIM,
-			DocId: &pb.DocID{Namespace: did.Namespace, Id: did.ID, Version: did.Version},
-		})
+// depDetails renders a DependencyError as the gRPC status detail messages naming
+// which dependencies failed. It adapts the shared, transport-neutral pbconv
+// renderer (which returns []*pb.ModifyDep) to the []proto.Message that
+// status.WithDetails wants, so the gRPC layer owns the widening and pbconv stays
+// gRPC-agnostic.
+func depDetails(depErr *entroq.DependencyError) []proto.Message {
+	deps := pbconv.DependencyErrorDetails(depErr)
+	details := make([]proto.Message, len(deps))
+	for i, d := range deps {
+		details[i] = d
 	}
 	return details
 }
@@ -773,7 +760,7 @@ func (s *QSvc) ClaimDocs(ctx context.Context, req *pb.ClaimDocsRequest) (*pb.Cla
 	})
 	if err != nil {
 		if depErr, ok := entroq.AsDependency(err); ok {
-			details := docClaimDepDetails(depErr)
+			details := depDetails(depErr)
 			stat, sErr := status.New(codes.NotFound, "claim docs dependency error").WithDetails(details...)
 			if sErr != nil {
 				return nil, codeErrorf(codes.NotFound, "claim docs dependency failed, unable to add details %v: %w", err, sErr)
