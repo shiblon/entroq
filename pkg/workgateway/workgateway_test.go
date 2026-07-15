@@ -880,11 +880,13 @@ func TestBridge_ClientDropDuringTakeDocs(t *testing.T) {
 	}
 }
 
-// TestBridge_SuccessDropKeepsCommit proves the exactly-once boundary holds across
-// a post-commit disconnect: if the client drops during the success phase, the
-// commit is already durable. The success phase is best-effort, so its failure
-// rolls nothing back.
-func TestBridge_SuccessDropKeepsCommit(t *testing.T) {
+// TestBridge_SuccessDropStopsWorker proves two things about a client that drops
+// during the (best-effort) success phase: the worker stops with a fatal error
+// rather than looping back to claim a task the dead connection cannot deliver
+// (which would needlessly starve that task for a lease period), and the
+// already-committed task stays committed (the exactly-once boundary holds). A
+// dropped connection is the one thing OnSuccess treats as fatal.
+func TestBridge_SuccessDropStopsWorker(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	eq := newEQ(t, ctx)
@@ -902,11 +904,14 @@ func TestBridge_SuccessDropKeepsCommit(t *testing.T) {
 	s.c.recv(&su)   // the commit has happened; the bridge now awaits the done reply
 	s.closeClient() // drop before acknowledging the success phase
 
-	// The commit is durable regardless of the success-phase drop.
+	// The dead connection stops the worker instead of looping back to claim.
+	if _, ok := worker.AsFatal(s.wait()); !ok {
+		t.Fatal("a success-phase drop must stop the worker with a fatal error")
+	}
+	// ...and the commit is durable regardless.
 	if err := eq.WaitQueuesEmpty(ctx, entroq.MatchExact("in")); err != nil {
 		t.Fatalf("commit must survive a success-phase drop: %v", err)
 	}
-	s.stop()
 }
 
 // TestBridge_WrongMessageType stops the worker on a protocol violation: a reply

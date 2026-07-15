@@ -274,13 +274,18 @@ func (b *Bridge) report(ctx context.Context, depErr *entroq.DependencyError) err
 // disposition back to the worker's OnSuccess layer, which logs a non-fatal
 // outcome and continues, stopping only on "fatal" -- so "retry"/"move" here are
 // harmless no-ops, exactly as the Go OnSuccess contract states.
+//
+// A transport failure is the exception: because OnSuccess treats a plain error
+// as best-effort and would loop on to claim another task the dead connection
+// cannot deliver (needlessly starving that task for a lease period), a dropped
+// connection must escalate to a FatalError so the worker stops instead.
 func (b *Bridge) success(ctx context.Context) error {
 	if err := b.conn.Send(ctx, successMsg{Type: msgSuccess}); err != nil {
-		return fmt.Errorf("send success: %w", err)
+		return worker.FatalErrorf("send success: %v", err)
 	}
 	var d done
 	if err := b.conn.Recv(ctx, &d); err != nil {
-		return fmt.Errorf("read done: %w", err)
+		return worker.FatalErrorf("read done: %v", err)
 	}
 	if d.Type != msgDone {
 		return worker.FatalErrorf("expected %q message, got %q", msgDone, d.Type)
