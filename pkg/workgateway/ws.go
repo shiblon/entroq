@@ -80,11 +80,31 @@ func Handler(ctx context.Context, eq *entroq.EntroQ, lease time.Duration) http.H
 		case err == nil || errors.Is(err, context.Canceled):
 			c.Close(websocket.StatusNormalClosure, "")
 		default:
+			code, reason := websocket.StatusInternalError, "worker error"
+			if ee, ok := AsExit(err); ok {
+				code, reason = closeCodeForClass(ee.Class), ee.Class.String()
+			}
 			log.Printf("work: connection %s: %v", r.RemoteAddr, err)
-			c.Close(websocket.StatusInternalError, "worker error")
+			c.Close(code, reason)
 		}
 	})
 	return mux
+}
+
+// closeCodeForClass maps a gateway ExitClass to the WebSocket close code a worker
+// client reads to decide retry-vs-stop, drawn from the standard close-code
+// registry: transient -> try-again-later, caller fault -> policy violation,
+// gateway fault -> internal error. ExitOK never reaches here (it is the
+// normal-closure path above).
+func closeCodeForClass(c ExitClass) websocket.StatusCode {
+	switch c {
+	case ExitTransient:
+		return websocket.StatusTryAgainLater
+	case ExitCaller:
+		return websocket.StatusPolicyViolation
+	default:
+		return websocket.StatusInternalError
+	}
 }
 
 // queryInt32 parses an optional int32 query parameter, defaulting to 0 when
