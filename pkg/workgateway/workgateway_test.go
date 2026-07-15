@@ -51,10 +51,12 @@ func (c *codec) recv(v any) {
 // session runs a Bridge over pipes against eq with the given registration, and
 // the test plays the worker.
 type session struct {
-	t      *testing.T
-	c      *codec
-	cancel context.CancelFunc
-	errc   chan error
+	t       *testing.T
+	c       *codec
+	cancel  context.CancelFunc
+	errc    chan error
+	clientR *io.PipeReader // client's read end; closing it breaks the bridge's Send
+	clientW *io.PipeWriter // client's write end; closing it gives the bridge's Recv EOF
 }
 
 func newSession(t *testing.T, ctx context.Context, eq *entroq.EntroQ, cfg Config, lease time.Duration) *session {
@@ -68,11 +70,22 @@ func newSession(t *testing.T, ctx context.Context, eq *entroq.EntroQ, cfg Config
 	go func() { errc <- bridge.Run(rctx, eq) }()
 
 	return &session{
-		t:      t,
-		c:      &codec{t: t, enc: json.NewEncoder(clientW), dec: json.NewDecoder(clientR)},
-		cancel: cancel,
-		errc:   errc,
+		t:       t,
+		c:       &codec{t: t, enc: json.NewEncoder(clientW), dec: json.NewDecoder(clientR)},
+		cancel:  cancel,
+		errc:    errc,
+		clientR: clientR,
+		clientW: clientW,
 	}
+}
+
+// closeClient simulates the worker vanishing: it closes both client pipe ends,
+// so whichever operation the bridge is blocked on next fails as it would on a
+// dropped connection (Recv sees EOF, Send sees a closed pipe).
+func (s *session) closeClient() {
+	s.t.Helper()
+	s.clientW.Close()
+	s.clientR.Close()
 }
 
 // stop cancels the bridge and asserts it exited cleanly (nil or a cancellation).
@@ -787,5 +800,152 @@ func TestBridge_RequiresWorkHandler(t *testing.T) {
 	s := newSession(t, ctx, eq, Config{Queues: []string{"in"}}, time.Second) // Work:false
 	if err := s.wait(); err == nil {
 		t.Fatal("expected an error for a registration with no work handler")
+	}
+}
+
+// The tests below exercise transport failure: a worker that drops its connection
+// mid-task. The gateway's contract is that any Send/Recv failure ends the worker
+// (a dead connection is not recoverable), and because the task was claimed under
+// a lease rather than committed, it is reclaimed after the lease expires -- the
+// at-least-once guarantee that lets a foreign worker crash without losing work.
+
+// TestBridge_ClientDropReclaims is the core resilience property: a worker that
+// receives a task then vanishes without replying leaves the bridge to exit with
+// an error, the (uncommitted) task still in its queue, and the task reclaimable
+// once the lease lapses.
+func TestBridge_ClientDropReclaims(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	eq := newEQ(t, ctx)
+	insertTask(t, ctx, eq, "in", "hello")
+
+	lease := 200 * time.Millisecond
+	s := newSession(t, ctx, eq, workCfg(), lease)
+
+	var dw doWorkMsg
+	s.c.recv(&dw) // the task is now claimed by the bridge
+	s.closeClient()
+
+	// A dropped connection ends the worker via a non-sentinel Recv error.
+	if err := s.wait(); err == nil {
+		t.Fatal("expected Run to exit with an error when the client drops")
+	}
+	// The task was never committed, so it is still present, just leased.
+	tasks, err := eq.Tasks(ctx, "in")
+	if err != nil {
+		t.Fatalf("tasks: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("task lost after a drop: got %d tasks, want 1", len(tasks))
+	}
+	// Once the lease lapses it must be claimable again (at-least-once).
+	deadline := time.After(5 * time.Second)
+	for {
+		claimed, err := eq.TryClaim(ctx, entroq.From("in"), entroq.ClaimFor(time.Second))
+		if err != nil {
+			t.Fatalf("try claim: %v", err)
+		}
+		if claimed != nil {
+			if got := string(claimed.Value); got != `"hello"` {
+				t.Errorf("reclaimed value = %s, want %q", got, `"hello"`)
+			}
+			return // reclaimed: at-least-once holds
+		}
+		select {
+		case <-deadline:
+			t.Fatal("task was never reclaimable after the lease expired")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
+// TestBridge_ClientDropDuringTakeDocs covers a drop at the takeDocs phase: the
+// bridge exits with an error rather than hanging, before any work happens.
+func TestBridge_ClientDropDuringTakeDocs(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	eq := newEQ(t, ctx)
+	insertTask(t, ctx, eq, "in", "hello")
+
+	cfg := workCfg()
+	cfg.TakeDocs = true
+	s := newSession(t, ctx, eq, cfg, time.Second)
+
+	var td takeDocsMsg
+	s.c.recv(&td) // the bridge is now waiting for the docs reply
+	s.closeClient()
+
+	if err := s.wait(); err == nil {
+		t.Fatal("expected Run to exit with an error when the client drops during takeDocs")
+	}
+}
+
+// TestBridge_SuccessDropKeepsCommit proves the exactly-once boundary holds across
+// a post-commit disconnect: if the client drops during the success phase, the
+// commit is already durable. The success phase is best-effort, so its failure
+// rolls nothing back.
+func TestBridge_SuccessDropKeepsCommit(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	eq := newEQ(t, ctx)
+	insertTask(t, ctx, eq, "in", "hello")
+
+	cfg := workCfg()
+	cfg.Success = true
+	s := newSession(t, ctx, eq, cfg, time.Second)
+
+	var dw doWorkMsg
+	s.c.recv(&dw)
+	s.c.send(okResult(deleteTask(dw.Task.Task))) // commit: delete the task
+
+	var su successMsg
+	s.c.recv(&su)   // the commit has happened; the bridge now awaits the done reply
+	s.closeClient() // drop before acknowledging the success phase
+
+	// The commit is durable regardless of the success-phase drop.
+	if err := eq.WaitQueuesEmpty(ctx, entroq.MatchExact("in")); err != nil {
+		t.Fatalf("commit must survive a success-phase drop: %v", err)
+	}
+	s.stop()
+}
+
+// TestBridge_WrongMessageType stops the worker on a protocol violation: a reply
+// with an unexpected type is a client bug, not a transient fault, so the bridge
+// returns a fatal error.
+func TestBridge_WrongMessageType(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	eq := newEQ(t, ctx)
+	insertTask(t, ctx, eq, "in", "hello")
+
+	s := newSession(t, ctx, eq, workCfg(), time.Second)
+
+	var dw doWorkMsg
+	s.c.recv(&dw)
+	s.c.send(map[string]string{"type": "bogus"}) // not a result
+
+	if _, ok := worker.AsFatal(s.wait()); !ok {
+		t.Fatal("expected a fatal error for an unexpected message type")
+	}
+}
+
+// TestBridge_MalformedInput ends the worker on undecodable input rather than
+// hanging or panicking.
+func TestBridge_MalformedInput(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	eq := newEQ(t, ctx)
+	insertTask(t, ctx, eq, "in", "hello")
+
+	s := newSession(t, ctx, eq, workCfg(), time.Second)
+
+	var dw doWorkMsg
+	s.c.recv(&dw)
+	if _, err := s.clientW.Write([]byte("this is not json\n")); err != nil {
+		t.Fatalf("write garbage: %v", err)
+	}
+
+	if err := s.wait(); err == nil {
+		t.Fatal("expected Run to exit on malformed input")
 	}
 }

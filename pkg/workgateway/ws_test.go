@@ -59,3 +59,48 @@ func TestWS_OK(t *testing.T) {
 	c.Close(websocket.StatusNormalClosure, "")
 	srvCancel()
 }
+
+// TestWS_ClientDropReclaims is the WebSocket analog of TestBridge_ClientDropReclaims:
+// a worker that dials in, receives a task, and abruptly drops the connection
+// leaves the (uncommitted) task reclaimable once the lease expires.
+func TestWS_ClientDropReclaims(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	eq := newEQ(t, ctx)
+	insertTask(t, ctx, eq, "in", "hello")
+
+	lease := 200 * time.Millisecond
+	srvCtx, srvCancel := context.WithCancel(ctx)
+	defer srvCancel()
+	srv := httptest.NewServer(Handler(srvCtx, eq, lease))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/work?queue=in&work=1"
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+
+	var dw doWorkMsg
+	if err := wsjson.Read(ctx, c, &dw); err != nil {
+		t.Fatalf("read doWork: %v", err)
+	}
+	c.CloseNow() // abruptly drop without replying
+
+	// The task must be reclaimable once the lease lapses (at-least-once over WS).
+	deadline := time.After(5 * time.Second)
+	for {
+		claimed, err := eq.TryClaim(ctx, entroq.From("in"), entroq.ClaimFor(time.Second))
+		if err != nil {
+			t.Fatalf("try claim: %v", err)
+		}
+		if claimed != nil {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("task never reclaimable after a WS drop + lease expiry")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
