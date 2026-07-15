@@ -7,6 +7,7 @@ import (
 	"os"
 
 	"github.com/shiblon/entroq/pkg/version"
+	"github.com/shiblon/entroq/pkg/workgateway"
 	"github.com/spf13/cobra"
 )
 
@@ -34,10 +35,16 @@ The handoff command links two EntroQ instances directly, claiming tasks from a
 source instance and delivering them into a destination instance, exactly once.`,
 }
 
-// Execute is the entry point called from main.
+// Execute is the entry point called from main. A gateway that stops with a
+// classified *ExitError exits with the class's code (sysexits conventions) so a
+// supervisor can tell a transient backend blip from a caller fault; anything
+// else is a generic failure (exit 1).
 func Execute() {
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
+		if ee, ok := workgateway.AsExit(err); ok {
+			os.Exit(ee.Class.ExitCode())
+		}
 		os.Exit(1)
 	}
 }

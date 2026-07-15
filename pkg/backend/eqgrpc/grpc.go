@@ -439,6 +439,11 @@ func unpackGRPCError(grpcErr error) error {
 		return depErrorFromStat(stat)
 	case codes.PermissionDenied:
 		return authzErrFromStat(stat)
+	case codes.Unavailable:
+		// The server is unreachable (down, restarting, or being relocated).
+		// Translate to entroq's transient-unavailable error so callers can retry
+		// on it via entroq.IsUnavailable without inspecting gRPC codes.
+		return entroq.Unavailablef("backend unavailable: %s", stat.Message())
 	default:
 		return grpcErr
 	}

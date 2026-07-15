@@ -24,7 +24,7 @@ func TestWS_OK(t *testing.T) {
 
 	srvCtx, srvCancel := context.WithCancel(ctx)
 	defer srvCancel()
-	srv := httptest.NewServer(Handler(srvCtx, eq, 30*time.Second))
+	srv := httptest.NewServer(Handler(srvCtx, eq, 30*time.Second, defaultEntroQTimeout))
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/work?queue=in&work=1"
@@ -72,7 +72,7 @@ func TestWS_ClientDropReclaims(t *testing.T) {
 	lease := 200 * time.Millisecond
 	srvCtx, srvCancel := context.WithCancel(ctx)
 	defer srvCancel()
-	srv := httptest.NewServer(Handler(srvCtx, eq, lease))
+	srv := httptest.NewServer(Handler(srvCtx, eq, lease, defaultEntroQTimeout))
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/work?queue=in&work=1"

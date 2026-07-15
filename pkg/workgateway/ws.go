@@ -40,7 +40,7 @@ func (w *WSConn) Recv(ctx context.Context, v any) error { return wsjson.Read(ctx
 // ends that worker and reclaims its task. An idle connection (blocked claiming)
 // is only noticed at shutdown or the next task; a keepalive ping to catch idle
 // drops promptly is a follow-up.
-func Handler(ctx context.Context, eq *entroq.EntroQ, lease time.Duration) http.Handler {
+func Handler(ctx context.Context, eq *entroq.EntroQ, lease, entroqTimeout time.Duration) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/work", func(rw http.ResponseWriter, r *http.Request) {
 		maxAttempts, err := queryInt32(r, "maxAttempts")
@@ -75,16 +75,36 @@ func Handler(ctx context.Context, eq *entroq.EntroQ, lease time.Duration) http.H
 		}
 		defer c.CloseNow()
 
-		bridge := NewBridge(NewWSConn(c), WithConfig(cfg), WithLease(lease))
+		bridge := NewBridge(NewWSConn(c), WithConfig(cfg), WithLease(lease), WithEntroQTimeout(entroqTimeout))
 		switch err := bridge.Run(ctx, eq); {
 		case err == nil || errors.Is(err, context.Canceled):
 			c.Close(websocket.StatusNormalClosure, "")
 		default:
+			code, reason := websocket.StatusInternalError, "worker error"
+			if ee, ok := AsExit(err); ok {
+				code, reason = closeCodeForClass(ee.Class), ee.Class.String()
+			}
 			log.Printf("work: connection %s: %v", r.RemoteAddr, err)
-			c.Close(websocket.StatusInternalError, "worker error")
+			c.Close(code, reason)
 		}
 	})
 	return mux
+}
+
+// closeCodeForClass maps a gateway ExitClass to the WebSocket close code a worker
+// client reads to decide retry-vs-stop, drawn from the standard close-code
+// registry: transient -> try-again-later, caller fault -> policy violation,
+// gateway fault -> internal error. ExitOK never reaches here (it is the
+// normal-closure path above).
+func closeCodeForClass(c ExitClass) websocket.StatusCode {
+	switch c {
+	case ExitTransient:
+		return websocket.StatusTryAgainLater
+	case ExitCaller:
+		return websocket.StatusPolicyViolation
+	default:
+		return websocket.StatusInternalError
+	}
 }
 
 // queryInt32 parses an optional int32 query parameter, defaulting to 0 when
@@ -109,8 +129,8 @@ func queryBool(r *http.Request, key string) bool {
 }
 
 // Serve runs Handler on addr until ctx is done, then shuts the server down.
-func Serve(ctx context.Context, addr string, eq *entroq.EntroQ, lease time.Duration) error {
-	srv := &http.Server{Addr: addr, Handler: Handler(ctx, eq, lease)}
+func Serve(ctx context.Context, addr string, eq *entroq.EntroQ, lease, entroqTimeout time.Duration) error {
+	srv := &http.Server{Addr: addr, Handler: Handler(ctx, eq, lease, entroqTimeout)}
 
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error {

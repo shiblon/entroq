@@ -13,14 +13,15 @@ import (
 )
 
 var (
-	workAddr        string
-	workLease       time.Duration
-	workQueues      []string
-	workMaxAttempts int32
-	workTakeDocs    bool
-	workWork        bool
-	workSuccess     bool
-	workDependency  bool
+	workAddr          string
+	workLease         time.Duration
+	workQueues        []string
+	workMaxAttempts   int32
+	workTakeDocs      bool
+	workWork          bool
+	workSuccess       bool
+	workDependency    bool
+	workEntroQTimeout time.Duration
 )
 
 var workCmd = &cobra.Command{
@@ -66,10 +67,20 @@ dependencies (a protojson ModifyDep list) and the done outcome picks the task's
 fate the same way. Diagnostics go to stderr; stdout carries only the protocol,
 so a spawning client should let this process inherit its stderr to see them.
 
+A worker error that does not itself drop the connection (a transient EntroQ
+outage being retried, or a caller/gateway fault about to stop the worker) is
+reported to the client out of band as {"type":"error","class":...,"message":...}
+in place of the next phase message; it is one-way, the client decides what to do.
+The gateway rides out an unreachable EntroQ backend (one being restarted or
+relocated) for --entroq-timeout, reconnecting transparently, before giving up.
+On stop it exits with a class code a supervisor can key on: 0 clean, 75
+transient (retryable), 78 caller fault, 70 gateway fault.
+
 With --addr the gateway serves WebSocket instead, and each connecting worker
 declares the same registration via URL query params (?queue=..&work=1&...).
-Concurrency is more connections; dropping a connection stops renewal and the
-in-flight task is reclaimed on lease expiry.`,
+Concurrency is more connections; a dropped connection is a clean stop and the
+in-flight task is reclaimed on lease expiry. The same classes surface as
+WebSocket close codes (1013 transient, 1008 caller, 1011 gateway).`,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -87,7 +98,7 @@ in-flight task is reclaimed on lease expiry.`,
 		// WebSocket serve mode: many workers connect, each declaring its own
 		// registration via URL query params.
 		if workAddr != "" {
-			return workgateway.Serve(gctx, workAddr, eq, workLease)
+			return workgateway.Serve(gctx, workAddr, eq, workLease, workEntroQTimeout)
 		}
 
 		// stdio mode: one worker over this process's stdin/stdout, registered by
@@ -101,7 +112,8 @@ in-flight task is reclaimed on lease expiry.`,
 			Dependency:  workDependency,
 		}
 		bridge := workgateway.NewBridge(workgateway.NewPipeConn(os.Stdin, os.Stdout),
-			workgateway.WithConfig(cfg), workgateway.WithLease(workLease))
+			workgateway.WithConfig(cfg), workgateway.WithLease(workLease),
+			workgateway.WithEntroQTimeout(workEntroQTimeout))
 		return bridge.Run(gctx, eq)
 	},
 }
@@ -116,6 +128,7 @@ func init() {
 	flags.BoolVar(&workWork, "work", false, "The worker implements the work phase (required).")
 	flags.BoolVar(&workSuccess, "success", false, "The worker implements the success phase (post-commit).")
 	flags.BoolVar(&workDependency, "dependency", false, "The worker implements the dependency phase (commit lost a dependency).")
+	flags.DurationVar(&workEntroQTimeout, "entroq-timeout", 60*time.Second, "How long to ride out an unreachable EntroQ backend (restart or relocation) before exiting; 0 disables the ride-out.")
 
 	rootCmd.AddCommand(workCmd)
 }

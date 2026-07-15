@@ -48,6 +48,22 @@ func (c *codec) recv(v any) {
 	}
 }
 
+// recvAny reads the next message and returns its type tag plus the raw JSON, for
+// tests that must dispatch on type -- e.g. draining error messages until a phase
+// message arrives.
+func (c *codec) recvAny() (string, json.RawMessage) {
+	c.t.Helper()
+	var raw json.RawMessage
+	c.recv(&raw)
+	var probe struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		c.t.Fatalf("recvAny probe: %v", err)
+	}
+	return probe.Type, raw
+}
+
 // session runs a Bridge over pipes against eq with the given registration, and
 // the test plays the worker.
 type session struct {
@@ -59,11 +75,12 @@ type session struct {
 	clientW *io.PipeWriter // client's write end; closing it gives the bridge's Recv EOF
 }
 
-func newSession(t *testing.T, ctx context.Context, eq *entroq.EntroQ, cfg Config, lease time.Duration) *session {
+func newSession(t *testing.T, ctx context.Context, eq *entroq.EntroQ, cfg Config, lease time.Duration, opts ...Option) *session {
 	t.Helper()
 	clientR, gatewayW := io.Pipe()
 	gatewayR, clientW := io.Pipe()
-	bridge := NewBridge(NewPipeConn(gatewayR, gatewayW), WithConfig(cfg), WithLease(lease))
+	bopts := append([]Option{WithConfig(cfg), WithLease(lease)}, opts...)
+	bridge := NewBridge(NewPipeConn(gatewayR, gatewayW), bopts...)
 
 	rctx, cancel := context.WithCancel(ctx)
 	errc := make(chan error, 1)
@@ -716,8 +733,15 @@ func TestBridge_SuccessFatal(t *testing.T) {
 	s.c.recv(&su)
 	s.c.send(done{Type: msgDone, disposition: disposition{Outcome: outcomeFatal, Message: "success step blew up"}})
 
-	if _, ok := worker.AsFatal(s.wait()); !ok {
-		t.Fatal("expected a fatal error to stop the worker")
+	// A worker-requested fatal is a caller fault, reported before the stop.
+	var em errorMsg
+	s.c.recv(&em)
+	if em.Class != ExitCaller.String() {
+		t.Errorf("error class = %q, want %q", em.Class, ExitCaller.String())
+	}
+	ee, ok := AsExit(s.wait())
+	if !ok || ee.Class != ExitCaller {
+		t.Fatalf("expected a caller-fault exit, got %+v (ok=%v)", ee, ok)
 	}
 	// The task committed before the fatal, so the queue is empty.
 	if err := eq.WaitQueuesEmpty(ctx, entroq.MatchExact("in")); err != nil {
@@ -773,8 +797,15 @@ func TestBridge_Fatal(t *testing.T) {
 	s.c.recv(&dw)
 	s.c.send(result{Type: msgResult, disposition: disposition{Outcome: outcomeFatal, Message: "boom"}})
 
-	if _, ok := worker.AsFatal(s.wait()); !ok {
-		t.Fatal("expected a fatal error to stop the worker")
+	// A worker-requested fatal is a caller fault, reported before the stop.
+	var em errorMsg
+	s.c.recv(&em)
+	if em.Class != ExitCaller.String() {
+		t.Errorf("error class = %q, want %q", em.Class, ExitCaller.String())
+	}
+	ee, ok := AsExit(s.wait())
+	if !ok || ee.Class != ExitCaller {
+		t.Fatalf("expected a caller-fault exit, got %+v (ok=%v)", ee, ok)
 	}
 }
 
@@ -804,14 +835,17 @@ func TestBridge_RequiresWorkHandler(t *testing.T) {
 }
 
 // The tests below exercise transport failure: a worker that drops its connection
-// mid-task. The gateway's contract is that any Send/Recv failure ends the worker
-// (a dead connection is not recoverable), and because the task was claimed under
-// a lease rather than committed, it is reclaimed after the lease expires -- the
-// at-least-once guarantee that lets a foreign worker crash without losing work.
+// mid-task. Because the gateway owns the claim under a lease rather than a
+// commit, a drop leaves the task reclaimable after the lease -- the at-least-once
+// guarantee that lets a foreign worker crash without losing work. A dropped
+// connection is a *clean* stop (Run returns nil): the client owns its own
+// lifecycle, so there is nothing for the gateway to alert on. A decodable message
+// of the wrong type or shape, by contrast, is a caller fault the gateway reports
+// over the error channel before it stops.
 
 // TestBridge_ClientDropReclaims is the core resilience property: a worker that
-// receives a task then vanishes without replying leaves the bridge to exit with
-// an error, the (uncommitted) task still in its queue, and the task reclaimable
+// receives a task then vanishes without replying leaves the bridge to stop
+// cleanly, the (uncommitted) task still in its queue, and the task reclaimable
 // once the lease lapses.
 func TestBridge_ClientDropReclaims(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -826,9 +860,9 @@ func TestBridge_ClientDropReclaims(t *testing.T) {
 	s.c.recv(&dw) // the task is now claimed by the bridge
 	s.closeClient()
 
-	// A dropped connection ends the worker via a non-sentinel Recv error.
-	if err := s.wait(); err == nil {
-		t.Fatal("expected Run to exit with an error when the client drops")
+	// A dropped client is a clean stop: the client owns its own lifecycle.
+	if err := s.wait(); err != nil {
+		t.Fatalf("a client drop should be a clean stop, got: %v", err)
 	}
 	// The task was never committed, so it is still present, just leased.
 	tasks, err := eq.Tasks(ctx, "in")
@@ -860,7 +894,7 @@ func TestBridge_ClientDropReclaims(t *testing.T) {
 }
 
 // TestBridge_ClientDropDuringTakeDocs covers a drop at the takeDocs phase: the
-// bridge exits with an error rather than hanging, before any work happens.
+// bridge stops cleanly rather than hanging, before any work happens.
 func TestBridge_ClientDropDuringTakeDocs(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -875,16 +909,17 @@ func TestBridge_ClientDropDuringTakeDocs(t *testing.T) {
 	s.c.recv(&td) // the bridge is now waiting for the docs reply
 	s.closeClient()
 
-	if err := s.wait(); err == nil {
-		t.Fatal("expected Run to exit with an error when the client drops during takeDocs")
+	if err := s.wait(); err != nil {
+		t.Fatalf("a client drop during takeDocs should be a clean stop, got: %v", err)
 	}
 }
 
-// TestBridge_SuccessDropKeepsCommit proves the exactly-once boundary holds across
-// a post-commit disconnect: if the client drops during the success phase, the
-// commit is already durable. The success phase is best-effort, so its failure
-// rolls nothing back.
-func TestBridge_SuccessDropKeepsCommit(t *testing.T) {
+// TestBridge_SuccessDropStopsWorker proves a client dropping during the
+// best-effort success phase stops the worker promptly -- rather than looping back
+// to claim a task the dead connection cannot deliver, which would needlessly
+// starve that task for a lease period -- and that the already-committed task
+// stays committed (the exactly-once boundary holds). The drop is a clean stop.
+func TestBridge_SuccessDropStopsWorker(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	eq := newEQ(t, ctx)
@@ -902,16 +937,19 @@ func TestBridge_SuccessDropKeepsCommit(t *testing.T) {
 	s.c.recv(&su)   // the commit has happened; the bridge now awaits the done reply
 	s.closeClient() // drop before acknowledging the success phase
 
-	// The commit is durable regardless of the success-phase drop.
+	// The dead connection stops the worker cleanly (no wasteful reclaim loop).
+	if err := s.wait(); err != nil {
+		t.Fatalf("a success-phase drop should be a clean stop, got: %v", err)
+	}
+	// ...and the commit is durable regardless.
 	if err := eq.WaitQueuesEmpty(ctx, entroq.MatchExact("in")); err != nil {
 		t.Fatalf("commit must survive a success-phase drop: %v", err)
 	}
-	s.stop()
 }
 
-// TestBridge_WrongMessageType stops the worker on a protocol violation: a reply
-// with an unexpected type is a client bug, not a transient fault, so the bridge
-// returns a fatal error.
+// TestBridge_WrongMessageType is a caller fault: a decodable reply of an
+// unexpected type is a client bug, so the gateway reports it over the error
+// channel (class "caller") and stops with a caller-fault exit.
 func TestBridge_WrongMessageType(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -922,15 +960,25 @@ func TestBridge_WrongMessageType(t *testing.T) {
 
 	var dw doWorkMsg
 	s.c.recv(&dw)
-	s.c.send(map[string]string{"type": "bogus"}) // not a result
+	s.c.send(map[string]string{"type": "bogus"}) // decodable, but not a result
 
-	if _, ok := worker.AsFatal(s.wait()); !ok {
-		t.Fatal("expected a fatal error for an unexpected message type")
+	// The gateway reports the fault over the error channel before stopping. The
+	// client must read it (the pipe is synchronous), which also lets us assert it.
+	var em errorMsg
+	s.c.recv(&em)
+	if em.Type != msgError || em.Class != ExitCaller.String() {
+		t.Fatalf("got %+v, want an error message of class %q", em, ExitCaller.String())
+	}
+	ee, ok := AsExit(s.wait())
+	if !ok || ee.Class != ExitCaller {
+		t.Fatalf("expected a caller-fault ExitError, got: %+v (ok=%v)", ee, ok)
 	}
 }
 
-// TestBridge_MalformedInput ends the worker on undecodable input rather than
-// hanging or panicking.
+// TestBridge_MalformedInput treats undecodable input as a lost connection: the
+// gateway cannot parse the stream, so it stops cleanly rather than hanging or
+// panicking. (A decodable-but-wrong message is a caller fault; see
+// TestBridge_WrongMessageType.)
 func TestBridge_MalformedInput(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -945,7 +993,52 @@ func TestBridge_MalformedInput(t *testing.T) {
 		t.Fatalf("write garbage: %v", err)
 	}
 
-	if err := s.wait(); err == nil {
-		t.Fatal("expected Run to exit on malformed input")
+	if err := s.wait(); err != nil {
+		t.Fatalf("malformed input should be a clean stop, got: %v", err)
+	}
+}
+
+// TestClassify checks the exit classification in isolation, over the errors a
+// worker run can surface.
+func TestClassify(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		bridge *Bridge
+		err    error
+		want   ExitClass
+	}{
+		{"nil is clean", &Bridge{}, nil, ExitOK},
+		{"canceled is clean", &Bridge{}, context.Canceled, ExitOK},
+		{"lost connection is clean", &Bridge{connLost: true}, errors.New("anything"), ExitOK},
+		{"unavailable is transient", &Bridge{}, entroq.Unavailablef("backend down"), ExitTransient},
+		{"fatal is caller fault", &Bridge{}, worker.FatalErrorf("bad message"), ExitCaller},
+		{"unknown is gateway fault", &Bridge{}, errors.New("surprise"), ExitGateway},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.bridge.classify(tc.err); got != tc.want {
+				t.Errorf("classify = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestExitClassCodes locks the class -> exit code and wire token mapping.
+func TestExitClassCodes(t *testing.T) {
+	for _, tc := range []struct {
+		class ExitClass
+		code  int
+		token string
+	}{
+		{ExitOK, 0, "ok"},
+		{ExitTransient, 75, "transient"},
+		{ExitCaller, 78, "caller"},
+		{ExitGateway, 70, "gateway"},
+	} {
+		if got := tc.class.ExitCode(); got != tc.code {
+			t.Errorf("%v.ExitCode() = %d, want %d", tc.class, got, tc.code)
+		}
+		if got := tc.class.String(); got != tc.token {
+			t.Errorf("%v.String() = %q, want %q", tc.class, got, tc.token)
+		}
 	}
 }
