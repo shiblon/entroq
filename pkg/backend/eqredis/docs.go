@@ -94,8 +94,8 @@ func (f *docFields) toDoc() *entroq.Doc {
 	}
 }
 
-func (f *docFields) toMap() map[string]interface{} {
-	return map[string]interface{}{
+func (f *docFields) toMap() map[string]any {
+	return map[string]any{
 		"namespace":     f.Namespace,
 		"id":            f.ID,
 		"version":       strconv.FormatInt(int64(f.Version), 10),

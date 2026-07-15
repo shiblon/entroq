@@ -195,7 +195,7 @@ func DocConcurrencyStress(ctx context.Context, t *testing.T, client *entroq.Entr
 
 	// Setup: Create docs with an initial counter value of 0.
 	var setupArgs []entroq.ModifyArg
-	for i := 0; i < numDocs; i++ {
+	for i := range numDocs {
 		setupArgs = append(setupArgs, entroq.PuttingDocInto(ns,
 			entroq.WithIDKeys(fmt.Sprintf("doc-%d", i), "", ""),
 			entroq.WithContent(0),
@@ -210,10 +210,10 @@ func DocConcurrencyStress(ctx context.Context, t *testing.T, client *entroq.Entr
 	// parentCtx is preserved for final verification after the errgroup context is done.
 	parentCtx := ctx
 	g, ctx := errgroup.WithContext(ctx)
-	for w := 0; w < numWorkers; w++ {
+	for range numWorkers {
 		g.Go(func() error {
 			rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-			for i := 0; i < iterations; i++ {
+			for range iterations {
 				docID := fmt.Sprintf("doc-%d", rng.Intn(numDocs))
 				for {
 					docList, err := client.Docs(ctx, &entroq.DocQuery{Namespace: ns})
@@ -293,7 +293,7 @@ func MixedAtomicStress(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 	)
 
 	// Setup: each 'item' has a task and a corresponding doc, both starting at 0.
-	for i := 0; i < numItems; i++ {
+	for i := range numItems {
 		id := fmt.Sprintf("item-%d", i)
 		if _, err := client.Modify(ctx,
 			entroq.InsertingInto(q, entroq.WithID(id), entroq.WithValue(0)),
@@ -309,10 +309,10 @@ func MixedAtomicStress(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 	// parentCtx is preserved for final verification after the errgroup context is done.
 	parentCtx := ctx
 	g, ctx := errgroup.WithContext(ctx)
-	for w := 0; w < numWorkers; w++ {
+	for range numWorkers {
 		g.Go(func() error {
 			rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-			for i := 0; i < iterations; i++ {
+			for range iterations {
 				for {
 					task, err := client.TryClaim(ctx, entroq.From(q))
 					if err != nil {

@@ -96,10 +96,7 @@ func (e *EQRedis) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[s
 		}
 		available := int(zcountCmds[name].Val())
 		claimed := int(claimedCmds[name].Val())
-		future := size - available - claimed
-		if future < 0 {
-			future = 0
-		}
+		future := max(size-available-claimed, 0)
 		result[name] = &entroq.QueueStat{
 			Name:      name,
 			Size:      size,

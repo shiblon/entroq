@@ -101,13 +101,13 @@ func (h *claimHeap) Swap(i, j int) {
 	h.items[j].idx = j
 }
 
-func (h *claimHeap) Push(x interface{}) {
+func (h *claimHeap) Push(x any) {
 	item := x.(*claimItem)
 	item.idx = len(h.items)
 	h.items = append(h.items, item)
 }
 
-func (h *claimHeap) Pop() interface{} {
+func (h *claimHeap) Pop() any {
 	n := len(h.items)
 	item := h.items[n-1]
 	item.idx = -1

@@ -1173,8 +1173,8 @@ func (m *EQMem) lockQueues(qs []string) ([]*qLock, func()) {
 
 	return qls, func() {
 		// Unlock in reverse order.
-		for i := len(qls) - 1; i >= 0; i-- {
-			qls[i].Unlock()
+		for _, ql := range slices.Backward(qls) {
+			ql.Unlock()
 		}
 		// Now that we're unlocked, take the global lock again and reduce
 		// dependents by 1, in reverse order, then try to clean up if
@@ -1182,8 +1182,7 @@ func (m *EQMem) lockQueues(qs []string) ([]*qLock, func()) {
 		// simply exits; something else needed the lock to stay alive betwen
 		// lock acquisitions, so cleanup will occur later.
 		defer un(lock(m))
-		for i := len(qls) - 1; i >= 0; i-- {
-			ql := qls[i]
+		for _, ql := range slices.Backward(qls) {
 			ql.dependents--
 
 			if ts := m.queues[ql.queue]; ql.dependents == 0 && ts.Len() == 0 {
@@ -1243,12 +1242,11 @@ func (m *EQMem) lockNamespaces(ns []string) ([]*nsLock, func()) {
 	}
 
 	return nls, func() {
-		for i := len(nls) - 1; i >= 0; i-- {
-			nls[i].Unlock()
+		for _, nl := range slices.Backward(nls) {
+			nl.Unlock()
 		}
 		defer un(lock(m))
-		for i := len(nls) - 1; i >= 0; i-- {
-			nl := nls[i]
+		for _, nl := range slices.Backward(nls) {
 			nl.dependents--
 
 			if nss := m.namespaces[nl.namespace]; nl.dependents == 0 && nss.Len() == 0 {

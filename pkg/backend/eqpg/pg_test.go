@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -110,10 +111,8 @@ func TestNotifyReadyQueues(t *testing.T) {
 		t.Fatalf("rows: %v", err)
 	}
 
-	for _, q := range notified {
-		if q == queue {
-			return
-		}
+	if slices.Contains(notified, queue) {
+		return
 	}
 	t.Fatalf("notify_ready_queues did not return %q; got %v", queue, notified)
 }

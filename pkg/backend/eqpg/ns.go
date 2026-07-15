@@ -17,7 +17,7 @@ func (b *EQPG) NamespaceStats(ctx context.Context, qq *entroq.MatchQuery) (map[s
 			COUNT(*) FILTER(WHERE at > NOW() AND claimant != '') AS claimed
 		FROM entroq.docs`
 
-	var values []interface{}
+	var values []any
 
 	if len(qq.MatchPrefix) != 0 || len(qq.MatchExact) != 0 {
 		q += " WHERE"

@@ -258,7 +258,7 @@ func (f *taskFields) toTask() *entroq.Task {
 }
 
 // taskToMap converts taskFields to a Redis HSET argument map.
-func (f *taskFields) toMap() map[string]interface{} {
+func (f *taskFields) toMap() map[string]any {
 	return map[string]any{
 		"id":       f.ID,
 		"queue":    f.Queue,

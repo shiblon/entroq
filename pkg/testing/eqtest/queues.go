@@ -28,7 +28,7 @@ func QueueMatch(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefi
 	// Add tasks so that queues have a certain number of things in them, as above.
 	var toInsert []entroq.ModifyArg
 	for q, n := range wantQueues {
-		for i := 0; i < n; i++ {
+		for range n {
 			toInsert = append(toInsert, entroq.InsertingInto(q))
 		}
 	}
@@ -162,7 +162,7 @@ func QueueStats(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefi
 // returned by QueueStats. Regression test for a LIMIT/GROUP BY ordering bug.
 func QueueStatsLimit(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	t.Helper()
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		q := path.Join(qPrefix, fmt.Sprintf("queue-%d", i))
 		if _, err := client.Modify(ctx, entroq.InsertingInto(q)); err != nil {
 			t.Fatalf("Insert into %v: %v", q, err)

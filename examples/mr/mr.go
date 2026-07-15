@@ -521,7 +521,7 @@ func IdentityMapper(ctx context.Context, key, value []byte, emit MapEmitFunc) er
 // ignored. Splitting is purely based on whitespace, and is quite naive.
 func WordCountMapper(ctx context.Context, key, value []byte, emit MapEmitFunc) error {
 	words := make(map[string]int)
-	for _, w := range strings.Fields(string(value)) {
+	for w := range strings.FieldsSeq(string(value)) {
 		words[w]++
 	}
 	numEmitted := 0

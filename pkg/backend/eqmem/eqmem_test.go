@@ -385,7 +385,7 @@ func stressJournalStats(t *testing.T) {
 
 func TestEQMem_stressJournalStats(t *testing.T) {
 	N := 1
-	for i := 0; i < N; i++ {
+	for range N {
 		stressJournalStats(t)
 	}
 }

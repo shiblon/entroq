@@ -62,7 +62,7 @@ func MRCheck(ctx context.Context, eq *entroq.EntroQ, numDocs, numMappers, numRed
 	})
 
 	var docs []*KV
-	for di := 0; di < numDocs; di++ {
+	for di := range numDocs {
 		docs = append(docs, NewKV(nil, []byte(strings.Join(occurrences[di*wordsPerDoc:(di+1)*wordsPerDoc], " "))))
 	}
 
