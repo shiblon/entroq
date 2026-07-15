@@ -48,6 +48,22 @@ func (c *codec) recv(v any) {
 	}
 }
 
+// recvAny reads the next message and returns its type tag plus the raw JSON, for
+// tests that must dispatch on type -- e.g. draining error messages until a phase
+// message arrives.
+func (c *codec) recvAny() (string, json.RawMessage) {
+	c.t.Helper()
+	var raw json.RawMessage
+	c.recv(&raw)
+	var probe struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		c.t.Fatalf("recvAny probe: %v", err)
+	}
+	return probe.Type, raw
+}
+
 // session runs a Bridge over pipes against eq with the given registration, and
 // the test plays the worker.
 type session struct {
@@ -59,11 +75,12 @@ type session struct {
 	clientW *io.PipeWriter // client's write end; closing it gives the bridge's Recv EOF
 }
 
-func newSession(t *testing.T, ctx context.Context, eq *entroq.EntroQ, cfg Config, lease time.Duration) *session {
+func newSession(t *testing.T, ctx context.Context, eq *entroq.EntroQ, cfg Config, lease time.Duration, opts ...Option) *session {
 	t.Helper()
 	clientR, gatewayW := io.Pipe()
 	gatewayR, clientW := io.Pipe()
-	bridge := NewBridge(NewPipeConn(gatewayR, gatewayW), WithConfig(cfg), WithLease(lease))
+	bopts := append([]Option{WithConfig(cfg), WithLease(lease)}, opts...)
+	bridge := NewBridge(NewPipeConn(gatewayR, gatewayW), bopts...)
 
 	rctx, cancel := context.WithCancel(ctx)
 	errc := make(chan error, 1)
