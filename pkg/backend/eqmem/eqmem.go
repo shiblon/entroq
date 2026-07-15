@@ -354,7 +354,7 @@ func (m *EQMem) mustTryClaimOne(q string, now time.Time, cq *entroq.ClaimQuery) 
 		found = t
 		return t
 	}); err != nil {
-		log.Fatalf("Inconsistent internal state: could not update task in %q after claim started", ql.queue)
+		log.Panicf("Inconsistent internal state: could not update task in %q after claim started", ql.queue)
 	}
 
 	if m.journal != nil {
@@ -605,7 +605,7 @@ func (m *EQMem) queueUnsafeDeleteID(ql *qLock, id string) func() {
 // only. Returns a function to be called to finish global fixups, if needed.
 func (m *EQMem) queueUnsafeUpdateTask(ql *qLock, t *entroq.Task) func() {
 	if ok := ql.heap.UpdateID(t.ID, t.At); !ok {
-		log.Fatalf("Inconsistent state: task %v not found in queue heap %q for update", t.ID, t.Queue)
+		log.Panicf("Inconsistent state: task %v not found in queue heap %q for update", t.ID, t.Queue)
 	}
 	ql.tasks.Set(t.ID, t)
 	// Nothing to do at present.
@@ -1130,7 +1130,7 @@ func (m *EQMem) lockForQueueUnsafe(q string) (ql *qLock) {
 	ql = m.locksSuperUnsafe[q]
 
 	if ts := m.queues[q]; (ts == nil) != (ql == nil) {
-		log.Fatalf("Queue tasks and lock structures out of step for queue %q: ts=%v, ql=%v", q, ts, ql)
+		log.Panicf("Queue tasks and lock structures out of step for queue %q: ts=%v, ql=%v", q, ts, ql)
 	}
 
 	if ql != nil {
@@ -1173,8 +1173,8 @@ func (m *EQMem) lockQueues(qs []string) ([]*qLock, func()) {
 
 	return qls, func() {
 		// Unlock in reverse order.
-		for i := len(qls) - 1; i >= 0; i-- {
-			qls[i].Unlock()
+		for _, ql := range slices.Backward(qls) {
+			ql.Unlock()
 		}
 		// Now that we're unlocked, take the global lock again and reduce
 		// dependents by 1, in reverse order, then try to clean up if
@@ -1182,8 +1182,7 @@ func (m *EQMem) lockQueues(qs []string) ([]*qLock, func()) {
 		// simply exits; something else needed the lock to stay alive betwen
 		// lock acquisitions, so cleanup will occur later.
 		defer un(lock(m))
-		for i := len(qls) - 1; i >= 0; i-- {
-			ql := qls[i]
+		for _, ql := range slices.Backward(qls) {
 			ql.dependents--
 
 			if ts := m.queues[ql.queue]; ql.dependents == 0 && ts.Len() == 0 {
@@ -1211,7 +1210,7 @@ func (m *EQMem) lockForNamespaceUnsafe(ns string) (nl *nsLock) {
 	nl = m.locksSuperUnsafeNS[ns]
 
 	if nss := m.namespaces[ns]; (nss == nil) != (nl == nil) {
-		log.Fatalf("Namespace storage and lock structures out of step for namespace %q: nss=%v, nl=%v", ns, nss, nl)
+		log.Panicf("Namespace storage and lock structures out of step for namespace %q: nss=%v, nl=%v", ns, nss, nl)
 	}
 
 	if nl != nil {
@@ -1243,12 +1242,11 @@ func (m *EQMem) lockNamespaces(ns []string) ([]*nsLock, func()) {
 	}
 
 	return nls, func() {
-		for i := len(nls) - 1; i >= 0; i-- {
-			nls[i].Unlock()
+		for _, nl := range slices.Backward(nls) {
+			nl.Unlock()
 		}
 		defer un(lock(m))
-		for i := len(nls) - 1; i >= 0; i-- {
-			nl := nls[i]
+		for _, nl := range slices.Backward(nls) {
 			nl.dependents--
 
 			if nss := m.namespaces[nl.namespace]; nl.dependents == 0 && nss.Len() == 0 {

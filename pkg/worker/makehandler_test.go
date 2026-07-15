@@ -53,7 +53,7 @@ func TestWorker_FreshHandlerPerTask(t *testing.T) {
 	defer client.Close()
 
 	const nTasks = 3
-	for i := 0; i < nTasks; i++ {
+	for i := range nTasks {
 		if _, err := client.Modify(ctx, entroq.InsertingInto("test_q", entroq.WithValue("t"))); err != nil {
 			t.Fatalf("insert task %d: %v", i, err)
 		}
@@ -74,7 +74,7 @@ func TestWorker_FreshHandlerPerTask(t *testing.T) {
 		}
 	}()
 
-	for i := 0; i < nTasks; i++ {
+	for i := range nTasks {
 		select {
 		case uses := <-observed:
 			if uses != 1 {

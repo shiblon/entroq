@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -52,10 +53,8 @@ func validatePattern(pattern string, matchType entroqv1alpha1.MatchType) error {
 	if strings.Contains(pattern, "//") {
 		return fmt.Errorf("%q must not contain empty segments (//)", pattern)
 	}
-	for _, seg := range strings.Split(strings.Trim(pattern, "/"), "/") {
-		if seg == ".." {
-			return fmt.Errorf("%q must not contain path traversal (..)", pattern)
-		}
+	if slices.Contains(strings.Split(strings.Trim(pattern, "/"), "/"), "..") {
+		return fmt.Errorf("%q must not contain path traversal (..)", pattern)
 	}
 	switch matchType {
 	case entroqv1alpha1.MatchPrefix:

@@ -33,7 +33,7 @@ func TestGCUnderConcurrentLoad(t *testing.T) {
 
 	// Producers: continuously insert immediately-collectable tasks into gc=0
 	// queues, racing the GC loop that is draining them.
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -53,7 +53,7 @@ func TestGCUnderConcurrentLoad(t *testing.T) {
 
 	// Consumers: claim and delete from non-gc work queues, exercising the normal
 	// claim/modify paths concurrently with GC.
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()

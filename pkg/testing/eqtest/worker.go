@@ -85,7 +85,7 @@ func simpleWorkerOnce(ctx context.Context, t *testing.T, client *entroq.EntroQ, 
 	}
 
 	var inserted []*entroq.Task
-	for i := 0; i < numTasks; i++ {
+	for i := range numTasks {
 		resp, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithRawValue(json.RawMessage(fmt.Sprintf("%d", i)))))
 		if err != nil {
 			t.Fatalf("Failed to insert task: %v", err)
@@ -131,7 +131,7 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	)
 
 	// Populate all of the queues, most in the big one, least in the small one.
-	for i := 0; i < bigSize; i++ {
+	for i := range bigSize {
 		args := []entroq.ModifyArg{
 			entroq.InsertingInto(bigQueue, entroq.WithValue("big value")),
 		}

@@ -375,7 +375,7 @@ func TasksClaimantLimit(ctx context.Context, t *testing.T, client *entroq.EntroQ
 		queue := path.Join(qPrefix, "claimant_limit", "available")
 		past := time.Now().Add(-time.Hour).UTC()
 		var args []entroq.ModifyArg
-		for i := 0; i < 10; i++ {
+		for range 10 {
 			args = append(args, entroq.InsertingInto(queue, entroq.WithArrivalTime(past)))
 		}
 		if _, err := client.Modify(ctx, args...); err != nil {
@@ -417,7 +417,7 @@ func TasksClaimantLimit(ctx context.Context, t *testing.T, client *entroq.EntroQ
 
 		past := time.Now().Add(-time.Hour).UTC()
 		var args []entroq.ModifyArg
-		for i := 0; i < nMine+nOther; i++ {
+		for range nMine + nOther {
 			args = append(args, entroq.InsertingInto(queue, entroq.WithArrivalTime(past)))
 		}
 		if _, err := client.Modify(ctx, args...); err != nil {
@@ -426,7 +426,7 @@ func TasksClaimantLimit(ctx context.Context, t *testing.T, client *entroq.EntroQ
 
 		// Claim nMine as the querying claimant with the farther expiry.
 		mine := make(map[string]bool, nMine)
-		for i := 0; i < nMine; i++ {
+		for i := range nMine {
 			task, err := client.TryClaim(ctx, entroq.From(queue), entroq.WithClaimant(me), entroq.ClaimFor(myClaim))
 			if err != nil {
 				t.Fatalf("claim mine %d: %v", i, err)
@@ -438,7 +438,7 @@ func TasksClaimantLimit(ctx context.Context, t *testing.T, client *entroq.EntroQ
 		}
 		// Claim the rest as another claimant with a nearer expiry, so they sort
 		// ahead of "mine" by arrival time.
-		for i := 0; i < nOther; i++ {
+		for i := range nOther {
 			task, err := client.TryClaim(ctx, entroq.From(queue), entroq.WithClaimant(other), entroq.ClaimFor(otherClaim))
 			if err != nil {
 				t.Fatalf("claim other %d: %v", i, err)
@@ -520,7 +520,7 @@ func TasksWithIDOnly(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 	q2 := path.Join(qPrefix, "id_only_2")
 
 	var modArgs []entroq.ModifyArg
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		q := q1
 		if i%2 == 0 {
 			q = q2
@@ -882,7 +882,7 @@ func ClaimRandomHead(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 	at := time.Now().Add(-time.Hour).UTC()
 
 	var smallerIDWins, firstInsertedWins int
-	for i := 0; i < trials; i++ {
+	for i := range trials {
 		queue := path.Join(qPrefix, "claim_random_head", fmt.Sprint(i))
 
 		resp, err := client.Modify(ctx,
@@ -896,10 +896,7 @@ func ClaimRandomHead(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 			t.Fatalf("trial %d: want 2 inserted, got %d", i, len(resp.InsertedTasks))
 		}
 		first := resp.InsertedTasks[0].ID
-		smaller := resp.InsertedTasks[0].ID
-		if resp.InsertedTasks[1].ID < smaller {
-			smaller = resp.InsertedTasks[1].ID
-		}
+		smaller := min(resp.InsertedTasks[1].ID, resp.InsertedTasks[0].ID)
 
 		claimed, err := client.TryClaim(ctx, entroq.From(queue), entroq.ClaimFor(time.Minute))
 		if err != nil {

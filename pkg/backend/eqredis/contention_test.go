@@ -15,7 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"sort"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -46,7 +46,7 @@ func summarize(name string, ds []time.Duration) string {
 	if len(ds) == 0 {
 		return fmt.Sprintf("  %-24s (no samples)", name)
 	}
-	sort.Slice(ds, func(i, j int) bool { return ds[i] < ds[j] })
+	slices.Sort(ds)
 	r := func(d time.Duration) time.Duration { return d.Round(time.Microsecond) }
 	return fmt.Sprintf("  %-24s n=%-7d p50=%-9v p95=%-9v p99=%-9v max=%-9v",
 		name, len(ds), r(pctl(ds, 0.50)), r(pctl(ds, 0.95)), r(pctl(ds, 0.99)), r(ds[len(ds)-1]))
@@ -57,10 +57,7 @@ func seedContention(ctx context.Context, t *testing.T, b *EQRedis, queue string,
 	val := json.RawMessage(`{"contend":true}`)
 	const batch = 500
 	for done := 0; done < n; {
-		m := batch
-		if n-done < m {
-			m = n - done
-		}
+		m := min(n-done, batch)
 		args := make([]entroq.ModifyArg, m)
 		for k := range args {
 			args[k] = entroq.InsertingInto(queue, entroq.WithRawValue(val))
@@ -107,7 +104,7 @@ func TestRedisContention(t *testing.T) {
 	seedStart := time.Now()
 	seedContention(ctx, t, b, cProbeQueue, cProbeTasks)
 	seedContention(ctx, t, b, cListQueue, cListTasks)
-	for i := 0; i < cGCQueues; i++ {
+	for i := range cGCQueues {
 		seedContention(ctx, t, b, fmt.Sprintf("contend/gc/%d/gc=0", i), cGCPerQueue)
 	}
 	t.Logf("seeded in %v", time.Since(seedStart).Round(time.Millisecond))
@@ -116,20 +113,18 @@ func TestRedisContention(t *testing.T) {
 	interferer := func(fn func(ctx context.Context)) func() {
 		ictx, cancel := context.WithCancel(ctx)
 		var wg sync.WaitGroup
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for ictx.Err() == nil {
 				fn(ictx)
 			}
-		}()
+		})
 		return func() { cancel(); wg.Wait() }
 	}
 
 	claimContenders := func() func() {
 		ictx, cancel := context.WithCancel(ctx)
 		var wg sync.WaitGroup
-		for i := 0; i < cClaimers; i++ {
+		for i := range cClaimers {
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()

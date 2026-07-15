@@ -107,7 +107,7 @@ func (e *EQRedis) tryClaimOne(ctx context.Context, queue string, claimant string
 		return nil, fmt.Errorf("claim script %q: %w", queue, err)
 	}
 
-	arr, ok := res.([]interface{})
+	arr, ok := res.([]any)
 	if !ok {
 		return nil, fmt.Errorf("claim script %q: unexpected result type %T", queue, res)
 	}

@@ -526,7 +526,7 @@ func (b *EQPG) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[stri
 			COUNT(*) FILTER(WHERE at <= NOW()) as available,
 			COALESCE(MAX(claims), 0) AS max_claims
 		FROM entroq.tasks`
-	var values []interface{}
+	var values []any
 
 	if len(qq.MatchPrefix) != 0 || len(qq.MatchExact) != 0 {
 		q += " WHERE"
@@ -592,7 +592,7 @@ func (b *EQPG) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[stri
 // Tasks returns a slice of all tasks in the given queue.
 func (b *EQPG) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Task, error) {
 	q := "SELECT id, version, queue, at, created, modified, claimant, value, claims, attempt, err FROM tasks WHERE true"
-	var values []interface{}
+	var values []any
 
 	if tq.Queue != "" {
 		q += fmt.Sprintf(" AND queue = $%d", len(values)+1)
@@ -756,7 +756,7 @@ func (b *EQPG) Modify(ctx context.Context, mod *entroq.Modification) (*entroq.Mo
 func (b *EQPG) modifyHandlingRetriable(ctx context.Context, doModify func() (*entroq.ModifyResponse, error)) (*entroq.ModifyResponse, error) {
 	const minBackoff = 10 * time.Millisecond
 	var err error
-	for i := 0; i < 7; i++ {
+	for i := range 7 {
 		var resp *entroq.ModifyResponse
 		resp, err = doModify()
 		// No error - we're done!
@@ -777,10 +777,7 @@ func (b *EQPG) modifyHandlingRetriable(ctx context.Context, doModify func() (*en
 			return nil, fmt.Errorf("pg modify unknown: %w", err)
 		}
 		// Serialization error -- back off randomly with increasing time caps.
-		backoff := time.Duration(float64((1<<i)*minBackoff) * rand.Float64())
-		if backoff > time.Second {
-			backoff = time.Second
-		}
+		backoff := min(time.Duration(float64((1<<i)*minBackoff)*rand.Float64()), time.Second)
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():

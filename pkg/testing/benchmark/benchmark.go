@@ -3,7 +3,7 @@ package benchmark
 import (
 	"context"
 	"log"
-	"sort"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -32,9 +32,7 @@ func (d *Distribution) Report(b *testing.B) {
 	if len(d.latencies) == 0 {
 		return
 	}
-	sort.Slice(d.latencies, func(i, j int) bool {
-		return d.latencies[i] < d.latencies[j]
-	})
+	slices.Sort(d.latencies)
 
 	n := len(d.latencies)
 	p50 := d.latencies[n*50/100]
@@ -60,7 +58,7 @@ func RunContentionBenchmark(b *testing.B, client *entroq.EntroQ, queues []string
 	g, gctx := errgroup.WithContext(ctx)
 
 	// Background workers claiming/deleting across all queues
-	for i := 0; i < numWorkers; i++ {
+	for range numWorkers {
 		g.Go(func() error {
 			for {
 				select {

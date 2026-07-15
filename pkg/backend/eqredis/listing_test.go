@@ -31,7 +31,7 @@ const (
 // timeit runs fn iters times and returns the latency distribution summary line.
 func timeit(name string, iters int, fn func() error) (string, error) {
 	lats := make([]time.Duration, 0, iters)
-	for i := 0; i < iters; i++ {
+	for i := range iters {
 		start := time.Now()
 		if err := fn(); err != nil {
 			return "", fmt.Errorf("%s iter %d: %w", name, i, err)
@@ -158,7 +158,7 @@ func TestRedisListingLimit(t *testing.T) {
 		bMine = 100
 	)
 	claimN := func(t *testing.T, queue, claimant string, n int, dur time.Duration) {
-		for i := 0; i < n; i++ {
+		for i := range n {
 			task, err := b.TryClaim(ctx, &entroq.ClaimQuery{Queues: []string{queue}, Claimant: claimant, Duration: dur})
 			if err != nil {
 				t.Fatalf("claim %s: %v", claimant, err)

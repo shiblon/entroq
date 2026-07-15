@@ -76,7 +76,7 @@ func TestClaimContentionOverGRPCPostgres(t *testing.T) {
 
 	// Consumers: distinct clients (distinct claimants) claim-and-delete until the
 	// pool is drained, then release the rest.
-	var consumed int64
+	var consumed atomic.Int64
 	consumeCtx, consumeCancel := context.WithCancel(ctx)
 	defer consumeCancel()
 
@@ -102,7 +102,7 @@ func TestClaimContentionOverGRPCPostgres(t *testing.T) {
 					}
 					return fmt.Errorf("delete: %w", err)
 				}
-				if atomic.AddInt64(&consumed, 1) >= total {
+				if consumed.Add(1) >= total {
 					consumeCancel() // pool drained; wake the other workers out of Claim
 					return nil
 				}
@@ -113,7 +113,7 @@ func TestClaimContentionOverGRPCPostgres(t *testing.T) {
 		t.Fatalf("consumers: %v", err)
 	}
 
-	if got := atomic.LoadInt64(&consumed); got != total {
+	if got := consumed.Load(); got != total {
 		t.Fatalf("consumed %d tasks, want %d; a lost or stranded claim fell short", got, total)
 	}
 }
