@@ -10,6 +10,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 	"github.com/shiblon/entroq"
+	pb "github.com/shiblon/entroq/api"
 )
 
 // TestWS_OK proves the identical Bridge works over WebSocket: a worker dials in,
@@ -40,13 +41,14 @@ func TestWS_OK(t *testing.T) {
 	if dw.Type != msgDoWork {
 		t.Errorf("got %q, want %q", dw.Type, msgDoWork)
 	}
-	if got := string(dw.Task.Value); got != `"hello"` {
-		t.Errorf("task value = %s, want %q", got, `"hello"`)
+	if got := dw.Task.Value.GetStringValue(); got != "hello" {
+		t.Errorf("task value = %q, want %q", got, "hello")
 	}
+	del := &pb.ModifyRequest{Deletes: []*pb.TaskID{{Id: dw.Task.Id, Version: dw.Task.Version, Queue: dw.Task.Queue}}}
 	if err := wsjson.Write(ctx, c, result{
 		Type:         msgResult,
-		Outcome:      outcomeOK,
-		Modification: &modification{Deletes: []taskRef{{ID: dw.Task.ID, Version: dw.Task.Version}}},
+		disposition:  disposition{Outcome: outcomeOK},
+		Modification: &wireModReq{del},
 	}); err != nil {
 		t.Fatalf("write result: %v", err)
 	}

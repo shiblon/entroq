@@ -19,7 +19,8 @@ var (
 	workMaxAttempts int32
 	workTakeDocs    bool
 	workWork        bool
-	workCleanup     bool
+	workSuccess     bool
+	workDependency  bool
 )
 
 var workCmd = &cobra.Command{
@@ -29,24 +30,41 @@ var workCmd = &cobra.Command{
 in any language, which speaks a small newline-delimited JSON protocol and never
 touches EntroQ, gRPC, or the queue API.
 
+Every domain object on the wire (task, docs, modification, dependency list) is
+the canonical protojson of the corresponding message in api/entroq.proto, so a
+worker generates those types from the same proto the rest of EntroQ uses and
+hand-models nothing. Only the thin envelope around them (the "type" tag and the
+phase framing) is gateway-specific.
+
 Registration is out-of-band and set at connection time. In stdio mode (the
 default) the client typically spawns this process and declares its registration
 with flags: the queues it serves, its max-attempts, and which phases it
-implements (--take-docs, --work, --cleanup). A work handler is required.
+implements (--take-docs, --work, --success, --dependency). A work handler is
+required.
 
 Then, per claimed task, the gateway sends only the registered phases and reads a
-reply:
+reply. Exactly one post-commit phase (success or dependency) fires, and only if
+registered:
 
     gateway -> {"type":"takeDocs","task":{...}}          # only if --take-docs
     client  -> {"type":"docs","claims":[{"namespace":..,"key":..}]}
     gateway -> {"type":"doWork","task":{...},"docs":[...]}
-    client  -> {"type":"result","outcome":"ok","modification":{...}}
-    gateway -> {"type":"cleanup"}                        # only if --cleanup
-    client  -> {"type":"done"}
+    client  -> {"type":"result","outcome":"ok","ack":true,"modification":{...}}
+    gateway -> {"type":"success"}                        # commit ok; only if --success
+    client  -> {"type":"done","outcome":"ok"}
+    gateway -> {"type":"dependency","deps":[...]}        # commit lost a dependency; only if --dependency
+    client  -> {"type":"done","outcome":"ok"}
 
-"ok" commits the (possibly empty) modification; "ok" alone does not delete the
-task. "retry"/"move"/"fatal" map to the worker's structured errors. Diagnostics
-go to stderr; stdout carries only the protocol.
+The modification is a protojson ModifyRequest; leave its claimant_id empty, as
+the gateway owns the claim and attributes the commit itself. "ok" commits the
+(possibly empty) modification; "ok" alone does not delete the task. Set
+"ack":true as the shorthand for "I consumed this task" and the gateway also
+deletes it (unless the modification already disposes of it, in which case the
+modification wins). "retry"/"move"/"fatal" map to the worker's structured
+errors. If the commit loses a dependency race, the gateway reports the failed
+dependencies (a protojson ModifyDep list) and the done outcome picks the task's
+fate the same way. Diagnostics go to stderr; stdout carries only the protocol,
+so a spawning client should let this process inherit its stderr to see them.
 
 With --addr the gateway serves WebSocket instead, and each connecting worker
 declares the same registration via URL query params (?queue=..&work=1&...).
@@ -79,10 +97,12 @@ in-flight task is reclaimed on lease expiry.`,
 			MaxAttempts: workMaxAttempts,
 			TakeDocs:    workTakeDocs,
 			Work:        workWork,
-			Cleanup:     workCleanup,
+			Success:     workSuccess,
+			Dependency:  workDependency,
 		}
-		bridge := workgateway.NewBridge(workgateway.NewPipeConn(os.Stdin, os.Stdout))
-		return bridge.Run(gctx, eq, cfg, workLease)
+		bridge := workgateway.NewBridge(workgateway.NewPipeConn(os.Stdin, os.Stdout),
+			workgateway.WithConfig(cfg), workgateway.WithLease(workLease))
+		return bridge.Run(gctx, eq)
 	},
 }
 
@@ -94,7 +114,8 @@ func init() {
 	flags.Int32Var(&workMaxAttempts, "max-attempts", 0, "Max attempts before a retry is quarantined; 0 means unlimited.")
 	flags.BoolVar(&workTakeDocs, "take-docs", false, "The worker implements the takeDocs phase.")
 	flags.BoolVar(&workWork, "work", false, "The worker implements the work phase (required).")
-	flags.BoolVar(&workCleanup, "cleanup", false, "The worker implements the cleanup phase.")
+	flags.BoolVar(&workSuccess, "success", false, "The worker implements the success phase (post-commit).")
+	flags.BoolVar(&workDependency, "dependency", false, "The worker implements the dependency phase (commit lost a dependency).")
 
 	rootCmd.AddCommand(workCmd)
 }

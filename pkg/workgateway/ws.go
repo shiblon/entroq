@@ -32,9 +32,9 @@ func (w *WSConn) Recv(ctx context.Context, v any) error { return wsjson.Read(ctx
 
 // Handler returns the work gateway's HTTP handler. A worker connects to /work
 // and declares its registration in the URL query string (?queue=... repeated,
-// plus optional maxAttempts=N, takeDocs=1, work=1, cleanup=1), the same
-// connection preamble a pipe worker supplies via flags. The handler upgrades to
-// WebSocket and runs one Bridge over it. Canceling ctx stops every connection.
+// plus optional maxAttempts=N, takeDocs=1, work=1, success=1, dependency=1), the
+// same connection preamble a pipe worker supplies via flags. The handler upgrades
+// to WebSocket and runs one Bridge over it. Canceling ctx stops every connection.
 //
 // Liveness: a connection dropped mid-task surfaces as a Send/Recv error, which
 // ends that worker and reclaims its task. An idle connection (blocked claiming)
@@ -53,7 +53,8 @@ func Handler(ctx context.Context, eq *entroq.EntroQ, lease time.Duration) http.H
 			MaxAttempts: maxAttempts,
 			TakeDocs:    queryBool(r, "takeDocs"),
 			Work:        queryBool(r, "work"),
-			Cleanup:     queryBool(r, "cleanup"),
+			Success:     queryBool(r, "success"),
+			Dependency:  queryBool(r, "dependency"),
 		}
 		// Validate the registration before upgrading, so a misconfigured worker
 		// gets a plain 400 instead of a successful upgrade followed by an immediate
@@ -74,8 +75,8 @@ func Handler(ctx context.Context, eq *entroq.EntroQ, lease time.Duration) http.H
 		}
 		defer c.CloseNow()
 
-		bridge := NewBridge(NewWSConn(c))
-		switch err := bridge.Run(ctx, eq, cfg, lease); {
+		bridge := NewBridge(NewWSConn(c), WithConfig(cfg), WithLease(lease))
+		switch err := bridge.Run(ctx, eq); {
 		case err == nil || errors.Is(err, context.Canceled):
 			c.Close(websocket.StatusNormalClosure, "")
 		default:
