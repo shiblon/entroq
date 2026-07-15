@@ -30,7 +30,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"github.com/shiblon/entroq/test/utils"
+	"github.com/shiblon/entroq/cmd/eqk8s/test/utils"
 )
 
 // namespace where the project is deployed in
