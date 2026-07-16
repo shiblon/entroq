@@ -13,13 +13,10 @@ import (
 
 	"path"
 
-	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/async"
-	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
 	"github.com/shiblon/entroq/pkg/worker"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
-	"google.golang.org/grpc"
 )
 
 var (
@@ -63,22 +60,11 @@ Graceful shutdown on SIGINT/SIGTERM:
 		}
 		defer stopMetrics()
 
-		grpcOpts := []eqgrpc.Option{eqgrpc.WithInsecure()}
-		var creds *tokenFileCreds
-		if authzTokenFile != "" {
-			creds, err = newTokenFileCreds(authzTokenFile)
-			if err != nil {
-				return err
-			}
-			grpcOpts = append(grpcOpts, eqgrpc.WithDialOpts(
-				grpc.WithPerRPCCredentials(creds),
-			))
-		}
-		var eqOpts []entroq.Option
-		if creds != nil {
-			eqOpts = append(eqOpts, entroq.WithClaimantID(creds.claimant))
-		}
-		eq, err := entroq.New(ctx, eqgrpc.Opener(entroqAddr, grpcOpts...), eqOpts...)
+		g, gCtx := errgroup.WithContext(ctx)
+
+		// localEQ applies --cert/--key/--ca and --authz-token-file to the EntroQ
+		// connection (TLS, bearer token, claimant, and token reload in g).
+		eq, err := localEQ(gCtx, g)
 		if err != nil {
 			return err
 		}
@@ -99,8 +85,6 @@ Graceful shutdown on SIGINT/SIGTERM:
 			async.WithSenderName(myQueue),
 			async.WithSenderAuditLogger(alog),
 		)
-
-		g, gCtx := errgroup.WithContext(ctx)
 
 		g.Go(func() error {
 			return sender.Run(ctx)
@@ -131,16 +115,9 @@ Graceful shutdown on SIGINT/SIGTERM:
 			})
 		}
 
-		// Token reload: reload the bearer token on rotation (SIGHUP or mtime).
-		hupCtx, hupCancel := context.WithCancel(gCtx)
-		if creds != nil {
-			watchTokenReload(hupCtx, g, creds)
-		}
-
 		// Signal handler: staged shutdown. Also fires when any goroutine fails
 		// (gCtx cancelled), ensuring the sender is always cleaned up.
 		g.Go(func() error {
-			defer hupCancel()
 			select {
 			case <-gCtx.Done():
 			case sig := <-sigs:
