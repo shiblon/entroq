@@ -25,8 +25,10 @@ var SchemaSQL string
 // is a release-time property -- during development the schema is legitimately
 // ahead of the last tag, since it is prepared for the upcoming release -- so the
 // release process, not a unit test, must enforce that the tag being cut is >=
-// SchemaVersion. (TestSchemaSQLVersionMatchesConst guards the related drift
-// between this constant and the version schema.sql writes into entroq.meta.)
+// SchemaVersion. (TestSchemaFilesInSync guards the related lockstep: it requires
+// this constant, the version schema.sql stamps into entroq.meta, and the Python
+// client's SCHEMA_VERSION to all agree, and the two schema.sql copies to be
+// byte-identical.)
 //
 // Versioning policy (1.x+):
 //   - The schema version changes only when the schema itself changes, and takes
