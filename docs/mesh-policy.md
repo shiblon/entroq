@@ -15,6 +15,18 @@ pushes it to OPA on every change and on a periodic resync.
 
 ---
 
+## Why queue authorization is enforceable
+
+Queue-level authorization works only because a task's queue is part of its
+identity for modification. A change, delete, or dependency names the queue the
+task currently occupies, and the backend rejects any operation whose queue does
+not match the stored one (with a `DependencyError`) — it never substitutes the
+real queue. So a caller granted access only to its own queues cannot reach a task
+elsewhere by misdeclaring where it lives: the policy authorizes the queue the
+caller *named*, and the backend independently requires that same queue to be the
+task's actual home. Lying about a queue fails the operation rather than slipping
+past the policy.
+
 ## Queue naming convention
 
 By convention, queues follow the path `/<namespace>/<service>/<leaf>`, for example:
