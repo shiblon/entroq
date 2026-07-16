@@ -220,6 +220,15 @@ client = EntroQ.new("http://localhost:9100")
 EntroQ.Worker.run(client, ["/my/queue"], MyWorker)
 ```
 
+### Any language (work gateway)
+A worker can be written in **any** language without importing EntroQ or gRPC:
+`eqlink work` runs the hard part of the worker loop (claim, renew, commit) on its
+behalf and speaks a small newline-delimited JSON protocol over a stdio pipe or a
+WebSocket. See the wire contract and the client recipes in
+[`docs/workgateway-protocol.md`](docs/workgateway-protocol.md), and a minimal
+Python example in [`examples/workgateway/`](examples/workgateway/). This surface
+is new and currently experimental (see the [changelog](CHANGELOG.md)).
+
 ## Document Store
 
 In addition to tasks, EntroQ provides a key-value document store that shares
@@ -294,12 +303,17 @@ CRD reference (field-by-field, worked examples, policy verification):
 
 ## Cross-Instance Task Handoff
 
-`eqlink pull` links two EntroQ instances directly, moving tasks from a queue on a
-remote instance into a local inbox **exactly once in effect**. Run it next to the
-destination and point it at the remote source; it claims there and delivers here:
+`eqlink handoff` links two EntroQ instances directly, moving tasks from a queue on
+one instance into an inbox on another **exactly once in effect**. Direction is
+fixed by the endpoints — it claims from `--from` and delivers to `--to` — and you
+can run it next to either side:
 
 ```
-[remote EQ] ──claim──▶ [eqlink pull] ──insert──▶ [local EQ inbox]
+[--from EQ] ──claim──▶ [eqlink handoff] ──insert──▶ [--to EQ inbox]
+```
+
+```bash
+eqlink handoff --from <source-addr> --from-queue <q> --to <dest-addr> --to-queue <inbox>
 ```
 
 Each delivery atomically inserts the inbox task and a value-stripped dedup
@@ -350,6 +364,7 @@ EntroQ is backend-agnostic. The Go library supports:
 
 - **In-memory**: Perfect for testing or light-duty singleton services (includes a WAL journal).
 - **PostgreSQL**: Production-grade persistence using `SKIP LOCKED` for high performance.
+- **Redis**: Persistence backed by Redis (server binary `eqredis`).
 - **gRPC**: A client that talks to a remote `eqpg`, `eqmem`, or `eqredis` service instance.
 
 ## Authorization
