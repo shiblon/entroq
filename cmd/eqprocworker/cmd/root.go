@@ -1,4 +1,4 @@
-// Copyright © 2019 NAME HERE <EMAIL ADDRESS>
+// Copyright 2019 Chris Monson <shiblon@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -118,7 +118,7 @@ func init() {
 	pflags.StringVar(&inbox, "inbox", "/subprocworker/inbox", "Queue to listen to")
 	pflags.StringVar(&eqaddr, "eqaddr", ":37706", "address of service, uses port 37706 if none is specified")
 
-	viper.BindPFlag("eqaddr", pflags.Lookup("svcaddr"))
+	viper.BindPFlag("eqaddr", pflags.Lookup("eqaddr"))
 }
 
 // initConfig reads in config file and ENV variables if set.
