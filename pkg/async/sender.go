@@ -32,9 +32,16 @@ const (
 // translated into a task on the target queue, and the sender blocks waiting
 // for a response task to appear on an ephemeral per-request response queue.
 //
-// Path routing: the first path segment names the target queue; the rest is
-// forwarded as the request path. For example, a request to /svc-b/process
-// enqueues a task on queue "svc-b" with forwarded path "/process".
+// Queue routing: the target queue is derived from the request's Host header,
+// not its path. The configured domain suffix (see WithSenderDomainSuffix) is
+// stripped from the host, the remaining dotted labels become queue path
+// segments, and a single-label host is prefixed with the default namespace
+// (see WithSenderNamespace). With the default ".localhost" suffix,
+// "payments.localhost" targets "/payments" and "orders.acme.localhost" targets
+// "/orders/acme"; the task is enqueued on that target's "/inbox" subqueue. The
+// request's full path and query string are forwarded unchanged in the
+// envelope, so the upstream's own router dispatches by path exactly as it would
+// for a direct call.
 //
 // # Delivery semantics
 //
