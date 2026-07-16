@@ -353,7 +353,7 @@ $$;
 -- operation as a missing dependency (the queue authorizes access, so it must
 -- not be silently filled in from stored state).
 --
--- The signature gained the queue arrays in schema 1.7.0; drop the prior overload
+-- The signature gained the queue arrays in schema 1.7.1; drop the prior overload
 -- first, since a changed argument list would otherwise leave the old function
 -- behind on a re-applied schema.
 DROP FUNCTION IF EXISTS entroq._modify_arrays(
@@ -1206,13 +1206,19 @@ DROP FUNCTION IF EXISTS entroq.gc_due(text);
 -- Migrations: 1.2.0 → 1.6.0 (additive: byGCQueueAt partial index and the
 --   gc_activation / gc_queues / gc_collect functions for built-in garbage
 --   collection; drops the interim gc_due function; no data movement)
--- Migrations: 1.6.0 → 1.7.0 (the queue joins the modify key: _modify_arrays
---   gains per-op queue arrays and checks them; drops+recreates _modify_arrays
---   for the new signature; no data movement)
--- Migrations: 1.7.0 → 1.8.0 (task id/queue and doc namespace/id/key_primary/
---   key_secondary to byte-order COLLATE "C" so key ranges and prefix scans
---   match the other backends; rewrites the tasks and docs tables and rebuilds
---   their keys/indexes)
+-- Migrations: 1.6.0 → 1.7.1 (two changes, shipped in one release; 1.7.0 is
+--   skipped -- it named a queue-array-only schema that only ever existed on an
+--   unreleased branch, so reusing it would let such a database skip the
+--   collation step below):
+--   (1) the queue joins the modify key: _modify_arrays gains per-op queue arrays
+--       and checks them; drops+recreates _modify_arrays for the new signature;
+--       no data movement.
+--   (2) task id/queue and doc namespace/id/key_primary/key_secondary to
+--       byte-order COLLATE "C" so key ranges and prefix scans match the other
+--       backends; rewrites the tasks and docs tables and rebuilds their
+--       keys/indexes. Transparent to clients (it changes only lexicographical
+--       ordering, not data), but a heavy op -- plan a maintenance window on
+--       large tables.
 -- Each block checks pg_attribute to skip on fresh installs where the column
 -- is already correct, avoiding unnecessary table scans on re-runs.
 
@@ -1264,7 +1270,7 @@ BEGIN
     END IF;
 END $$;
 
--- Migrations: 1.7.0 -> 1.8.0 (key/id/queue columns to byte-order "C" collation).
+-- Migration detail: key/id/queue columns to byte-order "C" collation.
 -- Range and prefix comparisons on these columns previously used the database's
 -- default (locale) collation, which disagrees with the other backends (eqmem,
 -- eqredis) and with Go's byte-order string comparison for keys containing
@@ -1305,5 +1311,5 @@ CREATE TABLE IF NOT EXISTS entroq.meta (
     value TEXT NOT NULL
 );
 
-INSERT INTO entroq.meta (key, value) VALUES ('schema_version', '1.8.0')
-    ON CONFLICT (key) DO UPDATE SET value = '1.8.0' WHERE entroq.meta.key = 'schema_version';
+INSERT INTO entroq.meta (key, value) VALUES ('schema_version', '1.7.1')
+    ON CONFLICT (key) DO UPDATE SET value = '1.7.1' WHERE entroq.meta.key = 'schema_version';
