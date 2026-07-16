@@ -36,11 +36,13 @@ if ! grep -q "^\#\# \[${VERSION}\]" CHANGELOG.md; then
     fail "no CHANGELOG.md entry found for [${VERSION}]; add one before tagging"
 fi
 
-# 4. SchemaVersion major.minor matches release tag major.minor.
-TAG_MAJMIN="$(echo "${VERSION}" | sed 's/^\([0-9]*\.[0-9]*\).*/\1/')"
-SCHEMA_MAJMIN="$(grep 'SchemaVersion\s*=' pkg/backend/eqpg/schema.go | sed 's/.*"\([0-9]*\.[0-9]*\).*/\1/')"
-if [ "${TAG_MAJMIN}" != "${SCHEMA_MAJMIN}" ]; then
-    fail "SchemaVersion major.minor (${SCHEMA_MAJMIN}) does not match release tag major.minor (${TAG_MAJMIN}); update pkg/backend/eqpg/schema.go"
+# 4. SchemaVersion is not ahead of the release tag. The schema version only
+#    advances when the schema itself changes, so it may lag the module (a
+#    schema-unchanged release is fine); it must never exceed the module version,
+#    which would imply code expecting a release that does not exist.
+SCHEMA_VER="$(grep 'SchemaVersion\s*=' pkg/backend/eqpg/schema.go | sed 's/.*"\([0-9]*\.[0-9]*\.[0-9]*\)".*/\1/')"
+if [ "$(printf '%s\n%s\n' "${SCHEMA_VER}" "${VERSION}" | sort -V | tail -n1)" != "${VERSION}" ]; then
+    fail "SchemaVersion (${SCHEMA_VER}) is ahead of release tag (${VERSION}); the schema must not outrun the module"
 fi
 
 # 5. Tag does not already exist.

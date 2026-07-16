@@ -375,3 +375,18 @@ Full configuration guide, IDP-specific settings, and examples:
 [`pkg/authz/opadata/OPA_AUTHZ.md`](pkg/authz/opadata/OPA_AUTHZ.md)
 
 Runnable sandbox: [`examples/authz/`](examples/authz/)
+
+## Versioning
+
+EntroQ follows [Semantic Versioning](https://semver.org/) in spirit, but while
+the user base is small it does **not** promise a major-version bump for every
+breaking change: a breaking change may ship in a **minor** release, always called
+out in the [changelog](CHANGELOG.md). Pin an exact version and read the changelog
+before upgrading. This policy will tighten as adoption grows.
+
+The PostgreSQL backend (`eqpg`) carries its own schema version, which only
+changes when the schema does and never exceeds the module version. After
+upgrading across a release whose changelog notes a schema change, run
+`eqpg schema upgrade` before starting the service — it refuses to open on a
+version mismatch rather than migrating a live database silently. The in-memory
+and Redis backends need no migration.

@@ -7,6 +7,88 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.7.1] - 2026-07-16
+
+Go module `v1.7.1`. A **breaking** release that is also a **necessary security
+update**. `1.7.0` is skipped deliberately (see Changed).
+
+- **Schema change (eqpg: 1.6.0 → 1.7.1).** Existing PostgreSQL deployments must
+  run `eqpg schema upgrade` (or re-apply `schema.sql`) before starting the
+  upgraded service — `initDB` refuses to open on a version mismatch rather than
+  migrating silently. The migration is idempotent and client-transparent (it
+  changes only byte-ordering, not data), but it rewrites the `tasks`/`docs`
+  tables and rebuilds their indexes, so **plan a maintenance window on large
+  deployments**. eqmem and eqredis need no migration.
+- **The service wire is unchanged.** `api/entroq.proto` is byte-for-byte
+  identical to 1.6.3, so a standard gRPC client or the connect/JSON gateway keeps
+  working against the upgraded service with no changes. The breaking changes are
+  in the Go `worker`/`entroq` APIs and the (new, experimental) `eqlink work`
+  gateway — not in the queue protocol.
+- **Older releases are retired.** Prior 1.6.x releases and their Docker images
+  are deprecated in favor of 1.7.1 for the security fixes below.
+
+### Security
+
+- **Queue integrity: a modify can no longer misdeclare a task's queue.** The
+  queue is now part of the modify key across all backends, checked on every
+  change/delete/depend, with the true source queue carried through the gRPC
+  change path. Previously an operation could name a queue different from the
+  task's own and sidestep queue-scoped authorization; that hole is closed
+  (eqmem, eqpg, eqredis), and the service fails closed on empty targets.
+- **Authorization fails closed.** OPA denies requests naming an empty queue or
+  namespace; the core rejects writes to an empty queue or namespace; document
+  operations are authorized in place and cross-namespace doc changes are
+  rejected.
+- **Arrival-time handling.** Far-past arrival times normalize to now as a
+  backend contract, removing an inconsistency in deferred/at handling.
+- **Dependency updates.** `golang.org/x/crypto` 0.50→0.54 and `golang.org/x/net`
+  0.53→0.57 (the service's TLS/HTTP-2 transport) clear the outstanding
+  advisories; `esbuild` is pinned in the JS client's build tooling.
+
+### Added
+
+- **Work gateway (`eqlink work`, package `workgateway`): run an EntroQ worker in
+  any language** over a small newline-delimited JSON protocol whose payloads are
+  the protojson of the api protobufs. Opt-in phases (takeDocs / work / success /
+  dependency), an `ack` shorthand for consuming the claimed task, a one-way error
+  channel with a shared exit taxonomy (process exit codes and WebSocket close
+  codes), and a supervision loop that rides out a restarting or relocating
+  backend (`--entroq-timeout`) transparently to the client. See
+  `docs/workgateway-protocol.md` and `examples/workgateway/`.
+- **`entroq.IsUnavailable`** classifies a temporarily unreachable backend (the
+  gRPC backend translates `codes.Unavailable`), so callers can retry a routine
+  restart/relocation without inspecting transport specifics.
+- **`DependencyError.Implicates`** for task-scoped dependency-failure checks.
+
+### Changed
+
+- **Breaking: the `worker` API is reworked.** `DoModify` returns a fluently-built
+  `Result` with `OnSuccess` (post-commit) and `OnDependency` (dependency-race)
+  hooks, replacing `WithDependencyHandler`; `Retry`/`Move`/`Fatal` are structured
+  errors with fluent options; handlers are built fresh per task.
+- **Breaking: the modify API is fluent-only.** `Put` for docs, the queue rides on
+  the identifier, and the older argument styles are gone.
+- **Breaking: the `eqlink work` gateway protocol** is the full register / take /
+  work / commit contract described in `docs/workgateway-protocol.md` (this
+  surface is new and experimental).
+- **eqpg schema policy loosened** to permit a client-transparent, idempotent
+  non-additive migration within a minor (see `SchemaVersion`). `1.7.0` is skipped
+  because it named a queue-array-only schema that existed only on an unreleased
+  branch; reusing it would let such a database skip the collation migration.
+
+### Fixed
+
+- **eqgrpc:** `Claim` is a single blocking RPC (the client retry loop is gone),
+  and a committed claim is no longer lost to a client retry cancel.
+- **eqpg:** byte-order (`COLLATE "C"`) key/queue/id columns so ranges and prefix
+  scans match the other backends; `LIKE` metacharacters escaped in SQL prefix
+  matching; a test-service backend-loop leak.
+- **eqmem:** all modify failure classes are reported in one `DependencyError`;
+  old journals that omit an op's queue still replay.
+- **workgateway:** a change carries full desired state (not a preserve-on-absent
+  delta); a namespace is required on doc delete/depend; reply types are
+  validated; a dropped client connection is a clean stop.
+
 ## [1.6.3] - 2026-07-08
 
 Go module `v1.6.3`. A rename/refactor release for the cross-instance task handoff
