@@ -29,7 +29,7 @@ giving services fault tolerance and load balancing without changing their code.
 
 The sender proxies outgoing HTTP calls from the local service into queues.
 The receiver claims tasks from queues and forwards them to the local service.
-The GC cleans up stale response queues left by crashed senders.
+Stale response queues are garbage-collected by the EntroQ server, not the sidecar.
 
 The handoff command links two EntroQ instances directly, claiming tasks from a
 source instance and delivering them into a destination instance, exactly once.`,

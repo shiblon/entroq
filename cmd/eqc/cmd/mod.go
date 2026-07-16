@@ -44,7 +44,7 @@ func init() {
 // modCmd represents the mod command
 var modCmd = &cobra.Command{
 	Use:   "mod",
-	Short: "Modify a task by queue and ID.",
+	Short: "Modify a task by ID.",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		tasks, err := eq.Tasks(context.Background(), "", entroq.WithTaskID(flagMod.id))
 		if err != nil {

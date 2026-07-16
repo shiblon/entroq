@@ -26,7 +26,7 @@
 //
 // Using the Go implementation opens up possibilities of, among other things, an
 // in-memory backend served via gRPC with queue-level authorization. To use
-// GRPC as a service protocol, see cmd/eqpgsvc or cmd/eqmemsvc to start it up,
+// GRPC as a service protocol, see cmd/eqpg or cmd/eqmem to start it up,
 // and use cmd/eqc as a client to play with it.
 //
 // All of this is very lightweight. You can run it on a laptop or a cluster, it
@@ -442,7 +442,7 @@ type BackendOpener func(ctx context.Context) (Backend, error)
 //     with EntroQ operations in the same transaction. Clients limited by PG connections.
 //   - eqgrpc: gRPC client backend - connects to a remote EntroQ service that is
 //     backed by eqmem or eqpg (or similar direct stores). Requires you to start or
-//     point to a service. Can be started with cmd/eqpg or cmd/eqmemsvc.
+//     point to a service. Can be started with cmd/eqpg or cmd/eqmem.
 //
 // Valid backends will be in pkg/backend. As new ones are added, corresponding cmd/
 // startup CLIs will be added as well.
@@ -752,9 +752,12 @@ func (c *EntroQ) RenewAllFor(ctx context.Context, tasks []*Task, duration time.D
 //
 // Every operation in a Modify call — whether it is an insertion, deletion,
 // update, or dependency check — is gated on the existence and version of the
-// specified tasks. If any part of the modification fails (e.g., a task has been
-// claimed by another worker and its version has changed), the entire batch
-// rolls back and a DependencyError is returned.
+// specified tasks. Each change/delete/depend is also bound to its target's
+// current queue (for docs, its namespace): naming the wrong queue, or leaving it
+// empty, fails the whole batch — the backend never substitutes the stored queue
+// (see Backend.Modify). If any part fails (e.g., a task has been claimed by
+// another worker and its version has changed), the entire batch rolls back and a
+// DependencyError is returned.
 //
 // This method is the foundation of EntroQ's "Exactly Once" semantics. By
 // including a task deletion in the same Modify call as a result insertion,
