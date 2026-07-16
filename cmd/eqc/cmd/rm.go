@@ -42,7 +42,7 @@ func init() {
 // rmCmd represents the rm command
 var rmCmd = &cobra.Command{
 	Use:   "rm",
-	Short: "Remove a task by queue and ID.",
+	Short: "Remove a task by ID.",
 	Run: func(cmd *cobra.Command, args []string) {
 		ctx := context.Background()
 		var delErr error

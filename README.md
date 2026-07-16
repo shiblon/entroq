@@ -220,6 +220,15 @@ client = EntroQ.new("http://localhost:9100")
 EntroQ.Worker.run(client, ["/my/queue"], MyWorker)
 ```
 
+### Any language (work gateway)
+A worker can be written in **any** language without importing EntroQ or gRPC:
+`eqlink work` runs the hard part of the worker loop (claim, renew, commit) on its
+behalf and speaks a small newline-delimited JSON protocol over a stdio pipe or a
+WebSocket. See the wire contract and the client recipes in
+[`docs/workgateway-protocol.md`](docs/workgateway-protocol.md), and a minimal
+Python example in [`examples/workgateway/`](examples/workgateway/). This surface
+is new and currently experimental (see the [changelog](CHANGELOG.md)).
+
 ## Document Store
 
 In addition to tasks, EntroQ provides a key-value document store that shares
@@ -294,12 +303,17 @@ CRD reference (field-by-field, worked examples, policy verification):
 
 ## Cross-Instance Task Handoff
 
-`eqlink pull` links two EntroQ instances directly, moving tasks from a queue on a
-remote instance into a local inbox **exactly once in effect**. Run it next to the
-destination and point it at the remote source; it claims there and delivers here:
+`eqlink handoff` links two EntroQ instances directly, moving tasks from a queue on
+one instance into an inbox on another **exactly once in effect**. Direction is
+fixed by the endpoints — it claims from `--from` and delivers to `--to` — and you
+can run it next to either side:
 
 ```
-[remote EQ] ──claim──▶ [eqlink pull] ──insert──▶ [local EQ inbox]
+[--from EQ] ──claim──▶ [eqlink handoff] ──insert──▶ [--to EQ inbox]
+```
+
+```bash
+eqlink handoff --from <source-addr> --from-queue <q> --to <dest-addr> --to-queue <inbox>
 ```
 
 Each delivery atomically inserts the inbox task and a value-stripped dedup
@@ -324,6 +338,8 @@ helm install my-queue ./charts/entroq --set entroq.backend.type=postgres
 
 ### Tasks
 A task is defined by a Queue Name, a Globally Unique ID, a Version, an Arrival Time, and a Value. The version increments every time the task is mutated, providing the foundation for transactional safety.
+
+A task's identity for modification is the tuple **(id, version, queue)**: a delete, change, or dependency must name the queue the task currently occupies. A mismatch is rejected (`DependencyError`) and the server never substitutes the stored queue — this is what makes queue-based authorization enforceable, since you cannot reach a task by misdeclaring where it lives.
 
 ### Queues
 Queues are not first-class entities; they spring into existence only when tasks are assigned to them and vanish when empty, allowing for highly dynamic, ad-hoc workflows.
@@ -350,6 +366,7 @@ EntroQ is backend-agnostic. The Go library supports:
 
 - **In-memory**: Perfect for testing or light-duty singleton services (includes a WAL journal).
 - **PostgreSQL**: Production-grade persistence using `SKIP LOCKED` for high performance.
+- **Redis**: Persistence backed by Redis (server binary `eqredis`).
 - **gRPC**: A client that talks to a remote `eqpg`, `eqmem`, or `eqredis` service instance.
 
 ## Authorization
@@ -375,3 +392,18 @@ Full configuration guide, IDP-specific settings, and examples:
 [`pkg/authz/opadata/OPA_AUTHZ.md`](pkg/authz/opadata/OPA_AUTHZ.md)
 
 Runnable sandbox: [`examples/authz/`](examples/authz/)
+
+## Versioning
+
+EntroQ follows [Semantic Versioning](https://semver.org/) in spirit, but while
+the user base is small it does **not** promise a major-version bump for every
+breaking change: a breaking change may ship in a **minor** release, always called
+out in the [changelog](CHANGELOG.md). Pin an exact version and read the changelog
+before upgrading. This policy will tighten as adoption grows.
+
+The PostgreSQL backend (`eqpg`) carries its own schema version, which only
+changes when the schema does and never exceeds the module version. After
+upgrading across a release whose changelog notes a schema change, run
+`eqpg schema upgrade` before starting the service — it refuses to open on a
+version mismatch rather than migrating a live database silently. The in-memory
+and Redis backends need no migration.

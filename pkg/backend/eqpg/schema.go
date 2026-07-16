@@ -14,19 +14,41 @@ import (
 //go:embed schema.sql
 var SchemaSQL string
 
-// SchemaVersion is the schema version this build of eqpg expects to find in
-// the database. initDB refuses to open the backend if the stored version
-// differs, protecting against accidental use of a mismatched schema.
+// SchemaVersion is the schema version this build of eqpg expects to find in the
+// database. It is the module version in which the schema last changed; initDB
+// refuses to open the backend if the stored version differs, protecting against
+// accidental use of a mismatched schema.
+//
+// Invariant: the schema version never exceeds the module version. The module may
+// advance without the schema (not every change touches it), but a schema version
+// ahead of the module implies code expecting a release that does not exist. This
+// is a release-time property -- during development the schema is legitimately
+// ahead of the last tag, since it is prepared for the upcoming release -- so the
+// release process, not a unit test, must enforce that the tag being cut is >=
+// SchemaVersion. (TestSchemaFilesInSync guards the related lockstep: it requires
+// this constant, the version schema.sql stamps into entroq.meta, and the Python
+// client's SCHEMA_VERSION to all agree, and the two schema.sql copies to be
+// byte-identical.)
 //
 // Versioning policy (1.x+):
-//   - Schema version changes only when the schema itself changes.
-//   - Minor releases (1.x -> 1.y) may change the schema, but only additively:
-//     new tables, columns with defaults, indexes, or functions. No renames,
-//     type changes, or data movement.
+//   - The schema version changes only when the schema itself changes, and takes
+//     the version of the release that ships the change.
+//   - Minor releases (1.x -> 1.y) may change the schema. Additive changes (new
+//     tables, columns with defaults, indexes, functions) are always fine. A
+//     non-additive change (a type change or data movement) is permitted only
+//     when it is transparent to clients and re-applying schema.sql performs it
+//     idempotently -- e.g. the 1.7.1 byte-order collation change, which alters
+//     only lexicographical ordering, not data or the client contract. Such a
+//     migration may rewrite tables and rebuild indexes, so it needs a
+//     maintenance window (see the changelog and UpgradeSchema).
 //   - Patch releases never change the schema.
 //   - Any 1.x schema upgrades to any later 1.y by re-running schema.sql.
+//   - A schema version is skipped when a value was used transiently for a
+//     different schema on an unreleased branch, to keep re-run detection sound:
+//     1.7.0 is skipped because it named a queue-array-only schema on develop
+//     that lacked the 1.7.1 collation change.
 //   - Schemas predating 1.0 cannot be migrated; see UpgradeSchema.
-const SchemaVersion = "1.8.0"
+const SchemaVersion = "1.7.1"
 
 // InitSchema applies the full idempotent EntroQ DDL to db. Safe to run on an
 // already-initialized database.
@@ -78,8 +100,10 @@ func (r UpgradeResult) String() string {
 // UpgradeSchema brings the database to SchemaVersion:
 //
 //   - Already at SchemaVersion: returns UpgradeAlreadyCurrent; nothing is changed.
-//   - 1.x schema at an older minor version: re-applies schema.sql (additive
-//     changes only by policy) and returns UpgradeApplied.
+//   - 1.x schema at an older minor version: re-applies schema.sql idempotently
+//     and returns UpgradeApplied. Most upgrades are additive, but a minor may
+//     include a client-transparent non-additive migration (see SchemaVersion),
+//     which can rewrite tables and rebuild indexes -- plan a maintenance window.
 //   - Pre-1.0 schema (0.x): returns an error. The 0.x -> 1.0 gap is too large
 //     to migrate automatically. Drain all tasks, drop the schema, and
 //     reinitialize: DROP SCHEMA entroq CASCADE, then run eqpg schema init.

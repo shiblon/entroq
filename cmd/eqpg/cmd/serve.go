@@ -42,6 +42,13 @@ var (
 var serveCmd = &cobra.Command{
 	Use:   "serve",
 	Short: "Start the EntroQ gRPC and HTTP/JSON service.",
+	Long: `Serve a PostgreSQL-backed EntroQ over gRPC (--port, default 37706) and an
+HTTP/JSON + Connect API (--http_port, default 9100, which also serves /metrics).
+
+Requires an initialized schema at the version this build expects: run
+"eqpg schema init" (or "eqpg schema upgrade"), or pass --init_schema to apply the
+idempotent DDL before serving. The service refuses to start on a schema-version
+mismatch rather than migrating a live database silently.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := context.Background()
 
@@ -146,8 +153,8 @@ func init() {
 	flags.StringVar(&authzStrategy, "authz", "none", "Authorization strategy: none, opahttp.")
 	flags.StringVar(&opaURL, "opa_url", "", fmt.Sprintf("OPA base URL (scheme://host:port). Default: %s.", opahttp.DefaultHostURL))
 	flags.StringVar(&opaPath, "opa_path", "", fmt.Sprintf("OPA API path. Default: %s.", opahttp.DefaultAPIPath))
-	flags.DurationVar(&heartbeat, "heartbeat", 5*time.Second, "Heartbeat interval for this service. Non-zero values designate this node as a cluster Leader.")
-	flags.BoolVar(&noListen, "no_listen", true, "Disable the persistent PostgreSQL LISTEN connection. Optimizes singleton deployments.")
+	flags.DurationVar(&heartbeat, "heartbeat", 5*time.Second, "Interval at which this node triggers notifications for tasks that have become available (via NOTIFY).")
+	flags.BoolVar(&noListen, "no_listen", false, "Disable the persistent PostgreSQL LISTEN connection; claims then fall back to polling. LISTEN is on by default for prompt claim wakeups via NOTIFY.")
 	flags.BoolVar(&initSchema, "init_schema", false, "Initialize the EntroQ schema before serving (idempotent; safe to always set).")
 
 	rootCmd.AddCommand(serveCmd)

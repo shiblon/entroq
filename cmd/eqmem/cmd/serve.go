@@ -48,6 +48,12 @@ var serve struct {
 var serveCmd = &cobra.Command{
 	Use:   "serve",
 	Short: "Start the EntroQ gRPC and HTTP/JSON service.",
+	Long: `Serve an in-memory EntroQ backend over gRPC (--port, default 37706) and an
+HTTP/JSON + Connect API (--http_port, default 9100, which also serves /metrics).
+
+State is held in memory. Pass --journal to persist it to a write-ahead journal
+that replays quickly on restart; without one, a restart starts empty. Best for
+tests, development, and light-duty singleton services.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := context.Background()
 
@@ -171,8 +177,8 @@ func init() {
 	f.BoolVar(&serve.snapshotAndQuit, "snapshot_and_quit", false, "Read the journal, write a snapshot, then exit. Requires --journal.")
 	f.StringVar(&serve.periodicSnapshot, "periodic_snapshot", "", "Snapshot interval (e.g. 1h). Minimum 1m. Requires --journal.")
 	f.BoolVar(&serve.cleanup, "journal_cleanup", false, "Remove compacted journal files after snapshotting. Requires --journal.")
-	f.IntVar(&serve.journalMaxItems, "journal_max_items", 0, "Rotate journal after this many items (0 = default).")
-	f.IntVar(&serve.journalMaxBytes, "journal_max_bytes", 0, "Rotate journal after this many bytes (0 = default).")
+	f.IntVar(&serve.journalMaxItems, "journal_max_items", 0, "Rotate journal after this many items (0 uses the built-in default).")
+	f.IntVar(&serve.journalMaxBytes, "journal_max_bytes", 0, "Rotate journal after this many bytes (0 uses the built-in default).")
 
 	rootCmd.AddCommand(serveCmd)
 }

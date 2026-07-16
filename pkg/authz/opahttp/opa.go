@@ -99,12 +99,31 @@ func (a *OPA) Authorize(ctx context.Context, req *authz.Request) error {
 		return fmt.Errorf("authorize read response: %w", err)
 	}
 
+	// A non-OK status means OPA itself errored (bad request, wrong path, server
+	// fault) rather than rendering a decision. Fail closed instead of trying to
+	// interpret the body as an allow/deny.
+	if resp.StatusCode != http.StatusOK {
+		return &authz.AuthzError{
+			Errors: []string{fmt.Sprintf("OPA returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBytes)))},
+		}
+	}
+
 	type authzResp struct {
 		Result *authz.AuthzError `json:"result"`
 	}
 	result := new(authzResp)
 	if err := json.NewDecoder(bytes.NewBuffer(respBytes)).Decode(result); err != nil {
 		return fmt.Errorf("authorize decode response: %w", err)
+	}
+
+	// OPA answers an undefined decision with "200 {}" (no result field) -- e.g.
+	// a policy path that names no rule, or a rule that never sets a value. There
+	// is no decision to honor, so fail closed rather than dereferencing a nil
+	// result (which would panic) or treating absence as permission.
+	if result.Result == nil {
+		return &authz.AuthzError{
+			Errors: []string{fmt.Sprintf("OPA returned no decision at %s (undefined policy path?)", a.fullURL())},
+		}
 	}
 
 	if e := result.Result; !e.Allow {

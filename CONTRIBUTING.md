@@ -75,7 +75,9 @@ To cut a release from `develop`:
 1. Finalize the changelog: rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD`,
    and bump the schema / client versions if they changed. Commit to `develop`.
 2. Tag with the release script (it runs pre-flight guards, clean tree, changelog
-   entry, `SchemaVersion` major.minor matching the tag, then pushes the tag):
+   entry, and `SchemaVersion` not being ahead of the tag — the schema version
+   only advances when the schema changes, so it may lag the module but must never
+   exceed it — then pushes the tag):
    ```
    git checkout develop && git pull
    ./scripts/tag-release.sh X.Y.Z

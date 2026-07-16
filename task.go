@@ -8,13 +8,16 @@ import (
 	"time"
 )
 
-// TaskID contains the identifying parts of a task. If IDs don't match
-// (identifier and version together), then operations fail on those tasks.
+// TaskID identifies a task for modification: the id, the version, and the queue
+// the task currently occupies. All three participate — an operation whose id and
+// version do not match the stored task fails, and so does one whose Queue does
+// not match, because the queue is part of the modify key (see Backend.Modify).
 //
-// Also contains the name of the queue in which this task resides. Can be
-// omitted, as it does not effect functionality, but might be required for
-// authorization, which is performed based on queue name. Present whenever
-// using tasks as a source of IDs.
+// The Queue is therefore NOT optional for a delete or depend: the backend never
+// substitutes the stored queue, so naming an empty or wrong queue fails the
+// operation with a DependencyError. This is also what makes queue-scoped
+// authorization enforceable — a caller cannot reach a task by misdeclaring where
+// it lives.
 type TaskID struct {
 	ID      string `json:"id"`
 	Version int32  `json:"version"`
@@ -38,14 +41,18 @@ func (t TaskID) String() string {
 	return fmt.Sprintf("%s:v%d (in %q)", t.ID, t.Version, t.Queue)
 }
 
-// Delete produces an appropriate ModifyArg to delete the task with this ID.
+// Delete produces a ModifyArg to delete the task with this ID. The TaskID's
+// Queue must name the task's current queue (it is part of the modify key); a
+// mismatch fails the whole modify with a DependencyError.
 func (t TaskID) Delete() ModifyArg {
 	return func(m *Modification) {
 		m.Deletes = append(m.Deletes, &t)
 	}
 }
 
-// Depend produces an appropriate ModifyArg to depend on this task ID.
+// Depend produces a ModifyArg to depend on this task ID. As with Delete, the
+// TaskID's Queue must match the task's current queue, or the modify fails with a
+// DependencyError.
 func (t TaskID) Depend() ModifyArg {
 	return func(m *Modification) {
 		m.Depends = append(m.Depends, &t)
@@ -263,7 +270,11 @@ func InsertingInto(q string, insertArgs ...InsertArg) ModifyArg {
 	}
 }
 
-// Task represents a unit of work, with a byte slice value payload.
+// Task represents a unit of work, with a JSON value payload. A task is identified
+// for modification by the tuple (ID, Version, Queue): a change, delete, or
+// depend must name the queue the task currently occupies, since the queue is
+// part of the modify key (see Backend.Modify and TaskID).
+//
 // Note that Claims is the number of times a task has successfully been claimed.
 // This is different than the version number, which increments for
 // every modification, not just claims.
@@ -413,6 +424,11 @@ func AttemptToZero() ChangeArg {
 // Change returns a ModifyArg that can be used in the Modify function, e.g.,
 //
 //	cli.Modify(ctx, task1.Change(ArrivalTimeBy(2 * time.Minute)))
+//
+// The change is bound to the task's current queue as its source (captured in
+// FromQueue), which is part of the modify key: it must match where the task
+// actually lives. The destination defaults to that same queue; use QueueTo to
+// move the task to another queue (both queues then matter for authorization).
 func (t *Task) Change(args ...ChangeArg) ModifyArg {
 	return func(m *Modification) {
 		newTask := *t

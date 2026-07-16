@@ -59,7 +59,7 @@ func openEntroq(ctx context.Context, g *errgroup.Group, label, addr, certF, keyF
 
 // localEQ opens the local EntroQ instance (--entroq) with optional transport
 // security (--cert/--key/--ca) and bearer-token auth (--authz-token-file). It is
-// used by the single-instance sidecar commands (send/recv/run/gc); "eqlink
+// used by the single-instance sidecar commands (send/recv/run); "eqlink
 // handoff" opens its two endpoints directly via openEntroq.
 func localEQ(ctx context.Context, g *errgroup.Group) (*entroq.EntroQ, error) {
 	return openEntroq(ctx, g, "local", entroqAddr, certFile, keyFile, caFile, authzTokenFile)
