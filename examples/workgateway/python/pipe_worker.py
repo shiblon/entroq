@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""A resident EntroQ worker over the work gateway, in stdlib Python.
+"""A resident EntroQ worker over the work gateway, PIPE transport, stdlib Python.
+
+The work itself lives in handler.py, shared with the WebSocket example
+(ws_worker.py); this file is only the pipe transport and its supervision loop.
 
 It spawns `eqlink work` as a child -- the gateway, which runs the EntroQ worker
 loop (claim, renew, commit) on our behalf -- and speaks the small
@@ -25,6 +28,8 @@ import subprocess
 import sys
 import time
 
+from handler import handle
+
 ENTROQ_ADDR = os.environ.get("ENTROQ_ADDR", "localhost:37706")
 QUEUE = os.environ.get("QUEUE", "in")
 
@@ -32,19 +37,6 @@ QUEUE = os.environ.get("QUEUE", "in")
 # 75 (EX_TEMPFAIL) is a transient backend blip to reconnect on; 0 (clean),
 # 78 (caller fault), and 70 (gateway fault) are all terminal -- stop and surface.
 EXIT_TRANSIENT = 75
-
-
-def handle(task):
-    """Do the work for one task and return the result message.
-
-    `task` is the protojson of an api.Task; its JSON payload is under "value".
-    Here we just log it and consume the task -- replace this with real work.
-    """
-    print(f"[worker] task {task.get('id')}: value={task.get('value')!r}", file=sys.stderr)
-    # "ok" commits; "ack" is the shorthand for "I consumed this task", so the
-    # gateway deletes it for us. To produce new work instead, add a "modification"
-    # (a protojson ModifyRequest); leave its claimant_id empty.
-    return {"type": "result", "outcome": "ok", "ack": True}
 
 
 def serve(proc):
