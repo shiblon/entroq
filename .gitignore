@@ -49,3 +49,6 @@ charts/*.tgz
 
 /eqc
 /eqlink
+
+# built example binary
+/examples/dynamic_config/dynamic_config

@@ -96,7 +96,7 @@ kubectl create serviceaccount stranger -n greetings
 TOKEN=$(kubectl create token stranger -n greetings)
 kubectl port-forward -n entroq-system svc/entroq 37706:37706 &
 go run ./cmd/eqc --svcaddr localhost:37706 --authz_token "$TOKEN" \
-  ins -q /greetings/svc-b/inbox '{}'
+  ins -q /greetings/svc-b/inbox -v '{}'
 # Expected: permission denied
 ```
 
