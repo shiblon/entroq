@@ -36,6 +36,8 @@ var serve struct {
 var serveCmd = &cobra.Command{
 	Use:   "serve",
 	Short: "Start the EntroQ gRPC and HTTP/JSON service.",
+	Long: `Serve a Redis-backed EntroQ over gRPC (--port, default 37706) and an
+HTTP/JSON + Connect API (--http_port, default 9100, which also serves /metrics).`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := context.Background()
 
