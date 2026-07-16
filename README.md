@@ -339,6 +339,8 @@ helm install my-queue ./charts/entroq --set entroq.backend.type=postgres
 ### Tasks
 A task is defined by a Queue Name, a Globally Unique ID, a Version, an Arrival Time, and a Value. The version increments every time the task is mutated, providing the foundation for transactional safety.
 
+A task's identity for modification is the tuple **(id, version, queue)**: a delete, change, or dependency must name the queue the task currently occupies. A mismatch is rejected (`DependencyError`) and the server never substitutes the stored queue — this is what makes queue-based authorization enforceable, since you cannot reach a task by misdeclaring where it lives.
+
 ### Queues
 Queues are not first-class entities; they spring into existence only when tasks are assigned to them and vanish when empty, allowing for highly dynamic, ad-hoc workflows.
 
