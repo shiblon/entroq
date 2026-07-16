@@ -4,10 +4,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/async"
-	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
 	"github.com/spf13/cobra"
+	"golang.org/x/sync/errgroup"
 )
 
 var sendCmd = &cobra.Command{
@@ -27,7 +26,8 @@ Use "eqlink run" to start the full sidecar (sender + receiver).`,
 		}
 		defer stopMetrics()
 
-		eq, err := entroq.New(ctx, eqgrpc.Opener(entroqAddr, eqgrpc.WithInsecure()))
+		g, gctx := errgroup.WithContext(ctx)
+		eq, err := localEQ(gctx, g)
 		if err != nil {
 			return err
 		}
@@ -44,7 +44,8 @@ Use "eqlink run" to start the full sidecar (sender + receiver).`,
 			async.WithSenderDomainSuffix(domainSuffix),
 			async.WithSenderNamespace(namespace),
 		)
-		return sender.Run(ctx)
+		g.Go(func() error { return sender.Run(gctx) })
+		return g.Wait()
 	},
 }
 

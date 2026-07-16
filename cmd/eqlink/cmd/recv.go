@@ -4,9 +4,7 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/async"
-	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
 	"github.com/shiblon/entroq/pkg/worker"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
@@ -29,7 +27,8 @@ Use "eqlink run" to start the full sidecar (sender + receiver).`,
 		}
 		defer stopMetrics()
 
-		eq, err := entroq.New(ctx, eqgrpc.Opener(entroqAddr, eqgrpc.WithInsecure()))
+		g, gctx := errgroup.WithContext(ctx)
+		eq, err := localEQ(gctx, g)
 		if err != nil {
 			return err
 		}
@@ -54,10 +53,9 @@ Use "eqlink run" to start the full sidecar (sender + receiver).`,
 			worker.WithDoModify(async.ReceiverHandler(upstream, rcvOpts...)),
 		)
 
-		g, ctx := errgroup.WithContext(ctx)
 		for range concurrency {
 			g.Go(func() error {
-				if err := recvWorker.Run(ctx, worker.Watching(myQueue+"/inbox")); err != nil {
+				if err := recvWorker.Run(gctx, worker.Watching(myQueue+"/inbox")); err != nil {
 					return fmt.Errorf("run worker: %w", err)
 				}
 				return nil
