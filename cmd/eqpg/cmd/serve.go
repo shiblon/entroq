@@ -147,7 +147,7 @@ func init() {
 	flags.StringVar(&opaURL, "opa_url", "", fmt.Sprintf("OPA base URL (scheme://host:port). Default: %s.", opahttp.DefaultHostURL))
 	flags.StringVar(&opaPath, "opa_path", "", fmt.Sprintf("OPA API path. Default: %s.", opahttp.DefaultAPIPath))
 	flags.DurationVar(&heartbeat, "heartbeat", 5*time.Second, "Heartbeat interval for this service. Non-zero values designate this node as a cluster Leader.")
-	flags.BoolVar(&noListen, "no_listen", true, "Disable the persistent PostgreSQL LISTEN connection. Optimizes singleton deployments.")
+	flags.BoolVar(&noListen, "no_listen", false, "Disable the persistent PostgreSQL LISTEN connection; claims then fall back to polling. LISTEN is on by default for prompt claim wakeups via NOTIFY.")
 	flags.BoolVar(&initSchema, "init_schema", false, "Initialize the EntroQ schema before serving (idempotent; safe to always set).")
 
 	rootCmd.AddCommand(serveCmd)
