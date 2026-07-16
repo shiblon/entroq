@@ -1,10 +1,13 @@
 -- EntroQ psql worker example
 --
--- Demonstrates the full task lifecycle from a plain psql session:
--- setup, insert, claim, complete, and retry-on-error.
+-- Demonstrates the full task lifecycle from a plain psql session: insert, claim,
+-- complete, and retry-on-error. This is the direct-SQL path -- EntroQ's
+-- PostgreSQL backend is pure stored procedures, so a worker in any language (or a
+-- shell script) can drive it with nothing but a psql connection: no EntroQ
+-- server, gRPC, or client library required.
 --
 -- Prerequisites:
---   psql -d mydb -f path/to/schema.sql   -- apply schema once
+--   psql -d mydb -f path/to/schema.sql   -- apply the schema once
 --   psql -d mydb -f worker_example.sql   -- run this file
 --
 -- Or interactively:
@@ -12,54 +15,50 @@
 --   \i path/to/schema.sql
 --   \i worker_example.sql
 --
--- Values are bytea. Text payloads are encoded as UTF-8:
---   encode('hello'::bytea, 'base64')   -- text  -> base64 JSON string
---   convert_from(value, 'UTF8')        -- bytea -> text for display
+-- A task's value is JSON (the tasks.value column is jsonb) -- a string, number,
+-- object, or array, passed and returned as-is with no encoding.
 --
--- All operations go through entroq_modify (JSONB) or entroq_try_claim_one.
+-- All mutations go through entroq.modify (which takes JSONB arrays of
+-- operations); claims go through entroq.try_claim.
 
 
 -- ============================================================
 -- 1. Insert tasks
 -- ============================================================
 
--- Insert a single task with an auto-generated ID.
--- 'queue' is required; all other fields are optional.
--- Omitting 'at' schedules the task for immediate availability.
-SELECT kind, id, version, queue, convert_from(value, 'UTF8') AS payload
-FROM entroq_modify(
+-- Insert a single task with an auto-generated ID. 'queue' is required; all other
+-- fields are optional. Omitting 'at' schedules it for immediate availability.
+SELECT kind, id, version, queue, value
+FROM entroq.modify(
     'my-worker',
     p_inserts := '[
-        {"queue": "/jobs/email", "value": "aGVsbG8gd29ybGQ="}
-    ]'::jsonb
-);
--- aGVsbG8gd29ybGQ= is base64 for "hello world"
--- encode(''hello world''::bytea, ''base64'') produces it
-
--- Insert several tasks at once. All inserts in one entroq_modify call
--- are atomic -- either all succeed or none do.
-SELECT kind, id, version, queue, convert_from(value, 'UTF8') AS payload
-FROM entroq_modify(
-    'my-worker',
-    p_inserts := '[
-        {"queue": "/jobs/email", "value": "am9iIG9uZQ=="},
-        {"queue": "/jobs/email", "value": "am9iIHR3bw=="},
-        {"queue": "/jobs/sms",   "value": "c21zIGpvYg=="}
+        {"queue": "/jobs/email", "value": "hello world"}
     ]'::jsonb
 );
 
--- Insert a task with an explicit ID and a future availability time.
--- Useful when you need to reference the ID before it exists, or to
--- schedule work for later.
+-- Insert several tasks at once. All inserts in one entroq.modify call are atomic
+-- -- either all succeed or none do. Values can be structured JSON.
+SELECT kind, id, version, queue, value
+FROM entroq.modify(
+    'my-worker',
+    p_inserts := '[
+        {"queue": "/jobs/email", "value": {"to": "a@example.com"}},
+        {"queue": "/jobs/email", "value": {"to": "b@example.com"}},
+        {"queue": "/jobs/sms",   "value": {"to": "+15551234"}}
+    ]'::jsonb
+);
+
+-- Insert a task with an explicit ID and a future availability time. Useful when
+-- you need to reference the ID before it exists, or to schedule work for later.
 SELECT kind, id, version, queue
-FROM entroq_modify(
+FROM entroq.modify(
     'my-worker',
     p_inserts := '[
         {
             "id":    "my-known-id-001",
             "queue": "/jobs/email",
             "at":    "2099-01-01T00:00:00Z",
-            "value": "ZnV0dXJlIGpvYg=="
+            "value": "future job"
         }
     ]'::jsonb
 );
@@ -70,18 +69,18 @@ FROM entroq_modify(
 -- ============================================================
 
 -- List all queues and their task counts.
-SELECT name, num_tasks FROM entroq_queues();
+SELECT name, num_tasks FROM entroq.queues();
 
 -- List queues matching a prefix.
-SELECT name, num_tasks FROM entroq_queues(p_prefix := '/jobs/');
+SELECT name, num_tasks FROM entroq.queues(p_prefix := '/jobs/');
 
 -- List tasks in a queue, oldest-first.
-SELECT id, version, at, convert_from(value, 'UTF8') AS payload
-FROM entroq_tasks(p_queue := '/jobs/email');
+SELECT id, version, at, value
+FROM entroq.tasks(p_queue := '/jobs/email');
 
--- List tasks across all queues (p_queue='' means all).
+-- List tasks across all queues (the default p_queue='' means all).
 SELECT queue, id, version, at
-FROM entroq_tasks()
+FROM entroq.tasks()
 ORDER BY at;
 
 
@@ -89,112 +88,108 @@ ORDER BY at;
 -- 3. Claim a task
 -- ============================================================
 
--- entroq_try_claim_one atomically claims one available task from the
--- given queue for the given duration. Returns zero rows if no task is
--- available right now (caller should poll or use LISTEN/NOTIFY).
+-- entroq.try_claim atomically claims one available task from any of the given
+-- queues (an array) for the given duration. It returns zero rows if nothing is
+-- available right now -- the caller should poll, or use LISTEN/NOTIFY (below).
 --
--- The claimed task's 'at' is set to now() + duration. Any worker that
--- holds the task must complete or renew it before that time, or another
+-- The claimed task's 'at' is set to now() + duration and its version bumps. The
+-- worker holding it must complete or renew it before that time, or another
 -- worker may claim it.
 
-SELECT id, version, queue, claimant,
-       convert_from(value, 'UTF8') AS payload, at AS lease_expires
-FROM entroq_try_claim_one(
-    '/jobs/email',  -- queue
-    'worker-abc',   -- claimant ID (any unique string per worker)
-    '30 seconds'    -- lease duration
+SELECT id, version, queue, claimant, value, at AS lease_expires
+FROM entroq.try_claim(
+    ARRAY['/jobs/email'],  -- queues to claim from (only one task, from one queue)
+    'worker-abc',          -- claimant ID (any unique string per worker)
+    '30 seconds'           -- lease duration
 );
 
--- In a psql script, use \gset to capture the claimed task into variables
--- so subsequent statements can reference :task_id and :task_version.
+-- In a psql script, capture the claimed task with \gset so later statements can
+-- reference :task_id, :task_version, and :'task_queue':
 --
--- Example (substitute real id/version from the claim above):
---
---   SELECT id, version
---   FROM entroq_try_claim_one('/jobs/email', 'worker-abc', '30 seconds')
+--   SELECT id, version, queue
+--   FROM entroq.try_claim(ARRAY['/jobs/email'], 'worker-abc', '30 seconds')
 --   \gset task_
---
--- :task_id and :task_version are then available below.
 
 
 -- ============================================================
 -- 4. Complete a task (delete after successful processing)
 -- ============================================================
 
--- After processing, delete the task by id + version. The version check
--- is the safety mechanism: if the task was claimed by another worker
--- (i.e., its version incremented), entroq_modify raises SQLSTATE EQ001
--- with a JSON detail describing the mismatched dependency.
+-- After processing, delete the task by id + version + queue. There are two
+-- safety checks: the VERSION guards against a concurrent re-claim, and the QUEUE
+-- is part of the modify key -- a delete must name the queue the task currently
+-- occupies, and the backend never substitutes it. A mismatch on either raises
+-- SQLSTATE EQ001 with a JSON detail describing the failed dependency. (This
+-- queue check is what makes queue-based authorization unbypassable: you cannot
+-- reach a task by misdeclaring where it lives.)
 --
 -- Replace <id> and <version> with values from your claim above.
 
 SELECT kind, id, version
-FROM entroq_modify(
+FROM entroq.modify(
     'worker-abc',
-    p_deletes := '[{"id": "<id>", "version": <version>}]'::jsonb
+    p_deletes := '[{"id": "<id>", "version": <version>, "queue": "/jobs/email"}]'::jsonb
 );
--- Returns zero rows on success (deletes produce no output rows).
--- Raises EQ001 if the version no longer matches (task was re-claimed
--- or modified by someone else since you claimed it).
+-- Deletes produce no output rows on success.
 
 
 -- ============================================================
 -- 5. Retry on error (re-enqueue with attempt counter and error string)
 -- ============================================================
 
--- On failure, delete the claimed task and re-insert it in the same
--- atomic modify call. Incrementing 'attempt' and setting 'err' lets
--- downstream workers or operators see the failure history.
---
--- The delete + insert happen together: if the version check fails
--- (another worker claimed it), neither operation takes effect.
+-- On failure, delete the claimed task and re-insert it in the same atomic
+-- entroq.modify call. Incrementing 'attempt' and setting 'err' preserves the
+-- failure history. The delete + insert happen together: if the delete's
+-- version/queue check fails, neither operation takes effect.
 
-SELECT kind, id, version, queue,
-       attempt, err, convert_from(value, 'UTF8') AS payload
-FROM entroq_modify(
+SELECT kind, id, version, queue, attempt, err, value
+FROM entroq.modify(
     'worker-abc',
-    p_deletes := '[{"id": "<id>", "version": <version>}]'::jsonb,
+    p_deletes := '[{"id": "<id>", "version": <version>, "queue": "/jobs/email"}]'::jsonb,
     p_inserts := '[{
         "queue":   "/jobs/email",
-        "value":   "aGVsbG8gd29ybGQ=",
+        "value":   "hello world",
         "attempt": 1,
         "err":     "SMTP connection refused"
     }]'::jsonb
 );
--- The new task gets a fresh auto-generated ID and version 0.
--- 'at' is omitted so it is available immediately for retry.
--- Add an "at" field with a future timestamp to implement backoff.
+-- The new task gets a fresh auto-generated ID and version 0. 'at' is omitted so
+-- it is available immediately; add an "at" with a future timestamp for backoff.
 
 
 -- ============================================================
 -- 6. LISTEN/NOTIFY for efficient polling (optional)
 -- ============================================================
 
--- The trigger entroq_task_notify fires pg_notify on the queue's channel
--- whenever a task becomes immediately available (at <= now()).
--- entroq_channel_name() derives the channel name from the queue name.
+-- Instead of spinning in a tight claim loop, listen for a wakeup. Each queue has
+-- a notification channel; entroq.channel_name derives it from the queue name.
 
-SELECT entroq_channel_name('/jobs/email');
+SELECT entroq.channel_name('/jobs/email');
 -- e.g. "q__jobs_email"
 
--- In an interactive psql session, LISTEN on that channel before polling:
+-- Notifications are emitted by entroq.notify_ready_queues(), which sends a
+-- pg_notify on the channel of every queue that has a task ready now (at <=
+-- now()) and returns the queues it notified. The EntroQ service calls it on its
+-- heartbeat; a pure-SQL deployment calls it itself (after inserts, or on a
+-- timer):
+SELECT entroq.notify_ready_queues();
+
+-- In an interactive psql session, LISTEN on the channel, then drive claims in
+-- response to the async notifications psql prints:
 --
 --   LISTEN q__jobs_email;
+--   SELECT entroq.notify_ready_queues();   -- or let the service do it
+--   -- psql prints: Asynchronous notification "q__jobs_email" received ...
 --
--- psql will print an asynchronous notification line whenever a task
--- arrives, so you can run entroq_try_claim_one in response rather than
--- spinning in a tight loop.
---
--- In a bash script, pg_isready + a sleep loop is simpler:
+-- In a shell script, a poll loop is simplest:
 --
 --   while true; do
 --     psql "$DSN" -c "
---       SELECT id, version, convert_from(value,'UTF8') AS payload
---       FROM entroq_try_claim_one('/jobs/email', 'worker-$$', '30 seconds');
+--       SELECT id, version, value
+--       FROM entroq.try_claim(ARRAY['/jobs/email'], 'worker-'$$, '30 seconds');
 --     "
 --     sleep 1
 --   done
 --
--- For true async notification in a script, consider psql's --single-transaction
--- mode with LISTEN, or use a language client (Python asyncpg, Go lib/pq, etc.)
--- that exposes pg_notify callbacks.
+-- For true async wakeups in code, use a client library that exposes LISTEN/
+-- NOTIFY (Python asyncpg, Go lib/pq or pgx, etc.).
