@@ -49,9 +49,37 @@ var (
 )
 
 func TestControllers(t *testing.T) {
+	// The envtest suite needs the control-plane binaries (etcd, kube-apiserver)
+	// that `make setup-envtest` provisions. Without them testEnv.Start() fails,
+	// so skip cleanly rather than hard-failing a bare `go test ./...`. The plain
+	// unit tests in this package (mesh_controller_test.go) still run.
+	if !envtestAvailable() {
+		t.Skip("envtest assets not found (set KUBEBUILDER_ASSETS or run `make setup-envtest`); skipping controller envtest suite")
+	}
+
 	RegisterFailHandler(Fail)
 
 	RunSpecs(t, "Controller Suite")
+}
+
+// envtestAvailable reports whether the envtest control-plane binaries are
+// discoverable, either via KUBEBUILDER_ASSETS or the bin/k8s directory that
+// `make setup-envtest` populates. It reads the directory quietly (no error log)
+// so the common "assets absent" case does not spam output on a plain test run.
+func envtestAvailable() bool {
+	if os.Getenv("KUBEBUILDER_ASSETS") != "" {
+		return true
+	}
+	entries, err := os.ReadDir(filepath.Join("..", "..", "bin", "k8s"))
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			return true
+		}
+	}
+	return false
 }
 
 var _ = BeforeSuite(func() {
