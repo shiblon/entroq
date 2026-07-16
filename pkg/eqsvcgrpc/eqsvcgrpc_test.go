@@ -209,3 +209,70 @@ func TestModifyRejectsDocNamespaceChange(t *testing.T) {
 		t.Errorf("same-namespace doc change should not be an InvalidArgument, got %v", err)
 	}
 }
+
+// stubAuthorizer is a test authz.Authorizer returning a fixed decision, so a
+// test can drive Modify's enforcement seam without a live OPA. It records
+// whether it was consulted, distinguishing "allowed" from "never asked".
+type stubAuthorizer struct {
+	err    error
+	called bool
+}
+
+func (s *stubAuthorizer) Authorize(context.Context, *authz.Request) error {
+	s.called = true
+	return s.err
+}
+
+func (s *stubAuthorizer) Close() error { return nil }
+
+// TestModifyEnforcesAuthorizerDenial closes the loop that the modifyAuthz unit
+// tests leave open: those prove the right authorization request is BUILT, but
+// not that a denial actually blocks the modification. Here a configured
+// authorizer denies, and Modify must surface PermissionDenied and never touch
+// the backend. This guards the build -> authorize -> reject wiring end to end.
+func TestModifyEnforcesAuthorizerDenial(t *testing.T) {
+	ctx := context.Background()
+	denied := &authz.AuthzError{
+		Failed: []*authz.Queue{{Exact: "q", Actions: []authz.Action{authz.Insert}}},
+	}
+	az := &stubAuthorizer{err: denied}
+	svc, err := New(ctx, eqmem.Opener(), WithAuthorizer(az))
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	defer svc.Close()
+
+	req := &pb.ModifyRequest{Inserts: []*pb.TaskData{{Queue: "q"}}}
+	if _, err := svc.Modify(ctx, req); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("denied modify: got err %v (code %v), want PermissionDenied", err, status.Code(err))
+	}
+	if !az.called {
+		t.Error("authorizer was never consulted; denial did not come from authz")
+	}
+}
+
+// TestModifyAllowsWhenAuthorized is the positive counterpart: with an
+// authorizer that allows, the same insert proceeds to the backend and succeeds.
+// Together with the denial test this pins the authorizer's decision -- not some
+// unrelated validation -- as what gates the modification.
+func TestModifyAllowsWhenAuthorized(t *testing.T) {
+	ctx := context.Background()
+	az := &stubAuthorizer{err: nil}
+	svc, err := New(ctx, eqmem.Opener(), WithAuthorizer(az))
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	defer svc.Close()
+
+	req := &pb.ModifyRequest{Inserts: []*pb.TaskData{{Queue: "q"}}}
+	resp, err := svc.Modify(ctx, req)
+	if err != nil {
+		t.Fatalf("allowed modify: unexpected error: %v", err)
+	}
+	if !az.called {
+		t.Error("authorizer was never consulted")
+	}
+	if len(resp.Inserted) != 1 {
+		t.Errorf("inserted tasks = %d, want 1", len(resp.Inserted))
+	}
+}
