@@ -57,6 +57,59 @@ func TestWorker_Basic(t *testing.T) {
 	}
 }
 
+func TestWorker_MaxClaimsQuarantinesBeforeHandler(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	client, err := entroq.New(ctx, eqmem.Opener())
+	if err != nil {
+		t.Fatalf("New client: %v", err)
+	}
+	defer client.Close()
+
+	const queue = "max_claims"
+	if _, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue("work"))); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	claimed, err := client.Claim(ctx, entroq.From(queue), entroq.ClaimFor(time.Second))
+	if err != nil {
+		t.Fatalf("First claim: %v", err)
+	}
+	if _, err := client.Modify(ctx, claimed.Change(entroq.ArrivalTimeBy(0))); err != nil {
+		t.Fatalf("Release first claim: %v", err)
+	}
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	handlerMade := make(chan struct{}, 1)
+	go func() {
+		w := New[string](client, WithMakeHandler(func() (Handler[string], error) {
+			handlerMade <- struct{}{}
+			return nil, errors.New("handler must not be constructed")
+		}))
+		done <- w.Run(runCtx, Watching(queue), WithMaxClaims(1))
+	}()
+
+	waitForTasks(ctx, t, client, queue+"/err", 1)
+	runCancel()
+	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+		t.Errorf("worker run: %v", err)
+	}
+	select {
+	case <-handlerMade:
+		t.Error("handler was constructed for a task over max claims")
+	default:
+	}
+
+	tasks, err := client.Tasks(ctx, queue+"/err")
+	if err != nil {
+		t.Fatalf("error queue tasks: %v", err)
+	}
+	if got, want := tasks[0].Claims, int32(2); got != want {
+		t.Errorf("quarantined task claims = %d, want %d", got, want)
+	}
+}
+
 // TestWorkerRenewal verifies that doWhileRenewing actually renews the claim at
 // the expected interval and that stop() returns stable (finalized) versions.
 func TestWorkerRenewal(t *testing.T) {

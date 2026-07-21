@@ -7,6 +7,39 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.8.0] - 2026-07-21
+
+### Added
+
+- **Worker claim limit.** Go workers accept `WithMaxClaims(N)`. Claim `N` may
+  run; a later claim is moved to the configured error queue before handler
+  construction or payload decoding. Zero keeps the existing unlimited behavior.
+- **Worker slot telemetry.** `worker.WithMeterProvider` emits current slot counts
+  and longest current state duration through `entroq.worker.slots` and
+  `entroq.worker.state.max_duration`, labeled `idle` or `busy`. `eqlink run` and
+  `eqlink recv` expose these through their existing Prometheus endpoint.
+- **Document garbage collection.** A `/gc=<timestamp>` component in a doc
+  primary key opts its complete `(namespace, primary key)` group into the same
+  always-on backend GC used by task queues. Collection is all-or-nothing and
+  skips any group with a live claim. This uses the ordinary doc API and requires
+  no storage-schema change.
+
+### Changed
+
+- **GC follows the worker contract.** Go backends now share one bounded
+  collector that lists queues and doc keys, then uses `TryClaim`/`ClaimDocs` and
+  ordinary atomic deletes. PostgreSQL's existing GC procedures remain available
+  for direct-PG client compatibility, but the Go backend no longer depends on
+  them.
+
+### Fixed
+
+- **Redis exact doc-key queries.** `Docs` now bounds the complete primary-key
+  prefix in the lexicographic index, so `KeyExact` returns docs whose index
+  entries continue with secondary keys and IDs.
+
+---
+
 ## [1.7.1] - 2026-07-16
 
 Go module `v1.7.1`. A **breaking** release that is also a **necessary security

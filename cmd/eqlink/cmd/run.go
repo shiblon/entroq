@@ -54,7 +54,7 @@ Graceful shutdown on SIGINT/SIGTERM:
 		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 		defer signal.Stop(sigs)
 
-		_, stopMetrics, err := setupMetrics(ctx)
+		mp, stopMetrics, err := setupMetrics(ctx)
 		if err != nil {
 			return fmt.Errorf("metrics: %w", err)
 		}
@@ -108,6 +108,7 @@ Graceful shutdown on SIGINT/SIGTERM:
 		defer rcvCancel()
 		recvWorker := worker.New(eq,
 			worker.WithDoModify(async.ReceiverHandler(upstream, rcvOpts...)),
+			worker.WithMeterProvider[async.Envelope](mp),
 		)
 		for range concurrency {
 			g.Go(func() error {

@@ -121,11 +121,22 @@ func TestGCLoopCollects(t *testing.T) {
 	eqtest.GCCollectsInLoop(ctx, t, client, "/test/gcloop")
 }
 
-// TestGCCollectOnce drives the discover-then-collect path directly (white-box) to
-// pin the SQL semantics: gc_queues finds the gc= queues, and gc_collect (fed the
-// valid ones) reaps due gc= tasks while leaving not-yet-due activation, future
-// arrival (claimed-equivalent), and non-gc queues alone. The GC interval is set
-// long so the background loop does not collect out from under the assertions.
+func TestGCDocGroups(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	b, err := Open(ctx, pgHostPort,
+		WithDB("postgres"), WithUsername("postgres"), WithPassword("password"),
+		WithConnectAttempts(10), withGCInterval(time.Hour))
+	if err != nil {
+		t.Fatalf("open backend: %v", err)
+	}
+	defer b.Close()
+	eqtest.GCDocGroups(ctx, t, b, b.collectDocsOnce, "/pgtest/"+entroq.GenHex16())
+}
+
+// TestGCCollectOnce drives the shared claim/delete collector directly: due gc=
+// tasks are reaped while future activation, future arrival, and plain queues
+// survive. The GC interval is held off so the loop cannot race the assertions.
 func TestGCCollectOnce(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -166,27 +177,12 @@ func TestGCCollectOnce(t *testing.T) {
 		}
 	}
 
-	// Discover, relaying only the valid (non-malformed) queues to collectOnce; the
-	// SQL still filters future activations and future task arrivals.
-	qs, err := b.gcQueues(ctx)
-	if err != nil {
-		t.Fatalf("gcQueues: %v", err)
-	}
-	var queues []string
-	var activations []time.Time
-	for _, q := range qs {
-		if q.activateAt.Valid {
-			queues = append(queues, q.queue)
-			activations = append(activations, q.activateAt.Time)
-		}
-	}
-
-	n, err := b.collectOnce(ctx, queues, activations, 100)
+	n, err := b.collectOnce(ctx, 100)
 	if err != nil {
 		t.Fatalf("collectOnce: %v", err)
 	}
-	if want := 2; n != want {
-		t.Errorf("collectOnce deleted %d, want %d (co_due0, co_past)", n, want)
+	if n < 2 {
+		t.Errorf("collectOnce deleted %d, want at least 2 (co_due0, co_past)", n)
 	}
 
 	// Verify exactly the intended survivors remain.

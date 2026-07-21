@@ -37,9 +37,10 @@ Do not hand-roll a release. Releases are cut from `develop` (not `main`, which
 is unused), and the tooling exists:
 
 - `scripts/tag-release.sh <version>` — runs pre-flight guards (clean tree, no
-  `go.mod` `replace`, a `CHANGELOG.md` entry, `SchemaVersion` major.minor
-  matching the tag) then creates and pushes `v<version>`. Prefer it over a bare
-  `git tag` so the guards run.
+  `go.mod` `replace`, a `CHANGELOG.md` entry, and `SchemaVersion` not exceeding
+  the tag) then creates and pushes `v<version>`. The schema version advances
+  only when the schema changes, so it may lag the module version. Prefer the
+  script over a bare `git tag` so the guards run.
 - `scripts/build-docker.sh <version> --push` — builds and pushes the service
   images to `ghcr.io`.
 - Python/JS clients version and publish independently (`scripts/publish-py.sh`,

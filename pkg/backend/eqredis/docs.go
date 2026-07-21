@@ -165,9 +165,10 @@ func (e *EQRedis) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc,
 		min := "-"
 		max := "+"
 		if rq.KeyExact != "" {
-			// Exact primary key match: inclusive on both ends with same value.
-			min = "[" + rq.KeyExact
-			max = "[" + rq.KeyExact
+			// Index members continue with NUL after the primary key. Bound
+			// that complete prefix, excluding the next possible byte value.
+			min = "[" + rq.KeyExact + docIndexSep
+			max = "(" + rq.KeyExact + "\x01"
 		} else {
 			if rq.KeyStart != "" {
 				min = "[" + rq.KeyStart

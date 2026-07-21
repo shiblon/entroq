@@ -1189,16 +1189,17 @@ DROP FUNCTION IF EXISTS entroq.gc_due(text);
 -- the compiled-in SchemaVersion constant.
 --
 -- Versioning policy (1.x+):
---   - Schema version tracks the release minor version (major.minor.0 on each
---     minor release). A schema change always causes a minor bump; a minor bump
---     does not always mean the schema changed.
---   - Minor version changes (1.x -> 1.y) are additive only: new tables,
---     columns with defaults, indexes, or functions. No column renames, type
---     changes, or data movement.
+--   - Schema version is the full version of the release where the schema last
+--     changed. It may lag the module version, but must never exceed it.
+--   - A schema change causes a minor bump. A minor release with no schema
+--     change leaves the schema version alone.
+--   - Additive changes (new tables, columns with defaults, indexes, or
+--     functions) are always permitted. A non-additive migration is permitted
+--     only when it is transparent to clients and this file applies it
+--     idempotently; such migrations may require a maintenance window.
 --   - Patch releases never change the schema.
---   - Upgrading from any 1.x schema to any later 1.y schema is always safe:
---     re-run this script and the new additions appear without touching existing
---     data.
+--   - Upgrading from any 1.x schema to any later 1.y schema is supported by
+--     re-running this file; see the release changelog for operational impact.
 --   - Schemas predating 1.0 (0.x) cannot be migrated. Drain all tasks and
 --     reinitialize: DROP SCHEMA entroq CASCADE, then run eqpg schema init.
 -- Migrations: 1.0.0 → 1.1.0 (see blocks below)

@@ -34,7 +34,7 @@ type Metrics struct {
 // such as mp.Meter("entroq.pg"); pass a noop meter to disable reporting.
 func New(meter metric.Meter) (*Metrics, error) {
 	deleted, err := meter.Int64Counter("entroq.gc.deleted_total",
-		metric.WithDescription("Total tasks deleted by garbage collection."),
+		metric.WithDescription("Total tasks and docs deleted by garbage collection."),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("gc deleted counter: %w", err)
@@ -67,8 +67,8 @@ func queueAttrs(qname string) []attribute.KeyValue {
 	}
 }
 
-// Deleted records n tasks collected from queue qname. n <= 0 and a nil receiver
-// are no-ops.
+// Deleted records n items collected from a queue or doc primary key. n <= 0 and
+// a nil receiver are no-ops.
 func (m *Metrics) Deleted(ctx context.Context, qname string, n int) {
 	if m == nil || n <= 0 {
 		return

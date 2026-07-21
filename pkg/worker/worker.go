@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
+	"go.opentelemetry.io/otel/metric"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -140,8 +141,8 @@ type DoModifyRun[T any] func(context.Context, *entroq.Task, T, []*entroq.Doc) (*
 // successfully. Build it with Modify, then chain OnSuccess for a post-success
 // step.
 type Result struct {
-	mods      []entroq.ModifyArg
-	onSuccess func(context.Context) error
+	mods         []entroq.ModifyArg
+	onSuccess    func(context.Context) error
 	onDependency func(context.Context, *entroq.DependencyError) error
 }
 
@@ -405,6 +406,7 @@ type Worker[T any] struct {
 	// Creates a new handler. Called once per task, in runOne, so per-task
 	// handler state is isolated by construction.
 	makeHandler MakeHandler[T]
+	metrics     *workerMetrics
 }
 
 // workerOpts holds built-up worker options to be later checked against as a
@@ -419,6 +421,7 @@ type workerOpts[T any] struct {
 	finish   FinishRun[T]
 
 	errQMap ErrQMap
+	mp      metric.MeterProvider
 }
 
 // New creates a new Worker[T] that claims tasks from its configured queues and
@@ -439,6 +442,14 @@ func New[T any](eq *entroq.EntroQ, opts ...Option[T]) *Worker[T] {
 		eqc:         eq,
 		errQMap:     wOpts.errQMap,
 		makeHandler: wOpts.makeHandler,
+	}
+	if wOpts.mp != nil {
+		metrics, err := newWorkerMetrics(wOpts.mp)
+		if err != nil {
+			log.Printf("worker metrics disabled: %v", err)
+		} else {
+			worker.metrics = metrics
+		}
 	}
 
 	if worker.makeHandler != nil {
@@ -468,6 +479,14 @@ func New[T any](eq *entroq.EntroQ, opts ...Option[T]) *Worker[T] {
 
 // Option[T] can be passed to New to modify worker parameters.
 type Option[T any] func(*workerOpts[T])
+
+// WithMeterProvider enables worker slot state metrics on the supplied OTel
+// provider. Concurrent calls to Run on this Worker are aggregated as slots.
+func WithMeterProvider[T any](mp metric.MeterProvider) Option[T] {
+	return func(wo *workerOpts[T]) {
+		wo.mp = mp
+	}
+}
 
 // ErrorQueueFor returns the error queue for the given inbox, using the worker's
 // configured mapping or the default if none is set.
@@ -654,12 +673,7 @@ func acquireDocs[T any](ctx context.Context, eqc *entroq.EntroQ, task *entroq.Ta
 
 // runOne claims one task, unmarshals its value into T, runs the work function
 // with renewal, and applies any resulting modification.
-func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt) error {
-	handler, err := w.makeHandler()
-	if err != nil {
-		return FatalErrorf("failed to make handler: %v", err)
-	}
-
+func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt, slot *workerSlot) error {
 	// Note: do NOT cancel rCtx from inside the work function. If rCtx is
 	// canceled while a renewal Modify is in flight over gRPC, the client sees
 	// context.Canceled but the server may have already committed the renewal.
@@ -668,9 +682,25 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt) error {
 	defer rCancel()
 
 	// Phase 1: Claim task and unmarshal its value.
+	slot.set(workerIdle)
 	task, err := w.eqc.Claim(rCtx, entroq.From(opts.qs...), entroq.ClaimFor(opts.lease))
 	if err != nil {
 		return fmt.Errorf("worker (%q) claim: %w", opts.qs, err)
+	}
+	slot.set(workerBusy)
+	if opts.maxClaims > 0 && task.Claims > opts.maxClaims {
+		errQ := w.ErrorQueueFor(task.Queue)
+		if _, err := w.handleSentinelErrors(ctx,
+			MoveErrorf("maximum claims exceeded (%d)", opts.maxClaims), task, errQ, opts,
+		); err != nil {
+			return fmt.Errorf("handle max claims: %w", err)
+		}
+		return nil
+	}
+
+	handler, err := w.makeHandler()
+	if err != nil {
+		return FatalErrorf("failed to make handler: %v", err)
 	}
 	value, err := entroq.GetValue[T](task)
 	if err != nil {
@@ -768,6 +798,7 @@ type runOpt struct {
 	qs             []string
 	baseRetryDelay time.Duration
 	maxAttempts    int32
+	maxClaims      int32
 	lease          time.Duration
 }
 
@@ -790,6 +821,15 @@ func WithLease(d time.Duration) RunOption {
 func WithMaxAttempts(m int32) RunOption {
 	return func(ro *runOpt) {
 		ro.maxAttempts = m
+	}
+}
+
+// WithMaxClaims sets the maximum number of times a task may be claimed before
+// it is moved to the worker's error queue without constructing or invoking the
+// handler. If 0 (the default), there is no maximum.
+func WithMaxClaims(m int32) RunOption {
+	return func(ro *runOpt) {
+		ro.maxClaims = m
 	}
 }
 
@@ -843,8 +883,10 @@ func (w *Worker[T]) Run(ctx context.Context, opts ...RunOption) error {
 	if len(ro.qs) == 0 {
 		return fmt.Errorf("no queues specified to work on")
 	}
+	slot := w.metrics.add()
+	defer slot.remove()
 	for {
-		if err := w.runOne(ctx, ro); err != nil {
+		if err := w.runOne(ctx, ro, slot); err != nil {
 			if entroq.IsCanceled(err) || entroq.IsTimeout(err) {
 				log.Printf("worker was asked to quit: %v", ctx.Err())
 				return nil

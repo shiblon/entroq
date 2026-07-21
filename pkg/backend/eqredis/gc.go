@@ -2,14 +2,10 @@ package eqredis
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"log"
-	"strconv"
 	"time"
 
-	"github.com/redis/go-redis/v9"
-	"github.com/shiblon/entroq/pkg/queues"
+	backendgc "github.com/shiblon/entroq/pkg/backend/internal/gc"
 )
 
 // Default garbage-collection tuning. Not exposed as options: GC is a first-class,
@@ -28,10 +24,8 @@ func withGCInterval(d time.Duration) RedisOpt {
 	}
 }
 
-// runGCLoop periodically drains queues that opt into garbage collection by name
-// (a /gc= component) and removes now-empty bookkeeping entries, until ctx is
-// canceled. Each tick drains due gc= tasks in bounded batches, then sweeps empty
-// queues/namespaces. Errors are logged and the loop continues.
+// runGCLoop performs one bounded task/doc collection pass per tick, then removes
+// empty queue and namespace bookkeeping entries.
 func (e *EQRedis) runGCLoop(ctx context.Context, interval time.Duration, batch int) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
@@ -41,21 +35,11 @@ func (e *EQRedis) runGCLoop(ctx context.Context, interval time.Duration, batch i
 			return
 		case <-t.C:
 			start := time.Now()
-			e.reportMalformed(ctx) // once per sweep, before draining
-			for {
-				n, err := e.collectOnce(ctx, batch)
-				if err != nil {
-					if ctx.Err() == nil {
-						log.Printf("eqredis gc collect: %v", err)
-					}
-					break
-				}
-				if n < batch {
-					break // backlog drained, or nothing was due
-				}
-				if ctx.Err() != nil {
-					return
-				}
+			if _, err := e.collectOnce(ctx, batch); err != nil && ctx.Err() == nil {
+				log.Printf("eqredis gc collect tasks: %v", err)
+			}
+			if _, err := e.collectDocsOnce(ctx, batch); err != nil && ctx.Err() == nil {
+				log.Printf("eqredis gc collect docs: %v", err)
 			}
 			if err := e.gc(ctx); err != nil {
 				if ctx.Err() == nil {
@@ -68,114 +52,12 @@ func (e *EQRedis) runGCLoop(ctx context.Context, interval time.Duration, batch i
 	}
 }
 
-// collectOnce deletes up to batch collectable tasks across queues whose gc
-// activation has passed, and returns the number deleted. Discovery uses the Go
-// parser (queues.GCActivation) over the active-queue set, so the gc= grammar
-// lives in exactly one place; only the delete is Redis-specific.
+func (e *EQRedis) collectDocsOnce(ctx context.Context, batch int) (int, error) {
+	return backendgc.CollectDocsOnce(ctx, e, batch, e.gcMetrics)
+}
+
 func (e *EQRedis) collectOnce(ctx context.Context, batch int) (int, error) {
-	now := time.Now().UTC()
-	nowMs := now.UnixMilli()
-
-	names, err := e.client.SMembers(ctx, queuesKey).Result()
-	if err != nil {
-		if ctx.Err() == nil { // don't count shutdown cancellation as a GC error
-			e.gcMetrics.Error(ctx, "", "list")
-		}
-		return 0, fmt.Errorf("gc list queues: %w", err)
-	}
-
-	total := 0
-	for _, q := range names {
-		if total >= batch {
-			break
-		}
-		at, present, err := queues.GCActivation(q)
-		if err != nil || !present || at.After(now) {
-			continue // not a gc= queue, malformed, or not yet due
-		}
-		n, err := e.collectQueue(ctx, q, nowMs, batch-total)
-		if err != nil {
-			if ctx.Err() == nil {
-				e.gcMetrics.Error(ctx, q, "collect")
-			}
-			return total, fmt.Errorf("gc collect %q: %w", q, err)
-		}
-		e.gcMetrics.Deleted(ctx, q, n)
-		total += n
-	}
-	return total, nil
-}
-
-// reportMalformed surfaces queues that opted into GC (a /gc= component) but whose
-// activation value will not parse: they are never collected, so without this they
-// would pile up silently. Runs once per sweep, emitting the metric and a log line
-// for each malformed queue.
-func (e *EQRedis) reportMalformed(ctx context.Context) {
-	names, err := e.client.SMembers(ctx, queuesKey).Result()
-	if err != nil {
-		if ctx.Err() == nil {
-			log.Printf("eqredis gc: list queues: %v", err)
-			e.gcMetrics.Error(ctx, "", "list")
-		}
-		return
-	}
-	for _, q := range names {
-		_, present, perr := queues.GCActivation(q)
-		if !present || perr == nil {
-			continue // not a gc= queue, or a well-formed one
-		}
-		e.gcMetrics.Error(ctx, q, "malformed")
-		log.Printf("eqredis gc: queue %q has a malformed gc= value; it will never be collected", q)
-	}
-}
-
-// collectQueue deletes up to limit arrived (score = at <= nowMs) tasks from a
-// single gc= queue, atomically. It WATCHes the queue ZSET: if a concurrent
-// claim, insert, or delete changes it between the read and the EXEC, the
-// transaction aborts and nothing is deleted this pass (best-effort; the next
-// tick retries). A claim pushes a task's score into the future, so it either
-// falls outside the range read here or trips the WATCH -- a claimed task is
-// never collected.
-func (e *EQRedis) collectQueue(ctx context.Context, q string, nowMs int64, limit int) (int, error) {
-	qKey := queueKey(q)
-	deleted := 0
-	err := e.client.Watch(ctx, func(tx *redis.Tx) error {
-		ids, err := tx.ZRangeArgs(ctx, redis.ZRangeArgs{
-			Key:     qKey,
-			Start:   "0",
-			Stop:    strconv.FormatInt(nowMs, 10),
-			ByScore: true,
-			Offset:  0,
-			Count:   int64(limit),
-		}).Result()
-		if err != nil {
-			return err
-		}
-		if len(ids) == 0 {
-			return nil
-		}
-		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-			for _, id := range ids {
-				pipe.Del(ctx, taskKey(id))
-				pipe.ZRem(ctx, qKey, id)
-				pipe.ZRem(ctx, qsclaimedKey(q), id)
-			}
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-		deleted = len(ids)
-		return nil
-	}, qKey)
-
-	if errors.Is(err, redis.TxFailedErr) {
-		return 0, nil // concurrent change; retry on the next tick
-	}
-	if err != nil {
-		return 0, err
-	}
-	return deleted, nil
+	return backendgc.CollectTasksOnce(ctx, e, batch, e.gcMetrics)
 }
 
 func (e *EQRedis) gc(ctx context.Context) error {

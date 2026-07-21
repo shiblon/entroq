@@ -21,7 +21,7 @@ Use "eqlink run" to start the full sidecar (sender + receiver).`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		_, stopMetrics, err := setupMetrics(ctx)
+		mp, stopMetrics, err := setupMetrics(ctx)
 		if err != nil {
 			return fmt.Errorf("metrics: %w", err)
 		}
@@ -51,6 +51,7 @@ Use "eqlink run" to start the full sidecar (sender + receiver).`,
 
 		recvWorker := worker.New(eq,
 			worker.WithDoModify(async.ReceiverHandler(upstream, rcvOpts...)),
+			worker.WithMeterProvider[async.Envelope](mp),
 		)
 
 		for range concurrency {

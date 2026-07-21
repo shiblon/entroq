@@ -180,6 +180,16 @@ func DocListing(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefi
 			t.Errorf("Doc PK out of range [2,4): %q", r.Key)
 		}
 	}
+
+	// Filter by one complete primary key. Secondary keys and IDs are suffixes
+	// in some backend indexes, so this also pins the exact-prefix boundary.
+	res, err = client.Docs(ctx, &entroq.DocQuery{Namespace: ns, KeyExact: "2"})
+	if err != nil {
+		t.Fatalf("Filter exact: %v", err)
+	}
+	if len(res) != 1 || res[0].ID != "b" {
+		t.Fatalf("Filter exact 2: want doc b, got %v", res)
+	}
 }
 
 // DocConcurrencyStress hammers the doc locking logic by having multiple

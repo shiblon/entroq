@@ -183,8 +183,6 @@ func TestGCReportsMalformed(t *testing.T) {
 		t.Fatalf("insert: %v", err)
 	}
 
-	b.reportMalformed(ctx)
-
 	// It must NOT be collected.
 	if n, err := b.collectOnce(ctx, 100); err != nil || n != 0 {
 		t.Fatalf("collectOnce = (%d, %v), want (0, nil): malformed queue must not be collected", n, err)
@@ -236,6 +234,17 @@ func TestGCLoopCollects(t *testing.T) {
 	defer client.Close()
 
 	eqtest.GCCollectsInLoop(ctx, t, client, "/test/gcloop")
+}
+
+func TestGCDocGroups(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	b, err := New(ctx, withGCInterval(time.Hour))
+	if err != nil {
+		t.Fatalf("new backend: %v", err)
+	}
+	defer b.Close()
+	eqtest.GCDocGroups(ctx, t, b, b.collectDocsOnce, "/memtest")
 }
 
 // TestGCCollectOnce drives collectOnce directly (white-box) to pin the semantics:

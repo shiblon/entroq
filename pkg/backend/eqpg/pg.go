@@ -3,10 +3,10 @@
 //
 // # Garbage collection
 //
-// This backend garbage-collects on its own. Queues that opt in by name (a /gc=
-// component) have their arrived tasks reaped by an always-on background loop
-// started when the backend is opened -- driven by the gc_collect stored
-// procedure. It is a first-class backend behavior, not a separate process, so a
+// This backend garbage-collects on its own. Queues and doc primary keys that opt
+// in by name (a /gc= component) have their arrived tasks or complete unclaimed
+// doc groups reaped by an always-on background loop started when the backend is
+// opened. It is a first-class backend behavior, not a separate process, so a
 // client talking directly to PostgreSQL with this package (the many-clients,
 // one-database model, with no "eqpg serve" in front) collects gc=-marked queues
 // -- async response queues, eqlink dedup tombstones, and the like -- exactly as

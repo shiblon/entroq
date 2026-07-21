@@ -33,6 +33,17 @@ func TestGCLoopCollects(t *testing.T) {
 	eqtest.GCCollectsInLoop(ctx, t, client, fmt.Sprintf("/redistest/gcloop/%s", client.GenID()))
 }
 
+func TestGCDocGroups(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	b, err := Open(ctx, WithAddr(redisAddr), withGCInterval(time.Hour))
+	if err != nil {
+		t.Fatalf("open backend: %v", err)
+	}
+	defer b.Close()
+	eqtest.GCDocGroups(ctx, t, b, b.collectDocsOnce, "/redistest/"+entroq.GenHex16())
+}
+
 // TestGCRemovesEmptyQueues covers the pre-existing empty-queue bookkeeping
 // cleanup (gc()), which the GC-loop refactor moved into runGCLoop: after a
 // queue's last task is deleted, the loop should drop its name from {eq}:qs. This

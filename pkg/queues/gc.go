@@ -38,13 +38,14 @@ func ParseGCActivation(value string) (time.Time, error) {
 	return t, nil
 }
 
-// GCActivation resolves a queue's garbage-collection policy from its /gc= path
+// GCActivation resolves a path's garbage-collection policy from its /gc= path
 // components. present is false when no /gc= component appears. When several are
 // present the most specific one wins: the last in path order. A malformed value
-// yields an error, and the caller must not collect the queue on error.
-func GCActivation(qname string) (activateAt time.Time, present bool, err error) {
+// yields an error, and the caller must not collect the path on error. Backends
+// apply this to both task queue names and doc primary keys.
+func GCActivation(path string) (activateAt time.Time, present bool, err error) {
 	last := ""
-	for _, component := range PathComponents(qname) {
+	for _, component := range PathComponents(path) {
 		if !strings.HasPrefix(component, "/") {
 			continue
 		}

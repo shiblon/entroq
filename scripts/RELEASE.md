@@ -25,7 +25,8 @@ git checkout develop && git pull
   `pkg/backend/eqpg/schema.go` **and** the matching `INSERT` in
   `pkg/backend/eqpg/schema.sql` (then `make schema-sync`, and update
   `SCHEMA_VERSION` in the Python client). `tag-release.sh` enforces that
-  `SchemaVersion` major.minor matches the release tag major.minor.
+  `SchemaVersion` does not exceed the release tag. It advances only when the
+  schema changes, so a schema-unchanged release leaves it alone.
 - If the Python client changed, bump its independent version in
   `clients/py/pyproject.toml` (it is not tied to the Go module version).
 
@@ -47,8 +48,8 @@ git push origin develop
 ```
 
 The script runs pre-flight checks (clean tree; no `replace` directives in
-`go.mod`; a `CHANGELOG.md` entry for the version; `SchemaVersion` major.minor
-matches the tag; the tag does not already exist), then creates and pushes
+`go.mod`; a `CHANGELOG.md` entry for the version; `SchemaVersion` does not
+exceed the tag; the tag does not already exist), then creates and pushes
 `v<version>`.
 
 ### 3. Build and push Docker images
@@ -84,7 +85,8 @@ the tokens must not require an interactive 2FA prompt:
 ## Version numbering
 
 - **Patch** (`1.x.y+1`): bug fixes, no schema changes, no new public API.
-- **Minor** (`1.x+1.0`): new features, additive schema changes. `SchemaVersion`
-  major.minor must match. Existing databases upgrade by re-running
-  `eqpg schema upgrade`.
+- **Minor** (`1.x+1.0`): new features; may include compatible schema changes.
+  When the schema changes, set `SchemaVersion` to this release and existing
+  databases upgrade by running `eqpg schema upgrade`. Otherwise leave
+  `SchemaVersion` at the release where the schema last changed.
 - **Major** (`x+1.0.0`): breaking changes.
