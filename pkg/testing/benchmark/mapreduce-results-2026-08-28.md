@@ -15,6 +15,20 @@ ranges show the lowest and highest sample.
 | Redis 7 | 92.0 (80.0–94.5) | 98.8 (89.0–103.6) | +7.5% | 99.7 (80.3–101.5) | +8.4% |
 | PostgreSQL 17 | 38.3 (33.2–44.2) | 38.2 (37.4–39.5) | -0.4% | 39.7 (35.4–41.1) | +3.7% |
 
+Within each backend, the bars below are baseline, 250 ms stats, and five-second
+stats from left to right. The chart shows medians; the table remains the source
+for sample ranges.
+
+```mermaid
+xychart-beta
+    title "MapReduce throughput medians"
+    x-axis [Memory, Journal, SQLite, Redis, PostgreSQL]
+    y-axis "Documents per second" 0 --> 320
+    bar [297.9, 286.6, 101.9, 92.0, 38.3]
+    bar [299.0, 264.1, 100.5, 98.8, 38.2]
+    bar [296.9, 288.2, 113.0, 99.7, 39.7]
+```
+
 The ranges overlap for every sampling mode. In particular, the apparent gains
 with five-second polling are not evidence that polling improves throughput.
 They expose the amount of run-to-run noise in this workload.
@@ -32,6 +46,14 @@ is the range of the corresponding per-sample percentile.
 | SQLite | 2.09 ms (1.95–2.90) | 10.7 ms (6.73–12.7) | 17.3 ms (11.2–17.8) | 23.1 ms (18.9–27.9) |
 | Redis 7 | 1.06 ms (1.00–1.27) | 19.2 ms (11.6–23.6) | 30.7 ms (26.5–32.5) | 40.5 ms (39.3–47.0) |
 | PostgreSQL 17 | 3.43 ms (3.38–3.46) | 131 ms (121–142) | 169 ms (162–171) | 229 ms (195–299) |
+
+```mermaid
+xychart-beta
+    title "QueueStats p95 latency under load"
+    x-axis [Memory, Journal, SQLite, Redis, PostgreSQL]
+    y-axis "Milliseconds" 0 --> 150
+    bar [3.26, 2.34, 10.7, 19.2, 131]
+```
 
 The medians are much smaller than the tails. A periodic stats collector should
 therefore keep at most one request in flight, as this benchmark does, rather
