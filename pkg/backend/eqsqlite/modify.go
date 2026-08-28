@@ -3,8 +3,8 @@ package eqsqlite
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/shiblon/entroq"
@@ -45,10 +45,8 @@ func modifyTx(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (*entro
 	}
 
 	resp := &entroq.ModifyResponse{}
-	for _, del := range mod.Deletes {
-		if _, err := tx.ExecContext(ctx, "DELETE FROM tasks WHERE id = ?", del.ID); err != nil {
-			return nil, fmt.Errorf("delete task %q: %w", del.ID, err)
-		}
+	if err := deleteTasks(ctx, tx, mod.Deletes); err != nil {
+		return nil, err
 	}
 	for _, change := range mod.Changes {
 		old := foundTasks[change.ID]
@@ -62,16 +60,10 @@ func modifyTx(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (*entro
 			At: at, Claimant: claimant, Claims: old.Claims, Value: change.Value,
 			Created: old.Created, Modified: now, Attempt: change.Attempt, Err: change.Err,
 		}
-		_, err := tx.ExecContext(ctx, `UPDATE tasks SET
-            version = ?, queue = ?, at_ms = ?, claimant = ?, value = ?,
-            modified_ms = ?, attempt = ?, err = ? WHERE id = ?`,
-			updated.Version, updated.Queue, updated.At.UnixMilli(), updated.Claimant,
-			jsonValue(updated.Value), updated.Modified.UnixMilli(), updated.Attempt,
-			updated.Err, updated.ID)
-		if err != nil {
-			return nil, fmt.Errorf("change task %q: %w", change.ID, err)
-		}
 		resp.ChangedTasks = append(resp.ChangedTasks, updated)
+	}
+	if err := changeTasks(ctx, tx, resp.ChangedTasks); err != nil {
+		return nil, err
 	}
 	for _, insert := range mod.Inserts {
 		id := insert.ID
@@ -86,22 +78,14 @@ func modifyTx(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (*entro
 			Claimant: mod.Claimant, Value: insert.Value, Created: created,
 			Modified: modified, Attempt: insert.Attempt, Err: insert.Err,
 		}
-		_, err := tx.ExecContext(ctx, `INSERT INTO tasks
-            (id, version, queue, at_ms, claimant, claims, value, created_ms, modified_ms, attempt, err)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			task.ID, task.Version, task.Queue, task.At.UnixMilli(), task.Claimant,
-			task.Claims, jsonValue(task.Value), task.Created.UnixMilli(),
-			task.Modified.UnixMilli(), task.Attempt, task.Err)
-		if err != nil {
-			return nil, fmt.Errorf("insert task %q: %w", task.ID, err)
-		}
 		resp.InsertedTasks = append(resp.InsertedTasks, task)
 	}
+	if err := insertTasks(ctx, tx, resp.InsertedTasks); err != nil {
+		return nil, err
+	}
 
-	for _, del := range mod.DocDeletes {
-		if _, err := tx.ExecContext(ctx, "DELETE FROM docs WHERE namespace = ? AND id = ?", del.Namespace, del.ID); err != nil {
-			return nil, fmt.Errorf("delete doc %q/%q: %w", del.Namespace, del.ID, err)
-		}
+	if err := deleteDocs(ctx, tx, mod.DocDeletes); err != nil {
+		return nil, err
 	}
 	for _, insert := range mod.DocInserts {
 		id := insert.ID
@@ -115,15 +99,10 @@ func modifyTx(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (*entro
 			Key: insert.Key, SecondaryKey: insert.SecondaryKey, Content: insert.Content,
 			Created: created, Modified: modified,
 		}
-		_, err := tx.ExecContext(ctx, `INSERT INTO docs
-            (namespace, id, version, claimant, at_ms, key_primary, key_secondary, content, created_ms, modified_ms)
-            VALUES (?, ?, ?, '', 0, ?, ?, ?, ?, ?)`,
-			doc.Namespace, doc.ID, doc.Version, doc.Key, doc.SecondaryKey,
-			jsonValue(doc.Content), doc.Created.UnixMilli(), doc.Modified.UnixMilli())
-		if err != nil {
-			return nil, fmt.Errorf("insert doc %q/%q: %w", doc.Namespace, doc.ID, err)
-		}
 		resp.InsertedDocs = append(resp.InsertedDocs, doc)
+	}
+	if err := insertDocs(ctx, tx, resp.InsertedDocs); err != nil {
+		return nil, err
 	}
 	for _, change := range mod.DocChanges {
 		old := foundDocs[entroq.DocKey(change.Namespace, change.ID)]
@@ -137,67 +116,245 @@ func modifyTx(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (*entro
 			Claimant: claimant, At: at, Key: change.Key, SecondaryKey: change.SecondaryKey,
 			Content: change.Content, Created: old.Created, Modified: now,
 		}
-		_, err := tx.ExecContext(ctx, `UPDATE docs SET
-            version = ?, claimant = ?, at_ms = ?, key_primary = ?, key_secondary = ?,
-            content = ?, modified_ms = ? WHERE namespace = ? AND id = ?`,
-			doc.Version, doc.Claimant, doc.At.UnixMilli(), doc.Key, doc.SecondaryKey,
-			jsonValue(doc.Content), doc.Modified.UnixMilli(), doc.Namespace, doc.ID)
-		if err != nil {
-			return nil, fmt.Errorf("change doc %q/%q: %w", doc.Namespace, doc.ID, err)
-		}
 		resp.ChangedDocs = append(resp.ChangedDocs, doc)
 	}
+	if err := changeDocs(ctx, tx, resp.ChangedDocs); err != nil {
+		return nil, err
+	}
 	return resp, nil
+}
+
+// modernc SQLite is built with SQLITE_MAX_VARIABLE_NUMBER=32766. Chunking at
+// that boundary keeps large public Modify calls valid without returning to one
+// statement per row.
+const sqliteMaxVariables = 32766
+
+func batchRanges(length, variablesPerRow int, f func(start, end int) error) error {
+	if length == 0 {
+		return nil
+	}
+	batchSize := sqliteMaxVariables / variablesPerRow
+	for start := 0; start < length; start += batchSize {
+		if err := f(start, min(start+batchSize, length)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func rowPlaceholders(rows, columns int) string {
+	row := "(" + placeholders(columns) + "),"
+	return strings.TrimSuffix(strings.Repeat(row, rows), ",")
+}
+
+func deleteTasks(ctx context.Context, tx *sql.Tx, deletes []*entroq.TaskID) error {
+	return batchRanges(len(deletes), 1, func(start, end int) error {
+		args := make([]any, 0, end-start)
+		for _, task := range deletes[start:end] {
+			args = append(args, task.ID)
+		}
+		if _, err := tx.ExecContext(ctx,
+			"DELETE FROM tasks WHERE id IN ("+placeholders(len(args))+")", args...); err != nil {
+			return fmt.Errorf("delete tasks: %w", err)
+		}
+		return nil
+	})
+}
+
+func changeTasks(ctx context.Context, tx *sql.Tx, tasks []*entroq.Task) error {
+	const columns = 9
+	return batchRanges(len(tasks), columns, func(start, end int) error {
+		args := make([]any, 0, columns*(end-start))
+		for _, task := range tasks[start:end] {
+			args = append(args, task.ID, task.Version, task.Queue, task.At.UnixMilli(),
+				task.Claimant, jsonValue(task.Value), task.Modified.UnixMilli(), task.Attempt, task.Err)
+		}
+		query := `WITH changes(id, new_version, new_queue, new_at_ms, new_claimant,
+			new_value, new_modified_ms, new_attempt, new_err) AS (VALUES ` +
+			rowPlaceholders(end-start, columns) + `)
+			UPDATE tasks SET
+				version = changes.new_version,
+				queue = changes.new_queue,
+				at_ms = changes.new_at_ms,
+				claimant = changes.new_claimant,
+				value = changes.new_value,
+				modified_ms = changes.new_modified_ms,
+				attempt = changes.new_attempt,
+				err = changes.new_err
+			FROM changes WHERE tasks.id = changes.id`
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+			return fmt.Errorf("change tasks: %w", err)
+		}
+		return nil
+	})
+}
+
+func insertTasks(ctx context.Context, tx *sql.Tx, tasks []*entroq.Task) error {
+	const columns = 11
+	return batchRanges(len(tasks), columns, func(start, end int) error {
+		args := make([]any, 0, columns*(end-start))
+		for _, task := range tasks[start:end] {
+			args = append(args, task.ID, task.Version, task.Queue, task.At.UnixMilli(), task.Claimant,
+				task.Claims, jsonValue(task.Value), task.Created.UnixMilli(), task.Modified.UnixMilli(),
+				task.Attempt, task.Err)
+		}
+		query := `INSERT INTO tasks
+			(id, version, queue, at_ms, claimant, claims, value, created_ms, modified_ms, attempt, err)
+			VALUES ` + rowPlaceholders(end-start, columns)
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+			return fmt.Errorf("insert tasks: %w", err)
+		}
+		return nil
+	})
+}
+
+func deleteDocs(ctx context.Context, tx *sql.Tx, deletes []*entroq.DocID) error {
+	const columns = 2
+	return batchRanges(len(deletes), columns, func(start, end int) error {
+		args := make([]any, 0, columns*(end-start))
+		for _, doc := range deletes[start:end] {
+			args = append(args, doc.Namespace, doc.ID)
+		}
+		query := "DELETE FROM docs WHERE (namespace, id) IN (VALUES " +
+			rowPlaceholders(end-start, columns) + ")"
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+			return fmt.Errorf("delete docs: %w", err)
+		}
+		return nil
+	})
+}
+
+func insertDocs(ctx context.Context, tx *sql.Tx, docs []*entroq.Doc) error {
+	const columns = 8
+	return batchRanges(len(docs), columns, func(start, end int) error {
+		args := make([]any, 0, columns*(end-start))
+		for _, doc := range docs[start:end] {
+			args = append(args, doc.Namespace, doc.ID, doc.Version, doc.Key, doc.SecondaryKey,
+				jsonValue(doc.Content), doc.Created.UnixMilli(), doc.Modified.UnixMilli())
+		}
+		query := `INSERT INTO docs
+			(namespace, id, version, claimant, at_ms, key_primary, key_secondary, content, created_ms, modified_ms)
+			VALUES `
+		row := "(?, ?, ?, '', 0, ?, ?, ?, ?, ?),"
+		query += strings.TrimSuffix(strings.Repeat(row, end-start), ",")
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+			return fmt.Errorf("insert docs: %w", err)
+		}
+		return nil
+	})
+}
+
+func changeDocs(ctx context.Context, tx *sql.Tx, docs []*entroq.Doc) error {
+	const columns = 9
+	return batchRanges(len(docs), columns, func(start, end int) error {
+		args := make([]any, 0, columns*(end-start))
+		for _, doc := range docs[start:end] {
+			args = append(args, doc.Namespace, doc.ID, doc.Version, doc.Claimant, doc.At.UnixMilli(),
+				doc.Key, doc.SecondaryKey, jsonValue(doc.Content), doc.Modified.UnixMilli())
+		}
+		query := `WITH changes(namespace, id, new_version, new_claimant, new_at_ms,
+			new_key_primary, new_key_secondary, new_content, new_modified_ms) AS (VALUES ` +
+			rowPlaceholders(end-start, columns) + `)
+			UPDATE docs SET
+				version = changes.new_version,
+				claimant = changes.new_claimant,
+				at_ms = changes.new_at_ms,
+				key_primary = changes.new_key_primary,
+				key_secondary = changes.new_key_secondary,
+				content = changes.new_content,
+				modified_ms = changes.new_modified_ms
+			FROM changes
+			WHERE docs.namespace = changes.namespace AND docs.id = changes.id`
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+			return fmt.Errorf("change docs: %w", err)
+		}
+		return nil
+	})
 }
 
 func loadDependencies(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (map[string]*entroq.Task, map[string]*entroq.Doc, error) {
 	taskDeps, docDeps, _ := mod.AllDependencies()
 	tasks := make(map[string]*entroq.Task, len(taskDeps))
+	taskIDs := make([]string, 0, len(taskDeps))
 	for id := range taskDeps {
-		task, err := scanTask(tx.QueryRowContext(ctx, "SELECT "+taskColumns+" FROM tasks WHERE id = ?", id))
-		if errors.Is(err, sql.ErrNoRows) {
-			continue
+		taskIDs = append(taskIDs, id)
+	}
+	if err := batchRanges(len(taskIDs), 1, func(start, end int) error {
+		args := make([]any, end-start)
+		for i, id := range taskIDs[start:end] {
+			args[i] = id
 		}
+		rows, err := tx.QueryContext(ctx,
+			"SELECT "+taskColumns+" FROM tasks WHERE id IN ("+placeholders(len(args))+")", args...)
 		if err != nil {
-			return nil, nil, fmt.Errorf("load task dependency %q: %w", id, err)
+			return fmt.Errorf("load task dependencies: %w", err)
 		}
-		tasks[id] = task
+		for rows.Next() {
+			task, err := scanTask(rows)
+			if err != nil {
+				rows.Close()
+				return fmt.Errorf("scan task dependency: %w", err)
+			}
+			tasks[task.ID] = task
+		}
+		err = rows.Err()
+		rows.Close()
+		return err
+	}); err != nil {
+		return nil, nil, err
 	}
+
 	docs := make(map[string]*entroq.Doc, len(docDeps))
-	for _, change := range mod.DocChanges {
-		if _, ok := docs[entroq.DocKey(change.Namespace, change.ID)]; !ok {
-			if err := loadOneDoc(ctx, tx, docs, change.Namespace, change.ID); err != nil {
-				return nil, nil, err
-			}
+	type docKey struct{ namespace, id string }
+	docIDs := make([]docKey, 0, len(docDeps))
+	seenDocs := make(map[string]bool, len(docDeps))
+	addDoc := func(namespace, id string) {
+		key := entroq.DocKey(namespace, id)
+		if !seenDocs[key] {
+			seenDocs[key] = true
+			docIDs = append(docIDs, docKey{namespace: namespace, id: id})
 		}
 	}
-	for _, dep := range append(append([]*entroq.DocID{}, mod.DocDepends...), mod.DocDeletes...) {
-		if _, ok := docs[entroq.DocKey(dep.Namespace, dep.ID)]; !ok {
-			if err := loadOneDoc(ctx, tx, docs, dep.Namespace, dep.ID); err != nil {
-				return nil, nil, err
-			}
-		}
+	for _, change := range mod.DocChanges {
+		addDoc(change.Namespace, change.ID)
+	}
+	for _, dep := range mod.DocDepends {
+		addDoc(dep.Namespace, dep.ID)
+	}
+	for _, del := range mod.DocDeletes {
+		addDoc(del.Namespace, del.ID)
 	}
 	for _, insert := range mod.DocInserts {
 		if insert.ID != "" {
-			if err := loadOneDoc(ctx, tx, docs, insert.Namespace, insert.ID); err != nil {
-				return nil, nil, err
-			}
+			addDoc(insert.Namespace, insert.ID)
 		}
 	}
+	if err := batchRanges(len(docIDs), 2, func(start, end int) error {
+		args := make([]any, 0, 2*(end-start))
+		for _, doc := range docIDs[start:end] {
+			args = append(args, doc.namespace, doc.id)
+		}
+		query := "SELECT " + docColumns + " FROM docs WHERE (namespace, id) IN (VALUES " +
+			rowPlaceholders(end-start, 2) + ")"
+		rows, err := tx.QueryContext(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("load doc dependencies: %w", err)
+		}
+		for rows.Next() {
+			doc, err := scanDoc(rows)
+			if err != nil {
+				rows.Close()
+				return fmt.Errorf("scan doc dependency: %w", err)
+			}
+			docs[entroq.DocKey(doc.Namespace, doc.ID)] = doc
+		}
+		err = rows.Err()
+		rows.Close()
+		return err
+	}); err != nil {
+		return nil, nil, err
+	}
 	return tasks, docs, nil
-}
-
-func loadOneDoc(ctx context.Context, tx *sql.Tx, docs map[string]*entroq.Doc, namespace, id string) error {
-	doc, err := scanDoc(tx.QueryRowContext(ctx, "SELECT "+docColumns+" FROM docs WHERE namespace = ? AND id = ?", namespace, id))
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("load doc dependency %q/%q: %w", namespace, id, err)
-	}
-	docs[entroq.DocKey(namespace, id)] = doc
-	return nil
 }
 
 func checkDependencies(mod *entroq.Modification, tasks map[string]*entroq.Task, docs map[string]*entroq.Doc, now time.Time) *entroq.DependencyError {

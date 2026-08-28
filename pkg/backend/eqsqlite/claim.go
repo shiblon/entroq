@@ -66,6 +66,10 @@ func (b *EQSQLite) Claim(ctx context.Context, q *entroq.ClaimQuery) (*entroq.Tas
 	if err := validateClaim(q); err != nil {
 		return nil, fmt.Errorf("eqsqlite claim: %w", err)
 	}
+	task, err := b.TryClaim(ctx, q)
+	if err != nil || task != nil {
+		return task, err
+	}
 	return entroq.WaitTryClaim(ctx, q, b.tryClaimWhenReady, b.nw)
 }
 

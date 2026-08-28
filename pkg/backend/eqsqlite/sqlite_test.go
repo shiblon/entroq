@@ -272,7 +272,7 @@ func TestConcurrentBackendsShareWriterLock(t *testing.T) {
 	}
 }
 
-func TestBlockingClaimReadinessDoesNotWaitForWriter(t *testing.T) {
+func TestBlockingClaimAfterInitialMissDoesNotWaitForWriter(t *testing.T) {
 	ctx := context.Background()
 	b, err := Open(ctx, filepath.Join(t.TempDir(), "entroq.sqlite"))
 	if err != nil {
@@ -280,15 +280,9 @@ func TestBlockingClaimReadinessDoesNotWaitForWriter(t *testing.T) {
 	}
 	defer b.Close()
 
-	// Occupy the sole write-pool connection. An empty blocking Claim should
-	// remain entirely on the read/subq path rather than queueing behind this tx.
-	tx, err := b.writeDB.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tx.Rollback()
-	before := b.writeDB.Stats().WaitCount
-
+	// Claim makes one optimistic write attempt so a ready backlog does not pay
+	// for a separate readiness query. Once that misses, empty-queue polling must
+	// stay on the read/subq path rather than repeatedly entering the write pool.
 	claimCtx, cancel := context.WithCancel(ctx)
 	done := make(chan error, 1)
 	go func() {
@@ -300,8 +294,16 @@ func TestBlockingClaimReadinessDoesNotWaitForWriter(t *testing.T) {
 		done <- err
 	}()
 	time.Sleep(100 * time.Millisecond)
+
+	tx, err := b.writeDB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	before := b.writeDB.Stats().WaitCount
+	time.Sleep(100 * time.Millisecond)
 	if got := b.writeDB.Stats().WaitCount; got != before {
-		t.Fatalf("empty blocking claim waited for writer: WaitCount changed from %d to %d", before, got)
+		t.Fatalf("blocking claim retried through writer after initial miss: WaitCount changed from %d to %d", before, got)
 	}
 	cancel()
 	select {

@@ -54,9 +54,12 @@ func (b *EQSQLite) ClaimDocs(ctx context.Context, q *entroq.DocClaim) ([]*entroq
 			doc.Claimant = q.Claimant
 			doc.At = at
 			doc.Modified = now
-			if _, err := tx.ExecContext(ctx, `UPDATE docs SET version = ?, claimant = ?, at_ms = ?, modified_ms = ?
-                        WHERE namespace = ? AND id = ?`, doc.Version, doc.Claimant,
-				doc.At.UnixMilli(), doc.Modified.UnixMilli(), doc.Namespace, doc.ID); err != nil {
+		}
+		if len(docs) > 0 {
+			if _, err := tx.ExecContext(ctx, `UPDATE docs
+					SET version = version + 1, claimant = ?, at_ms = ?, modified_ms = ?
+					WHERE namespace = ? AND key_primary = ?`,
+				q.Claimant, at.UnixMilli(), now.UnixMilli(), q.Namespace, q.Key); err != nil {
 				return nil, err
 			}
 		}

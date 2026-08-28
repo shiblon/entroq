@@ -184,6 +184,7 @@ func QueueStatsAccuracy(ctx context.Context, t *testing.T, client *entroq.EntroQ
 	t.Helper()
 	unclaimed := path.Join(qPrefix, "qs-acc-1")
 	partial := path.Join(qPrefix, "qs-acc-2")
+	future := path.Join(qPrefix, "qs-acc-3")
 
 	if _, err := client.Modify(ctx,
 		entroq.InsertingInto(unclaimed),
@@ -191,6 +192,7 @@ func QueueStatsAccuracy(ctx context.Context, t *testing.T, client *entroq.EntroQ
 		entroq.InsertingInto(partial),
 		entroq.InsertingInto(partial),
 		entroq.InsertingInto(partial),
+		entroq.InsertingInto(future, entroq.WithArrivalTime(time.Now().Add(time.Hour))),
 	); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
@@ -205,13 +207,15 @@ func QueueStatsAccuracy(ctx context.Context, t *testing.T, client *entroq.EntroQ
 	}
 
 	for _, tc := range []struct {
-		name      string
-		wantSize  int
-		wantClaim int
-		wantAvail int
+		name       string
+		wantSize   int
+		wantClaim  int
+		wantAvail  int
+		wantFuture int
 	}{
-		{unclaimed, 2, 0, 2},
-		{partial, 3, 1, 2},
+		{unclaimed, 2, 0, 2, 0},
+		{partial, 3, 1, 2, 0},
+		{future, 1, 0, 0, 1},
 	} {
 		s, ok := got[tc.name]
 		if !ok {
@@ -227,8 +231,8 @@ func QueueStatsAccuracy(ctx context.Context, t *testing.T, client *entroq.EntroQ
 		if s.Available != tc.wantAvail {
 			t.Errorf("queue %q: Available want %d got %d", tc.name, tc.wantAvail, s.Available)
 		}
-		if future := s.Size - s.Claimed - s.Available; future < 0 {
-			t.Errorf("queue %q: Future is negative (%d)", tc.name, future)
+		if s.Future != tc.wantFuture {
+			t.Errorf("queue %q: Future want %d got %d", tc.name, tc.wantFuture, s.Future)
 		}
 	}
 }

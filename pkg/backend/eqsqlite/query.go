@@ -44,7 +44,7 @@ func (b *EQSQLite) QueueStats(ctx context.Context, q *entroq.QueuesQuery) (map[s
 	now := nowUTC().UnixMilli()
 	where, args := appendMatch(nil, nil, "queue", q)
 	query := `SELECT queue, count(*),
-        coalesce(sum(CASE WHEN claimant <> '' AND at_ms > ? THEN 1 ELSE 0 END), 0),
+		coalesce(sum(CASE WHEN claims > 0 AND at_ms > ? THEN 1 ELSE 0 END), 0),
         coalesce(sum(CASE WHEN at_ms <= ? THEN 1 ELSE 0 END), 0),
         coalesce(sum(CASE WHEN at_ms > ? AND claims = 0 THEN 1 ELSE 0 END), 0),
         coalesce(max(claims), 0)
