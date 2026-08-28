@@ -24,7 +24,7 @@ func populateRaw(ctx context.Context, backend *EQPG, n int, queues []string) err
 			now(),
 			now(),
 			'',
-			'bench-value'::bytea,
+			'{"benchmark":true}'::jsonb,
 			0, 0, ''
 		FROM generate_series(1, $2)
 	`
