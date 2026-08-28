@@ -93,3 +93,20 @@ func BenchmarkStatsContention_1M_PollOnly(b *testing.B) {
 
 	benchmark.RunContentionBenchmark(b, client, queues, 20)
 }
+
+func BenchmarkBackend(b *testing.B) {
+	benchmark.RunBackendBenchmarks(b, "postgres", func(ctx context.Context, _ *testing.B) (*entroq.EntroQ, error) {
+		return entroq.New(ctx, Opener(pgHostPort,
+			WithDB("postgres"),
+			WithUsername("postgres"),
+			WithPassword("password"),
+			WithConnectAttempts(10)))
+	})
+	benchmark.RunBackendBenchmarks(b, "grpc-postgres", func(ctx context.Context, b *testing.B) (*entroq.EntroQ, error) {
+		return benchmark.OpenGRPC(ctx, b, Opener(pgHostPort,
+			WithDB("postgres"),
+			WithUsername("postgres"),
+			WithPassword("password"),
+			WithConnectAttempts(10)))
+	})
+}
