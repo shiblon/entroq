@@ -120,13 +120,19 @@ func (c *Controller) DocNS() string { return c.prefix }
 // Setup creates one shard doc and one map task per input KV. Call this before
 // starting mapper workers.
 func (c *Controller) Setup(ctx context.Context, input []*KV) error {
-	for i, kv := range input {
-		key := shardDocKey(i)
-		if _, err := c.client.Modify(ctx,
-			entroq.PuttingDocInto(c.DocNS(), entroq.WithKeys(key, ""), entroq.WithContent(kv)),
-			entroq.InsertingInto(c.MapQ(), entroq.WithValue(docRef{NS: c.DocNS(), Key: key})),
-		); err != nil {
-			return fmt.Errorf("setup shard %d: %w", i, err)
+	const batchSize = 250
+	for start := 0; start < len(input); start += batchSize {
+		end := min(start+batchSize, len(input))
+		args := make([]entroq.ModifyArg, 0, 2*(end-start))
+		for i, kv := range input[start:end] {
+			key := shardDocKey(start + i)
+			args = append(args,
+				entroq.PuttingDocInto(c.DocNS(), entroq.WithKeys(key, ""), entroq.WithContent(kv)),
+				entroq.InsertingInto(c.MapQ(), entroq.WithValue(docRef{NS: c.DocNS(), Key: key})),
+			)
+		}
+		if _, err := c.client.Modify(ctx, args...); err != nil {
+			return fmt.Errorf("setup shards %d-%d: %w", start, end-1, err)
 		}
 	}
 	return nil
