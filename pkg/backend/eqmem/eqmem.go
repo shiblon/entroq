@@ -321,7 +321,7 @@ func (m *EQMem) queueLen(q string) int {
 // provided indexing lock structure. If there is some kind of error it will be
 // because of an inconsistent state (a bug), and therefore errors are fatal
 // here.
-func (m *EQMem) mustTryClaimOne(q string, now time.Time, cq *entroq.ClaimQuery) *entroq.Task {
+func (m *EQMem) mustTryClaimOne(q string, cq *entroq.ClaimQuery) *entroq.Task {
 	if m.queueLen(q) == 0 {
 		return nil
 	}
@@ -329,6 +329,7 @@ func (m *EQMem) mustTryClaimOne(q string, now time.Time, cq *entroq.ClaimQuery) 
 	defer unlock()
 
 	ql := qls[0]
+	now := entroq.ProcessTime()
 
 	item := ql.heap.RandomAvailable(now)
 	if item == nil {
@@ -428,13 +429,8 @@ func (m *EQMem) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Ta
 		queues[i], queues[j] = queues[j], queues[i]
 	})
 
-	now, err := m.Time(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("eqmem claim time: %w", err)
-	}
-
 	for _, q := range queues {
-		if task := m.mustTryClaimOne(q, now, cq); task != nil {
+		if task := m.mustTryClaimOne(q, cq); task != nil {
 			return task, nil
 		}
 	}
