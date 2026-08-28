@@ -16,3 +16,9 @@ func BenchmarkBackend(b *testing.B) {
 		return backendbench.OpenGRPC(ctx, b, Opener(WithAddr(redisAddr)))
 	})
 }
+
+func BenchmarkMapReduceLoad(b *testing.B) {
+	backendbench.RunMapReduceLoadBenchmarks(b, "grpc-redis", func(ctx context.Context, b *testing.B) (*entroq.EntroQ, error) {
+		return backendbench.OpenGRPC(ctx, b, Opener(WithAddr(redisAddr)))
+	})
+}

@@ -19,16 +19,22 @@ count="${ENTROQ_BENCHCOUNT:-3}"
 
 for backend in "${backends[@]}"; do
   case "$backend" in
-    eqmem|eqsqlite|eqgrpc|eqredis|eqpg) ;;
-    *)
-      echo "unknown backend: $backend" >&2
-      exit 2
-      ;;
+  eqmem|eqsqlite|eqgrpc|eqredis|eqpg) ;;
+  *)
+    echo "unknown backend: $backend" >&2
+    exit 2
+    ;;
   esac
-  go test "./pkg/backend/$backend" \
-    -run '^$' \
-    -bench '^BenchmarkBackend$' \
-    -benchmem \
-    -benchtime "$benchtime" \
-    -count "$count"
+done
+
+for ((sample = 0; sample < count; sample++)); do
+  for ((backend_offset = 0; backend_offset < ${#backends[@]}; backend_offset++)); do
+    backend="${backends[(sample + backend_offset) % ${#backends[@]}]}"
+    go test "./pkg/backend/$backend" \
+      -run '^$' \
+      -bench '^BenchmarkBackend$' \
+      -benchmem \
+      -benchtime "$benchtime" \
+      -count 1
+  done
 done

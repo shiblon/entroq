@@ -17,3 +17,12 @@ func BenchmarkBackend(b *testing.B) {
 		return backendbench.OpenGRPC(ctx, b, eqmem.Opener(eqmem.WithJournal(b.TempDir())))
 	})
 }
+
+func BenchmarkMapReduceLoad(b *testing.B) {
+	backendbench.RunMapReduceLoadBenchmarks(b, "grpc-memory", func(ctx context.Context, b *testing.B) (*entroq.EntroQ, error) {
+		return backendbench.OpenGRPC(ctx, b, eqmem.Opener())
+	})
+	backendbench.RunMapReduceLoadBenchmarks(b, "grpc-journal", func(ctx context.Context, b *testing.B) (*entroq.EntroQ, error) {
+		return backendbench.OpenGRPC(ctx, b, eqmem.Opener(eqmem.WithJournal(b.TempDir())))
+	})
+}

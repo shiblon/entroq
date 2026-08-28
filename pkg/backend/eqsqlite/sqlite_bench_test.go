@@ -17,3 +17,9 @@ func BenchmarkBackend(b *testing.B) {
 		return backendbench.OpenGRPC(ctx, b, Opener(filepath.Join(b.TempDir(), "entroq.sqlite")))
 	})
 }
+
+func BenchmarkMapReduceLoad(b *testing.B) {
+	backendbench.RunMapReduceLoadBenchmarks(b, "grpc-sqlite", func(ctx context.Context, b *testing.B) (*entroq.EntroQ, error) {
+		return backendbench.OpenGRPC(ctx, b, Opener(filepath.Join(b.TempDir(), "entroq.sqlite")))
+	})
+}

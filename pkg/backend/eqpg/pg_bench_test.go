@@ -110,3 +110,13 @@ func BenchmarkBackend(b *testing.B) {
 			WithConnectAttempts(10)))
 	})
 }
+
+func BenchmarkMapReduceLoad(b *testing.B) {
+	benchmark.RunMapReduceLoadBenchmarks(b, "grpc-postgres", func(ctx context.Context, b *testing.B) (*entroq.EntroQ, error) {
+		return benchmark.OpenGRPC(ctx, b, Opener(pgHostPort,
+			WithDB("postgres"),
+			WithUsername("postgres"),
+			WithPassword("password"),
+			WithConnectAttempts(10)))
+	})
+}

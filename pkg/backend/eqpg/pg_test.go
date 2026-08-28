@@ -52,7 +52,7 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	}
 
-	ctr, err := postgres.Run(ctx, "postgres:11",
+	ctr, err := postgres.Run(ctx, "postgres:17",
 		postgres.WithPassword("password"),
 		testcontainers.WithWaitStrategy(
 			wait.ForLog("database system is ready to accept connections").
