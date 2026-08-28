@@ -7,6 +7,26 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.8.1] - 2026-08-28
+
+Go module `v1.8.1`. No PostgreSQL schema or client version changes.
+
+### Added
+
+- **Experimental SQLite backend.** `pkg/backend/eqsqlite` provides a persistent,
+  embedded `entroq.Backend` using WAL mode and serialized transactional writes.
+  Its Go API, schema, and on-disk format are experimental and may change or be
+  removed without a migration path.
+- **Cross-backend performance harness.** Public-API benchmarks now compare the
+  memory, journal, SQLite, PostgreSQL, and Redis backends directly and through
+  gRPC, with a MapReduce workload for observing queue statistics under load.
+
+### Fixed
+
+- **eqmem ready-task claims.** Availability time is sampled while holding the
+  queue lock, closing a small contention window that could transiently report
+  no ready task when one had just become eligible.
+
 ## [1.8.0] - 2026-07-21
 
 ### Added
