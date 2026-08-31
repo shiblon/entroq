@@ -26,8 +26,8 @@
 //
 // Using the Go implementation opens up possibilities of, among other things, an
 // in-memory backend served via gRPC with queue-level authorization. To use
-// GRPC as a service protocol, see cmd/eqpg or cmd/eqmem to start it up,
-// and use cmd/eqc as a client to play with it.
+// gRPC as a service protocol, start a backend with cmd/eqpg, cmd/eqmem,
+// cmd/eqredis, or cmd/eqsqlite, and use cmd/eqc as a client to play with it.
 //
 // All of this is very lightweight. You can run it on a laptop or a cluster, it
 // scales effortlessly. If you want to work faster, just start more workers.
@@ -430,7 +430,7 @@ type BackendOpener func(ctx context.Context) (Backend, error)
 //
 // Example using an in-memory implementation:
 //
-//	cli, err := New(ctx, eqmem.Opener(eqmem.WithJournal("/path/to/journal/dir"))
+//	cli, err := New(ctx, eqmem.Opener(eqmem.WithJournal("/path/to/journal/dir")))
 //
 // This opens a new EntroQ instance using the in-memory backend. Each backend
 // has its own set of options that can be passed to its opener. For example, the
@@ -439,14 +439,15 @@ type BackendOpener func(ctx context.Context) (Backend, error)
 //
 // Backends available are
 //   - eqmem: in-memory, optionally journal-backed (recommended) - fast and lean
+//   - eqsqlite: experimental embedded SQLite - persistent and single-writer
 //   - eqpg: PostgreSQL-backed - persistent, robust, supports mixing database operations
 //     with EntroQ operations in the same transaction. Clients limited by PG connections.
+//   - eqredis: Redis-backed - persistent and suitable for a shared service
 //   - eqgrpc: gRPC client backend - connects to a remote EntroQ service that is
-//     backed by eqmem or eqpg (or similar direct stores). Requires you to start or
-//     point to a service. Can be started with cmd/eqpg or cmd/eqmem.
+//     backed by any direct store. Requires you to start or point to a service.
 //
-// Valid backends will be in pkg/backend. As new ones are added, corresponding cmd/
-// startup CLIs will be added as well.
+// Valid backends live in pkg/backend. Each direct storage backend has a
+// corresponding startup CLI under cmd/.
 func New(ctx context.Context, opener BackendOpener, opts ...Option) (*EntroQ, error) {
 	eq := &EntroQ{
 		idGenRand: GenHex16,

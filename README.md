@@ -10,8 +10,8 @@ ordinary HTTP microservices asynchronous without any queue code in the services
 themselves. A sidecar intercepts outbound HTTP calls and routes them through
 queues transparently.
 
-Go, Python, TypeScript, and Elixir clients. PostgreSQL, Redis, and in-memory
-backends. Kubernetes deployment via Helm.
+Go, Python, TypeScript, and Elixir clients. PostgreSQL, Redis, in-memory, and
+experimental embedded SQLite backends. Kubernetes deployment via Helm.
 
 ---
 
@@ -372,7 +372,13 @@ EntroQ is backend-agnostic. The Go library supports:
 - **In-memory**: Perfect for testing or light-duty singleton services (includes a WAL journal).
 - **PostgreSQL**: Production-grade persistence using `SKIP LOCKED` for high performance.
 - **Redis**: Persistence backed by Redis (server binary `eqredis`).
-- **gRPC**: A client that talks to a remote `eqpg`, `eqmem`, or `eqredis` service instance.
+- **SQLite (experimental)**: Embedded persistence for singleton and small-service
+  deployments. It uses WAL mode and durable synchronous writes, but remains a
+  single-writer database and has no stable schema or migration guarantee. Run it
+  with `eqsqlite serve --path ./entroq.db`; see the
+  [backend notes](pkg/backend/eqsqlite/README.md).
+- **gRPC**: A client that talks to a remote `eqpg`, `eqmem`, `eqredis`, or
+  `eqsqlite` service instance.
 
 ## Authorization
 
@@ -411,4 +417,5 @@ changes when the schema does and never exceeds the module version. After
 upgrading across a release whose changelog notes a schema change, run
 `eqpg schema upgrade` before starting the service — it refuses to open on a
 version mismatch rather than migrating a live database silently. The in-memory
-and Redis backends need no migration.
+and Redis backends need no migration. The experimental SQLite schema and on-disk
+format may change without a migration path.

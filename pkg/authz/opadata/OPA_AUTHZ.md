@@ -4,9 +4,10 @@ This document explains how EntroQ's authorization system works, how to configure
 it, and how to integrate it with real identity providers (Google, Auth0, Okta, etc.).
 
 **Scope:** This authorization layer applies only to the gRPC and HTTP/JSON
-(Connect) server endpoints (`eqpg serve`, `eqmem serve`, `eqredis serve`). It
-does not apply to direct backend connections (e.g. connecting a Go client
-directly to PostgreSQL). See Security Notes for details.
+(Connect) server endpoints (`eqpg serve`, `eqmem serve`, `eqredis serve`, or
+`eqsqlite serve`). It does not apply to direct backend connections (e.g.
+connecting a Go client directly to PostgreSQL or SQLite). See Security Notes
+for details.
 
 ## Two Provider Modes
 

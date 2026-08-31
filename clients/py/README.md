@@ -8,7 +8,8 @@ This package provides an async client and a small worker framework. It speaks to
 EntroQ two ways:
 
 - **`EntroQJSON`** — talks to a Go EntroQ server over its HTTP/Connect API. Use
-  this when a server is already running (`eqpg`/`eqmem`/`eqredis serve`).
+  this when a server is already running (`eqpg serve`, `eqmem serve`,
+  `eqredis serve`, or `eqsqlite serve`).
 - **`EntroQ`** (in `entroq.experimental.pg`) — talks **directly to PostgreSQL**,
   no Go server in the path. It uses the same stored procedures the Go `eqpg`
   backend does, and bundles the canonical schema so a pip-only environment can

@@ -4,6 +4,20 @@
 format may change or be removed without a migration path. Do not treat an
 `eqsqlite` database file as a stable interchange or archival format.
 
+## Run as a service
+
+Install and serve a database file over gRPC and HTTP/JSON:
+
+```bash
+go install github.com/shiblon/entroq/cmd/eqsqlite@latest
+eqsqlite serve --path ./entroq.db
+```
+
+The default gRPC endpoint is `:37706`; HTTP/JSON and `/metrics` use `:9100`.
+The database file is created if absent, but its parent directory must already
+exist. `eqsqlite serve --help` lists authorization, port, and message-size
+options.
+
 The backend uses WAL mode with `synchronous=FULL`. Reads use query-only
 connections. Every claim, task/doc modification, doc claim, and GC mutation is
 serialized through a single-connection `database/sql` write pool and committed

@@ -1,14 +1,15 @@
 // Package gcmetrics defines the OpenTelemetry instruments that every backend's
 // garbage collector reports through. GC is a per-backend responsibility, but its
 // telemetry should not be: keeping the metric names, units, and attributes in one
-// place means a single Grafana dashboard covers eqpg, eqmem, and eqredis without
-// per-backend drift.
+// place means a single Grafana dashboard covers eqpg, eqmem, eqredis, and
+// eqsqlite without per-backend drift.
 //
-// Each backend supplies its own Meter (entroq.pg, entroq.mem, entroq.redis), so
-// the OTel instrumentation scope distinguishes which backend collected while the
-// metric names stay identical. Attributes are the bounded queue hierarchy
-// (l1/l2/l3 from queues.PathLabels) rather than the raw queue name, so metric
-// cardinality is bounded by hierarchy depth, not by the number of queues.
+// Each backend supplies its own Meter (entroq.pg, entroq.mem, entroq.redis,
+// entroq.sqlite), so the OTel instrumentation scope distinguishes which backend
+// collected while the metric names stay identical. Attributes are the bounded
+// queue hierarchy (l1/l2/l3 from queues.PathLabels) rather than the raw queue
+// name, so metric cardinality is bounded by hierarchy depth, not by the number
+// of queues.
 package gcmetrics
 
 import (

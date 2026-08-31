@@ -7,6 +7,20 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Experimental SQLite service CLI.** `eqsqlite serve` exposes an embedded
+  SQLite database over the same gRPC, HTTP/JSON, authorization, health, and
+  Prometheus endpoints as the other backend services.
+
+### Changed
+
+- **Backend service bootstrap is shared.** `eqmem`, `eqpg`, `eqredis`, and
+  `eqsqlite` use one internal transport shell for authorization, telemetry,
+  gRPC/HTTP listeners, health registration, and coordinated shutdown.
+
 ## [1.8.1] - 2026-08-28
 
 Go module `v1.8.1`. No PostgreSQL schema or client version changes.
