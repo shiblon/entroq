@@ -83,11 +83,8 @@ def eqmem_url():
 
 async def _run(url: str) -> list:
     mod = _load_example()
-    eq = EntroQJSON(url)
-    try:
+    async with EntroQJSON(url) as eq:
         return await mod.run_demo(eq, queue="/example/test-queue")
-    finally:
-        await eq._http.aclose()
 
 
 def test_example_worker_drains_queue(eqmem_url):

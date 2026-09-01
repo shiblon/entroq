@@ -117,6 +117,10 @@ class EntroQJSON(EntroQBase):
         self.claimant_id = claimant_id or secrets.token_hex(8)
         self._http = httpx.AsyncClient()
 
+    async def aclose(self) -> None:
+        """Close the underlying HTTP connection pool."""
+        await self._http.aclose()
+
     async def _request(self, method: str, path: str, *, json=None, params=None) -> dict:
         resp = await self._http.request(method, f"{self._base_url}{path}", json=json, params=params)
         if not resp.is_success:

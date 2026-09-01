@@ -275,18 +275,16 @@ class EntroQWorker:
 
     Example::
 
-        eq = EntroQJSON('http://localhost:8080')
-
         @EntroQWorker.handler
         async def process(task, docs):
             return Modification(Modification.deleting(task))
 
-        @process.selector
-        async def process(task):
-            return [DocClaim('config', task.queue + '/settings')]
+        async def main():
+            async with EntroQJSON('http://localhost:8080') as eq:
+                worker = EntroQWorker(eq, 'my-queue')
+                await worker.run(process)
 
-        worker = EntroQWorker(eq, 'my-queue')
-        asyncio.run(worker.run(process))
+        asyncio.run(main())
     """
 
     def __init__(

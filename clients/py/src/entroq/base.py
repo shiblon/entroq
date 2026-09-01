@@ -1,12 +1,35 @@
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import List, Optional, Sequence, Union
+from types import TracebackType
+from typing import List, Optional, Sequence, TypeVar, Union
 
 from .types import Task, Doc, Modification, ModifyResult
 
 
+_EntroQ = TypeVar('_EntroQ', bound='EntroQBase')
+
+
 class EntroQBase(ABC):
     """Abstract base class for EntroQ clients. All methods are async."""
+
+    async def aclose(self) -> None:
+        """Release resources owned by the client.
+
+        The default implementation is a no-op for clients that do not retain
+        resources between operations.
+        """
+        return None
+
+    async def __aenter__(self: _EntroQ) -> _EntroQ:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        await self.aclose()
 
     @abstractmethod
     async def time(self) -> datetime:

@@ -7,6 +7,14 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Python client 0.12.3 lifecycle.** Async EntroQ clients support `aclose()`
+  and `async with`; the JSON client now exposes cleanup for its HTTP connection
+  pool.
+
 ## [1.8.2] - 2026-08-31
 
 Go module `v1.8.2`. No PostgreSQL schema or client version changes.

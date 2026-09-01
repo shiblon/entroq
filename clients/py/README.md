@@ -36,14 +36,16 @@ import asyncio
 from entroq import EntroQWorker, Modification
 from entroq.json import EntroQJSON
 
-eq = EntroQJSON("http://localhost:8080")
-
 @EntroQWorker.handler
 async def process(task, docs):
     # ... do the work ...
     return Modification(Modification.deleting(task))   # ack by deleting
 
-asyncio.run(EntroQWorker(eq, "my-queue").run(process))
+async def main():
+    async with EntroQJSON("http://localhost:8080") as eq:
+        await EntroQWorker(eq, "my-queue").run(process)
+
+asyncio.run(main())
 ```
 
 Talking straight to PostgreSQL instead of a server (experimental, see above):

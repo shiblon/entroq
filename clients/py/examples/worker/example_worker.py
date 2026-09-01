@@ -73,8 +73,13 @@ async def run_demo(eq: EntroQBase, *, queue: str = QUEUE) -> list:
     return processed
 
 
+async def _main() -> None:
+    async with EntroQJSON(DEFAULT_URL) as eq:
+        await run_demo(eq)
+
+
 def main() -> None:
-    asyncio.run(run_demo(EntroQJSON(DEFAULT_URL)))
+    asyncio.run(_main())
 
 
 if __name__ == "__main__":
