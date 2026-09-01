@@ -4,8 +4,8 @@ Deploys the EntroQ queue-based service mesh:
 
 - **eqk8s operator** — watches `EntroQQueue` and `EntroQIdentity` CRDs,
   maintains the OPA mesh authorization policy
-- **EntroQ server** — gRPC task queue server with an OPA sidecar for
-  k8s service-account JWT authorization
+- **EntroQ server** — verifies Kubernetes service-account JWTs, then asks its
+  OPA sidecar to authorize queue and namespace operations
 
 ## Prerequisites
 
@@ -187,8 +187,11 @@ Key values — override with `--set key=value` or `-f my-values.yaml`:
 | `operator.resyncInterval` | `5m` | How often to re-push the mesh document regardless of CRD changes |
 | `oidcDiscovery.grantAnonymous` | `false` | Set `true` on Minikube or clusters that restrict JWKS access |
 | `entroq.opa.decisionLogs` | unset | Set `true` to emit structured auth decisions to stdout (verbose) |
-| `entroq.opa.debug` | unset | Set `true` for OPA debug logging (reveals JWKS fetch failures etc.) |
+| `entroq.opa.debug` | unset | Set `true` for OPA authorization debug logging |
 | `entroq.auth.jwksUrl` | cluster default | Override for non-standard cluster OIDC configurations |
+| `entroq.auth.tokenCacheTTL` | `30s` | Maximum verified-token cache lifetime; `0s` disables it |
+| `entroq.auth.tokenCacheEntries` | `4096` | Maximum verified-token cache entries |
+| `entroq.auth.jwksCacheTTL` | `5m` | Signing-key cache lifetime |
 
 See `values.yaml` for the full set of options.
 

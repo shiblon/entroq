@@ -2,13 +2,12 @@
 
 Writes:
   example-key.pem   -- RSA private key (PEM, used by client.py to sign JWTs)
-  opa/data.json     -- OPA bundle data including inline JWKS public key,
-                       IDP config (audience/issuer), and example policy
-                       (users/roles).
+  jwks.json         -- public key read by the EntroQ JWT authenticator
+  opa/data.json     -- OPA authorization policy (users/roles)
 
 Run this once to bootstrap the example, or again to rotate keys.
-In production, replace the inline JWKS in opa/data.json with a jwks_url
-pointing to your IDP's JWKS endpoint, and remove example-key.pem.
+In production, configure --auth_jwks_url for your IDP and remove both local key
+files.
 """
 
 import base64
@@ -22,6 +21,7 @@ AUDIENCE = "entroq-example"
 ISSUER = "entroq-example-issuer"
 
 KEY_FILE = "example-key.pem"
+JWKS_FILE = "jwks.json"
 DATA_FILE = os.path.join("opa", "data.json")
 
 
@@ -57,15 +57,14 @@ def main():
         }]
     }
 
-    # Build OPA bundle data.
+    with open(JWKS_FILE, "w") as f:
+        json.dump(jwks, f, indent=2)
+        f.write("\n")
+    print(f"Wrote {JWKS_FILE}")
+
+    # Build OPA authorization data. Authentication settings stay with EntroQ.
     data = {
         "entroq": {
-            "idp": {
-                # Inline JWKS -- replace with jwks_url for a real IDP.
-                "jwks": json.dumps(jwks),
-                "audience": AUDIENCE,
-                "issuer": ISSUER,
-            },
             "policy": {
                 "users": [
                     {

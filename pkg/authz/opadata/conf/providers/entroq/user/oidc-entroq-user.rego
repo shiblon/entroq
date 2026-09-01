@@ -1,26 +1,14 @@
-# Package entroq.user resolves a username from an OIDC JWT.
+# Package entroq.user resolves a username from the principal authenticated by
+# the EntroQ service.
 #
-# Works with any IDP that serves a standard JWKS endpoint: Google, Auth0,
-# Okta, Azure AD, Keycloak, and others.
-#
-# Configure via OPA bundle data (data.json):
-#   {
-#     "entroq": {
-#       "idp": {
-#         "jwks_url": "https://www.googleapis.com/oauth2/v3/certs",
-#         "audience": "your-client-id",
-#         "issuer":   "https://accounts.google.com"
-#       }
-#     }
-#   }
-#
-# See OPA_AUTHZ.md for IDP-specific values.
+# Signature, issuer, audience, expiry, and not-before checks happen before this
+# policy is called. Customize this small projection when an environment uses a
+# verified claim other than sub as its local username.
 package entroq.user
 
 import rego.v1
 
-import data.entroq.jwt
+name := input.principal.subject
 
-name := jwt.verified_sub(input.authz.credentials, data.entroq.idp) if {
-	input.authz.type == "Bearer"
-}
+# Expose verified custom claims to environment policy without exposing the JWT.
+claims := input.principal.claims

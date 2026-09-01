@@ -43,6 +43,7 @@ import (
 
 	"github.com/golang/protobuf/proto"
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/authn"
 	"github.com/shiblon/entroq/pkg/authz"
 	"github.com/shiblon/entroq/pkg/pbconv"
 	"github.com/shiblon/entroq/pkg/queues"
@@ -71,6 +72,7 @@ type QSvc struct {
 	lastStats   map[string]*entroq.QueueStat
 
 	authzHeader string
+	an          authn.Authenticator
 	az          authz.Authorizer
 }
 
@@ -112,6 +114,15 @@ func WithAuthorizer(az authz.Authorizer) Option {
 	}
 }
 
+// WithAuthenticator sets the authentication implementation. An authenticator
+// and authorizer must be configured together: authentication establishes the
+// principal and authorization decides what that principal may do.
+func WithAuthenticator(an authn.Authenticator) Option {
+	return func(s *QSvc) {
+		s.an = an
+	}
+}
+
 // New creates a new service that exposes gRPC endpoints for task queue access.
 func New(ctx context.Context, opener entroq.BackendOpener, opts ...Option) (*QSvc, error) {
 	impl, err := entroq.New(ctx, opener)
@@ -128,6 +139,10 @@ func New(ctx context.Context, opener entroq.BackendOpener, opts ...Option) (*QSv
 
 	for _, o := range opts {
 		o(svc)
+	}
+	if (svc.an == nil) != (svc.az == nil) {
+		_ = impl.Close()
+		return nil, fmt.Errorf("eqsvcgrpc authentication and authorization must be configured together")
 	}
 
 	if err := svc.initMetrics(); err != nil {
@@ -204,10 +219,21 @@ func (s *QSvc) observeStats(o metric.Observer, gauge metric.Float64ObservableGau
 
 // Close closes the backend connections.
 func (s *QSvc) Close() error {
-	if err := s.impl.Close(); err != nil {
-		return fmt.Errorf("eqsvcgrpc close: %w", err)
+	var closeErrors []error
+	if s.az != nil {
+		if err := s.az.Close(); err != nil {
+			closeErrors = append(closeErrors, fmt.Errorf("close authorizer: %w", err))
+		}
 	}
-	return nil
+	if s.an != nil {
+		if err := s.an.Close(); err != nil {
+			closeErrors = append(closeErrors, fmt.Errorf("close authenticator: %w", err))
+		}
+	}
+	if err := s.impl.Close(); err != nil {
+		closeErrors = append(closeErrors, fmt.Errorf("close backend: %w", err))
+	}
+	return errors.Join(closeErrors...)
 }
 
 // Authorize attempts to authorize an action.
@@ -215,6 +241,25 @@ func (s *QSvc) Authorize(ctx context.Context, req *authz.Request) error {
 	if s.az == nil {
 		return nil
 	}
+	principal, err := s.an.Authenticate(ctx, authn.NewHeaderCredentials(s.authzToken(ctx)))
+	if err != nil {
+		var authErr *authn.Error
+		if !errors.As(err, &authErr) {
+			return status.Error(codes.Internal, "authentication failed")
+		}
+		switch authErr.Kind {
+		case authn.InvalidCredentials:
+			return status.Error(codes.Unauthenticated, authErr.Error())
+		case authn.AuthenticationUnavailable:
+			return status.Error(codes.Unavailable, authErr.Error())
+		default:
+			return status.Error(codes.Internal, "authentication failed")
+		}
+	}
+	if principal == nil {
+		return status.Error(codes.Internal, "authentication returned no principal")
+	}
+	req.Principal = principal
 
 	// Most of this is error formatting to provide structured things that can
 	// be unpacked and round-tripped through the grpc transport.
@@ -296,10 +341,8 @@ func (s *QSvc) authzToken(ctx context.Context) string {
 	return vals[0]
 }
 
-func (s *QSvc) newAuthzRequest(ctx context.Context) *authz.Request {
-	return &authz.Request{
-		Authz: authz.NewHeaderAuthorization(s.authzToken(ctx)),
-	}
+func (s *QSvc) newAuthzRequest(_ context.Context) *authz.Request {
+	return new(authz.Request)
 }
 
 func (s *QSvc) claimAuthz(ctx context.Context, req *pb.ClaimRequest) *authz.Request {

@@ -383,17 +383,17 @@ EntroQ is backend-agnostic. The Go library supports:
 ## Authorization
 
 EntroQ integrates with [Open Policy Agent (OPA)](https://www.openpolicyagent.org/)
-for queue-level access control. Enable it with `--authz=opahttp` on any service
-binary. On every operation the server packages the request (queues + actions +
-`Authorization` header) into a JSON document, POSTs it to OPA, and allows or
-denies based on the response.
+for queue-level access control. Enable JWT authentication and OPA authorization
+with `--authn=jwt --authz=opahttp` on any service binary. EntroQ verifies the
+bearer token and sends OPA only a server-constructed principal plus the requested
+queues, namespaces, and actions. OPA never receives the bearer credential.
 
 Two provider sets ship with the repo:
 
 | Deployment | Provider | Identity source |
 |---|---|---|
-| Standalone / OIDC | `pkg/authz/opadata/conf/providers/entroq/` | JWT from any standard OIDC IDP |
-| Kubernetes mesh | `pkg/authz/opadata/conf/providers/k8s/` | Pod service account tokens + `EntroQQueue`/`EntroQIdentity` CRDs |
+| Standalone / OIDC | `pkg/authz/opadata/conf/providers/entroq/` | Verified OIDC principal |
+| Kubernetes mesh | `pkg/authz/opadata/conf/providers/k8s/` | Verified service-account principal + `EntroQQueue`/`EntroQIdentity` CRDs |
 
 For the Kubernetes mesh path, the eqk8s operator maintains the OPA authorization
 document automatically from CRDs, with no manual data wiring needed when using

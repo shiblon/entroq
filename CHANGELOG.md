@@ -15,6 +15,27 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and `async with`; the JSON client now exposes cleanup for its HTTP connection
   pool.
 
+### Changed
+
+- **Breaking: JWT authentication moves from OPA into the EntroQ service.**
+  Services configured with OPA authorization now also use `--authn=jwt` plus
+  issuer, audience, and JWKS flags. EntroQ verifies the credential and sends OPA
+  an explicit `input.principal`; raw bearer tokens no longer cross the OPA
+  boundary. Custom `entroq.user` policy must read the verified principal or its
+  verified claims. The protobuf and client bearer-token configuration are
+  unchanged. See `pkg/authz/opadata/OPA_AUTHZ.md` for migration details.
+- **Authentication failures have transport-specific status.** Invalid
+  credentials return `Unauthenticated`, while an unavailable JWKS source returns
+  `Unavailable`; OPA authorization denials remain `PermissionDenied`.
+
+### Security
+
+- **Verified JWT caching is bounded and authorization-independent.** Successful
+  verification is cached by complete-token digest until the earlier of a short
+  configured TTL or token expiration, with a bounded LRU. Invalid credentials
+  and authorization decisions are never cached, unknown signing-key refreshes
+  are rate-limited, and OPA policy changes remain immediately effective.
+
 ## [1.8.2] - 2026-08-31
 
 Go module `v1.8.2`. No PostgreSQL schema or client version changes.

@@ -20,6 +20,11 @@ spec:
         imagePullPolicy: Never
         args:
         - serve
+        - --authn=jwt
+        - --auth_jwks_url=https://kubernetes.default.svc/openid/v1/jwks
+        - --auth_issuer=https://kubernetes.default.svc.cluster.local
+        - --auth_audience=https://kubernetes.default.svc.cluster.local
+        - --auth_ca_file=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
         - --authz=opahttp
         - --opa_url=http://localhost:8181
         ports:
@@ -46,12 +51,10 @@ spec:
         # Reveals JWKS fetch failures and other low-level issues immediately.
         #- --log-level=debug
         - /rego/core-entroq-authz.rego
-        - /rego/core-entroq-jwt.rego
         - /rego/core-entroq-namespaces.rego
         - /rego/core-entroq-queues.rego
         - /rego/k8s-entroq-permissions.rego
         - /rego/k8s-entroq-user.rego
-        - /data/data.json
         ports:
         - containerPort: 8181
           name: http
@@ -65,14 +68,8 @@ spec:
         - name: opa-rego
           mountPath: /rego
           readOnly: true
-        - name: opa-data
-          mountPath: /data
-          readOnly: true
 
       volumes:
       - name: opa-rego
         configMap:
           name: opa-rego
-      - name: opa-data
-        configMap:
-          name: opa-data

@@ -16,6 +16,7 @@ import (
 
 	"github.com/shiblon/entroq"
 	pb "github.com/shiblon/entroq/api"
+	"github.com/shiblon/entroq/pkg/authn/jwtauthn"
 	"github.com/shiblon/entroq/pkg/authz/opahttp"
 	"github.com/shiblon/entroq/pkg/eqsvcgrpc"
 	"github.com/shiblon/entroq/pkg/eqsvcjson"
@@ -35,6 +36,18 @@ type Config struct {
 	HTTPPort int
 	MaxSize  int
 
+	AuthnStrategy           string
+	AuthJWKSURL             string
+	AuthJWKSFile            string
+	AuthIssuer              string
+	AuthAudience            []string
+	AuthCAFile              string
+	AuthTokenCacheTTL       time.Duration
+	AuthTokenCacheEntries   int
+	AuthJWKSCacheTTL        time.Duration
+	AuthJWKSRefreshInterval time.Duration
+	AuthHTTPTimeout         time.Duration
+
 	AuthzStrategy string
 	OPAURL        string
 	OPAPath       string
@@ -47,6 +60,17 @@ func (c *Config) BindFlags(f *pflag.FlagSet) {
 	f.IntVar(&c.Port, "port", 37706, "gRPC service port.")
 	f.IntVar(&c.HTTPPort, "http_port", 9100, "HTTP port for /metrics and JSON/Connect API.")
 	f.IntVar(&c.MaxSize, "max_size_mb", 10, "Maximum gRPC message size in MB (send and receive).")
+	f.StringVar(&c.AuthnStrategy, "authn", "none", "Authentication strategy: none, jwt.")
+	f.StringVar(&c.AuthJWKSURL, "auth_jwks_url", "", "JWKS URL used to verify JWT signatures.")
+	f.StringVar(&c.AuthJWKSFile, "auth_jwks_file", "", "Local JWKS file used to verify JWT signatures.")
+	f.StringVar(&c.AuthIssuer, "auth_issuer", "", "Required JWT issuer.")
+	f.StringSliceVar(&c.AuthAudience, "auth_audience", nil, "Required JWT audience; repeat for multiple accepted audiences.")
+	f.StringVar(&c.AuthCAFile, "auth_ca_file", "", "Additional CA certificate file for the JWKS HTTPS endpoint.")
+	f.DurationVar(&c.AuthTokenCacheTTL, "auth_token_cache_ttl", 30*time.Second, "Maximum lifetime of a cached verified JWT; zero disables token caching.")
+	f.IntVar(&c.AuthTokenCacheEntries, "auth_token_cache_entries", 4096, "Maximum number of cached verified JWTs.")
+	f.DurationVar(&c.AuthJWKSCacheTTL, "auth_jwks_cache_ttl", 5*time.Minute, "Lifetime of cached JWKS key material.")
+	f.DurationVar(&c.AuthJWKSRefreshInterval, "auth_jwks_refresh_interval", 5*time.Second, "Minimum interval between JWKS refreshes for unknown key IDs.")
+	f.DurationVar(&c.AuthHTTPTimeout, "auth_http_timeout", 10*time.Second, "Timeout for JWKS HTTP requests.")
 	f.StringVar(&c.AuthzStrategy, "authz", "none", "Authorization strategy: none, opahttp.")
 	f.StringVar(&c.OPAURL, "opa_url", "", fmt.Sprintf("OPA base URL. Default: %s.", opahttp.DefaultHostURL))
 	f.StringVar(&c.OPAPath, "opa_path", "", fmt.Sprintf("OPA API path. Default: %s.", opahttp.DefaultAPIPath))
@@ -62,7 +86,7 @@ func Run(ctx context.Context, cfg Config, open OpenFunc, backendDescription stri
 	ctx, stopSignals := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
-	authzOpt, err := authorizationOption(cfg)
+	securityOpts, err := securityOptions(cfg)
 	if err != nil {
 		return err
 	}
@@ -73,10 +97,7 @@ func Run(ctx context.Context, cfg Config, open OpenFunc, backendDescription stri
 	}
 	defer stopMetrics()
 
-	svcOpts := []eqsvcgrpc.Option{
-		authzOpt,
-		eqsvcgrpc.WithMeterProvider(mp),
-	}
+	svcOpts := append(securityOpts, eqsvcgrpc.WithMeterProvider(mp))
 	if cfg.MetricInterval > 0 {
 		svcOpts = append(svcOpts, eqsvcgrpc.WithMetricInterval(cfg.MetricInterval))
 	}
@@ -146,16 +167,52 @@ func Run(ctx context.Context, cfg Config, open OpenFunc, backendDescription stri
 	}
 }
 
-func authorizationOption(cfg Config) (eqsvcgrpc.Option, error) {
+func securityOptions(cfg Config) ([]eqsvcgrpc.Option, error) {
+	switch cfg.AuthnStrategy {
+	case "", "none", "jwt":
+	default:
+		return nil, fmt.Errorf("unknown authn strategy: %q", cfg.AuthnStrategy)
+	}
 	switch cfg.AuthzStrategy {
-	case "opahttp":
-		return eqsvcgrpc.WithAuthorizer(opahttp.New(
-			opahttp.WithHostURL(cfg.OPAURL),
-			opahttp.WithAPIPath(cfg.OPAPath),
-		)), nil
-	case "", "none":
-		return eqsvcgrpc.WithAuthorizer(nil), nil
+	case "", "none", "opahttp":
 	default:
 		return nil, fmt.Errorf("unknown authz strategy: %q", cfg.AuthzStrategy)
 	}
+	authnEnabled := cfg.AuthnStrategy != "" && cfg.AuthnStrategy != "none"
+	authzEnabled := cfg.AuthzStrategy != "" && cfg.AuthzStrategy != "none"
+	if authnEnabled != authzEnabled {
+		return nil, fmt.Errorf("authentication and authorization must be enabled together")
+	}
+
+	var opts []eqsvcgrpc.Option
+	switch cfg.AuthnStrategy {
+	case "jwt":
+		authenticator, err := jwtauthn.New(jwtauthn.Config{
+			JWKSURL:             cfg.AuthJWKSURL,
+			JWKSFile:            cfg.AuthJWKSFile,
+			Issuer:              cfg.AuthIssuer,
+			Audience:            cfg.AuthAudience,
+			CAFile:              cfg.AuthCAFile,
+			TokenCacheTTL:       cfg.AuthTokenCacheTTL,
+			TokenCacheEntries:   cfg.AuthTokenCacheEntries,
+			JWKSCacheTTL:        cfg.AuthJWKSCacheTTL,
+			JWKSRefreshInterval: cfg.AuthJWKSRefreshInterval,
+			HTTPTimeout:         cfg.AuthHTTPTimeout,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("configure JWT authentication: %w", err)
+		}
+		opts = append(opts, eqsvcgrpc.WithAuthenticator(authenticator))
+	case "", "none":
+	}
+
+	switch cfg.AuthzStrategy {
+	case "opahttp":
+		opts = append(opts, eqsvcgrpc.WithAuthorizer(opahttp.New(
+			opahttp.WithHostURL(cfg.OPAURL),
+			opahttp.WithAPIPath(cfg.OPAPath),
+		)))
+	case "", "none":
+	}
+	return opts, nil
 }

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/shiblon/entroq/pkg/authn"
 	"github.com/shiblon/entroq/pkg/authz"
 )
 
@@ -133,6 +134,7 @@ func TestAuthorizeSendsInputEnvelope(t *testing.T) {
 	})
 
 	req := &authz.Request{
+		Principal:  &authn.VerifiedPrincipal{Subject: "service-a"},
 		ClaimantId: "worker-7",
 		Queues:     []*authz.Queue{{Exact: "payments/inbox", Actions: []authz.Action{authz.Claim}}},
 	}
@@ -149,6 +151,9 @@ func TestAuthorizeSendsInputEnvelope(t *testing.T) {
 	}
 	if in.ClaimantId != "worker-7" {
 		t.Errorf("input.claimant_id = %q, want %q", in.ClaimantId, "worker-7")
+	}
+	if in.Principal == nil || in.Principal.Subject != "service-a" {
+		t.Errorf("input.principal = %#v, want service-a", in.Principal)
 	}
 	if len(in.Queues) != 1 || in.Queues[0].Exact != "payments/inbox" {
 		t.Errorf("input.queues = %v, want one entry for payments/inbox", in.Queues)

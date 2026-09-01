@@ -7,8 +7,8 @@ so the EntroQ server can enforce fine-grained access control without restarts or
 manual data API calls.
 
 See `pkg/authz/opadata/OPA_AUTHZ.md` in the main repository for a detailed
-explanation of the OPA policy design, OIDC provider configuration, and how the
-authorization layer integrates with the EntroQ gRPC and HTTP servers.
+explanation of the verified-principal contract and how OPA authorization
+integrates with the EntroQ gRPC and HTTP servers.
 
 ---
 
@@ -32,8 +32,9 @@ EntroQIdentity CRDs        EntroQQueue CRDs
                     OPA sidecar reads on boot
                              │
                       EntroQ server
-              checks data.entroq.authz.allow
-              for every gRPC / HTTP call
+               verifies JWT, then checks
+               data.entroq.authz.allow
+               for every gRPC / HTTP call
 ```
 
 Every time an `EntroQQueue` or `EntroQIdentity` resource is created, updated, or
@@ -273,6 +274,11 @@ Point the EntroQ server at it:
 
 ```bash
 eqpg serve \
+  --authn jwt \
+  --auth_jwks_url https://kubernetes.default.svc/openid/v1/jwks \
+  --auth_issuer https://kubernetes.default.svc.cluster.local \
+  --auth_audience https://kubernetes.default.svc.cluster.local \
+  --auth_ca_file /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
   --authz opahttp \
   --opa_url http://localhost:8181 \
   --opa_path /v1/data/entroq/authz \

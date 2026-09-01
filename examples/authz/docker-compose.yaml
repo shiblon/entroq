@@ -5,8 +5,6 @@ services:
       - POSTGRES_DB=entroq
       - POSTGRES_USER=entroq
       - POSTGRES_PASSWORD=entroq
-    ports:
-      - "5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U entroq -d entroq"]
       interval: 5s
@@ -34,8 +32,14 @@ services:
       - "--dbuser=entroq"
       - "--heartbeat=5s"
       - "--init_schema"
+      - "--authn=jwt"
+      - "--auth_jwks_file=/etc/entroq/jwks.json"
+      - "--auth_issuer=entroq-example-issuer"
+      - "--auth_audience=entroq-example"
       - "--authz=opahttp"
       - "--opa_url=http://opa:8181"
+    volumes:
+      - ./jwks.json:/etc/entroq/jwks.json:ro
 
   opa:
     image: openpolicyagent/opa:latest
@@ -46,7 +50,7 @@ services:
       - "--watch"
       - "--log-level=info"
       - "/etc/opa/core"
-      - "/etc/opa/permissions"
+      - "/etc/opa/providers"
       - "/etc/opa/local"
 
     ports:
@@ -55,6 +59,6 @@ services:
       # Core EntroQ Rego -- do not modify.
       - ../../pkg/authz/opadata/conf/core:/etc/opa/core:ro
       # Built-in standalone/OIDC permissions provider -- do not modify.
-      - ../../pkg/authz/opadata/conf/providers/entroq/permissions:/etc/opa/permissions:ro
-      # Example config: inline-JWKS user provider plus users/roles policy.
+      - ../../pkg/authz/opadata/conf/providers/entroq:/etc/opa/providers:ro
+      # Example users/roles authorization policy.
       - ./opa:/etc/opa/local:ro

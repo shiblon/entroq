@@ -28,6 +28,16 @@ spec:
         imagePullPolicy: {{ .Values.entroq.images.pullPolicy }}
         args:
         - serve
+        - --authn=jwt
+        - --auth_jwks_url={{ .Values.entroq.auth.jwksUrl }}
+        - --auth_issuer={{ .Values.entroq.auth.issuer }}
+        - --auth_audience={{ .Values.entroq.auth.audience }}
+        - --auth_ca_file={{ .Values.entroq.auth.caFile }}
+        - --auth_token_cache_ttl={{ .Values.entroq.auth.tokenCacheTTL }}
+        - --auth_token_cache_entries={{ .Values.entroq.auth.tokenCacheEntries }}
+        - --auth_jwks_cache_ttl={{ .Values.entroq.auth.jwksCacheTTL }}
+        - --auth_jwks_refresh_interval={{ .Values.entroq.auth.jwksRefreshInterval }}
+        - --auth_http_timeout={{ .Values.entroq.auth.httpTimeout }}
         - --authz=opahttp
         - --opa_url=http://localhost:{{ .Values.entroq.service.opaPort }}
         {{- if $isJournal }}
@@ -89,12 +99,10 @@ spec:
         {{- $extra | nindent 8 }}
         {{- end }}
         - /rego/core-entroq-authz.rego
-        - /rego/core-entroq-jwt.rego
         - /rego/core-entroq-namespaces.rego
         - /rego/core-entroq-queues.rego
         - /rego/k8s-entroq-permissions.rego
         - /rego/k8s-entroq-user.rego
-        - /data/data.json
         ports:
         - containerPort: {{ .Values.entroq.service.opaPort }}
           name: http
@@ -110,18 +118,11 @@ spec:
         - name: opa-rego
           mountPath: /rego
           readOnly: true
-        - name: opa-data
-          mountPath: /data
-          readOnly: true
 
       volumes:
       - name: opa-rego
         configMap:
           name: opa-rego
-      - name: opa-data
-        configMap:
-          name: opa-data
-
   {{- if $isJournal }}
   volumeClaimTemplates:
   - metadata:

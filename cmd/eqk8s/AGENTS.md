@@ -74,7 +74,7 @@ go run ./cmd/eqk8s/cmd/main.go --opa-url http://localhost:8181
 ## Minikube Note
 
 The k8s OIDC JWKS endpoint is not anonymously accessible in Minikube by default.
-OPA needs it to verify SA JWTs. Fix once per cluster:
+The EntroQ service authenticator needs it to verify SA JWTs. Fix once per cluster:
 
 ```bash
 kubectl create clusterrolebinding oidc-discovery-anonymous \

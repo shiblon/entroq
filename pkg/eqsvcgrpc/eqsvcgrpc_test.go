@@ -1,13 +1,18 @@
 package eqsvcgrpc
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"testing"
 
 	pb "github.com/shiblon/entroq/api"
+	"github.com/shiblon/entroq/pkg/authn"
 	"github.com/shiblon/entroq/pkg/authz"
 	"github.com/shiblon/entroq/pkg/backend/eqmem"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -216,14 +221,38 @@ func TestModifyRejectsDocNamespaceChange(t *testing.T) {
 type stubAuthorizer struct {
 	err    error
 	called bool
+	req    *authz.Request
 }
 
-func (s *stubAuthorizer) Authorize(context.Context, *authz.Request) error {
+func (s *stubAuthorizer) Authorize(_ context.Context, req *authz.Request) error {
 	s.called = true
+	s.req = req
 	return s.err
 }
 
 func (s *stubAuthorizer) Close() error { return nil }
+
+type stubAuthenticator struct {
+	principal *authn.VerifiedPrincipal
+	err       error
+	called    bool
+	creds     *authn.Credentials
+}
+
+func (s *stubAuthenticator) Authenticate(_ context.Context, creds *authn.Credentials) (*authn.VerifiedPrincipal, error) {
+	s.called = true
+	if creds != nil {
+		copy := *creds
+		s.creds = &copy
+	}
+	return s.principal, s.err
+}
+
+func (s *stubAuthenticator) Close() error { return nil }
+
+func allowingAuthenticator() *stubAuthenticator {
+	return &stubAuthenticator{principal: &authn.VerifiedPrincipal{Subject: "service-a"}}
+}
 
 // TestModifyEnforcesAuthorizerDenial closes the loop that the modifyAuthz unit
 // tests leave open: those prove the right authorization request is BUILT, but
@@ -236,7 +265,8 @@ func TestModifyEnforcesAuthorizerDenial(t *testing.T) {
 		Failed: []*authz.Queue{{Exact: "q", Actions: []authz.Action{authz.Insert}}},
 	}
 	az := &stubAuthorizer{err: denied}
-	svc, err := New(ctx, eqmem.Opener(), WithAuthorizer(az))
+	an := allowingAuthenticator()
+	svc, err := New(ctx, eqmem.Opener(), WithAuthenticator(an), WithAuthorizer(az))
 	if err != nil {
 		t.Fatalf("new service: %v", err)
 	}
@@ -249,6 +279,9 @@ func TestModifyEnforcesAuthorizerDenial(t *testing.T) {
 	if !az.called {
 		t.Error("authorizer was never consulted; denial did not come from authz")
 	}
+	if !an.called || az.req.Principal == nil || az.req.Principal.Subject != "service-a" {
+		t.Fatalf("verified principal was not passed to authorizer: authn=%v request=%#v", an.called, az.req)
+	}
 }
 
 // TestModifyAllowsWhenAuthorized is the positive counterpart: with an
@@ -258,7 +291,7 @@ func TestModifyEnforcesAuthorizerDenial(t *testing.T) {
 func TestModifyAllowsWhenAuthorized(t *testing.T) {
 	ctx := context.Background()
 	az := &stubAuthorizer{err: nil}
-	svc, err := New(ctx, eqmem.Opener(), WithAuthorizer(az))
+	svc, err := New(ctx, eqmem.Opener(), WithAuthenticator(allowingAuthenticator()), WithAuthorizer(az))
 	if err != nil {
 		t.Fatalf("new service: %v", err)
 	}
@@ -274,5 +307,63 @@ func TestModifyAllowsWhenAuthorized(t *testing.T) {
 	}
 	if len(resp.Inserted) != 1 {
 		t.Errorf("inserted tasks = %d, want 1", len(resp.Inserted))
+	}
+}
+
+func TestAuthenticationFailureStopsBeforeAuthorization(t *testing.T) {
+	ctx := context.Background()
+	an := &stubAuthenticator{err: authn.InvalidError("bad token", errors.New("signature"))}
+	az := new(stubAuthorizer)
+	svc, err := New(ctx, eqmem.Opener(), WithAuthenticator(an), WithAuthorizer(az))
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	defer svc.Close()
+
+	_, err = svc.Modify(ctx, &pb.ModifyRequest{Inserts: []*pb.TaskData{{Queue: "q"}}})
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("authentication error = %v (code %v), want Unauthenticated", err, status.Code(err))
+	}
+	if az.called {
+		t.Fatal("authorizer was called after authentication failed")
+	}
+}
+
+func TestNewRequiresAuthenticationAndAuthorizationTogether(t *testing.T) {
+	ctx := context.Background()
+	for _, option := range []Option{
+		WithAuthenticator(allowingAuthenticator()),
+		WithAuthorizer(new(stubAuthorizer)),
+	} {
+		svc, err := New(ctx, eqmem.Opener(), option)
+		if err == nil {
+			svc.Close()
+			t.Fatal("New accepted an incomplete authentication/authorization boundary")
+		}
+	}
+}
+
+func TestBearerTokenStopsAtAuthenticator(t *testing.T) {
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer secret-token"))
+	an := allowingAuthenticator()
+	az := new(stubAuthorizer)
+	svc, err := New(ctx, eqmem.Opener(), WithAuthenticator(an), WithAuthorizer(az))
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	defer svc.Close()
+
+	if _, err := svc.Modify(ctx, &pb.ModifyRequest{Inserts: []*pb.TaskData{{Queue: "q"}}}); err != nil {
+		t.Fatalf("Modify: %v", err)
+	}
+	if an.creds == nil || an.creds.Scheme != "Bearer" || an.creds.Token != "secret-token" {
+		t.Fatalf("authenticator credentials = %#v", an.creds)
+	}
+	encoded, err := json.Marshal(az.req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(encoded, []byte("secret-token")) || bytes.Contains(encoded, []byte("authz")) {
+		t.Fatalf("authorization request leaked credentials: %s", encoded)
 	}
 }

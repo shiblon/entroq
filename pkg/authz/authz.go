@@ -7,12 +7,13 @@ import (
 	"fmt"
 	"strings"
 
-	yaml "gopkg.in/yaml.v2"
+	"github.com/shiblon/entroq/pkg/authn"
+	"sigs.k8s.io/yaml"
 )
 
 // Authorizer is an abstraction over Rego policy. Provide one of these to
 // manage policy files and changes. The query is expected to return a nil error
-// when authorized, and a non-nil error when not authorized (or smoething else
+// when authorized, and a non-nil error when not authorized (or something else
 // goes wrong). If the non-nil error is an AuthzError, it can be unpacked for
 // information about which queues and actions were disallowed.
 type Authorizer interface {
@@ -21,7 +22,7 @@ type Authorizer interface {
 	// a nil error indicates that the request is permitted. A non-nil error can
 	// be returned for system errors, or for permission denied reasons. The
 	// latter will be of type AuthzError and can be detected in standard
-	// errors.Is/As ways..
+	// errors.Is/As ways.
 	Authorize(context.Context, *Request) error
 
 	// Close cleans up any resources, or policy watchdogs, that the authorizer
@@ -44,11 +45,13 @@ const (
 
 // Request contains an authorization request to send to OPA.
 type Request struct {
-	// Authz contains information that came in with the request (headers).
-	Authz *Authorization `json:"authz"`
+	// Principal contains identity facts established by the EntroQ service's
+	// Authenticator. It is constructed inside the trusted service boundary and
+	// must never be populated from request payload fields.
+	Principal *authn.VerifiedPrincipal `json:"principal"`
 	// ClaimantId is the claimant ID supplied by the caller on the wire. OPA
-	// policy can enforce that this matches the token subject (e.g.
-	// input.authz.credentials JWT sub claim) to prevent impersonation.
+	// policy can enforce that this matches Principal.Subject to prevent
+	// impersonation.
 	ClaimantId string `json:"claimant_id,omitempty"`
 	// Queues contains information about what is desired: what queues to
 	// operate on, and what should be done to them.
@@ -65,35 +68,6 @@ func NewYAMLRequest(y string) (*Request, error) {
 		return nil, fmt.Errorf("new request: %w", err)
 	}
 	return req, nil
-}
-
-// Authorization represents per-request auth information extracted from the
-// incoming request headers. The Type and Credentials fields correspond to the
-// two parts of a standard HTTP Authorization header, e.g.:
-//
-//	Authorization: Bearer <jwt>
-//	-> Type="Bearer", Credentials="<jwt>"
-type Authorization struct {
-	// Type is the scheme portion of the Authorization header (e.g. "Bearer").
-	Type string `json:"type,omitempty"`
-	// Credentials is the token or credentials portion of the Authorization header.
-	Credentials string `json:"credentials,omitempty"`
-}
-
-// NewHeaderAuthorization creates an authorization structure from a header value.
-func NewHeaderAuthorization(val string) *Authorization {
-	az := new(Authorization)
-	if typ, creds, found := strings.Cut(val, " "); found {
-		az.Type, az.Credentials = typ, creds
-	} else {
-		az.Credentials = val
-	}
-	return az
-}
-
-// String returns the authoriation header value.
-func (a *Authorization) String() string {
-	return strings.TrimSpace(strings.Join([]string{a.Type, a.Credentials}, " "))
 }
 
 // Queue contains information about a single queue (it is expected that

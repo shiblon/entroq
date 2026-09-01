@@ -6,7 +6,6 @@ CRD_SRC   := cmd/eqk8s/config/crd/bases
 
 REGO_SOURCES := \
 	$(REGO_SRC)/core/entroq/authz/core-entroq-authz.rego \
-	$(REGO_SRC)/core/entroq/jwt/core-entroq-jwt.rego \
 	$(REGO_SRC)/core/entroq/namespaces/core-entroq-namespaces.rego \
 	$(REGO_SRC)/core/entroq/queues/core-entroq-queues.rego \
 	$(REGO_SRC)/providers/k8s/permissions/k8s-entroq-permissions.rego \
@@ -24,8 +23,9 @@ HELM_SYNC_STAMP := $(CHART_DIR)/files/.sync-stamp
 
 # Each source is copied with a leading "generated, do not edit" banner. Rego and
 # the CRD YAML both use '#', so a leading comment is inert in each.
-$(HELM_SYNC_STAMP): $(REGO_SOURCES) $(CRD_SOURCES)
+$(HELM_SYNC_STAMP): Makefile $(REGO_SOURCES) $(CRD_SOURCES)
 	@mkdir -p $(CHART_DIR)/files/rego $(CHART_DIR)/crds
+	@rm -f $(CHART_DIR)/files/rego/*.rego $(CHART_DIR)/crds/*.yaml
 	@for f in $(REGO_SOURCES); do d=$(CHART_DIR)/files/rego/$$(basename $$f); { echo "# GENERATED FILE. DO NOT EDIT. Source: $$f"; echo "# Regenerate: make helm-sync"; echo; cat $$f; } > $$d; done
 	@for f in $(CRD_SOURCES);  do d=$(CHART_DIR)/crds/$$(basename $$f);       { echo "# GENERATED FILE. DO NOT EDIT. Source: $$f"; echo "# Regenerate: make helm-sync"; echo; cat $$f; } > $$d; done
 	@touch $@

@@ -48,9 +48,14 @@ def session_for(token: str | None) -> requests.Session:
     return s
 
 
-def do_insert(session: requests.Session, queue: str, value: object = "test") -> requests.Response:
+def do_insert(
+    session: requests.Session,
+    queue: str,
+    subject: str,
+    value: object = "test",
+) -> requests.Response:
     return session.post(f"{ENTROQ_URL}/api/v0/modify", json={
-        "claimantId": "test-client",
+        "claimantId": f"{subject}#test-client",
         "inserts": [{"queue": queue, "value": json.dumps(value)}],
     })
 
@@ -98,21 +103,22 @@ def main() -> None:
     }, KEY_FILE.read_text(), algorithm="RS256"))
 
     print("\nPersonal namespace (auto-granted to everyone):")
-    check("alice: insert /users/alice/inbox",    do_insert(alice, "/users/alice/inbox"), True)
-    check("bob:   insert /users/bob/inbox",      do_insert(bob,   "/users/bob/inbox"),   True)
-    check("alice: insert /users/bob/inbox",      do_insert(alice, "/users/bob/inbox"),   False)
-    check("bob:   insert /users/alice/inbox",    do_insert(bob,   "/users/alice/inbox"), False)
+    check("alice: insert /users/alice/inbox",    do_insert(alice, "/users/alice/inbox", "alice"), True)
+    check("bob:   insert /users/bob/inbox",      do_insert(bob,   "/users/bob/inbox", "bob"),     True)
+    check("alice: insert /users/bob/inbox",      do_insert(alice, "/users/bob/inbox", "alice"),   False)
+    check("bob:   insert /users/alice/inbox",    do_insert(bob,   "/users/alice/inbox", "bob"),   False)
+    check("alice: spoof bob claimant",           do_insert(alice, "/users/alice/inbox", "bob"),   False)
 
     print("\nShared queues:")
-    check("alice: insert /shared/work (writers role)", do_insert(alice, "/shared/work"),  True)
+    check("alice: insert /shared/work (writers role)", do_insert(alice, "/shared/work", "alice"), True)
     check("alice: read   /shared/inbox",               do_read(alice,   "/shared/inbox"), True)
     check("bob:   read   /shared/inbox",               do_read(bob,     "/shared/inbox"), True)
-    check("bob:   insert /shared/work (no writers)",   do_insert(bob,   "/shared/work"),  False)
+    check("bob:   insert /shared/work (no writers)",   do_insert(bob,   "/shared/work", "bob"),   False)
 
     print("\nToken validity:")
-    check("no token:     insert /users/alice/inbox", do_insert(no_token,  "/users/alice/inbox"), False)
-    check("expired:      insert /users/alice/inbox", do_insert(expired,   "/users/alice/inbox"), False)
-    check("wrong issuer: insert /users/alice/inbox", do_insert(wrong_iss, "/users/alice/inbox"), False)
+    check("no token:     insert /users/alice/inbox", do_insert(no_token,  "/users/alice/inbox", "alice"), False)
+    check("expired:      insert /users/alice/inbox", do_insert(expired,   "/users/alice/inbox", "alice"), False)
+    check("wrong issuer: insert /users/alice/inbox", do_insert(wrong_iss, "/users/alice/inbox", "alice"), False)
 
     print()
     if failures:

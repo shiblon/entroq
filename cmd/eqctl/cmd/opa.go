@@ -13,15 +13,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// seedData is the template data.json written to local/ on opa init.
-// The admin fills in their IDP values and policy.
+// seedData is the template authorization data written by opa init. Identity
+// provider settings belong to the EntroQ service authenticator, not OPA.
 var seedData = map[string]any{
 	"entroq": map[string]any{
-		"idp": map[string]any{
-			"jwks_url": "https://your-idp/.well-known/jwks.json",
-			"audience": "your-audience",
-			"issuer":   "https://your-idp/",
-		},
 		"policy": map[string]any{
 			"users": []any{
 				map[string]any{
@@ -60,9 +55,9 @@ var opaInitCmd = &cobra.Command{
 The directory will contain:
 
   <dir>/core/       - core EntroQ Rego logic (do not modify)
-  <dir>/providers/  - built-in OIDC user and permissions provider (do not modify)
+  <dir>/providers/  - built-in principal and permissions provider (do not modify)
   <dir>/local/
-    data.json       - edit this: IDP settings, users, and roles
+    data.json       - edit this: users, roles, and grants
 
 Mount these into the OPA container:
   core/      -> /etc/opa/core
@@ -77,7 +72,8 @@ See pkg/authz/opadata/OPA_AUTHZ.md for full configuration reference.`,
 			log.Fatalf("opa init: %v", err)
 		}
 		fmt.Printf("OPA config initialized in %s\n", dir)
-		fmt.Printf("Edit %s/local/data.json to configure your IDP and policy.\n", dir)
+		fmt.Printf("Edit %s/local/data.json to configure authorization policy.\n", dir)
+		fmt.Println("Configure JWT issuer, audience, and JWKS on the EntroQ service.")
 	},
 }
 

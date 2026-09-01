@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/shiblon/entroq"
 	"github.com/spf13/pflag"
@@ -24,6 +25,12 @@ func TestBindFlagsDefaults(t *testing.T) {
 	if cfg.AuthzStrategy != "none" {
 		t.Fatalf("authz default = %q, want none", cfg.AuthzStrategy)
 	}
+	if cfg.AuthnStrategy != "none" {
+		t.Fatalf("authn default = %q, want none", cfg.AuthnStrategy)
+	}
+	if cfg.AuthTokenCacheTTL != 30*time.Second || cfg.AuthTokenCacheEntries != 4096 {
+		t.Fatalf("unexpected authentication cache defaults: %+v", cfg)
+	}
 }
 
 func TestRunRejectsUnknownAuthorizationBeforeOpeningBackend(t *testing.T) {
@@ -40,5 +47,27 @@ func TestRunRejectsUnknownAuthorizationBeforeOpeningBackend(t *testing.T) {
 	}
 	if opened {
 		t.Fatal("backend opener factory called after authorization validation failed")
+	}
+}
+
+func TestRunRejectsIncompleteSecurityBoundaryBeforeOpeningBackend(t *testing.T) {
+	for _, cfg := range []Config{
+		{AuthnStrategy: "jwt", AuthzStrategy: "none"},
+		{AuthnStrategy: "none", AuthzStrategy: "opahttp"},
+	} {
+		opened := false
+		err := Run(context.Background(), cfg,
+			func(metric.MeterProvider) entroq.BackendOpener {
+				opened = true
+				return nil
+			},
+			"test",
+		)
+		if err == nil {
+			t.Fatalf("Run(%+v) accepted an incomplete security boundary", cfg)
+		}
+		if opened {
+			t.Fatal("backend opener called after security configuration failed")
+		}
 	}
 }

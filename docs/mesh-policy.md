@@ -1,8 +1,9 @@
 # EntroQ Mesh Policy
 
 The eqk8s operator maintains an OPA authorization policy for the EntroQ service
-mesh. Services prove their identity with a Kubernetes service account JWT; OPA
-decides whether they may access a given queue.
+mesh. The EntroQ service verifies Kubernetes service-account JWTs and passes a
+trusted principal to OPA, which decides whether that identity may access a given
+queue.
 
 Two CRDs control the policy:
 
@@ -257,16 +258,24 @@ absent or false, the operator hasn't reconciled yet — check its logs:
 kubectl logs -n eqk8s-system -l app.kubernetes.io/component=operator
 ```
 
-To test a specific authorization decision:
+To isolate and test a specific OPA authorization decision, provide the internal
+verified-principal input shape directly. This tests policy only; use an EntroQ
+client with a service-account token to test authentication and authorization
+end to end.
 
 ```bash
-TOKEN=$(kubectl create token svc-a -n payments)
 curl -s -X POST http://localhost:8182/v1/data/entroq/authz \
   -H 'Content-Type: application/json' \
-  -d "{\"input\":{
-    \"authz\":{\"type\":\"Bearer\",\"credentials\":\"$TOKEN\"},
-    \"queues\":[{\"exact\":\"/payments/svc-b/inbox\",\"actions\":[\"INSERT\"]}]
-  }}" | jq .result
+  -d '{"input":{
+    "principal":{
+      "subject":"system:serviceaccount:payments:svc-a",
+      "issuer":"debug-only",
+      "audience":["debug-only"],
+      "expires_at":2000000000,
+      "claims":{"sub":"system:serviceaccount:payments:svc-a"}
+    },
+    "queues":[{"exact":"/payments/svc-b/inbox","actions":["INSERT"]}]
+  }}' | jq .result
 ```
 
 `allow: true` means the policy permits it. `failed` lists the queues that were

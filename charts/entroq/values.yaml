@@ -74,9 +74,9 @@ entroq:
       tag: "1.16.2"
       pullPolicy: IfNotPresent
     # decisionLogs: true   # emit structured auth decisions to stdout (verbose)
-    # debug: true          # debug-level OPA logging (reveals JWKS failures etc.)
+    # debug: true          # debug-level OPA authorization logging
 
-  # k8s OIDC settings for OPA JWT verification.
+  # Kubernetes JWT authentication performed by the EntroQ service before OPA.
   # Obtain cluster-specific values from:
   #   kubectl get --raw /.well-known/openid-configuration
   auth:
@@ -84,6 +84,11 @@ entroq:
     audience: "https://kubernetes.default.svc.cluster.local"
     issuer:   "https://kubernetes.default.svc.cluster.local"
     caFile:   "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+    tokenCacheTTL: 30s
+    tokenCacheEntries: 4096
+    jwksCacheTTL: 5m
+    jwksRefreshInterval: 5s
+    httpTimeout: 10s
 
   service:
     grpcPort: 37706
