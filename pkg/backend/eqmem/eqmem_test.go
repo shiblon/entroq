@@ -131,6 +131,20 @@ func TestEQMemClaimLongDuration(t *testing.T) {
 	RunQTest(t, eqtest.ClaimLongDuration)
 }
 
+func TestEQMemMapReduceContract(t *testing.T) {
+	ctx := context.Background()
+	client, err := entroq.New(ctx, Opener())
+	if err != nil {
+		t.Fatalf("Get client: %v", err)
+	}
+	defer client.Close()
+	eqtest.MapReduce(ctx, t, client, "")
+}
+
+func TestEQMemJournalMapReduceContract(t *testing.T) {
+	RunQTest(t, eqtest.MapReduce)
+}
+
 func TestEQMemMapReduce_checkSmall(t *testing.T) {
 	config := &quick.Config{
 		MaxCount: 2,

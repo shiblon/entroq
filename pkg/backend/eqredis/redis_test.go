@@ -178,6 +178,10 @@ func TestClaimLongDuration(t *testing.T) {
 	RunQTest(t, eqtest.ClaimLongDuration)
 }
 
+func TestMapReduce(t *testing.T) {
+	RunQTest(t, eqtest.MapReduce)
+}
+
 func TestWorkerCompactDependencyHandler(t *testing.T) {
 	RunQTest(t, eqtest.WorkerCompactDependencyHandler)
 }

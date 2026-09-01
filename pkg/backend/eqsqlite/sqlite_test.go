@@ -42,6 +42,7 @@ func TestBackendContract(t *testing.T) {
 		{"ClaimRandomHead", eqtest.ClaimRandomHead},
 		{"TasksClaimantLimit", eqtest.TasksClaimantLimit},
 		{"ClaimLongDuration", eqtest.ClaimLongDuration},
+		{"MapReduce", eqtest.MapReduce},
 		{"WorkerCompactDependencyHandler", eqtest.WorkerCompactDependencyHandler},
 		{"WorkerDependencyMove", eqtest.WorkerDependencyMove},
 		{"SimpleDocLifecycle", eqtest.SimpleDocLifecycle},

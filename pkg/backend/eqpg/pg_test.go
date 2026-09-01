@@ -467,6 +467,10 @@ func TestClaimLongDuration(t *testing.T) {
 	RunQTest(t, eqtest.ClaimLongDuration)
 }
 
+func TestMapReduce(t *testing.T) {
+	RunQTest(t, eqtest.MapReduce)
+}
+
 func Example_disableListenNotify() {
 	// 1. Connection poolers in "transaction mode" (like PgBouncer) break the Postgres
 	//    LISTEN/NOTIFY strategy because they re-assign the underlying server connection

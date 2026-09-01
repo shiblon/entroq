@@ -42,6 +42,11 @@ import (
 //		t.Fatal(err)
 //	}
 func MRCheck(ctx context.Context, eq *entroq.EntroQ, numDocs, numMappers, numReducers int) bool {
+	return MRCheckAt(ctx, eq, "/mrtest/"+entroq.GenHex16(), numDocs, numMappers, numReducers)
+}
+
+// MRCheckAt is MRCheck with a caller-supplied queue and document prefix.
+func MRCheckAt(ctx context.Context, eq *entroq.EntroQ, queuePrefix string, numDocs, numMappers, numReducers int) bool {
 	const (
 		uniqueWords = 10
 		wordsPerDoc = 1000
@@ -74,8 +79,6 @@ func MRCheck(ctx context.Context, eq *entroq.EntroQ, numDocs, numMappers, numRed
 	sort.Slice(expected, func(i, j int) bool {
 		return bytes.Compare(expected[i].Key, expected[j].Key) < 0
 	})
-
-	queuePrefix := "/mrtest/" + entroq.GenHex16()
 
 	if err := RunAll(ctx, eq, queuePrefix, docs, WordCountMapper, SumReducer, numMappers, numReducers); err != nil {
 		log.Print(err)
