@@ -7,13 +7,25 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [Unreleased]
+## [1.9.0] - 2026-09-02
+
+Go module `v1.9.0`. No PostgreSQL schema changes. The Python client is
+versioned independently and advances to `0.12.3`; the JavaScript client is
+unchanged.
 
 ### Added
 
 - **Python client 0.12.3 lifecycle.** Async EntroQ clients support `aclose()`
   and `async with`; the JSON client now exposes cleanup for its HTTP connection
   pool.
+- **Kubernetes mesh benchmark.** A pinned, disposable k3d harness compares raw
+  direct HTTP, OPA-authorized direct HTTP, and one- or two-hop EntroQ mesh paths
+  at a fixed offered rate across memory, Redis, and PostgreSQL backends. It
+  records validation, topology, resource, authorization, and eqlink telemetry
+  while keeping raw run artifacts out of the repository.
+- **Configurable chart authorization.** The EntroQ Helm chart can explicitly
+  omit the OPA sidecar and OPA-only resources for trusted-network deployments,
+  or select a custom OPA endpoint and data path.
 
 ### Changed
 
@@ -27,6 +39,15 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Authentication failures have transport-specific status.** Invalid
   credentials return `Unauthenticated`, while an unavailable JWKS source returns
   `Unavailable`; OPA authorization denials remain `PermissionDenied`.
+
+### Fixed
+
+- **eqlink data-path metrics.** The `send`, `recv`, and combined `run` commands
+  now attach their Prometheus meter provider to the async sender and receiver,
+  so deployed sidecars expose handled, error, inflight, and duration metrics.
+- **gRPC keepalive compatibility.** The server permits the client's 30-second
+  transport keepalive interval, preventing long-held claim streams from being
+  disconnected by the default five-minute enforcement policy.
 
 ### Security
 
