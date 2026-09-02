@@ -1,4 +1,4 @@
-{{- if .Values.oidcDiscovery.grantAnonymous }}
+{{- if and .Values.oidcDiscovery.grantAnonymous (eq .Values.entroq.authorization.strategy "opahttp") }}
 # Grants anonymous read access to the k8s OIDC JWKS endpoint.
 # Required on Minikube and some hardened clusters where anonymous access is
 # disabled. On most managed clusters (GKE, EKS, AKS) this is already granted.

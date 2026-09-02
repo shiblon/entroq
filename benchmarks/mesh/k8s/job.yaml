@@ -1,0 +1,57 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: @JOB_NAME@
+  namespace: mesh-bench
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mesh-benchmark
+        app.kubernetes.io/component: loadgen
+        app.kubernetes.io/part-of: entroq-mesh-benchmark
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node-role.kubernetes.io/control-plane
+                operator: DoesNotExist
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app.kubernetes.io/part-of: entroq-mesh-benchmark
+            topologyKey: kubernetes.io/hostname
+      containers:
+      - name: loadgen
+        image: entroq-mesh-workload:@IMAGE_TAG@
+        imagePullPolicy: Never
+        args:
+        - load
+        - --mode=@MODE@
+        - --authz-strategy=@AUTHZ_STRATEGY@
+        - --authz-profile=@AUTHZ_PROFILE@
+        - --sample=@SAMPLE@
+        - --url=@URL@
+        - --host=@HOST@
+        - --concurrency=@CONCURRENCY@
+        - --target-rps=@TARGET_RPS@
+        - --duration=@DURATION@
+        - --warmup=@WARMUP@
+        - --payload-bytes=@PAYLOAD_BYTES@
+        - --expected-status=@EXPECTED_STATUS@
+        - --request-timeout=@REQUEST_TIMEOUT@
+        - --metric-interval=@METRIC_INTERVAL@
+        - --metric=gateway=http://gateway-mesh.mesh-bench.svc.cluster.local:9090/metrics
+        - --metric=relay=http://relay-metrics.mesh-bench.svc.cluster.local:9090/metrics
+        - --metric=leaf=http://leaf-direct.mesh-bench.svc.cluster.local:9090/metrics
+        - --metric=entroq=http://entroq-metrics.entroq-system.svc.cluster.local:9100/metrics
+@OPA_METRIC@
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi

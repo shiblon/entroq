@@ -106,7 +106,8 @@ func BenchmarkSidecar(b *testing.B) {
 			eq, stopEQ := mustStartEntroQ(ctx, b, eqmem.Opener())
 			defer stopEQ()
 
-			queue := fmt.Sprintf("bench-c%d", n)
+			service := fmt.Sprintf("bench-c%d", n)
+			queue := "/" + service
 			stopReceivers := mustStartReceivers(ctx, b, eq, queue, upstream.URL, n)
 			defer stopReceivers()
 
@@ -114,7 +115,7 @@ func BenchmarkSidecar(b *testing.B) {
 			// the benchmark client and the sender. This isolates queue
 			// round-trip latency from TCP connection overhead.
 			sender := async.NewSender(eq, "", async.WithSenderDomainSuffix(".test"))
-			reqURL := fmt.Sprintf("http://%s.test/ping", queue)
+			reqURL := fmt.Sprintf("http://%s.test/ping", service)
 
 			b.ResetTimer()
 			b.RunParallel(func(pb *testing.PB) {

@@ -5,7 +5,7 @@ Deploys the EntroQ queue-based service mesh:
 - **eqk8s operator** — watches `EntroQQueue` and `EntroQIdentity` CRDs,
   maintains the OPA mesh authorization policy
 - **EntroQ server** — verifies Kubernetes service-account JWTs, then asks its
-  OPA sidecar to authorize queue and namespace operations
+  optional OPA sidecar to authorize queue and namespace operations
 
 ## Prerequisites
 
@@ -183,6 +183,9 @@ Key values — override with `--set key=value` or `-f my-values.yaml`:
 | `entroq.storage.enabled` | `false` | `true` = StatefulSet + PVC (journaled); `false` = Deployment (memory-only) |
 | `entroq.storage.size` | `1Gi` | PVC size when storage is enabled |
 | `entroq.storage.storageClass` | `""` | StorageClass for PVC; blank = cluster default |
+| `entroq.authorization.strategy` | `opahttp` | `opahttp` runs the OPA sidecar; `none` exposes EntroQ without authorization |
+| `entroq.authorization.opaUrl` | `http://localhost:8181` | OPA endpoint used by EntroQ when the strategy is `opahttp` |
+| `entroq.authorization.opaPath` | `""` | Optional OPA data path override; blank uses the client default |
 | `operator.opaUrl` | `http://entroq.entroq-system.svc.cluster.local:8181` | OPA endpoint the operator pushes mesh documents to |
 | `operator.resyncInterval` | `5m` | How often to re-push the mesh document regardless of CRD changes |
 | `oidcDiscovery.grantAnonymous` | `false` | Set `true` on Minikube or clusters that restrict JWKS access |
@@ -194,6 +197,18 @@ Key values — override with `--set key=value` or `-f my-values.yaml`:
 | `entroq.auth.jwksCacheTTL` | `5m` | Signing-key cache lifetime |
 
 See `values.yaml` for the full set of options.
+
+Setting `entroq.authorization.strategy=none` deliberately makes the queue
+service open to every client that can reach it and removes the bundled OPA
+container, policy ConfigMaps, and OPA Service port. Disable the operator too
+unless it is configured to publish to a separate OPA deployment:
+
+```bash
+helm install entroq ./charts/entroq \
+  --set entroq.authorization.strategy=none \
+  --set operator.enabled=false \
+  --set oidcDiscovery.grantAnonymous=false
+```
 
 ## Development Workflow
 

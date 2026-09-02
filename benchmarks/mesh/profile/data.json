@@ -1,0 +1,29 @@
+{
+  "mesh": {
+    "initialized": true,
+    "identities": {
+      "system:serviceaccount:mesh-bench:gateway": {
+        "labels": {"role": "gateway"}
+      },
+      "system:serviceaccount:mesh-bench:relay": {
+        "labels": {"role": "relay"}
+      },
+      "system:serviceaccount:mesh-bench:leaf": {
+        "labels": {"role": "leaf"}
+      }
+    },
+    "queues": [
+      {
+        "pattern": "/mesh-bench/relay/inbox",
+        "matchType": "Exact",
+        "allowedCallers": [{"role": "gateway"}]
+      },
+      {
+        "pattern": "/mesh-bench/leaf/inbox",
+        "matchType": "Exact",
+        "allowedCallers": [{"role": "gateway"}, {"role": "relay"}]
+      }
+    ],
+    "namespaces": []
+  }
+}

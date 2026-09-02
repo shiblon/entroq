@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mesh-redis
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mesh-redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mesh-redis
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node-role.kubernetes.io/control-plane
+                operator: Exists
+      containers:
+      - name: redis
+        image: @REDIS_IMAGE@
+        imagePullPolicy: IfNotPresent
+        args:
+        - redis-server
+        - --save
+        - ""
+        - --appendonly
+        - "no"
+        ports:
+        - name: redis
+          containerPort: 6379
+        readinessProbe:
+          exec:
+            command: [redis-cli, ping]
+          periodSeconds: 2
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: "2"
+            memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mesh-redis
+  namespace: default
+spec:
+  selector:
+    app.kubernetes.io/name: mesh-redis
+  ports:
+  - name: redis
+    port: 6379
+    targetPort: redis

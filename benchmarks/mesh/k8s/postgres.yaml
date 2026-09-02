@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mesh-postgres
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mesh-postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mesh-postgres
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node-role.kubernetes.io/control-plane
+                operator: Exists
+      containers:
+      - name: postgres
+        image: @POSTGRES_IMAGE@
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: POSTGRES_DB
+          value: entroq
+        - name: POSTGRES_USER
+          value: entroq
+        - name: POSTGRES_PASSWORD
+          value: meshbench
+        ports:
+        - name: postgres
+          containerPort: 5432
+        readinessProbe:
+          exec:
+            command: [pg_isready, -U, entroq, -d, entroq]
+          periodSeconds: 2
+        resources:
+          requests:
+            cpu: 10m
+            memory: 64Mi
+          limits:
+            cpu: "2"
+            memory: 512Mi
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+      volumes:
+      - name: data
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mesh-postgres
+  namespace: default
+spec:
+  selector:
+    app.kubernetes.io/name: mesh-postgres
+  ports:
+  - name: postgres
+    port: 5432
+    targetPort: postgres

@@ -79,6 +79,7 @@ Graceful shutdown on SIGINT/SIGTERM:
 		sender := async.NewSender(eq, senderAddr,
 			async.WithSenderRequestTimeout(requestTimeout),
 			async.WithSenderResponseGrace(responseGrace),
+			async.WithSenderMeterProvider(mp),
 			async.WithSenderTLSConfig(tlsCfg),
 			async.WithSenderDomainSuffix(domainSuffix),
 			async.WithSenderNamespace(namespace),
@@ -92,6 +93,7 @@ Graceful shutdown on SIGINT/SIGTERM:
 
 		var rcvOpts []async.ReceiverOption
 		rcvOpts = append(rcvOpts,
+			async.WithReceiverMeterProvider(mp),
 			async.WithReceiverName(myQueue),
 			async.WithReceiverAuditLogger(alog),
 		)

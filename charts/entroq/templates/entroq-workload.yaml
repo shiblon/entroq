@@ -1,4 +1,9 @@
 {{- if .Values.entroq.enabled -}}
+{{- $authzStrategy := .Values.entroq.authorization.strategy -}}
+{{- if not (has $authzStrategy (list "none" "opahttp")) -}}
+{{- fail (printf "entroq.authorization.strategy must be none or opahttp, got %q" $authzStrategy) -}}
+{{- end -}}
+{{- $usesOPA := eq $authzStrategy "opahttp" -}}
 {{- $backend := .Values.entroq.backend.type -}}
 {{- $isJournal  := eq $backend "journal"  -}}
 {{- $isPostgres := eq $backend "postgres" -}}
@@ -28,6 +33,7 @@ spec:
         imagePullPolicy: {{ .Values.entroq.images.pullPolicy }}
         args:
         - serve
+        {{- if $usesOPA }}
         - --authn=jwt
         - --auth_jwks_url={{ .Values.entroq.auth.jwksUrl }}
         - --auth_issuer={{ .Values.entroq.auth.issuer }}
@@ -39,7 +45,14 @@ spec:
         - --auth_jwks_refresh_interval={{ .Values.entroq.auth.jwksRefreshInterval }}
         - --auth_http_timeout={{ .Values.entroq.auth.httpTimeout }}
         - --authz=opahttp
-        - --opa_url=http://localhost:{{ .Values.entroq.service.opaPort }}
+        - --opa_url={{ .Values.entroq.authorization.opaUrl }}
+        {{- if .Values.entroq.authorization.opaPath }}
+        - --opa_path={{ .Values.entroq.authorization.opaPath }}
+        {{- end }}
+        {{- else }}
+        - --authn=none
+        - --authz=none
+        {{- end }}
         {{- if $isJournal }}
         - --journal={{ .Values.entroq.storage.mountPath }}
         - --mkdir
@@ -87,6 +100,7 @@ spec:
           mountPath: {{ .Values.entroq.storage.mountPath }}
         {{- end }}
 
+      {{- if $usesOPA }}
       - name: opa
         image: "{{ .Values.entroq.opa.image.repository }}:{{ .Values.entroq.opa.image.tag }}"
         imagePullPolicy: {{ .Values.entroq.opa.image.pullPolicy }}
@@ -118,11 +132,14 @@ spec:
         - name: opa-rego
           mountPath: /rego
           readOnly: true
+      {{- end }}
 
       volumes:
+      {{- if $usesOPA }}
       - name: opa-rego
         configMap:
           name: opa-rego
+      {{- end }}
   {{- if $isJournal }}
   volumeClaimTemplates:
   - metadata:

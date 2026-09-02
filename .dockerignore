@@ -1,0 +1,23 @@
+.git
+.engram
+.agents
+.codex
+
+# Generated benchmark output and local build caches.
+benchmarks/mesh/results
+**/.go-cache
+**/.cache
+*.test
+coverage.out
+
+# Client dependency and build output is not used by the Go service images.
+clients/js/node_modules
+clients/js/dist
+**/__pycache__
+**/.pytest_cache
+*.pyc
+
+# Editor and OS state.
+.DS_Store
+*.swp
+*.swo

@@ -1,4 +1,4 @@
-{{- if .Values.entroq.enabled }}
+{{- if and .Values.entroq.enabled (eq .Values.entroq.authorization.strategy "opahttp") }}
 # OPA Rego policy files. JWT verification is performed by EntroQ, so this
 # ConfigMap contains authorization policy only and no identity-provider secrets.
 # Run 'make helm-sync' from the repo root to refresh these from source.

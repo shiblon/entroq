@@ -181,3 +181,21 @@ func TestFullURL(t *testing.T) {
 		})
 	}
 }
+
+func TestActionSet(t *testing.T) {
+	req := &authz.Request{
+		Queues: []*authz.Queue{
+			{Exact: "request", Actions: []authz.Action{authz.Insert, authz.Delete}},
+			{Exact: "response", Actions: []authz.Action{authz.Insert}},
+		},
+		Namespaces: []*authz.Namespace{
+			{Exact: "docs", Actions: []authz.Action{authz.Read}},
+		},
+	}
+	if got, want := actionSet(req), "DELETE+INSERT+READ"; got != want {
+		t.Fatalf("actionSet() = %q, want %q", got, want)
+	}
+	if got := actionSet(nil); got != "none" {
+		t.Fatalf("actionSet(nil) = %q, want none", got)
+	}
+}

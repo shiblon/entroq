@@ -24,6 +24,13 @@ operator:
 entroq:
   enabled: true
 
+  # Authorization strategy. opahttp runs the bundled OPA sidecar; none exposes
+  # an explicitly open EntroQ service and omits all OPA-only resources.
+  authorization:
+    strategy: opahttp
+    opaUrl: "http://localhost:8181"
+    opaPath: ""
+
   # Storage backend. One of:
   #   memory    -- in-process only; data lost on restart (Deployment, no PVC)
   #   journal   -- in-process with WAL journal; durable (StatefulSet + PVC)

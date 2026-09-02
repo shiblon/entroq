@@ -5,12 +5,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/shiblon/entroq/pkg/authz"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/noop"
 )
 
 const (
@@ -21,8 +27,10 @@ const (
 // OPA is a client for interacting with a running OPA sidecar.
 // It implements authz.Authorizer.
 type OPA struct {
-	hostURL string
-	apiPath string
+	hostURL  string
+	apiPath  string
+	mp       metric.MeterProvider
+	duration metric.Float64Histogram
 }
 
 // Option configures an OPA authorizer.
@@ -46,15 +54,35 @@ func WithAPIPath(p string) Option {
 	}
 }
 
+// WithMeterProvider records client-observed OPA request duration. This includes
+// HTTP transport and scheduling time that OPA's own handler metric cannot see.
+func WithMeterProvider(mp metric.MeterProvider) Option {
+	return func(a *OPA) {
+		if mp != nil {
+			a.mp = mp
+		}
+	}
+}
+
 // New creates a new OPA authorizer.
 func New(opts ...Option) *OPA {
 	a := &OPA{
 		hostURL: DefaultHostURL,
 		apiPath: DefaultAPIPath,
+		mp:      noop.NewMeterProvider(),
 	}
 	for _, opt := range opts {
 		opt(a)
 	}
+	a.duration, _ = a.mp.Meter("entroq/authz/opahttp").Float64Histogram(
+		"authz.opa.duration_seconds",
+		metric.WithDescription("Client-observed OPA authorization request duration."),
+		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(
+			0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01,
+			0.025, 0.05, 0.1, 0.25, 0.5, 1,
+		),
+	)
 	return a
 }
 
@@ -72,7 +100,25 @@ func (a *OPA) fullURL() string {
 // Authorize sends an authorization request to OPA. A nil error means allowed.
 // If the error is an *authz.AuthzError it can be unpacked for details on which
 // queues and actions were denied.
-func (a *OPA) Authorize(ctx context.Context, req *authz.Request) error {
+func (a *OPA) Authorize(ctx context.Context, req *authz.Request) (resultErr error) {
+	started := time.Now()
+	defer func() {
+		outcome := "allow"
+		if resultErr != nil {
+			outcome = "error"
+			var authzErr *authz.AuthzError
+			if errors.As(resultErr, &authzErr) {
+				outcome = "deny"
+			}
+		}
+		if a.duration != nil {
+			a.duration.Record(ctx, time.Since(started).Seconds(),
+				metric.WithAttributes(
+					attribute.String("actions", actionSet(req)),
+					attribute.String("outcome", outcome),
+				))
+		}
+	}()
 	body := map[string]*authz.Request{
 		"input": req,
 	}
@@ -131,6 +177,40 @@ func (a *OPA) Authorize(ctx context.Context, req *authz.Request) error {
 	}
 
 	return nil
+}
+
+// actionSet returns a bounded-cardinality description of the requested
+// operations. Queue and namespace names are deliberately excluded from metric
+// attributes.
+func actionSet(req *authz.Request) string {
+	if req == nil {
+		return "none"
+	}
+	actions := make(map[string]struct{})
+	add := func(values []authz.Action) {
+		for _, action := range values {
+			actions[string(action)] = struct{}{}
+		}
+	}
+	for _, queue := range req.Queues {
+		if queue != nil {
+			add(queue.Actions)
+		}
+	}
+	for _, namespace := range req.Namespaces {
+		if namespace != nil {
+			add(namespace.Actions)
+		}
+	}
+	if len(actions) == 0 {
+		return "none"
+	}
+	values := make([]string, 0, len(actions))
+	for action := range actions {
+		values = append(values, action)
+	}
+	sort.Strings(values)
+	return strings.Join(values, "+")
 }
 
 // Close cleans up any resources used by this authorizer.

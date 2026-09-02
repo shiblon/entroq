@@ -20,7 +20,7 @@ Use "eqlink run" to start the full sidecar (sender + receiver).`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		_, stopMetrics, err := setupMetrics(ctx)
+		mp, stopMetrics, err := setupMetrics(ctx)
 		if err != nil {
 			return fmt.Errorf("metrics: %w", err)
 		}
@@ -40,6 +40,7 @@ Use "eqlink run" to start the full sidecar (sender + receiver).`,
 
 		sender := async.NewSender(eq, senderAddr,
 			async.WithSenderRequestTimeout(requestTimeout),
+			async.WithSenderMeterProvider(mp),
 			async.WithSenderTLSConfig(tlsCfg),
 			async.WithSenderDomainSuffix(domainSuffix),
 			async.WithSenderNamespace(namespace),

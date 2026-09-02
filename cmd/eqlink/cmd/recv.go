@@ -39,7 +39,9 @@ Use "eqlink run" to start the full sidecar (sender + receiver).`,
 			return fmt.Errorf("load tls: %w", err)
 		}
 
-		var rcvOpts []async.ReceiverOption
+		rcvOpts := []async.ReceiverOption{
+			async.WithReceiverMeterProvider(mp),
+		}
 		if tlsCfg != nil {
 			rcvOpts = append(rcvOpts, async.WithReceiverHTTPClient(&http.Client{
 				Transport: &http.Transport{

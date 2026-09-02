@@ -18,6 +18,7 @@ import (
 	pb "github.com/shiblon/entroq/api"
 	"github.com/shiblon/entroq/pkg/authn/jwtauthn"
 	"github.com/shiblon/entroq/pkg/authz/opahttp"
+	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
 	"github.com/shiblon/entroq/pkg/eqsvcgrpc"
 	"github.com/shiblon/entroq/pkg/eqsvcjson"
 	"github.com/shiblon/entroq/pkg/otel"
@@ -26,6 +27,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	hpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/keepalive"
 )
 
 const bytesPerMB = 1024 * 1024
@@ -86,16 +88,16 @@ func Run(ctx context.Context, cfg Config, open OpenFunc, backendDescription stri
 	ctx, stopSignals := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
-	securityOpts, err := securityOptions(cfg)
-	if err != nil {
-		return err
-	}
-
 	mp, metricsHandler, stopMetrics, err := otel.NewPrometheusProvider()
 	if err != nil {
 		return fmt.Errorf("otel setup: %w", err)
 	}
 	defer stopMetrics()
+
+	securityOpts, err := securityOptions(cfg, mp)
+	if err != nil {
+		return err
+	}
 
 	svcOpts := append(securityOpts, eqsvcgrpc.WithMeterProvider(mp))
 	if cfg.MetricInterval > 0 {
@@ -131,6 +133,7 @@ func Run(ctx context.Context, cfg Config, open OpenFunc, backendDescription stri
 	grpcServer := grpc.NewServer(
 		grpc.MaxRecvMsgSize(cfg.MaxSize*bytesPerMB),
 		grpc.MaxSendMsgSize(cfg.MaxSize*bytesPerMB),
+		grpc.KeepaliveEnforcementPolicy(serverKeepalivePolicy()),
 	)
 	pb.RegisterEntroQServer(grpcServer, svc)
 	hpb.RegisterHealthServer(grpcServer, health.NewServer())
@@ -167,7 +170,13 @@ func Run(ctx context.Context, cfg Config, open OpenFunc, backendDescription stri
 	}
 }
 
-func securityOptions(cfg Config) ([]eqsvcgrpc.Option, error) {
+func serverKeepalivePolicy() keepalive.EnforcementPolicy {
+	return keepalive.EnforcementPolicy{
+		MinTime: eqgrpc.DefaultKeepaliveTime,
+	}
+}
+
+func securityOptions(cfg Config, mp metric.MeterProvider) ([]eqsvcgrpc.Option, error) {
 	switch cfg.AuthnStrategy {
 	case "", "none", "jwt":
 	default:
@@ -205,12 +214,12 @@ func securityOptions(cfg Config) ([]eqsvcgrpc.Option, error) {
 		opts = append(opts, eqsvcgrpc.WithAuthenticator(authenticator))
 	case "", "none":
 	}
-
 	switch cfg.AuthzStrategy {
 	case "opahttp":
 		opts = append(opts, eqsvcgrpc.WithAuthorizer(opahttp.New(
 			opahttp.WithHostURL(cfg.OPAURL),
 			opahttp.WithAPIPath(cfg.OPAPath),
+			opahttp.WithMeterProvider(mp),
 		)))
 	case "", "none":
 	}
