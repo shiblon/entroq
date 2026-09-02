@@ -407,7 +407,9 @@ done
 
 kubectl get pods -A -o wide >"$result_dir/pods.txt"
 kubectl get events -A --sort-by=.lastTimestamp >"$result_dir/events.txt"
-GOCACHE=/tmp/entroq-mesh-report-cache go run ./benchmarks/mesh/workload report \
+GOCACHE=/tmp/entroq-mesh-report-cache \
+GOMODCACHE=/tmp/entroq-mesh-report-mod-cache \
+go run ./benchmarks/mesh/workload report \
     --input-dir "$result_dir" \
     --backend "$backend" >"$result_dir/summary.md"
 
