@@ -368,17 +368,19 @@ run_sample() {
     kubectl delete job "$job_name" -n mesh-bench --wait=true >/dev/null
 }
 
+# Warm each smoke path before strict metric sampling; rollout readiness can
+# precede Service endpoint propagation by a small interval.
 log "proving the one-hop mesh path with authorization strategy ${authz_strategy}"
-run_sample mesh 1 1s 0s "$result_dir/smoke-mesh.json" 0
+run_sample mesh 1 1s "$warmup" "$result_dir/smoke-mesh.json" 0
 log "waiting for the two-hop relay path"
-run_sample mesh2 1 1s 0s "$result_dir/smoke-mesh2.json" 0
+run_sample mesh2 1 1s "$warmup" "$result_dir/smoke-mesh2.json" 0
 if [ "$authz_strategy" = opahttp ]; then
     log "proving the authorized direct path"
-    run_sample direct-auth 1 1s 0s "$result_dir/smoke-direct-auth.json" 0
+    run_sample direct-auth 1 1s "$warmup" "$result_dir/smoke-direct-auth.json" 0
 fi
 if [ "$authz_profile" = full ]; then
     log "proving per-service denial on the authorized direct path"
-    run_sample direct-denied 1 1s 0s "$result_dir/smoke-direct-denied.json" 0
+    run_sample direct-denied 1 1s "$warmup" "$result_dir/smoke-direct-denied.json" 0
 fi
 
 sample=1
