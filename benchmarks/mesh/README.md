@@ -2,8 +2,8 @@
 
 This harness compares matched requests through raw Kubernetes HTTP, an
 OPA-authorized direct proxy, one EntroQ mesh hop, and two EntroQ mesh hops. It is
-a small deployment-shaped benchmark: memory backend, a 1 KiB echo request, and
-three repeated samples per path by default.
+a small deployment-shaped benchmark with a selectable EntroQ backend, a 1 KiB
+echo request, and three repeated samples per path by default.
 
 ```text
 raw direct:         load job ────────HTTP────────────────────> leaf handler
@@ -65,10 +65,11 @@ measured mode; a sample fails if achieved throughput is below 90% of the target.
 
 `AUTHZ_STRATEGY=none` removes the OPA container and OPA-only resources entirely;
 this isolates queue and gRPC orchestration from authorization. With the default
-`AUTHZ_STRATEGY=opahttp`, `OPA_POLICY_MODE=full` runs the JWT and mesh-policy
-decision, while `OPA_POLICY_MODE=allow-all` preserves the same number of OPA
-round trips with a trivial decision. Together these form a diagnostic ladder:
-no OPA, trivial OPA, and full OPA.
+`AUTHZ_STRATEGY=opahttp`, EntroQ verifies the JWT before OPA and
+`OPA_POLICY_MODE=full` runs the mesh-policy decision over the verified
+principal. `OPA_POLICY_MODE=allow-all` preserves authentication and the same
+number of OPA round trips with a trivial decision. Together these form a
+diagnostic ladder: no OPA, trivial OPA, and full OPA.
 
 `BACKEND` selects `memory`, `redis`, or `postgres`. Redis runs with RDB
 snapshots and AOF disabled. PostgreSQL uses version 17 container defaults on an
@@ -118,3 +119,6 @@ the benchmark pods.
 The gRPC server's minimum permitted transport keepalive matches the client's
 30-second keepalive. This is separate from EntroQ worker claim polling, which is
 a server-side fallback and is not the source of keepalive disconnects.
+
+The post-authentication-boundary fixed-rate findings and task-granularity
+guidance are in [results/post-auth-headroom-0902.md](results/post-auth-headroom-0902.md).
