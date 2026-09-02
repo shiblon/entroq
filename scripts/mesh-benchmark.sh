@@ -31,7 +31,7 @@ entroq_cpu_limit=${ENTROQ_CPU_LIMIT:-500m}
 opa_cpu_limit=${OPA_CPU_LIMIT:-250m}
 keep_cluster=${KEEP_CLUSTER:-0}
 result_dir=${RESULT_DIR:-${repo_root}/benchmarks/mesh/results/${run_id}}
-kubeconfig_file=/tmp/entroq-mesh-${run_id}.kubeconfig
+kubeconfig_file=${result_dir}/kubeconfig
 cluster_created=0
 
 log() {
