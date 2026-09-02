@@ -24,12 +24,10 @@ Replace `insert.json` with `claim.json`, `delete-insert.json`,
 made by one eqlink request.
 
 The Go benchmarks exercise prepared queries in the same OPA library version as
-EntroQ. `BenchmarkK8sPolicy` uses a real RSA-signed JWT and a warm local JWKS
-cache. The scale benchmarks compare the current list-shaped mesh policy with a
-prototype identity-keyed grants document:
+EntroQ. They compare the current list-shaped mesh policy with a prototype
+identity-keyed grants document:
 
 ```bash
-go test ./pkg/authz/opadata -run '^$' -bench '^BenchmarkK8sPolicy$' -benchmem -count=5
 go test ./pkg/authz/opadata -run '^$' -bench '^BenchmarkK8sPolicyScale$' -benchmem -count=3
 go test ./pkg/authz/opadata -run '^$' -bench '^BenchmarkK8sPrecomputedPolicyScale$' -benchmem -count=3
 ```
