@@ -271,6 +271,9 @@ kubectl rollout status deployment/leaf -n mesh-bench --timeout=3m
 if [ "$authz_strategy" = opahttp ]; then
     kubectl rollout status deployment/direct-auth -n mesh-bench --timeout=3m
 fi
+# Deployment readiness can precede kube-proxy observing the new Service
+# endpoints. Keep startup convergence outside the strict smoke warm-up.
+sleep 2
 
 wait_job() {
     job_name=$1
