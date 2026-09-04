@@ -7,6 +7,16 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.10.2] - 2026-09-04
+
+Go module `v1.10.2`. No PostgreSQL schema or independent client version
+changes.
+
+### Fixed
+
+- **Helm image repositories.** Released chart installations now pull EntroQ
+  service and operator images from `ghcr.io/shiblon` by default.
+
 ## [1.10.1] - 2026-09-04
 
 Go module `v1.10.1`. No PostgreSQL schema or independent client version

@@ -43,7 +43,9 @@ are required — `IfNotPresent` (the chart default) finds them immediately.
 ```bash
 make helm-sync   # copies Rego files + CRDs into the chart (incremental)
 helm install entroq ./charts/entroq \
+  --set entroq.images.mem.repository=entroq-mem \
   --set entroq.images.mem.tag=dev \
+  --set operator.image.repository=entroq-operator \
   --set operator.image.tag=dev
 ```
 
@@ -51,8 +53,9 @@ EntroQ authenticates its JWKS request with its mounted service-account token.
 Kubernetes grants service accounts read access to the issuer-discovery endpoints,
 so the API server does not need anonymous access enabled.
 
-The `*.tag=dev` overrides tell the chart to use the locally built `dev`-tagged
-images instead of the release tag. Omit them when installing a released chart.
+The image overrides tell the chart to use the locally built `dev`-tagged images
+instead of the released images in `ghcr.io/shiblon`. Omit them when installing
+a released chart.
 
 ### 4. Verify the stack
 
@@ -226,7 +229,11 @@ docker build -t entroq-operator:dev -f cmd/eqk8s/Dockerfile .
 
 # Sync chart and upgrade
 make helm-sync
-helm upgrade entroq ./charts/entroq --set entroq.images.mem.tag=dev --set operator.image.tag=dev
+helm upgrade entroq ./charts/entroq \
+  --set entroq.images.mem.repository=entroq-mem \
+  --set entroq.images.mem.tag=dev \
+  --set operator.image.repository=entroq-operator \
+  --set operator.image.tag=dev
 
 # Bounce the operator pod to pick up the new image
 kubectl rollout restart deployment -n eqk8s-system eqk8s-controller-manager
@@ -236,7 +243,11 @@ After changing Rego files for `strategy=opahttp` only (no image rebuild needed):
 
 ```bash
 make helm-sync
-helm upgrade entroq ./charts/entroq --set entroq.images.mem.tag=dev --set operator.image.tag=dev
+helm upgrade entroq ./charts/entroq \
+  --set entroq.images.mem.repository=entroq-mem \
+  --set entroq.images.mem.tag=dev \
+  --set operator.image.repository=entroq-operator \
+  --set operator.image.tag=dev
 kubectl rollout restart deployment -n entroq-system entroq
 ```
 

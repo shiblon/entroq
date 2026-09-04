@@ -6,7 +6,7 @@
 operator:
   enabled: true
   image:
-    repository: entroq-operator
+    repository: ghcr.io/shiblon/entroq-operator
     tag: ""            # defaults to .Chart.AppVersion
     pullPolicy: IfNotPresent
   # Blank selects the in-chart EntroQ or OPA endpoint for the chosen strategy.
@@ -43,13 +43,13 @@ entroq:
   # Images for each backend. Tag defaults to .Chart.AppVersion when left blank.
   images:
     mem:       # used for memory and journal backends (same binary)
-      repository: entroq-mem
+      repository: ghcr.io/shiblon/entroq-mem
       tag: ""
     postgres:
-      repository: entroq-pg
+      repository: ghcr.io/shiblon/entroq-pg
       tag: ""
     redis:
-      repository: entroq-redis
+      repository: ghcr.io/shiblon/entroq-redis
       tag: ""
     pullPolicy: IfNotPresent
 
