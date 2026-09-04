@@ -45,7 +45,15 @@ if [ "$(printf '%s\n%s\n' "${SCHEMA_VER}" "${VERSION}" | sort -V | tail -n1)" !=
     fail "SchemaVersion (${SCHEMA_VER}) is ahead of release tag (${VERSION}); the schema must not outrun the module"
 fi
 
-# 5. Tag does not already exist.
+# 5. The Helm chart defaults to images from this release. New chart templates
+#    may pass flags that older binaries do not understand, so appVersion must
+#    never lag the release tag.
+CHART_APP_VERSION="$(awk '$1 == "appVersion:" { gsub(/"/, "", $2); print $2; exit }' charts/entroq/Chart.yaml)"
+if [ "${CHART_APP_VERSION}" != "${VERSION}" ]; then
+    fail "Helm appVersion (${CHART_APP_VERSION:-missing}) does not match release tag (${VERSION})"
+fi
+
+# 6. Tag does not already exist.
 if git rev-parse "v${VERSION}" >/dev/null 2>&1; then
     fail "tag v${VERSION} already exists"
 fi

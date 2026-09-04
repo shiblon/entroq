@@ -5,8 +5,8 @@ description: >
   EntroQQueue and EntroQIdentity CRDs and maintains mesh authorization policy)
   alongside an EntroQ server.
 type: application
-version: 0.1.0
-appVersion: "0.1.0-rc4"
+version: 0.2.0
+appVersion: "1.10.1"
 keywords:
 - entroq
 - service-mesh

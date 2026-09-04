@@ -7,6 +7,17 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.10.1] - 2026-09-04
+
+Go module `v1.10.1`. No PostgreSQL schema or independent client version
+changes.
+
+### Fixed
+
+- **Helm image defaults.** The chart now deploys the `v1.10.1` service and
+  operator images by default, keeping its generated command-line flags aligned
+  with the binaries that receive them.
+
 ## [1.10.0] - 2026-09-04
 
 Go module `v1.10.0`. No PostgreSQL schema or independent client version

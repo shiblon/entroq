@@ -21,6 +21,9 @@ git checkout develop && git pull
 ```
 
 - Finalize `CHANGELOG.md`: rename `## [Unreleased]` to `## [<version>] - <YYYY-MM-DD>`.
+- Set `appVersion` in `charts/entroq/Chart.yaml` to `<version>` so the chart
+  defaults to binaries from the release. If the chart itself changed, also
+  advance its independent `version`. `tag-release.sh` enforces `appVersion`.
 - If the PostgreSQL schema changed, bump `SchemaVersion` in
   `pkg/backend/eqpg/schema.go` **and** the matching `INSERT` in
   `pkg/backend/eqpg/schema.sql` (then `make schema-sync`, and update
@@ -49,8 +52,8 @@ git push origin develop
 
 The script runs pre-flight checks (clean tree; no `replace` directives in
 `go.mod`; a `CHANGELOG.md` entry for the version; `SchemaVersion` does not
-exceed the tag; the tag does not already exist), then creates and pushes
-`v<version>`.
+exceed the tag; Helm `appVersion` matches the tag; the tag does not already
+exist), then creates and pushes `v<version>`.
 
 ### 3. Build and push Docker images
 
