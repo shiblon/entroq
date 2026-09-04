@@ -7,7 +7,10 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [Unreleased]
+## [1.10.0] - 2026-09-04
+
+Go module `v1.10.0`. No PostgreSQL schema or independent client version
+changes.
 
 ### Added
 
