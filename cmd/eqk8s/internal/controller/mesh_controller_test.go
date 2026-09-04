@@ -134,8 +134,8 @@ func TestBuildMeshIdentity(t *testing.T) {
 
 	mesh := buildMesh(nil, identities)
 
-	wantA := eqk8s.OPAIdentity{Labels: map[string]string{"group": "frontend", "team": "payments"}}
-	wantB := eqk8s.OPAIdentity{Labels: map[string]string{"group": "backend"}}
+	wantA := eqk8s.Identity{Labels: map[string]string{"group": "frontend", "team": "payments"}}
+	wantB := eqk8s.Identity{Labels: map[string]string{"group": "backend"}}
 
 	keyA := "system:serviceaccount:payments:svc-a"
 	keyB := "system:serviceaccount:payments:svc-b"

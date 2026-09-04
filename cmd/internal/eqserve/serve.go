@@ -16,7 +16,9 @@ import (
 
 	"github.com/shiblon/entroq"
 	pb "github.com/shiblon/entroq/api"
+	"github.com/shiblon/entroq/pkg/authn"
 	"github.com/shiblon/entroq/pkg/authn/jwtauthn"
+	meshauthz "github.com/shiblon/entroq/pkg/authz/mesh"
 	"github.com/shiblon/entroq/pkg/authz/opahttp"
 	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
 	"github.com/shiblon/entroq/pkg/eqsvcgrpc"
@@ -41,6 +43,7 @@ type Config struct {
 	AuthnStrategy           string
 	AuthJWKSURL             string
 	AuthJWKSFile            string
+	AuthJWKSTokenFile       string
 	AuthIssuer              string
 	AuthAudience            []string
 	AuthCAFile              string
@@ -50,9 +53,11 @@ type Config struct {
 	AuthJWKSRefreshInterval time.Duration
 	AuthHTTPTimeout         time.Duration
 
-	AuthzStrategy string
-	OPAURL        string
-	OPAPath       string
+	AuthzStrategy     string
+	OPAURL            string
+	OPAPath           string
+	MeshPolicyFile    string
+	MeshUpdateSubject string
 
 	MetricInterval time.Duration
 }
@@ -65,6 +70,7 @@ func (c *Config) BindFlags(f *pflag.FlagSet) {
 	f.StringVar(&c.AuthnStrategy, "authn", "none", "Authentication strategy: none, jwt.")
 	f.StringVar(&c.AuthJWKSURL, "auth_jwks_url", "", "JWKS URL used to verify JWT signatures.")
 	f.StringVar(&c.AuthJWKSFile, "auth_jwks_file", "", "Local JWKS file used to verify JWT signatures.")
+	f.StringVar(&c.AuthJWKSTokenFile, "auth_jwks_token_file", "", "Bearer-token file for authenticated JWKS requests.")
 	f.StringVar(&c.AuthIssuer, "auth_issuer", "", "Required JWT issuer.")
 	f.StringSliceVar(&c.AuthAudience, "auth_audience", nil, "Required JWT audience; repeat for multiple accepted audiences.")
 	f.StringVar(&c.AuthCAFile, "auth_ca_file", "", "Additional CA certificate file for the JWKS HTTPS endpoint.")
@@ -73,9 +79,11 @@ func (c *Config) BindFlags(f *pflag.FlagSet) {
 	f.DurationVar(&c.AuthJWKSCacheTTL, "auth_jwks_cache_ttl", 5*time.Minute, "Lifetime of cached JWKS key material.")
 	f.DurationVar(&c.AuthJWKSRefreshInterval, "auth_jwks_refresh_interval", 5*time.Second, "Minimum interval between JWKS refreshes for unknown key IDs.")
 	f.DurationVar(&c.AuthHTTPTimeout, "auth_http_timeout", 10*time.Second, "Timeout for JWKS HTTP requests.")
-	f.StringVar(&c.AuthzStrategy, "authz", "none", "Authorization strategy: none, opahttp.")
+	f.StringVar(&c.AuthzStrategy, "authz", "none", "Authorization strategy: none, mesh, opahttp.")
 	f.StringVar(&c.OPAURL, "opa_url", "", fmt.Sprintf("OPA base URL. Default: %s.", opahttp.DefaultHostURL))
 	f.StringVar(&c.OPAPath, "opa_path", "", fmt.Sprintf("OPA API path. Default: %s.", opahttp.DefaultAPIPath))
+	f.StringVar(&c.MeshPolicyFile, "mesh_policy_file", "", "Initial mesh policy document; typically a projected ConfigMap file.")
+	f.StringVar(&c.MeshUpdateSubject, "mesh_update_subject", "", "Authenticated subject permitted to replace native mesh policy.")
 }
 
 // OpenFunc constructs a backend opener after telemetry has been initialized.
@@ -94,12 +102,12 @@ func Run(ctx context.Context, cfg Config, open OpenFunc, backendDescription stri
 	}
 	defer stopMetrics()
 
-	securityOpts, err := securityOptions(cfg, mp)
+	security, err := securityOptions(ctx, cfg, mp)
 	if err != nil {
 		return err
 	}
 
-	svcOpts := append(securityOpts, eqsvcgrpc.WithMeterProvider(mp))
+	svcOpts := append(security.serviceOptions, eqsvcgrpc.WithMeterProvider(mp))
 	if cfg.MetricInterval > 0 {
 		svcOpts = append(svcOpts, eqsvcgrpc.WithMetricInterval(cfg.MetricInterval))
 	}
@@ -112,6 +120,9 @@ func Run(ctx context.Context, cfg Config, open OpenFunc, backendDescription stri
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", metricsHandler)
+	if security.meshHandler != nil {
+		mux.Handle(meshauthz.MeshDataPath, security.meshHandler)
+	}
 	path, handler, err := eqsvcjson.New(svc)
 	if err != nil {
 		return fmt.Errorf("create JSON/Connect handler: %w", err)
@@ -176,29 +187,50 @@ func serverKeepalivePolicy() keepalive.EnforcementPolicy {
 	}
 }
 
-func securityOptions(cfg Config, mp metric.MeterProvider) ([]eqsvcgrpc.Option, error) {
+type securitySetup struct {
+	serviceOptions []eqsvcgrpc.Option
+	meshHandler    http.Handler
+}
+
+func securityOptions(ctx context.Context, cfg Config, mp metric.MeterProvider) (securitySetup, error) {
 	switch cfg.AuthnStrategy {
 	case "", "none", "jwt":
 	default:
-		return nil, fmt.Errorf("unknown authn strategy: %q", cfg.AuthnStrategy)
+		return securitySetup{}, fmt.Errorf("unknown authn strategy: %q", cfg.AuthnStrategy)
 	}
 	switch cfg.AuthzStrategy {
-	case "", "none", "opahttp":
+	case "", "none", "mesh", "opahttp":
 	default:
-		return nil, fmt.Errorf("unknown authz strategy: %q", cfg.AuthzStrategy)
+		return securitySetup{}, fmt.Errorf("unknown authz strategy: %q", cfg.AuthzStrategy)
 	}
 	authnEnabled := cfg.AuthnStrategy != "" && cfg.AuthnStrategy != "none"
 	authzEnabled := cfg.AuthzStrategy != "" && cfg.AuthzStrategy != "none"
 	if authnEnabled != authzEnabled {
-		return nil, fmt.Errorf("authentication and authorization must be enabled together")
+		return securitySetup{}, fmt.Errorf("authentication and authorization must be enabled together")
+	}
+	if cfg.AuthzStrategy == "mesh" && cfg.MeshUpdateSubject == "" {
+		return securitySetup{}, fmt.Errorf("mesh update subject is required for native mesh authorization")
+	}
+
+	var meshAuthorizer *meshauthz.Authorizer
+	if cfg.AuthzStrategy == "mesh" {
+		meshAuthorizer = meshauthz.New()
+		if cfg.MeshPolicyFile != "" {
+			if err := meshAuthorizer.LoadFile(ctx, cfg.MeshPolicyFile); err != nil {
+				return securitySetup{}, fmt.Errorf("load initial mesh policy: %w", err)
+			}
+		}
 	}
 
 	var opts []eqsvcgrpc.Option
+	var authenticator authn.Authenticator
 	switch cfg.AuthnStrategy {
 	case "jwt":
-		authenticator, err := jwtauthn.New(jwtauthn.Config{
+		var err error
+		authenticator, err = jwtauthn.New(jwtauthn.Config{
 			JWKSURL:             cfg.AuthJWKSURL,
 			JWKSFile:            cfg.AuthJWKSFile,
+			JWKSAuthTokenFile:   cfg.AuthJWKSTokenFile,
 			Issuer:              cfg.AuthIssuer,
 			Audience:            cfg.AuthAudience,
 			CAFile:              cfg.AuthCAFile,
@@ -209,12 +241,26 @@ func securityOptions(cfg Config, mp metric.MeterProvider) ([]eqsvcgrpc.Option, e
 			HTTPTimeout:         cfg.AuthHTTPTimeout,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("configure JWT authentication: %w", err)
+			return securitySetup{}, fmt.Errorf("configure JWT authentication: %w", err)
 		}
 		opts = append(opts, eqsvcgrpc.WithAuthenticator(authenticator))
 	case "", "none":
 	}
+
+	var meshHandler http.Handler
 	switch cfg.AuthzStrategy {
+	case "mesh":
+		handler, err := meshauthz.NewMeshDataHandler(
+			meshAuthorizer,
+			authenticator,
+			cfg.MeshUpdateSubject,
+		)
+		if err != nil {
+			_ = authenticator.Close()
+			return securitySetup{}, fmt.Errorf("configure mesh update handler: %w", err)
+		}
+		meshHandler = handler
+		opts = append(opts, eqsvcgrpc.WithAuthorizer(meshAuthorizer))
 	case "opahttp":
 		opts = append(opts, eqsvcgrpc.WithAuthorizer(opahttp.New(
 			opahttp.WithHostURL(cfg.OPAURL),
@@ -223,5 +269,5 @@ func securityOptions(cfg Config, mp metric.MeterProvider) ([]eqsvcgrpc.Option, e
 		)))
 	case "", "none":
 	}
-	return opts, nil
+	return securitySetup{serviceOptions: opts, meshHandler: meshHandler}, nil
 }

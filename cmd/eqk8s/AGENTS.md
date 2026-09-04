@@ -5,28 +5,31 @@
 
 ## What This Operator Does
 
-The eqk8s operator manages OPA authorization policy for the EntroQ queue-based
+The eqk8s operator manages authorization policy for the EntroQ queue-based
 service mesh. It watches two CRDs across all namespaces:
 
 - `EntroQQueue` -- declares queue patterns and which caller labels may access them
 - `EntroQIdentity` -- maps k8s service accounts to mesh label claims
 
 On each reconcile, it builds a mesh document and:
-1. Writes it to a ConfigMap (`entroq-mesh` in `--mesh-configmap-namespace`) for OPA startup durability
-2. PUTs it to OPA's data API at `/v1/data/mesh` for immediate effect
+1. Writes it to a ConfigMap (`entroq-mesh` in `--mesh-configmap-namespace`) for startup durability
+2. PUTs it to the active policy endpoint at `/v1/data/mesh` for immediate effect
+
+The default endpoint is EntroQ's native mesh authorizer. External OPA remains
+supported because its data API uses the same path and document shape.
 
 ## Project Layout
 
 ```
 api/v1alpha1/          CRD types (EntroQQueue, EntroQIdentity)
-internal/controller/   MeshReconciler -- watches CRDs, pushes mesh to OPA
+internal/controller/   MeshReconciler -- watches CRDs, publishes mesh policy
 internal/webhook/      Validating admission webhook for both CRDs
 cmd/main.go            Manager entry point
 config/crd/bases/      Generated CRDs -- do not edit (regenerate with make manifests)
 config/rbac/role.yaml  Generated RBAC -- do not edit (regenerate with make manifests)
 config/webhook/        Generated ValidatingWebhookConfiguration -- do not edit
 config/samples/        Example CRs -- edit these
-pkg/eqk8s/             OPAClient, OPAMesh types (shared with other packages)
+pkg/eqk8s/             MeshClient and mesh document types
 ```
 
 ## Auto-Generated Files -- Never Edit Directly
@@ -47,9 +50,11 @@ doc comments -- controller-gen only finds them as package-level declarations).
 ## Key Flags
 
 ```
---opa-url                    OPA base URL (default http://localhost:8181)
+--mesh-url                   Policy endpoint base URL (default http://localhost:9100)
+--opa-url                    Deprecated compatibility alias for --mesh-url
+--authz-token-file           Rotating bearer token used for authenticated updates
 --mesh-configmap-namespace   Namespace for the entroq-mesh ConfigMap (default entroq-system)
---resync-interval            How often to re-push mesh to OPA (default 5m)
+--resync-interval            How often to re-push mesh policy (default 5m)
 --enable-webhook             Start the validating webhook server (default false; requires TLS)
 ```
 
@@ -68,19 +73,12 @@ docker build -t eqk8s-operator:dev -f cmd/eqk8s/Dockerfile .
 kubectl apply -k cmd/eqk8s/config/default/
 
 # Run locally (no webhook):
-go run ./cmd/eqk8s/cmd/main.go --opa-url http://localhost:8181
+go run ./cmd/eqk8s/cmd/main.go --mesh-url http://localhost:9100
 ```
 
-## Minikube Note
+## Kubernetes OIDC discovery
 
-The k8s OIDC JWKS endpoint is not anonymously accessible in Minikube by default.
-The EntroQ service authenticator needs it to verify SA JWTs. Fix once per cluster:
-
-```bash
-kubectl create clusterrolebinding oidc-discovery-anonymous \
-  --clusterrole=system:service-account-issuer-discovery \
-  --group=system:unauthenticated
-```
-
-This is correct per the OIDC spec -- JWKS endpoints contain only public keys.
-Production clusters (GKE, EKS, AKS) already allow anonymous JWKS access.
+The EntroQ service authenticates OIDC JWKS requests with its mounted
+service-account token. Do not enable anonymous API-server access for this;
+the default `system:service-account-issuer-discovery` binding already grants
+service accounts access to the discovery and JWKS endpoints.

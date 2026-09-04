@@ -2,14 +2,15 @@
 # Override with: helm install entroq ./charts/entroq -f my-values.yaml
 # or:           helm install entroq ./charts/entroq --set key=value
 
-# -- Operator: watches EntroQQueue and EntroQIdentity CRDs, pushes OPA policy.
+# -- Operator: watches EntroQQueue and EntroQIdentity CRDs, pushes mesh policy.
 operator:
   enabled: true
   image:
     repository: entroq-operator
     tag: ""            # defaults to .Chart.AppVersion
     pullPolicy: IfNotPresent
-  opaUrl: "http://entroq.entroq-system.svc.cluster.local:8181"
+  # Blank selects the in-chart EntroQ or OPA endpoint for the chosen strategy.
+  meshUrl: ""
   resyncInterval: 5m
   meshConfigMapNamespace: entroq-system
   resources:
@@ -20,14 +21,14 @@ operator:
       cpu: 500m
       memory: 128Mi
 
-# -- EntroQ server + OPA sidecar.
+# -- EntroQ server and authorization policy.
 entroq:
   enabled: true
 
-  # Authorization strategy. opahttp runs the bundled OPA sidecar; none exposes
-  # an explicitly open EntroQ service and omits all OPA-only resources.
+  # Authorization strategy. mesh uses EntroQ's native Kubernetes label policy;
+  # opahttp runs the bundled OPA sidecar; none is explicitly unsecured.
   authorization:
-    strategy: opahttp
+    strategy: mesh
     opaUrl: "http://localhost:8181"
     opaPath: ""
 
@@ -74,7 +75,7 @@ entroq:
     existingSecret: ""    # use a pre-existing Secret instead (recommended for production)
     db: 0
 
-  # OPA sidecar.
+  # Optional external-policy OPA sidecar, used only with strategy=opahttp.
   opa:
     image:
       repository: openpolicyagent/opa
@@ -83,11 +84,13 @@ entroq:
     # decisionLogs: true   # emit structured auth decisions to stdout (verbose)
     # debug: true          # debug-level OPA authorization logging
 
-  # Kubernetes JWT authentication performed by the EntroQ service before OPA.
+  # Kubernetes JWT authentication performed by the EntroQ service.
   # Obtain cluster-specific values from:
   #   kubectl get --raw /.well-known/openid-configuration
   auth:
     jwksUrl: "https://kubernetes.default.svc/openid/v1/jwks"
+    # Clear this when jwksUrl is a public endpoint outside the cluster.
+    jwksTokenFile: "/var/run/secrets/kubernetes.io/serviceaccount/token"
     audience: "https://kubernetes.default.svc.cluster.local"
     issuer:   "https://kubernetes.default.svc.cluster.local"
     caFile:   "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
@@ -99,6 +102,7 @@ entroq:
 
   service:
     grpcPort: 37706
+    httpPort: 9100
     opaPort: 8181
 
   resources:
@@ -116,9 +120,3 @@ entroq:
       limits:
         cpu: 250m
         memory: 128Mi
-
-# -- OIDC discovery RBAC.
-# Set true on Minikube or clusters that restrict anonymous JWKS access.
-# Most managed clusters (GKE, EKS, AKS) already allow it.
-oidcDiscovery:
-  grantAnonymous: false

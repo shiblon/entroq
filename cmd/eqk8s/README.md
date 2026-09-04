@@ -1,14 +1,10 @@
 # eqk8s — EntroQ Kubernetes Operator
 
-eqk8s is a Kubernetes operator that manages OPA authorization policies for
-EntroQ deployments. It watches two custom resource types — `EntroQQueue` and
-`EntroQIdentity` — and continuously pushes a mesh authorization document to OPA
-so the EntroQ server can enforce fine-grained access control without restarts or
-manual data API calls.
-
-See `pkg/authz/opadata/OPA_AUTHZ.md` in the main repository for a detailed
-explanation of the verified-principal contract and how OPA authorization
-integrates with the EntroQ gRPC and HTTP servers.
+eqk8s manages authorization policy for EntroQ deployments. It watches
+`EntroQQueue` and `EntroQIdentity` resources and continuously publishes a mesh
+authorization document so policy changes take effect without service restarts.
+EntroQ's native mesh authorizer is the default; an external OPA endpoint can
+consume the same document when custom Rego is required.
 
 ---
 
@@ -25,26 +21,24 @@ EntroQIdentity CRDs        EntroQQueue CRDs
                      │
           ┌──────────┴──────────┐
           ▼                     ▼
-   OPA data API          ConfigMap
+   Policy endpoint       ConfigMap
   PUT /v1/data/mesh    entroq-mesh
-  (live updates)      (startup volume)
-                             │
-                    OPA sidecar reads on boot
-                             │
-                      EntroQ server
-               verifies JWT, then checks
-               data.entroq.authz.allow
-               for every gRPC / HTTP call
+  (live updates)      (startup policy)
+          │                     │
+          └──────────┬──────────┘
+                     ▼
+               EntroQ server
+         verifies JWT, then applies
+         queue and namespace policy
 ```
 
 Every time an `EntroQQueue` or `EntroQIdentity` resource is created, updated, or
 deleted anywhere in the cluster, the reconciler:
 
 1. Lists all `EntroQQueue` and `EntroQIdentity` resources across all namespaces.
-2. Builds an `OPAMesh` document from them.
-3. `PUT`s it to `http://localhost:8181/v1/data/mesh` (OPA's data API).
-4. Writes it to the `entroq-mesh` ConfigMap so OPA can load it on startup via a
-   volume mount.
+2. Builds a `MeshDocument` from them.
+3. Writes it to the `entroq-mesh` ConfigMap for startup durability.
+4. Authenticates and `PUT`s it to `/v1/data/mesh` for immediate effect.
 
 ---
 
@@ -127,8 +121,7 @@ and document-store access for a service.
 
 ## Authorization Logic
 
-The k8s OPA provider (loaded from `conf/providers/k8s/`) derives allowed access
-from three sources:
+The built-in Kubernetes policy derives allowed access from three sources:
 
 ### 1. Auto-grant (always on, no CRD needed)
 
@@ -148,10 +141,8 @@ For cross-service calls, the caller's labels (from `EntroQIdentity`) are checked
 against each queue or namespace policy (from `EntroQQueue`). If the caller's
 labels satisfy any `allowedCallers` entry in a policy, access is granted.
 
-If `data.mesh.initialized` is false or absent — meaning OPA just restarted and
-the operator hasn't reconciled yet — mesh grants are suppressed. Auto-grants
-still fire. This prevents a temporarily uninitialized OPA from becoming an open
-gateway.
+Before an initialized mesh document has been loaded, mesh grants are suppressed
+and only auto-grants fire. A missing policy therefore fails closed.
 
 ### 3. Response queue grant (automatic)
 
@@ -164,10 +155,11 @@ every nonce.
 
 ## The Mesh Document
 
-You can inspect the current mesh document pushed to OPA at any time:
+You can inspect the startup-durable mesh document at any time:
 
 ```bash
-curl http://localhost:8181/v1/data/mesh | jq .
+kubectl get configmap -n entroq-system entroq-mesh \
+  -o jsonpath='{.data.mesh\.json}' | jq .
 ```
 
 Example output (with namespace policies added):
@@ -258,34 +250,26 @@ kubectl apply -k config/samples/
 This creates an example `EntroQIdentity` and an `EntroQQueue` (with both queue
 and namespace policies) in the `default` namespace.
 
-### Configure OPA
-
-From the repository root, load the core and k8s provider policies — **not** the
-OIDC provider; the two provider sets define overlapping packages and will
-conflict if loaded together.
-
-```bash
-opa run --server \
-  --bundle ./pkg/authz/opadata/conf/core/ \
-  --bundle ./pkg/authz/opadata/conf/providers/k8s/
-```
-
-Point the EntroQ server at it:
+### Configure native mesh authorization
 
 ```bash
 eqpg serve \
   --authn jwt \
   --auth_jwks_url https://kubernetes.default.svc/openid/v1/jwks \
+  --auth_jwks_token_file /var/run/secrets/kubernetes.io/serviceaccount/token \
   --auth_issuer https://kubernetes.default.svc.cluster.local \
   --auth_audience https://kubernetes.default.svc.cluster.local \
   --auth_ca_file /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
-  --authz opahttp \
-  --opa_url http://localhost:8181 \
-  --opa_path /v1/data/entroq/authz \
+  --authz mesh \
+  --mesh_policy_file /etc/entroq/mesh/mesh.json \
+  --mesh_update_subject system:serviceaccount:eqk8s-system:eqk8s-controller-manager \
   ...
 ```
 
-The Helm chart (`charts/entroq/`) wires all of this together automatically.
+The Helm chart (`charts/entroq/`) mounts the policy ConfigMap, projects a
+rotating operator token, and wires the update endpoint automatically. Select
+`entroq.authorization.strategy=opahttp` to run the bundled OPA sidecar for
+custom Rego policy.
 
 ---
 

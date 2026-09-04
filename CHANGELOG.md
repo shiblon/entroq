@@ -7,6 +7,22 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Native Kubernetes mesh authorization.** Backend service commands accept
+  `--authz=mesh`, load startup-durable policy from the operator's ConfigMap,
+  and accept authenticated atomic updates at `PUT /v1/data/mesh`. Kubernetes
+  label matchers provide AND-within and OR-across grouping without an OPA
+  sidecar; `opahttp` remains available for custom Rego policy.
+
+### Changed
+
+- **Authenticated Kubernetes JWKS discovery.** Services can read a rotating
+  bearer token from `--auth_jwks_token_file` for JWKS requests. The Helm chart
+  uses its service-account token instead of requiring anonymous API access.
+
 ## [1.9.0] - 2026-09-02
 
 Go module `v1.9.0`. No PostgreSQL schema changes. The Python client is

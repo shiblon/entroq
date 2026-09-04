@@ -14,6 +14,12 @@ spec:
     port: {{ .Values.entroq.service.grpcPort }}
     targetPort: {{ .Values.entroq.service.grpcPort }}
     protocol: TCP
+  {{- if eq .Values.entroq.authorization.strategy "mesh" }}
+  - name: http
+    port: {{ .Values.entroq.service.httpPort }}
+    targetPort: {{ .Values.entroq.service.httpPort }}
+    protocol: TCP
+  {{- end }}
   {{- if eq .Values.entroq.authorization.strategy "opahttp" }}
   - name: opa
     port: {{ .Values.entroq.service.opaPort }}

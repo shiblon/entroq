@@ -11,8 +11,8 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-// Authorizer is an abstraction over Rego policy. Provide one of these to
-// manage policy files and changes. The query is expected to return a nil error
+// Authorizer is an abstraction over authorization policy. The implementation
+// is expected to return a nil error
 // when authorized, and a non-nil error when not authorized (or something else
 // goes wrong). If the non-nil error is an AuthzError, it can be unpacked for
 // information about which queues and actions were disallowed.
@@ -43,14 +43,14 @@ const (
 	All    Action = "*"
 )
 
-// Request contains an authorization request to send to OPA.
+// Request contains an authorization request.
 type Request struct {
 	// Principal contains identity facts established by the EntroQ service's
 	// Authenticator. It is constructed inside the trusted service boundary and
 	// must never be populated from request payload fields.
 	Principal *authn.VerifiedPrincipal `json:"principal"`
-	// ClaimantId is the claimant ID supplied by the caller on the wire. OPA
-	// policy can enforce that this matches Principal.Subject to prevent
+	// ClaimantId is the claimant ID supplied by the caller on the wire. Policy
+	// can enforce that this matches Principal.Subject to prevent
 	// impersonation.
 	ClaimantId string `json:"claimant_id,omitempty"`
 	// Queues contains information about what is desired: what queues to
@@ -108,7 +108,7 @@ func (q *Queue) String() string {
 	return strings.Join(vals, " ")
 }
 
-// AuthzError contains the reply from OPA.
+// AuthzError describes an authorization denial.
 type AuthzError struct {
 	// If Allow is true, then authorization succeeded and we can proceed.
 	// The reason we don't just go with "empty error and failures" is that

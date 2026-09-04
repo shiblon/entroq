@@ -254,6 +254,80 @@ func TestJWKSRedirectCannotDowngradeHTTPS(t *testing.T) {
 	}
 }
 
+func TestJWKSBearerTokenFileIsReread(t *testing.T) {
+	key := testKey(t)
+	wantToken := atomic.Value{}
+	wantToken.Store("token-one")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.Header.Get("Authorization"), "Bearer "+wantToken.Load().(string); got != want {
+			http.Error(w, "wrong bearer token", http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write(testJWKS(key, "key-1"))
+	}))
+	t.Cleanup(server.Close)
+
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("token-one\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config := testConfig(server.URL)
+	config.JWKSAuthTokenFile = tokenFile
+	authenticator, err := New(config)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = authenticator.Close() })
+
+	if _, err := authenticator.fetchKeys(); err != nil {
+		t.Fatalf("first fetchKeys: %v", err)
+	}
+	wantToken.Store("token-two")
+	if err := os.WriteFile(tokenFile, []byte("token-two\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authenticator.fetchKeys(); err != nil {
+		t.Fatalf("second fetchKeys after token rotation: %v", err)
+	}
+}
+
+func TestJWKSBearerTokenIsNotForwardedAcrossOrigins(t *testing.T) {
+	key := testKey(t)
+	received := make(chan string, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- r.Header.Get("Authorization")
+		_, _ = w.Write(testJWKS(key, "key-1"))
+	}))
+	t.Cleanup(target.Close)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer private-token" {
+			http.Error(w, "missing bearer token", http.StatusUnauthorized)
+			return
+		}
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	t.Cleanup(origin.Close)
+
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("private-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config := testConfig(origin.URL)
+	config.JWKSAuthTokenFile = tokenFile
+	authenticator, err := New(config)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = authenticator.Close() })
+
+	if _, err := authenticator.fetchKeys(); err != nil {
+		t.Fatalf("fetchKeys: %v", err)
+	}
+	if got := <-received; got != "" {
+		t.Fatalf("cross-origin Authorization header = %q, want empty", got)
+	}
+}
+
 func TestAuthenticateClassifiesJWKSFailureAsUnavailable(t *testing.T) {
 	key := testKey(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

@@ -18,6 +18,7 @@ package main
 
 import (
 	"crypto/tls"
+	"errors"
 	"flag"
 	"os"
 	"time"
@@ -64,7 +65,7 @@ func main() {
 	var enableLeaderElection bool
 	var probeAddr string
 	var secureMetrics bool
-	var opaURL string
+	var meshURL, legacyOPAURL, authzTokenFile string
 	var resyncInterval time.Duration
 	var meshConfigMapNamespace string
 	var enableWebhook bool
@@ -85,9 +86,11 @@ func main() {
 		"The directory that contains the metrics server certificate.")
 	flag.StringVar(&metricsCertName, "metrics-cert-name", "tls.crt", "The name of the metrics server certificate file.")
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
-	flag.StringVar(&opaURL, "opa-url", "http://localhost:8181", "Base URL of the OPA instance.")
-	flag.DurationVar(&resyncInterval, "resync-interval", 5*time.Minute, "How often the reconciler re-pushes the mesh document to OPA, regardless of CRD changes.")
-	flag.StringVar(&meshConfigMapNamespace, "mesh-configmap-namespace", "entroq-system", "Namespace for the entroq-mesh ConfigMap that OPA mounts on startup.")
+	flag.StringVar(&meshURL, "mesh-url", "http://localhost:9100", "Base URL of the mesh policy endpoint.")
+	flag.StringVar(&legacyOPAURL, "opa-url", "", "Deprecated alias for --mesh-url.")
+	flag.StringVar(&authzTokenFile, "authz-token-file", "", "Bearer-token file read for every mesh policy update.")
+	flag.DurationVar(&resyncInterval, "resync-interval", 5*time.Minute, "How often the reconciler re-pushes the mesh document, regardless of CRD changes.")
+	flag.StringVar(&meshConfigMapNamespace, "mesh-configmap-namespace", "entroq-system", "Namespace for the startup-durable entroq-mesh ConfigMap.")
 	flag.BoolVar(&enableWebhook, "enable-webhook", false, "Start the validating admission webhook server. Requires TLS certificates; disabled by default for local development.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
@@ -98,6 +101,14 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	if legacyOPAURL != "" {
+		if meshURL != "http://localhost:9100" && meshURL != legacyOPAURL {
+			setupLog.Error(errors.New("conflicting mesh endpoint flags"), "--mesh-url and deprecated --opa-url disagree")
+			os.Exit(1)
+		}
+		meshURL = legacyOPAURL
+		setupLog.Info("--opa-url is deprecated; use --mesh-url")
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -185,10 +196,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	meshClientOptions := []eqk8s.MeshClientOption{eqk8s.WithMeshURL(meshURL)}
+	if authzTokenFile != "" {
+		meshClientOptions = append(meshClientOptions, eqk8s.WithAuthzTokenFile(authzTokenFile))
+	}
 	if err := (&controller.MeshReconciler{
 		Client:                 mgr.GetClient(),
 		Scheme:                 mgr.GetScheme(),
-		OPAClient:              eqk8s.NewOPAClient(eqk8s.WithOPAURL(opaURL)),
+		MeshClient:             eqk8s.NewMeshClient(meshClientOptions...),
 		ResyncInterval:         resyncInterval,
 		MeshConfigMapNamespace: meshConfigMapNamespace,
 	}).SetupWithManager(mgr); err != nil {

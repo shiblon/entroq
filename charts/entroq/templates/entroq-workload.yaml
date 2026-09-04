@@ -1,8 +1,10 @@
 {{- if .Values.entroq.enabled -}}
 {{- $authzStrategy := .Values.entroq.authorization.strategy -}}
-{{- if not (has $authzStrategy (list "none" "opahttp")) -}}
-{{- fail (printf "entroq.authorization.strategy must be none or opahttp, got %q" $authzStrategy) -}}
+{{- if not (has $authzStrategy (list "none" "mesh" "opahttp")) -}}
+{{- fail (printf "entroq.authorization.strategy must be none, mesh, or opahttp, got %q" $authzStrategy) -}}
 {{- end -}}
+{{- $usesAuthz := ne $authzStrategy "none" -}}
+{{- $usesMesh := eq $authzStrategy "mesh" -}}
 {{- $usesOPA := eq $authzStrategy "opahttp" -}}
 {{- $backend := .Values.entroq.backend.type -}}
 {{- $isJournal  := eq $backend "journal"  -}}
@@ -33,9 +35,14 @@ spec:
         imagePullPolicy: {{ .Values.entroq.images.pullPolicy }}
         args:
         - serve
-        {{- if $usesOPA }}
+        - --port={{ .Values.entroq.service.grpcPort }}
+        - --http_port={{ .Values.entroq.service.httpPort }}
+        {{- if $usesAuthz }}
         - --authn=jwt
         - --auth_jwks_url={{ .Values.entroq.auth.jwksUrl }}
+        {{- if .Values.entroq.auth.jwksTokenFile }}
+        - --auth_jwks_token_file={{ .Values.entroq.auth.jwksTokenFile }}
+        {{- end }}
         - --auth_issuer={{ .Values.entroq.auth.issuer }}
         - --auth_audience={{ .Values.entroq.auth.audience }}
         - --auth_ca_file={{ .Values.entroq.auth.caFile }}
@@ -44,10 +51,15 @@ spec:
         - --auth_jwks_cache_ttl={{ .Values.entroq.auth.jwksCacheTTL }}
         - --auth_jwks_refresh_interval={{ .Values.entroq.auth.jwksRefreshInterval }}
         - --auth_http_timeout={{ .Values.entroq.auth.httpTimeout }}
-        - --authz=opahttp
+        - --authz={{ $authzStrategy }}
+        {{- if $usesMesh }}
+        - --mesh_policy_file=/etc/entroq/mesh/mesh.json
+        - --mesh_update_subject=system:serviceaccount:eqk8s-system:eqk8s-controller-manager
+        {{- else if $usesOPA }}
         - --opa_url={{ .Values.entroq.authorization.opaUrl }}
         {{- if .Values.entroq.authorization.opaPath }}
         - --opa_path={{ .Values.entroq.authorization.opaPath }}
+        {{- end }}
         {{- end }}
         {{- else }}
         - --authn=none
@@ -87,6 +99,10 @@ spec:
         ports:
         - containerPort: {{ .Values.entroq.service.grpcPort }}
           name: grpc
+        {{- if $usesMesh }}
+        - containerPort: {{ .Values.entroq.service.httpPort }}
+          name: http
+        {{- end }}
         readinessProbe:
           tcpSocket:
             port: {{ .Values.entroq.service.grpcPort }}
@@ -94,10 +110,17 @@ spec:
           periodSeconds: 5
         resources:
           {{- toYaml .Values.entroq.resources.entroq | nindent 10 }}
-        {{- if $isJournal }}
+        {{- if or $isJournal $usesMesh }}
         volumeMounts:
+        {{- if $isJournal }}
         - name: journal
           mountPath: {{ .Values.entroq.storage.mountPath }}
+        {{- end }}
+        {{- if $usesMesh }}
+        - name: mesh-policy
+          mountPath: /etc/entroq/mesh
+          readOnly: true
+        {{- end }}
         {{- end }}
 
       {{- if $usesOPA }}
@@ -134,11 +157,18 @@ spec:
           readOnly: true
       {{- end }}
 
+      {{- if or $usesOPA $usesMesh }}
       volumes:
       {{- if $usesOPA }}
       - name: opa-rego
         configMap:
           name: opa-rego
+      {{- end }}
+      {{- if $usesMesh }}
+      - name: mesh-policy
+        configMap:
+          name: entroq-mesh
+      {{- end }}
       {{- end }}
   {{- if $isJournal }}
   volumeClaimTemplates:

@@ -3,9 +3,12 @@
 Deploys the EntroQ queue-based service mesh:
 
 - **eqk8s operator** — watches `EntroQQueue` and `EntroQIdentity` CRDs,
-  maintains the OPA mesh authorization policy
-- **EntroQ server** — verifies Kubernetes service-account JWTs, then asks its
-  optional OPA sidecar to authorize queue and namespace operations
+  maintains mesh authorization policy
+- **EntroQ server** — verifies Kubernetes service-account JWTs and natively
+  authorizes queue and namespace operations using Kubernetes label matchers
+
+Set `entroq.authorization.strategy=opahttp` when custom Rego requires an
+external OPA policy engine.
 
 ## Prerequisites
 
@@ -40,14 +43,13 @@ are required — `IfNotPresent` (the chart default) finds them immediately.
 ```bash
 make helm-sync   # copies Rego files + CRDs into the chart (incremental)
 helm install entroq ./charts/entroq \
-  --set oidcDiscovery.grantAnonymous=true \
   --set entroq.images.mem.tag=dev \
   --set operator.image.tag=dev
 ```
 
-The `oidcDiscovery.grantAnonymous=true` flag grants anonymous read access
-to the k8s OIDC JWKS endpoint. Minikube denies this by default; most
-managed clusters (GKE, EKS, AKS) already allow it.
+EntroQ authenticates its JWKS request with its mounted service-account token.
+Kubernetes grants service accounts read access to the issuer-discovery endpoints,
+so the API server does not need anonymous access enabled.
 
 The `*.tag=dev` overrides tell the chart to use the locally built `dev`-tagged
 images instead of the release tag. Omit them when installing a released chart.
@@ -56,7 +58,7 @@ images instead of the release tag. Omit them when installing a released chart.
 
 ```bash
 kubectl get pods -A
-# entroq-system: entroq-* (2/2 Running)
+# entroq-system: entroq-* (1/1 Running)
 # eqk8s-system:  eqk8s-controller-manager-* (1/1 Running)
 ```
 
@@ -67,19 +69,20 @@ kubectl apply -f cmd/eqk8s/config/samples/entroq_v1alpha1_entroqqueue.yaml
 kubectl apply -f cmd/eqk8s/config/samples/entroq_v1alpha1_entroqidentity.yaml
 ```
 
-Verify the operator pushed the mesh document to OPA:
+Verify the operator published the mesh document:
 
 ```bash
-kubectl port-forward -n entroq-system svc/entroq 8182:8181 &
-curl -s http://localhost:8182/v1/data/mesh | jq .
+kubectl get configmap -n entroq-system entroq-mesh \
+  -o jsonpath='{.data.mesh\.json}' | jq .
 # expect: initialized=true, identities and queues populated
 ```
 
 ### 6. Test authorization
 
 ```bash
+AUDIENCE=https://kubernetes.default.svc.cluster.local
 kubectl create serviceaccount svc-a -n default
-TOKEN=$(kubectl create token svc-a -n default)
+TOKEN=$(kubectl create token svc-a -n default --audience="$AUDIENCE")
 
 kubectl port-forward -n entroq-system svc/entroq 37706:37706 &
 
@@ -91,7 +94,7 @@ go run ./cmd/eqc --svcaddr localhost:37706 \
 
 # Should be denied -- stranger has no mesh identity
 kubectl create serviceaccount stranger -n default
-TOKEN2=$(kubectl create token stranger -n default)
+TOKEN2=$(kubectl create token stranger -n default --audience="$AUDIENCE")
 go run ./cmd/eqc --svcaddr localhost:37706 \
   --authz_token "$TOKEN2" \
   --claimant "system:serviceaccount:default:stranger#test" \
@@ -183,15 +186,15 @@ Key values — override with `--set key=value` or `-f my-values.yaml`:
 | `entroq.storage.enabled` | `false` | `true` = StatefulSet + PVC (journaled); `false` = Deployment (memory-only) |
 | `entroq.storage.size` | `1Gi` | PVC size when storage is enabled |
 | `entroq.storage.storageClass` | `""` | StorageClass for PVC; blank = cluster default |
-| `entroq.authorization.strategy` | `opahttp` | `opahttp` runs the OPA sidecar; `none` exposes EntroQ without authorization |
+| `entroq.authorization.strategy` | `mesh` | `mesh` uses native label policy; `opahttp` runs the OPA sidecar; `none` is unsecured |
 | `entroq.authorization.opaUrl` | `http://localhost:8181` | OPA endpoint used by EntroQ when the strategy is `opahttp` |
 | `entroq.authorization.opaPath` | `""` | Optional OPA data path override; blank uses the client default |
-| `operator.opaUrl` | `http://entroq.entroq-system.svc.cluster.local:8181` | OPA endpoint the operator pushes mesh documents to |
+| `operator.meshUrl` | `""` | Policy endpoint override; blank selects the in-chart endpoint for the authorization strategy |
 | `operator.resyncInterval` | `5m` | How often to re-push the mesh document regardless of CRD changes |
-| `oidcDiscovery.grantAnonymous` | `false` | Set `true` on Minikube or clusters that restrict JWKS access |
 | `entroq.opa.decisionLogs` | unset | Set `true` to emit structured auth decisions to stdout (verbose) |
 | `entroq.opa.debug` | unset | Set `true` for OPA authorization debug logging |
 | `entroq.auth.jwksUrl` | cluster default | Override for non-standard cluster OIDC configurations |
+| `entroq.auth.jwksTokenFile` | service-account token | Bearer-token file for authenticated JWKS requests; clear for public external endpoints |
 | `entroq.auth.tokenCacheTTL` | `30s` | Maximum verified-token cache lifetime; `0s` disables it |
 | `entroq.auth.tokenCacheEntries` | `4096` | Maximum verified-token cache entries |
 | `entroq.auth.jwksCacheTTL` | `5m` | Signing-key cache lifetime |
@@ -199,15 +202,14 @@ Key values — override with `--set key=value` or `-f my-values.yaml`:
 See `values.yaml` for the full set of options.
 
 Setting `entroq.authorization.strategy=none` deliberately makes the queue
-service open to every client that can reach it and removes the bundled OPA
-container, policy ConfigMaps, and OPA Service port. Disable the operator too
-unless it is configured to publish to a separate OPA deployment:
+service open to every client that can reach it and removes policy-update
+resources. Disable the operator too unless it publishes to a separate policy
+endpoint:
 
 ```bash
 helm install entroq ./charts/entroq \
   --set entroq.authorization.strategy=none \
-  --set operator.enabled=false \
-  --set oidcDiscovery.grantAnonymous=false
+  --set operator.enabled=false
 ```
 
 ## Development Workflow
@@ -224,17 +226,17 @@ docker build -t entroq-operator:dev -f cmd/eqk8s/Dockerfile .
 
 # Sync chart and upgrade
 make helm-sync
-helm upgrade entroq ./charts/entroq --set oidcDiscovery.grantAnonymous=true --set entroq.images.mem.tag=dev --set operator.image.tag=dev
+helm upgrade entroq ./charts/entroq --set entroq.images.mem.tag=dev --set operator.image.tag=dev
 
 # Bounce the operator pod to pick up the new image
 kubectl rollout restart deployment -n eqk8s-system eqk8s-controller-manager
 ```
 
-After changing Rego files only (no image rebuild needed):
+After changing Rego files for `strategy=opahttp` only (no image rebuild needed):
 
 ```bash
 make helm-sync
-helm upgrade entroq ./charts/entroq --set oidcDiscovery.grantAnonymous=true --set entroq.images.mem.tag=dev --set operator.image.tag=dev
+helm upgrade entroq ./charts/entroq --set entroq.images.mem.tag=dev --set operator.image.tag=dev
 kubectl rollout restart deployment -n entroq-system entroq
 ```
 

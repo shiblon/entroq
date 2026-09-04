@@ -1,4 +1,8 @@
 {{- if .Values.operator.enabled }}
+{{- $usesMesh := eq .Values.entroq.authorization.strategy "mesh" -}}
+{{- $defaultPort := ternary .Values.entroq.service.httpPort .Values.entroq.service.opaPort $usesMesh -}}
+{{- $defaultMeshURL := printf "http://entroq.entroq-system.svc.cluster.local:%v" $defaultPort -}}
+{{- $meshURL := default $defaultMeshURL .Values.operator.meshUrl -}}
 # Leader election: allows the operator to acquire a lease so only one replica
 # is active at a time.
 apiVersion: rbac.authorization.k8s.io/v1
@@ -101,7 +105,10 @@ spec:
         - --leader-elect
         - --health-probe-bind-address=:8081
         - --metrics-secure=false
-        - --opa-url={{ .Values.operator.opaUrl }}
+        - --mesh-url={{ $meshURL }}
+        {{- if $usesMesh }}
+        - --authz-token-file=/var/run/secrets/entroq-auth/token
+        {{- end }}
         - --resync-interval={{ .Values.operator.resyncInterval }}
         - --mesh-configmap-namespace={{ .Values.operator.meshConfigMapNamespace }}
         ports:
@@ -119,12 +126,28 @@ spec:
             port: 8081
           initialDelaySeconds: 5
           periodSeconds: 10
+        {{- if $usesMesh }}
+        volumeMounts:
+        - name: entroq-auth-token
+          mountPath: /var/run/secrets/entroq-auth
+          readOnly: true
+        {{- end }}
         resources:
           {{- toYaml .Values.operator.resources | nindent 10 }}
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:
             drop: ["ALL"]
+      {{- if $usesMesh }}
+      volumes:
+      - name: entroq-auth-token
+        projected:
+          sources:
+          - serviceAccountToken:
+              path: token
+              audience: {{ .Values.entroq.auth.audience | quote }}
+              expirationSeconds: 3600
+      {{- end }}
       securityContext:
         runAsNonRoot: true
       terminationGracePeriodSeconds: 10

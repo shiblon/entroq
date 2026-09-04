@@ -81,7 +81,6 @@ esac
 case "$authz_strategy" in
     opahttp)
         operator_enabled=true
-        oidc_discovery=true
         opa_metric='        - --metric=opa=http://entroq.entroq-system.svc.cluster.local:8181/metrics'
         case "$opa_policy_mode" in
             full)
@@ -104,7 +103,6 @@ case "$authz_strategy" in
             exit 1
         fi
         operator_enabled=false
-        oidc_discovery=false
         opa_metric=
         authz_profile=none
         opa_path=/v1/data/entroq/authz
@@ -247,7 +245,6 @@ helm upgrade --install entroq "$entroq_source_root/charts/entroq" \
     --set "entroq.postgres.password=meshbench" \
     --set "entroq.resources.entroq.limits.cpu=${entroq_cpu_limit}" \
     --set "entroq.resources.opa.limits.cpu=${opa_cpu_limit}" \
-    --set "oidcDiscovery.grantAnonymous=${oidc_discovery}" \
     --wait \
     --timeout 3m
 

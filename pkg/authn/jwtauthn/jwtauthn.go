@@ -47,6 +47,9 @@ type Config struct {
 	JWKSURL string
 	// JWKSFile is a local key-set file, mutually exclusive with JWKSURL.
 	JWKSFile string
+	// JWKSAuthTokenFile is a bearer-token file read before each JWKS HTTP request.
+	// The token is sent only to the configured JWKS origin, never cross-origin redirects.
+	JWKSAuthTokenFile string
 	// Issuer is the required JWT issuer.
 	Issuer string
 	// Audience lists acceptable JWT audiences.
@@ -87,6 +90,36 @@ type cacheEntry struct {
 	digest    [sha256.Size]byte
 	principal authn.VerifiedPrincipal
 	until     time.Time
+}
+
+type bearerTokenFileTransport struct {
+	base      http.RoundTripper
+	tokenFile string
+	scheme    string
+	host      string
+}
+
+func (t *bearerTokenFileTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Scheme != t.scheme || req.URL.Host != t.host {
+		return t.base.RoundTrip(req)
+	}
+	token, err := os.ReadFile(t.tokenFile)
+	if err != nil {
+		return nil, fmt.Errorf("read JWKS bearer-token file: %w", err)
+	}
+	value := strings.TrimSpace(string(token))
+	if value == "" {
+		return nil, fmt.Errorf("JWKS bearer-token file is empty")
+	}
+	request := req.Clone(req.Context())
+	request.Header.Set("Authorization", "Bearer "+value)
+	return t.base.RoundTrip(request)
+}
+
+func (t *bearerTokenFileTransport) CloseIdleConnections() {
+	if closer, ok := t.base.(interface{ CloseIdleConnections() }); ok {
+		closer.CloseIdleConnections()
+	}
 }
 
 type verificationKey struct {
@@ -147,6 +180,9 @@ func New(config Config) (*Authenticator, error) {
 	if config.HTTPTimeout <= 0 {
 		return nil, fmt.Errorf("jwtauthn: HTTP timeout must be positive")
 	}
+	if config.JWKSAuthTokenFile != "" && config.JWKSURL == "" {
+		return nil, fmt.Errorf("jwtauthn: JWKS bearer-token file requires a JWKS URL")
+	}
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	if config.CAFile != "" {
@@ -174,8 +210,20 @@ func New(config Config) (*Authenticator, error) {
 		if err := validateJWKSURL(u); err != nil {
 			return nil, fmt.Errorf("jwtauthn: invalid JWKS URL: %w", err)
 		}
+		if config.JWKSAuthTokenFile != "" {
+			return newAuthenticator(config, &bearerTokenFileTransport{
+				base:      transport,
+				tokenFile: config.JWKSAuthTokenFile,
+				scheme:    u.Scheme,
+				host:      u.Host,
+			}), nil
+		}
 	}
 
+	return newAuthenticator(config, transport), nil
+}
+
+func newAuthenticator(config Config, transport http.RoundTripper) *Authenticator {
 	return &Authenticator{
 		config: config,
 		client: &http.Client{
@@ -189,7 +237,7 @@ func New(config Config) (*Authenticator, error) {
 			},
 		},
 		cache: make(map[[sha256.Size]byte]*list.Element),
-	}, nil
+	}
 }
 
 func validateJWKSURL(u *url.URL) error {

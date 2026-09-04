@@ -32,6 +32,9 @@ func TestBindFlagsDefaults(t *testing.T) {
 	if cfg.AuthTokenCacheTTL != 30*time.Second || cfg.AuthTokenCacheEntries != 4096 {
 		t.Fatalf("unexpected authentication cache defaults: %+v", cfg)
 	}
+	if cfg.MeshPolicyFile != "" || cfg.MeshUpdateSubject != "" {
+		t.Fatalf("unexpected mesh authorization defaults: %+v", cfg)
+	}
 }
 
 func TestServerKeepalivePolicyAcceptsDefaultClient(t *testing.T) {
@@ -81,5 +84,22 @@ func TestRunRejectsIncompleteSecurityBoundaryBeforeOpeningBackend(t *testing.T) 
 		if opened {
 			t.Fatal("backend opener called after security configuration failed")
 		}
+	}
+}
+
+func TestRunRequiresMeshUpdateSubjectBeforeOpeningBackend(t *testing.T) {
+	opened := false
+	err := Run(context.Background(), Config{
+		AuthnStrategy: "jwt",
+		AuthzStrategy: "mesh",
+	}, func(metric.MeterProvider) entroq.BackendOpener {
+		opened = true
+		return nil
+	}, "test")
+	if err == nil || !strings.Contains(err.Error(), "mesh update subject is required") {
+		t.Fatalf("Run error = %v, want missing mesh update subject", err)
+	}
+	if opened {
+		t.Fatal("backend opener called after incomplete mesh configuration")
 	}
 }

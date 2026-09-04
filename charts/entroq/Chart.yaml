@@ -2,8 +2,8 @@ apiVersion: v2
 name: entroq
 description: >
   EntroQ queue-based service mesh. Deploys the eqk8s operator (watches
-  EntroQQueue and EntroQIdentity CRDs, maintains OPA mesh authorization policy)
-  alongside an EntroQ server with an OPA sidecar.
+  EntroQQueue and EntroQIdentity CRDs and maintains mesh authorization policy)
+  alongside an EntroQ server.
 type: application
 version: 0.1.0
 appVersion: "0.1.0-rc4"
