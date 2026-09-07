@@ -20,13 +20,26 @@ spec:
     metadata:
       serverAddress: http://prometheus-operated.monitoring.svc.cluster.local:9090
       query: |
-        sum(
-          max by (type) (
-            entroq_queue_size{
-              queue="/greetings/svc-c/inbox",
-              type=~"available|claimed"
+        (
+          sum(
+            max by (type) (
+              entroq_queue_size{
+                queue="/greetings/svc-c/inbox",
+                type=~"available|claimed"
+              }
+            )
+          )
+          or vector(0)
+        )
+        +
+        (
+          max(
+            entroq_namespace_size{
+              doc_namespace="/greetings/svc-c/status",
+              type="total"
             }
           )
-        ) or vector(0)
+          or vector(0)
+        )
       threshold: "1"
       activationThreshold: "0"

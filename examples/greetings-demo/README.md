@@ -146,5 +146,10 @@ eqlink senders use request timeouts long enough to cover observation and pod
 startup.
 
 The Prometheus query counts available and claimed tasks, but not future tasks.
-That wakes svc-c for ready work, keeps its pod alive while a request is in
-flight, and lets delayed tasks remain dormant until they become available.
+It also includes docs in `/greetings/svc-c/status`, illustrating the status-doc
+pattern for a fan-out worker. This simple service does not create those docs, so
+that term remains zero here. A fan-out worker would atomically insert its root
+task and one status doc per workflow, then delete the doc only after all work
+completes. The status namespace is the autoscaling domain; each workflow's
+primary key remains internal rather than becoming a high-cardinality metric
+label.

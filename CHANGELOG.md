@@ -58,9 +58,10 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   document layout may change without a migration path.
 
 - **Queue-driven Kubernetes autoscaling.** The Helm chart can publish an
-  optional Prometheus `ServiceMonitor`, and the greetings demo includes a KEDA
-  `ScaledObject` that scales an eqlink receiver between zero and one replica
-  from its ready and claimed EntroQ task count.
+  optional Prometheus `ServiceMonitor`; the service exports queue and doc
+  namespace size gauges; and the greetings demo includes a KEDA `ScaledObject`
+  that scales an eqlink receiver between zero and one replica from queued work
+  or durable workflow-status docs.
 
 ### Removed
 

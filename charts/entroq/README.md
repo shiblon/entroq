@@ -186,9 +186,9 @@ helm install entroq ./charts/entroq \
 
 ## Queue-driven autoscaling
 
-EntroQ exports the per-queue gauge `entroq_queue_size` from `/metrics` on its
-HTTP port. Enable the optional Prometheus Operator `ServiceMonitor` to discover
-that endpoint:
+EntroQ exports the per-queue gauge `entroq_queue_size` and per-doc-namespace
+gauge `entroq_namespace_size` from `/metrics` on its HTTP port. Enable the
+optional Prometheus Operator `ServiceMonitor` to discover that endpoint:
 
 ```bash
 helm upgrade --install entroq ./charts/entroq \
@@ -208,12 +208,27 @@ while claimed tasks keep it alive until in-flight work finishes. Excluding
 `type="future"` avoids waking a worker solely for a task whose arrival time has
 not elapsed.
 
+Queue depth measures back pressure, not the lifetime of a workflow. A worker
+that fans out can consume its root task immediately and still have substantial
+work in flight. For those workflows, atomically submit the root task and one
+status doc in a namespace dedicated to that scalable worker pool. Give each
+workflow its own primary key, keep the status doc while any fan-out work is
+live, and delete it only when the workflow completes. The autoscaler adds the
+namespace's `type="total"` metric (selected by its `doc_namespace` label) to the
+runnable queue count, so either queued work or a live workflow keeps a replica
+running. Namespace strings may use path components by convention, making values
+such as `/payments/report/status` natural autoscaling domains without exposing
+per-workflow primary keys as Prometheus labels. The label is named
+`doc_namespace` to avoid colliding with the Kubernetes namespace label commonly
+attached by Prometheus discovery.
+
 The scaler's polling interval and the Prometheus scrape interval both contribute
 to cold-start latency. Set eqlink's `--request_timeout` longer than their
 combined worst case plus pod startup time, and set the scale-down cooldown
 longer than the metric interval. See
 [`examples/greetings-demo/k8s/svc-c-autoscaling.yaml`](../../examples/greetings-demo/k8s/svc-c-autoscaling.yaml)
-for a zero-to-one receiver.
+for a zero-to-one receiver. Its status-namespace term is dormant in the simple
+request-response demo, but shows the complete query for a fan-out worker.
 
 ## Configuration
 
