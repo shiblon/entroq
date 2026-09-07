@@ -303,6 +303,13 @@ See **[`examples/greetings-demo`](examples/greetings-demo)** for a working
 end-to-end example with three Python services, deployment manifests, and a
 step-by-step walkthrough.
 
+Queue receivers can scale to zero with KEDA while EntroQ durably holds their
+inbox work. The Helm chart can publish queue-depth metrics through an optional
+Prometheus `ServiceMonitor`; the greetings demo includes a zero-to-one eqlink
+receiver example. See the chart's
+[`Queue-driven autoscaling`](charts/entroq/README.md#queue-driven-autoscaling)
+section for the deployment contract.
+
 CRD reference (field-by-field, worked examples, policy verification):
 [`docs/mesh-policy.md`](docs/mesh-policy.md)
 

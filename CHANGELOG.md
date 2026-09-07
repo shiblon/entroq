@@ -57,6 +57,11 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   wire each role to its own queue, lease and claim ceiling. The API and the
   document layout may change without a migration path.
 
+- **Queue-driven Kubernetes autoscaling.** The Helm chart can publish an
+  optional Prometheus `ServiceMonitor`, and the greetings demo includes a KEDA
+  `ScaledObject` that scales an eqlink receiver between zero and one replica
+  from its ready and claimed EntroQ task count.
+
 ### Removed
 
 - **`examples/mr` and `examples/mrtest`.** Retired in favor of `pkg/eqmr`, with

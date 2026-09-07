@@ -6,6 +6,7 @@ metadata:
   namespace: entroq-system
   labels:
     {{- include "entroq.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
 spec:
   selector:
     {{- include "entroq.selectorLabels" . | nindent 4 }}
@@ -14,7 +15,7 @@ spec:
     port: {{ .Values.entroq.service.grpcPort }}
     targetPort: {{ .Values.entroq.service.grpcPort }}
     protocol: TCP
-  {{- if eq .Values.entroq.authorization.strategy "mesh" }}
+  {{- if or (eq .Values.entroq.authorization.strategy "mesh") .Values.entroq.metrics.serviceMonitor.enabled }}
   - name: http
     port: {{ .Values.entroq.service.httpPort }}
     targetPort: {{ .Values.entroq.service.httpPort }}

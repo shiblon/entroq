@@ -1,0 +1,21 @@
+{{- if and .Values.entroq.enabled .Values.entroq.metrics.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: entroq
+  namespace: entroq-system
+  labels:
+    {{- include "entroq.labels" . | nindent 4 }}
+    {{- with .Values.entroq.metrics.serviceMonitor.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "entroq.selectorLabels" . | nindent 6 }}
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: {{ .Values.entroq.metrics.serviceMonitor.interval }}
+    scrapeTimeout: {{ .Values.entroq.metrics.serviceMonitor.scrapeTimeout }}
+{{- end }}

@@ -1,0 +1,32 @@
+# Requires KEDA and a Prometheus server that scrapes the EntroQ ServiceMonitor.
+# Change serverAddress when Prometheus uses a different in-cluster address.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: svc-c
+  namespace: greetings
+spec:
+  scaleTargetRef:
+    name: svc-c
+  pollingInterval: 60
+  cooldownPeriod: 300
+  minReplicaCount: 0
+  maxReplicaCount: 1
+  fallback:
+    failureThreshold: 3
+    replicas: 1
+  triggers:
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus-operated.monitoring.svc.cluster.local:9090
+      query: |
+        sum(
+          max by (type) (
+            entroq_queue_size{
+              queue="/greetings/svc-c/inbox",
+              type=~"available|claimed"
+            }
+          )
+        ) or vector(0)
+      threshold: "1"
+      activationThreshold: "0"

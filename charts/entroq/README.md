@@ -16,6 +16,10 @@ external OPA policy engine.
 - A k8s cluster (see Minikube below for local development)
 - Images built and available to the cluster (see below)
 
+Prometheus Operator is optional. Install it before enabling the chart's
+`ServiceMonitor`; KEDA is also optional and is installed independently when
+workloads need queue-driven autoscaling.
+
 ## Quick Start (Minikube)
 
 ### 1. Start a fresh cluster
@@ -180,6 +184,37 @@ helm install entroq ./charts/entroq \
   --set entroq.redis.existingSecret=entroq-redis-credentials
 ```
 
+## Queue-driven autoscaling
+
+EntroQ exports the per-queue gauge `entroq_queue_size` from `/metrics` on its
+HTTP port. Enable the optional Prometheus Operator `ServiceMonitor` to discover
+that endpoint:
+
+```bash
+helm upgrade --install entroq ./charts/entroq \
+  --set entroq.metrics.serviceMonitor.enabled=true
+```
+
+The monitor scrapes once per minute by default. If the Prometheus installation
+selects monitors by label, pass the required labels through
+`entroq.metrics.serviceMonitor.additionalLabels` in a values file.
+
+KEDA and Prometheus are cluster-level dependencies and are not installed by
+this chart. Each application owns its `ScaledObject` beside the Deployment it
+scales, because the application knows its queue, concurrency, replica limits,
+and acceptable cold-start latency. For a receiver, scale on the sum of
+`type="available"` and `type="claimed"`: available tasks wake the Deployment,
+while claimed tasks keep it alive until in-flight work finishes. Excluding
+`type="future"` avoids waking a worker solely for a task whose arrival time has
+not elapsed.
+
+The scaler's polling interval and the Prometheus scrape interval both contribute
+to cold-start latency. Set eqlink's `--request_timeout` longer than their
+combined worst case plus pod startup time, and set the scale-down cooldown
+longer than the metric interval. See
+[`examples/greetings-demo/k8s/svc-c-autoscaling.yaml`](../../examples/greetings-demo/k8s/svc-c-autoscaling.yaml)
+for a zero-to-one receiver.
+
 ## Configuration
 
 Key values — override with `--set key=value` or `-f my-values.yaml`:
@@ -201,6 +236,10 @@ Key values — override with `--set key=value` or `-f my-values.yaml`:
 | `entroq.auth.tokenCacheTTL` | `30s` | Maximum verified-token cache lifetime; `0s` disables it |
 | `entroq.auth.tokenCacheEntries` | `4096` | Maximum verified-token cache entries |
 | `entroq.auth.jwksCacheTTL` | `5m` | Signing-key cache lifetime |
+| `entroq.metrics.serviceMonitor.enabled` | `false` | Create a Prometheus Operator `ServiceMonitor` for EntroQ metrics |
+| `entroq.metrics.serviceMonitor.interval` | `1m` | Prometheus scrape interval |
+| `entroq.metrics.serviceMonitor.scrapeTimeout` | `10s` | Timeout for each metrics scrape |
+| `entroq.metrics.serviceMonitor.additionalLabels` | `{}` | Labels required by the Prometheus monitor selector |
 
 See `values.yaml` for the full set of options.
 

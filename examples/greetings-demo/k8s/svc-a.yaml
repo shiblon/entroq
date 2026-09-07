@@ -44,4 +44,6 @@ spec:
         - --entroq=entroq.entroq-system.svc.cluster.local:37706
         - --queue=/greetings/svc-a
         - --namespace=greetings
+        # Covers svc-c's optional autoscaling observation and cold-start delay.
+        - --request_timeout=4m
         - --authz-token-file=/var/run/secrets/kubernetes.io/serviceaccount/token
