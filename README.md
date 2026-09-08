@@ -239,10 +239,11 @@ Unlike tasks, docs are not work items. They are durable shared state:
 configuration, counters, reduce output, or any data that multiple workers need
 to read or coordinate around.
 
-Docs can opt into the same built-in garbage collection as task queues by placing
-`/gc=<timestamp>` in their primary key. Once active, GC removes the entire
-`(namespace, primary key)` group atomically, and only while every member is
-unclaimed. Malformed `gc=` values are reported and never collected.
+Doc namespaces can opt into the same built-in garbage collection as task queues
+by placing `/gc=<timestamp>` in the namespace. Once active, GC removes each
+primary-key group atomically, and only while every member of that group is
+unclaimed. A claimed group does not prevent collection of other groups in the
+same namespace. Malformed `gc=` values are reported and never collected.
 
 Docs and tasks share the same `Modify` call, so you can atomically insert a
 task and its initial doc state, or delete a task and update a doc, in one round

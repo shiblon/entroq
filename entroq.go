@@ -263,11 +263,11 @@ func NormalizeArrival(at, now time.Time) time.Time {
 // to be used as the storage for task queues.
 //
 // Beyond these methods, a backend is expected to honor the /gc= path
-// convention for garbage-collected task queues and doc primary keys. Each
-// backend starts its own GC loop that pays attention to any queue or doc key
+// convention for garbage-collected task queues and doc namespaces. Each
+// backend starts its own GC loop that pays attention to any queue or namespace
 // whose /gc=<ts> activation has fired (ts <= now). It deletes available tasks
-// (At <= now), and atomically deletes complete (namespace, primary-key) doc
-// groups only when every member is available.
+// (At <= now), and atomically deletes complete primary-key groups from opted-in
+// namespaces only when every member of that group is available.
 //
 // Backends MAY implement GC loops more efficiently so long as the behavior is
 // equivalent to those task and doc-group semantics.

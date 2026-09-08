@@ -3,7 +3,7 @@
 //
 // # Garbage collection
 //
-// This backend garbage-collects on its own. Queues and doc primary keys that opt
+// This backend garbage-collects on its own. Queues and doc namespaces that opt
 // in by name (a /gc= component) have their arrived tasks or complete unclaimed
 // doc groups reaped by an always-on background loop started when the backend is
 // opened. It is a first-class backend behavior, not a separate process, so a

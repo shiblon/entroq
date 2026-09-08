@@ -73,6 +73,11 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Breaking: document GC is namespace-scoped.** A `gc` path marker now opts an
+  entire document namespace into garbage collection. Collection remains atomic
+  per primary-key group and skips claimed groups; markers in primary keys no
+  longer enable GC. This keeps lifecycle policy in the namespace and avoids
+  scanning documents in ordinary namespaces during every GC pass.
 - **Compound path policy markers and bounded session metrics.** A path component
   may contain ordered, semicolon-separated `key=value` parameters. Go and
   PostgreSQL share the same escape-aware semantics, and GC accepts `gc` in any

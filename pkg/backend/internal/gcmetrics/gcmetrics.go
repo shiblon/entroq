@@ -69,7 +69,7 @@ func queueAttrs(qname string) []attribute.KeyValue {
 	}
 }
 
-// Deleted records n items collected from a queue or doc primary key. n <= 0 and
+// Deleted records n items collected from a queue or doc namespace. n <= 0 and
 // a nil receiver are no-ops.
 func (m *Metrics) Deleted(ctx context.Context, qname string, n int) {
 	if m == nil || n <= 0 {

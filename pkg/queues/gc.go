@@ -41,7 +41,7 @@ func ParseGCActivation(value string) (time.Time, error) {
 // components. present is false when no /gc= component appears. When several are
 // present the most specific one wins: the last in path order. A malformed value
 // yields an error, and the caller must not collect the path on error. Backends
-// apply this to both task queue names and doc primary keys.
+// apply this to both task queue names and doc namespace names.
 func GCActivation(path string) (activateAt time.Time, present bool, err error) {
 	values := PathParams(path)["gc"]
 	if len(values) == 0 {
