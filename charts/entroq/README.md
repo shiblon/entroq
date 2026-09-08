@@ -199,6 +199,14 @@ The monitor scrapes once per minute by default. If the Prometheus installation
 selects monitors by label, pass the required labels through
 `entroq.metrics.serviceMonitor.additionalLabels` in a values file.
 
+Queue and namespace paths may mark a high-cardinality session component with a
+`sess` parameter. Before exporting metrics, EntroQ replaces any component that
+contains `sess` with `*` and aggregates the resulting series. For example, both
+`/workers/sess=a;gc=0/inbox` and `/workers/gc=0;sess=b/inbox` contribute to
+`/workers/*/inbox`. Queue and namespace statistics returned by the API remain
+literal; folding applies only to metrics. Counts are summed across folded queue
+series, while `type="maxClaims"` reports their maximum.
+
 KEDA and Prometheus are cluster-level dependencies and are not installed by
 this chart. Each application owns its `ScaledObject` beside the Deployment it
 scales, because the application knows its queue, concurrency, replica limits,

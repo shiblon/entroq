@@ -102,12 +102,12 @@ func TestGCMetricsEmitted(t *testing.T) {
 	}
 	defer b.Close()
 
-	// Three due tasks across two queues that share an l1 of "/metrics".
+	// Three due tasks across two session queues that fold to one hierarchy.
 	past := time.Now().Add(-time.Hour)
 	inserts := []struct{ id, queue string }{
-		{"m1", "/metrics/a/gc=0"},
-		{"m2", "/metrics/a/gc=0"},
-		{"m3", "/metrics/b/gc=0"},
+		{"m1", "/metrics/sess=a;gc=0/inbox"},
+		{"m2", "/metrics/sess=a;gc=0/inbox"},
+		{"m3", "/metrics/gc=0;sess=b/inbox"},
 	}
 	for _, c := range inserts {
 		if _, err := b.Modify(ctx, entroq.NewModification("",
@@ -142,11 +142,17 @@ func TestGCMetricsEmitted(t *testing.T) {
 			}
 			for _, dp := range sum.DataPoints {
 				total += dp.Value
-				l1, ok := dp.Attributes.Value(attribute.Key("l1"))
-				if !ok {
-					t.Errorf("data point missing l1 attribute: %v", dp.Attributes.ToSlice())
-				} else if l1.AsString() != "/metrics" {
-					t.Errorf("l1 = %q, want %q", l1.AsString(), "/metrics")
+				for key, want := range map[string]string{
+					"l1": "/metrics",
+					"l2": "/metrics/*",
+					"l3": "/metrics/*/inbox",
+				} {
+					got, ok := dp.Attributes.Value(attribute.Key(key))
+					if !ok {
+						t.Errorf("data point missing %s attribute: %v", key, dp.Attributes.ToSlice())
+					} else if got.AsString() != want {
+						t.Errorf("%s = %q, want %q", key, got.AsString(), want)
+					}
 				}
 			}
 		}

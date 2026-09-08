@@ -50,23 +50,29 @@ var gcGrammarVectors = []struct {
 	queue          string
 	malformed, due bool
 }{
-	{"/q/gc=0", false, true},                            // always on
-	{"/q/gc=/leaf", false, true},                        // empty value => always on
-	{"/q/gc=1", false, true},                            // unix seconds, 1970
-	{"/q/gc=946684800", false, true},                    // unix seconds, 2000
-	{"/q/gc=4102444800", false, false},                  // unix seconds, 2100 (future)
-	{"/q/gc=2000-01-01T00:00:00Z", false, true},         // RFC3339 past
-	{"/q/gc=2999-01-01T00:00:00Z", false, false},        // RFC3339 future
-	{"/q/gc=2000-01-01T00:00:00.000Z", false, true},     // JS toISOString, past
-	{"/q/gc=2000-01-01T00:00:00+00:00", false, true},    // Python aware isoformat, past
-	{"/q/gc=notatime", true, false},                     // malformed => never collect
-	{"/q/gc=12.5", true, false},                         // decimal => malformed
-	{"/q/gc=2000-01-01 00:00:00Z", true, false},         // space separator => malformed (strict)
-	{"/q/gc=2000-01-01", true, false},                   // bare date => malformed (strict)
-	{"/q/gc=2000-01-01T00:00:00", true, false},          // no timezone => malformed (strict)
-	{"/q/gc=2000-01-01T00:00:00+0000", true, false},     // colonless offset => malformed (strict)
-	{"/a/gc=0/b/gc=2999-01-01T00:00:00Z", false, false}, // last wins: future
-	{"/a/gc=2999-01-01T00:00:00Z/b/gc=0", false, true},  // last wins: always on
+	{"/q/gc=0", false, true},                                         // always on
+	{"/q/gc=/leaf", false, true},                                     // empty value => always on
+	{"/q/gc=1", false, true},                                         // unix seconds, 1970
+	{"/q/gc=946684800", false, true},                                 // unix seconds, 2000
+	{"/q/gc=4102444800", false, false},                               // unix seconds, 2100 (future)
+	{"/q/gc=2000-01-01T00:00:00Z", false, true},                      // RFC3339 past
+	{"/q/gc=2999-01-01T00:00:00Z", false, false},                     // RFC3339 future
+	{"/q/gc=2000-01-01T00:00:00.000Z", false, true},                  // JS toISOString, past
+	{"/q/gc=2000-01-01T00:00:00+00:00", false, true},                 // Python aware isoformat, past
+	{"/q/gc=notatime", true, false},                                  // malformed => never collect
+	{"/q/gc=12.5", true, false},                                      // decimal => malformed
+	{"/q/gc=2000-01-01 00:00:00Z", true, false},                      // space separator => malformed (strict)
+	{"/q/gc=2000-01-01", true, false},                                // bare date => malformed (strict)
+	{"/q/gc=2000-01-01T00:00:00", true, false},                       // no timezone => malformed (strict)
+	{"/q/gc=2000-01-01T00:00:00+0000", true, false},                  // colonless offset => malformed (strict)
+	{"/q/sess=abc;gc=0", false, true},                                // compound, gc last
+	{"/q/gc=0;sess=abc", false, true},                                // compound, gc first
+	{"/q/sess=abc;gc=/leaf", false, true},                            // compound empty value
+	{"/q/gc=;sess=abc/leaf", false, true},                            // compound empty value, gc first
+	{"/q/sess=abc;gc=notatime", true, false},                         // compound malformed
+	{"/a/gc=0/b/gc=2999-01-01T00:00:00Z", false, false},              // last wins: future
+	{"/a/gc=2999-01-01T00:00:00Z/b/gc=0", false, true},               // last wins: always on
+	{"/a/gc=2999-01-01T00:00:00Z;sess=a/b/sess=b;gc=0", false, true}, // last compound gc wins
 }
 
 // TestGCGrammarGoMatchesSQL guards against drift between queues.GCActivation
@@ -105,6 +111,87 @@ func TestGCGrammarGoMatchesSQL(t *testing.T) {
 		if goMalformed != sqlMalformed || goDue != sqlDue {
 			t.Errorf("%q: Go/SQL DISAGREE (go m=%v d=%v, sql m=%v d=%v) -- grammar drift",
 				v.queue, goMalformed, goDue, sqlMalformed, sqlDue)
+		}
+	}
+}
+
+func TestGCGrammarEscapedMarkersAreLiteral(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	b, err := Open(ctx, pgHostPort,
+		WithDB("postgres"), WithUsername("postgres"), WithPassword("password"),
+		WithConnectAttempts(10), withGCInterval(time.Hour))
+	if err != nil {
+		t.Fatalf("open backend: %v", err)
+	}
+	defer b.Close()
+
+	for _, queue := range []string{
+		`/q/name=value\;gc=0`,
+		`/q/name=value\/gc=0`,
+		`\/gc=0`,
+	} {
+		if _, present, err := queues.GCActivation(queue); err != nil || present {
+			t.Errorf("GCActivation(%q) = (present=%v, err=%v), want absent", queue, present, err)
+		}
+
+		var count int
+		var activation sql.NullTime
+		if err := b.DB.QueryRowContext(ctx,
+			"SELECT cardinality(entroq._path_param_values($1, 'gc')), entroq.gc_activation($1)",
+			queue,
+		).Scan(&count, &activation); err != nil {
+			t.Fatalf("parse %q: %v", queue, err)
+		}
+		if count != 0 || activation.Valid {
+			t.Errorf("SQL parse %q = (count=%d, activation=%v), want absent", queue, count, activation)
+		}
+	}
+}
+
+func TestGCQueuesDiscoversCompoundMarker(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	b, err := Open(ctx, pgHostPort,
+		WithDB("postgres"), WithUsername("postgres"), WithPassword("password"),
+		WithConnectAttempts(10), withGCInterval(time.Hour))
+	if err != nil {
+		t.Fatalf("open backend: %v", err)
+	}
+	defer b.Close()
+
+	compound := "/test/gc-discovery/sess=abc;gc=0"
+	literal := `/test/gc-discovery/name=abc\;gc=0`
+	if _, err := b.DB.ExecContext(ctx, `
+		INSERT INTO tasks (id, queue, at)
+		VALUES ($1, $2, now()), ($3, $4, now())
+	`, entroq.GenHex16(), compound, entroq.GenHex16(), literal); err != nil {
+		t.Fatalf("insert discovery candidates: %v", err)
+	}
+	defer func() {
+		if _, err := b.DB.ExecContext(context.Background(), "DELETE FROM tasks WHERE queue IN ($1, $2)", compound, literal); err != nil {
+			t.Errorf("clean up discovery candidates: %v", err)
+		}
+	}()
+
+	for _, test := range []struct {
+		queue string
+		want  bool
+	}{
+		{compound, true},
+		{literal, false},
+	} {
+		var found bool
+		if err := b.DB.QueryRowContext(ctx,
+			"SELECT EXISTS (SELECT 1 FROM entroq.gc_queues() WHERE queue = $1)",
+			test.queue,
+		).Scan(&found); err != nil {
+			t.Fatalf("discover %q: %v", test.queue, err)
+		}
+		if found != test.want {
+			t.Errorf("gc_queues contains %q = %v, want %v", test.queue, found, test.want)
 		}
 	}
 }

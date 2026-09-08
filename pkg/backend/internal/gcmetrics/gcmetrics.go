@@ -60,6 +60,7 @@ func New(meter metric.Meter) (*Metrics, error) {
 // metrics. It omits the raw queue name on purpose: raw queue is unbounded
 // cardinality, while l1/l2/l3 is bounded by hierarchy depth.
 func queueAttrs(qname string) []attribute.KeyValue {
+	qname = queues.FoldPathParam(qname, "sess")
 	l1, l2, l3 := queues.PathLabels(qname)
 	return []attribute.KeyValue{
 		attribute.String("l1", l1),

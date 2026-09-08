@@ -185,7 +185,7 @@ func (s *QSvc) initMetrics() error {
 			if err != nil {
 				log.Printf("eqsvcgrpc: queue stats for metrics: %v", err)
 			} else {
-				s.lastQueueStats = stats
+				s.lastQueueStats = foldQueueMetricStats(stats)
 				s.lastQueueRefresh = time.Now()
 			}
 		}
@@ -198,7 +198,7 @@ func (s *QSvc) initMetrics() error {
 			if err != nil {
 				log.Printf("eqsvcgrpc: namespace stats for metrics: %v", err)
 			} else {
-				s.lastNamespaceStats = stats
+				s.lastNamespaceStats = foldNamespaceMetricStats(stats)
 				s.lastNamespaceRefresh = time.Now()
 			}
 		}
@@ -209,6 +209,56 @@ func (s *QSvc) initMetrics() error {
 	}, queueGauge, namespaceGauge)
 
 	return err
+}
+
+// foldQueueMetricStats aggregates session-scoped queues before they become
+// metric label sets. Counts sum across queues; MaxClaims remains a maximum.
+func foldQueueMetricStats(stats map[string]*entroq.QueueStat) map[string]*entroq.QueueStat {
+	folded := make(map[string]*entroq.QueueStat, len(stats))
+	for name, stat := range stats {
+		name = queues.FoldPathParam(name, "sess")
+		aggregate := folded[name]
+		if aggregate == nil {
+			folded[name] = &entroq.QueueStat{
+				Name:      name,
+				Size:      stat.Size,
+				Claimed:   stat.Claimed,
+				Available: stat.Available,
+				Future:    stat.Future,
+				MaxClaims: stat.MaxClaims,
+			}
+			continue
+		}
+		aggregate.Size += stat.Size
+		aggregate.Claimed += stat.Claimed
+		aggregate.Available += stat.Available
+		aggregate.Future += stat.Future
+		if stat.MaxClaims > aggregate.MaxClaims {
+			aggregate.MaxClaims = stat.MaxClaims
+		}
+	}
+	return folded
+}
+
+// foldNamespaceMetricStats aggregates session-scoped doc namespaces before
+// they become metric label sets.
+func foldNamespaceMetricStats(stats map[string]*entroq.NamespaceStat) map[string]*entroq.NamespaceStat {
+	folded := make(map[string]*entroq.NamespaceStat, len(stats))
+	for name, stat := range stats {
+		name = queues.FoldPathParam(name, "sess")
+		aggregate := folded[name]
+		if aggregate == nil {
+			folded[name] = &entroq.NamespaceStat{
+				Name:    name,
+				Size:    stat.Size,
+				Claimed: stat.Claimed,
+			}
+			continue
+		}
+		aggregate.Size += stat.Size
+		aggregate.Claimed += stat.Claimed
+	}
+	return folded
 }
 
 // observeQueueStats reports queue stat values to the OTel observer. Must be
@@ -224,11 +274,11 @@ func (s *QSvc) observeQueueStats(o metric.Observer, gauge metric.Float64Observab
 			attribute.String("l3", l3),
 		}
 
-		for typ, val := range map[string]int32{
-			"total":     int32(stat.Size),
-			"claimed":   int32(stat.Claimed),
-			"available": int32(stat.Available),
-			"maxClaims": int32(stat.MaxClaims),
+		for typ, val := range map[string]int{
+			"total":     stat.Size,
+			"claimed":   stat.Claimed,
+			"available": stat.Available,
+			"maxClaims": stat.MaxClaims,
 		} {
 			attrs := append(base, attribute.String("type", typ))
 			o.ObserveFloat64(gauge, float64(val), metric.WithAttributes(attrs...))
@@ -249,9 +299,9 @@ func (s *QSvc) observeNamespaceStats(o metric.Observer, gauge metric.Float64Obse
 			attribute.String("l3", l3),
 		}
 
-		for typ, val := range map[string]int32{
-			"total":   int32(stat.Size),
-			"claimed": int32(stat.Claimed),
+		for typ, val := range map[string]int{
+			"total":   stat.Size,
+			"claimed": stat.Claimed,
 		} {
 			attrs := append(base, attribute.String("type", typ))
 			o.ObserveFloat64(gauge, float64(val), metric.WithAttributes(attrs...))

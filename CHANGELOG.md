@@ -73,6 +73,18 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Compound path policy markers and bounded session metrics.** A path component
+  may contain ordered, semicolon-separated `key=value` parameters. Go and
+  PostgreSQL share the same escape-aware semantics, and GC accepts `gc` in any
+  position within a compound component. Queue, namespace, and GC hierarchy
+  metrics replace components containing `sess` with `*` and aggregate their
+  values, preventing ephemeral EQLink sessions from creating unbounded
+  Prometheus series.
+- **Schema change (eqpg: 1.7.1 → 1.11.0).** Existing PostgreSQL deployments
+  must run `eqpg schema upgrade` before starting the upgraded service. The
+  backward-compatible update adds the compound-marker discovery index and the
+  general path-parameter parser; it does not rewrite stored task or document
+  data.
 - **Python worker failure policy.** Claim transport failures known to occur
   before submission retry with full-jitter exponential backoff. Ambiguous
   transport failures and unexpected handler exceptions return to the caller

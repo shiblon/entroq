@@ -48,6 +48,12 @@ func TestNamespace(t *testing.T) {
 			ok:    true,
 			want:  "some/thing",
 		},
+		{
+			name:  "escaped semicolon",
+			queue: "/ns=some\\;thing/hey",
+			ok:    true,
+			want:  "some;thing",
+		},
 	}
 
 	for _, test := range cases {
@@ -86,6 +92,30 @@ func TestPathParams(t *testing.T) {
 			},
 		},
 		{
+			name:  "compound params",
+			queue: "/tasks/sess=abc;gc=123/inbox",
+			want: map[string][]string{
+				"gc":   []string{"123"},
+				"sess": []string{"abc"},
+			},
+		},
+		{
+			name:  "compound params reverse order",
+			queue: "/tasks/gc=123;sess=abc/inbox",
+			want: map[string][]string{
+				"gc":   []string{"123"},
+				"sess": []string{"abc"},
+			},
+		},
+		{
+			name:  "repeated compound params preserve order",
+			queue: "/gc=100;sess=abc/sub/sess=def;gc=200",
+			want: map[string][]string{
+				"gc":   []string{"100", "200"},
+				"sess": []string{"abc", "def"},
+			},
+		},
+		{
 			name:  "escaped key",
 			queue: "/n\\/s=something/hey",
 			want: map[string][]string{
@@ -97,6 +127,22 @@ func TestPathParams(t *testing.T) {
 			queue: "/key=val\\/ue/hey",
 			want: map[string][]string{
 				"key": []string{"val/ue"},
+			},
+		},
+		{
+			name:  "escaped semicolon",
+			queue: "/key=val\\;ue;gc=123/hey",
+			want: map[string][]string{
+				"gc":  []string{"123"},
+				"key": []string{"val;ue"},
+			},
+		},
+		{
+			name:  "equals in value",
+			queue: "/key=left=right;other=value",
+			want: map[string][]string{
+				"key":   []string{"left=right"},
+				"other": []string{"value"},
 			},
 		},
 		{
@@ -117,6 +163,10 @@ func TestPathParams(t *testing.T) {
 			name:  "leading without slash prefix",
 			queue: "key=something/and/other/stuff",
 		},
+		{
+			name:  "escaped leading slash",
+			queue: "\\/key=something/and/other/stuff",
+		},
 	}
 
 	for _, test := range cases {
@@ -125,6 +175,78 @@ func TestPathParams(t *testing.T) {
 			log.Printf("want %v, got %v", test.want, params)
 			t.Errorf("TestPathParams %q (-want +got):\n%v", test.name, diff)
 		}
+	}
+}
+
+func TestFoldPathParam(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+		key  string
+		want string
+	}{
+		{
+			name: "no matching parameter",
+			path: "/foo/bar/gc=123/baz",
+			key:  "sess",
+			want: "/foo/bar/gc=123/baz",
+		},
+		{
+			name: "standalone parameter",
+			path: "/foo/bar/sess=123/baz",
+			key:  "sess",
+			want: "/foo/bar/*/baz",
+		},
+		{
+			name: "compound parameter first",
+			path: "/foo/bar/sess=123;gc=456/baz",
+			key:  "sess",
+			want: "/foo/bar/*/baz",
+		},
+		{
+			name: "compound parameter last",
+			path: "/foo/bar/gc=456;sess=123/baz",
+			key:  "sess",
+			want: "/foo/bar/*/baz",
+		},
+		{
+			name: "empty parameter",
+			path: "/foo/sess=/bar",
+			key:  "sess",
+			want: "/foo/*/bar",
+		},
+		{
+			name: "multiple matching components",
+			path: "/sess=one/foo/gc=123;sess=two/bar",
+			key:  "sess",
+			want: "/*/foo/*/bar",
+		},
+		{
+			name: "escaped semicolon is literal",
+			path: `/foo/name=value\;sess=123/bar`,
+			key:  "sess",
+			want: `/foo/name=value\;sess=123/bar`,
+		},
+		{
+			name: "preserve unrelated escapes",
+			path: `/foo\/bar/sess=123/baz\\quux`,
+			key:  "sess",
+			want: `/foo\/bar/*/baz\\quux`,
+		},
+		{
+			name: "relative leading parameter is literal",
+			path: "sess=123/foo/bar",
+			key:  "sess",
+			want: "sess=123/foo/bar",
+		},
+	}
+
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			if got := FoldPathParam(test.path, test.key); got != test.want {
+				t.Errorf("FoldPathParam(%q, %q) = %q, want %q", test.path, test.key, got, test.want)
+			}
+		})
 	}
 }
 
@@ -185,6 +307,11 @@ func TestEscapeComponent(t *testing.T) {
 			name:      "forward slashes",
 			component: "something/in/here/needs/escaping/",
 			want:      "something\\/in\\/here\\/needs\\/escaping\\/",
+		},
+		{
+			name:      "semicolons",
+			component: "something;needs;escaping",
+			want:      "something\\;needs\\;escaping",
 		},
 		{
 			name:      "backslash",

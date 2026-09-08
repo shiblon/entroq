@@ -16,6 +16,7 @@
 --   entroq._try_claim_one   -- claim from a single queue with bucket randomization
 --   entroq._try_claim_bucket -- claim from a specific hash bucket range
 --   entroq._claim_docs   -- claim specific storage resources
+--   entroq._path_param_values -- parse ordered values from path policy markers
 --   entroq.notify_ready_queues -- trigger notifications for tasks that reached their 'at' time
 
 CREATE SCHEMA IF NOT EXISTS entroq;
@@ -82,13 +83,14 @@ DROP INDEX IF EXISTS entroq.byQueueAt;
 DROP INDEX IF EXISTS entroq.byQueueClaims;
 CREATE INDEX IF NOT EXISTS byQueueAtClaims ON entroq.tasks (queue, at, claims);
 
--- Garbage-collection discovery index. Partial: only rows in queues that opt into
--- GC via a /gc= name component. Lets gc_collect find due collectable tasks by
--- scanning O(gc= rows) rather than the whole table -- and, being partial, it is
--- tiny and cheap to maintain (a per-insert LIKE predicate; non-gc rows never
--- enter it). The query predicate MUST match this WHERE clause verbatim for the
--- planner to use it.
+-- Garbage-collection discovery indexes. These are deliberately broad candidate
+-- filters: _path_param_values performs the exact, escape-aware parse. Keeping
+-- standalone and compound markers in separate partial indexes lets an existing
+-- schema add compound support without rebuilding the established /gc= index.
+-- The gc_queues query predicates MUST match these WHERE clauses for the planner
+-- to use them.
 CREATE INDEX IF NOT EXISTS byGCQueueAt ON entroq.tasks (queue, at) WHERE queue LIKE '%/gc=%';
+CREATE INDEX IF NOT EXISTS byCompoundGCQueueAt ON entroq.tasks (queue, at) WHERE queue LIKE '%;gc=%';
 
 -- Storage Indexes.
 CREATE INDEX IF NOT EXISTS idx_docs_keys     ON entroq.docs (namespace, key_primary, key_secondary);
@@ -1098,8 +1100,65 @@ BEGIN
 END;
 $$;
 
--- entroq.gc_activation parses the last /gc= component of a queue name into the
--- time after which the queue's arrived tasks may be collected:
+-- entroq._path_param_values implements the escape-aware path parameter grammar
+-- shared with Go's queues.PathParams. Only slash-prefixed path components are
+-- inspected. Within each component, unescaped semicolons separate key=value
+-- pairs; backslash quotes the following character. Values are returned in path
+-- and within-component order.
+CREATE OR REPLACE FUNCTION entroq._path_param_values(p_path text, p_key text)
+RETURNS text[] LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+    v_values       text[] := ARRAY[]::text[];
+    v_part         text := '';
+    v_char         text;
+    v_length       integer;
+    v_equals_at    integer;
+    v_in_component boolean := false;
+    v_escaped      boolean := false;
+BEGIN
+    IF p_path IS NULL OR p_key IS NULL THEN RETURN v_values; END IF;
+    v_length := char_length(p_path);
+
+    -- The extra iteration flushes the final pair without a separate copy of
+    -- the pair-processing block.
+    FOR i IN 1..v_length + 1 LOOP
+        IF i <= v_length THEN
+            v_char := substr(p_path, i, 1);
+        ELSE
+            v_char := NULL;
+        END IF;
+
+        IF i > v_length
+           OR (NOT v_escaped AND v_char = '/')
+           OR (v_in_component AND NOT v_escaped AND v_char = ';') THEN
+            IF v_in_component THEN
+                v_equals_at := strpos(v_part, '=');
+                IF v_equals_at > 0 AND left(v_part, v_equals_at - 1) = p_key THEN
+                    v_values := array_append(v_values, substr(v_part, v_equals_at + 1));
+                END IF;
+            END IF;
+            v_part := '';
+            IF v_char = '/' THEN v_in_component := true; END IF;
+            CONTINUE;
+        END IF;
+
+        IF v_escaped THEN
+            v_part := v_part || v_char;
+            v_escaped := false;
+        ELSIF v_char = E'\\' THEN
+            v_escaped := true;
+        ELSE
+            v_part := v_part || v_char;
+        END IF;
+    END LOOP;
+
+    RETURN v_values;
+END $$;
+
+-- entroq.gc_activation parses the last gc= parameter of a queue name into the
+-- time after which the queue's arrived tasks may be collected. The parameter
+-- may occupy a path component by itself or share one with other semicolon-
+-- separated parameters:
 --   - empty         => the epoch (always active)
 --   - all digits    => Unix seconds ('0' is thus also the epoch)
 --   - otherwise     => STRICT RFC3339Nano: a 'T' separator and an explicit Z or
@@ -1114,9 +1173,12 @@ $$;
 -- Kept in lockstep with the Go parser entroq/pkg/queues.GCActivation (a shared
 -- test guards the grammar).
 CREATE OR REPLACE FUNCTION entroq.gc_activation(queue text) RETURNS timestamptz LANGUAGE plpgsql IMMUTABLE AS $$
-DECLARE v text := substring(queue from '.*/gc=([^/]*)');
+DECLARE
+    v_values text[] := entroq._path_param_values(queue, 'gc');
+    v        text;
 BEGIN
-    IF v IS NULL THEN RETURN NULL; END IF;
+    IF cardinality(v_values) = 0 THEN RETURN NULL; END IF;
+    v := v_values[cardinality(v_values)];
     IF v = '' THEN RETURN to_timestamp(0); END IF;
     IF v ~ '^[0-9]+$' THEN RETURN to_timestamp(v::bigint); END IF;
     IF v !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$' THEN
@@ -1128,7 +1190,7 @@ EXCEPTION WHEN others THEN
 END $$;
 
 -- entroq.gc_queues enumerates every queue that opts into garbage collection (its
--- name carries a /gc= component), paired with its activation time. A NULL
+-- name carries a gc= parameter), paired with its activation time. A NULL
 -- activate_at marks a malformed gc= value -- the queue opted in but its timestamp
 -- will not parse. This is the mandatory discovery step: callers feed these rows
 -- straight to gc_collect (which ignores NULL and future activations) and
@@ -1137,7 +1199,12 @@ END $$;
 -- raw task rows repeatedly.
 CREATE OR REPLACE FUNCTION entroq.gc_queues() RETURNS TABLE (queue text, activate_at timestamptz) LANGUAGE sql STABLE AS $$
     SELECT q.queue, entroq.gc_activation(q.queue)
-    FROM (SELECT DISTINCT t.queue FROM entroq.tasks t WHERE t.queue LIKE '%/gc=%') q;
+    FROM (
+        SELECT DISTINCT t.queue
+        FROM entroq.tasks t
+        WHERE t.queue LIKE '%/gc=%' OR t.queue LIKE '%;gc=%'
+    ) q
+    WHERE cardinality(entroq._path_param_values(q.queue, 'gc')) > 0;
 $$;
 
 -- entroq.gc_collect deletes up to p_limit arrived tasks (at <= now) from the

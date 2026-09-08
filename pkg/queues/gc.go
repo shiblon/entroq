@@ -3,7 +3,6 @@ package queues
 import (
 	"fmt"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -44,21 +43,11 @@ func ParseGCActivation(value string) (time.Time, error) {
 // yields an error, and the caller must not collect the path on error. Backends
 // apply this to both task queue names and doc primary keys.
 func GCActivation(path string) (activateAt time.Time, present bool, err error) {
-	last := ""
-	for _, component := range PathComponents(path) {
-		if !strings.HasPrefix(component, "/") {
-			continue
-		}
-		key, val, found := strings.Cut(component[1:], "=")
-		if !found || key != "gc" {
-			continue
-		}
-		last, present = val, true
-	}
-	if !present {
+	values := PathParams(path)["gc"]
+	if len(values) == 0 {
 		return time.Time{}, false, nil
 	}
-	at, err := ParseGCActivation(last)
+	at, err := ParseGCActivation(values[len(values)-1])
 	return at, true, err
 }
 

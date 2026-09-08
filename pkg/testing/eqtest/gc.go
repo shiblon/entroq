@@ -46,7 +46,7 @@ func GCDocGroups(ctx context.Context, t *testing.T, backend entroq.Backend, coll
 	t.Helper()
 	ns := path.Join(prefix, "doc-gc-ns")
 	activation := time.Now().Add(2 * time.Second)
-	key := path.Join(prefix, "doc-gc", "gc="+activation.UTC().Format(time.RFC3339Nano))
+	key := path.Join(prefix, "doc-gc", "sess=test;gc="+activation.UTC().Format(time.RFC3339Nano))
 	past := time.Now().Add(-time.Hour)
 
 	if _, err := backend.Modify(ctx, entroq.NewModification("",

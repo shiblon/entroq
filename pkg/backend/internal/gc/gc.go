@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"strings"
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/queues"
@@ -95,7 +94,7 @@ func CollectDocsOnce(ctx context.Context, backend entroq.Backend, batch int, rep
 		return 0, fmt.Errorf("doc gc list namespaces: %w", err)
 	}
 
-	var candidates []docCandidate
+	var due []docCandidate
 	for namespace := range namespaces {
 		docs, err := backend.Docs(ctx, &entroq.DocQuery{Namespace: namespace, OmitValues: true})
 		if err != nil {
@@ -103,25 +102,21 @@ func CollectDocsOnce(ctx context.Context, backend entroq.Backend, batch int, rep
 		}
 		last := ""
 		for _, doc := range docs {
-			if doc.Key != last && strings.Contains(doc.Key, "/gc=") {
-				candidates = append(candidates, docCandidate{namespace: namespace, key: doc.Key})
+			if doc.Key == last {
+				continue
 			}
 			last = doc.Key
-		}
-	}
 
-	var due []docCandidate
-	for _, candidate := range candidates {
-		activateAt, present, err := queues.GCActivation(candidate.key)
-		if err != nil {
-			reporter.Error(ctx, candidate.key, "malformed_doc_key")
-			log.Printf("doc gc: key %q in namespace %q has a malformed gc= value; it will never be collected", candidate.key, candidate.namespace)
-			continue
+			activateAt, present, err := queues.GCActivation(doc.Key)
+			if err != nil {
+				reporter.Error(ctx, doc.Key, "malformed_doc_key")
+				log.Printf("doc gc: key %q in namespace %q has a malformed gc= value; it will never be collected", doc.Key, namespace)
+				continue
+			}
+			if present && !activateAt.After(now) {
+				due = append(due, docCandidate{namespace: namespace, key: doc.Key})
+			}
 		}
-		if !present || activateAt.After(now) {
-			continue
-		}
-		due = append(due, candidate)
 	}
 
 	collected := 0
