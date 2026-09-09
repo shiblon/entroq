@@ -19,12 +19,8 @@ var schemaCmd = &cobra.Command{
 // openDB opens a *sql.DB via eqpg.OpenDB - no schema version check - for use
 // by schema subcommands that need to operate on uninitialized or legacy databases.
 func openDB() (*sql.DB, error) {
-	resolveDBFlags()
-	return eqpg.OpenDB(dbAddr,
-		eqpg.WithDB(dbName),
-		eqpg.WithUsername(dbUser),
-		eqpg.WithPassword(dbPass),
-	)
+	dbTarget, connectionOptions := databaseConnection()
+	return eqpg.OpenDB(dbTarget, connectionOptions...)
 }
 
 var schemaInitCmd = &cobra.Command{

@@ -36,14 +36,10 @@ mismatch rather than migrating a live database silently.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		resolveDBFlags()
+		dbTarget, connectionOptions := databaseConnection()
 
 		if initSchema {
-			db, err := eqpg.OpenDB(dbAddr,
-				eqpg.WithDB(dbName),
-				eqpg.WithUsername(dbUser),
-				eqpg.WithPassword(dbPass),
-			)
+			db, err := eqpg.OpenDB(dbTarget, connectionOptions...)
 			if err != nil {
 				return fmt.Errorf("schema init: open db: %w", err)
 			}
@@ -57,20 +53,17 @@ mismatch rather than migrating a live database silently.`,
 
 		return eqserve.Run(ctx, serve,
 			func(mp metric.MeterProvider) entroq.BackendOpener {
-				openerOptions := []eqpg.PGOpt{
-					eqpg.WithDB(dbName),
-					eqpg.WithUsername(dbUser),
-					eqpg.WithPassword(dbPass),
+				openerOptions := append(connectionOptions,
 					eqpg.WithConnectAttempts(attempts),
 					eqpg.WithHeartbeat(heartbeat),
 					eqpg.WithMeterProvider(mp),
-				}
+				)
 				if noListen {
 					openerOptions = append(openerOptions, eqpg.WithNoListen())
 				}
-				return eqpg.Opener(dbAddr, openerOptions...)
+				return eqpg.Opener(dbTarget, openerOptions...)
 			},
-			fmt.Sprintf("postgres(%s db=%s user=%s)", dbAddr, dbName, dbUser),
+			databaseDescription(dbTarget),
 		)
 	},
 }

@@ -197,11 +197,31 @@ func WithMeterProvider(mp metric.MeterProvider) PGOpt {
 	}
 }
 
-// Open opens a postgres backend with the given host/port and options. This is
-// useful if you want to get at eqpg-specific backend options like
-// in-transaction database updates.
-// buildConnStr constructs a libpq connection string from a host:port and options.
-func buildConnStr(hostPort string, options *pgOptions) (string, error) {
+// buildConnStr constructs a libpq connection string from a host:port and
+// options, or prepares a complete PostgreSQL URL. A URL is authoritative for
+// connection parameters; PGOpts still configure backend behavior such as
+// connection attempts and notifications.
+func buildConnStr(target string, options *pgOptions) (string, error) {
+	if strings.Contains(target, "://") {
+		u, err := url.Parse(target)
+		if err != nil {
+			var urlErr *url.Error
+			if errors.As(err, &urlErr) {
+				err = urlErr.Err
+			}
+			return "", fmt.Errorf("parse PostgreSQL URL: %w", err)
+		}
+		if u.Scheme != "postgres" && u.Scheme != "postgresql" {
+			return "", fmt.Errorf("unsupported PostgreSQL URL scheme %q", u.Scheme)
+		}
+
+		query := u.Query()
+		query.Set("search_path", "entroq,public")
+		u.RawQuery = query.Encode()
+		return u.String(), nil
+	}
+
+	hostPort := target
 	u, err := url.Parse("postgres://" + hostPort)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse hostport %q: %w", hostPort, err)
@@ -233,13 +253,13 @@ func buildConnStr(hostPort string, options *pgOptions) (string, error) {
 		params = append(params, fmt.Sprintf("port=%s", port))
 	}
 	if options.sslClientKeyFile != "" {
-		params = append(params, "sslkey="+url.QueryEscape(options.sslClientKeyFile))
+		params = append(params, "sslkey="+escp(options.sslClientKeyFile))
 	}
 	if options.sslClientCertFile != "" {
-		params = append(params, "sslcert="+url.QueryEscape(options.sslClientCertFile))
+		params = append(params, "sslcert="+escp(options.sslClientCertFile))
 	}
 	if options.sslServerCAFile != "" {
-		params = append(params, "sslrootcert="+url.QueryEscape(options.sslServerCAFile))
+		params = append(params, "sslrootcert="+escp(options.sslServerCAFile))
 	}
 	params = append(params, "search_path=entroq,public")
 	return strings.Join(params, " "), nil
@@ -264,13 +284,15 @@ func defaultOptions(opts []PGOpt) *pgOptions {
 	return options
 }
 
-// OpenDB opens a *sql.DB using the given connection parameters without
-// performing any schema version check. Use this when the schema may not yet
-// exist or may be in a legacy state -- e.g. for schema init, upgrade, or
-// version commands. Open is the right choice for normal service use.
-func OpenDB(hostPort string, opts ...PGOpt) (*sql.DB, error) {
+// OpenDB opens a *sql.DB using a host:port plus connection options or a complete
+// PostgreSQL URL, without performing any schema version check. Use this when the
+// schema may not yet exist or may be in a legacy state -- e.g. for schema init,
+// upgrade, or version commands. When target is a URL, it supplies all connection
+// parameters and connection-related options are ignored. Open is the right
+// choice for normal service use.
+func OpenDB(target string, opts ...PGOpt) (*sql.DB, error) {
 	options := defaultOptions(opts)
-	connStr, err := buildConnStr(hostPort, options)
+	connStr, err := buildConnStr(target, options)
 	if err != nil {
 		return nil, err
 	}
@@ -281,18 +303,18 @@ func OpenDB(hostPort string, opts ...PGOpt) (*sql.DB, error) {
 	return db, nil
 }
 
-// Open opens a fully operational *EQPG backend, verifying that the database
-// schema is present and at the expected version. Fails loudly if the schema is
-// uninitialized or at the wrong version; run "eqpg schema init" or
-// "eqpg schema upgrade" first.
-func Open(ctx context.Context, hostPort string, opts ...PGOpt) (*EQPG, error) {
+// Open opens a fully operational *EQPG backend from a host:port or complete
+// PostgreSQL URL, verifying that the database schema is present and at the
+// expected version. Fails loudly if the schema is uninitialized or at the wrong
+// version; run "eqpg schema init" or "eqpg schema upgrade" first.
+func Open(ctx context.Context, target string, opts ...PGOpt) (*EQPG, error) {
 	options := defaultOptions(opts)
-	connStr, err := buildConnStr(hostPort, options)
+	connStr, err := buildConnStr(target, options)
 	if err != nil {
 		return nil, err
 	}
 
-	db, err := OpenDB(hostPort, opts...)
+	db, err := OpenDB(target, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open postgres DB: %w", err)
 	}
@@ -330,9 +352,9 @@ func Open(ctx context.Context, hostPort string, opts ...PGOpt) (*EQPG, error) {
 // Opener creates an opener function to be used to get a backend.
 // If you need some of the database-specific options in this module, use Open
 // instead and pass the resulting backend into entroq.New.
-func Opener(hostPort string, opts ...PGOpt) entroq.BackendOpener {
+func Opener(target string, opts ...PGOpt) entroq.BackendOpener {
 	return func(ctx context.Context) (entroq.Backend, error) {
-		return Open(ctx, hostPort, opts...)
+		return Open(ctx, target, opts...)
 	}
 }
 

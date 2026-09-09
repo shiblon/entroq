@@ -11,6 +11,12 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **PostgreSQL deployment connections.** `eqpg` accepts a complete connection URL via
+  `--dburl` or `PGURL`, overriding decomposed `PG*` connection settings while
+  retaining backend controls such as retries and heartbeat configuration. URL
+  parameters carry TLS configuration; decomposed settings also accept
+  `PGSSLMODE`, `PGSSLROOTCERT`, `PGSSLCERT`, and `PGSSLKEY`.
+
 - **Python client document listing.** `docs()` sends its filters under the
   `query.` field path the service transcodes them from, so a listing is a valid
   request rather than an unknown-field error, and it accepts the `key_exact` and
