@@ -2,8 +2,8 @@
 
 All tests require a running Docker daemon. The pg_connstr session fixture in
 conftest.py starts a throwaway PostgreSQL container and applies schema.sql
-once per test session. The eq function fixture truncates the tasks table
-before each test.
+once per test session. The eq function fixture truncates the tasks and docs
+tables before each test.
 
 These tests focus on Python+native-PostgreSQL-specific behavior: LISTEN/NOTIFY
 wakeup, the renewing context manager, and transaction composability with
@@ -19,7 +19,7 @@ import psycopg
 import pytest
 
 from entroq.experimental.pg import EntroQ
-from entroq.types import DependencyError, Modification, TaskData, TaskID
+from entroq.types import DependencyError, DocData, Modification, TaskData, TaskID
 from entroq.worker import EntroQWorker, Handler, _renewing
 
 
@@ -510,3 +510,84 @@ async def test_worker_ambient_gc_reaps(eq: EntroQ):
         await run_task
 
     assert await eq.tasks(queue=GC_QUEUE) == []
+
+
+# ---------------------------------------------------------------------------
+# Doc listing (the id and exact-key modes are SQL this client owns, so they are
+# not covered by the Go suite running against the shared stored procedures)
+# ---------------------------------------------------------------------------
+
+async def _seed_docs(eq: EntroQ, ns: str = 'status') -> list:
+    """Insert four docs across three primary keys; return them in listing order.
+
+    Ids are explicit because this client does not generate them for doc
+    inserts: entroq._modify_docs stores the supplied id verbatim, so omitting
+    one violates the docs table's NOT NULL constraint.
+    """
+    res = await eq.modify(Modification(*[
+        Modification.inserting(DocData(
+            namespace=ns, id=f'{ns}-{key}-{sub}', key=key, secondary_key=sub,
+            content={'k': key},
+        ))
+        for key, sub in (('a', '1'), ('b', '1'), ('b', '2'), ('c', '1'))
+    ]))
+    assert len(res.docs_inserted) == 4
+    return await eq.docs(namespace=ns)
+
+
+async def test_docs_key_exact_returns_whole_key_group(eq: EntroQ):
+    await _seed_docs(eq)
+
+    got = await eq.docs(namespace='status', key_exact='b')
+
+    assert [(d.key, d.secondary_key) for d in got] == [('b', '1'), ('b', '2')]
+    assert all(d.claimant == '' for d in got), 'an exact read must not claim'
+
+
+async def test_docs_key_exact_honors_limit_and_omit_values(eq: EntroQ):
+    await _seed_docs(eq)
+
+    got = await eq.docs(namespace='status', key_exact='b', limit=1, omit_values=True)
+
+    assert [(d.key, d.secondary_key) for d in got] == [('b', '1')]
+    assert got[0].content is None
+
+
+async def test_docs_key_exact_missing_key_is_empty(eq: EntroQ):
+    await _seed_docs(eq)
+
+    assert await eq.docs(namespace='status', key_exact='nope') == []
+
+
+async def test_docs_ids_selects_those_docs(eq: EntroQ):
+    seeded = await _seed_docs(eq)
+    want = [seeded[0], seeded[3]]
+
+    got = await eq.docs(namespace='status', ids=[d.id for d in want])
+
+    assert [d.id for d in got] == [d.id for d in want]
+
+
+async def test_docs_ids_honors_omit_values(eq: EntroQ):
+    seeded = await _seed_docs(eq)
+
+    got = await eq.docs(namespace='status', ids=[seeded[0].id], omit_values=True)
+
+    assert [d.content for d in got] == [None]
+    assert [d.key for d in got] == ['a'], 'metadata must survive omit_values'
+
+
+async def test_docs_empty_namespace_spans_namespaces(eq: EntroQ):
+    """Empty namespace means every namespace, as entroq.docs() itself reads it.
+
+    This is the PostgreSQL reading and is not a cross-backend contract: eqmem
+    returns nothing for an empty namespace.
+    """
+    await _seed_docs(eq, ns='ns-one')
+    await _seed_docs(eq, ns='ns-two')
+
+    got = await eq.docs(key_exact='b')
+
+    assert [(d.namespace, d.secondary_key) for d in got] == [
+        ('ns-one', '1'), ('ns-one', '2'), ('ns-two', '1'), ('ns-two', '2'),
+    ]

@@ -63,8 +63,21 @@ class EntroQBase(ABC):
         key_end: str = '',
         limit: int = 0,
         omit_values: bool = False,
+        key_exact: str = '',
+        ids: Sequence[str] = (),
     ) -> List[Doc]:
-        """Return docs in a namespace, optionally filtered by key range [key_start, key_end)."""
+        """Return docs in a namespace, filtered by one of three exclusive modes.
+
+        The filter modes are mutually exclusive and applied in this precedence:
+
+        - ``ids``: return only those docs. Key range and limit are ignored.
+        - ``key_exact``: return every doc whose primary key is exactly this.
+        - ``key_start``/``key_end``: half-open range ``[key_start, key_end)`` on
+          the primary key. An empty ``key_end`` lists from ``key_start`` onward.
+
+        Passing no filter lists the whole namespace. ``key_exact`` is the way to
+        read one document's group without claiming it.
+        """
 
     @abstractmethod
     async def claim_docs(

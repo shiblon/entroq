@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import secrets
+from collections.abc import Sequence
 from datetime import datetime, timezone
 
 import httpx
@@ -239,12 +240,19 @@ class EntroQJSON(EntroQBase):
         key_end: str = "",
         limit: int = 0,
         omit_values: bool = False,
+        key_exact: str = "",
+        ids: Sequence[str] = (),
     ) -> list[Doc]:
-        params: dict = {"namespace": namespace}
-        if key_start:   params["keyStart"] = key_start
-        if key_end:     params["keyEnd"] = key_end
-        if limit:       params["limit"] = limit
-        if omit_values: params["omitValues"] = "true"
+        # Docs takes a nested DocQuery, so every filter is transcoded under the
+        # "query." field path. Unprefixed names are rejected as unknown fields.
+        params: dict = {}
+        if namespace:   params["query.namespace"] = namespace
+        if key_start:   params["query.keyStart"] = key_start
+        if key_end:     params["query.keyEnd"] = key_end
+        if limit:       params["query.limit"] = limit
+        if omit_values: params["query.omitValues"] = "true"
+        if key_exact:   params["query.keyExact"] = key_exact
+        if ids:         params["query.ids"] = list(ids)
         data = await self._request("GET", "/api/v0/docs", params=params)
         return [_doc_from_json(d) for d in data.get("docs", [])]
 

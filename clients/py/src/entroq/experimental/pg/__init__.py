@@ -10,6 +10,7 @@ import json
 import re
 import time
 import uuid
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import AsyncIterator
@@ -163,6 +164,27 @@ def _dep_error_from_pg(e: psycopg.DatabaseError) -> DependencyError:
 # ---------------------------------------------------------------------------
 
 _OPTS = "-c search_path=entroq,public"
+
+# Doc listing modes entroq.docs() does not cover. An empty namespace matches
+# every namespace, mirroring the function's own filtering.
+_DOC_SELECT = """
+    SELECT namespace, id, version, claimant, at, key_primary, key_secondary,
+           CASE WHEN %(omit_values)s THEN NULL::jsonb ELSE value END AS value,
+           created, modified
+      FROM entroq.docs
+     WHERE (%(namespace)s = '' OR namespace = %(namespace)s)
+"""
+
+_DOCS_BY_IDS = _DOC_SELECT + """
+       AND id = ANY(%(ids)s::text[])
+     ORDER BY namespace, key_primary, key_secondary
+"""
+
+_DOCS_BY_KEY_EXACT = _DOC_SELECT + """
+       AND key_primary = %(key_exact)s
+     ORDER BY namespace, key_primary, key_secondary
+     LIMIT NULLIF(%(limit)s, 0)
+"""
 
 
 class Transaction:
@@ -351,12 +373,22 @@ class EntroQ(EntroQBase):
         key_end: str = '',
         limit: int = 0,
         omit_values: bool = False,
+        key_exact: str = '',
+        ids: Sequence[str] = (),
     ) -> list[Doc]:
+        # entroq.docs() only accepts the key-range mode, so the id and
+        # exact-key modes are queried directly against the table here. Per the
+        # query contract, the id mode ignores limit; both honor omit_values.
         async with await psycopg.AsyncConnection.connect(self._connstr, autocommit=True, row_factory=dict_row, options=_OPTS) as conn:
-            cur = await conn.execute(
-                'SELECT * FROM docs(%s, %s, %s, %s, %s)',
-                (namespace, key_start, key_end, limit, omit_values),
-            )
+            if ids:
+                cur = await conn.execute(_DOCS_BY_IDS, {'namespace': namespace, 'ids': list(ids), 'omit_values': omit_values})
+            elif key_exact:
+                cur = await conn.execute(_DOCS_BY_KEY_EXACT, {'namespace': namespace, 'key_exact': key_exact, 'limit': limit, 'omit_values': omit_values})
+            else:
+                cur = await conn.execute(
+                    'SELECT * FROM docs(%s, %s, %s, %s, %s)',
+                    (namespace, key_start, key_end, limit, omit_values),
+                )
             return [_row_to_doc(r) for r in await cur.fetchall()]
 
     async def claim_docs(self, namespace: str, key: str, duration_ms: int = 30000) -> list[Doc]:

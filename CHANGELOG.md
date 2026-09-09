@@ -7,6 +7,18 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **Python client document listing.** `docs()` sends its filters under the
+  `query.` field path the service transcodes them from, so a listing is a valid
+  request rather than an unknown-field error, and it accepts the `key_exact` and
+  `ids` filter modes alongside the key range. `key_exact` reads every document
+  sharing one primary key without claiming it, which is what a status or cancel
+  path needs. The Python client advances to `0.12.4`; the experimental
+  PostgreSQL client gains the same two filter modes.
+
 ## [1.10.2] - 2026-09-04
 
 Go module `v1.10.2`. No PostgreSQL schema or independent client version
