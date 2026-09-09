@@ -6,7 +6,7 @@ description: >
   alongside an EntroQ server.
 type: application
 version: 0.2.1
-appVersion: "1.10.2"
+appVersion: "1.10.3"
 keywords:
 - entroq
 - service-mesh
