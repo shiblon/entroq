@@ -98,6 +98,7 @@ class DocData:
     secondary_key: str = ''
     content: Any = None
     id: Optional[str] = None
+    at: Optional[datetime] = None
 
 
 @dataclass

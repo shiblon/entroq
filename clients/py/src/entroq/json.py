@@ -95,6 +95,7 @@ def _doc_insert_json(d: DocData) -> dict:
         "key": d.key,
         "secondaryKey": d.secondary_key or None,
         "content": d.content,
+        "atMs": _to_ms(d.at) or None,
     }.items() if v is not None}
 
 

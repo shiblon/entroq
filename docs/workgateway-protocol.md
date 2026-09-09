@@ -33,6 +33,9 @@ framing below — is gateway-specific.
 
 A worker does **not** fill in a modification's `claimant_id`: the gateway owns the
 claim, attributes the commit itself, and ignores whatever the worker put there.
+That attribution also applies to a document inserted with a future `atMs`: the
+gateway creates it atomically under its own claim, just like an in-process Go
+worker using `WithDocArrivalTime`.
 
 ## Registration is out of band
 

@@ -134,6 +134,7 @@ def _encode_doc_inserts(items) -> str:
         }
         if it.id:       obj['id'] = str(it.id)
         if it.content is not None: obj['content'] = it.content
+        if it.at:       obj['at'] = it.at.isoformat()
         out.append(obj)
     return json.dumps(out)
 

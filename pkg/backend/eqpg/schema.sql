@@ -644,6 +644,16 @@ $$;
 -- entroq._modify_docs handles all doc table updates for an atomic modify call.
 -- Used internally by entroq.modify and the Go backend.
 -- Raises EQ001 on dependency failure.
+-- Drop the public wrapper first so an upgrade can replace the internal
+-- function's signature without leaving an obsolete overload behind.
+DROP FUNCTION IF EXISTS entroq.modify_docs(text, jsonb, jsonb, jsonb, jsonb);
+DROP FUNCTION IF EXISTS entroq._modify_docs(
+    text,
+    text[], text[], integer[],
+    text[], text[], integer[],
+    text[], text[], text[], text[], text[],
+    text[], text[], integer[], text[], text[], text[], timestamptz[]
+);
 CREATE OR REPLACE FUNCTION entroq._modify_docs(
     p_claimant     text,
     p_dep_ns       text[],
@@ -657,6 +667,7 @@ CREATE OR REPLACE FUNCTION entroq._modify_docs(
     p_ins_pkeys    text[],
     p_ins_skeys    text[],
     p_ins_values   text[],
+    p_ins_ats      timestamptz[],
     p_chg_ns       text[],
     p_chg_ids      text[],
     p_chg_vers     integer[],
@@ -726,10 +737,13 @@ BEGIN
     -- Inserts
     RETURN QUERY
     WITH r AS (
-        INSERT INTO entroq.docs (namespace, id, version, key_primary, key_secondary, value, created, modified)
-        SELECT ins_ns, ins_id, 0, ins_pk, ins_sk, ins_val::jsonb, v_now, v_now
-        FROM unnest(p_ins_ns, p_ins_ids, p_ins_pkeys, p_ins_skeys, p_ins_values)
-        AS i(ins_ns, ins_id, ins_pk, ins_sk, ins_val)
+        INSERT INTO entroq.docs (namespace, id, version, claimant, at, key_primary, key_secondary, value, created, modified)
+        SELECT ins_ns, ins_id, 0,
+               CASE WHEN ins_at > v_now THEN p_claimant ELSE '' END,
+               CASE WHEN ins_at IS NULL OR ins_at < v_now - interval '1 year' THEN v_now ELSE ins_at END,
+               ins_pk, ins_sk, ins_val::jsonb, v_now, v_now
+        FROM unnest(p_ins_ns, p_ins_ids, p_ins_pkeys, p_ins_skeys, p_ins_values, p_ins_ats)
+        AS i(ins_ns, ins_id, ins_pk, ins_sk, ins_val, ins_at)
         RETURNING *
     )
     SELECT 'inserted', r.namespace, r.id, r.version, r.claimant, r.at, r.key_primary, r.key_secondary, r.value, r.created, r.modified FROM r;
@@ -766,7 +780,7 @@ $$;
 --   depends / deletes:  {"namespace": "<ns>", "id": "<id>", "version": <int>}
 --   inserts:            {"namespace": "<ns>", "id": "<id>",
 --                        "key_primary": "<str>", "key_secondary": "<str>",
---                        "content": <jsonb>}
+--                        "content": <jsonb>, "at": "<rfc3339>"}
 --   changes:            {"namespace": "<ns>", "id": "<id>", "version": <int>,
 --                        "key_primary": "<str>", "key_secondary": "<str>",
 --                        "content": <jsonb>, "at": "<rfc3339>"}
@@ -809,6 +823,7 @@ CREATE OR REPLACE FUNCTION entroq.modify_docs(
         ARRAY(SELECT coalesce(e->>'key_secondary', '') FROM jsonb_array_elements(p_inserts) e),
         ARRAY(SELECT CASE WHEN e ? 'content' THEN (e->'content')::text ELSE NULL END
               FROM jsonb_array_elements(p_inserts) e),
+        ARRAY(SELECT (e->>'at')::timestamptz         FROM jsonb_array_elements(p_inserts) e),
         -- changes
         ARRAY(SELECT e->>'namespace'             FROM jsonb_array_elements(p_changes) e),
         ARRAY(SELECT e->>'id'                    FROM jsonb_array_elements(p_changes) e),

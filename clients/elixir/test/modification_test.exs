@@ -1,7 +1,7 @@
 defmodule EntroQ.ModificationTest do
   use ExUnit.Case, async: true
 
-  alias EntroQ.{Doc, Modification, Task}
+  alias EntroQ.{Doc, DocData, Modification, Task}
 
   test "fix_versions updates renewed task and doc versions" do
     task = %Task{id: "t1", version: 9, queue: "q"}
@@ -36,5 +36,14 @@ defmodule EntroQ.ModificationTest do
     assert json["claimantId"] == "worker"
     assert [%{"oldId" => %{"id" => "t1", "version" => 1, "queue" => "q"}}] = json["changes"]
     assert [%{"namespace" => "ns", "id" => "d1", "version" => 1}] = json["docDeletes"]
+  end
+
+  test "encodes a future arrival for a doc insert" do
+    json =
+      Modification.new()
+      |> Modification.insert(%DocData{namespace: "status", key: "session", at_ms: 123})
+      |> Modification.to_json("worker")
+
+    assert [%{"atMs" => "123"}] = json["docInserts"]
   end
 end

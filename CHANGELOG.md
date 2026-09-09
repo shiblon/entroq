@@ -73,6 +73,10 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Claimed document insertion.** `WithDocArrivalTime` and
+  `WithDocArrivalTimeBy` now apply to document inserts as well as changes. A
+  future arrival atomically creates the document under the inserting client's
+  claim, consistently across every backend and language client.
 - **Breaking: document GC is namespace-scoped.** A `gc` path marker now opts an
   entire document namespace into garbage collection. Collection remains atomic
   per primary-key group and skips claimed groups; markers in primary keys no
@@ -88,8 +92,8 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Schema change (eqpg: 1.7.1 → 1.11.0).** Existing PostgreSQL deployments
   must run `eqpg schema upgrade` before starting the upgraded service. The
   backward-compatible update adds the compound-marker discovery index and the
-  general path-parameter parser; it does not rewrite stored task or document
-  data.
+  general path-parameter parser, and lets document inserts carry an initial
+  claim expiry; it does not rewrite stored task or document data.
 - **Python worker failure policy.** Claim transport failures known to occur
   before submission retry with full-jitter exponential backoff. Ambiguous
   transport failures and unexpected handler exceptions return to the caller
@@ -121,6 +125,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for this part.
 ### Fixed
 
+- **Reproducible protobuf generation.** The Connect generator is pinned to the
+  version used by the Go module instead of resolving an incompatible latest
+  release during Docker builds.
 - **Python client 0.13.1 document listing.** Restores the `key_exact` and `ids`
   filters shipped in 0.12.4, including the `query.` field paths required by the
   HTTP transcoder. Direct PostgreSQL and HTTP clients again expose the same
@@ -133,9 +140,6 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   five-second timeout, remain caller-cancelable, and use the Go client's
   30-second poll default. Direct-PostgreSQL claims use the same default and no
   longer busy-loop when passed a zero poll interval.
-
-### Fixed
-
 - **Immediate task quarantine.** Retry exhaustion and Python worker moves reset
   task arrival to backend time and release the claim, making quarantined tasks
   immediately available in their error queue.

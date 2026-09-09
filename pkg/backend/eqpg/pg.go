@@ -826,7 +826,7 @@ func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *mo
 	// Build parallel arrays for resource operation set.
 	rDepNS, rDepIDs, rDepVers := resourceIDArrays(mod.DocDepends)
 	rDelNS, rDelIDs, rDelVers := resourceIDArrays(mod.DocDeletes)
-	rInsNS, rInsIDs, rInsPKeys, rInsSKeys, rInsValues := resourceInsertArrays(mod.DocInserts)
+	rInsNS, rInsIDs, rInsPKeys, rInsSKeys, rInsValues, rInsAts := resourceInsertArrays(mod.DocInserts)
 	rChgNS, rChgIDs, rChgVers, rChgPKeys, rChgSKeys, rChgValues, rChgAts := resourceChangeArrays(mod.DocChanges)
 
 	if options == nil {
@@ -866,13 +866,13 @@ func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *mo
 				$1,
 				$2::text[], $3::text[], $4::integer[],
 				$5::text[], $6::text[], $7::integer[],
-				$8::text[], $9::text[], $10::text[], $11::text[], $12::text[],
-				$13::text[], $14::text[], $15::integer[], $16::text[], $17::text[], $18::text[], $19::timestamptz[]
+				$8::text[], $9::text[], $10::text[], $11::text[], $12::text[], $13::timestamptz[],
+				$14::text[], $15::text[], $16::integer[], $17::text[], $18::text[], $19::text[], $20::timestamptz[]
 			)`,
 			mod.Claimant,
 			pq.Array(rDepNS), pq.Array(rDepIDs), pq.Array(rDepVers),
 			pq.Array(rDelNS), pq.Array(rDelIDs), pq.Array(rDelVers),
-			pq.Array(rInsNS), pq.Array(rInsIDs), pq.Array(rInsPKeys), pq.Array(rInsSKeys), pq.Array(rInsValues),
+			pq.Array(rInsNS), pq.Array(rInsIDs), pq.Array(rInsPKeys), pq.Array(rInsSKeys), pq.Array(rInsValues), pq.Array(rInsAts),
 			pq.Array(rChgNS), pq.Array(rChgIDs), pq.Array(rChgVers), pq.Array(rChgPKeys), pq.Array(rChgSKeys), pq.Array(rChgValues), pq.Array(rChgAts),
 		)
 		if err != nil {
@@ -1159,18 +1159,20 @@ func resourceIDArrays(rids []*entroq.DocID) (ns, ids []string, versions []int32)
 }
 
 // resourceInsertArrays splits a slice of ResourceData into parallel arrays.
-func resourceInsertArrays(inserts []*entroq.DocData) (ns, ids, pkeys, skeys []string, values []*string) {
+func resourceInsertArrays(inserts []*entroq.DocData) (ns, ids, pkeys, skeys []string, values []*string, ats []time.Time) {
 	ns = make([]string, len(inserts))
 	ids = make([]string, len(inserts))
 	pkeys = make([]string, len(inserts))
 	skeys = make([]string, len(inserts))
 	values = make([]*string, len(inserts))
+	ats = make([]time.Time, len(inserts))
 	for i, ins := range inserts {
 		ns[i] = ins.Namespace
 		ids[i] = ins.ID
 		pkeys[i] = ins.Key
 		skeys[i] = ins.SecondaryKey
 		values[i] = jsonTextVal(ins.Content)
+		ats[i] = ins.At
 	}
 	return
 }

@@ -94,8 +94,14 @@ func modifyTx(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (*entro
 		}
 		created := time.UnixMilli(storedTime(insert.Created, now)).UTC()
 		modified := time.UnixMilli(storedTime(insert.Modified, now)).UTC()
+		at := entroq.NormalizeArrival(insert.At, now)
+		claimant := ""
+		if at.After(now) {
+			claimant = mod.Claimant
+		}
 		doc := &entroq.Doc{
 			Namespace: insert.Namespace, ID: id, Version: 0,
+			Claimant: claimant, At: at,
 			Key: insert.Key, SecondaryKey: insert.SecondaryKey, Content: insert.Content,
 			Created: created, Modified: modified,
 		}
@@ -225,17 +231,17 @@ func deleteDocs(ctx context.Context, tx *sql.Tx, deletes []*entroq.DocID) error 
 }
 
 func insertDocs(ctx context.Context, tx *sql.Tx, docs []*entroq.Doc) error {
-	const columns = 8
+	const columns = 10
 	return batchRanges(len(docs), columns, func(start, end int) error {
 		args := make([]any, 0, columns*(end-start))
 		for _, doc := range docs[start:end] {
-			args = append(args, doc.Namespace, doc.ID, doc.Version, doc.Key, doc.SecondaryKey,
+			args = append(args, doc.Namespace, doc.ID, doc.Version, doc.Claimant, doc.At.UnixMilli(), doc.Key, doc.SecondaryKey,
 				jsonValue(doc.Content), doc.Created.UnixMilli(), doc.Modified.UnixMilli())
 		}
 		query := `INSERT INTO docs
 			(namespace, id, version, claimant, at_ms, key_primary, key_secondary, content, created_ms, modified_ms)
 			VALUES `
-		row := "(?, ?, ?, '', 0, ?, ?, ?, ?, ?),"
+		row := "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?),"
 		query += strings.TrimSuffix(strings.Repeat(row, end-start), ",")
 		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 			return fmt.Errorf("insert docs: %w", err)

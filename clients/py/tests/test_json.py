@@ -1,11 +1,12 @@
 import asyncio
 import json
+from datetime import datetime, timezone
 
 import httpx
 import pytest
 
-from entroq.json import EntroQJSON
-from entroq.types import TransportError
+from entroq.json import EntroQJSON, _doc_insert_json
+from entroq.types import DocData, TransportError
 
 
 async def _docs_query(**kwargs) -> httpx.QueryParams:
@@ -164,3 +165,9 @@ async def test_transport_errors_preserve_retry_safety(error_type, safe_to_retry)
     assert raised.value.safe_to_retry is safe_to_retry
     assert isinstance(raised.value.cause, error_type)
     assert raised.value.__cause__ is raised.value.cause
+
+
+def test_doc_insert_encodes_future_arrival():
+    at = datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
+    assert _doc_insert_json(DocData(namespace="status", key="session", at=at))["atMs"] == 1893553445000

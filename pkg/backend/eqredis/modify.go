@@ -389,12 +389,17 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 				if id == "" {
 					id = entroq.GenHex16()
 				}
+				atMs := entroq.NormalizeArrival(dd.At, now).UnixMilli()
+				docClaimant := ""
+				if atMs > nowMs {
+					docClaimant = claimant
+				}
 				f := &docFields{
 					Namespace:    dd.Namespace,
 					ID:           id,
 					Version:      0,
-					Claimant:     "",
-					AtMs:         0,
+					Claimant:     docClaimant,
+					AtMs:         atMs,
 					KeyPrimary:   dd.Key,
 					KeySecondary: dd.SecondaryKey,
 					Content:      []byte(dd.Content),
@@ -407,6 +412,9 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 					Member: docIndexMember(dd.Key, dd.SecondaryKey, id),
 				})
 				pipe.SAdd(ctx, namespacesKey, dd.Namespace)
+				if atMs > nowMs {
+					pipe.ZAdd(ctx, nsclaimedKey(dd.Namespace), redis.Z{Score: float64(atMs), Member: id})
+				}
 				resp.InsertedDocs = append(resp.InsertedDocs, f.toDoc())
 			}
 

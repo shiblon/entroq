@@ -755,7 +755,7 @@ type DocData struct {
 	Content      *structpb.Value `protobuf:"bytes,5,opt,name=content,proto3" json:"content,omitempty"`
 	CreatedMs    int64           `protobuf:"varint,6,opt,name=created_ms,json=createdMs,proto3" json:"created_ms,omitempty"`
 	ModifiedMs   int64           `protobuf:"varint,7,opt,name=modified_ms,json=modifiedMs,proto3" json:"modified_ms,omitempty"`
-	// at_ms is the requested arrival/claim-expiry time for doc changes.
+	// at_ms is the requested arrival/claim-expiry time for doc inserts and changes.
 	// Zero means "use the backend's current time and release any claim."
 	AtMs int64 `protobuf:"varint,8,opt,name=at_ms,json=atMs,proto3" json:"at_ms,omitempty"`
 }

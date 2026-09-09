@@ -65,9 +65,9 @@ func WithContent(v any) DocOpt {
 	return WithRawContent(b)
 }
 
-// WithDocArrivalTime sets the arrival time on a doc change. When non-zero and in the
-// future, the backend will also record the caller as the claimant so the doc
-// can be renewed or released.
+// WithDocArrivalTime sets the arrival time on a doc insertion or change. When
+// non-zero and in the future, the backend also records the caller as the
+// claimant so the doc can be renewed or released.
 func WithDocArrivalTime(t time.Time) DocOpt {
 	return func(o *docOpts) {
 		o.at = t
@@ -75,7 +75,8 @@ func WithDocArrivalTime(t time.Time) DocOpt {
 }
 
 // WithDocArrivalTimeBy sets the doc arrival time to now plus d. Use this to
-// claim or renew a doc by pushing its At into the future.
+// insert a claimed doc, or to claim or renew an existing doc, by pushing its At
+// into the future.
 func WithDocArrivalTimeBy(d time.Duration) DocOpt {
 	return func(o *docOpts) {
 		o.at = time.Now().Add(d)
@@ -129,6 +130,7 @@ func (r DocID) Depend() ModifyArg {
 type DocData struct {
 	Namespace    string          `json:"namespace"`
 	ID           string          `json:"id"`
+	At           time.Time       `json:"at"`
 	Key          string          `json:"key"`
 	SecondaryKey string          `json:"secondary_key"`
 	Content      json.RawMessage `json:"content"`
@@ -160,6 +162,7 @@ func (r *Doc) Data() *DocData {
 	rd := &DocData{
 		Namespace:    r.Namespace,
 		ID:           r.ID,
+		At:           r.At,
 		Key:          r.Key,
 		SecondaryKey: r.SecondaryKey,
 		Created:      r.Created,
@@ -267,7 +270,8 @@ func PuttingDoc(rd *DocData) ModifyArg {
 
 // PuttingDocInto returns a ModifyArg that creates a doc in the given namespace.
 // Use WithKeys to set the primary and secondary keys, WithContent/WithRawContent
-// to set the payload. Use WithIDKeys only when explicit ID control is required.
+// to set the payload, and WithDocArrivalTime/WithDocArrivalTimeBy to insert the
+// doc with a claim. Use WithIDKeys only when explicit ID control is required.
 // Use WithSkipCollidingDoc to allow the insert to be silently dropped on ID collision.
 func PuttingDocInto(ns string, opts ...DocOpt) ModifyArg {
 	return func(m *Modification) {
@@ -278,6 +282,7 @@ func PuttingDocInto(ns string, opts ...DocOpt) ModifyArg {
 		rd := &DocData{
 			Namespace:       ns,
 			ID:              o.id,
+			At:              o.at,
 			Key:             o.key,
 			SecondaryKey:    o.secondaryKey,
 			Content:         o.content,

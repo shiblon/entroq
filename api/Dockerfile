@@ -17,7 +17,7 @@ RUN apt-get update \
  && unzip protoc.zip \
  && go install "google.golang.org/protobuf/cmd/protoc-gen-go@${go_proto_version}" \
  && go install "google.golang.org/grpc/cmd/protoc-gen-go-grpc@${go_grpc_version}" \
- && go install "connectrpc.com/connect/cmd/protoc-gen-connect-go@latest" \
+ && go install "connectrpc.com/connect/cmd/protoc-gen-connect-go@v1.19.1" \
  && go install "github.com/google/gnostic/cmd/protoc-gen-openapi@v0.7.0" \
  && mkdir -p /include/google/api \
  && curl -Lo /include/google/api/annotations.proto https://raw.githubusercontent.com/googleapis/googleapis/master/google/api/annotations.proto \

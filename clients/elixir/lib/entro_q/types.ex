@@ -241,7 +241,7 @@ defmodule EntroQ.DocData do
       "content" => data.content
     }
     |> maybe_put("id", data.id)
-    |> maybe_put("atMs", mode == :change && Integer.to_string(data.at_ms || 0))
+    |> maybe_put("atMs", (mode == :change || data.at_ms != 0) && Integer.to_string(data.at_ms || 0))
     |> maybe_put("createdMs", data.created_ms != 0 && Integer.to_string(data.created_ms))
     |> maybe_put("modifiedMs", data.modified_ms != 0 && Integer.to_string(data.modified_ms))
   end
