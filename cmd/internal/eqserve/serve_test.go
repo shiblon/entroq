@@ -1,13 +1,16 @@
 package eqserve
 
 import (
+	"bytes"
 	"context"
+	"log"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
+	"github.com/shiblon/entroq/pkg/version"
 	"github.com/spf13/pflag"
 	"go.opentelemetry.io/otel/metric"
 )
@@ -45,6 +48,29 @@ func TestServerKeepalivePolicyAcceptsDefaultClient(t *testing.T) {
 	}
 	if policy.PermitWithoutStream {
 		t.Fatal("server permits keepalive without an active RPC")
+	}
+}
+
+func TestRunLogsVersionBeforeSetup(t *testing.T) {
+	oldOutput, oldFlags := log.Writer(), log.Flags()
+	oldVersion := version.Version
+	t.Cleanup(func() {
+		log.SetOutput(oldOutput)
+		log.SetFlags(oldFlags)
+		version.Version = oldVersion
+	})
+
+	var output bytes.Buffer
+	log.SetOutput(&output)
+	log.SetFlags(0)
+	version.Version = "test-version"
+
+	err := Run(context.Background(), Config{AuthzStrategy: "invalid"}, nil, "test")
+	if err == nil {
+		t.Fatal("Run accepted invalid authorization")
+	}
+	if got := output.String(); got != "EntroQ test-version starting\n" {
+		t.Fatalf("startup log = %q", got)
 	}
 }
 

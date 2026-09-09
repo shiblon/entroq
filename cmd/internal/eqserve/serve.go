@@ -24,6 +24,7 @@ import (
 	"github.com/shiblon/entroq/pkg/eqsvcgrpc"
 	"github.com/shiblon/entroq/pkg/eqsvcjson"
 	"github.com/shiblon/entroq/pkg/otel"
+	"github.com/shiblon/entroq/pkg/version"
 	"github.com/spf13/pflag"
 	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc"
@@ -93,6 +94,8 @@ type OpenFunc func(metric.MeterProvider) entroq.BackendOpener
 // canceled. Backend-specific commands retain responsibility for validating
 // their own flags and constructing open.
 func Run(ctx context.Context, cfg Config, open OpenFunc, backendDescription string) error {
+	log.Printf("EntroQ %s starting", version.Version)
+
 	ctx, stopSignals := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 

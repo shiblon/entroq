@@ -7,6 +7,13 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Service startup version.** PostgreSQL, in-memory, Redis, and SQLite servers
+  log their binary version to standard error before startup setup begins.
+
 ## [1.10.3] - 2026-09-09
 
 Go module `v1.10.3`. No PostgreSQL schema changes. The Python client is
