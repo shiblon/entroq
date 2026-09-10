@@ -15,18 +15,20 @@ import (
 	"github.com/shiblon/entroq/pkg/worker"
 )
 
-// testConfig returns a config with a unique prefix and intervals tightened so
-// tests are not paced by the production-shaped control loop.
-func testConfig(mapShards, reduceShards int) eqmr.Config {
-	return eqmr.Config{
-		Prefix:          "/eqmrtest/" + entroq.GenHex16(),
-		MapShards:       mapShards,
-		ReduceShards:    reduceShards,
-		Lease:           5 * time.Second,
-		ControlInterval: 100 * time.Millisecond,
-		StallTimeout:    60 * time.Second,
+// testOpts is the standard option set for these tests: intervals tightened so
+// the suite is paced by work rather than by the production-shaped control loop.
+func testOpts(mapShards, reduceShards int) []eqmr.Option {
+	return []eqmr.Option{
+		eqmr.WithMapShards(mapShards),
+		eqmr.WithReduceShards(reduceShards),
+		eqmr.WithLease(30 * time.Second),
+		eqmr.WithControlInterval(25 * time.Millisecond),
+		eqmr.WithStallTimeout(60 * time.Second),
 	}
 }
+
+// testPrefix returns a fresh, unique run prefix.
+func testPrefix() string { return "/eqmrtest/" + entroq.GenHex16() }
 
 func newClient(ctx context.Context, t *testing.T) *entroq.EntroQ {
 	t.Helper()
@@ -50,7 +52,7 @@ func TestWordCountSmall(t *testing.T) {
 	ctx := context.Background()
 	eq := newClient(ctx, t)
 
-	ctrl, err := eqmr.New(eq, testConfig(2, 3))
+	ctrl, err := eqmr.New(eq, testPrefix(), testOpts(2, 3)...)
 	if err != nil {
 		t.Fatalf("new controller: %v", err)
 	}
@@ -143,8 +145,8 @@ func TestManyDistinctKeys(t *testing.T) {
 	)
 	input, histogram := wordCountFixture(t, uniqueWords, totalWords, numDocs)
 
-	cfg := testConfig(8, 7)
-	ctrl, err := eqmr.New(eq, cfg)
+	const reduceShards = 7
+	ctrl, err := eqmr.New(eq, testPrefix(), testOpts(8, reduceShards)...)
 	if err != nil {
 		t.Fatalf("new controller: %v", err)
 	}
@@ -178,7 +180,7 @@ func TestManyDistinctKeys(t *testing.T) {
 
 	// The shuffle must actually spread keys, or the partition count is a lie.
 	used := 0
-	for p := range cfg.ReduceShards {
+	for p := range reduceShards {
 		part, err := ctrl.ResultsForPartition(ctx, p)
 		if err != nil {
 			t.Fatalf("partition %d: %v", p, err)
@@ -192,8 +194,8 @@ func TestManyDistinctKeys(t *testing.T) {
 			t.Errorf("partition %d is not sorted by key", p)
 		}
 	}
-	if used != cfg.ReduceShards {
-		t.Errorf("only %d of %d reduce partitions received keys", used, cfg.ReduceShards)
+	if used != reduceShards {
+		t.Errorf("only %d of %d reduce partitions received keys", used, reduceShards)
 	}
 }
 
@@ -206,7 +208,7 @@ func TestCombinerDoesNotChangeResults(t *testing.T) {
 	run := func(t *testing.T, combiner eqmr.Combiner) []string {
 		t.Helper()
 		eq := newClient(ctx, t)
-		ctrl, err := eqmr.New(eq, testConfig(5, 4))
+		ctrl, err := eqmr.New(eq, testPrefix(), testOpts(5, 4)...)
 		if err != nil {
 			t.Fatalf("new controller: %v", err)
 		}
@@ -244,7 +246,7 @@ func TestDifferentShardingSameResults(t *testing.T) {
 	run := func(t *testing.T, mapShards, reduceShards int) []string {
 		t.Helper()
 		eq := newClient(ctx, t)
-		ctrl, err := eqmr.New(eq, testConfig(mapShards, reduceShards))
+		ctrl, err := eqmr.New(eq, testPrefix(), testOpts(mapShards, reduceShards)...)
 		if err != nil {
 			t.Fatalf("new controller: %v", err)
 		}
@@ -286,7 +288,7 @@ func TestBinaryKeysAreRejected(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			eq := newClient(ctx, t)
-			ctrl, err := eqmr.New(eq, testConfig(1, 1))
+			ctrl, err := eqmr.New(eq, testPrefix(), testOpts(1, 1)...)
 			if err != nil {
 				t.Fatalf("new controller: %v", err)
 			}
@@ -333,33 +335,62 @@ func TestValidateTextRule(t *testing.T) {
 	}
 }
 
-func TestConfigRequiresShardCounts(t *testing.T) {
+// TestNewRejectsBadPrefix covers what New alone can check. Shard counts are
+// deliberately absent here: a mapper or reducer pod builds a Controller without
+// them, so requiring them at construction would break the very case the option
+// form exists to serve.
+func TestNewRejectsBadPrefix(t *testing.T) {
 	ctx := context.Background()
 	eq := newClient(ctx, t)
 
 	for _, tc := range []struct {
-		name string
-		cfg  eqmr.Config
-		want string
+		name   string
+		prefix string
+		want   string
 	}{
-		{"no prefix", eqmr.Config{MapShards: 1, ReduceShards: 1}, "Prefix is required"},
-		{"no map shards", eqmr.Config{Prefix: "/x", ReduceShards: 1}, "MapShards must be set explicitly"},
-		{"no reduce shards", eqmr.Config{Prefix: "/x", MapShards: 1}, "ReduceShards must be set explicitly"},
-		{"negative map shards", eqmr.Config{Prefix: "/x", MapShards: -2, ReduceShards: 1}, "MapShards must be set explicitly"},
-		{"prefix too long", eqmr.Config{Prefix: "/" + strings.Repeat("x", 1100), MapShards: 1, ReduceShards: 1}, "limit is 1024"},
-		{"prefix multibyte over byte limit", eqmr.Config{Prefix: "/" + strings.Repeat("→", 400), MapShards: 1, ReduceShards: 1}, "limit is 1024"},
-		{"prefix bad utf8", eqmr.Config{Prefix: string([]byte{'/', 0xff}), MapShards: 1, ReduceShards: 1}, "not valid UTF-8"},
-		{"prefix has NUL", eqmr.Config{Prefix: string([]byte{'/', 'a', 0x00}), MapShards: 1, ReduceShards: 1}, "NUL"},
+		{"empty", "", "prefix is required"},
+		{"too long", "/" + strings.Repeat("x", 1100), "limit is 1024"},
+		{"multibyte over the byte limit", "/" + strings.Repeat("\u2192", 400), "limit is 1024"},
+		{"invalid utf-8", string([]byte{'/', 0xff}), "not valid UTF-8"},
+		{"embedded NUL", string([]byte{'/', 'a', 0x00}), "NUL"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := eqmr.New(eq, tc.cfg)
-			if err == nil {
+			if _, err := eqmr.New(eq, tc.prefix); err == nil {
 				t.Fatalf("expected an error for %s", tc.name)
-			}
-			if !strings.Contains(err.Error(), tc.want) {
+			} else if !strings.Contains(err.Error(), tc.want) {
 				t.Errorf("error %q does not mention %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// TestWorkerRolesNeedNoShardCounts pins the property the whole option shape is
+// for: a worker pod constructs its Controller from a prefix alone. Only Setup,
+// which fixes the layout, requires the counts, and it says which one is missing.
+func TestWorkerRolesNeedNoShardCounts(t *testing.T) {
+	ctx := context.Background()
+	eq := newClient(ctx, t)
+
+	ctrl, err := eqmr.New(eq, testPrefix())
+	if err != nil {
+		t.Fatalf("a worker role must be able to build a Controller from a prefix alone: %v", err)
+	}
+
+	err = ctrl.Setup(ctx, []*eqmr.KV{eqmr.NewKV("", "a b c")})
+	if err == nil {
+		t.Fatal("Setup must refuse to run without shard counts")
+	}
+	if !strings.Contains(err.Error(), "MapShards must be set") {
+		t.Errorf("error %q should name the missing option", err)
+	}
+
+	partial, err := eqmr.New(eq, testPrefix(), eqmr.WithMapShards(2))
+	if err != nil {
+		t.Fatalf("new controller: %v", err)
+	}
+	err = partial.Setup(ctx, []*eqmr.KV{eqmr.NewKV("", "a b c")})
+	if err == nil || !strings.Contains(err.Error(), "ReduceShards must be set") {
+		t.Errorf("error %q should name the missing option", err)
 	}
 }
 
@@ -367,8 +398,8 @@ func TestCleanupRemovesEverything(t *testing.T) {
 	ctx := context.Background()
 	eq := newClient(ctx, t)
 
-	cfg := testConfig(3, 2)
-	ctrl, err := eqmr.New(eq, cfg)
+	prefix := testPrefix()
+	ctrl, err := eqmr.New(eq, prefix, testOpts(3, 2)...)
 	if err != nil {
 		t.Fatalf("new controller: %v", err)
 	}
@@ -400,7 +431,7 @@ func TestCleanupRemovesEverything(t *testing.T) {
 		t.Errorf("expected no docs after cleanup, got %d", len(docs))
 	}
 
-	stats, err := eq.QueueStats(ctx, entroq.MatchPrefix(cfg.Prefix))
+	stats, err := eq.QueueStats(ctx, entroq.MatchPrefix(prefix))
 	if err != nil {
 		t.Fatalf("queue stats: %v", err)
 	}
@@ -415,7 +446,7 @@ func TestEmptyInputCompletes(t *testing.T) {
 	ctx := context.Background()
 	eq := newClient(ctx, t)
 
-	ctrl, err := eqmr.New(eq, testConfig(4, 3))
+	ctrl, err := eqmr.New(eq, testPrefix(), testOpts(4, 3)...)
 	if err != nil {
 		t.Fatalf("new controller: %v", err)
 	}
@@ -454,7 +485,7 @@ func TestQuarantinedWorkFailsRun(t *testing.T) {
 	defer cancel()
 	eq := newClient(ctx, t)
 
-	ctrl, err := eqmr.New(eq, testConfig(2, 2))
+	ctrl, err := eqmr.New(eq, testPrefix(), testOpts(2, 2)...)
 	if err != nil {
 		t.Fatalf("new controller: %v", err)
 	}
@@ -507,11 +538,7 @@ func TestMaxClaimsDefault(t *testing.T) {
 	ctx := context.Background()
 	eq := newClient(ctx, t)
 
-	base := func() eqmr.Config {
-		return eqmr.Config{Prefix: "/mc/" + entroq.GenHex16(), MapShards: 2, ReduceShards: 2}
-	}
-
-	ctrl, err := eqmr.New(eq, base())
+	ctrl, err := eqmr.New(eq, testPrefix(), eqmr.WithMapShards(2), eqmr.WithReduceShards(2))
 	if err != nil {
 		t.Fatalf("new controller: %v", err)
 	}
@@ -519,9 +546,7 @@ func TestMaxClaimsDefault(t *testing.T) {
 		t.Errorf("default MaxClaims is %d, want %d", got, eqmr.DefaultMaxClaims)
 	}
 
-	cfg := base()
-	cfg.MaxClaims = -1
-	unlimited, err := eqmr.New(eq, cfg)
+	unlimited, err := eqmr.New(eq, testPrefix(), eqmr.WithMaxClaims(-1))
 	if err != nil {
 		t.Fatalf("new controller: %v", err)
 	}
@@ -529,9 +554,15 @@ func TestMaxClaimsDefault(t *testing.T) {
 		t.Errorf("negative MaxClaims became %d, want it preserved as unlimited", got)
 	}
 
-	// The control queue must never carry a claim ceiling: its task is claimed
-	// once per tick for the life of the run.
-	if len(ctrl.ControlRunOptions()) >= len(ctrl.WorkerRunOptions(ctrl.MapQ())) {
-		t.Error("control run options should carry fewer options than worker ones (no claim ceiling)")
+	// A whole Config still works, for callers who prefer one, and composes with
+	// other options rather than replacing them.
+	viaStruct, err := eqmr.New(eq, testPrefix(),
+		eqmr.WithLease(time.Minute),
+		eqmr.WithConfig(eqmr.Config{MapShards: 4, ReduceShards: 2}))
+	if err != nil {
+		t.Fatalf("new controller: %v", err)
+	}
+	if got := viaStruct.Config(); got.MapShards != 4 || got.ReduceShards != 2 || got.Lease != time.Minute {
+		t.Errorf("WithConfig did not compose: %+v", got)
 	}
 }

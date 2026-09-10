@@ -18,14 +18,22 @@ import (
 // into memory; a run whose output does not fit should read partitions
 // individually with ResultsForPartition instead.
 func (c *Controller) Results(ctx context.Context) ([]*KV, error) {
-	runs := make([][]*KV, 0, c.cfg.ReduceShards)
-	for p := range c.cfg.ReduceShards {
-		part, err := c.ResultsForPartition(ctx, p)
-		if err != nil {
-			return nil, err
+	docs, err := c.client.Docs(ctx, &entroq.DocQuery{
+		Namespace: c.DocNS(),
+		KeyStart:  resultPrefix,
+		KeyEnd:    prefixEnd(resultPrefix),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("eqmr results: %w", err)
+	}
+	runs := make([][]*KV, 0, len(docs))
+	for _, d := range docs {
+		var out []*KV
+		if err := json.Unmarshal(d.Content, &out); err != nil {
+			return nil, fmt.Errorf("eqmr results: parse %q: %w", d.Key, err)
 		}
-		if len(part) > 0 {
-			runs = append(runs, part)
+		if len(out) > 0 {
+			runs = append(runs, out)
 		}
 	}
 	return mergeKVRuns(runs), nil
@@ -33,9 +41,12 @@ func (c *Controller) Results(ctx context.Context) ([]*KV, error) {
 
 // ResultsForPartition returns the output pairs for one reduce partition, sorted
 // by key. An empty slice means no mapper emitted a key belonging to it.
+//
+// Prefer Results unless you are deliberately reading partition by partition;
+// this is the escape hatch for output too large to hold at once.
 func (c *Controller) ResultsForPartition(ctx context.Context, p int) ([]*KV, error) {
-	if p < 0 || p >= c.cfg.ReduceShards {
-		return nil, fmt.Errorf("eqmr results: partition %d out of range [0,%d)", p, c.cfg.ReduceShards)
+	if p < 0 {
+		return nil, fmt.Errorf("eqmr results: negative partition %d", p)
 	}
 	docs, err := c.client.Docs(ctx, &entroq.DocQuery{
 		Namespace: c.DocNS(),
@@ -87,15 +98,13 @@ func mergeKVRuns(runs [][]*KV) []*KV {
 // Cleanup removes everything a run created: all of its docs and all of its
 // tasks, including the control task and anything quarantined.
 //
-// It is safe to call on a partially completed run, but not on a running one: a
-// claimed doc or task cannot be deleted, and Cleanup reports that as an error
-// rather than partially tearing down a live run.
+// Call it on a finished or abandoned run. A live one returns an error, because
+// a claimed doc or task cannot be deleted.
 //
-// Cleanup is the explicit path. A run whose output should simply expire can
-// instead put its namespace under EntroQ's /gc= convention, but note that
-// activation is baked into the namespace string at insert time and collects any
-// unclaimed doc group once it fires, which is wrong for intermediate docs and
-// right only for output a consumer has a bounded window to read.
+// For output that should simply expire, put the run's namespace under EntroQ's
+// /gc= convention. Activation is fixed in the namespace string when documents
+// are inserted, and collects any unclaimed doc group once it fires, so it suits
+// output with a bounded reading window.
 func (c *Controller) Cleanup(ctx context.Context) error {
 	const batch = 250
 
@@ -184,13 +193,13 @@ func (c *Controller) Run(ctx context.Context, input []*KV, mapFn Mapper, reduceF
 	// Work queues get the claim ceiling from Config; the control queue must not
 	// have one, which WorkerRunOptions and ControlRunOptions encode.
 	workOpts := func(q string) []worker.RunOption {
-		ro := c.WorkerRunOptions(q)
+		ro := c.workerRunOptions(q)
 		if opts.MaxAttempts > 0 {
 			ro = append(ro, worker.WithMaxAttempts(opts.MaxAttempts))
 		}
 		return ro
 	}
-	controlOpts := c.ControlRunOptions()
+	controlOpts := c.controlRunOptions()
 
 	var mapperOpts []MapperOption
 	if opts.Combiner != nil {

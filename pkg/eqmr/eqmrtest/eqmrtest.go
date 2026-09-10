@@ -1,10 +1,14 @@
-// Package eqmrtest provides correctness helpers for the experimental eqmr
-// MapReduce, mirroring the word-count histogram check that examples/mrtest
-// applied to the older example implementation.
+// Package eqmrtest verifies eqmr pipelines against a known answer.
 //
-// The generator is deterministic given a seed and returns document bodies as
-// plain strings rather than a package-specific KV type, so the same input can be
-// fed to two different MapReduce implementations for comparison.
+// Docs generates a word corpus together with its exact histogram, Check runs a
+// word-count MapReduce over such a corpus and compares the two, and QuickCheck
+// does the same at a size given by document and worker counts. Bodies come back
+// as plain strings, so the same corpus can be fed to more than one
+// implementation.
+//
+//	if err := eqmrtest.QuickCheck(ctx, eq, 100, 8, 3); err != nil {
+//		t.Fatal(err)
+//	}
 package eqmrtest
 
 import (
@@ -98,15 +102,12 @@ type Config struct {
 	ControlInterval time.Duration
 }
 
-// Intervals used when a Config leaves them zero. These are test-shaped, not
-// deployment-shaped: a check should be paced by the work, not by the control
-// loop waiting to look again.
-// A lease has to outlast a single unit of work, and a reduce unit here is a
-// whole partition: its duration scales with how much the map phase sent there,
-// not with some fixed per-record cost. Five seconds was enough until a large
-// check put hundreds of workers in one process, where scheduling delay alone
-// pushed renewals past expiry, tasks were reclaimed mid-work, and the claim
-// ceiling correctly turned the churn into a failed run. Thirty gives room.
+// Intervals applied when a Config leaves them zero.
+//
+// The lease has to outlast a single unit of work. A reduce unit is a whole
+// partition, so its duration grows with how much the map phase sent there; the
+// value here covers the largest partition these helpers produce under a process
+// running hundreds of workers.
 const (
 	testLease           = 30 * time.Second
 	testControlInterval = 25 * time.Millisecond
@@ -132,13 +133,12 @@ func Check(ctx context.Context, eq *entroq.EntroQ, cfg Config) error {
 		input[i] = eqmr.NewKV("", b)
 	}
 
-	ctrl, err := eqmr.New(eq, eqmr.Config{
-		Prefix:          prefix,
-		MapShards:       cfg.MapShards,
-		ReduceShards:    cfg.ReduceShards,
-		Lease:           cfg.Lease,
-		ControlInterval: cfg.ControlInterval,
-	})
+	ctrl, err := eqmr.New(eq, prefix,
+		eqmr.WithMapShards(cfg.MapShards),
+		eqmr.WithReduceShards(cfg.ReduceShards),
+		eqmr.WithLease(cfg.Lease),
+		eqmr.WithControlInterval(cfg.ControlInterval),
+	)
 	if err != nil {
 		return fmt.Errorf("eqmrtest: %w", err)
 	}
@@ -160,38 +160,44 @@ func Check(ctx context.Context, eq *entroq.EntroQ, cfg Config) error {
 	return nil
 }
 
-// Standard shape for QuickCheck.
+// Corpus shape for QuickCheck.
 //
-// The old examples/mrtest check fixed uniqueWords at 10, so no cross-backend
-// test ever produced enough distinct keys to spread across reduce partitions:
-// the shuffle went unexercised by the very tests meant to verify the pipeline.
+// A mapper emits one pair per distinct word per document, so intermediate
+// volume is documents times distinct words, and callers pass document counts in
+// the tens of thousands. The knob is steep: at 25 distinct words a 50,000
+// document check runs in about five minutes, at 100 it produces partitions
+// large enough for a reduce unit to outlive a 30 second lease, and at 500 even
+// a 10,000 document check takes a minute and a half. Twenty-five spreads keys
+// across the partition counts these callers use while keeping the corpus cheap.
 //
-// This value is chosen for cost, not maximised. The mapper emits one pair per
-// distinct word per document, and callers here scale documents into the tens of
-// thousands, so intermediate volume is documents times this number. At 500 the
-// large eqmem check took 93 seconds; at 100 the huge one produced millions of
-// spill documents and partitions so large that reduce units outlived their
-// lease. Twenty-five still spreads keys across partitions, which is the
-// coverage the old fixed value of 10 never gave, while staying near the old
-// cost. Deep fan-out belongs in this package's own tests, which run to twenty
-// thousand distinct keys against a bounded document count.
+// A test wanting deep fan-out should call Check with a larger UniqueWords and a
+// bounded NumDocs.
 const (
 	quickUniqueWords = 25
 	quickWordsPerDoc = 200
+
+	// quickMaxSplits caps how finely QuickCheck divides its corpus.
+	//
+	// A split is a batch of records, and intermediate volume is splits times
+	// distinct keys per split, so dividing a large corpus one record per split
+	// multiplies the documents a run has to move without testing anything
+	// further. Callers pass document counts in the tens of thousands; this
+	// keeps the pipeline the subject of the test.
+	quickMaxSplits = 512
 )
 
 // QuickCheck runs a word-count MapReduce sized by the given parameters and
 // verifies it against the histogram that generated it.
 //
 // It exists so a cross-backend test can vary scale without composing a Config.
-// Splits are one per input document, matching how a caller would naturally
-// decompose this workload, and partitions follow the reducer count.
+// Records are divided into at most quickMaxSplits batches, and partitions
+// follow the reducer count.
 func QuickCheck(ctx context.Context, eq *entroq.EntroQ, numDocs, numMappers, numReducers int) error {
 	return Check(ctx, eq, Config{
 		UniqueWords:  quickUniqueWords,
 		WordsPerDoc:  quickWordsPerDoc,
 		NumDocs:      numDocs,
-		MapShards:    numDocs,
+		MapShards:    min(numDocs, quickMaxSplits),
 		ReduceShards: numReducers,
 		Mappers:      numMappers,
 		Reducers:     numReducers,

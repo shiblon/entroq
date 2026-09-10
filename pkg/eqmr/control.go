@@ -76,9 +76,8 @@ func (c *Controller) step(ctx context.Context, state controlState) (controlState
 		return state, nil, nil
 	}
 
-	// A quarantined task fails the run. A MapReduce that lost part of its input
-	// cannot support any claim about the correctness of its output, so
-	// surfacing this beats reporting a plausible but wrong answer.
+	// A quarantined task fails the run: a MapReduce that lost part of its input
+	// cannot support a claim about the correctness of its output.
 	stats, err := c.client.QueueStats(ctx, entroq.MatchExact(c.ErrQ()))
 	if err != nil {
 		return state, nil, fmt.Errorf("eqmr control: quarantine check: %w", err)
@@ -89,8 +88,8 @@ func (c *Controller) step(ctx context.Context, state controlState) (controlState
 
 	switch state.Phase {
 	case PhaseMap:
-		// Split docs are deleted in the same Modify that writes their spills,
-		// so their absence means every spill doc exists.
+		// Split docs are deleted in the same Modify that writes their map outputs,
+		// so their absence means every map-output doc exists.
 		remaining, err := c.countDocs(ctx, splitPrefix)
 		if err != nil {
 			return state, nil, fmt.Errorf("eqmr control: %w", err)
@@ -102,13 +101,13 @@ func (c *Controller) step(ctx context.Context, state controlState) (controlState
 				ReduceParts:  state.ReduceParts,
 				LastProgress: time.Now(),
 			}
-			return next, c.pendingReduceTasks(), nil
+			return next, c.pendingReduceTasks(state.ReduceParts), nil
 		}
 		return c.progress(state, remaining)
 
 	case PhaseReduce:
 		// Every partition writes a result doc, empty ones included, and each is
-		// committed atomically with that partition's spill deletions. So the
+		// committed atomically with that partition's map output deletions. So the
 		// count of result docs is a complete and purely doc-based statement of
 		// how much of the reduce phase is finished. No queue is consulted.
 		done, err := c.countDocs(ctx, resultPrefix)
@@ -134,11 +133,11 @@ func (c *Controller) step(ctx context.Context, state controlState) (controlState
 // pendingReduceTasks is the modification that fans a run out to its reduce
 // partitions. It is applied by the same Modify that advances the control task,
 // so the fan-out and the phase change cannot diverge.
-func (c *Controller) pendingReduceTasks() []entroq.ModifyArg {
-	args := make([]entroq.ModifyArg, 0, c.cfg.ReduceShards)
-	for p := range c.cfg.ReduceShards {
+func (c *Controller) pendingReduceTasks(parts int) []entroq.ModifyArg {
+	args := make([]entroq.ModifyArg, 0, parts)
+	for p := range parts {
 		args = append(args, entroq.InsertingInto(c.ReduceQ(), entroq.WithValue(reduceClaim{
-			Doc:       docRef{NS: c.DocNS(), Key: spillDocKey(p)},
+			Doc:       docRef{NS: c.DocNS(), Key: mapOutDocKey(p)},
 			Partition: p,
 		})))
 	}
@@ -258,7 +257,7 @@ func (c *Controller) Wait(ctx context.Context) error {
 		case PhaseDone:
 			return nil
 		case PhaseFailed:
-			return fmt.Errorf("eqmr run %q failed: %s", c.cfg.Prefix, reason)
+			return fmt.Errorf("eqmr run %q failed: %s", c.prefix, reason)
 		}
 		select {
 		case <-ctx.Done():
@@ -304,14 +303,13 @@ type PhaseProgress struct {
 
 // Progress is a snapshot of a run, sufficient to draw it.
 //
-// It reports counts rather than a per-worker breakdown, and that is a property
-// of the system rather than an omission. Classic MapReduce could draw a bar per
-// worker because input shards were statically preassigned, so "how far along is
-// this mapper" had an answer. EntroQ is competing-consumer: a unit is claimed by
-// whichever worker is free, so no worker owns a knowable share and there is no
-// meaningful per-worker denominator. Per-worker throughput and idleness are
-// observability questions, answered by the worker metrics
-// (entroq.worker.slots, entroq.worker.tasks_total), not by run state.
+// Counts are per phase, not per worker. A unit is claimed by whichever worker
+// is free, so no worker owns a knowable share of the run. For per-worker
+// throughput and idleness use the worker metrics, entroq.worker.tasks_total and
+// entroq.worker.slots.
+//
+// Map resolution follows the split count: a mapper commits once, at the end of
+// its split, so finer progress comes from smaller splits.
 type Progress struct {
 	Phase  string        `json:"phase"`
 	Reason string        `json:"reason,omitempty"`

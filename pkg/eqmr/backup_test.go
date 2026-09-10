@@ -35,13 +35,12 @@ func TestBackupTasksRaceWithoutCorrupting(t *testing.T) {
 	defer eq.Close()
 
 	const mapShards = 4
-	ctrl, err := eqmr.New(eq, eqmr.Config{
-		Prefix:          "/backuptest/" + entroq.GenHex16(),
-		MapShards:       mapShards,
-		ReduceShards:    3,
-		Lease:           10 * time.Second,
-		ControlInterval: 20 * time.Millisecond,
-	})
+	ctrl, err := eqmr.New(eq, "/backuptest/"+entroq.GenHex16(),
+		eqmr.WithMapShards(mapShards),
+		eqmr.WithReduceShards(3),
+		eqmr.WithLease(10*time.Second),
+		eqmr.WithControlInterval(20*time.Millisecond),
+	)
 	if err != nil {
 		t.Fatalf("new controller: %v", err)
 	}

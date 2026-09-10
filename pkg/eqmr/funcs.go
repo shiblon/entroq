@@ -12,20 +12,10 @@ import (
 // KV is a key/value pair: the input type for mappers and the output type of a
 // completed run.
 //
-// Both halves are text, and must be valid UTF-8 without NUL. That is not a
-// stylistic preference. These values are stored inside document content, which
-// is JSONB in PostgreSQL, and JSONB rejects \u0000 outright; a JSON string
-// cannot represent invalid UTF-8 at all, and encoding/json silently substitutes
-// U+FFFD rather than failing. Text is also what the document store itself uses
-// for keys, so this keeps one rule across the package.
-//
-// A job whose keys or values are genuinely binary should encode them, with
-// base64 or anything else it prefers. That choice belongs to the job, which
-// knows whether it needs it; making everyone pay base64 for the few who do
-// inflates every intermediate document by roughly a fifth and leaves them
-// unreadable in psql. ValidateText reports whether a string qualifies, and the
-// pipeline checks emitted pairs so a violation fails where it was produced
-// rather than corrupting silently on the wire.
+// Both halves must be valid UTF-8 with no NUL, the rule ValidateText applies.
+// Content is stored as JSONB in PostgreSQL, which rejects NUL, and a JSON
+// string cannot represent invalid UTF-8. Encode binary keys or values in the
+// job that needs them.
 type KV struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
@@ -43,20 +33,12 @@ type EmitFunc func(ctx context.Context, key, value string) error
 
 // Mapper is called once per input KV and emits zero or more intermediate pairs.
 //
-// A Mapper that returns an error kills its worker. That is deliberate and it is
-// the standard MapReduce contract: a run in which some map calls failed cannot
-// support any claim about the correctness of its output. The task itself is
-// reclaimed once the lease expires, so a transient failure such as a network
-// blip costs one claim rather than the run.
-//
-// Bounding that recovery is the caller's job, via RunOptions.MaxClaims (or
-// worker.WithMaxClaims when running workers directly). A fatal handler error
-// does not mark the task, so without a claim bound a genuinely poisonous record
-// is retried forever. With one, the task is quarantined after a few tries and
-// the controller fails the run with a reason.
-//
-// If a particular failure should be tolerated instead, that judgment belongs
-// inside the Mapper body, which can swallow it and emit nothing.
+// Returning an error kills the worker, per the MapReduce contract: a run in
+// which some map calls failed cannot support a claim about its output. The task
+// is reclaimed once the lease expires, so a transient failure costs one claim,
+// and a record that fails every time exhausts the claim ceiling and fails the
+// run with a reason. To tolerate a particular failure, handle it in the Mapper
+// and emit nothing.
 type Mapper func(ctx context.Context, key, value string, emit EmitFunc) error
 
 // Reducer is called once per distinct intermediate key with every value for
@@ -65,19 +47,15 @@ type Reducer func(ctx context.Context, input ReducerInput) (string, error)
 
 // Combiner shrinks the value list for one key without finishing the reduction.
 //
-// It differs from Reducer in exactly the way that matters: a Combiner's output
-// has the same type as its input, so it is closed over its own output and may
-// run repeatedly, at more than one stage, on data it has already touched. A
-// Reducer collapses to a single value and can run only once, at the end.
+// Its output has the same type as its input, so it may run more than once and
+// on data it has already touched. The contract is that combining in pieces
+// equals combining all at once: for any split of the values into groups a and
+// b, C(C(a) ++ C(b)) must equal C(a ++ b). Sum, min, max, count and set-union
+// satisfy that; mean and median satisfy it only when carried as a richer
+// intermediate value, such as a running sum and count.
 //
-// The contract a Combiner must satisfy is that combining in pieces equals
-// combining all at once: for any partition of the values into groups a and b,
-// C(C(a) ++ C(b)) must be equivalent to C(a ++ b). Sum, min, max, count, and
-// set-union satisfy this; mean and median do not, unless carried as a richer
-// intermediate value.
-//
-// Combiners are an optimization and never a correctness requirement: a run with
-// no Combiner produces the same output, more slowly and with larger spills.
+// A Combiner is an optimization. Output is identical without one; intermediate
+// data is larger. See SumCombiner.
 type Combiner func(ctx context.Context, key string, values []string) ([]string, error)
 
 // ReducerInput iterates the values for one intermediate key.

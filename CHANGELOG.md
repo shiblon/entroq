@@ -29,7 +29,7 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Experimental MapReduce package (`pkg/eqmr`).** A MapReduce that runs
   entirely on EntroQ tasks and documents, promoted from the `examples/mr`
   sketch. It adds a real shuffle step: mappers partition intermediate keys into
-  a configured number of reduce shards and write per-partition spill documents,
+  a configured number of reduce shards and write per-partition map-output documents,
   so reduce work is proportional to the partition count rather than to the
   number of distinct keys. It adds combiners, which differ from reducers in
   being closed over their own output and so may run at more than one stage. The
@@ -41,7 +41,7 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   driving a status view, and validation of namespaces and document keys as
   NUL-free UTF-8 within the backend length limits. Map keys and values are text
   rather than bytes, validated on input and on every emit, which drops base64
-  from every intermediate document: measured, spill documents are 22% smaller
+  from every intermediate document: measured, map-output documents are 22% smaller
   and readable in psql. A job with genuinely binary keys encodes them itself. Phase completion is judged
   purely from documents: every partition writes a result document, empty ones
   included, so finishing is a recorded fact rather than an absence and no queue
@@ -50,16 +50,16 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   which makes backup tasks (speculative execution against stragglers) possible:
   a duplicate task races the original instead of blocking on its claim, and the
   loser's work is rejected atomically. No straggler policy ships with it. The
-  API and the document layout may change without a migration path.
-- **Queue-driven Kubernetes autoscaling.** The Helm chart can publish an
-  optional Prometheus `ServiceMonitor`; the service exports queue and doc
-  namespace size gauges; and the greetings demo includes a KEDA `ScaledObject`
-  that scales an eqlink receiver between zero and one replica from queued work
-  or durable workflow-status docs.
+  Configuration is by functional option, `New(eq, prefix, opts...)`, and shard
+  counts are required only by `Setup`: a mapper or reducer pod builds a
+  controller from a run prefix alone, because the partition count a mapper must
+  agree on travels in its task. `RunMapper`, `RunReducer` and `RunController`
+  wire each role to its own queue, lease and claim ceiling. The API and the
+  document layout may change without a migration path.
 
 ### Removed
 
-- **`examples/mr` and `examples/mrtest`.** Retired in favour of `pkg/eqmr`, with
+- **`examples/mr` and `examples/mrtest`.** Retired in favor of `pkg/eqmr`, with
   the cross-backend and benchmark callers rewired to `pkg/eqmr/eqmrtest`. The
   correctness check there also stops fixing its corpus at ten distinct words,
   which meant no cross-backend test ever produced enough keys to spread across

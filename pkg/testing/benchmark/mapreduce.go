@@ -155,11 +155,10 @@ func mapReduceInput() []*eqmr.KV {
 // mapReduceController builds a controller for one benchmark run.
 func mapReduceController(b *testing.B, client *entroq.EntroQ, prefix string) *eqmr.Controller {
 	b.Helper()
-	ctrl, err := eqmr.New(client, eqmr.Config{
-		Prefix:       prefix,
-		MapShards:    mapReduceMapShards,
-		ReduceShards: mapReduceReduceShards,
-	})
+	ctrl, err := eqmr.New(client, prefix,
+		eqmr.WithMapShards(mapReduceMapShards),
+		eqmr.WithReduceShards(mapReduceReduceShards),
+	)
 	if err != nil {
 		b.Fatalf("MapReduce controller: %v", err)
 	}

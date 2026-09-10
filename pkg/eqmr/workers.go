@@ -12,7 +12,7 @@ import (
 )
 
 // keyValues is one intermediate key with all of its values from a single map
-// split. A spill doc holds a slice of these, sorted by key, which is what makes
+// split. A map-output doc holds a slice of these, sorted by key, which is what makes
 // the reducer's merge a linear k-way merge rather than a full sort.
 type keyValues struct {
 	Key    string   `json:"key"`
@@ -66,6 +66,9 @@ type controlState struct {
 func (c *Controller) Setup(ctx context.Context, input []*KV) error {
 	const batchSize = 250
 
+	if err := c.cfg.validateForSetup(); err != nil {
+		return err
+	}
 	splits := splitInput(input, c.cfg.MapShards)
 
 	// Empty splits are never written, so the number of map units is not
@@ -112,7 +115,11 @@ func (c *Controller) Setup(ctx context.Context, input []*KV) error {
 		}
 		args = append(args,
 			entroq.PuttingDocInto(c.DocNS(), entroq.WithKeys(key, ""), entroq.WithContent(split)),
-			entroq.InsertingInto(c.MapQ(), entroq.WithValue(docRef{NS: c.DocNS(), Key: key})),
+			entroq.InsertingInto(c.MapQ(), entroq.WithValue(docRef{
+				NS:           c.DocNS(),
+				Key:          key,
+				ReduceShards: c.cfg.ReduceShards,
+			})),
 		)
 		if len(args) >= batchSize {
 			if err := flush(); err != nil {
@@ -167,7 +174,7 @@ type mapperOpts struct {
 }
 
 // WithCombiner applies a Combiner to each key's values before they are written
-// to spill docs. This is the cheapest place to combine and usually the most
+// to map-output docs. This is the cheapest place to combine and usually the most
 // effective, because it shrinks the data before it is ever stored. See Combiner
 // for the contract it must satisfy.
 func WithCombiner(cb Combiner) MapperOption {
@@ -178,7 +185,7 @@ func WithCombiner(cb Combiner) MapperOption {
 // RunOptions, or use the Run helper for the standard configuration.
 //
 // The worker claims its split doc before working, and commits the split doc's
-// deletion in the same Modify that writes its spill docs. That single atomic
+// deletion in the same Modify that writes its map-output docs. That single atomic
 // step is what makes "no split docs remain" a sound completion barrier.
 func (c *Controller) MapperWorker(mapFn Mapper, opts ...MapperOption) *worker.Worker[docRef] {
 	o := new(mapperOpts)
@@ -229,11 +236,17 @@ func (c *Controller) MapperWorker(mapFn Mapper, opts ...MapperOption) *worker.Wo
 				}
 			}
 
-			buckets := partition(grouped, order, c.cfg.ReduceShards)
+			// The partition count comes from the task, not from this process's
+			// configuration, so a mapper deployment cannot disagree with the
+			// run it is serving.
+			if ref.ReduceShards <= 0 {
+				return nil, worker.MoveErrorf("map task for %q carries no partition count", ref.Key)
+			}
+			buckets := partition(grouped, order, ref.ReduceShards)
 
 			// doc.Delete() is pinned to the version read above, so this whole
 			// modification is rejected if another worker committed the same
-			// split first. Rejection is atomic: the losing worker's spill docs
+			// split first. Rejection is atomic: the losing worker's map-output docs
 			// are never written, so a race costs duplicated compute and nothing
 			// else.
 			modArgs := []entroq.ModifyArg{task.Delete(), doc.Delete()}
@@ -242,16 +255,11 @@ func (c *Controller) MapperWorker(mapFn Mapper, opts ...MapperOption) *worker.Wo
 					continue
 				}
 				modArgs = append(modArgs, entroq.PuttingDocInto(c.DocNS(),
-					// No secondary key. A secondary key keeps subsets of a
-					// primary-key group located together; it does not define
-					// the group, which here is the whole partition and is taken
-					// in one ClaimDocs. This partition has no subset that needs
-					// co-locating: the merge is order-independent and the
-					// reducer sorts values itself. Left free rather than
-					// occupied by something nothing reads, so a later job-
-					// specific use (MapReduce's classic one being secondary
-					// sort) still has it.
-					entroq.WithKeys(spillDocKey(p), ""),
+					// No secondary key. A reducer takes a whole partition in
+					// one ClaimDocs, the merge is order-independent, and the
+					// reducer sorts values itself, so nothing here needs the
+					// intra-group ordering a secondary key provides.
+					entroq.WithKeys(mapOutDocKey(p), ""),
 					entroq.WithContent(entries),
 				))
 			}
@@ -262,15 +270,12 @@ func (c *Controller) MapperWorker(mapFn Mapper, opts ...MapperOption) *worker.Wo
 
 // lostRace is the disposition for a commit that failed on a dependency.
 //
-// Every branch that returns nil leaves the task alone, to be reclaimed on lease
-// expiry, at which point it re-reads its input, finds the work already done, and
-// retires. None of them is a RetryError: a retry increments the attempt count,
-// and a worker whose only misfortune was losing a race must never be
-// quarantined, because quarantining anything fails the whole run.
+// A nil return leaves the task alone. It is reclaimed on lease expiry, re-reads
+// its input, finds the work already done and retires. Never a RetryError: that
+// increments the attempt count, and a worker that lost a race must not be
+// quarantined, since quarantining anything fails the run.
 //
-// The default case is the point of the switch. Per the OnDependency contract,
-// failures you understand are classified and anything else stops the worker,
-// rather than continuing from a state whose cause is unknown.
+// Unclassified failures stop the worker, per the OnDependency contract.
 func lostRace(_ context.Context, de *entroq.DependencyError) error {
 	switch {
 	case de.HasMissingDocs():
@@ -286,7 +291,7 @@ func lostRace(_ context.Context, de *entroq.DependencyError) error {
 
 	case de.HasMissing() || de.HasClaims():
 		// Our own task was deleted or reclaimed while we worked, so it belongs
-		// to someone else now. Ordinary lease behaviour, nothing to dispose of.
+		// to someone else now. Ordinary lease behavior, nothing to dispose of.
 		return nil
 
 	default:
@@ -304,14 +309,11 @@ func runMapper(ctx context.Context, mapFn Mapper, split []*KV) (map[string][]str
 	var order []string
 
 	// Validate at the point of emission, so a bad pair names the mapper call
-	// that produced it rather than surfacing later as a marshaling failure or,
-	// worse, as silent U+FFFD substitution on the wire.
+	// that produced it.
 	//
-	// A MoveError rather than a plain one: text that is not valid UTF-8 will
-	// never become valid on a retry, so this is a data error like a malformed
-	// split. Quarantining at once beats killing a worker repeatedly over input
-	// that cannot succeed, and the controller turns the quarantine into a run
-	// failure carrying the reason.
+	// A MoveError, because text that is not valid UTF-8 stays invalid on a
+	// retry: the task is quarantined on the first attempt and the controller
+	// fails the run with the reason.
 	emit := func(_ context.Context, k, v string) error {
 		if err := ValidateText("emitted key", k); err != nil {
 			return worker.MoveErrorf("%v", err)
@@ -354,21 +356,21 @@ func sortValues(vals []string) { sort.Strings(vals) }
 
 // ReducerWorker returns a worker that consumes one reduce partition per task.
 //
-// It claims every spill doc sharing the partition's primary key in a single
+// It claims every map-output doc sharing the partition's primary key in a single
 // ClaimDocs, merges those sorted runs, runs reduceFn once per distinct key, and
-// commits the spill deletions together with the partition's result doc. As in
-// the map phase, that atomicity is what makes "no spill docs remain" a sound
+// commits the map output deletions together with the partition's result doc. As in
+// the map phase, that atomicity is what makes "no map-output docs remain" a sound
 // barrier.
 func (c *Controller) ReducerWorker(reduceFn Reducer) *worker.Worker[reduceClaim] {
 	return worker.New[reduceClaim](c.client,
 		worker.WithErrQMap[reduceClaim](c.errQMap),
 		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, rc reduceClaim, _ []*entroq.Doc) (*worker.Result, error) {
-			// Read the partition's spills WITHOUT claiming them, for the same
+			// Read the partition's map outputs WITHOUT claiming them, for the same
 			// reason the mapper does: a claim would block a duplicate worker
 			// rather than race it. Exclusion is at commit time.
 			docs, err := c.client.Docs(ctx, rc.Doc.asQuery())
 			if err != nil {
-				return nil, fmt.Errorf("read spills %q: %w", rc.Doc.Key, err)
+				return nil, fmt.Errorf("read map outputs %q: %w", rc.Doc.Key, err)
 			}
 
 			if len(docs) == 0 {
@@ -400,7 +402,7 @@ func (c *Controller) ReducerWorker(reduceFn Reducer) *worker.Worker[reduceClaim]
 			for _, d := range docs {
 				var entries []*keyValues
 				if err := json.Unmarshal(d.Content, &entries); err != nil {
-					return nil, worker.MoveErrorf("parse spill doc %q: %v", d.ID, err)
+					return nil, worker.MoveErrorf("parse map-output doc %q: %v", d.ID, err)
 				}
 				runs = append(runs, entries)
 			}
@@ -423,7 +425,7 @@ func (c *Controller) ReducerWorker(reduceFn Reducer) *worker.Worker[reduceClaim]
 				return nil, err
 			}
 
-			// Every spill delete is version-pinned, so a worker that lost this
+			// Every map output delete is version-pinned, so a worker that lost this
 			// partition to another has its whole modification rejected and
 			// writes no result.
 			modArgs := []entroq.ModifyArg{task.Delete()}
@@ -450,7 +452,7 @@ func (c *Controller) resultInsert(partition int, out []*KV) entroq.ModifyArg {
 //
 // Cursor-per-run with a linear minimum scan is O(k) per key. With k equal to
 // the number of map splits that is comfortably cheaper than the reduce work
-// itself; swapping in a heap becomes worthwhile only once spills are read
+// itself; swapping in a heap becomes worthwhile only once map outputs are read
 // lazily rather than unmarshaled up front.
 func mergeRuns(runs [][]*keyValues, visit func(key string, values []string) error) error {
 	cursors := make([]int, len(runs))

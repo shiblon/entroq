@@ -5,7 +5,7 @@ may change or be removed without a migration path. Do not treat what it writes
 to a namespace as a stable interchange format.
 
 It runs a complete MapReduce with no storage outside EntroQ: input, shuffle
-spills, and output all live as docs, and every phase transition is a task.
+map outputs, and output all live as docs, and every phase transition is a task.
 
 ## Deployed shape
 
@@ -16,11 +16,11 @@ each role scales independently:
                  {prefix}/map          {prefix}/reduce        {prefix}/control
                       |                      |                       |
               +---------------+      +---------------+       +---------------+
-              | MapperWorker  |      | ReducerWorker |       | ControlWorker |
-              |   (scale N)   |      |   (scale M)   |       | (scale 1..k)  |
+              |  RunMapper    |      |  RunReducer   |       | RunController |
+              |  (scale N)    |      | (scale to R)  |       | (scale 1..k)  |
               +---------------+      +---------------+       +---------------+
                       |                      |                       |
-   docs:  split/NNNNNN  ->  spill/NNNNNN  ->  result/NNNNNN
+   docs:  split/NNNNNN  ->  mapout/NNNNNN  ->  result/NNNNNN
 ```
 
 One process does `Setup` to write the splits and create the control task. After
@@ -36,8 +36,8 @@ benchmarks, and small jobs, not for the deployed shape.
 
 | phase | barrier | what ends it |
 |---|---|---|
-| `map` | no `split/` docs remain | every mapper committed its spills |
-| `reduce` | no `spill/` docs remain and the reduce queue is empty | every partition wrote its result |
+| `map` | no `split/` docs remain | every mapper committed its map outputs |
+| `reduce` | every partition has a result doc | every reducer committed |
 | `done` / `failed` | terminal | control task parks, stays inspectable |
 
 Completion is read **purely from documents**. A split document disappears when
@@ -66,17 +66,17 @@ messages.
 
 Both barriers are sound for the same reason: a worker deletes its input doc in
 the *same* `Modify` that writes its output docs. So "no split docs remain"
-atomically implies "every spill doc exists". No coordinator state is required,
+atomically implies "every map-output doc exists". No coordinator state is required,
 and a worker that dies mid-task simply loses its claim.
 
 ## Shuffle
 
-Mappers assign each intermediate key to one of `Config.ReduceShards` partitions
-by `ShardForKey`, and write one spill doc per non-empty partition, keyed
-`spill/<partition>`. A reducer claims a whole partition in one `ClaimDocs`,
+Mappers assign each intermediate key to one of the run's reduce partitions
+by `ShardForKey`, and write one map-output doc per non-empty partition, keyed
+`mapout/<partition>`. A reducer claims a whole partition in one `ClaimDocs`,
 merges the per-split sorted runs, and reduces each key once.
 
-Spill docs carry **no secondary key**, on purpose. A secondary key keeps subsets
+Map-output docs carry **no secondary key**, on purpose. A secondary key keeps subsets
 of a primary-key group located together; it does not define the group. Here the
 group is the whole partition, taken in one `ClaimDocs`, and it has no subset that
 needs co-locating: the merge is order-independent and the reducer sorts values
@@ -85,9 +85,22 @@ so a later job-specific use (MapReduce's classic one being secondary sort) still
 has it.
 
 That makes reduce work proportional to the partition count, not to the number of
-distinct keys. Both shard counts are **required** in `Config`: they are baked
-into the doc layout when the map phase writes spills and cannot be changed
-mid-run, so defaulting them would silently pick a layout the caller never chose.
+distinct keys.
+
+Both shard counts are **required**, and required only by `Setup`, because that
+is the moment the layout gets fixed. A worker pod therefore constructs its
+controller from a prefix alone:
+
+```go
+ctrl, err := eqmr.New(eq, prefix)                       // mapper or reducer pod
+ctrl, err := eqmr.New(eq, prefix,                        // the launcher
+    eqmr.WithMapShards(64), eqmr.WithReduceShards(8))
+```
+
+Mappers do need the partition count, to decide where each emitted key goes, but
+they read it from their own task rather than from configuration. Two deployments
+configured with different numbers would each be internally consistent and jointly
+wrong, silently; there is one writer instead, and no way to disagree.
 
 ## Combiners
 
@@ -119,7 +132,7 @@ where the mistake was made.
 A job whose keys or values are genuinely binary encodes them itself, with base64
 or anything else. That choice belongs to the job, which knows whether it needs
 it. The alternative, `[]byte` everywhere, charges every job for the few that
-need it: measured on a real run, base64 made spill documents **22% larger**
+need it: measured on a real run, base64 made map-output documents **22% larger**
 (18,550 bytes against 14,392) and left them unreadable:
 
 ```json
@@ -181,10 +194,12 @@ record why it died. A general worker cannot know a workload's ratio of the two.
 A batch run can take the position that a general worker cannot, because it has a
 defined end and failing loudly beats burning a pool forever.
 
-Use `WorkerRunOptions` and `ControlRunOptions` rather than assembling run options
-by hand, so the bound cannot be omitted in one deployment and not another. The
-control worker deliberately gets no bound: its task is claimed once per tick for
-the life of the run.
+Use `RunMapper`, `RunReducer` and `RunController` rather than wiring workers by
+hand: they watch the right queue with the run's lease and claim ceiling, so
+nothing about the wiring is yours to get right. `RunController` deliberately
+carries no claim ceiling, because the control task is claimed once per tick for
+the life of the run and any bound would quarantine the controller after seconds
+of healthy operation.
 
 When a dead worker's task actually gets reclaimed is the backend's business, not
 this package's. Let the claim mechanism do its job and roll with a blocked
@@ -206,7 +221,7 @@ wrong for intermediates.
 
 ## Known limits
 
-- A split doc holds all of its input KVs in one value, and a spill doc holds one
+- A split doc holds all of its input KVs in one value, and a map-output doc holds one
   partition's output from one split. Both must fit the backend message size
   limit (10MB by default for the gRPC service).
 - A reducer holds an entire partition in memory. **`ReduceShards` is the knob
@@ -215,9 +230,9 @@ wrong for intermediates.
   `OmitValues`, so claiming a partition materializes all of it either way.
 - The `Combiner` runs only within a split. Values for one key emitted by
   different splits accumulate untouched until the reducer. A merger worker that
-  combined spill documents across splits, concurrently with the map phase, would
+  combined map-output documents across splits, concurrently with the map phase, would
   close that gap and cut intermediate volume; it is worth doing for throughput
-  and spill size, but not as a memory bound. Inserting a new spill into a
+  and map output size, but not as a memory bound. Inserting a new map output into a
   partition whose documents are claimed does work (doc inserts use generated
   IDs, and only an explicit-ID collision is rejected), so such a merger can run
   alongside mappers safely.

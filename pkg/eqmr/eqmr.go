@@ -1,41 +1,69 @@
 // Package eqmr is an EXPERIMENTAL MapReduce built entirely on EntroQ task
-// queues and documents. Its API, doc layout, and queue layout may change or be
-// removed without a migration path. Do not depend on the on-queue or in-doc
-// representations as a stable interchange format.
+// queues and documents. Its API and its queue and document layouts may change
+// or be removed without a migration path. Do not treat what it writes as a
+// stable interchange format.
 //
-// # Shape
+// # Roles
 //
-// A run is described by a Config and driven by three kinds of worker, each of
-// which may run in its own process or pod:
+// A run has three roles, each of which may be its own process or pod, and each
+// with its own scaling property:
 //
-//   - MapperWorker watches {Prefix}/map, claims one input split, runs the
-//     Mapper over every KV in it, optionally applies a Combiner, partitions the
-//     emitted keys into Config.ReduceShards buckets, and writes one spill doc
-//     per non-empty bucket.
-//   - ReducerWorker watches {Prefix}/reduce, claims every spill doc for one
-//     partition, merges their sorted runs by key, runs the Reducer once per
-//     key, and writes one result doc for the partition.
-//   - ControlWorker watches {Prefix}/control, which holds exactly one
-//     self-requeueing task carrying the phase state. EntroQ's claim guarantees
-//     a single controller acts at a time, so any number of control pods may
-//     run, and a crashed one is replaced once its claim is released.
+//   - Mappers (RunMapper) claim one input split, run the Mapper over every pair
+//     in it, optionally apply a Combiner, assign each emitted key to a
+//     partition, and write one map-output document per non-empty partition.
+//     Scale them freely.
+//   - Reducers (RunReducer) claim every map-output document for one partition,
+//     merge those sorted runs by key, run the Reducer once per key, and write
+//     the partition's result. There is one unit per partition, so scale to the
+//     partition count.
+//   - Controllers (RunController) drive the phase machine. The control queue
+//     holds exactly one task, so a claim makes exactly one controller act at a
+//     time; run as many replicas as you like for failover.
 //
-// # Why the phase barriers are safe
+// # Getting started
 //
-// Each phase ends when a class of doc is exhausted, and each worker deletes its
-// input doc in the same Modify that writes its output docs. So "no split docs
-// remain" atomically implies "every spill doc exists", and "no spill docs
-// remain" implies "every result doc exists". No coordinator state is needed for
-// the barrier, and a worker that dies mid-task simply loses its claim.
+// One process, start to finish:
 //
-// # Keys
+//	ctrl, err := eqmr.New(eq, "/wordcount/run-1",
+//		eqmr.WithMapShards(8), eqmr.WithReduceShards(4))
+//	if err != nil { return err }
+//	if err := ctrl.Run(ctx, input, eqmr.WordCountMapper, eqmr.SumReducer,
+//		eqmr.RunOptions{Mappers: 4, Reducers: 2}); err != nil {
+//		return err
+//	}
+//	results, err := ctrl.Results(ctx)
 //
-// Doc keys here are ordinary readable text: "split/000007", "spill/000003",
-// "result/000003". Arbitrary map keys are NOT doc keys. They travel as []byte
-// inside doc content, where encoding/json represents them losslessly as base64.
-// This matters because a doc key must survive both PostgreSQL TEXT (valid
-// UTF-8, no NUL) and a JSON string (valid UTF-8), and encoding a byte string to
-// fit those would make every key opaque in psql and in logs.
+// A mapper pod needs the run prefix and nothing else. The partition count it
+// must agree on arrives with each task:
+//
+//	ctrl, err := eqmr.New(eq, os.Getenv("MR_PREFIX"))
+//	if err != nil { return err }
+//	for {
+//		if err := ctrl.RunMapper(ctx, myMapper); err != nil {
+//			log.Printf("mapper exited: %v", err) // restart: see RunMapper
+//		}
+//	}
+//
+// Shard counts are required by Setup, which is where the layout is fixed. See
+// the examples for a controller pod and for combiners.
+//
+// # Completion
+//
+// Each worker deletes its input document in the same Modify that writes its
+// output, so document state alone says how far a run has got. No split
+// documents remain exactly when every map-output document exists, and every
+// partition writes a result, empty ones included, so counting results measures
+// the reduce phase. Progress reports both; no queue is consulted to decide
+// completion.
+//
+// # Text
+//
+// Keys and values are strings, and must be valid UTF-8 with no NUL. Content is
+// JSONB in PostgreSQL, which rejects NUL, and a JSON string cannot represent
+// invalid UTF-8. ValidateText states the rule, and Setup and every emit apply
+// it, so a violation fails where it was produced. Encode binary keys in the job
+// that needs them. Document keys are readable text: "split/000007",
+// "mapout/000003", "result/000003".
 package eqmr
 
 import (
@@ -72,65 +100,123 @@ const (
 	// DefaultMaxClaims bounds how many times a unit may be claimed before it is
 	// quarantined, which fails the run.
 	//
-	// pkg/worker leaves this unlimited because it cannot know a workload's shape,
-	// and Task.Claims conflates two unrelated things: work that kills workers,
-	// and ordinary infrastructure churn such as rolling deploys and evictions.
-	// That conflation is forced rather than sloppy, since a crashing worker is
-	// precisely the one that cannot reliably record why it died.
-	//
-	// A batch run can take a position where a general worker cannot. It has a
-	// defined end, so failing loudly beats burning a worker pool forever on a
-	// record that kills everything it touches. Ten survives a handful of
-	// infrastructure events while bounding a poison record to ten worker deaths
-	// instead of unboundedly many.
+	// A claim count covers both work that kills workers and ordinary
+	// infrastructure churn such as rolling deploys and evictions, so the bound
+	// has to survive a handful of the latter while still catching the former.
+	// Ten does. Raise it for a cluster that churns more; WithMaxClaims takes a
+	// negative value for no bound at all.
 	DefaultMaxClaims int32 = 10
 )
 
-// Config describes one MapReduce run. Both shard counts are required: they are
-// baked into the doc layout when the map phase writes spills and cannot be
-// changed mid-run, so defaulting them would silently pick a layout the caller
-// never chose.
+// Config carries a whole run configuration at once, for callers who would
+// rather build a struct than a list of options. Pass it with WithConfig.
+//
+// Every field has a matching option, and options are the primary form. A zero
+// field is left alone, so a partially filled Config merges with other options.
 type Config struct {
-	// Prefix is the doc namespace and the root of every queue name for this
-	// run. It must be unique per run, valid UTF-8, NUL-free, and at most
-	// MaxNamespaceBytes bytes. Required.
-	Prefix string
-
-	// MapShards is the number of input splits. Input KVs are divided into this
-	// many split docs, each of which becomes one map task. Required, > 0.
+	// MapShards is the number of input splits. Input pairs are divided into
+	// this many split documents, each becoming one map task.
 	//
-	// A split doc holds all of its KVs in a single doc value, so
+	// A split document holds all of its pairs in one value, so
 	// len(input)/MapShards must comfortably fit the backend's message size
 	// limit (10MB by default for the gRPC service).
 	MapShards int
 
 	// ReduceShards is the number of reduce partitions, and therefore the number
-	// of reduce tasks the run creates. Map output keys are assigned to
-	// partitions by ShardForKey. This is the reducer pool size. Required, > 0.
+	// of reduce tasks a run creates. Intermediate keys are assigned to
+	// partitions by ShardForKey.
 	ReduceShards int
 
-	// Lease is the task and doc claim duration for every worker in the run.
-	// Zero means DefaultLease.
+	// Lease is the task claim duration for every worker in the run.
 	Lease time.Duration
 
-	// ControlInterval paces the control loop: how long the controller waits
-	// between phase-barrier checks while holding its claim. It is a loop
-	// cadence, not a task schedule, so it should be a human-scale interval
-	// rather than a fine-grained tick. Zero means DefaultControlInterval.
+	// ControlInterval paces the control loop.
 	ControlInterval time.Duration
 
-	// StallTimeout fails the run when a phase reports no progress for this
-	// long: no change in queue depth and no change in barrier state. Negative
-	// disables stall detection entirely. Zero means DefaultStallTimeout.
+	// StallTimeout fails a run whose phase stops making progress. Negative
+	// disables stall detection.
 	StallTimeout time.Duration
 
-	// MaxClaims bounds how many times any one unit may be claimed before it is
-	// quarantined, which fails the run. Negative means unlimited, reproducing
-	// the pkg/worker default. Zero means DefaultMaxClaims.
-	//
-	// Note that the check runs before a handler is constructed, so a task over
-	// the bound is quarantined without being given a chance to retire itself.
+	// MaxClaims bounds how many times a unit may be claimed before it is
+	// quarantined. Negative means unlimited.
 	MaxClaims int32
+}
+
+// Option configures a Controller. See New.
+type Option func(*Config)
+
+// WithConfig merges a whole Config into the configuration. Zero fields are left
+// alone, so it can be combined with other options in any order.
+func WithConfig(cfg Config) Option {
+	return func(c *Config) {
+		if cfg.MapShards != 0 {
+			c.MapShards = cfg.MapShards
+		}
+		if cfg.ReduceShards != 0 {
+			c.ReduceShards = cfg.ReduceShards
+		}
+		if cfg.Lease != 0 {
+			c.Lease = cfg.Lease
+		}
+		if cfg.ControlInterval != 0 {
+			c.ControlInterval = cfg.ControlInterval
+		}
+		if cfg.StallTimeout != 0 {
+			c.StallTimeout = cfg.StallTimeout
+		}
+		if cfg.MaxClaims != 0 {
+			c.MaxClaims = cfg.MaxClaims
+		}
+	}
+}
+
+// WithMapShards sets the number of input splits.
+//
+// Required by Setup, and only by Setup: it fixes the document layout at the
+// moment a run is created. Worker processes never need it, so a mapper or
+// reducer pod constructs its Controller without one.
+func WithMapShards(n int) Option {
+	return func(c *Config) { c.MapShards = n }
+}
+
+// WithReduceShards sets the number of reduce partitions.
+//
+// Required by Setup, and only by Setup. Mappers read the number from their own
+// task, so mapper processes need no configuration of their own.
+func WithReduceShards(n int) Option {
+	return func(c *Config) { c.ReduceShards = n }
+}
+
+// WithLease sets the task claim duration for workers in this run.
+//
+// It has to outlast a single unit of work. A reduce unit is a whole partition,
+// so its duration scales with how much the map phase sent there rather than
+// with a fixed per-record cost; size this against the largest partition you
+// expect, not the average. Renewal happens at half the lease, and a unit whose
+// renewal slips is reclaimed mid-work and eventually quarantined.
+func WithLease(d time.Duration) Option {
+	return func(c *Config) { c.Lease = d }
+}
+
+// WithControlInterval paces the control loop: how long the controller waits
+// between phase-barrier checks while holding its claim. It is a loop cadence
+// rather than a task schedule, so a human-scale interval suits it.
+func WithControlInterval(d time.Duration) Option {
+	return func(c *Config) { c.ControlInterval = d }
+}
+
+// WithStallTimeout fails a run whose current phase reports no progress for this
+// long. A negative duration disables stall detection.
+func WithStallTimeout(d time.Duration) Option {
+	return func(c *Config) { c.StallTimeout = d }
+}
+
+// WithMaxClaims bounds how many times a unit may be claimed before it is
+// quarantined, which fails the run. Negative means unlimited, reproducing the
+// pkg/worker default; see DefaultMaxClaims for why this package takes a
+// position where a general worker cannot.
+func WithMaxClaims(n int32) Option {
+	return func(c *Config) { c.MaxClaims = n }
 }
 
 func (c *Config) withDefaults() Config {
@@ -150,49 +236,16 @@ func (c *Config) withDefaults() Config {
 	return out
 }
 
-// WorkerRunOptions returns the run options every mapper and reducer in this run
-// should use: the queue to watch, the configured lease, and the claim ceiling.
+// ValidateText reports whether s is usable as a MapReduce key or value: valid
+// UTF-8, with no NUL.
 //
-// Deployed workers should call this rather than assembling options by hand, so
-// that the claim bound cannot be left off by accident in one deployment and not
-// another.
-func (c *Controller) WorkerRunOptions(queue string) []worker.RunOption {
-	opts := []worker.RunOption{
-		worker.Watching(queue),
-		worker.WithLease(c.cfg.Lease),
-	}
-	if c.cfg.MaxClaims > 0 {
-		opts = append(opts, worker.WithMaxClaims(c.cfg.MaxClaims))
-	}
-	return opts
-}
-
-// ControlRunOptions returns the run options for a control worker.
+// Keys and values live inside document content, which is JSONB in PostgreSQL,
+// and JSONB rejects \u0000 ("unsupported Unicode escape sequence"). A JSON
+// string cannot represent invalid UTF-8 at all, and Go's encoding/json
+// substitutes U+FFFD for it silently.
 //
-// Deliberately without a claim bound. The control task is claimed once per tick
-// for the life of the run, so any ceiling would quarantine the controller after
-// a few seconds of entirely healthy operation, leaving the run with nothing
-// driving it and nothing left to notice.
-func (c *Controller) ControlRunOptions() []worker.RunOption {
-	return []worker.RunOption{
-		worker.Watching(c.ControlQ()),
-		worker.WithLease(c.cfg.Lease),
-	}
-}
-
-// ValidateText reports whether s is usable as a MapReduce key or value.
-//
-// The rule is valid UTF-8 with no NUL, and both halves are load-bearing rather
-// than fussy. Keys and values live inside document content, which is JSONB in
-// PostgreSQL, and JSONB rejects \u0000 outright ("unsupported Unicode escape
-// sequence"). A JSON string cannot represent invalid UTF-8 at all, and Go's
-// encoding/json silently substitutes U+FFFD instead of failing, so an
-// unvalidated value would corrupt in transit rather than erroring where the
-// mistake was made.
-//
-// A job with genuinely binary keys or values should encode them itself. Doing so
-// is one line, and it keeps the cost with the job that needs it instead of
-// charging every job base64 on every intermediate document.
+// Setup and every emit apply this, so a violation fails where it was produced.
+// Encode binary keys or values in the job that needs them.
 func ValidateText(what, s string) error {
 	if !utf8.ValidString(s) {
 		return fmt.Errorf("%s is not valid UTF-8 (encode it, with base64 or similar, if it is genuinely binary)", what)
@@ -222,61 +275,79 @@ func ValidText(what, s string, maxBytes int) error {
 	return nil
 }
 
-func (c *Config) validate() error {
-	if c.Prefix == "" {
-		return fmt.Errorf("eqmr: Config.Prefix is required")
-	}
-	if err := ValidText("Config.Prefix", c.Prefix, MaxNamespaceBytes); err != nil {
-		return fmt.Errorf("eqmr: %w", err)
-	}
-	if c.MapShards <= 0 {
-		return fmt.Errorf("eqmr: Config.MapShards must be set explicitly and be positive, got %d", c.MapShards)
-	}
-	if c.ReduceShards <= 0 {
-		return fmt.Errorf("eqmr: Config.ReduceShards must be set explicitly and be positive, got %d", c.ReduceShards)
-	}
-	return nil
-}
-
 // Controller holds the queue and doc layout for one run and drives its phases.
 // It is safe to construct one in every process that participates in the run:
 // it carries no run state of its own, because all of it lives in EntroQ.
 type Controller struct {
 	client *entroq.EntroQ
 	cfg    Config
+	prefix string
 }
 
-// New creates a Controller for a run described by cfg. It returns an error
-// rather than defaulting when a required field is missing.
-func New(eq *entroq.EntroQ, cfg Config) (*Controller, error) {
+// New creates a Controller for the run under prefix.
+//
+// prefix is the document namespace and the root of every queue name, and it is
+// the only thing a participating process cannot work out for itself. It must be
+// unique per run, valid UTF-8, NUL-free, and at most MaxNamespaceBytes bytes.
+//
+// Shard counts are options rather than parameters because only Setup needs
+// them. A mapper or reducer pod says
+//
+//	ctrl, err := eqmr.New(eq, prefix)
+//
+// and nothing more: the layout it must agree on travels with its work.
+func New(eq *entroq.EntroQ, prefix string, opts ...Option) (*Controller, error) {
 	if eq == nil {
 		return nil, fmt.Errorf("eqmr: nil client")
 	}
-	if err := cfg.validate(); err != nil {
-		return nil, err
+	if prefix == "" {
+		return nil, fmt.Errorf("eqmr: prefix is required")
 	}
-	return &Controller{client: eq, cfg: cfg.withDefaults()}, nil
+	if err := ValidText("prefix", prefix, MaxNamespaceBytes); err != nil {
+		return nil, fmt.Errorf("eqmr: %w", err)
+	}
+	cfg := new(Config)
+	for _, opt := range opts {
+		opt(cfg)
+	}
+	return &Controller{client: eq, cfg: cfg.withDefaults(), prefix: prefix}, nil
+}
+
+// validateForSetup checks the fields only Setup requires. A Controller built for
+// a worker role legitimately has neither shard count, so these are not checked
+// at construction.
+func (c *Config) validateForSetup() error {
+	if c.MapShards <= 0 {
+		return fmt.Errorf("eqmr: MapShards must be set with WithMapShards; it fixes how input is divided when a run is created and cannot change afterwards")
+	}
+	if c.ReduceShards <= 0 {
+		return fmt.Errorf("eqmr: ReduceShards must be set with WithReduceShards; it fixes the document layout when the map phase writes its output and cannot change mid-run")
+	}
+	return nil
 }
 
 // Config returns the effective configuration, with defaults applied.
 func (c *Controller) Config() Config { return c.cfg }
 
-// DocNS is the doc namespace holding every split, spill, and result doc.
-func (c *Controller) DocNS() string { return c.cfg.Prefix }
+// Prefix returns the document namespace and queue root for this run.
+func (c *Controller) Prefix() string { return c.prefix }
+
+// DocNS is the doc namespace holding every split, map output, and result doc.
+func (c *Controller) DocNS() string { return c.prefix }
 
 // MapQ is the queue of input-split tasks, watched by mapper workers.
-func (c *Controller) MapQ() string { return c.cfg.Prefix + "/map" }
+func (c *Controller) MapQ() string { return c.prefix + "/map" }
 
 // ReduceQ is the queue of partition tasks, watched by reducer workers.
-func (c *Controller) ReduceQ() string { return c.cfg.Prefix + "/reduce" }
+func (c *Controller) ReduceQ() string { return c.prefix + "/reduce" }
 
 // ControlQ holds the single self-requeueing control task.
-func (c *Controller) ControlQ() string { return c.cfg.Prefix + "/control" }
+func (c *Controller) ControlQ() string { return c.prefix + "/control" }
 
 // ErrQ is the quarantine queue for tasks that exhausted their attempts. A
 // non-empty ErrQ fails the run: a MapReduce whose parts did not all succeed
 // cannot make any claim about the correctness of its output.
-func (c *Controller) ErrQ() string { return c.cfg.Prefix + "/err" }
+func (c *Controller) ErrQ() string { return c.prefix + "/err" }
 
 // errQMap sends every worker's failures to the single run quarantine queue, so
 // the controller has exactly one place to look.
@@ -285,7 +356,7 @@ func (c *Controller) errQMap(string) string { return c.ErrQ() }
 // Doc key layout. These are readable on purpose: they are what shows up in psql
 // and in `eqc` output when a run needs debugging.
 func splitDocKey(n int) string  { return fmt.Sprintf("split/%06d", n) }
-func spillDocKey(p int) string  { return fmt.Sprintf("spill/%06d", p) }
+func mapOutDocKey(p int) string { return fmt.Sprintf("mapout/%06d", p) }
 func resultDocKey(p int) string { return fmt.Sprintf("result/%06d", p) }
 
 // resultDocID is a deterministic document id for a partition's output.
@@ -293,7 +364,7 @@ func resultDocKey(p int) string { return fmt.Sprintf("result/%06d", p) }
 // It exists so that two workers racing the same partition cannot both write a
 // result. An insert carrying an explicit id is rejected when that id already
 // exists, which gives the empty-partition case the exclusion that a non-empty
-// one gets from deleting its spill documents. Ids are capped at 64 bytes; this
+// one gets from deleting its map output documents. Ids are capped at 64 bytes; this
 // is 13.
 func resultDocID(p int) string { return fmt.Sprintf("result-%06d", p) }
 
@@ -302,7 +373,7 @@ func resultDocID(p int) string { return fmt.Sprintf("result-%06d", p) }
 // next string after every key under the prefix.
 const (
 	splitPrefix  = "split/"
-	spillPrefix  = "spill/"
+	mapOutPrefix = "mapout/"
 	resultPrefix = "result/"
 )
 
@@ -321,6 +392,11 @@ func prefixEnd(prefix string) string {
 type docRef struct {
 	NS  string `json:"ns"`
 	Key string `json:"key"`
+	// ReduceShards is the partition count for the run, stamped by Setup. A
+	// mapper reads it here to decide which partition each emitted key belongs
+	// to, so mapper processes need no configuration of their own and no two
+	// can disagree about it.
+	ReduceShards int `json:"reduce_shards"`
 }
 
 // asQuery reads the doc group by primary key without claiming it. Reading
@@ -328,6 +404,56 @@ type docRef struct {
 // concurrently; exclusion happens when they commit.
 func (r docRef) asQuery() *entroq.DocQuery {
 	return &entroq.DocQuery{Namespace: r.NS, KeyExact: r.Key}
+}
+
+// RunMapper runs a mapper for this run until ctx ends or the worker exits. It
+// watches the map queue with the run's lease and claim ceiling.
+//
+// A Mapper that returns an error kills the worker, which is the MapReduce
+// contract: a run whose map calls failed cannot support a claim about its
+// output. Restart it and let the pipeline decide. The task is reclaimed when
+// its lease expires, and a record that kills every worker exhausts the claim
+// ceiling and fails the run.
+func (c *Controller) RunMapper(ctx context.Context, mapFn Mapper, opts ...MapperOption) error {
+	return c.MapperWorker(mapFn, opts...).Run(ctx, c.workerRunOptions(c.MapQ())...)
+}
+
+// RunReducer runs a reducer for this run until ctx ends or the worker exits.
+// Restart it on return, as with RunMapper.
+func (c *Controller) RunReducer(ctx context.Context, reduceFn Reducer) error {
+	return c.ReducerWorker(reduceFn).Run(ctx, c.workerRunOptions(c.ReduceQ())...)
+}
+
+// RunController runs the phase machine for this run.
+//
+// Run as many as you like. The control queue holds exactly one task, so EntroQ's
+// claim guarantees a single controller acts at a time, and a replica that dies
+// is replaced once its claim is released.
+func (c *Controller) RunController(ctx context.Context) error {
+	return c.ControlWorker().Run(ctx, c.controlRunOptions()...)
+}
+
+// workerRunOptions is the run configuration shared by mappers and reducers.
+func (c *Controller) workerRunOptions(queue string) []worker.RunOption {
+	opts := []worker.RunOption{
+		worker.Watching(queue),
+		worker.WithLease(c.cfg.Lease),
+	}
+	if c.cfg.MaxClaims > 0 {
+		opts = append(opts, worker.WithMaxClaims(c.cfg.MaxClaims))
+	}
+	return opts
+}
+
+// controlRunOptions deliberately carries no claim ceiling. The control task is
+// claimed once per tick for the life of a run, so any ceiling would quarantine
+// the controller after seconds of healthy operation and leave the run with
+// nothing driving it.
+func (c *Controller) controlRunOptions() []worker.RunOption {
+	return []worker.RunOption{
+		worker.Watching(c.ControlQ()),
+		worker.WithLease(c.cfg.Lease),
+	}
 }
 
 // countDocs counts the docs under a key prefix. It lists metadata only, so the

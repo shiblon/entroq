@@ -29,13 +29,12 @@ func TestProgressAccounting(t *testing.T) {
 		mapShards    = 12
 		reduceShards = 5
 	)
-	ctrl, err := eqmr.New(eq, eqmr.Config{
-		Prefix:          "/progresstest/" + entroq.GenHex16(),
-		MapShards:       mapShards,
-		ReduceShards:    reduceShards,
-		Lease:           5 * time.Second,
-		ControlInterval: 10 * time.Millisecond,
-	})
+	ctrl, err := eqmr.New(eq, "/progresstest/"+entroq.GenHex16(),
+		eqmr.WithMapShards(mapShards),
+		eqmr.WithReduceShards(reduceShards),
+		eqmr.WithLease(5*time.Second),
+		eqmr.WithControlInterval(10*time.Millisecond),
+	)
 	if err != nil {
 		t.Fatalf("new controller: %v", err)
 	}
@@ -145,13 +144,12 @@ func TestProgressCountsEmptyPartitions(t *testing.T) {
 
 	// Far more partitions than distinct keys, so most partitions get nothing.
 	const reduceShards = 40
-	ctrl, err := eqmr.New(eq, eqmr.Config{
-		Prefix:          "/emptyparts/" + entroq.GenHex16(),
-		MapShards:       2,
-		ReduceShards:    reduceShards,
-		Lease:           5 * time.Second,
-		ControlInterval: 10 * time.Millisecond,
-	})
+	ctrl, err := eqmr.New(eq, "/emptyparts/"+entroq.GenHex16(),
+		eqmr.WithMapShards(2),
+		eqmr.WithReduceShards(reduceShards),
+		eqmr.WithLease(5*time.Second),
+		eqmr.WithControlInterval(10*time.Millisecond),
+	)
 	if err != nil {
 		t.Fatalf("new controller: %v", err)
 	}
