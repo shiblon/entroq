@@ -1,7 +1,6 @@
 package async
 
 import (
-	"encoding/json"
 	"net/http"
 )
 
@@ -33,26 +32,41 @@ func copyHeaders(src http.Header) http.Header {
 	return dst
 }
 
-// Envelope is the task payload used for sidecar-to-sidecar communication.
-// It carries everything needed to reconstruct an HTTP request on the receiving
-// end, plus the response queue name for the reply.
-type Envelope struct {
-	Method        string          `json:"method"`
-	Path          string          `json:"path"`
-	Headers       http.Header     `json:"headers,omitempty"`
-	Body          json.RawMessage `json:"body,omitempty"`
-	ResponseQueue string          `json:"response_queue"`
+// FrameControl carries the state shared by request and response frames.
+// ReplyQueue is the full queue name on which the frame sender awaits the next
+// frame. It is required for non-final frames and omitted from final frames,
+// which do not receive an acknowledgement. A changed ReplyQueue requests a
+// queue switch; the queue name and its policy components remain opaque to the
+// peer.
+type FrameControl struct {
+	Session    string `json:"session"`
+	ReplyQueue string `json:"reply_queue,omitempty"`
+	Final      bool   `json:"final,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
 
-// Response is the task payload enqueued onto the response queue after the
-// upstream service handles a request. When the upstream is unreachable or the
-// sidecar encounters an infrastructure error, StatusCode is set to an
-// appropriate HTTP gateway code (502 Bad Gateway, 504 Gateway Timeout, etc.)
-// and Error carries the internal detail. The sender always reconstructs its
-// HTTP response from StatusCode and Body alone.
+// Envelope is a request-direction frame used for sidecar-to-sidecar
+// communication. The initial envelope carries the HTTP request metadata;
+// continuation frames may omit fields that have not changed.
+type Envelope struct {
+	FrameControl
+
+	Method  string      `json:"method,omitempty"`
+	Path    string      `json:"path,omitempty"`
+	Headers http.Header `json:"headers,omitempty"`
+	Body    []byte      `json:"body,omitempty"`
+}
+
+// Response is a response-direction frame. The initial response carries HTTP
+// response metadata; continuation frames may omit fields that have not
+// changed. When the upstream is unreachable or the sidecar encounters an
+// infrastructure error, StatusCode is set to an appropriate HTTP gateway code
+// (502 Bad Gateway, 504 Gateway Timeout, etc.) and Error carries the internal
+// detail.
 type Response struct {
-	StatusCode int             `json:"status_code"`
-	Headers    http.Header     `json:"headers,omitempty"`
-	Body       json.RawMessage `json:"body,omitempty"`
-	Error      string          `json:"error,omitempty"`
+	FrameControl
+
+	StatusCode int         `json:"status_code,omitempty"`
+	Headers    http.Header `json:"headers,omitempty"`
+	Body       []byte      `json:"body,omitempty"`
 }

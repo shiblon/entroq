@@ -334,16 +334,20 @@ func (s *Sender) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// only requestTimeout+responseGrace later, so GC never deletes a response
 	// this sender might still be awaiting. See WithSenderResponseGrace.
 	collectAt := time.Now().Add(s.requestTimeout + s.responseGrace)
+	session := entroq.GenHex16()
 	responseQueue := path.Join(queuePrefix, "response",
 		fmt.Sprintf("gc=%d", collectAt.Unix()),
-		entroq.GenHex16())
+		session)
 
 	env := Envelope{
-		Method:        r.Method,
-		Path:          forwardPath,
-		Headers:       headers,
-		Body:          json.RawMessage(body),
-		ResponseQueue: responseQueue,
+		FrameControl: FrameControl{
+			Session:    session,
+			ReplyQueue: responseQueue,
+		},
+		Method:  r.Method,
+		Path:    forwardPath,
+		Headers: headers,
+		Body:    body,
 	}
 	envValue, err := json.Marshal(env)
 	if err != nil {

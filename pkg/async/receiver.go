@@ -64,7 +64,7 @@ func WithReceiverAuditLogger(l *slog.Logger) ReceiverOption {
 
 // ReceiverHandler returns a worker.DoModifyRun that claims Envelope tasks,
 // forwards them as HTTP requests to upstream, and enqueues a Response onto
-// the envelope's ResponseQueue. Errors from the upstream are packed into the
+// the envelope's ReplyQueue. Errors from the upstream are packed into the
 // Response rather than returned, so the sender always unblocks with a result.
 //
 // Use with a standard worker.Worker:
@@ -105,6 +105,8 @@ func ReceiverHandler(upstream string, opts ...ReceiverOption) worker.DoModifyRun
 		}()
 
 		resp, err := forward(ctx, cfg.httpClient, upstream, env)
+		resp.Session = env.Session
+		resp.Final = true
 		if err != nil {
 			log.Printf("receiver forward %s%s: %v", upstream, env.Path, err)
 			forwardErrors.Add(ctx, 1)
@@ -112,7 +114,7 @@ func ReceiverHandler(upstream string, opts ...ReceiverOption) worker.DoModifyRun
 		if cfg.auditLog != nil {
 			cfg.auditLog.LogAttrs(ctx, slog.LevelInfo, "request_handled",
 				slog.String("queue", cfg.name),
-				slog.String("response_queue", env.ResponseQueue),
+				slog.String("response_queue", env.ReplyQueue),
 				slog.String("method", env.Method),
 				slog.String("path", env.Path),
 				slog.Int("status_code", resp.StatusCode),
@@ -127,7 +129,7 @@ func ReceiverHandler(upstream string, opts ...ReceiverOption) worker.DoModifyRun
 
 		return worker.Modify(
 			task.Delete(),
-			entroq.InsertingInto(env.ResponseQueue, entroq.WithRawValue(respValue)),
+			entroq.InsertingInto(env.ReplyQueue, entroq.WithRawValue(respValue)),
 		), nil
 	}
 }
@@ -171,14 +173,20 @@ func forward(ctx context.Context, client *http.Client, upstream string, env Enve
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
-				return Response{StatusCode: http.StatusGatewayTimeout, Error: ctx.Err().Error()}, ctx.Err()
+				return Response{
+					FrameControl: FrameControl{Error: ctx.Err().Error()},
+					StatusCode:   http.StatusGatewayTimeout,
+				}, ctx.Err()
 			case <-time.After(forwardDelay(attempt)):
 			}
 		}
 
 		req, err := makeReq()
 		if err != nil {
-			return Response{StatusCode: http.StatusInternalServerError, Error: fmt.Sprintf("build request: %v", err)}, err
+			return Response{
+				FrameControl: FrameControl{Error: fmt.Sprintf("build request: %v", err)},
+				StatusCode:   http.StatusInternalServerError,
+			}, err
 		}
 
 		httpResp, err := client.Do(req)
@@ -191,13 +199,16 @@ func forward(ctx context.Context, client *http.Client, upstream string, env Enve
 		body, err := io.ReadAll(httpResp.Body)
 		httpResp.Body.Close()
 		if err != nil {
-			return Response{StatusCode: http.StatusBadGateway, Error: fmt.Sprintf("read response body: %v", err)}, err
+			return Response{
+				FrameControl: FrameControl{Error: fmt.Sprintf("read response body: %v", err)},
+				StatusCode:   http.StatusBadGateway,
+			}, err
 		}
 
 		return Response{
 			StatusCode: httpResp.StatusCode,
 			Headers:    copyHeaders(httpResp.Header),
-			Body:       json.RawMessage(body),
+			Body:       body,
 		}, nil
 	}
 
@@ -210,7 +221,9 @@ func forward(ctx context.Context, client *http.Client, upstream string, env Enve
 		code = http.StatusGatewayTimeout
 	}
 	return Response{
+		FrameControl: FrameControl{
+			Error: fmt.Sprintf("upstream unreachable after %d attempts: %v", forwardMaxAttempts, lastErr),
+		},
 		StatusCode: code,
-		Error:      fmt.Sprintf("upstream unreachable after %d attempts: %v", forwardMaxAttempts, lastErr),
 	}, lastErr
 }
