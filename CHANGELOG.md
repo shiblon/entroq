@@ -26,6 +26,28 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   defaults to a random per-client value, so a deployment wanting stable
   per-worker series should set a durable one with `entroq.WithClaimantID`.
 
+- **Experimental MapReduce package (`pkg/eqmr`).** A MapReduce that runs
+  entirely on EntroQ tasks and documents, promoted from the `examples/mr`
+  sketch. It adds a real shuffle step: mappers partition intermediate keys into
+  a configured number of reduce shards and write per-partition spill documents,
+  so reduce work is proportional to the partition count rather than to the
+  number of distinct keys. It adds combiners, which differ from reducers in
+  being closed over their own output and so may run at more than one stage. The
+  controller is now a single self-requeueing control task rather than in-process
+  goroutines, so it can run in its own pod, in as many replicas as desired, with
+  the claim providing the single-actor guarantee and lease expiry providing
+  failover. Both shard counts must be configured explicitly. Also included:
+  run cleanup, stall and quarantine detection, a `Progress` snapshot suitable for
+  driving a status view, and validation of namespaces and document keys as
+  NUL-free UTF-8 within the backend length limits. Phase completion is judged
+  purely from documents: every partition writes a result document, empty ones
+  included, so finishing is a recorded fact rather than an absence and no queue
+  is consulted to decide it. Workers read their input document rather than
+  claiming it, taking exclusion at commit time through a version-pinned delete,
+  which makes backup tasks (speculative execution against stragglers) possible:
+  a duplicate task races the original instead of blocking on its claim, and the
+  loser's work is rejected atomically. No straggler policy ships with it. The
+  API and the document layout may change without a migration path.
 - **Queue-driven Kubernetes autoscaling.** The Helm chart can publish an
   optional Prometheus `ServiceMonitor`; the service exports queue and doc
   namespace size gauges; and the greetings demo includes a KEDA `ScaledObject`
