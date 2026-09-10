@@ -250,22 +250,41 @@ func (c *Controller) MapperWorker(mapFn Mapper, opts ...MapperOption) *worker.Wo
 	)
 }
 
-// lostRace is the disposition for a commit that failed because the input
-// document was already consumed by another worker.
+// lostRace is the disposition for a commit that failed on a dependency.
 //
-// Returning nil leaves the task claimed until its lease expires, after which it
-// is reclaimed, finds no input document, and retires itself. Deliberately NOT a
-// RetryError: a retry increments the attempt count, and a worker that merely
-// lost a race must never be quarantined, because quarantining anything fails
-// the whole run. Losing costs one lease period of delay on a task that has no
-// work left to do.
+// Every branch that returns nil leaves the task alone, to be reclaimed on lease
+// expiry, at which point it re-reads its input, finds the work already done, and
+// retires. None of them is a RetryError: a retry increments the attempt count,
+// and a worker whose only misfortune was losing a race must never be
+// quarantined, because quarantining anything fails the whole run.
+//
+// The default case is the point of the switch. Per the OnDependency contract,
+// failures you understand are classified and anything else stops the worker,
+// rather than continuing from a state whose cause is unknown.
 func lostRace(_ context.Context, de *entroq.DependencyError) error {
-	if de.HasMissingDocs() {
+	switch {
+	case de.HasMissingDocs():
+		// The input document is gone: another worker committed this unit first.
+		// This is the ordinary way to lose a speculative race.
 		return nil
+
+	case de.HasCollisions():
+		// An explicit-id insert collided, meaning another worker already
+		// recorded this partition's result. It is how an empty partition loses,
+		// having no input document to lose instead.
+		return nil
+
+	case de.HasMissing() || de.HasClaims():
+		// Our own task was deleted or reclaimed while we worked, so it belongs
+		// to someone else now. Ordinary lease behaviour, nothing to dispose of.
+		return nil
+
+	default:
+		// Nothing in this package claims documents, so document contention here
+		// means an assumption no longer holds. Stop and let the orchestrator
+		// restart rather than continue from an unexplained failure.
+		return fmt.Errorf("eqmr: unexpected dependency failure: %w", de)
 	}
-	// Anything else (a claimed doc, a task version conflict) is the ordinary
-	// reclaim path and is equally safe to leave alone.
-	return nil
 }
 
 // runMapper runs mapFn over every KV in a split, collecting emitted pairs
