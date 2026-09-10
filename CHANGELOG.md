@@ -26,7 +26,31 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before submission retry with full-jitter exponential backoff. Ambiguous
   transport failures and unexpected handler exceptions return to the caller
   instead of entering synchronized fixed-delay retry loops.
-
+- **Text length limits count bytes, not characters.** The `CHECK` constraints
+  bounding `tasks.id`/`claimant` and
+  `docs.namespace`/`id`/`claimant`/`key_primary`/`key_secondary` now use
+  `octet_length()` rather than `length()`. These bounds exist to budget btree
+  index entries, which are measured in bytes, and clients validate in bytes, so
+  a multi-byte key could previously pass the check while consuming up to four
+  times the intended index space. Collation was never involved: `COLLATE "C"`
+  governs comparison, while `length()` counts characters per the server
+  encoding, so these columns were byte-ordered but character-bounded. The
+  migration adds the new constraints `NOT VALID`, so a database holding legacy
+  multi-byte values still upgrades and the rule binds every new write
+  immediately; run `VALIDATE CONSTRAINT` during a maintenance window to check
+  the existing rows.
+- **Document namespace limit raised from 64 to 1024 bytes.** A namespace is a
+  path carrying the same `/key=value` marker grammar as a queue name, and queue
+  names have no length limit at all, so the 64-byte cap was an asymmetry rather
+  than a design. It also has to hold the `/gc=` activation marker, whose
+  RFC3339Nano form alone is 34 bytes, leaving under half the old budget for the
+  name itself, so a namespace with a tenant path, a run id and a couple of
+  markers reaches 150-250 bytes without trying. Note that `namespace`,
+  `key_primary` and `key_secondary` share one budget: they are the columns of
+  `idx_docs_keys`, and a btree index row cannot exceed 2704 bytes. The new
+  allocation is 1024 + 256 + 256 = 1536, about 57% of that ceiling. Loosening a
+  bound cannot fail against existing rows, so no maintenance window is needed
+  for this part.
 ### Fixed
 
 - **Python client 0.13.1 document listing.** Restores the `key_exact` and `ids`

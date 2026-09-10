@@ -87,8 +87,8 @@ func RunMapReduceLoadBenchmarks(b *testing.B, name string, open BackendFactory) 
 				prefixes := make([]string, 0, b.N)
 				for range b.N {
 					prefix := root + "/" + entroq.GenHex16()
-					if len(prefix) > 64 {
-						b.Fatalf("MapReduce namespace %q is %d bytes, want at most 64", prefix, len(prefix))
+					if len(prefix) > 256 {
+						b.Fatalf("MapReduce namespace %q is %d bytes, want at most 256", prefix, len(prefix))
 					}
 					start := time.Now()
 					err := mr.RunAll(ctx, client, prefix, input, mr.WordCountMapper, mr.SumReducer,
