@@ -231,7 +231,8 @@ per-workflow primary keys as Prometheus labels. The label is named
 attached by Prometheus discovery.
 
 The scaler's polling interval and the Prometheus scrape interval both contribute
-to cold-start latency. Set eqlink's `--request_timeout` longer than their
+to cold-start latency. Set eqlink's `--request_timeout` (the maximum peer-silence
+interval, with heartbeats every third of that duration) longer than their
 combined worst case plus pod startup time, and set the scale-down cooldown
 longer than the metric interval. See
 [`examples/greetings-demo/k8s/svc-c-autoscaling.yaml`](../../examples/greetings-demo/k8s/svc-c-autoscaling.yaml)

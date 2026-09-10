@@ -2,7 +2,7 @@ package cmd
 
 import (
 	"fmt"
-	"net/http"
+	"time"
 
 	"github.com/shiblon/entroq/pkg/async"
 	"github.com/spf13/cobra"
@@ -41,14 +41,10 @@ Use "eqlink run" to start the full sidecar (sender + receiver).`,
 		rcvOpts := []async.ReceiverOption{
 			async.WithReceiverMeterProvider(mp),
 			async.WithReceiverConcurrency(concurrency),
+			async.WithReceiverRequestTimeout(requestTimeout),
 		}
 		if tlsCfg != nil {
-			rcvOpts = append(rcvOpts, async.WithReceiverHTTPClient(&http.Client{
-				Transport: &http.Transport{
-					TLSClientConfig:     tlsCfg,
-					MaxIdleConnsPerHost: 32,
-				},
-			}))
+			rcvOpts = append(rcvOpts, async.WithReceiverTLSConfig(tlsCfg))
 		}
 
 		receiver := async.NewReceiver(eq, upstream, rcvOpts...)
@@ -67,6 +63,7 @@ func init() {
 	flags.StringVar(&myQueue, "queue", "", "Service queue prefix (required). Receiver watches <prefix>/inbox.")
 	flags.StringVar(&upstream, "upstream", "http://localhost:8000", "Upstream service address.")
 	flags.IntVar(&concurrency, "concurrency", 1, "Number of concurrent receiver goroutines.")
+	flags.DurationVar(&requestTimeout, "request_timeout", 3*time.Minute, "Maximum silence from the peer EQLink before ending a session; heartbeats are sent every third of this duration.")
 	recvCmd.MarkFlagRequired("queue")
 
 	rootCmd.AddCommand(recvCmd)

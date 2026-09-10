@@ -53,7 +53,7 @@ Use "eqlink run" to start the full sidecar (sender + receiver).`,
 func init() {
 	flags := sendCmd.Flags()
 	flags.StringVar(&senderAddr, "addr", ":8080", "Address to listen on.")
-	flags.DurationVar(&requestTimeout, "request_timeout", 30*time.Second, "Maximum idle time between response frames before the sender returns 504.")
+	flags.DurationVar(&requestTimeout, "request_timeout", 3*time.Minute, "Maximum silence from the peer EQLink before ending a session; heartbeats are sent every third of this duration.")
 	flags.StringVar(&domainSuffix, "domain-suffix", ".localhost", "Domain suffix stripped from Host header to derive the target service.")
 	flags.StringVar(&namespace, "namespace", "", "Default namespace prepended to single-label targets.")
 	rootCmd.AddCommand(sendCmd)

@@ -294,12 +294,17 @@ other side, the receiver's eqlink claims the task, calls the local service over
 loopback, and routes the response back through a per-request reply queue.
 Neither service knows any of this happened.
 
-EQLink buffers each request body before enqueueing it. It streams HTTP/1.1
-response bodies back as serialized, acknowledged byte segments, so SSE and
-NDJSON work without EQLink parsing their event framing. Protocol upgrades and
-concurrent HTTP/2 request/response streaming are not supported. Active lanes
-rotate through 30-minute `gc=` queue generations: ordinary data piggybacks a
-switch in the final ten minutes, and an idle turn forces a blank switch in the
+EQLink carries request and response bodies as arbitrary byte segments over two
+independent stop-and-wait lane pairs. Empty frames acknowledge data on each
+lane; EQLink does not parse SSE, NDJSON, HTTP chunks, or gRPC messages. This
+supports HTTP/1.1 response streaming and concurrent HTTP/2 request/response
+streaming, including trailers; protocol upgrades such as WebSocket remain out
+of scope. Each segment pays an EntroQ data/acknowledgement round trip, so this
+is best suited to low-rate status, heartbeat, and compatibility streams rather
+than high-throughput traffic. A quiet lane sends an empty heartbeat after one
+minute; three minutes without receiving any peer frame ends the session. Active
+lanes rotate through 30-minute `gc=` queue generations: ordinary data piggybacks
+a switch in the final ten minutes, and an idle turn forces a blank switch in the
 final five minutes.
 
 Authorization is declared with two CRDs:

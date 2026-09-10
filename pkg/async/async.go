@@ -12,21 +12,30 @@
 // Sender translates outgoing HTTP calls from a local service into Envelope
 // tasks on a named queue. One or more Receiver workers claim those tasks,
 // forward them as HTTP requests to an upstream service, and enqueue Response
-// tasks on an ephemeral response lane. The sender relays response metadata and
-// body bytes to the original caller as acknowledged frames arrive.
+// tasks on ephemeral lanes. The sender relays response metadata and body bytes
+// to the original caller as frames arrive.
 //
-//	[Service A] -HTTP-> [Sender] -task-> [EQ] <-claim- [Receiver] -HTTP-> [Service B]
-//	                       ^                                  |
-//	                       +--------response task-------------+
+//	[Service A] <-HTTP-> [Sender] <-tasks-> [EQ] <-tasks-> [Receiver] <-HTTP-> [Service B]
 //
 // This permits basic microservices to communicate with one another through the
 // queueing system without knowing they are part of such a system. The services
-// themselves are synchronous, but only with local connections in their
-// container. The rest of the system uses a serialized, stop-and-wait exchange
-// over queues. Request bodies are buffered before the initial task is inserted.
-// Response bodies are streamed as arbitrary byte segments, which supports
-// HTTP/1.1 SSE and NDJSON without parsing their application framing. Protocol
-// upgrades and concurrent HTTP/2 request/response streaming are not supported.
+// themselves hold only local HTTP connections in their container. EQLink uses
+// two independent stop-and-wait lane pairs over queues, one for each HTTP body
+// direction. Empty Envelope or Response frames acknowledge data in the same
+// lane; there is no distinct acknowledgement frame type. This carries arbitrary
+// byte segments without parsing SSE, NDJSON, HTTP chunks, or gRPC messages and
+// permits concurrent HTTP/2 request and response streaming. HTTP protocol
+// upgrades such as WebSocket are not supported.
+//
+// Every segment waits for an EntroQ round trip before the next segment in that
+// direction. EQLink streaming is therefore intended for low-rate interactions
+// such as status, heartbeats, and compatibility with otherwise unsupported
+// client languages, not high-throughput streaming.
+//
+// After one minute without a frame to send, the side that owns a lane turn
+// sends an ordinary empty frame. Only a frame received from the peer resets the
+// session liveness deadline; three minutes of peer silence ends the exchange.
+// Both durations scale together when the request timeout is configured.
 //
 // This works across datacenters if the remote receiver can reach EQ over the
 // WAN. mTLS (--cert/--key/--ca flags on eqlink) is used to authenticate the

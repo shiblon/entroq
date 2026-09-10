@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -94,14 +93,10 @@ Graceful shutdown on SIGINT/SIGTERM:
 			async.WithReceiverName(myQueue),
 			async.WithReceiverAuditLogger(alog),
 			async.WithReceiverConcurrency(concurrency),
+			async.WithReceiverRequestTimeout(requestTimeout),
 		)
 		if tlsCfg != nil {
-			rcvOpts = append(rcvOpts, async.WithReceiverHTTPClient(&http.Client{
-				Transport: &http.Transport{
-					TLSClientConfig:     tlsCfg,
-					MaxIdleConnsPerHost: 32,
-				},
-			}))
+			rcvOpts = append(rcvOpts, async.WithReceiverTLSConfig(tlsCfg))
 		}
 
 		rcvCtx, rcvCancel := context.WithCancel(gCtx)
@@ -148,7 +143,7 @@ func init() {
 	flags.StringVar(&senderAddr, "addr", ":8080", "Address for the sender to listen on.")
 	flags.StringVar(&upstream, "upstream", "http://localhost:8000", "Upstream service address for the receiver.")
 	flags.IntVar(&concurrency, "concurrency", 1, "Number of concurrent receiver goroutines.")
-	flags.DurationVar(&requestTimeout, "request_timeout", 30*time.Second, "Maximum idle time between response frames before the sender returns 504.")
+	flags.DurationVar(&requestTimeout, "request_timeout", 3*time.Minute, "Maximum silence from the peer EQLink before ending a session; heartbeats are sent every third of this duration.")
 	flags.DurationVar(&drainTimeout, "drain_timeout", 35*time.Second, "How long to wait for in-flight requests to finish on shutdown.")
 	flags.BoolVar(&auditLog, "audit-log", false, "Emit structured JSON audit events to stderr for every request mediated (request_enqueued, request_handled, response_received).")
 	flags.DurationVar(&tokenReloadInterval, "token-reload-interval", 5*time.Minute, "How often to stat the --authz-token-file and reload it if changed. Handles k8s projected token rotation.")

@@ -2,7 +2,6 @@ package async
 
 import (
 	"context"
-	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -10,42 +9,87 @@ import (
 	"time"
 )
 
-func TestOpenUpstreamResponseRetriesBufferedRequest(t *testing.T) {
+func TestResponseSocketStreamsRequestAndResponse(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	attempts := 0
+	requestSeen := make(chan string, 1)
 	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		attempts++
 		body, err := io.ReadAll(req.Body)
 		if err != nil {
-			t.Fatalf("read attempt %d body: %v", attempts, err)
+			return nil, err
 		}
-		if got, want := string(body), "request bytes"; got != want {
-			t.Fatalf("attempt %d body: got %q, want %q", attempts, got, want)
-		}
-		if attempts < forwardMaxAttempts {
-			return nil, errors.New("temporary connection failure")
-		}
+		requestSeen <- string(body) + ":" + req.Trailer.Get("X-Checksum")
 		return &http.Response{
 			StatusCode: http.StatusAccepted,
-			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader("response")),
+			Header:     http.Header{"Content-Type": []string{"application/octet-stream"}},
+			Trailer:    http.Header{"Grpc-Status": nil},
+			Body:       io.NopCloser(strings.NewReader("response bytes")),
 			Request:    req,
 		}, nil
 	})}
 
-	response, err := openUpstreamResponse(ctx, client, "http://upstream", Envelope{
-		Method: http.MethodPost,
-		Path:   "/work",
-		Body:   []byte("request bytes"),
-	})
-	if err != nil {
-		t.Fatalf("open response: %v", err)
+	socket := newResponseSocket()
+	done := make(chan error, 1)
+	go func() { done <- socket.run(ctx, client, "http://upstream") }()
+
+	if err := socket.open(ctx, Envelope{
+		FrameControl:  FrameControl{Session: "session"},
+		Method:        http.MethodPost,
+		Path:          "/work",
+		ProtocolMajor: 2,
+		ContentLength: -1,
+		TrailerKeys:   []string{"X-Checksum"},
+	}); err != nil {
+		t.Fatalf("open socket: %v", err)
 	}
-	defer response.Body.Close()
-	if attempts != forwardMaxAttempts {
-		t.Errorf("attempts: got %d, want %d", attempts, forwardMaxAttempts)
+	if err := socket.write(ctx, bodyEvent{body: []byte("request ")}); err != nil {
+		t.Fatalf("write first request segment: %v", err)
+	}
+	if err := socket.write(ctx, bodyEvent{
+		body:     []byte("bytes"),
+		trailers: http.Header{"X-Checksum": []string{"abc123"}},
+		end:      true,
+	}); err != nil {
+		t.Fatalf("write terminal request segment: %v", err)
+	}
+
+	metadata, _, err := socket.nextBefore(ctx, time.Now().Add(time.Second))
+	if err != nil {
+		t.Fatalf("read response metadata: %v", err)
+	}
+	if metadata.statusCode != http.StatusAccepted {
+		t.Errorf("status: got %d, want %d", metadata.statusCode, http.StatusAccepted)
+	}
+	if len(metadata.trailerKeys) != 1 || metadata.trailerKeys[0] != "Grpc-Status" {
+		t.Errorf("trailer keys: got %v", metadata.trailerKeys)
+	}
+	var responseBody []byte
+	for {
+		event, _, err := socket.nextBefore(ctx, time.Now().Add(time.Second))
+		if err != nil {
+			t.Fatalf("read response body: %v", err)
+		}
+		responseBody = append(responseBody, event.body...)
+		if event.end {
+			break
+		}
+	}
+	if got := string(responseBody); got != "response bytes" {
+		t.Errorf("response body: got %q, want %q", got, "response bytes")
+	}
+
+	select {
+	case got := <-requestSeen:
+		if got != "request bytes:abc123" {
+			t.Errorf("upstream request: got %q", got)
+		}
+	case <-ctx.Done():
+		t.Fatal("upstream request was not observed")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("socket run: %v", err)
 	}
 }
 
