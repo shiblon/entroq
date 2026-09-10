@@ -14,7 +14,6 @@ import (
 	"path"
 
 	"github.com/shiblon/entroq/pkg/async"
-	"github.com/shiblon/entroq/pkg/worker"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
 )
@@ -96,6 +95,7 @@ Graceful shutdown on SIGINT/SIGTERM:
 			async.WithReceiverMeterProvider(mp),
 			async.WithReceiverName(myQueue),
 			async.WithReceiverAuditLogger(alog),
+			async.WithReceiverConcurrency(concurrency),
 		)
 		if tlsCfg != nil {
 			rcvOpts = append(rcvOpts, async.WithReceiverHTTPClient(&http.Client{
@@ -108,15 +108,10 @@ Graceful shutdown on SIGINT/SIGTERM:
 
 		rcvCtx, rcvCancel := context.WithCancel(gCtx)
 		defer rcvCancel()
-		recvWorker := worker.New(eq,
-			worker.WithDoModify(async.ReceiverHandler(upstream, rcvOpts...)),
-			worker.WithMeterProvider[async.Envelope](mp),
-		)
-		for range concurrency {
-			g.Go(func() error {
-				return recvWorker.Run(rcvCtx, worker.Watching(path.Join(myQueue, "inbox")))
-			})
-		}
+		receiver := async.NewReceiver(eq, upstream, rcvOpts...)
+		g.Go(func() error {
+			return receiver.Run(rcvCtx, path.Join(myQueue, "inbox"))
+		})
 
 		// Signal handler: staged shutdown. Also fires when any goroutine fails
 		// (gCtx cancelled), ensuring the sender is always cleaned up.

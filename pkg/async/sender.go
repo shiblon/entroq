@@ -335,9 +335,7 @@ func (s *Sender) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// this sender might still be awaiting. See WithSenderResponseGrace.
 	collectAt := time.Now().Add(s.requestTimeout + s.responseGrace)
 	session := entroq.GenHex16()
-	responseQueue := path.Join(queuePrefix, "response",
-		fmt.Sprintf("gc=%d", collectAt.Unix()),
-		session)
+	responseQueue := sessionQueue(queuePrefix, session, collectAt, "response")
 
 	env := Envelope{
 		FrameControl: FrameControl{
