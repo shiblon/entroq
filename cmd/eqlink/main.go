@@ -1,4 +1,4 @@
-// Command eqlink is an async HTTP networking sidecar built on EntroQ.
+// Command eqlink is an experimental HTTP networking sidecar built on EntroQ.
 // Services communicate through task queues rather than direct connections,
 // gaining fault tolerance and load balancing without changing their HTTP code.
 //

@@ -1,7 +1,8 @@
-// Package async provides primitives for building asynchronous HTTP networking
-// over EntroQ task queues. Services communicate by sending and receiving tasks
-// rather than making direct HTTP connections, gaining fault tolerance and
-// decoupled addressing without changing their HTTP interface.
+// Package async provides experimental primitives for carrying HTTP exchanges
+// over EntroQ task queues. Its wire protocol may change without compatibility.
+// Services communicate by sending and receiving tasks rather than making
+// direct cross-service HTTP connections, gaining decoupled addressing and
+// queue-based load distribution without changing their HTTP interface.
 //
 // # Sidecar Pattern (Single EQ Instance)
 //
@@ -10,9 +11,9 @@
 // retool existing services, is a sidecar pair sharing one EntroQ instance. The
 // Sender translates outgoing HTTP calls from a local service into Envelope
 // tasks on a named queue. One or more Receiver workers claim those tasks,
-// forward them as HTTP requests to an upstream service, and enqueue a Response
-// task on the per-request response queue. The sender unblocks and returns the
-// response to the original caller.
+// forward them as HTTP requests to an upstream service, and enqueue Response
+// tasks on an ephemeral response lane. The sender relays response metadata and
+// body bytes to the original caller as acknowledged frames arrive.
 //
 //	[Service A] -HTTP-> [Sender] -task-> [EQ] <-claim- [Receiver] -HTTP-> [Service B]
 //	                       ^                                  |
@@ -21,7 +22,11 @@
 // This permits basic microservices to communicate with one another through the
 // queueing system without knowing they are part of such a system. The services
 // themselves are synchronous, but only with local connections in their
-// container. The rest of the system is fully asynchronous.
+// container. The rest of the system uses a serialized, stop-and-wait exchange
+// over queues. Request bodies are buffered before the initial task is inserted.
+// Response bodies are streamed as arbitrary byte segments, which supports
+// HTTP/1.1 SSE and NDJSON without parsing their application framing. Protocol
+// upgrades and concurrent HTTP/2 request/response streaming are not supported.
 //
 // This works across datacenters if the remote receiver can reach EQ over the
 // WAN. mTLS (--cert/--key/--ca flags on eqlink) is used to authenticate the

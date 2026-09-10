@@ -29,7 +29,6 @@ var (
 	namespace           string
 	auditLog            bool
 	tokenReloadInterval time.Duration
-	responseGrace       time.Duration
 )
 
 var runCmd = &cobra.Command{
@@ -77,7 +76,6 @@ Graceful shutdown on SIGINT/SIGTERM:
 		alog := newAuditLogger()
 		sender := async.NewSender(eq, senderAddr,
 			async.WithSenderRequestTimeout(requestTimeout),
-			async.WithSenderResponseGrace(responseGrace),
 			async.WithSenderMeterProvider(mp),
 			async.WithSenderTLSConfig(tlsCfg),
 			async.WithSenderDomainSuffix(domainSuffix),
@@ -150,9 +148,8 @@ func init() {
 	flags.StringVar(&senderAddr, "addr", ":8080", "Address for the sender to listen on.")
 	flags.StringVar(&upstream, "upstream", "http://localhost:8000", "Upstream service address for the receiver.")
 	flags.IntVar(&concurrency, "concurrency", 1, "Number of concurrent receiver goroutines.")
-	flags.DurationVar(&requestTimeout, "request_timeout", 30*time.Second, "Sender request timeout.")
+	flags.DurationVar(&requestTimeout, "request_timeout", 30*time.Second, "Maximum idle time between response frames before the sender returns 504.")
 	flags.DurationVar(&drainTimeout, "drain_timeout", 35*time.Second, "How long to wait for in-flight requests to finish on shutdown.")
-	flags.DurationVar(&responseGrace, "response_grace", 15*time.Second, "Margin added past --request_timeout when stamping the response queue's collectable-at time, so GC does not delete a response still being awaited. Size to worst-case server-side GC clock skew.")
 	flags.BoolVar(&auditLog, "audit-log", false, "Emit structured JSON audit events to stderr for every request mediated (request_enqueued, request_handled, response_received).")
 	flags.DurationVar(&tokenReloadInterval, "token-reload-interval", 5*time.Minute, "How often to stat the --authz-token-file and reload it if changed. Handles k8s projected token rotation.")
 	runCmd.MarkFlagRequired("queue")

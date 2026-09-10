@@ -57,6 +57,13 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   wire each role to its own queue, lease and claim ceiling. The API and the
   document layout may change without a migration path.
 
+- **Experimental EQLink response streaming.** EQLink buffers request bodies and
+  relays HTTP/1.1 response bodies through an acknowledged, stop-and-wait queue
+  lane, including SSE and NDJSON. Session queues use 30-minute `gc=` generations,
+  rotate opportunistically with data in their final ten minutes, and force a
+  blank reciprocal switch in their final five minutes. A receiver-owned
+  connection doc keeps autoscaling replicas alive while a session is active.
+
 - **Queue-driven Kubernetes autoscaling.** The Helm chart can publish an
   optional Prometheus `ServiceMonitor`; the service exports queue and doc
   namespace size gauges; and the greetings demo includes a KEDA `ScaledObject`

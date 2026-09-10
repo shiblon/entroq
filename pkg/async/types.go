@@ -37,7 +37,8 @@ func copyHeaders(src http.Header) http.Header {
 // frame. It is required for non-final frames and omitted from final frames,
 // which do not receive an acknowledgement. A changed ReplyQueue requests a
 // queue switch; the queue name and its policy components remain opaque to the
-// peer.
+// peer. A final Envelope is a best-effort cancellation and carries Error; a
+// final Response may represent ordinary EOF and therefore need not carry one.
 type FrameControl struct {
 	Session    string `json:"session"`
 	ReplyQueue string `json:"reply_queue,omitempty"`

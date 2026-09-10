@@ -270,7 +270,11 @@ so you don't have to write the claim/renew/modify loop yourself:
 
 ## Kubernetes Service Mesh
 
-EntroQ v1.0.0 ships a Kubernetes operator that turns the queue into a
+> [!WARNING]
+> EQLink is experimental. Its queue protocol and command surface may change
+> without backward compatibility.
+
+EntroQ ships a Kubernetes operator that turns the queue into a
 **transparent async service mesh**. Ordinary HTTP microservices communicate
 through queues with no queue-awareness in their code. Each pod gets an
 **eqlink sidecar** that intercepts outbound HTTP calls, converts them to queue
@@ -289,6 +293,14 @@ domain suffix, maps the hostname to a queue name, and inserts a task. On the
 other side, the receiver's eqlink claims the task, calls the local service over
 loopback, and routes the response back through a per-request reply queue.
 Neither service knows any of this happened.
+
+EQLink buffers each request body before enqueueing it. It streams HTTP/1.1
+response bodies back as serialized, acknowledged byte segments, so SSE and
+NDJSON work without EQLink parsing their event framing. Protocol upgrades and
+concurrent HTTP/2 request/response streaming are not supported. Active lanes
+rotate through 30-minute `gc=` queue generations: ordinary data piggybacks a
+switch in the final ten minutes, and an idle turn forces a blank switch in the
+final five minutes.
 
 Authorization is declared with two CRDs:
 

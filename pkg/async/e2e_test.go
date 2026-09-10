@@ -1,6 +1,7 @@
 package async_test
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,6 +26,118 @@ type echoResponse struct {
 	Query      string              `json:"query"`
 	Body       string              `json:"body"`
 	ReqHeaders map[string][]string `json:"req_headers"`
+}
+
+func TestSidecarSSEStreamsBeforeUpstreamEOF(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	firstFlushed := make(chan struct{})
+	releaseUpstream := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseUpstream) }) }
+	defer release()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("upstream response writer does not support flushing")
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+
+		_, _ = io.WriteString(w, "data: hel")
+		flusher.Flush()
+		_, _ = io.WriteString(w, "lo\n\n")
+		flusher.Flush()
+		close(firstFlushed)
+
+		select {
+		case <-releaseUpstream:
+		case <-ctx.Done():
+			return
+		}
+		_, _ = io.WriteString(w, "event: done\ndata: goodbye\n\n")
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	eq, stopEQ := mustStartEntroQ(ctx, t, eqmem.Opener())
+	defer stopEQ()
+	stopReceiver := mustStartReceivers(ctx, t, eq, "/events/svc", upstream.URL, 1)
+	defer stopReceiver()
+
+	sender := async.NewSender(eq, "",
+		async.WithSenderDomainSuffix(".test"),
+		async.WithSenderNamespace("events"),
+		async.WithSenderRequestTimeout(5*time.Second),
+	)
+	senderServer := httptest.NewServer(sender)
+	defer senderServer.Close()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, senderServer.URL+"/stream", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Host = "svc.test"
+	req.Header.Set("Accept", "text/event-stream")
+	resp, err := senderServer.Client().Do(req)
+	if err != nil {
+		t.Fatalf("open streaming response: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "text/event-stream" {
+		t.Errorf("Content-Type: got %q, want text/event-stream", got)
+	}
+	select {
+	case <-firstFlushed:
+	case <-ctx.Done():
+		t.Fatal("upstream did not flush its first event")
+	}
+
+	type readResult struct {
+		value string
+		err   error
+	}
+	reader := bufio.NewReader(resp.Body)
+	firstEvent := make(chan readResult, 1)
+	go func() {
+		line, readErr := reader.ReadString('\n')
+		if readErr == nil {
+			var separator string
+			separator, readErr = reader.ReadString('\n')
+			line += separator
+		}
+		firstEvent <- readResult{value: line, err: readErr}
+	}()
+
+	select {
+	case got := <-firstEvent:
+		if got.err != nil {
+			t.Fatalf("read first event: %v", got.err)
+		}
+		if got.value != "data: hello\n\n" {
+			t.Errorf("first event: got %q, want %q", got.value, "data: hello\n\n")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("first SSE event did not arrive while upstream remained open")
+	}
+
+	release()
+	remainder, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read remaining stream: %v", err)
+	}
+	if got, want := string(remainder), "event: done\ndata: goodbye\n\n"; got != want {
+		t.Errorf("remaining stream: got %q, want %q", got, want)
+	}
 }
 
 // startEchoUpstream returns an httptest.Server that reflects the request
@@ -189,9 +303,9 @@ func TestSidecarE2E(t *testing.T) {
 		},
 	}
 
-	// Streaming rejection cases are separate: they return non-200 before
-	// the queue is touched, so they don't need a running receiver.
-	streamingCases := []struct {
+	// Protocol upgrade rejection is separate: it returns before the queue is
+	// touched, so it doesn't need a running receiver.
+	upgradeCases := []struct {
 		name       string
 		setupReq   func(*http.Request)
 		wantStatus int
@@ -203,15 +317,8 @@ func TestSidecarE2E(t *testing.T) {
 			},
 			wantStatus: http.StatusNotImplemented,
 		},
-		{
-			name: "SSE accept rejected with 501",
-			setupReq: func(r *http.Request) {
-				r.Header.Set("Accept", "text/event-stream")
-			},
-			wantStatus: http.StatusNotImplemented,
-		},
 	}
-	for _, tc := range streamingCases {
+	for _, tc := range upgradeCases {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "http://svc.test/stream", nil).WithContext(ctx)
 			tc.setupReq(req)
