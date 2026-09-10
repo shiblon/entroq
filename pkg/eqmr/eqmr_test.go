@@ -1,12 +1,10 @@
 package eqmr_test
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"math/rand"
 	"sort"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -59,10 +57,10 @@ func TestWordCountSmall(t *testing.T) {
 
 	// word1 appears 4 times, word3/word4/word5/word7 twice, the rest once.
 	input := []*eqmr.KV{
-		eqmr.NewKV(nil, []byte("word1 word2 word3 word4")),
-		eqmr.NewKV(nil, []byte("word1 word3 word5 word7")),
-		eqmr.NewKV(nil, []byte("word1 word4 word7 wordA")),
-		eqmr.NewKV(nil, []byte("word1 word5 word9 wordE")),
+		eqmr.NewKV("", ("word1 word2 word3 word4")),
+		eqmr.NewKV("", ("word1 word3 word5 word7")),
+		eqmr.NewKV("", ("word1 word4 word7 wordA")),
+		eqmr.NewKV("", ("word1 word5 word9 wordE")),
 	}
 
 	if err := ctrl.Run(ctx, input, eqmr.WordCountMapper, eqmr.SumReducer, eqmr.RunOptions{
@@ -112,7 +110,7 @@ func wordCountFixture(t *testing.T, uniqueWords, totalWords, numDocs int) ([]*eq
 		if i == numDocs-1 {
 			end = len(occurrences)
 		}
-		docs = append(docs, eqmr.NewKV(nil, []byte(strings.Join(occurrences[i*perDoc:end], " "))))
+		docs = append(docs, eqmr.NewKV("", (strings.Join(occurrences[i*perDoc:end], " "))))
 	}
 	return docs, histogram
 }
@@ -173,7 +171,7 @@ func TestManyDistinctKeys(t *testing.T) {
 		}
 	}
 	if !sort.SliceIsSorted(results, func(i, j int) bool {
-		return bytes.Compare(results[i].Key, results[j].Key) < 0
+		return results[i].Key < results[j].Key
 	}) {
 		t.Error("merged results are not sorted by key")
 	}
@@ -189,7 +187,7 @@ func TestManyDistinctKeys(t *testing.T) {
 			used++
 		}
 		if !sort.SliceIsSorted(part, func(i, j int) bool {
-			return bytes.Compare(part[i].Key, part[j].Key) < 0
+			return part[i].Key < part[j].Key
 		}) {
 			t.Errorf("partition %d is not sorted by key", p)
 		}
@@ -269,63 +267,69 @@ func TestDifferentShardingSameResults(t *testing.T) {
 	}
 }
 
-// TestArbitraryByteKeys is the key-management guarantee: intermediate keys may
-// hold any bytes at all, including invalid UTF-8 and NUL, because they travel
-// in doc content as []byte rather than in doc keys.
-func TestArbitraryByteKeys(t *testing.T) {
+// TestBinaryKeysAreRejected is the inverse of the guarantee this package used
+// to make. Keys and values are text, and a job with genuinely binary data
+// encodes it itself. What matters is that a violation fails loudly at the point
+// it was produced, rather than being silently substituted with U+FFFD on the
+// way through JSON or rejected much later by PostgreSQL's JSONB.
+func TestBinaryKeysAreRejected(t *testing.T) {
 	ctx := context.Background()
-	eq := newClient(ctx, t)
 
-	nasty := [][]byte{
-		{0xff, 0xfe},
-		{0x00, 0x01, 0x02},
-		[]byte("plain"),
-		{0xed, 0xa0, 0x80}, // an unpaired surrogate encoding
-		{},
+	for _, tc := range []struct {
+		name string
+		key  string
+		want string
+	}{
+		{"invalid utf-8", string([]byte{0xff, 0xfe}), "not valid UTF-8"},
+		{"unpaired surrogate bytes", string([]byte{0xed, 0xa0, 0x80}), "not valid UTF-8"},
+		{"embedded NUL", string([]byte{'a', 0x00, 'b'}), "NUL"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			eq := newClient(ctx, t)
+			ctrl, err := eqmr.New(eq, testConfig(1, 1))
+			if err != nil {
+				t.Fatalf("new controller: %v", err)
+			}
+			mapper := func(ctx context.Context, _, _ string, emit eqmr.EmitFunc) error {
+				return emit(ctx, tc.key, "1")
+			}
+			err = ctrl.Run(ctx, []*eqmr.KV{eqmr.NewKV("", "anything")}, mapper, eqmr.SumReducer,
+				eqmr.RunOptions{Mappers: 1, Reducers: 1})
+			if err == nil {
+				t.Fatal("expected the run to fail on a non-text key")
+			}
+			if !strings.Contains(err.Error(), "quarantined") {
+				t.Errorf("error %q should report quarantined work", err)
+			}
+		})
 	}
+}
 
-	mapper := func(ctx context.Context, _, value []byte, emit eqmr.EmitFunc) error {
-		idx, err := strconv.Atoi(string(value))
-		if err != nil {
-			return err
-		}
-		return emit(ctx, nasty[idx], []byte("1"))
-	}
-
-	input := make([]*eqmr.KV, len(nasty))
-	for i := range nasty {
-		input[i] = eqmr.NewKV(nil, []byte(strconv.Itoa(i)))
-	}
-
-	ctrl, err := eqmr.New(eq, testConfig(3, 3))
-	if err != nil {
-		t.Fatalf("new controller: %v", err)
-	}
-	if err := ctrl.Run(ctx, input, mapper, eqmr.SumReducer, eqmr.RunOptions{
-		Mappers: 2, Reducers: 2,
-	}); err != nil {
-		t.Fatalf("run: %v", err)
-	}
-
-	results, err := ctrl.Results(ctx)
-	if err != nil {
-		t.Fatalf("results: %v", err)
-	}
-	if len(results) != len(nasty) {
-		t.Fatalf("got %d results, want %d", len(results), len(nasty))
-	}
-
-	want := make([][]byte, len(nasty))
-	copy(want, nasty)
-	sort.Slice(want, func(i, j int) bool { return bytes.Compare(want[i], want[j]) < 0 })
-
-	for i, kv := range results {
-		if !bytes.Equal(kv.Key, want[i]) {
-			t.Errorf("result %d key: got % x, want % x", i, kv.Key, want[i])
-		}
-		if string(kv.Value) != "1" {
-			t.Errorf("result %d value: got %q, want %q", i, kv.Value, "1")
-		}
+// TestValidateTextRule pins the rule itself, independently of a pipeline run.
+func TestValidateTextRule(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		in      string
+		wantErr string
+	}{
+		{"plain ascii", "w000042", ""},
+		{"multibyte utf-8", "\u65e5\u672c\u8a9e", ""},
+		{"emoji", "\U0001f525", ""},
+		{"empty", "", ""},
+		{"invalid utf-8", string([]byte{0xff}), "not valid UTF-8"},
+		{"NUL", string([]byte{'a', 0x00}), "NUL"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := eqmr.ValidateText("test value", tc.in)
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Errorf("unexpected error: %v", err)
+			case tc.wantErr != "" && err == nil:
+				t.Errorf("expected an error mentioning %q", tc.wantErr)
+			case tc.wantErr != "" && !strings.Contains(err.Error(), tc.wantErr):
+				t.Errorf("error %q does not mention %q", err, tc.wantErr)
+			}
+		})
 	}
 }
 

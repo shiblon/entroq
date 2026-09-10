@@ -39,7 +39,10 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   failover. Both shard counts must be configured explicitly. Also included:
   run cleanup, stall and quarantine detection, a `Progress` snapshot suitable for
   driving a status view, and validation of namespaces and document keys as
-  NUL-free UTF-8 within the backend length limits. Phase completion is judged
+  NUL-free UTF-8 within the backend length limits. Map keys and values are text
+  rather than bytes, validated on input and on every emit, which drops base64
+  from every intermediate document: measured, spill documents are 22% smaller
+  and readable in psql. A job with genuinely binary keys encodes them itself. Phase completion is judged
   purely from documents: every partition writes a result document, empty ones
   included, so finishing is a recorded fact rather than an absence and no queue
   is consulted to decide it. Workers read their input document rather than

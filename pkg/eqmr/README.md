@@ -104,21 +104,34 @@ carried as a richer intermediate. A Combiner is purely an optimization:
 `TestCombinerDoesNotChangeResults` pins that a run produces identical output
 with and without one.
 
-## Keys
+## Keys and values are text
 
-Doc keys here are readable text (`split/000007`, `spill/000003`). Intermediate
-keys are **not** doc keys: they are `[]byte` inside doc content, where
-`encoding/json` represents them as base64 and round-trips them losslessly.
+Everything in the pipeline is a string: document keys (`split/000007`), map keys,
+and values. All must be valid UTF-8 with no NUL.
 
-This is deliberate. A doc key has to survive both PostgreSQL `TEXT` (valid
-UTF-8, no NUL) and a JSON string (valid UTF-8), and `encoding/json` silently
-substitutes U+FFFD for invalid UTF-8 in a Go string rather than failing, so an
-unvalidated byte key corrupts on the wire instead of erroring where the mistake
-was made. Encoding byte keys to fit would work but would make every key opaque
-in `psql` and in logs, which is the one thing a range-scanned key is for.
+Both halves of that rule are load-bearing. Keys and values live inside document
+content, which is JSONB in PostgreSQL, and JSONB rejects `\u0000` outright
+("unsupported Unicode escape sequence"). A JSON string cannot represent invalid
+UTF-8 at all, and Go's `encoding/json` silently substitutes U+FFFD rather than
+failing, so an unvalidated value would corrupt in transit rather than erroring
+where the mistake was made.
 
-`TestArbitraryByteKeys` pins that intermediate keys may hold any bytes at all,
-including invalid UTF-8 and NUL.
+A job whose keys or values are genuinely binary encodes them itself, with base64
+or anything else. That choice belongs to the job, which knows whether it needs
+it. The alternative, `[]byte` everywhere, charges every job for the few that
+need it: measured on a real run, base64 made spill documents **22% larger**
+(18,550 bytes against 14,392) and left them unreadable:
+
+```json
+[{"key":"dzAwMDAwMA==","values":["MQ==","Mw=="]}]     // []byte
+[{"key":"w000000","values":["1","3"]}]                // string
+```
+
+`ValidateText` is the rule, and it is enforced where violations happen: on input
+at `Setup`, and on every emitted pair. An invalid pair is a `MoveError`, since
+text that is not valid UTF-8 will never become valid on a retry, so the task is
+quarantined at once and the controller fails the run with a reason rather than
+killing a worker repeatedly over input that cannot succeed.
 
 ## Backup tasks (speculative execution)
 

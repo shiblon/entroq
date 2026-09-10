@@ -180,6 +180,29 @@ func (c *Controller) ControlRunOptions() []worker.RunOption {
 	}
 }
 
+// ValidateText reports whether s is usable as a MapReduce key or value.
+//
+// The rule is valid UTF-8 with no NUL, and both halves are load-bearing rather
+// than fussy. Keys and values live inside document content, which is JSONB in
+// PostgreSQL, and JSONB rejects \u0000 outright ("unsupported Unicode escape
+// sequence"). A JSON string cannot represent invalid UTF-8 at all, and Go's
+// encoding/json silently substitutes U+FFFD instead of failing, so an
+// unvalidated value would corrupt in transit rather than erroring where the
+// mistake was made.
+//
+// A job with genuinely binary keys or values should encode them itself. Doing so
+// is one line, and it keeps the cost with the job that needs it instead of
+// charging every job base64 on every intermediate document.
+func ValidateText(what, s string) error {
+	if !utf8.ValidString(s) {
+		return fmt.Errorf("%s is not valid UTF-8 (encode it, with base64 or similar, if it is genuinely binary)", what)
+	}
+	if strings.ContainsRune(s, 0) {
+		return fmt.Errorf("%s contains a NUL byte, which PostgreSQL JSONB cannot store (encode it if it is genuinely binary)", what)
+	}
+	return nil
+}
+
 // ValidText reports whether s is usable as a doc namespace or key: valid UTF-8,
 // free of NUL, and within maxBytes. Both restrictions are real. PostgreSQL TEXT
 // in a UTF-8 database rejects invalid sequences and NUL outright, and a JSON

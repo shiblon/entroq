@@ -9,23 +9,37 @@ import (
 	"strings"
 )
 
-// KV is a key/value pair. It is the input type for mappers and the output type
-// of a completed run. Both halves are []byte, so they may hold arbitrary bytes:
-// encoding/json represents a []byte as base64, which round-trips losslessly,
-// unlike a Go string containing invalid UTF-8.
+// KV is a key/value pair: the input type for mappers and the output type of a
+// completed run.
+//
+// Both halves are text, and must be valid UTF-8 without NUL. That is not a
+// stylistic preference. These values are stored inside document content, which
+// is JSONB in PostgreSQL, and JSONB rejects \u0000 outright; a JSON string
+// cannot represent invalid UTF-8 at all, and encoding/json silently substitutes
+// U+FFFD rather than failing. Text is also what the document store itself uses
+// for keys, so this keeps one rule across the package.
+//
+// A job whose keys or values are genuinely binary should encode them, with
+// base64 or anything else it prefers. That choice belongs to the job, which
+// knows whether it needs it; making everyone pay base64 for the few who do
+// inflates every intermediate document by roughly a fifth and leaves them
+// unreadable in psql. ValidateText reports whether a string qualifies, and the
+// pipeline checks emitted pairs so a violation fails where it was produced
+// rather than corrupting silently on the wire.
 type KV struct {
-	Key   []byte `json:"key"`
-	Value []byte `json:"value"`
+	Key   string `json:"key"`
+	Value string `json:"value"`
 }
 
 // NewKV creates a key/value pair.
-func NewKV(key, value []byte) *KV { return &KV{Key: key, Value: value} }
+func NewKV(key, value string) *KV { return &KV{Key: key, Value: value} }
 
 // String renders a readable form for logs and test failures.
 func (kv *KV) String() string { return fmt.Sprintf("(%s)=%s", kv.Key, kv.Value) }
 
-// EmitFunc is handed to a Mapper to emit intermediate pairs.
-type EmitFunc func(ctx context.Context, key, value []byte) error
+// EmitFunc is handed to a Mapper to emit intermediate pairs. It rejects a key or
+// value that is not valid NUL-free UTF-8.
+type EmitFunc func(ctx context.Context, key, value string) error
 
 // Mapper is called once per input KV and emits zero or more intermediate pairs.
 //
@@ -43,11 +57,11 @@ type EmitFunc func(ctx context.Context, key, value []byte) error
 //
 // If a particular failure should be tolerated instead, that judgment belongs
 // inside the Mapper body, which can swallow it and emit nothing.
-type Mapper func(ctx context.Context, key, value []byte, emit EmitFunc) error
+type Mapper func(ctx context.Context, key, value string, emit EmitFunc) error
 
 // Reducer is called once per distinct intermediate key with every value for
 // that key, and returns the single value recorded in the run's output.
-type Reducer func(ctx context.Context, input ReducerInput) ([]byte, error)
+type Reducer func(ctx context.Context, input ReducerInput) (string, error)
 
 // Combiner shrinks the value list for one key without finishing the reduction.
 //
@@ -64,14 +78,14 @@ type Reducer func(ctx context.Context, input ReducerInput) ([]byte, error)
 //
 // Combiners are an optimization and never a correctness requirement: a run with
 // no Combiner produces the same output, more slowly and with larger spills.
-type Combiner func(ctx context.Context, key []byte, values [][]byte) ([][]byte, error)
+type Combiner func(ctx context.Context, key string, values []string) ([]string, error)
 
 // ReducerInput iterates the values for one intermediate key.
 type ReducerInput interface {
 	// Key is the intermediate key being reduced. Always available.
-	Key() []byte
+	Key() string
 	// Value is the current value. Call Next before the first use.
-	Value() []byte
+	Value() string
 	// Err returns any iteration error. Check it after Next returns false.
 	Err() error
 	// Next advances to the next value, reporting false when exhausted.
@@ -85,17 +99,17 @@ type ReducerInput interface {
 
 // sliceInput is a ReducerInput over an in-memory value slice.
 type sliceInput struct {
-	key    []byte
-	values [][]byte
+	key    string
+	values []string
 	idx    int
 }
 
-func (s *sliceInput) Key() []byte { return s.key }
+func (s *sliceInput) Key() string { return s.key }
 func (s *sliceInput) Err() error  { return nil }
 
-func (s *sliceInput) Value() []byte {
+func (s *sliceInput) Value() string {
 	if s.idx == 0 || s.idx > len(s.values) {
-		return nil
+		return ""
 	}
 	return s.values[s.idx-1]
 }
@@ -108,30 +122,30 @@ func (s *sliceInput) Next() bool {
 	return true
 }
 
-// Fingerprint64 produces a 64-bit unsigned integer from a byte string.
-func Fingerprint64(key []byte) uint64 {
+// Fingerprint64 produces a 64-bit unsigned integer from a string.
+func Fingerprint64(key string) uint64 {
 	h := fnv.New64()
-	h.Write(key)
+	h.Write([]byte(key))
 	return h.Sum64()
 }
 
 // ShardForKey assigns an intermediate key to one of n partitions. Every mapper
 // in a run must agree on n, which is why Config.ReduceShards is required and
 // fixed for the life of a run.
-func ShardForKey(key []byte, n int) int {
+func ShardForKey(key string, n int) int {
 	return int(Fingerprint64(key) % uint64(n))
 }
 
 // IdentityMapper emits its input unchanged.
-func IdentityMapper(ctx context.Context, key, value []byte, emit EmitFunc) error {
+func IdentityMapper(ctx context.Context, key, value string, emit EmitFunc) error {
 	return emit(ctx, key, value)
 }
 
 // WordCountMapper emits word:count for each whitespace-separated word in the
 // value, ignoring the input key. Splitting is naive on purpose.
-func WordCountMapper(ctx context.Context, _, value []byte, emit EmitFunc) error {
+func WordCountMapper(ctx context.Context, _, value string, emit EmitFunc) error {
 	words := make(map[string]int)
-	for w := range strings.FieldsSeq(string(value)) {
+	for w := range strings.FieldsSeq(value) {
 		words[w]++
 	}
 	emitted := 0
@@ -143,7 +157,7 @@ func WordCountMapper(ctx context.Context, _, value []byte, emit EmitFunc) error 
 			default:
 			}
 		}
-		if err := emit(ctx, []byte(word), []byte(strconv.Itoa(count))); err != nil {
+		if err := emit(ctx, word, strconv.Itoa(count)); err != nil {
 			return fmt.Errorf("word count emit: %w", err)
 		}
 		emitted++
@@ -152,62 +166,66 @@ func WordCountMapper(ctx context.Context, _, value []byte, emit EmitFunc) error 
 }
 
 // SumReducer sums decimal integer values for a key.
-func SumReducer(_ context.Context, input ReducerInput) ([]byte, error) {
+func SumReducer(_ context.Context, input ReducerInput) (string, error) {
 	sum := 0
 	for input.Next() {
-		n, err := strconv.Atoi(string(input.Value()))
+		n, err := strconv.Atoi(input.Value())
 		if err != nil {
-			return nil, fmt.Errorf("SumReducer int conversion: %w", err)
+			return "", fmt.Errorf("SumReducer int conversion: %w", err)
 		}
 		sum += n
 	}
 	if err := input.Err(); err != nil {
-		return nil, fmt.Errorf("SumReducer input: %w", err)
+		return "", fmt.Errorf("SumReducer input: %w", err)
 	}
-	return []byte(strconv.Itoa(sum)), nil
+	return strconv.Itoa(sum), nil
 }
 
 // SumCombiner is the Combiner matching SumReducer: it collapses a value list to
 // a single running total. Addition is associative and commutative, so combining
 // partial sums and then summing those equals summing everything at once, which
 // is exactly the property Combiner requires.
-func SumCombiner(_ context.Context, _ []byte, values [][]byte) ([][]byte, error) {
+func SumCombiner(_ context.Context, _ string, values []string) ([]string, error) {
 	if len(values) < 2 {
 		return values, nil
 	}
 	sum := 0
 	for _, v := range values {
-		n, err := strconv.Atoi(string(v))
+		n, err := strconv.Atoi(v)
 		if err != nil {
 			return nil, fmt.Errorf("SumCombiner int conversion: %w", err)
 		}
 		sum += n
 	}
-	return [][]byte{[]byte(strconv.Itoa(sum))}, nil
+	return []string{strconv.Itoa(sum)}, nil
 }
 
 // FirstValueReducer returns the first value for a key and stops.
-func FirstValueReducer(_ context.Context, input ReducerInput) ([]byte, error) {
+func FirstValueReducer(_ context.Context, input ReducerInput) (string, error) {
 	if !input.Next() {
-		return nil, fmt.Errorf("no inputs to reducer")
+		return "", fmt.Errorf("no inputs to reducer")
 	}
 	if err := input.Err(); err != nil {
-		return nil, fmt.Errorf("FirstValueReducer input: %w", err)
+		return "", fmt.Errorf("FirstValueReducer input: %w", err)
 	}
 	return input.Value(), nil
 }
 
-// NilReducer produces a nil value for every key.
-func NilReducer(_ context.Context, _ ReducerInput) ([]byte, error) { return nil, nil }
+// EmptyReducer produces an empty value for every key.
+func EmptyReducer(_ context.Context, _ ReducerInput) (string, error) { return "", nil }
 
 // SliceReducer produces a JSON-serialized slice of all values for a key.
-func SliceReducer(_ context.Context, input ReducerInput) ([]byte, error) {
-	var vals [][]byte
+func SliceReducer(_ context.Context, input ReducerInput) (string, error) {
+	var vals []string
 	for input.Next() {
 		vals = append(vals, input.Value())
 	}
 	if err := input.Err(); err != nil {
-		return nil, fmt.Errorf("SliceReducer input: %w", err)
+		return "", fmt.Errorf("SliceReducer input: %w", err)
 	}
-	return json.Marshal(vals)
+	b, err := json.Marshal(vals)
+	if err != nil {
+		return "", fmt.Errorf("SliceReducer marshal: %w", err)
+	}
+	return string(b), nil
 }

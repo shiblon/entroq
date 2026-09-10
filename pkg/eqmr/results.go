@@ -1,7 +1,6 @@
 package eqmr
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -72,7 +71,7 @@ func mergeKVRuns(runs [][]*KV) []*KV {
 			if cursors[i] >= len(run) {
 				continue
 			}
-			if best < 0 || bytes.Compare(run[cursors[i]].Key, runs[best][cursors[best]].Key) < 0 {
+			if best < 0 || run[cursors[i]].Key < runs[best][cursors[best]].Key {
 				best = i
 			}
 		}

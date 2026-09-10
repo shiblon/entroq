@@ -1,7 +1,6 @@
 package eqmr
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -16,8 +15,8 @@ import (
 // split. A spill doc holds a slice of these, sorted by key, which is what makes
 // the reducer's merge a linear k-way merge rather than a full sort.
 type keyValues struct {
-	Key    []byte   `json:"key"`
-	Values [][]byte `json:"values"`
+	Key    string   `json:"key"`
+	Values []string `json:"values"`
 }
 
 // reduceClaim is the value of a reduce task: one partition of the shuffle.
@@ -95,6 +94,17 @@ func (c *Controller) Setup(ctx context.Context, input []*KV) error {
 	for i, split := range splits {
 		if len(split) == 0 {
 			continue
+		}
+		// Validate the input here rather than letting a bad record surface as a
+		// marshaling failure inside a mapper, where it would be reported against
+		// a split rather than against the record that is actually wrong.
+		for j, kv := range split {
+			if err := ValidateText(fmt.Sprintf("input key at index %d", j), kv.Key); err != nil {
+				return fmt.Errorf("eqmr setup: %w", err)
+			}
+			if err := ValidateText(fmt.Sprintf("input value at index %d", j), kv.Value); err != nil {
+				return fmt.Errorf("eqmr setup: %w", err)
+			}
 		}
 		key := splitDocKey(i)
 		if err := ValidText("split doc key", key, MaxDocKeyBytes); err != nil {
@@ -211,7 +221,7 @@ func (c *Controller) MapperWorker(mapFn Mapper, opts ...MapperOption) *worker.Wo
 			}
 			if o.combiner != nil {
 				for _, k := range order {
-					combined, err := o.combiner(ctx, []byte(k), grouped[k])
+					combined, err := o.combiner(ctx, k, grouped[k])
 					if err != nil {
 						return nil, fmt.Errorf("combine %q: %w", k, err)
 					}
@@ -289,16 +299,30 @@ func lostRace(_ context.Context, de *entroq.DependencyError) error {
 
 // runMapper runs mapFn over every KV in a split, collecting emitted pairs
 // grouped by key and remembering first-emit order for deterministic bucketing.
-func runMapper(ctx context.Context, mapFn Mapper, split []*KV) (map[string][][]byte, []string, error) {
-	grouped := make(map[string][][]byte)
+func runMapper(ctx context.Context, mapFn Mapper, split []*KV) (map[string][]string, []string, error) {
+	grouped := make(map[string][]string)
 	var order []string
 
-	emit := func(_ context.Context, k, v []byte) error {
-		ks := string(k)
-		if _, seen := grouped[ks]; !seen {
-			order = append(order, ks)
+	// Validate at the point of emission, so a bad pair names the mapper call
+	// that produced it rather than surfacing later as a marshaling failure or,
+	// worse, as silent U+FFFD substitution on the wire.
+	//
+	// A MoveError rather than a plain one: text that is not valid UTF-8 will
+	// never become valid on a retry, so this is a data error like a malformed
+	// split. Quarantining at once beats killing a worker repeatedly over input
+	// that cannot succeed, and the controller turns the quarantine into a run
+	// failure carrying the reason.
+	emit := func(_ context.Context, k, v string) error {
+		if err := ValidateText("emitted key", k); err != nil {
+			return worker.MoveErrorf("%v", err)
 		}
-		grouped[ks] = append(grouped[ks], v)
+		if err := ValidateText(fmt.Sprintf("value emitted for key %q", k), v); err != nil {
+			return worker.MoveErrorf("%v", err)
+		}
+		if _, seen := grouped[k]; !seen {
+			order = append(order, k)
+		}
+		grouped[k] = append(grouped[k], v)
 		return nil
 	}
 
@@ -312,26 +336,21 @@ func runMapper(ctx context.Context, mapFn Mapper, split []*KV) (map[string][][]b
 
 // partition assigns each key to a reduce shard and returns per-shard entries
 // sorted by key, which is the precondition for the reducer's merge.
-func partition(grouped map[string][][]byte, order []string, shards int) [][]*keyValues {
+func partition(grouped map[string][]string, order []string, shards int) [][]*keyValues {
 	buckets := make([][]*keyValues, shards)
-	for _, ks := range order {
-		key := []byte(ks)
+	for _, key := range order {
 		p := ShardForKey(key, shards)
-		vals := grouped[ks]
+		vals := grouped[key]
 		sortValues(vals)
 		buckets[p] = append(buckets[p], &keyValues{Key: key, Values: vals})
 	}
 	for _, entries := range buckets {
-		sort.Slice(entries, func(i, j int) bool {
-			return bytes.Compare(entries[i].Key, entries[j].Key) < 0
-		})
+		sort.Slice(entries, func(i, j int) bool { return entries[i].Key < entries[j].Key })
 	}
 	return buckets
 }
 
-func sortValues(vals [][]byte) {
-	sort.Slice(vals, func(i, j int) bool { return bytes.Compare(vals[i], vals[j]) < 0 })
-}
+func sortValues(vals []string) { sort.Strings(vals) }
 
 // ReducerWorker returns a worker that consumes one reduce partition per task.
 //
@@ -387,7 +406,7 @@ func (c *Controller) ReducerWorker(reduceFn Reducer) *worker.Worker[reduceClaim]
 			}
 
 			var out []*KV
-			err = mergeRuns(runs, func(key []byte, values [][]byte) error {
+			err = mergeRuns(runs, func(key string, values []string) error {
 				// Values arrive as the concatenation of per-split runs, each
 				// internally sorted. Sorting again makes a key's reduce input
 				// independent of split count and combine order, so results are
@@ -433,25 +452,25 @@ func (c *Controller) resultInsert(partition int, out []*KV) entroq.ModifyArg {
 // the number of map splits that is comfortably cheaper than the reduce work
 // itself; swapping in a heap becomes worthwhile only once spills are read
 // lazily rather than unmarshaled up front.
-func mergeRuns(runs [][]*keyValues, visit func(key []byte, values [][]byte) error) error {
+func mergeRuns(runs [][]*keyValues, visit func(key string, values []string) error) error {
 	cursors := make([]int, len(runs))
 	for {
-		var minKey []byte
+		minKey, have := "", false
 		for i, run := range runs {
 			if cursors[i] >= len(run) {
 				continue
 			}
-			if minKey == nil || bytes.Compare(run[cursors[i]].Key, minKey) < 0 {
-				minKey = run[cursors[i]].Key
+			if k := run[cursors[i]].Key; !have || k < minKey {
+				minKey, have = k, true
 			}
 		}
-		if minKey == nil {
+		if !have {
 			return nil
 		}
 
-		var values [][]byte
+		var values []string
 		for i, run := range runs {
-			for cursors[i] < len(run) && bytes.Equal(run[cursors[i]].Key, minKey) {
+			for cursors[i] < len(run) && run[cursors[i]].Key == minKey {
 				values = append(values, run[cursors[i]].Values...)
 				cursors[i]++
 			}

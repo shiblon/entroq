@@ -49,7 +49,7 @@ func TestBackupTasksRaceWithoutCorrupting(t *testing.T) {
 	bodies, histogram := eqmrtest.Docs(40, 200, 8, 11)
 	input := make([]*eqmr.KV, len(bodies))
 	for i, b := range bodies {
-		input[i] = eqmr.NewKV(nil, b)
+		input[i] = eqmr.NewKV("", b)
 	}
 	if err := ctrl.Setup(ctx, input); err != nil {
 		t.Fatalf("setup: %v", err)
@@ -74,7 +74,7 @@ func TestBackupTasksRaceWithoutCorrupting(t *testing.T) {
 	// A slow mapper, so both copies of a split overlap instead of one finishing
 	// before the other starts.
 	var invocations atomic.Int64
-	slowMapper := func(ctx context.Context, key, value []byte, emit eqmr.EmitFunc) error {
+	slowMapper := func(ctx context.Context, key, value string, emit eqmr.EmitFunc) error {
 		invocations.Add(1)
 		select {
 		case <-ctx.Done():

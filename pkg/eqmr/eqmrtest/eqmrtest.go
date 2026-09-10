@@ -3,12 +3,11 @@
 // applied to the older example implementation.
 //
 // The generator is deterministic given a seed and returns document bodies as
-// raw bytes rather than a package-specific KV type, so the same input can be fed
-// to two different MapReduce implementations for comparison.
+// plain strings rather than a package-specific KV type, so the same input can be
+// fed to two different MapReduce implementations for comparison.
 package eqmrtest
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"math/rand"
@@ -27,7 +26,7 @@ import (
 //
 // Words are zero-padded ("w000042") so lexical and numeric order agree, which
 // makes the expected output trivial to construct and compare.
-func Docs(uniqueWords, wordsPerDoc, numDocs int, seed int64) (bodies [][]byte, histogram map[string]int) {
+func Docs(uniqueWords, wordsPerDoc, numDocs int, seed int64) (bodies []string, histogram map[string]int) {
 	rng := rand.New(rand.NewSource(seed))
 
 	total := wordsPerDoc * numDocs
@@ -42,9 +41,9 @@ func Docs(uniqueWords, wordsPerDoc, numDocs int, seed int64) (bodies [][]byte, h
 		occurrences[i], occurrences[j] = occurrences[j], occurrences[i]
 	})
 
-	bodies = make([][]byte, 0, numDocs)
+	bodies = make([]string, 0, numDocs)
 	for i := range numDocs {
-		bodies = append(bodies, []byte(strings.Join(occurrences[i*wordsPerDoc:(i+1)*wordsPerDoc], " ")))
+		bodies = append(bodies, strings.Join(occurrences[i*wordsPerDoc:(i+1)*wordsPerDoc], " "))
 	}
 	return bodies, histogram
 }
@@ -57,16 +56,16 @@ func VerifyHistogram(results []*eqmr.KV, histogram map[string]int) error {
 		return fmt.Errorf("got %d distinct keys, want %d", len(results), len(histogram))
 	}
 	if !sort.SliceIsSorted(results, func(i, j int) bool {
-		return bytes.Compare(results[i].Key, results[j].Key) < 0
+		return results[i].Key < results[j].Key
 	}) {
 		return fmt.Errorf("results are not sorted by key")
 	}
 	for _, kv := range results {
-		want, ok := histogram[string(kv.Key)]
+		want, ok := histogram[kv.Key]
 		if !ok {
 			return fmt.Errorf("unexpected key %q in results", kv.Key)
 		}
-		got, err := strconv.Atoi(string(kv.Value))
+		got, err := strconv.Atoi(kv.Value)
 		if err != nil {
 			return fmt.Errorf("key %q has non-numeric count %q: %w", kv.Key, kv.Value, err)
 		}
@@ -108,7 +107,7 @@ func Check(ctx context.Context, eq *entroq.EntroQ, cfg Config) error {
 
 	input := make([]*eqmr.KV, len(bodies))
 	for i, b := range bodies {
-		input[i] = eqmr.NewKV(nil, b)
+		input[i] = eqmr.NewKV("", b)
 	}
 
 	ctrl, err := eqmr.New(eq, eqmr.Config{

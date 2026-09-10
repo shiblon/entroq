@@ -43,7 +43,7 @@ func TestProgressAccounting(t *testing.T) {
 	bodies, _ := eqmrtest.Docs(400, 800, 60, 7)
 	input := make([]*eqmr.KV, len(bodies))
 	for i, b := range bodies {
-		input[i] = eqmr.NewKV(nil, b)
+		input[i] = eqmr.NewKV("", b)
 	}
 
 	sampleCtx, stopSampling := context.WithCancel(ctx)
@@ -156,7 +156,7 @@ func TestProgressCountsEmptyPartitions(t *testing.T) {
 		t.Fatalf("new controller: %v", err)
 	}
 
-	input := []*eqmr.KV{eqmr.NewKV(nil, []byte("alpha beta alpha"))}
+	input := []*eqmr.KV{eqmr.NewKV("", ("alpha beta alpha"))}
 	if err := ctrl.Run(ctx, input, eqmr.WordCountMapper, eqmr.SumReducer, eqmr.RunOptions{
 		Mappers: 2, Reducers: 2,
 	}); err != nil {
