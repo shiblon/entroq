@@ -495,3 +495,39 @@ func TestQuarantinedWorkFailsRun(t *testing.T) {
 		t.Errorf("reason %q does not explain the failure", reason)
 	}
 }
+
+// TestMaxClaimsDefault pins that a run gets a claim ceiling without asking, and
+// that unlimited remains reachable. A default the documentation tells you to
+// always override is not a default.
+func TestMaxClaimsDefault(t *testing.T) {
+	ctx := context.Background()
+	eq := newClient(ctx, t)
+
+	base := func() eqmr.Config {
+		return eqmr.Config{Prefix: "/mc/" + entroq.GenHex16(), MapShards: 2, ReduceShards: 2}
+	}
+
+	ctrl, err := eqmr.New(eq, base())
+	if err != nil {
+		t.Fatalf("new controller: %v", err)
+	}
+	if got := ctrl.Config().MaxClaims; got != eqmr.DefaultMaxClaims {
+		t.Errorf("default MaxClaims is %d, want %d", got, eqmr.DefaultMaxClaims)
+	}
+
+	cfg := base()
+	cfg.MaxClaims = -1
+	unlimited, err := eqmr.New(eq, cfg)
+	if err != nil {
+		t.Fatalf("new controller: %v", err)
+	}
+	if got := unlimited.Config().MaxClaims; got != -1 {
+		t.Errorf("negative MaxClaims became %d, want it preserved as unlimited", got)
+	}
+
+	// The control queue must never carry a claim ceiling: its task is claimed
+	// once per tick for the life of the run.
+	if len(ctrl.ControlRunOptions()) >= len(ctrl.WorkerRunOptions(ctrl.MapQ())) {
+		t.Error("control run options should carry fewer options than worker ones (no claim ceiling)")
+	}
+}

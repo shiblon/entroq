@@ -153,17 +153,6 @@ type RunOptions struct {
 	// worker default.
 	MaxAttempts int32
 
-	// MaxClaims is how many times a task may be claimed at all before it is
-	// quarantined without being handed to a handler. This is the bound that
-	// actually catches poison input: a Mapper that dies on a bad record kills
-	// its worker without marking the task, so the task is simply reclaimed
-	// after its lease expires and kills the next worker too. MaxClaims turns
-	// that loop into a run failure after a bounded number of tries, which is
-	// what "a crash is recoverable up to a point" means in practice.
-	//
-	// Zero means unlimited, and a run with a genuinely poisonous input will
-	// then retry it forever. Set it.
-	MaxClaims int32
 	// Combiner, if set, is applied by every mapper.
 	Combiner Combiner
 }
@@ -193,22 +182,16 @@ func (c *Controller) Run(ctx context.Context, input []*KV, mapFn Mapper, reduceF
 
 	g, gctx := errgroup.WithContext(runCtx)
 
-	// Work queues get the retry and claim bounds; the control queue must not.
-	// The control task is deliberately claimed once per tick for the life of
-	// the run, so a claim bound would quarantine the controller after a few
-	// seconds of perfectly healthy operation, leaving the run with nothing
-	// driving it and nothing left to notice.
+	// Work queues get the claim ceiling from Config; the control queue must not
+	// have one, which WorkerRunOptions and ControlRunOptions encode.
 	workOpts := func(q string) []worker.RunOption {
-		ro := []worker.RunOption{worker.Watching(q), worker.WithLease(c.cfg.Lease)}
+		ro := c.WorkerRunOptions(q)
 		if opts.MaxAttempts > 0 {
 			ro = append(ro, worker.WithMaxAttempts(opts.MaxAttempts))
 		}
-		if opts.MaxClaims > 0 {
-			ro = append(ro, worker.WithMaxClaims(opts.MaxClaims))
-		}
 		return ro
 	}
-	controlOpts := []worker.RunOption{worker.Watching(c.ControlQ()), worker.WithLease(c.cfg.Lease)}
+	controlOpts := c.ControlRunOptions()
 
 	var mapperOpts []MapperOption
 	if opts.Combiner != nil {

@@ -122,10 +122,9 @@ func Check(ctx context.Context, eq *entroq.EntroQ, cfg Config) error {
 		return fmt.Errorf("eqmrtest: %w", err)
 	}
 	if err := ctrl.Run(ctx, input, eqmr.WordCountMapper, eqmr.SumReducer, eqmr.RunOptions{
-		Mappers:   cfg.Mappers,
-		Reducers:  cfg.Reducers,
-		Combiner:  cfg.Combiner,
-		MaxClaims: 5,
+		Mappers:  cfg.Mappers,
+		Reducers: cfg.Reducers,
+		Combiner: cfg.Combiner,
 	}); err != nil {
 		return fmt.Errorf("eqmrtest run: %w", err)
 	}

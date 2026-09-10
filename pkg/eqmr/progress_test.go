@@ -97,7 +97,7 @@ func TestProgressAccounting(t *testing.T) {
 	}()
 
 	if err := ctrl.Run(ctx, input, eqmr.WordCountMapper, eqmr.SumReducer, eqmr.RunOptions{
-		Mappers: 3, Reducers: 2, MaxClaims: 5,
+		Mappers: 3, Reducers: 2,
 	}); err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestProgressCountsEmptyPartitions(t *testing.T) {
 
 	input := []*eqmr.KV{eqmr.NewKV(nil, []byte("alpha beta alpha"))}
 	if err := ctrl.Run(ctx, input, eqmr.WordCountMapper, eqmr.SumReducer, eqmr.RunOptions{
-		Mappers: 2, Reducers: 2, MaxClaims: 5,
+		Mappers: 2, Reducers: 2,
 	}); err != nil {
 		t.Fatalf("run: %v", err)
 	}

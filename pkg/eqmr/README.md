@@ -154,12 +154,24 @@ standard MapReduce contract: a run in which some map calls failed cannot support
 any claim about the correctness of its output. The task is reclaimed once the
 lease expires, so a transient failure costs one claim rather than the run.
 
-Bounding that recovery is the caller's job. Set `RunOptions.MaxClaims` (or
-`worker.WithMaxClaims`): a fatal handler error does not mark the task, so
-without a claim bound a genuinely poisonous record is retried forever. With one,
-the task is quarantined to `{prefix}/err` after a bounded number of claims, and
-the controller fails the run with a reason. `TestQuarantinedWorkFailsRun` pins
-the controller half of that.
+A fatal handler error does not mark the task, so without a bound a genuinely
+poisonous record is retried forever, killing a worker each time. `Config`
+therefore defaults `MaxClaims` to `DefaultMaxClaims` (10): the task is
+quarantined to `{prefix}/err` after ten claims and the controller fails the run
+with a reason. Set it negative for unlimited.
+
+`pkg/worker` leaves this unlimited, and that difference is deliberate.
+`Task.Claims` conflates work that kills workers with ordinary infrastructure
+churn such as rolling deploys and evictions, and that conflation is forced
+rather than sloppy: a crashing worker is precisely the one that cannot reliably
+record why it died. A general worker cannot know a workload's ratio of the two.
+A batch run can take the position that a general worker cannot, because it has a
+defined end and failing loudly beats burning a pool forever.
+
+Use `WorkerRunOptions` and `ControlRunOptions` rather than assembling run options
+by hand, so the bound cannot be omitted in one deployment and not another. The
+control worker deliberately gets no bound: its task is claimed once per tick for
+the life of the run.
 
 When a dead worker's task actually gets reclaimed is the backend's business, not
 this package's. Let the claim mechanism do its job and roll with a blocked

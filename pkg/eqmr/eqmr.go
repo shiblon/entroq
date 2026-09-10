@@ -46,6 +46,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/worker"
 )
 
 // Limits mirrored from the backend schema. Note that the PostgreSQL CHECK
@@ -67,6 +68,22 @@ const (
 	DefaultLease           = 30 * time.Second
 	DefaultControlInterval = time.Second
 	DefaultStallTimeout    = 5 * time.Minute
+
+	// DefaultMaxClaims bounds how many times a unit may be claimed before it is
+	// quarantined, which fails the run.
+	//
+	// pkg/worker leaves this unlimited because it cannot know a workload's shape,
+	// and Task.Claims conflates two unrelated things: work that kills workers,
+	// and ordinary infrastructure churn such as rolling deploys and evictions.
+	// That conflation is forced rather than sloppy, since a crashing worker is
+	// precisely the one that cannot reliably record why it died.
+	//
+	// A batch run can take a position where a general worker cannot. It has a
+	// defined end, so failing loudly beats burning a worker pool forever on a
+	// record that kills everything it touches. Ten survives a handful of
+	// infrastructure events while bounding a poison record to ten worker deaths
+	// instead of unboundedly many.
+	DefaultMaxClaims int32 = 10
 )
 
 // Config describes one MapReduce run. Both shard counts are required: they are
@@ -106,6 +123,14 @@ type Config struct {
 	// long: no change in queue depth and no change in barrier state. Negative
 	// disables stall detection entirely. Zero means DefaultStallTimeout.
 	StallTimeout time.Duration
+
+	// MaxClaims bounds how many times any one unit may be claimed before it is
+	// quarantined, which fails the run. Negative means unlimited, reproducing
+	// the pkg/worker default. Zero means DefaultMaxClaims.
+	//
+	// Note that the check runs before a handler is constructed, so a task over
+	// the bound is quarantined without being given a chance to retire itself.
+	MaxClaims int32
 }
 
 func (c *Config) withDefaults() Config {
@@ -119,7 +144,40 @@ func (c *Config) withDefaults() Config {
 	if out.StallTimeout == 0 {
 		out.StallTimeout = DefaultStallTimeout
 	}
+	if out.MaxClaims == 0 {
+		out.MaxClaims = DefaultMaxClaims
+	}
 	return out
+}
+
+// WorkerRunOptions returns the run options every mapper and reducer in this run
+// should use: the queue to watch, the configured lease, and the claim ceiling.
+//
+// Deployed workers should call this rather than assembling options by hand, so
+// that the claim bound cannot be left off by accident in one deployment and not
+// another.
+func (c *Controller) WorkerRunOptions(queue string) []worker.RunOption {
+	opts := []worker.RunOption{
+		worker.Watching(queue),
+		worker.WithLease(c.cfg.Lease),
+	}
+	if c.cfg.MaxClaims > 0 {
+		opts = append(opts, worker.WithMaxClaims(c.cfg.MaxClaims))
+	}
+	return opts
+}
+
+// ControlRunOptions returns the run options for a control worker.
+//
+// Deliberately without a claim bound. The control task is claimed once per tick
+// for the life of the run, so any ceiling would quarantine the controller after
+// a few seconds of entirely healthy operation, leaving the run with nothing
+// driving it and nothing left to notice.
+func (c *Controller) ControlRunOptions() []worker.RunOption {
+	return []worker.RunOption{
+		worker.Watching(c.ControlQ()),
+		worker.WithLease(c.cfg.Lease),
+	}
 }
 
 // ValidText reports whether s is usable as a doc namespace or key: valid UTF-8,
