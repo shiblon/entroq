@@ -19,6 +19,18 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ambiguous outcomes. The experimental direct-PostgreSQL client pools ordinary
   operations and can opt individual workers out of client-driven garbage
   collection.
+- **`worker.tasks_total` metric.** Workers now count every finished task by
+  queue, claimant, and outcome (`done`, `retried`, `moved`, `failed`). A
+  completed task is deleted, so the queue retains no record of which worker
+  handled what; this counter is where that history lives. The claimant attribute
+  defaults to a random per-client value, so a deployment wanting stable
+  per-worker series should set a durable one with `entroq.WithClaimantID`.
+
+- **Queue-driven Kubernetes autoscaling.** The Helm chart can publish an
+  optional Prometheus `ServiceMonitor`; the service exports queue and doc
+  namespace size gauges; and the greetings demo includes a KEDA `ScaledObject`
+  that scales an eqlink receiver between zero and one replica from queued work
+  or durable workflow-status docs.
 
 ### Changed
 

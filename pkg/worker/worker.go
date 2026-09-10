@@ -688,6 +688,14 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt, slot *workerSlot) 
 		return fmt.Errorf("worker (%q) claim: %w", opts.qs, err)
 	}
 	slot.set(workerBusy)
+
+	// Count every claimed task once, by how it ended. A task is deleted when it
+	// completes, so the queue keeps no record of who handled what; this counter
+	// is where that history lives. Default to "failed" so an exit path added
+	// later is counted pessimistically rather than silently dropped.
+	outcome := outcomeFailed
+	defer func() { w.metrics.recordTask(ctx, task.Queue, w.eqc.ID(), outcome) }()
+
 	if opts.maxClaims > 0 && task.Claims > opts.maxClaims {
 		errQ := w.ErrorQueueFor(task.Queue)
 		if _, err := w.handleSentinelErrors(ctx,
@@ -695,6 +703,7 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt, slot *workerSlot) 
 		); err != nil {
 			return fmt.Errorf("handle max claims: %w", err)
 		}
+		outcome = outcomeMoved
 		return nil
 	}
 
@@ -716,8 +725,10 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt, slot *workerSlot) 
 			var sentinelErr error
 			if de.HasMissingDocs() {
 				sentinelErr = MoveErrorf("required doc missing")
+				outcome = outcomeMoved
 			} else {
 				sentinelErr = RetryErrorf("doc contention")
+				outcome = outcomeRetried
 			}
 			errQ := w.ErrorQueueFor(task.Queue)
 			if _, herr := w.handleSentinelErrors(ctx, sentinelErr, task, errQ, opts); herr != nil {
@@ -758,6 +769,7 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt, slot *workerSlot) 
 	)
 
 	if sentinelErr != nil {
+		outcome = sentinelOutcome(sentinelErr)
 		errQ := w.ErrorQueueFor(task.Queue)
 		if _, err := w.handleSentinelErrors(ctx, sentinelErr, finalTask, errQ, opts); err != nil {
 			return fmt.Errorf("handle sentinel error: %w", err)
@@ -780,6 +792,7 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt, slot *workerSlot) 
 		}
 		if de, ok := entroq.AsDependency(err); ok {
 			log.Printf("Worker finish failed (%q), throwing away: %v", opts.qs, de)
+			outcome = outcomeRetried
 			return nil
 		}
 		if entroq.IsTimeout(err) || entroq.IsCanceled(err) {
@@ -788,7 +801,19 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt, slot *workerSlot) 
 		}
 		return fmt.Errorf("worker finish (%q): %w", opts.qs, err)
 	}
+	outcome = outcomeDone
 	return nil
+}
+
+// sentinelOutcome maps a handler sentinel onto the outcome it produces.
+func sentinelOutcome(err error) string {
+	if _, ok := AsMove(err); ok {
+		return outcomeMoved
+	}
+	if _, ok := AsRetry(err); ok {
+		return outcomeRetried
+	}
+	return outcomeFailed
 }
 
 // RunOption is an option for a run call.

@@ -135,3 +135,98 @@ func TestWorkerMetricsTrackConcurrentRunSlots(t *testing.T) {
 	}
 	waitWorkerMetrics(ctx, t, reader, 0, 0)
 }
+
+// taskCounts reads entroq.worker.tasks_total, keyed by "claimant/outcome".
+func taskCounts(ctx context.Context, t *testing.T, reader *sdkmetric.ManualReader) map[string]int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &rm); err != nil {
+		t.Fatalf("collect task counts: %v", err)
+	}
+	counts := make(map[string]int64)
+	for _, sm := range rm.ScopeMetrics {
+		if sm.Scope.Name != "entroq.worker" {
+			continue
+		}
+		for _, m := range sm.Metrics {
+			if m.Name != "entroq.worker.tasks_total" {
+				continue
+			}
+			data, ok := m.Data.(metricdata.Sum[int64])
+			if !ok {
+				t.Fatalf("tasks_total is %T, want Sum[int64]", m.Data)
+			}
+			for _, point := range data.DataPoints {
+				claimant, _ := point.Attributes.Value(attribute.Key("claimant"))
+				out, _ := point.Attributes.Value(attribute.Key("outcome"))
+				counts[claimant.AsString()+"/"+out.AsString()] += point.Value
+			}
+		}
+	}
+	return counts
+}
+
+// TestWorkerTaskCounterAttributesOutcomes pins that finished tasks are counted
+// against the claimant that handled them, split by how they ended. This is the
+// only record of per-worker throughput: a completed task is deleted, so the
+// queue itself retains no history of who did what.
+func TestWorkerTaskCounterAttributesOutcomes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	client, err := entroq.New(ctx, eqmem.Opener(), entroq.WithClaimantID("worker-a"))
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	defer client.Close()
+
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+
+	const queue = "counter_test"
+	// Three tasks: one succeeds, one asks to be moved, one asks to be retried
+	// until it exhausts its single attempt and is quarantined.
+	for _, body := range []string{"ok", "move", "retry"} {
+		if _, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue(body))); err != nil {
+			t.Fatalf("insert %q: %v", body, err)
+		}
+	}
+
+	w := New(client,
+		WithMeterProvider[string](mp),
+		WithDoModify(func(_ context.Context, task *entroq.Task, v string, _ []*entroq.Doc) (*Result, error) {
+			switch v {
+			case "move":
+				return nil, MoveErrorf("sent to quarantine")
+			case "retry":
+				return nil, RetryErrorf("try again")
+			default:
+				return Modify(task.Delete()), nil
+			}
+		}),
+	)
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+	go func() {
+		_ = w.Run(runCtx, Watching(queue), WithLease(time.Second), WithBaseRetryDelay(time.Millisecond))
+	}()
+
+	// Wait until every outcome we expect has been observed at least once.
+	for {
+		counts := taskCounts(ctx, t, reader)
+		if counts["worker-a/done"] >= 1 && counts["worker-a/moved"] >= 1 && counts["worker-a/retried"] >= 1 {
+			runCancel()
+			for key, n := range counts {
+				t.Logf("%s = %d", key, n)
+			}
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("outcomes never all observed; saw %v", counts)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
