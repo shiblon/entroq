@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/examples/mr"
+	"github.com/shiblon/entroq/pkg/eqmr"
 )
 
 const (
@@ -21,7 +21,18 @@ const (
 	mapReduceReducers    = 4
 	mapReduceWordKinds   = 10
 	mapReduceWordRepeats = 100
+
+	// One split per input document, matching how the workload decomposes
+	// naturally, and one reduce partition per reducer.
+	mapReduceMapShards    = mapReduceDocuments
+	mapReduceReduceShards = mapReduceReducers
 )
+
+// NOTE: mapReduceWordKinds is 10, so this workload only ever produces ten
+// distinct intermediate keys and therefore never exercises the shuffle's
+// fan-out. It measures queue and document throughput, not partitioning. Raising
+// it is a separate change, since it would invalidate comparison against the
+// recorded results.
 
 type statsMode struct {
 	name     string
@@ -91,8 +102,11 @@ func RunMapReduceLoadBenchmarks(b *testing.B, name string, open BackendFactory) 
 						b.Fatalf("MapReduce namespace %q is %d bytes, want at most 1024", prefix, len(prefix))
 					}
 					start := time.Now()
-					err := mr.RunAll(ctx, client, prefix, input, mr.WordCountMapper, mr.SumReducer,
-						mapReduceMappers, mapReduceReducers)
+					err := mapReduceController(b, client, prefix).Run(ctx, input,
+						eqmr.WordCountMapper, eqmr.SumReducer, eqmr.RunOptions{
+							Mappers:  mapReduceMappers,
+							Reducers: mapReduceReducers,
+						})
 					workloadDuration += time.Since(start)
 					if err != nil {
 						b.Fatalf("MapReduce: %v", err)
@@ -123,24 +137,38 @@ type statsSampleResult struct {
 	err     error
 }
 
-func mapReduceInput() []*mr.KV {
+func mapReduceInput() []*eqmr.KV {
 	words := make([]string, 0, mapReduceWordKinds*mapReduceWordRepeats)
 	for range mapReduceWordRepeats {
 		for word := range mapReduceWordKinds {
 			words = append(words, strconv.Itoa(word))
 		}
 	}
-	payload := []byte(strings.Join(words, " "))
-	input := make([]*mr.KV, mapReduceDocuments)
+	payload := strings.Join(words, " ")
+	input := make([]*eqmr.KV, mapReduceDocuments)
 	for i := range input {
-		input[i] = mr.NewKV(nil, payload)
+		input[i] = eqmr.NewKV("", payload)
 	}
 	return input
 }
 
+// mapReduceController builds a controller for one benchmark run.
+func mapReduceController(b *testing.B, client *entroq.EntroQ, prefix string) *eqmr.Controller {
+	b.Helper()
+	ctrl, err := eqmr.New(client, eqmr.Config{
+		Prefix:       prefix,
+		MapShards:    mapReduceMapShards,
+		ReduceShards: mapReduceReduceShards,
+	})
+	if err != nil {
+		b.Fatalf("MapReduce controller: %v", err)
+	}
+	return ctrl
+}
+
 func verifyMapReduceResults(b *testing.B, ctx context.Context, client *entroq.EntroQ, prefix string) {
 	b.Helper()
-	results, err := mr.Results(ctx, client, prefix)
+	results, err := mapReduceController(b, client, prefix).Results(ctx)
 	if err != nil {
 		b.Fatalf("MapReduce results: %v", err)
 	}
@@ -149,10 +177,10 @@ func verifyMapReduceResults(b *testing.B, ctx context.Context, client *entroq.En
 	}
 	wantCount := strconv.Itoa(mapReduceDocuments * mapReduceWordRepeats)
 	for word, result := range results {
-		if got, want := string(result.Key), strconv.Itoa(word); got != want {
+		if got, want := result.Key, strconv.Itoa(word); got != want {
 			b.Fatalf("MapReduce result %d key %q, want %q", word, got, want)
 		}
-		if got := string(result.Value); got != wantCount {
+		if got := result.Value; got != wantCount {
 			b.Fatalf("MapReduce result %q count %q, want %q", result.Key, got, wantCount)
 		}
 	}

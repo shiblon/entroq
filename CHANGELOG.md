@@ -57,6 +57,14 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that scales an eqlink receiver between zero and one replica from queued work
   or durable workflow-status docs.
 
+### Removed
+
+- **`examples/mr` and `examples/mrtest`.** Retired in favour of `pkg/eqmr`, with
+  the cross-backend and benchmark callers rewired to `pkg/eqmr/eqmrtest`. The
+  correctness check there also stops fixing its corpus at ten distinct words,
+  which meant no cross-backend test ever produced enough keys to spread across
+  reduce partitions.
+
 ### Changed
 
 - **Python worker failure policy.** Claim transport failures known to occur

@@ -84,7 +84,7 @@ func (c *Controller) step(ctx context.Context, state controlState) (controlState
 		return state, nil, fmt.Errorf("eqmr control: quarantine check: %w", err)
 	}
 	if n := queueDepth(stats, c.ErrQ()); n > 0 {
-		return failed(state, fmt.Sprintf("%d task(s) quarantined in %s", n, c.ErrQ())), nil, nil
+		return failed(state, c.quarantineReason(ctx, n)), nil, nil
 	}
 
 	switch state.Phase {
@@ -175,6 +175,21 @@ func (c *Controller) progress(state controlState, remaining int) (controlState, 
 			state.Phase, now.Sub(state.LastProgress).Round(time.Second), remaining)), nil, nil
 	}
 	return next, nil, nil
+}
+
+// quarantineReason describes a quarantine failure, including why the first
+// quarantined task got there.
+//
+// A bare count says a run failed without saying what to change, and the reason
+// is right there: the worker records it on the task when it quarantines. Only
+// reached on the terminal failure path, so one extra listing costs nothing.
+func (c *Controller) quarantineReason(ctx context.Context, n int) string {
+	base := fmt.Sprintf("%d task(s) quarantined in %s", n, c.ErrQ())
+	tasks, err := c.client.Tasks(ctx, c.ErrQ(), entroq.LimitTasks(1))
+	if err != nil || len(tasks) == 0 || tasks[0].Err == "" {
+		return base
+	}
+	return fmt.Sprintf("%s; first: %s", base, tasks[0].Err)
 }
 
 func failed(state controlState, reason string) controlState {
