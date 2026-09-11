@@ -864,6 +864,11 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 	}
 	for _, rd := range mod.DocInserts {
 		id := rd.ID
+		at := entroq.NormalizeArrival(rd.At, now)
+		claimant := ""
+		if at.After(now) {
+			claimant = mod.Claimant
+		}
 		created := rd.Created
 		if created.IsZero() {
 			created = now
@@ -875,10 +880,11 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 		newRes := &entroq.Doc{
 			Namespace:    rd.Namespace,
 			ID:           id,
+			At:           at,
 			Content:      rd.Content,
 			Key:          rd.Key,
 			SecondaryKey: rd.SecondaryKey,
-			Claimant:     "",
+			Claimant:     claimant,
 			Created:      created,
 			Modified:     modified,
 			Version:      1,

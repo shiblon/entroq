@@ -16,9 +16,7 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Python client transport controls.** The JSON client exposes its configured
   `httpx.AsyncClient` as `http` and accepts caller-owned clients; transport
   failures preserve their cause and distinguish definitely safe retries from
-  ambiguous outcomes. The experimental direct-PostgreSQL client pools ordinary
-  operations and can opt individual workers out of client-driven garbage
-  collection.
+  ambiguous outcomes.
 - **`worker.tasks_total` metric.** Workers now count every finished task by
   queue, claimant, and outcome (`done`, `retried`, `moved`, `failed`). A
   completed task is deleted, so the queue retains no record of which worker
@@ -57,6 +55,19 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   wire each role to its own queue, lease and claim ceiling. The API and the
   document layout may change without a migration path.
 
+- **Experimental EQLink response streaming.** EQLink buffers request bodies and
+  relays HTTP/1.1 response bodies through an acknowledged, stop-and-wait queue
+  lane, including SSE and NDJSON. Session queues use 30-minute `gc=` generations,
+  rotate opportunistically with data in their final ten minutes, and force a
+  blank reciprocal switch in their final five minutes. A receiver-owned
+  connection doc keeps autoscaling replicas alive while a session is active.
+
+- **Queue-driven Kubernetes autoscaling.** The Helm chart can publish an
+  optional Prometheus `ServiceMonitor`; the service exports queue and doc
+  namespace size gauges; and the greetings demo includes a KEDA `ScaledObject`
+  that scales an eqlink receiver between zero and one replica from queued work
+  or durable workflow-status docs.
+
 ### Removed
 
 - **`examples/mr` and `examples/mrtest`.** Retired in favor of `pkg/eqmr`, with
@@ -64,9 +75,36 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   correctness check there also stops fixing its corpus at ten distinct words,
   which meant no cross-backend test ever produced enough keys to spread across
   reduce partitions.
+- **Experimental direct-PostgreSQL access.** The Python raw-SQL client, bundled
+  schema, `pg` dependency extra, psql worker example, and their public SQL
+  convenience wrappers are removed. PostgreSQL remains available through the
+  Go `eqpg` service, which is now the sole owner of schema behavior and backend
+  garbage collection.
 
 ### Changed
 
+- **Claimed document insertion.** `WithDocArrivalTime` and
+  `WithDocArrivalTimeBy` now apply to document inserts as well as changes. A
+  future arrival atomically creates the document under the inserting client's
+  claim, consistently across every backend and language client.
+- **Breaking: document GC is namespace-scoped.** A `gc` path marker now opts an
+  entire document namespace into garbage collection. Collection remains atomic
+  per primary-key group and skips claimed groups; markers in primary keys no
+  longer enable GC. This keeps lifecycle policy in the namespace and avoids
+  scanning documents in ordinary namespaces during every GC pass.
+- **Compound path policy markers and bounded session metrics.** A path component
+  may contain ordered, semicolon-separated `key=value` parameters. The Go
+  service applies the escape-aware grammar consistently for every backend, and
+  GC accepts `gc` in any position within a compound component. Queue, namespace,
+  and GC hierarchy metrics replace components containing `sess` with `*` and
+  aggregate their values, preventing ephemeral EQLink sessions from creating
+  unbounded Prometheus series.
+- **Schema change (eqpg: 1.7.1 → 1.11.0).** Existing PostgreSQL deployments
+  must run `eqpg schema upgrade` before starting the upgraded service. The
+  data-preserving update lets document inserts carry an initial claim expiry
+  and removes the retired direct-SQL wrappers, composite argument types, and
+  PostgreSQL-specific GC helpers and indexes. It does not rewrite stored task
+  or document data.
 - **Python worker failure policy.** Claim transport failures known to occur
   before submission retry with full-jitter exponential backoff. Ambiguous
   transport failures and unexpected handler exceptions return to the caller
@@ -96,23 +134,22 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   allocation is 1024 + 256 + 256 = 1536, about 57% of that ceiling. Loosening a
   bound cannot fail against existing rows, so no maintenance window is needed
   for this part.
+
 ### Fixed
 
+- **Reproducible protobuf generation.** The Connect generator is pinned to the
+  version used by the Go module instead of resolving an incompatible latest
+  release during Docker builds.
 - **Python client 0.13.1 document listing.** Restores the `key_exact` and `ids`
   filters shipped in 0.12.4, including the `query.` field paths required by the
-  HTTP transcoder. Direct PostgreSQL and HTTP clients again expose the same
-  document-listing modes.
+  HTTP transcoder.
 - **Python 0.13.0 package provenance.** Removes the unreleased claimed-document
   insertion field and PostgreSQL schema 1.11.0 that were accidentally bundled
   from a feature branch. The experimental PostgreSQL client is realigned with
   the released service schema, 1.7.1.
 - **Python long-held claims.** Blocking JSON claims no longer inherit httpx's
   five-second timeout, remain caller-cancelable, and use the Go client's
-  30-second poll default. Direct-PostgreSQL claims use the same default and no
-  longer busy-loop when passed a zero poll interval.
-
-### Fixed
-
+  30-second poll default.
 - **Immediate task quarantine.** Retry exhaustion and Python worker moves reset
   task arrival to backend time and release the claim, making quarantined tasks
   immediately available in their error queue.

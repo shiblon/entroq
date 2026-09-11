@@ -594,9 +594,35 @@ func DocInsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 func DocClaimantBehavior(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	t.Helper()
 	ns := path.Join(qPrefix, "doc_claimant_behavior")
+	insertLease := 10 * time.Second
+
+	// A future arrival on insertion starts the document claimed by the
+	// inserting client. This permits an atomic create-and-hold handoff to a
+	// worker using the same client identity.
+	resp, err := client.Modify(ctx, entroq.PuttingDocInto(ns,
+		entroq.WithKeys("claimed-on-insert", ""),
+		entroq.WithDocArrivalTimeBy(insertLease),
+	))
+	if err != nil {
+		t.Fatalf("future-at insert: %v", err)
+	}
+	inserted := resp.InsertedDocs[0]
+	if inserted.Claimant != client.ClientID {
+		t.Errorf("after future-at insert: claimant want %q, got %q", client.ClientID, inserted.Claimant)
+	}
+	if time.Until(inserted.At) <= 0 {
+		t.Errorf("after future-at insert: at %v is not in the future", inserted.At)
+	}
+	reclaimed, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "claimed-on-insert").For(insertLease))
+	if err != nil {
+		t.Fatalf("same-client reclaim after future-at insert: %v", err)
+	}
+	if len(reclaimed) != 1 || reclaimed[0].Claimant != client.ClientID {
+		t.Fatalf("same-client reclaim after future-at insert: got %+v", reclaimed)
+	}
 
 	// Insert: claimant must be empty; at defaults to now (past by query time).
-	resp, err := client.Modify(ctx, entroq.PuttingDocInto(ns, entroq.WithKeys("k", "")))
+	resp, err = client.Modify(ctx, entroq.PuttingDocInto(ns, entroq.WithKeys("k", "")))
 	if err != nil {
 		t.Fatalf("insert: %v", err)
 	}

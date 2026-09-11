@@ -13,8 +13,6 @@ import (
 	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
 	"github.com/shiblon/entroq/pkg/backend/eqmem"
 	"github.com/shiblon/entroq/pkg/eqsvcgrpc"
-	"github.com/shiblon/entroq/pkg/worker"
-	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health"
@@ -80,16 +78,13 @@ func mustStartReceivers(ctx context.Context, t testing.TB, eq *entroq.EntroQ, qu
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(ctx)
-	recvWorker := worker.New(eq, worker.WithDoModify(async.ReceiverHandler(upstream)))
-
-	g, gctx := errgroup.WithContext(ctx)
-	for range concurrency {
-		g.Go(func() error { return recvWorker.Run(gctx, worker.Watching(queue+"/inbox")) })
-	}
+	receiver := async.NewReceiver(eq, upstream, async.WithReceiverConcurrency(concurrency))
+	done := make(chan error, 1)
+	go func() { done <- receiver.Run(ctx, queue+"/inbox") }()
 
 	return func() {
 		cancel()
-		g.Wait()
+		<-done
 	}
 }
 

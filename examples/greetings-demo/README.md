@@ -111,3 +111,45 @@ calls `http://localhost:8000/greet` on the local Python process, and enqueues
 the response for svc-a to pick up.
 
 Neither service knows any of this happened.
+
+## Scale svc-c to zero
+
+The leaf service can be idle at zero replicas until a request reaches
+`/greetings/svc-c/inbox`. This optional example requires:
+
+- KEDA installed in the cluster.
+- Prometheus Operator and a Prometheus instance configured to select the
+  EntroQ `ServiceMonitor`.
+
+Enable metrics discovery when installing or upgrading EntroQ:
+
+```bash
+helm upgrade --install entroq ./charts/entroq \
+  --set entroq.metrics.serviceMonitor.enabled=true
+```
+
+The example scaler uses the common kube-prometheus-stack address
+`prometheus-operated.monitoring.svc.cluster.local:9090`. Edit `serverAddress`
+in `k8s/svc-c-autoscaling.yaml` if Prometheus has a different address, then
+apply it:
+
+```bash
+kubectl apply -f examples/greetings-demo/k8s/svc-c-autoscaling.yaml
+kubectl get scaledobject,hpa,pods -n greetings --watch
+```
+
+After five idle minutes, KEDA scales the `svc-c` Deployment to zero. The next
+greeting leaves a durable task in svc-c's EntroQ inbox; Prometheus observes the
+queue and KEDA starts one replica. The one-minute scrape and polling intervals
+can take nearly two minutes in the worst alignment, so the svc-a and svc-b
+eqlink senders use request timeouts long enough to cover observation and pod
+startup.
+
+The Prometheus query counts available and claimed tasks, but not future tasks.
+It also includes docs in `/greetings/svc-c/status`, illustrating the status-doc
+pattern for a fan-out worker. This simple service does not create those docs, so
+that term remains zero here. A fan-out worker would atomically insert its root
+task and one status doc per workflow, then delete the doc only after all work
+completes. The status namespace is the autoscaling domain; each workflow's
+primary key remains internal rather than becoming a high-cardinality metric
+label.

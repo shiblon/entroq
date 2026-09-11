@@ -66,10 +66,12 @@ type QSvc struct {
 	mp             metric.MeterProvider
 	metricInterval time.Duration
 
-	// guards lastRefresh and lastStats for the observable gauge callback.
-	mu          sync.Mutex
-	lastRefresh time.Time
-	lastStats   map[string]*entroq.QueueStat
+	// guards the cached stats used by the observable gauge callback.
+	mu                   sync.Mutex
+	lastQueueRefresh     time.Time
+	lastQueueStats       map[string]*entroq.QueueStat
+	lastNamespaceRefresh time.Time
+	lastNamespaceStats   map[string]*entroq.NamespaceStat
 
 	authzHeader string
 	an          authn.Authenticator
@@ -79,7 +81,7 @@ type QSvc struct {
 // Option allows QSvc creation options to be defined.
 type Option func(*QSvc)
 
-// WithMeterProvider sets the OTel MeterProvider used to emit queue size metrics.
+// WithMeterProvider sets the OTel MeterProvider used to emit task and doc metrics.
 // Defaults to a noop provider.
 func WithMeterProvider(mp metric.MeterProvider) Option {
 	return func(s *QSvc) {
@@ -88,8 +90,8 @@ func WithMeterProvider(mp metric.MeterProvider) Option {
 }
 
 // WithMetricInterval sets the minimum time between database queries for queue
-// stats. The observable gauge callback caches results for this duration, so
-// frequent Prometheus scrapes do not hammer the database.
+// and namespace stats. The observable gauge callback caches results for this
+// duration, so frequent Prometheus scrapes do not hammer the database.
 // Capped from below at 5 seconds.
 func WithMetricInterval(d time.Duration) Option {
 	return func(s *QSvc) {
@@ -155,46 +157,113 @@ func New(ctx context.Context, opener entroq.BackendOpener, opts ...Option) (*QSv
 	return svc, nil
 }
 
-// initMetrics registers an observable gauge that queries queue stats on each
-// collection cycle, caching results for metricInterval to avoid hammering the
-// database on every Prometheus scrape.
+// initMetrics registers observable gauges that query queue and namespace stats
+// on each collection cycle, caching each result for metricInterval to avoid
+// hammering the database on every Prometheus scrape.
 func (s *QSvc) initMetrics() error {
 	meter := s.mp.Meter("entroq.svc")
 
-	gauge, err := meter.Float64ObservableGauge("entroq.queue.size",
+	queueGauge, err := meter.Float64ObservableGauge("entroq.queue.size",
 		metric.WithDescription("Number of tasks in a named queue, by type."),
 	)
 	if err != nil {
 		return fmt.Errorf("queue size gauge: %w", err)
+	}
+	namespaceGauge, err := meter.Float64ObservableGauge("entroq.namespace.size",
+		metric.WithDescription("Number of docs in a named namespace, by type."),
+	)
+	if err != nil {
+		return fmt.Errorf("namespace size gauge: %w", err)
 	}
 
 	_, err = meter.RegisterCallback(func(ctx context.Context, o metric.Observer) error {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 
-		if time.Since(s.lastRefresh) < s.metricInterval && s.lastStats != nil {
-			s.observeStats(o, gauge, s.lastStats)
-			return nil
+		if time.Since(s.lastQueueRefresh) >= s.metricInterval || s.lastQueueStats == nil {
+			stats, err := s.impl.QueueStats(ctx)
+			if err != nil {
+				log.Printf("eqsvcgrpc: queue stats for metrics: %v", err)
+			} else {
+				s.lastQueueStats = foldQueueMetricStats(stats)
+				s.lastQueueRefresh = time.Now()
+			}
+		}
+		if s.lastQueueStats != nil {
+			s.observeQueueStats(o, queueGauge, s.lastQueueStats)
 		}
 
-		stats, err := s.impl.QueueStats(ctx)
-		if err != nil {
-			log.Printf("eqsvcgrpc: queue stats for metrics: %v", err)
-			return nil
+		if time.Since(s.lastNamespaceRefresh) >= s.metricInterval || s.lastNamespaceStats == nil {
+			stats, err := s.impl.NamespaceStats(ctx)
+			if err != nil {
+				log.Printf("eqsvcgrpc: namespace stats for metrics: %v", err)
+			} else {
+				s.lastNamespaceStats = foldNamespaceMetricStats(stats)
+				s.lastNamespaceRefresh = time.Now()
+			}
 		}
-
-		s.lastStats = stats
-		s.lastRefresh = time.Now()
-		s.observeStats(o, gauge, stats)
+		if s.lastNamespaceStats != nil {
+			s.observeNamespaceStats(o, namespaceGauge, s.lastNamespaceStats)
+		}
 		return nil
-	}, gauge)
+	}, queueGauge, namespaceGauge)
 
 	return err
 }
 
-// observeStats reports queue stat values to the OTel observer. Must be called
-// with s.mu held.
-func (s *QSvc) observeStats(o metric.Observer, gauge metric.Float64ObservableGauge, stats map[string]*entroq.QueueStat) {
+// foldQueueMetricStats aggregates session-scoped queues before they become
+// metric label sets. Counts sum across queues; MaxClaims remains a maximum.
+func foldQueueMetricStats(stats map[string]*entroq.QueueStat) map[string]*entroq.QueueStat {
+	folded := make(map[string]*entroq.QueueStat, len(stats))
+	for name, stat := range stats {
+		name = queues.FoldPathParam(name, "sess")
+		aggregate := folded[name]
+		if aggregate == nil {
+			folded[name] = &entroq.QueueStat{
+				Name:      name,
+				Size:      stat.Size,
+				Claimed:   stat.Claimed,
+				Available: stat.Available,
+				Future:    stat.Future,
+				MaxClaims: stat.MaxClaims,
+			}
+			continue
+		}
+		aggregate.Size += stat.Size
+		aggregate.Claimed += stat.Claimed
+		aggregate.Available += stat.Available
+		aggregate.Future += stat.Future
+		if stat.MaxClaims > aggregate.MaxClaims {
+			aggregate.MaxClaims = stat.MaxClaims
+		}
+	}
+	return folded
+}
+
+// foldNamespaceMetricStats aggregates session-scoped doc namespaces before
+// they become metric label sets.
+func foldNamespaceMetricStats(stats map[string]*entroq.NamespaceStat) map[string]*entroq.NamespaceStat {
+	folded := make(map[string]*entroq.NamespaceStat, len(stats))
+	for name, stat := range stats {
+		name = queues.FoldPathParam(name, "sess")
+		aggregate := folded[name]
+		if aggregate == nil {
+			folded[name] = &entroq.NamespaceStat{
+				Name:    name,
+				Size:    stat.Size,
+				Claimed: stat.Claimed,
+			}
+			continue
+		}
+		aggregate.Size += stat.Size
+		aggregate.Claimed += stat.Claimed
+	}
+	return folded
+}
+
+// observeQueueStats reports queue stat values to the OTel observer. Must be
+// called with s.mu held.
+func (s *QSvc) observeQueueStats(o metric.Observer, gauge metric.Float64ObservableGauge, stats map[string]*entroq.QueueStat) {
 	for name, stat := range stats {
 		l1, l2, l3 := queues.PathLabels(name)
 
@@ -205,11 +274,34 @@ func (s *QSvc) observeStats(o metric.Observer, gauge metric.Float64ObservableGau
 			attribute.String("l3", l3),
 		}
 
-		for typ, val := range map[string]int32{
-			"total":     int32(stat.Size),
-			"claimed":   int32(stat.Claimed),
-			"available": int32(stat.Available),
-			"maxClaims": int32(stat.MaxClaims),
+		for typ, val := range map[string]int{
+			"total":     stat.Size,
+			"claimed":   stat.Claimed,
+			"available": stat.Available,
+			"maxClaims": stat.MaxClaims,
+		} {
+			attrs := append(base, attribute.String("type", typ))
+			o.ObserveFloat64(gauge, float64(val), metric.WithAttributes(attrs...))
+		}
+	}
+}
+
+// observeNamespaceStats reports doc namespace stat values to the OTel observer.
+// Must be called with s.mu held.
+func (s *QSvc) observeNamespaceStats(o metric.Observer, gauge metric.Float64ObservableGauge, stats map[string]*entroq.NamespaceStat) {
+	for name, stat := range stats {
+		l1, l2, l3 := queues.PathLabels(name)
+
+		base := []attribute.KeyValue{
+			attribute.String("doc_namespace", name),
+			attribute.String("l1", l1),
+			attribute.String("l2", l2),
+			attribute.String("l3", l3),
+		}
+
+		for typ, val := range map[string]int{
+			"total":   stat.Size,
+			"claimed": stat.Claimed,
 		} {
 			attrs := append(base, attribute.String("type", typ))
 			o.ObserveFloat64(gauge, float64(val), metric.WithAttributes(attrs...))

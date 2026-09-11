@@ -83,8 +83,9 @@ export interface DocID {
 
 /**
  * DocData holds the data portion of a doc, used for insertions.
- * atMs controls claim behavior on changes: "0" (or omitted) releases the
- * claim; a future ms timestamp sets the caller as claimant until then.
+ * atMs controls claim behavior on inserts and changes: "0" (or omitted)
+ * leaves/releases the claim; a future ms timestamp sets the caller as claimant
+ * until then.
  */
 export interface DocData {
   namespace: string;

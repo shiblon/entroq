@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -14,7 +13,6 @@ import (
 	"path"
 
 	"github.com/shiblon/entroq/pkg/async"
-	"github.com/shiblon/entroq/pkg/worker"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
 )
@@ -30,7 +28,6 @@ var (
 	namespace           string
 	auditLog            bool
 	tokenReloadInterval time.Duration
-	responseGrace       time.Duration
 )
 
 var runCmd = &cobra.Command{
@@ -78,7 +75,6 @@ Graceful shutdown on SIGINT/SIGTERM:
 		alog := newAuditLogger()
 		sender := async.NewSender(eq, senderAddr,
 			async.WithSenderRequestTimeout(requestTimeout),
-			async.WithSenderResponseGrace(responseGrace),
 			async.WithSenderMeterProvider(mp),
 			async.WithSenderTLSConfig(tlsCfg),
 			async.WithSenderDomainSuffix(domainSuffix),
@@ -96,27 +92,19 @@ Graceful shutdown on SIGINT/SIGTERM:
 			async.WithReceiverMeterProvider(mp),
 			async.WithReceiverName(myQueue),
 			async.WithReceiverAuditLogger(alog),
+			async.WithReceiverConcurrency(concurrency),
+			async.WithReceiverRequestTimeout(requestTimeout),
 		)
 		if tlsCfg != nil {
-			rcvOpts = append(rcvOpts, async.WithReceiverHTTPClient(&http.Client{
-				Transport: &http.Transport{
-					TLSClientConfig:     tlsCfg,
-					MaxIdleConnsPerHost: 32,
-				},
-			}))
+			rcvOpts = append(rcvOpts, async.WithReceiverTLSConfig(tlsCfg))
 		}
 
 		rcvCtx, rcvCancel := context.WithCancel(gCtx)
 		defer rcvCancel()
-		recvWorker := worker.New(eq,
-			worker.WithDoModify(async.ReceiverHandler(upstream, rcvOpts...)),
-			worker.WithMeterProvider[async.Envelope](mp),
-		)
-		for range concurrency {
-			g.Go(func() error {
-				return recvWorker.Run(rcvCtx, worker.Watching(path.Join(myQueue, "inbox")))
-			})
-		}
+		receiver := async.NewReceiver(eq, upstream, rcvOpts...)
+		g.Go(func() error {
+			return receiver.Run(rcvCtx, path.Join(myQueue, "inbox"))
+		})
 
 		// Signal handler: staged shutdown. Also fires when any goroutine fails
 		// (gCtx cancelled), ensuring the sender is always cleaned up.
@@ -155,9 +143,8 @@ func init() {
 	flags.StringVar(&senderAddr, "addr", ":8080", "Address for the sender to listen on.")
 	flags.StringVar(&upstream, "upstream", "http://localhost:8000", "Upstream service address for the receiver.")
 	flags.IntVar(&concurrency, "concurrency", 1, "Number of concurrent receiver goroutines.")
-	flags.DurationVar(&requestTimeout, "request_timeout", 30*time.Second, "Sender request timeout.")
+	flags.DurationVar(&requestTimeout, "request_timeout", 3*time.Minute, "Maximum silence from the peer EQLink before ending a session; heartbeats are sent every third of this duration.")
 	flags.DurationVar(&drainTimeout, "drain_timeout", 35*time.Second, "How long to wait for in-flight requests to finish on shutdown.")
-	flags.DurationVar(&responseGrace, "response_grace", 15*time.Second, "Margin added past --request_timeout when stamping the response queue's collectable-at time, so GC does not delete a response still being awaited. Size to worst-case server-side GC clock skew.")
 	flags.BoolVar(&auditLog, "audit-log", false, "Emit structured JSON audit events to stderr for every request mediated (request_enqueued, request_handled, response_received).")
 	flags.DurationVar(&tokenReloadInterval, "token-reload-interval", 5*time.Minute, "How often to stat the --authz-token-file and reload it if changed. Handles k8s projected token rotation.")
 	runCmd.MarkFlagRequired("queue")

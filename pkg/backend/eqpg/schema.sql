@@ -2,20 +2,14 @@
 -- All statements are idempotent and can be re-run safely against an existing database.
 -- Compatible with PostgreSQL 12+.
 --
--- Public API (intended for direct use):
---   entroq.modify        -- atomically insert/change/delete/depend on tasks (JSONB)
---   entroq.try_claim     -- claim a task from one of several queues (pure SQL)
---   entroq.queues        -- queue statistics
---   entroq.tasks         -- task listing
---   entroq.docs       -- resource/state storage
---   entroq.channel_name  -- convert a queue name to a LISTEN/NOTIFY channel identifier
---
--- Internal functions (prefixed with _; used by Go backend or by public functions):
+-- Backend functions used by the Go eqpg implementation:
+--   entroq.try_claim       -- claim a task from one of several queues
 --   entroq._modify_arrays   -- parallel-array form of modify, called by Go backend
---   entroq._modify_docs  -- update storage resources
+--   entroq._modify_docs     -- atomically update storage resources
 --   entroq._try_claim_one   -- claim from a single queue with bucket randomization
 --   entroq._try_claim_bucket -- claim from a specific hash bucket range
---   entroq._claim_docs   -- claim specific storage resources
+--   entroq._claim_docs      -- atomically claim specific storage resources
+--   entroq.channel_name     -- map queue names to LISTEN/NOTIFY channels
 --   entroq.notify_ready_queues -- trigger notifications for tasks that reached their 'at' time
 
 CREATE SCHEMA IF NOT EXISTS entroq;
@@ -24,20 +18,16 @@ CREATE SCHEMA IF NOT EXISTS entroq;
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 -- Core table. Task IDs and claimant IDs are arbitrary TEXT with a CHECK
--- constraint limiting them to 64 characters. They are NOT UUIDs: the default
--- generator emits short random strings. The 64-char ceiling simply leaves room
+-- constraint limiting them to 64 bytes. They are NOT UUIDs: the default
+-- generator emits short random strings. The 64-byte ceiling simply leaves room
 -- for callers who elect to supply their own UUIDs (36 chars), ULIDs (26), or
 -- similar schemes, while keeping indexes efficient.
 -- Bucketing uses hashtext(id) & 255 -- a stable 8-bit hash value in [0,255] --
 -- with an index on (queue, at, (hashtext(id) & 255)) for efficient range scans.
 -- hashtext() is IMMUTABLE and available in all supported PostgreSQL versions.
--- DIRECT-PG PARITY NOTE: the eqpg Go backend rejects writes to an empty queue or
--- namespace (via entroq.Modification.EnsureModifyKeys, as every entroq.Backend
--- does). That guard lives in the backend, not in this schema: queue and namespace
--- carry only a length CHECK, not a non-empty one. A client that bypasses the eqpg
--- backend and talks to Postgres directly is not a supported path, so this is
--- intentional. If direct-pg support is ever revived, add CHECK (queue <> '') on
--- tasks and CHECK (namespace <> '') on docs (a schema migration) to restore it.
+-- The Go backend rejects writes to an empty queue or namespace through
+-- entroq.Modification.EnsureModifyKeys. That API validation intentionally does
+-- not need a second implementation in this private storage schema.
 CREATE TABLE IF NOT EXISTS entroq.tasks (
     id       TEXT COLLATE "C"         PRIMARY KEY NOT NULL CHECK (octet_length(id) <= 64),
     version  INTEGER                  NOT NULL DEFAULT 0,
@@ -82,13 +72,11 @@ DROP INDEX IF EXISTS entroq.byQueueAt;
 DROP INDEX IF EXISTS entroq.byQueueClaims;
 CREATE INDEX IF NOT EXISTS byQueueAtClaims ON entroq.tasks (queue, at, claims);
 
--- Garbage-collection discovery index. Partial: only rows in queues that opt into
--- GC via a /gc= name component. Lets gc_collect find due collectable tasks by
--- scanning O(gc= rows) rather than the whole table -- and, being partial, it is
--- tiny and cheap to maintain (a per-insert LIKE predicate; non-gc rows never
--- enter it). The query predicate MUST match this WHERE clause verbatim for the
--- planner to use it.
-CREATE INDEX IF NOT EXISTS byGCQueueAt ON entroq.tasks (queue, at) WHERE queue LIKE '%/gc=%';
+-- GC is an ordinary Go backend claim/delete worker. Retire the old discovery
+-- indexes; ordinary queue listing uses byQueue and exact claims use
+-- byQueueAtClaims.
+DROP INDEX IF EXISTS entroq.byGCQueueAt;
+DROP INDEX IF EXISTS entroq.byCompoundGCQueueAt;
 
 -- Storage Indexes.
 CREATE INDEX IF NOT EXISTS idx_docs_keys     ON entroq.docs (namespace, key_primary, key_secondary);
@@ -103,54 +91,6 @@ CREATE INDEX IF NOT EXISTS byQueueAtBucket ON entroq.tasks (queue, at, (hashtext
 
 -- Readiness index: supports global range scans for future-bound tasks becoming ready.
 CREATE INDEX IF NOT EXISTS byAt ON entroq.tasks (at, queue);
-
--- Composite types used by stored procedures.
--- PostgreSQL has no CREATE TYPE IF NOT EXISTS, so we use DO/EXCEPTION blocks.
-DO $$ BEGIN
-    CREATE TYPE entroq.task_id AS (
-        id      text,
-        version integer
-    );
-EXCEPTION WHEN duplicate_object THEN NULL;
-END $$;
-
-DO $$ BEGIN
-    CREATE TYPE entroq.doc_id AS (
-        namespace text,
-        id        text,
-        version   integer
-    );
-EXCEPTION WHEN duplicate_object THEN NULL;
-END $$;
-
--- task_arg is used for both inserts and changes. For inserts, the
--- version field is ignored. Empty id means auto-generate; NULL at means use
--- the current transaction time.
-DO $$ BEGIN
-    CREATE TYPE entroq.task_arg AS (
-        id      text,
-        version integer,
-        queue   text,
-        at      timestamptz,
-        value   jsonb,
-        attempt integer,
-        err     text
-    );
-EXCEPTION WHEN duplicate_object THEN NULL;
-END $$;
-
-DO $$ BEGIN
-    CREATE TYPE entroq.doc_arg AS (
-        namespace     text,
-        id            text,
-        version       integer,
-        at            timestamptz,
-        key_primary   text,
-        key_secondary text,
-        value         jsonb
-    );
-EXCEPTION WHEN duplicate_object THEN NULL;
-END $$;
 
 -- entroq._try_claim_bucket claims one available task whose ID hashes into the
 -- given bucket range. The bucket is selected by:
@@ -283,11 +223,9 @@ BEGIN
 END;
 $$;
 
--- entroq.try_claim is NOT used by the Go backend, which performs the queue
--- shuffle and per-queue claim loop in Go to preserve inter-transaction
--- interleaving (important for fairness across queues of different sizes).
--- It is provided here for pure-SQL consumers or future database-side claim
--- strategies that do not require that interleaving property.
+-- entroq.try_claim is the Go backend's single-statement multi-queue claim
+-- coordinator. It randomizes queue order, then delegates each attempt to
+-- _try_claim_one; the locking and atomic update live in _try_claim_bucket.
 CREATE OR REPLACE FUNCTION entroq.try_claim(
     p_queues    text[],
     p_claimant  text,
@@ -344,8 +282,6 @@ $$;
 --
 -- Insert sentinel: empty string in p_ins_ids means auto-generate.
 -- Timestamp sentinel: Go's zero time ('0001-01-01 00:00:00+00') means use now().
---
--- For a more ergonomic SQL interface, use entroq.modify (JSONB).
 --
 -- The queue is part of the modify key: depends and deletes must name the task's
 -- current queue, and a change must name its source (from) queue, with
@@ -565,83 +501,23 @@ BEGIN
 END;
 $$;
 
--- entroq.modify is the ergonomic public SQL API: accepts JSONB arrays of task
--- objects and delegates to _modify_arrays.
---
--- Each JSONB array element is an object with fields matching the operation:
---
---   depends / deletes:  {"id": "<id>", "version": <int>}
---   inserts:            {"queue": "<name>", "at": "<rfc3339>",
---                        "value": "<base64>", "attempt": <int>, "err": "<str>"}
---                       id and at are optional (omit/null -> auto-generate / now()).
---   changes:            {"id": "<id>", "version": <int>, "queue": "<name>",
---                        "at": "<rfc3339>", "value": "<base64>",
---                        "attempt": <int>, "err": "<str>"}
---
--- All parameters default to '[]' so callers only need to supply the operations
--- they actually want.
---
--- Returns the same tagged rows as _modify_arrays:
---   kind='inserted' or kind='changed', followed by all task fields.
-CREATE OR REPLACE FUNCTION entroq.modify(
-    p_claimant text,
-    p_depends  jsonb DEFAULT '[]',
-    p_deletes  jsonb DEFAULT '[]',
-    p_inserts  jsonb DEFAULT '[]',
-    p_changes  jsonb DEFAULT '[]'
-) RETURNS TABLE(
-    kind     text,
-    id       text,
-    version  integer,
-    queue    text,
-    at       timestamptz,
-    created  timestamptz,
-    modified timestamptz,
-    claimant text,
-    value    jsonb,
-    claims   integer,
-    attempt  integer,
-    err      text
-) LANGUAGE sql AS $$
-    SELECT * FROM entroq._modify_arrays(
-        p_claimant,
-        -- depends (queue is part of the key)
-        ARRAY(SELECT e->>'id'                 FROM jsonb_array_elements(p_depends) e),
-        ARRAY(SELECT (e->>'version')::integer  FROM jsonb_array_elements(p_depends) e),
-        ARRAY(SELECT e->>'queue'              FROM jsonb_array_elements(p_depends) e),
-        -- deletes (queue is part of the key)
-        ARRAY(SELECT e->>'id'                 FROM jsonb_array_elements(p_deletes) e),
-        ARRAY(SELECT (e->>'version')::integer  FROM jsonb_array_elements(p_deletes) e),
-        ARRAY(SELECT e->>'queue'              FROM jsonb_array_elements(p_deletes) e),
-        -- inserts: empty string triggers auto-generate in _modify_arrays
-        ARRAY(SELECT coalesce(e->>'id', '')   FROM jsonb_array_elements(p_inserts) e),
-        ARRAY(SELECT e->>'queue'              FROM jsonb_array_elements(p_inserts) e),
-        ARRAY(SELECT coalesce((e->>'at')::timestamptz, '0001-01-01 00:00:00+00')
-              FROM jsonb_array_elements(p_inserts) e),
-        ARRAY(SELECT CASE WHEN e ? 'value' THEN (e->'value')::text ELSE NULL END
-              FROM jsonb_array_elements(p_inserts) e),
-        ARRAY(SELECT coalesce((e->>'attempt')::integer, 0)
-              FROM jsonb_array_elements(p_inserts) e),
-        ARRAY(SELECT coalesce(e->>'err', '')
-              FROM jsonb_array_elements(p_inserts) e),
-        -- changes (from_queue is the source, matched; queue is the destination)
-        ARRAY(SELECT e->>'id'                 FROM jsonb_array_elements(p_changes) e),
-        ARRAY(SELECT (e->>'version')::integer  FROM jsonb_array_elements(p_changes) e),
-        ARRAY(SELECT e->>'from_queue'         FROM jsonb_array_elements(p_changes) e),
-        ARRAY(SELECT e->>'queue'              FROM jsonb_array_elements(p_changes) e),
-        ARRAY(SELECT (e->>'at')::timestamptz  FROM jsonb_array_elements(p_changes) e),
-        ARRAY(SELECT CASE WHEN e ? 'value' THEN (e->'value')::text ELSE NULL END
-              FROM jsonb_array_elements(p_changes) e),
-        ARRAY(SELECT coalesce((e->>'attempt')::integer, 0)
-              FROM jsonb_array_elements(p_changes) e),
-        ARRAY(SELECT coalesce(e->>'err', '')
-              FROM jsonb_array_elements(p_changes) e)
-    )
-$$;
+-- Remove the retired raw-SQL task wrapper. The Go backend calls
+-- _modify_arrays directly.
+DROP FUNCTION IF EXISTS entroq.modify(text, jsonb, jsonb, jsonb, jsonb);
 
 -- entroq._modify_docs handles all doc table updates for an atomic modify call.
--- Used internally by entroq.modify and the Go backend.
+-- Used by the Go backend.
 -- Raises EQ001 on dependency failure.
+-- Drop the public wrapper first so an upgrade can replace the internal
+-- function's signature without leaving an obsolete overload behind.
+DROP FUNCTION IF EXISTS entroq.modify_docs(text, jsonb, jsonb, jsonb, jsonb);
+DROP FUNCTION IF EXISTS entroq._modify_docs(
+    text,
+    text[], text[], integer[],
+    text[], text[], integer[],
+    text[], text[], text[], text[], text[],
+    text[], text[], integer[], text[], text[], text[], timestamptz[]
+);
 CREATE OR REPLACE FUNCTION entroq._modify_docs(
     p_claimant     text,
     p_dep_ns       text[],
@@ -655,6 +531,7 @@ CREATE OR REPLACE FUNCTION entroq._modify_docs(
     p_ins_pkeys    text[],
     p_ins_skeys    text[],
     p_ins_values   text[],
+    p_ins_ats      timestamptz[],
     p_chg_ns       text[],
     p_chg_ids      text[],
     p_chg_vers     integer[],
@@ -724,10 +601,13 @@ BEGIN
     -- Inserts
     RETURN QUERY
     WITH r AS (
-        INSERT INTO entroq.docs (namespace, id, version, key_primary, key_secondary, value, created, modified)
-        SELECT ins_ns, ins_id, 0, ins_pk, ins_sk, ins_val::jsonb, v_now, v_now
-        FROM unnest(p_ins_ns, p_ins_ids, p_ins_pkeys, p_ins_skeys, p_ins_values)
-        AS i(ins_ns, ins_id, ins_pk, ins_sk, ins_val)
+        INSERT INTO entroq.docs (namespace, id, version, claimant, at, key_primary, key_secondary, value, created, modified)
+        SELECT ins_ns, ins_id, 0,
+               CASE WHEN ins_at > v_now THEN p_claimant ELSE '' END,
+               CASE WHEN ins_at IS NULL OR ins_at < v_now - interval '1 year' THEN v_now ELSE ins_at END,
+               ins_pk, ins_sk, ins_val::jsonb, v_now, v_now
+        FROM unnest(p_ins_ns, p_ins_ids, p_ins_pkeys, p_ins_skeys, p_ins_values, p_ins_ats)
+        AS i(ins_ns, ins_id, ins_pk, ins_sk, ins_val, ins_at)
         RETURNING *
     )
     SELECT 'inserted', r.namespace, r.id, r.version, r.claimant, r.at, r.key_primary, r.key_secondary, r.value, r.created, r.modified FROM r;
@@ -754,134 +634,11 @@ BEGIN
 END;
 $$;
 
--- entroq.modify_docs is the ergonomic public SQL API for doc operations.
--- Mirrors entroq.modify but delegates to _modify_docs instead of _modify_arrays.
--- Callers needing atomic task+doc operations should wrap both in a transaction.
--- (Open question: whether a combined entroq.modify_all is worth adding.)
---
--- Each JSONB array element is an object with fields matching the operation:
---
---   depends / deletes:  {"namespace": "<ns>", "id": "<id>", "version": <int>}
---   inserts:            {"namespace": "<ns>", "id": "<id>",
---                        "key_primary": "<str>", "key_secondary": "<str>",
---                        "content": <jsonb>}
---   changes:            {"namespace": "<ns>", "id": "<id>", "version": <int>,
---                        "key_primary": "<str>", "key_secondary": "<str>",
---                        "content": <jsonb>, "at": "<rfc3339>"}
---
--- All parameters default to '[]'. Returns tagged rows from _modify_docs:
---   kind='inserted' or kind='changed', followed by all doc fields.
-CREATE OR REPLACE FUNCTION entroq.modify_docs(
-    p_claimant text,
-    p_depends  jsonb DEFAULT '[]',
-    p_deletes  jsonb DEFAULT '[]',
-    p_inserts  jsonb DEFAULT '[]',
-    p_changes  jsonb DEFAULT '[]'
-) RETURNS TABLE(
-    kind          text,
-    namespace     text,
-    id            text,
-    version       integer,
-    claimant      text,
-    at            timestamptz,
-    key_primary   text,
-    key_secondary text,
-    value         jsonb,
-    created       timestamptz,
-    modified      timestamptz
-) LANGUAGE sql AS $$
-    SELECT * FROM entroq._modify_docs(
-        p_claimant,
-        -- depends
-        ARRAY(SELECT e->>'namespace'             FROM jsonb_array_elements(p_depends) e),
-        ARRAY(SELECT e->>'id'                    FROM jsonb_array_elements(p_depends) e),
-        ARRAY(SELECT (e->>'version')::integer    FROM jsonb_array_elements(p_depends) e),
-        -- deletes
-        ARRAY(SELECT e->>'namespace'             FROM jsonb_array_elements(p_deletes) e),
-        ARRAY(SELECT e->>'id'                    FROM jsonb_array_elements(p_deletes) e),
-        ARRAY(SELECT (e->>'version')::integer    FROM jsonb_array_elements(p_deletes) e),
-        -- inserts
-        ARRAY(SELECT e->>'namespace'             FROM jsonb_array_elements(p_inserts) e),
-        ARRAY(SELECT e->>'id'                    FROM jsonb_array_elements(p_inserts) e),
-        ARRAY(SELECT coalesce(e->>'key_primary',   '') FROM jsonb_array_elements(p_inserts) e),
-        ARRAY(SELECT coalesce(e->>'key_secondary', '') FROM jsonb_array_elements(p_inserts) e),
-        ARRAY(SELECT CASE WHEN e ? 'content' THEN (e->'content')::text ELSE NULL END
-              FROM jsonb_array_elements(p_inserts) e),
-        -- changes
-        ARRAY(SELECT e->>'namespace'             FROM jsonb_array_elements(p_changes) e),
-        ARRAY(SELECT e->>'id'                    FROM jsonb_array_elements(p_changes) e),
-        ARRAY(SELECT (e->>'version')::integer    FROM jsonb_array_elements(p_changes) e),
-        ARRAY(SELECT coalesce(e->>'key_primary',   '') FROM jsonb_array_elements(p_changes) e),
-        ARRAY(SELECT coalesce(e->>'key_secondary', '') FROM jsonb_array_elements(p_changes) e),
-        ARRAY(SELECT CASE WHEN e ? 'content' THEN (e->'content')::text ELSE NULL END
-              FROM jsonb_array_elements(p_changes) e),
-        ARRAY(SELECT (e->>'at')::timestamptz         FROM jsonb_array_elements(p_changes) e)
-    )
-$$;
-
--- entroq.like_prefix turns a literal prefix into a LIKE pattern matching exactly
--- that prefix followed by anything, escaping the LIKE metacharacters (\ % _) so
--- callers pass a raw prefix and never carry the escaping burden themselves. This
--- keeps prefix matching correct and identical for every client (the Go backend
--- and the pg-native Python client) with the escaping defined in exactly one
--- place. Use with: queue LIKE entroq.like_prefix($1) ESCAPE '\'. Escape the
--- backslash first so the backslashes introduced for % and _ are not re-escaped.
-CREATE OR REPLACE FUNCTION entroq.like_prefix(p text)
-RETURNS text LANGUAGE sql IMMUTABLE AS $$
-    SELECT replace(replace(replace(p, '\', '\\'), '%', '\%'), '_', '\_') || '%'
-$$;
-
--- entroq.queues returns queue statistics. If p_exact is non-empty it takes
--- precedence over p_prefix. p_limit=0 means no limit.
-CREATE OR REPLACE FUNCTION entroq.queues(
-    p_prefix text    DEFAULT '',
-    p_exact  text[]  DEFAULT '{}',
-    p_limit  integer DEFAULT 0
-) RETURNS TABLE(
-    name      text,
-    num_tasks bigint
-) LANGUAGE sql AS $$
-    SELECT queue AS name, COUNT(*) AS num_tasks
-    FROM entroq.tasks
-    WHERE CASE
-        WHEN cardinality(p_exact) > 0 THEN queue = ANY(p_exact)
-        WHEN p_prefix != ''           THEN queue LIKE entroq.like_prefix(p_prefix) ESCAPE '\'
-        ELSE true
-    END
-    GROUP BY queue
-    ORDER BY queue
-    LIMIT NULLIF(p_limit, 0)
-$$;
-
--- entroq.tasks returns tasks ordered by at. p_queue='' means all queues.
--- p_omit_values=true returns empty bytea for the value column.
--- p_limit=0 means no limit.
-CREATE OR REPLACE FUNCTION entroq.tasks(
-    p_queue        text    DEFAULT '',
-    p_limit        integer DEFAULT 0,
-    p_omit_values  boolean DEFAULT false
-) RETURNS TABLE(
-    id       text,
-    version  integer,
-    queue    text,
-    at       timestamptz,
-    created  timestamptz,
-    modified timestamptz,
-    claimant text,
-    value    jsonb,
-    claims   integer,
-    attempt  integer,
-    err      text
-) LANGUAGE sql AS $$
-    SELECT
-        id, version, queue, at, created, modified, claimant,
-        CASE WHEN p_omit_values THEN NULL::jsonb ELSE value END AS value,
-        claims, attempt, err
-    FROM entroq.tasks
-    WHERE p_queue = '' OR queue = p_queue
-    ORDER BY at
-    LIMIT NULLIF(p_limit, 0)
-$$;
+-- Remove read-only wrappers from the retired raw-SQL API. The Go backend
+-- issues these parameterized queries directly.
+DROP FUNCTION IF EXISTS entroq.queues(text, text[], integer);
+DROP FUNCTION IF EXISTS entroq.tasks(text, integer, boolean);
+DROP FUNCTION IF EXISTS entroq.like_prefix(text);
 
 -- entroq.channel_name converts a queue name into a valid PostgreSQL
 -- LISTEN/NOTIFY channel identifier within the 63-byte limit.
@@ -892,8 +649,8 @@ $$;
 -- md5() is used instead of CRC32 because it is a built-in PostgreSQL
 -- function requiring no extension.
 --
--- This function is part of the public API: use it when setting up your own
--- LISTEN subscriptions on entroq queues.
+-- SQL notification paths use this channel name; the Go listener mirrors the
+-- same algorithm in pgnotify.go.
 CREATE OR REPLACE FUNCTION entroq.channel_name(p_queue text)
 RETURNS text LANGUAGE sql IMMUTABLE STRICT AS $$
     SELECT CASE
@@ -906,41 +663,9 @@ RETURNS text LANGUAGE sql IMMUTABLE STRICT AS $$
     END
 $$;
 
--- entroq.docs lists docs in a namespace, optionally filtered by key range.
--- p_namespace='' means all namespaces.
--- p_key_start/p_key_end: half-open range [start, end) on key_primary.
--- p_key_end='' means no upper bound.
--- p_omit_values=true returns NULL for the value column.
-CREATE OR REPLACE FUNCTION entroq.docs(
-    p_namespace   text    DEFAULT '',
-    p_key_start   text    DEFAULT '',
-    p_key_end     text    DEFAULT '',
-    p_limit       integer DEFAULT 0,
-    p_omit_values boolean DEFAULT false
-) RETURNS TABLE(
-    namespace     text,
-    id            text,
-    version       integer,
-    claimant      text,
-    at            timestamptz,
-    key_primary   text,
-    key_secondary text,
-    value         jsonb,
-    created       timestamptz,
-    modified      timestamptz
-) LANGUAGE sql AS $$
-    SELECT
-        namespace, id, version, claimant, at,
-        key_primary, key_secondary,
-        CASE WHEN p_omit_values THEN NULL::jsonb ELSE value END AS value,
-        created, modified
-    FROM entroq.docs
-    WHERE (p_namespace = '' OR namespace = p_namespace)
-      AND (p_key_start = '' OR key_primary >= p_key_start)
-      AND (p_key_end   = '' OR key_primary <  p_key_end)
-    ORDER BY namespace, key_primary, key_secondary
-    LIMIT NULLIF(p_limit, 0)
-$$;
+-- Remove the retired raw-SQL document listing wrapper. The Go backend
+-- queries entroq.docs directly.
+DROP FUNCTION IF EXISTS entroq.docs(text, text, text, integer, boolean);
 
 -- entroq._claim_docs claims all docs sharing a primary key in a namespace.
 -- Raises EQ001 if any doc with that key is already claimed by another claimant,
@@ -1010,27 +735,16 @@ BEGIN
 END;
 $$;
 
--- entroq.claim_docs is the public interface for claiming docs.
--- See _claim_docs for parameter semantics.
-CREATE OR REPLACE FUNCTION entroq.claim_docs(
-    p_namespace text,
-    p_claimant  text,
-    p_duration  interval,
-    p_key       text
-) RETURNS TABLE(
-    namespace     text,
-    id            text,
-    version       integer,
-    claimant      text,
-    at            timestamptz,
-    key_primary   text,
-    key_secondary text,
-    value         jsonb,
-    created       timestamptz,
-    modified      timestamptz
-) LANGUAGE sql AS $$
-    SELECT * FROM entroq._claim_docs(p_namespace, p_claimant, p_duration, p_key)
-$$;
+-- Remove the retired raw-SQL claim wrapper. The locking implementation
+-- remains in _claim_docs for the Go backend.
+DROP FUNCTION IF EXISTS entroq.claim_docs(text, text, interval, text);
+
+-- Drop the composite argument types after every legacy wrapper that could
+-- depend on them has been removed.
+DROP TYPE IF EXISTS entroq.task_arg;
+DROP TYPE IF EXISTS entroq.doc_arg;
+DROP TYPE IF EXISTS entroq.task_id;
+DROP TYPE IF EXISTS entroq.doc_id;
 
 -- Global state for readiness notifications. last_at tracks the watermark of
 -- tasks that have already been processed for "silent readiness."
@@ -1044,8 +758,6 @@ INSERT INTO entroq.notification_state (id, last_at)
 VALUES (1, now())
 ON CONFLICT (id) DO NOTHING;
 
-
-
 -- entroq.notify_ready_queues atomizes the "Check and Notify" logic by maintaining
 -- a high-watermark of processed 'at' times. This makes the notification system
 -- immune to ticker jitter, overlapping runs, or service restarts.
@@ -1054,19 +766,8 @@ ON CONFLICT (id) DO NOTHING;
 -- watermark has stagnated for at least that long. This prevents distributed
 -- tickers from flooding the database with redundant updates and signals.
 --
--- pg_cron tip: if your PostgreSQL instance has pg_cron installed (e.g., RDS,
--- Cloud SQL, or self-hosted with the extension), you can schedule this function
--- to cover direct clients (such as entroq_pg.py) that do not run their own
--- heartbeat loop. Example:
---
---   SELECT cron.schedule('entroq-notify', '* * * * *',
---       $$SELECT entroq.notify_ready_queues('5 seconds')$$);
---
--- The p_min_interval argument ('5 seconds' above) prevents redundant work when
--- multiple backend instances or cron firings overlap within a minute. If the
--- eqpg gRPC backend is also running, its heartbeat and the cron job will
--- interleave harmlessly -- the watermark and interval guard ensure only one
--- caller does real work per interval.
+-- The minimum interval lets multiple eqpg backend instances call this safely;
+-- the watermark and interval guard ensure only one does real work per interval.
 CREATE OR REPLACE FUNCTION entroq.notify_ready_queues(p_min_interval interval DEFAULT '0 seconds')
 RETURNS SETOF text LANGUAGE plpgsql AS $$
 DECLARE
@@ -1098,89 +799,13 @@ BEGIN
 END;
 $$;
 
--- entroq.gc_activation parses the last /gc= component of a queue name into the
--- time after which the queue's arrived tasks may be collected:
---   - empty         => the epoch (always active)
---   - all digits    => Unix seconds ('0' is thus also the epoch)
---   - otherwise     => STRICT RFC3339Nano: a 'T' separator and an explicit Z or
---                      +hh:mm offset, matching Go's time.Parse(time.RFC3339Nano).
--- Returns NULL when the value is absent or malformed. NULL is the single signal
--- for "opted into GC but the timestamp will not parse": callers must never
--- collect such a queue and should surface it as a misconfiguration. The strict
--- regex gates the shape; the cast still validates ranges, and the EXCEPTION block
--- turns any residual cast failure into NULL rather than aborting the statement.
--- The epoch (not -infinity) marks always-active so the value scans cleanly into a
--- client time type; both lib/pq and psycopg reject infinity timestamps by default.
--- Kept in lockstep with the Go parser entroq/pkg/queues.GCActivation (a shared
--- test guards the grammar).
-CREATE OR REPLACE FUNCTION entroq.gc_activation(queue text) RETURNS timestamptz LANGUAGE plpgsql IMMUTABLE AS $$
-DECLARE v text := substring(queue from '.*/gc=([^/]*)');
-BEGIN
-    IF v IS NULL THEN RETURN NULL; END IF;
-    IF v = '' THEN RETURN to_timestamp(0); END IF;
-    IF v ~ '^[0-9]+$' THEN RETURN to_timestamp(v::bigint); END IF;
-    IF v !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$' THEN
-        RETURN NULL;
-    END IF;
-    RETURN v::timestamptz;
-EXCEPTION WHEN others THEN
-    RETURN NULL;
-END $$;
-
--- entroq.gc_queues enumerates every queue that opts into garbage collection (its
--- name carries a /gc= component), paired with its activation time. A NULL
--- activate_at marks a malformed gc= value -- the queue opted in but its timestamp
--- will not parse. This is the mandatory discovery step: callers feed these rows
--- straight to gc_collect (which ignores NULL and future activations) and
--- separately report the NULL ones as misconfigurations. It runs once per GC
--- sweep and enumerates distinct queues over the byGCQueueAt partial index, not
--- raw task rows repeatedly.
-CREATE OR REPLACE FUNCTION entroq.gc_queues() RETURNS TABLE (queue text, activate_at timestamptz) LANGUAGE sql STABLE AS $$
-    SELECT q.queue, entroq.gc_activation(q.queue)
-    FROM (SELECT DISTINCT t.queue FROM entroq.tasks t WHERE t.queue LIKE '%/gc=%') q;
-$$;
-
--- entroq.gc_collect deletes up to p_limit arrived tasks (at <= now) from the
--- supplied queues whose activation has passed, and returns one row per affected
--- queue with the number deleted. The caller passes queues and their activation
--- times from gc_queues; this function does NO grammar parsing. It collects where
--- the supplied activate_at <= now(), which naturally excludes both malformed
--- queues (NULL activation) and not-yet-due queues (future activation), evaluated
--- against the database clock. Sum the returned counts for the total. Bounded and
--- race-safe:
---   - FOR UPDATE SKIP LOCKED makes it mutually exclusive with try_claim per row:
---     a task being claimed is skipped, not clobbered, and GC never blocks a claim.
---   - at <= now excludes claimed tasks (claiming pushes at into the future).
---   - Concurrent collectors partition (SKIP LOCKED) rather than duplicate work.
--- The per-queue breakdown feeds GC telemetry (deleted counts by queue hierarchy).
--- Callers invoke it in a tight loop (each call one bounded, quickly-committed
--- transaction) until the summed count is < p_limit, so no single statement holds
--- locks or accumulates WAL for a large backlog.
-CREATE OR REPLACE FUNCTION entroq.gc_collect(p_queues text[], p_activations timestamptz[], p_limit integer DEFAULT 1000)
-    RETURNS TABLE (queue_name text, deleted bigint) LANGUAGE plpgsql AS $$
-BEGIN
-    RETURN QUERY
-    WITH due_queues AS (
-        SELECT u.queue FROM unnest(p_queues, p_activations) AS u(queue, activate_at)
-        WHERE u.activate_at <= now()
-    ),
-    due AS (
-        SELECT t.id, t.queue FROM entroq.tasks t
-        JOIN due_queues dq ON t.queue = dq.queue
-        WHERE t.at <= now()
-        LIMIT p_limit
-        FOR UPDATE OF t SKIP LOCKED
-    ),
-    del AS (
-        DELETE FROM entroq.tasks t USING due WHERE t.id = due.id
-        RETURNING t.queue
-    )
-    SELECT del.queue, count(*)::bigint FROM del GROUP BY del.queue;
-END $$;
-
--- entroq.gc_due is retired: superseded by gc_activation (NULL vs timestamp) plus
--- the client-driven gc_queues/gc_collect protocol. Dropped so a stale definition
--- can't linger on upgraded databases.
+-- GC is an ordinary Go backend queue worker. Remove the retired
+-- PostgreSQL-specific policy and collection API so existing schemas converge on
+-- the same claim/delete protocol used by every other backend.
+DROP FUNCTION IF EXISTS entroq.gc_collect(text[], timestamptz[], integer);
+DROP FUNCTION IF EXISTS entroq.gc_queues();
+DROP FUNCTION IF EXISTS entroq.gc_activation(text);
+DROP FUNCTION IF EXISTS entroq._path_param_values(text, text);
 DROP FUNCTION IF EXISTS entroq.gc_due(text);
 
 -- Schema version tracking. Updated on every run of this script so that
@@ -1220,36 +845,43 @@ DROP FUNCTION IF EXISTS entroq.gc_due(text);
 --       keys/indexes. Transparent to clients (it changes only lexicographical
 --       ordering, not data), but a heavy op -- plan a maintenance window on
 --       large tables.
--- Migrations: 1.7.1 -> 1.11.0 (text length CHECKs count BYTES, not characters:
---   length() -> octet_length() on tasks.id/claimant and
---   docs.namespace/id/claimant/key_primary/key_secondary). These bounds exist to
---   budget btree index entries, which are measured in bytes, and every client
---   validates in bytes (Go's len()), so a multi-byte key could pass the old
---   check while consuming up to 4x the intended index space. Collation is not
---   involved: COLLATE "C" governs comparison, while length() counts characters
---   per the server encoding, so the columns were byte-ordered but
---   character-bounded. The new constraints are added NOT VALID so a database
---   holding legacy multi-byte values still upgrades; they are enforced on every
---   new write immediately. To check and enforce the existing rows too, run
---   during a maintenance window:
---     ALTER TABLE entroq.docs VALIDATE CONSTRAINT docs_key_primary_check;
---   (and likewise for the other six), fixing any rows it reports.
---   The same version also raises the doc namespace bound from 64 to 1024 bytes.
---   A namespace is a path carrying the same /key=value marker grammar as a queue
---   name, and queue names have no length limit at all, so the 64-byte cap was an
---   asymmetry rather than a design. It also has to hold the /gc= activation
---   marker, whose RFC3339Nano form alone is 34 bytes, so a namespace with a
---   tenant path, a run id and a couple of markers reaches 150-250 bytes without
---   trying. Loosening a bound cannot fail against existing rows, so this
---   constraint is added VALID.
+-- Migrations: 1.7.1 → 1.11.0 (no data movement):
+--   (1) Text length CHECKs count bytes, not characters: length() becomes
+--       octet_length() on tasks.id/claimant and
+--       docs.namespace/id/claimant/key_primary/key_secondary. These bounds
+--       budget btree index entries, which are measured in bytes, and every
+--       client validates in bytes (Go's len()), so a multi-byte key could pass
+--       the old check while consuming up to 4x the intended index space.
+--       Collation is not involved: COLLATE "C" governs comparison, while
+--       length() counts characters per the server encoding, so the columns
+--       were byte-ordered but character-bounded. The new constraints are added
+--       NOT VALID so a database holding legacy multi-byte values still
+--       upgrades; they are enforced on every new write immediately. To check
+--       and enforce the existing rows too, run during a maintenance window:
+--         ALTER TABLE entroq.docs VALIDATE CONSTRAINT docs_key_primary_check;
+--       (and likewise for the other six), fixing any rows it reports.
+--       The same version raises the doc namespace bound from 64 to 1024 bytes.
+--       A namespace is a path carrying the same /key=value marker grammar as a
+--       queue name, and queue names have no length limit at all, so the 64-byte
+--       cap was an asymmetry rather than a design. It also has to hold the /gc=
+--       activation marker, whose RFC3339Nano form alone is 34 bytes, so a
+--       namespace with a tenant path, a run id and a couple of markers reaches
+--       150-250 bytes without trying. Loosening a bound cannot fail against
+--       existing rows, so this constraint is added VALID.
 --
---   NOTE: namespace, key_primary and key_secondary share ONE budget. They are
---   the columns of idx_docs_keys, and a btree index row cannot exceed 2704
---   bytes (1/3 of an 8kB page). Measured with both key columns at their 256
---   maximum and incompressible values, a namespace of 2048 bytes still indexes
---   and 2176 does not. The current allocation is 1024 + 256 + 256 = 1536, about
---   57% of the ceiling. Raising ANY of the three means re-checking that sum;
---   raising one far enough will break inserts for the others.
+--       NOTE: namespace, key_primary and key_secondary share one budget. They
+--       are the columns of idx_docs_keys, and a btree index row cannot exceed
+--       2704 bytes (1/3 of an 8kB page). Measured with both key columns at their
+--       256 maximum and incompressible values, a namespace of 2048 bytes still
+--       indexes and 2176 does not. The current allocation is
+--       1024 + 256 + 256 = 1536, about 57% of the ceiling. Raising any of the
+--       three means re-checking that sum; raising one far enough will break
+--       inserts for the others.
+--   (2) _modify_docs accepts an arrival time for inserted docs.
+--   (3) Retires the unsupported direct-SQL surface, including its JSON/listing
+--       wrappers, composite argument types, and PostgreSQL-specific GC helpers
+--       and indexes. Backend GC continues through Go's ordinary queue listing,
+--       claim, and modify operations.
 -- Each block checks pg_attribute to skip on fresh installs where the column
 -- is already correct, avoiding unnecessary table scans on re-runs.
 
@@ -1337,7 +969,7 @@ BEGIN
     END IF;
 END $$;
 
--- Raise the doc namespace bound to 256 bytes (see the header). Guarded so a
+-- Raise the doc namespace bound to 1024 bytes (see the header). Guarded so a
 -- fresh install, which already has the target constraint from the CREATE TABLE
 -- above, does no work. Loosening a bound always validates against existing
 -- rows, so unlike the byte-count swap below this one is added VALID.

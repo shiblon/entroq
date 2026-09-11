@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"strings"
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/queues"
@@ -83,8 +82,9 @@ type docCandidate struct {
 	key       string
 }
 
-// CollectDocsOnce discovers gc=-marked doc primary keys and deletes up to batch
-// complete groups. A claimed group is skipped without affecting other keys.
+// CollectDocsOnce discovers gc=-marked doc namespaces and deletes up to batch
+// complete primary-key groups. A claimed group is skipped without affecting
+// other keys in the same namespace.
 func CollectDocsOnce(ctx context.Context, backend entroq.Backend, batch int, reporter Reporter) (int, error) {
 	now, err := backend.Time(ctx)
 	if err != nil {
@@ -95,33 +95,30 @@ func CollectDocsOnce(ctx context.Context, backend entroq.Backend, batch int, rep
 		return 0, fmt.Errorf("doc gc list namespaces: %w", err)
 	}
 
-	var candidates []docCandidate
+	var due []docCandidate
 	for namespace := range namespaces {
+		activateAt, present, err := queues.GCActivation(namespace)
+		if err != nil {
+			reporter.Error(ctx, namespace, "malformed_doc_namespace")
+			log.Printf("doc gc: namespace %q has a malformed gc= value; it will never be collected", namespace)
+			continue
+		}
+		if !present || activateAt.After(now) {
+			continue
+		}
+
 		docs, err := backend.Docs(ctx, &entroq.DocQuery{Namespace: namespace, OmitValues: true})
 		if err != nil {
 			return 0, fmt.Errorf("doc gc list namespace %q: %w", namespace, err)
 		}
 		last := ""
 		for _, doc := range docs {
-			if doc.Key != last && strings.Contains(doc.Key, "/gc=") {
-				candidates = append(candidates, docCandidate{namespace: namespace, key: doc.Key})
+			if doc.Key == last {
+				continue
 			}
 			last = doc.Key
+			due = append(due, docCandidate{namespace: namespace, key: doc.Key})
 		}
-	}
-
-	var due []docCandidate
-	for _, candidate := range candidates {
-		activateAt, present, err := queues.GCActivation(candidate.key)
-		if err != nil {
-			reporter.Error(ctx, candidate.key, "malformed_doc_key")
-			log.Printf("doc gc: key %q in namespace %q has a malformed gc= value; it will never be collected", candidate.key, candidate.namespace)
-			continue
-		}
-		if !present || activateAt.After(now) {
-			continue
-		}
-		due = append(due, candidate)
 	}
 
 	collected := 0
@@ -155,7 +152,7 @@ func CollectDocsOnce(ctx context.Context, backend entroq.Backend, batch int, rep
 			return collected, fmt.Errorf("doc gc delete %q/%q: %w", candidate.namespace, candidate.key, err)
 		}
 		collected++
-		reporter.Deleted(ctx, candidate.key, len(docs))
+		reporter.Deleted(ctx, candidate.namespace, len(docs))
 	}
 	return collected, nil
 }

@@ -610,7 +610,36 @@ func TestSchemaInit(t *testing.T) {
 		t.Errorf("StoredSchemaVersion after init: want %q, got %q", SchemaVersion, got)
 	}
 
-	// Second apply: idempotency check.
+	// Simulate an upgrade from a schema that still exposed the raw-SQL surface.
+	// The dummy bodies are enough to recreate every retired identity so the next
+	// schema application proves its DROP statements actually converge an
+	// existing database, rather than merely succeeding when those objects never
+	// existed.
+	if _, err := freshDB.ExecContext(ctx, `
+		CREATE TYPE entroq.task_arg AS (value text);
+		CREATE TYPE entroq.doc_arg AS (value text);
+		CREATE TYPE entroq.task_id AS (value text);
+		CREATE TYPE entroq.doc_id AS (value text);
+		CREATE FUNCTION entroq.modify(text,jsonb,jsonb,jsonb,jsonb) RETURNS integer LANGUAGE sql AS 'SELECT 1';
+		CREATE FUNCTION entroq.modify_docs(text,jsonb,jsonb,jsonb,jsonb) RETURNS integer LANGUAGE sql AS 'SELECT 1';
+		CREATE FUNCTION entroq.queues(text,text[],integer) RETURNS integer LANGUAGE sql AS 'SELECT 1';
+		CREATE FUNCTION entroq.tasks(text,integer,boolean) RETURNS integer LANGUAGE sql AS 'SELECT 1';
+		CREATE FUNCTION entroq.docs(text,text,text,integer,boolean) RETURNS integer LANGUAGE sql AS 'SELECT 1';
+		CREATE FUNCTION entroq.claim_docs(text,text,interval,text) RETURNS integer LANGUAGE sql AS 'SELECT 1';
+		CREATE FUNCTION entroq.like_prefix(text) RETURNS integer LANGUAGE sql AS 'SELECT 1';
+		CREATE FUNCTION entroq.gc_collect(text[],timestamptz[],integer) RETURNS integer LANGUAGE sql AS 'SELECT 1';
+		CREATE FUNCTION entroq.gc_queues() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+		CREATE FUNCTION entroq.gc_activation(text) RETURNS integer LANGUAGE sql AS 'SELECT 1';
+		CREATE FUNCTION entroq._path_param_values(text,text) RETURNS integer LANGUAGE sql AS 'SELECT 1';
+		CREATE FUNCTION entroq.gc_due(text) RETURNS integer LANGUAGE sql AS 'SELECT 1';
+		CREATE INDEX byGCQueueAt ON entroq.tasks (queue, at) WHERE queue LIKE '%/gc=%';
+		CREATE INDEX byCompoundGCQueueAt ON entroq.tasks (queue, at) WHERE queue LIKE '%;gc=%';
+	`); err != nil {
+		freshDB.Close()
+		t.Fatalf("seed retired schema surface: %v", err)
+	}
+
+	// Second apply: idempotency plus legacy-object convergence.
 	if err := InitSchema(ctx, freshDB); err != nil {
 		freshDB.Close()
 		t.Fatalf("InitSchema idempotency: %v", err)
@@ -625,6 +654,7 @@ func TestSchemaInit(t *testing.T) {
 		freshDB.Close()
 		t.Errorf("StoredSchemaVersion after re-init: want %q, got %q", SchemaVersion, got)
 	}
+	assertLegacySQLSurfaceRemoved(ctx, t, freshDB)
 
 	// Close the fresh connection before dropping -- postgres refuses to drop a
 	// database with open connections.

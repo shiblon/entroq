@@ -499,7 +499,7 @@ components:
                 atMs:
                     type: string
                     description: |-
-                        at_ms is the requested arrival/claim-expiry time for doc changes.
+                        at_ms is the requested arrival/claim-expiry time for doc inserts and changes.
                          Zero means "use the backend's current time and release any claim."
             description: |-
                 DocData holds the data portion of a doc, used for insertions. The created_ms

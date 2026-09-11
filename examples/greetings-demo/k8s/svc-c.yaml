@@ -10,7 +10,6 @@ metadata:
   name: svc-c
   namespace: greetings
 spec:
-  replicas: 1
   selector:
     matchLabels:
       app: svc-c

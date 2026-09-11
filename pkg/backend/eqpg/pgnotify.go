@@ -24,9 +24,8 @@ import (
 // the gRPC service, you can just use the standard in-memory implementation
 // anyway.
 //
-// If you are direct-connected to Postgres, then the stored procedures will
-// fire NOTIFY during Modify events, and a heartbeat can cause it to trigger
-// for tasks becoming available due to the passage of time.
+// The eqpg stored procedures fire NOTIFY during Modify events, and the backend
+// heartbeat triggers notifications for tasks that become available with time.
 //
 // This is implemented in terms of SubQ, the normal in-memory implementation,
 // which gracefully handles claim subscriptions, etc.

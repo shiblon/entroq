@@ -75,7 +75,6 @@ eqc --help
 The Python client is on PyPI:
 ```bash
 python3 -m pip install entroq            # client + async worker
-python3 -m pip install "entroq[pg]"      # + experimental direct-PostgreSQL client (entroq.experimental.pg)
 ```
 
 To install an unreleased version straight from the `clients/py` subdirectory:
@@ -239,10 +238,11 @@ Unlike tasks, docs are not work items. They are durable shared state:
 configuration, counters, reduce output, or any data that multiple workers need
 to read or coordinate around.
 
-Docs can opt into the same built-in garbage collection as task queues by placing
-`/gc=<timestamp>` in their primary key. Once active, GC removes the entire
-`(namespace, primary key)` group atomically, and only while every member is
-unclaimed. Malformed `gc=` values are reported and never collected.
+Doc namespaces can opt into the same built-in garbage collection as task queues
+by placing `/gc=<timestamp>` in the namespace. Once active, GC removes each
+primary-key group atomically, and only while every member of that group is
+unclaimed. A claimed group does not prevent collection of other groups in the
+same namespace. Malformed `gc=` values are reported and never collected.
 
 Docs and tasks share the same `Modify` call, so you can atomically insert a
 task and its initial doc state, or delete a task and update a doc, in one round
@@ -269,7 +269,11 @@ so you don't have to write the claim/renew/modify loop yourself:
 
 ## Kubernetes Service Mesh
 
-EntroQ v1.0.0 ships a Kubernetes operator that turns the queue into a
+> [!WARNING]
+> EQLink is experimental. Its queue protocol and command surface may change
+> without backward compatibility.
+
+EntroQ ships a Kubernetes operator that turns the queue into a
 **transparent async service mesh**. Ordinary HTTP microservices communicate
 through queues with no queue-awareness in their code. Each pod gets an
 **eqlink sidecar** that intercepts outbound HTTP calls, converts them to queue
@@ -289,6 +293,19 @@ other side, the receiver's eqlink claims the task, calls the local service over
 loopback, and routes the response back through a per-request reply queue.
 Neither service knows any of this happened.
 
+EQLink carries request and response bodies as arbitrary byte segments over two
+independent stop-and-wait lane pairs. Empty frames acknowledge data on each
+lane; EQLink does not parse SSE, NDJSON, HTTP chunks, or gRPC messages. This
+supports HTTP/1.1 response streaming and concurrent HTTP/2 request/response
+streaming, including trailers; protocol upgrades such as WebSocket remain out
+of scope. Each segment pays an EntroQ data/acknowledgement round trip, so this
+is best suited to low-rate status, heartbeat, and compatibility streams rather
+than high-throughput traffic. A quiet lane sends an empty heartbeat after one
+minute; three minutes without receiving any peer frame ends the session. Active
+lanes rotate through 30-minute `gc=` queue generations: ordinary data piggybacks
+a switch in the final ten minutes, and an idle turn forces a blank switch in the
+final five minutes.
+
 Authorization is declared with two CRDs:
 
 - **`EntroQQueue`**: declares which queues a service exposes and which callers
@@ -302,6 +319,14 @@ document that the EntroQ service enforces on every queue operation.
 See **[`examples/greetings-demo`](examples/greetings-demo)** for a working
 end-to-end example with three Python services, deployment manifests, and a
 step-by-step walkthrough.
+
+Queue receivers can scale to zero with KEDA while EntroQ durably holds their
+inbox work. A status doc can keep fan-out workers alive after their root task
+disappears. The Helm chart can publish queue and doc-namespace metrics through
+an optional Prometheus `ServiceMonitor`; the greetings demo includes a
+zero-to-one eqlink receiver example. See the chart's
+[`Queue-driven autoscaling`](charts/entroq/README.md#queue-driven-autoscaling)
+section for the deployment contract.
 
 CRD reference (field-by-field, worked examples, policy verification):
 [`docs/mesh-policy.md`](docs/mesh-policy.md)

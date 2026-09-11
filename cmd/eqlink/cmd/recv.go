@@ -2,10 +2,9 @@ package cmd
 
 import (
 	"fmt"
-	"net/http"
+	"time"
 
 	"github.com/shiblon/entroq/pkg/async"
-	"github.com/shiblon/entroq/pkg/worker"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
 )
@@ -41,29 +40,20 @@ Use "eqlink run" to start the full sidecar (sender + receiver).`,
 
 		rcvOpts := []async.ReceiverOption{
 			async.WithReceiverMeterProvider(mp),
+			async.WithReceiverConcurrency(concurrency),
+			async.WithReceiverRequestTimeout(requestTimeout),
 		}
 		if tlsCfg != nil {
-			rcvOpts = append(rcvOpts, async.WithReceiverHTTPClient(&http.Client{
-				Transport: &http.Transport{
-					TLSClientConfig:     tlsCfg,
-					MaxIdleConnsPerHost: 32,
-				},
-			}))
+			rcvOpts = append(rcvOpts, async.WithReceiverTLSConfig(tlsCfg))
 		}
 
-		recvWorker := worker.New(eq,
-			worker.WithDoModify(async.ReceiverHandler(upstream, rcvOpts...)),
-			worker.WithMeterProvider[async.Envelope](mp),
-		)
-
-		for range concurrency {
-			g.Go(func() error {
-				if err := recvWorker.Run(gctx, worker.Watching(myQueue+"/inbox")); err != nil {
-					return fmt.Errorf("run worker: %w", err)
-				}
-				return nil
-			})
-		}
+		receiver := async.NewReceiver(eq, upstream, rcvOpts...)
+		g.Go(func() error {
+			if err := receiver.Run(gctx, myQueue+"/inbox"); err != nil {
+				return fmt.Errorf("run receiver: %w", err)
+			}
+			return nil
+		})
 		return g.Wait()
 	},
 }
@@ -73,6 +63,7 @@ func init() {
 	flags.StringVar(&myQueue, "queue", "", "Service queue prefix (required). Receiver watches <prefix>/inbox.")
 	flags.StringVar(&upstream, "upstream", "http://localhost:8000", "Upstream service address.")
 	flags.IntVar(&concurrency, "concurrency", 1, "Number of concurrent receiver goroutines.")
+	flags.DurationVar(&requestTimeout, "request_timeout", 3*time.Minute, "Maximum silence from the peer EQLink before ending a session; heartbeats are sent every third of this duration.")
 	recvCmd.MarkFlagRequired("queue")
 
 	rootCmd.AddCommand(recvCmd)

@@ -150,6 +150,7 @@ func ModifyArgsFromProto(req *pb.ModifyRequest) ([]entroq.ModifyArg, error) {
 		modArgs = append(modArgs, entroq.PuttingDoc(&entroq.DocData{
 			Namespace:    di.Namespace,
 			ID:           di.Id,
+			At:           FromMS(di.AtMs),
 			Key:          di.Key,
 			SecondaryKey: di.SecondaryKey,
 			Content:      val,

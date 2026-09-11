@@ -23,13 +23,22 @@ var (
 var rootCmd = &cobra.Command{
 	Use:     "eqlink",
 	Version: version.Version,
-	Short:   "Async HTTP networking sidecar over EntroQ task queues.",
-	Long: `eqlink translates synchronous HTTP calls into EntroQ task queue operations,
-giving services fault tolerance and load balancing without changing their code.
+	Short:   "Experimental HTTP networking sidecar over EntroQ task queues.",
+	Long: `EXPERIMENTAL: eqlink's protocol and command surface may change without compatibility.
+
+eqlink translates HTTP calls into EntroQ task queue operations, giving services
+decoupled addressing and queue-based load distribution without changing their code.
 
 The sender proxies outgoing HTTP calls from the local service into queues.
 The receiver claims tasks from queues and forwards them to the local service.
-Stale response queues are garbage-collected by the EntroQ server, not the sidecar.
+HTTP bodies are carried as arbitrary byte segments over independent request and
+response lane pairs. This supports HTTP/1.1 response streaming and concurrent
+HTTP/2 request/response streaming, including trailers, without parsing SSE,
+NDJSON, or gRPC messages. Each segment pays a queue round trip, so streaming is
+best suited to low-rate status and compatibility traffic. Protocol upgrades such
+as WebSocket are not supported. Quiet lanes exchange empty heartbeats; three
+missed heartbeat intervals end the session. Stale session queues are
+garbage-collected by the EntroQ server, not the sidecar.
 
 The handoff command links two EntroQ instances directly, claiming tasks from a
 source instance and delivering them into a destination instance, exactly once.`,

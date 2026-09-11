@@ -1,7 +1,8 @@
-// Package async provides primitives for building asynchronous HTTP networking
-// over EntroQ task queues. Services communicate by sending and receiving tasks
-// rather than making direct HTTP connections, gaining fault tolerance and
-// decoupled addressing without changing their HTTP interface.
+// Package async provides experimental primitives for carrying HTTP exchanges
+// over EntroQ task queues. Its wire protocol may change without compatibility.
+// Services communicate by sending and receiving tasks rather than making
+// direct cross-service HTTP connections, gaining decoupled addressing and
+// queue-based load distribution without changing their HTTP interface.
 //
 // # Sidecar Pattern (Single EQ Instance)
 //
@@ -10,18 +11,31 @@
 // retool existing services, is a sidecar pair sharing one EntroQ instance. The
 // Sender translates outgoing HTTP calls from a local service into Envelope
 // tasks on a named queue. One or more Receiver workers claim those tasks,
-// forward them as HTTP requests to an upstream service, and enqueue a Response
-// task on the per-request response queue. The sender unblocks and returns the
-// response to the original caller.
+// forward them as HTTP requests to an upstream service, and enqueue Response
+// tasks on ephemeral lanes. The sender relays response metadata and body bytes
+// to the original caller as frames arrive.
 //
-//	[Service A] -HTTP-> [Sender] -task-> [EQ] <-claim- [Receiver] -HTTP-> [Service B]
-//	                       ^                                  |
-//	                       +--------response task-------------+
+//	[Service A] <-HTTP-> [Sender] <-tasks-> [EQ] <-tasks-> [Receiver] <-HTTP-> [Service B]
 //
 // This permits basic microservices to communicate with one another through the
 // queueing system without knowing they are part of such a system. The services
-// themselves are synchronous, but only with local connections in their
-// container. The rest of the system is fully asynchronous.
+// themselves hold only local HTTP connections in their container. EQLink uses
+// two independent stop-and-wait lane pairs over queues, one for each HTTP body
+// direction. Empty Envelope or Response frames acknowledge data in the same
+// lane; there is no distinct acknowledgement frame type. This carries arbitrary
+// byte segments without parsing SSE, NDJSON, HTTP chunks, or gRPC messages and
+// permits concurrent HTTP/2 request and response streaming. HTTP protocol
+// upgrades such as WebSocket are not supported.
+//
+// Every segment waits for an EntroQ round trip before the next segment in that
+// direction. EQLink streaming is therefore intended for low-rate interactions
+// such as status, heartbeats, and compatibility with otherwise unsupported
+// client languages, not high-throughput streaming.
+//
+// After one minute without a frame to send, the side that owns a lane turn
+// sends an ordinary empty frame. Only a frame received from the peer resets the
+// session liveness deadline; three minutes of peer silence ends the exchange.
+// Both durations scale together when the request timeout is configured.
 //
 // This works across datacenters if the remote receiver can reach EQ over the
 // WAN. mTLS (--cert/--key/--ca flags on eqlink) is used to authenticate the

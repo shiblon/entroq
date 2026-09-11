@@ -449,7 +449,13 @@ func TestBridge_DocInsert(t *testing.T) {
 	var dw doWorkMsg
 	s.c.recv(&dw)
 	mr := deleteTask(dw.Task.Task)
-	mr.DocInserts = []*pb.DocData{{Namespace: "ns", Key: "k", Content: structpb.NewStringValue("docval")}}
+	claimUntil := time.Now().Add(time.Minute)
+	mr.DocInserts = []*pb.DocData{{
+		Namespace: "ns",
+		Key:       "k",
+		Content:   structpb.NewStringValue("docval"),
+		AtMs:      claimUntil.UnixMilli(),
+	}}
 	s.c.send(okResult(mr))
 
 	if err := eq.WaitQueuesEmpty(ctx, entroq.MatchExact("in")); err != nil {
@@ -467,6 +473,12 @@ func TestBridge_DocInsert(t *testing.T) {
 	}
 	if got := string(docs[0].Content); got != `"docval"` {
 		t.Errorf("doc content = %s, want %q", got, `"docval"`)
+	}
+	if docs[0].Claimant != eq.ClientID {
+		t.Errorf("doc claimant = %q, want gateway claimant %q", docs[0].Claimant, eq.ClientID)
+	}
+	if docs[0].At.Before(claimUntil.Add(-time.Second)) {
+		t.Errorf("doc at = %v, want approximately %v", docs[0].At, claimUntil)
 	}
 	s.stop()
 }

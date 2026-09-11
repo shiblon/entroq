@@ -23,11 +23,8 @@ func (b *EQPG) NamespaceStats(ctx context.Context, qq *entroq.MatchQuery) (map[s
 		q += " WHERE"
 		var frags []string
 		for _, m := range qq.MatchPrefix {
-			// Escaping lives in the SQL helper (entroq.like_prefix), so the raw
-			// prefix is passed as-is and LIKE metacharacters (%, _, \) in a
-			// namespace are matched literally rather than acting as wildcards.
-			frags = append(frags, fmt.Sprintf(" namespace LIKE entroq.like_prefix($%d) ESCAPE '\\'", len(values)+1))
-			values = append(values, m)
+			frags = append(frags, fmt.Sprintf(" namespace LIKE $%d ESCAPE '\\'", len(values)+1))
+			values = append(values, likePrefix(m))
 		}
 		for _, m := range qq.MatchExact {
 			frags = append(frags, fmt.Sprintf(" namespace = $%d", len(values)+1))

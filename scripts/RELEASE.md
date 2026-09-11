@@ -26,8 +26,7 @@ git checkout develop && git pull
   advance its independent `version`. `tag-release.sh` enforces `appVersion`.
 - If the PostgreSQL schema changed, bump `SchemaVersion` in
   `pkg/backend/eqpg/schema.go` **and** the matching `INSERT` in
-  `pkg/backend/eqpg/schema.sql` (then `make schema-sync`, and update
-  `SCHEMA_VERSION` in the Python client). `tag-release.sh` enforces that
+  `pkg/backend/eqpg/schema.sql`. `tag-release.sh` enforces that
   `SchemaVersion` does not exceed the release tag. It advances only when the
   schema changes, so a schema-unchanged release leaves it alone.
 - If the Python client changed, bump its independent version in

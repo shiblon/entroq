@@ -16,6 +16,10 @@ external OPA policy engine.
 - A k8s cluster (see Minikube below for local development)
 - Images built and available to the cluster (see below)
 
+Prometheus Operator is optional. Install it before enabling the chart's
+`ServiceMonitor`; KEDA is also optional and is installed independently when
+workloads need queue-driven autoscaling.
+
 ## Quick Start (Minikube)
 
 ### 1. Start a fresh cluster
@@ -180,6 +184,61 @@ helm install entroq ./charts/entroq \
   --set entroq.redis.existingSecret=entroq-redis-credentials
 ```
 
+## Queue-driven autoscaling
+
+EntroQ exports the per-queue gauge `entroq_queue_size` and per-doc-namespace
+gauge `entroq_namespace_size` from `/metrics` on its HTTP port. Enable the
+optional Prometheus Operator `ServiceMonitor` to discover that endpoint:
+
+```bash
+helm upgrade --install entroq ./charts/entroq \
+  --set entroq.metrics.serviceMonitor.enabled=true
+```
+
+The monitor scrapes once per minute by default. If the Prometheus installation
+selects monitors by label, pass the required labels through
+`entroq.metrics.serviceMonitor.additionalLabels` in a values file.
+
+Queue and namespace paths may mark a high-cardinality session component with a
+`sess` parameter. Before exporting metrics, EntroQ replaces any component that
+contains `sess` with `*` and aggregates the resulting series. For example, both
+`/workers/sess=a;gc=0/inbox` and `/workers/gc=0;sess=b/inbox` contribute to
+`/workers/*/inbox`. Queue and namespace statistics returned by the API remain
+literal; folding applies only to metrics. Counts are summed across folded queue
+series, while `type="maxClaims"` reports their maximum.
+
+KEDA and Prometheus are cluster-level dependencies and are not installed by
+this chart. Each application owns its `ScaledObject` beside the Deployment it
+scales, because the application knows its queue, concurrency, replica limits,
+and acceptable cold-start latency. For a receiver, scale on the sum of
+`type="available"` and `type="claimed"`: available tasks wake the Deployment,
+while claimed tasks keep it alive until in-flight work finishes. Excluding
+`type="future"` avoids waking a worker solely for a task whose arrival time has
+not elapsed.
+
+Queue depth measures back pressure, not the lifetime of a workflow. A worker
+that fans out can consume its root task immediately and still have substantial
+work in flight. For those workflows, atomically submit the root task and one
+status doc in a namespace dedicated to that scalable worker pool. Give each
+workflow its own primary key, keep the status doc while any fan-out work is
+live, and delete it only when the workflow completes. The autoscaler adds the
+namespace's `type="total"` metric (selected by its `doc_namespace` label) to the
+runnable queue count, so either queued work or a live workflow keeps a replica
+running. Namespace strings may use path components by convention, making values
+such as `/payments/report/status` natural autoscaling domains without exposing
+per-workflow primary keys as Prometheus labels. The label is named
+`doc_namespace` to avoid colliding with the Kubernetes namespace label commonly
+attached by Prometheus discovery.
+
+The scaler's polling interval and the Prometheus scrape interval both contribute
+to cold-start latency. Set eqlink's `--request_timeout` (the maximum peer-silence
+interval, with heartbeats every third of that duration) longer than their
+combined worst case plus pod startup time, and set the scale-down cooldown
+longer than the metric interval. See
+[`examples/greetings-demo/k8s/svc-c-autoscaling.yaml`](../../examples/greetings-demo/k8s/svc-c-autoscaling.yaml)
+for a zero-to-one receiver. Its status-namespace term is dormant in the simple
+request-response demo, but shows the complete query for a fan-out worker.
+
 ## Configuration
 
 Key values — override with `--set key=value` or `-f my-values.yaml`:
@@ -201,6 +260,10 @@ Key values — override with `--set key=value` or `-f my-values.yaml`:
 | `entroq.auth.tokenCacheTTL` | `30s` | Maximum verified-token cache lifetime; `0s` disables it |
 | `entroq.auth.tokenCacheEntries` | `4096` | Maximum verified-token cache entries |
 | `entroq.auth.jwksCacheTTL` | `5m` | Signing-key cache lifetime |
+| `entroq.metrics.serviceMonitor.enabled` | `false` | Create a Prometheus Operator `ServiceMonitor` for EntroQ metrics |
+| `entroq.metrics.serviceMonitor.interval` | `1m` | Prometheus scrape interval |
+| `entroq.metrics.serviceMonitor.scrapeTimeout` | `10s` | Timeout for each metrics scrape |
+| `entroq.metrics.serviceMonitor.additionalLabels` | `{}` | Labels required by the Prometheus monitor selector |
 
 See `values.yaml` for the full set of options.
 

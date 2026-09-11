@@ -110,6 +110,30 @@ func TestGCActivation(t *testing.T) {
 			want:    time.Unix(200, 0).UTC(),
 		},
 		{
+			name:    "gc after session in compound component",
+			queue:   "/tasks/sess=abc;gc=100/inbox",
+			present: true,
+			want:    time.Unix(100, 0).UTC(),
+		},
+		{
+			name:    "gc before session in compound component",
+			queue:   "/tasks/gc=100;sess=abc/inbox",
+			present: true,
+			want:    time.Unix(100, 0).UTC(),
+		},
+		{
+			name:    "empty gc before session in compound component",
+			queue:   "/tasks/gc=;sess=abc/inbox",
+			present: true,
+			want:    time.Time{},
+		},
+		{
+			name:    "last compound gc wins",
+			queue:   "/gc=100;sess=abc/sub/sess=def;gc=200",
+			present: true,
+			want:    time.Unix(200, 0).UTC(),
+		},
+		{
 			name:    "rfc3339 value",
 			queue:   "/tasks/gc=2026-07-02T15:04:05Z",
 			present: true,

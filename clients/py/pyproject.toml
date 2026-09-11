@@ -26,25 +26,13 @@ classifiers = [
 "Bug Tracker" = "https://github.com/shiblon/entroq/issues"
 
 [project.optional-dependencies]
-pg = [
-    "psycopg[pool]>=3.1.8",
-]
 dev = [
-    "entroq[pg]",
-    "psycopg[binary]",
     "pytest",
     "pytest-asyncio",
-    "testcontainers[postgres]",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 
-[tool.setuptools]
-include-package-data = true
-
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-"*" = ["*.sql"]

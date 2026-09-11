@@ -105,6 +105,15 @@ entroq:
     httpPort: 9100
     opaPort: 8181
 
+  # Prometheus Operator discovery for EntroQ's queue and service metrics.
+  # The ServiceMonitor CRD must already be installed in the cluster.
+  metrics:
+    serviceMonitor:
+      enabled: false
+      interval: 1m
+      scrapeTimeout: 10s
+      additionalLabels: {}
+
   resources:
     entroq:
       requests:

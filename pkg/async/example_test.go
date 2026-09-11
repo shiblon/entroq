@@ -13,7 +13,6 @@ import (
 	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
 	"github.com/shiblon/entroq/pkg/backend/eqmem"
 	"github.com/shiblon/entroq/pkg/eqsvcgrpc"
-	"github.com/shiblon/entroq/pkg/worker"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health"
@@ -67,11 +66,11 @@ func Example_sidecar() {
 
 	const queue = "echo-svc"
 
-	// Receiver worker: claims Envelope tasks, forwards to upstream, enqueues response.
+	// Receiver: claims Envelope tasks, forwards to upstream, and enqueues responses.
 	rcvCtx, rcvCancel := context.WithCancel(ctx)
 	defer rcvCancel()
-	recv := worker.New(eq, worker.WithDoModify(async.ReceiverHandler(upstream.URL)))
-	go recv.Run(rcvCtx, worker.Watching("/"+queue+"/inbox")) //nolint:errcheck
+	recv := async.NewReceiver(eq, upstream.URL)
+	go recv.Run(rcvCtx, "/"+queue+"/inbox") //nolint:errcheck
 
 	// Sender: routes outbound requests by target service name from the Host header.
 	// "echo-svc.test" strips ".test" to get "echo-svc", which maps to the inbox queue.

@@ -3,7 +3,7 @@
 //
 // # Garbage collection
 //
-// This backend garbage-collects on its own. Queues and doc primary keys that opt
+// This backend garbage-collects on its own. Queues and doc namespaces that opt
 // in by name (a /gc= component) have their arrived tasks or complete unclaimed
 // doc groups reaped by an always-on background loop started when the backend is
 // opened. It is a first-class backend behavior, not a separate process, so a
@@ -556,11 +556,8 @@ func (b *EQPG) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[stri
 
 	var matchFragments []string
 	for _, m := range qq.MatchPrefix {
-		// Escaping lives in the SQL helper (entroq.like_prefix), so the raw prefix
-		// is passed as-is and LIKE metacharacters (%, _, \) in a queue name are
-		// matched literally rather than acting as wildcards.
-		matchFragments = append(matchFragments, fmt.Sprintf(" queue LIKE entroq.like_prefix($%d) ESCAPE '\\'", len(values)+1))
-		values = append(values, m)
+		matchFragments = append(matchFragments, fmt.Sprintf(" queue LIKE $%d ESCAPE '\\'", len(values)+1))
+		values = append(values, likePrefix(m))
 	}
 	for _, m := range qq.MatchExact {
 		matchFragments = append(matchFragments, fmt.Sprintf(" queue = $%d", len(values)+1))
@@ -826,7 +823,7 @@ func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *mo
 	// Build parallel arrays for resource operation set.
 	rDepNS, rDepIDs, rDepVers := resourceIDArrays(mod.DocDepends)
 	rDelNS, rDelIDs, rDelVers := resourceIDArrays(mod.DocDeletes)
-	rInsNS, rInsIDs, rInsPKeys, rInsSKeys, rInsValues := resourceInsertArrays(mod.DocInserts)
+	rInsNS, rInsIDs, rInsPKeys, rInsSKeys, rInsValues, rInsAts := resourceInsertArrays(mod.DocInserts)
 	rChgNS, rChgIDs, rChgVers, rChgPKeys, rChgSKeys, rChgValues, rChgAts := resourceChangeArrays(mod.DocChanges)
 
 	if options == nil {
@@ -866,13 +863,13 @@ func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *mo
 				$1,
 				$2::text[], $3::text[], $4::integer[],
 				$5::text[], $6::text[], $7::integer[],
-				$8::text[], $9::text[], $10::text[], $11::text[], $12::text[],
-				$13::text[], $14::text[], $15::integer[], $16::text[], $17::text[], $18::text[], $19::timestamptz[]
+				$8::text[], $9::text[], $10::text[], $11::text[], $12::text[], $13::timestamptz[],
+				$14::text[], $15::text[], $16::integer[], $17::text[], $18::text[], $19::text[], $20::timestamptz[]
 			)`,
 			mod.Claimant,
 			pq.Array(rDepNS), pq.Array(rDepIDs), pq.Array(rDepVers),
 			pq.Array(rDelNS), pq.Array(rDelIDs), pq.Array(rDelVers),
-			pq.Array(rInsNS), pq.Array(rInsIDs), pq.Array(rInsPKeys), pq.Array(rInsSKeys), pq.Array(rInsValues),
+			pq.Array(rInsNS), pq.Array(rInsIDs), pq.Array(rInsPKeys), pq.Array(rInsSKeys), pq.Array(rInsValues), pq.Array(rInsAts),
 			pq.Array(rChgNS), pq.Array(rChgIDs), pq.Array(rChgVers), pq.Array(rChgPKeys), pq.Array(rChgSKeys), pq.Array(rChgValues), pq.Array(rChgAts),
 		)
 		if err != nil {
@@ -1159,18 +1156,20 @@ func resourceIDArrays(rids []*entroq.DocID) (ns, ids []string, versions []int32)
 }
 
 // resourceInsertArrays splits a slice of ResourceData into parallel arrays.
-func resourceInsertArrays(inserts []*entroq.DocData) (ns, ids, pkeys, skeys []string, values []*string) {
+func resourceInsertArrays(inserts []*entroq.DocData) (ns, ids, pkeys, skeys []string, values []*string, ats []time.Time) {
 	ns = make([]string, len(inserts))
 	ids = make([]string, len(inserts))
 	pkeys = make([]string, len(inserts))
 	skeys = make([]string, len(inserts))
 	values = make([]*string, len(inserts))
+	ats = make([]time.Time, len(inserts))
 	for i, ins := range inserts {
 		ns[i] = ins.Namespace
 		ids[i] = ins.ID
 		pkeys[i] = ins.Key
 		skeys[i] = ins.SecondaryKey
 		values[i] = jsonTextVal(ins.Content)
+		ats[i] = ins.At
 	}
 	return
 }
@@ -1247,8 +1246,15 @@ func (b *EQPG) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, er
 		)
 	} else {
 		rows, err = b.DB.QueryContext(ctx,
-			`SELECT namespace, id, version, claimant, at, key_primary, key_secondary, value, created, modified
-			 FROM entroq.docs($1, $2, $3, $4, $5)`,
+			`SELECT namespace, id, version, claimant, at, key_primary, key_secondary,
+			        CASE WHEN $5 THEN NULL::jsonb ELSE value END AS value,
+			        created, modified
+			 FROM entroq.docs
+			 WHERE ($1 = '' OR namespace = $1)
+			   AND ($2 = '' OR key_primary >= $2)
+			   AND ($3 = '' OR key_primary < $3)
+			 ORDER BY namespace, key_primary, key_secondary
+			 LIMIT NULLIF($4, 0)`,
 			rq.Namespace, rq.KeyStart, rq.KeyEnd, rq.Limit, rq.OmitValues,
 		)
 	}
