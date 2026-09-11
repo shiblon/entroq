@@ -39,13 +39,13 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 -- intentional. If direct-pg support is ever revived, add CHECK (queue <> '') on
 -- tasks and CHECK (namespace <> '') on docs (a schema migration) to restore it.
 CREATE TABLE IF NOT EXISTS entroq.tasks (
-    id       TEXT COLLATE "C"         PRIMARY KEY NOT NULL CHECK (length(id) <= 64),
+    id       TEXT COLLATE "C"         PRIMARY KEY NOT NULL CHECK (octet_length(id) <= 64),
     version  INTEGER                  NOT NULL DEFAULT 0,
     queue    TEXT COLLATE "C"         NOT NULL DEFAULT '',
     at       TIMESTAMP WITH TIME ZONE NOT NULL,
     created  TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
     modified TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
-    claimant TEXT                     NOT NULL DEFAULT '' CHECK (length(claimant) <= 64),
+    claimant TEXT                     NOT NULL DEFAULT '' CHECK (octet_length(claimant) <= 64),
     value    JSONB,
     claims   INTEGER                  NOT NULL DEFAULT 0,
     attempt  INTEGER                  NOT NULL DEFAULT 0,
@@ -56,13 +56,13 @@ CREATE TABLE IF NOT EXISTS entroq.tasks (
 -- key_primary and key_secondary provide range-scan and sorting capabilities.
 -- at is used for claiming (locking).
 CREATE TABLE IF NOT EXISTS entroq.docs (
-    namespace     TEXT COLLATE "C"         NOT NULL CHECK (length(namespace) <= 64),
-    id            TEXT COLLATE "C"         NOT NULL CHECK (length(id) <= 64),
+    namespace     TEXT COLLATE "C"         NOT NULL CHECK (octet_length(namespace) <= 1024),
+    id            TEXT COLLATE "C"         NOT NULL CHECK (octet_length(id) <= 64),
     version       INTEGER                  NOT NULL DEFAULT 0,
-    claimant      TEXT                     NOT NULL DEFAULT '' CHECK (length(claimant) <= 64),
+    claimant      TEXT                     NOT NULL DEFAULT '' CHECK (octet_length(claimant) <= 64),
     at            TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
-    key_primary   TEXT COLLATE "C"         NOT NULL DEFAULT '' CHECK (length(key_primary) <= 256),
-    key_secondary TEXT COLLATE "C"         NOT NULL DEFAULT '' CHECK (length(key_secondary) <= 256),
+    key_primary   TEXT COLLATE "C"         NOT NULL DEFAULT '' CHECK (octet_length(key_primary) <= 256),
+    key_secondary TEXT COLLATE "C"         NOT NULL DEFAULT '' CHECK (octet_length(key_secondary) <= 256),
     value         JSONB,
     created       TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
     modified      TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
@@ -1220,6 +1220,36 @@ DROP FUNCTION IF EXISTS entroq.gc_due(text);
 --       keys/indexes. Transparent to clients (it changes only lexicographical
 --       ordering, not data), but a heavy op -- plan a maintenance window on
 --       large tables.
+-- Migrations: 1.7.1 -> 1.11.0 (text length CHECKs count BYTES, not characters:
+--   length() -> octet_length() on tasks.id/claimant and
+--   docs.namespace/id/claimant/key_primary/key_secondary). These bounds exist to
+--   budget btree index entries, which are measured in bytes, and every client
+--   validates in bytes (Go's len()), so a multi-byte key could pass the old
+--   check while consuming up to 4x the intended index space. Collation is not
+--   involved: COLLATE "C" governs comparison, while length() counts characters
+--   per the server encoding, so the columns were byte-ordered but
+--   character-bounded. The new constraints are added NOT VALID so a database
+--   holding legacy multi-byte values still upgrades; they are enforced on every
+--   new write immediately. To check and enforce the existing rows too, run
+--   during a maintenance window:
+--     ALTER TABLE entroq.docs VALIDATE CONSTRAINT docs_key_primary_check;
+--   (and likewise for the other six), fixing any rows it reports.
+--   The same version also raises the doc namespace bound from 64 to 1024 bytes.
+--   A namespace is a path carrying the same /key=value marker grammar as a queue
+--   name, and queue names have no length limit at all, so the 64-byte cap was an
+--   asymmetry rather than a design. It also has to hold the /gc= activation
+--   marker, whose RFC3339Nano form alone is 34 bytes, so a namespace with a
+--   tenant path, a run id and a couple of markers reaches 150-250 bytes without
+--   trying. Loosening a bound cannot fail against existing rows, so this
+--   constraint is added VALID.
+--
+--   NOTE: namespace, key_primary and key_secondary share ONE budget. They are
+--   the columns of idx_docs_keys, and a btree index row cannot exceed 2704
+--   bytes (1/3 of an 8kB page). Measured with both key columns at their 256
+--   maximum and incompressible values, a namespace of 2048 bytes still indexes
+--   and 2176 does not. The current allocation is 1024 + 256 + 256 = 1536, about
+--   57% of the ceiling. Raising ANY of the three means re-checking that sum;
+--   raising one far enough will break inserts for the others.
 -- Each block checks pg_attribute to skip on fresh installs where the column
 -- is already correct, avoiding unnecessary table scans on re-runs.
 
@@ -1307,10 +1337,59 @@ BEGIN
     END IF;
 END $$;
 
+-- Raise the doc namespace bound to 256 bytes (see the header). Guarded so a
+-- fresh install, which already has the target constraint from the CREATE TABLE
+-- above, does no work. Loosening a bound always validates against existing
+-- rows, so unlike the byte-count swap below this one is added VALID.
+DO $$
+DECLARE v_def text;
+BEGIN
+    SELECT pg_get_constraintdef(oid) INTO v_def
+      FROM pg_constraint
+     WHERE conrelid = 'entroq.docs'::regclass AND conname = 'docs_namespace_check';
+    IF v_def IS NOT NULL AND v_def NOT LIKE '%octet_length(namespace) <= 1024%' THEN
+        ALTER TABLE entroq.docs DROP CONSTRAINT docs_namespace_check;
+        ALTER TABLE entroq.docs ADD CONSTRAINT docs_namespace_check
+            CHECK (octet_length(namespace) <= 1024);
+        RAISE NOTICE 'entroq: doc namespace limit raised to 1024 bytes';
+    END IF;
+END $$;
+
+-- Swap any character-counting length CHECK for a byte-counting one. Fresh
+-- installs already have octet_length from the CREATE TABLE above, so the loop
+-- finds nothing and this is a no-op; only a pre-1.11.0 database does work here.
+-- NOT VALID keeps the upgrade from failing on a legacy row that exceeds the byte
+-- bound: the rule binds every new write immediately, and the header above says
+-- how to validate the existing rows when convenient.
+DO $$
+DECLARE
+    r        record;
+    v_fixed  integer := 0;
+BEGIN
+    FOR r IN
+        SELECT c.conrelid::regclass::text AS tbl,
+               c.conname                  AS name,
+               pg_get_constraintdef(c.oid) AS def
+          FROM pg_constraint c
+         WHERE c.conrelid IN ('entroq.tasks'::regclass, 'entroq.docs'::regclass)
+           AND c.contype = 'c'
+           AND pg_get_constraintdef(c.oid) LIKE '%length(%'
+           AND pg_get_constraintdef(c.oid) NOT LIKE '%octet_length(%'
+    LOOP
+        EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', r.tbl, r.name);
+        EXECUTE format('ALTER TABLE %s ADD CONSTRAINT %I %s NOT VALID',
+                       r.tbl, r.name, replace(r.def, 'length(', 'octet_length('));
+        v_fixed := v_fixed + 1;
+    END LOOP;
+    IF v_fixed > 0 THEN
+        RAISE NOTICE 'entroq: % length CHECK(s) now count bytes; they are NOT VALID until you VALIDATE CONSTRAINT them', v_fixed;
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS entroq.meta (
     key   TEXT PRIMARY KEY NOT NULL,
     value TEXT NOT NULL
 );
 
-INSERT INTO entroq.meta (key, value) VALUES ('schema_version', '1.7.1')
-    ON CONFLICT (key) DO UPDATE SET value = '1.7.1' WHERE entroq.meta.key = 'schema_version';
+INSERT INTO entroq.meta (key, value) VALUES ('schema_version', '1.11.0')
+    ON CONFLICT (key) DO UPDATE SET value = '1.11.0' WHERE entroq.meta.key = 'schema_version';

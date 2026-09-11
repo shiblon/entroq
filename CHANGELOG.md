@@ -19,6 +19,51 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ambiguous outcomes. The experimental direct-PostgreSQL client pools ordinary
   operations and can opt individual workers out of client-driven garbage
   collection.
+- **`worker.tasks_total` metric.** Workers now count every finished task by
+  queue, claimant, and outcome (`done`, `retried`, `moved`, `failed`). A
+  completed task is deleted, so the queue retains no record of which worker
+  handled what; this counter is where that history lives. The claimant attribute
+  defaults to a random per-client value, so a deployment wanting stable
+  per-worker series should set a durable one with `entroq.WithClaimantID`.
+
+- **Experimental MapReduce package (`pkg/eqmr`).** A MapReduce that runs
+  entirely on EntroQ tasks and documents, promoted from the `examples/mr`
+  sketch. It adds a real shuffle step: mappers partition intermediate keys into
+  a configured number of reduce shards and write per-partition map-output documents,
+  so reduce work is proportional to the partition count rather than to the
+  number of distinct keys. It adds combiners, which differ from reducers in
+  being closed over their own output and so may run at more than one stage. The
+  controller is now a single self-requeueing control task rather than in-process
+  goroutines, so it can run in its own pod, in as many replicas as desired, with
+  the claim providing the single-actor guarantee and lease expiry providing
+  failover. Both shard counts must be configured explicitly. Also included:
+  run cleanup, stall and quarantine detection, a `Progress` snapshot suitable for
+  driving a status view, and validation of namespaces and document keys as
+  NUL-free UTF-8 within the backend length limits. Map keys and values are text
+  rather than bytes, validated on input and on every emit, which drops base64
+  from every intermediate document: measured, map-output documents are 22% smaller
+  and readable in psql. A job with genuinely binary keys encodes them itself. Phase completion is judged
+  purely from documents: every partition writes a result document, empty ones
+  included, so finishing is a recorded fact rather than an absence and no queue
+  is consulted to decide it. Workers read their input document rather than
+  claiming it, taking exclusion at commit time through a version-pinned delete,
+  which makes backup tasks (speculative execution against stragglers) possible:
+  a duplicate task races the original instead of blocking on its claim, and the
+  loser's work is rejected atomically. No straggler policy ships with it. The
+  Configuration is by functional option, `New(eq, prefix, opts...)`, and shard
+  counts are required only by `Setup`: a mapper or reducer pod builds a
+  controller from a run prefix alone, because the partition count a mapper must
+  agree on travels in its task. `RunMapper`, `RunReducer` and `RunController`
+  wire each role to its own queue, lease and claim ceiling. The API and the
+  document layout may change without a migration path.
+
+### Removed
+
+- **`examples/mr` and `examples/mrtest`.** Retired in favor of `pkg/eqmr`, with
+  the cross-backend and benchmark callers rewired to `pkg/eqmr/eqmrtest`. The
+  correctness check there also stops fixing its corpus at ten distinct words,
+  which meant no cross-backend test ever produced enough keys to spread across
+  reduce partitions.
 
 ### Changed
 
@@ -26,7 +71,31 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before submission retry with full-jitter exponential backoff. Ambiguous
   transport failures and unexpected handler exceptions return to the caller
   instead of entering synchronized fixed-delay retry loops.
-
+- **Text length limits count bytes, not characters.** The `CHECK` constraints
+  bounding `tasks.id`/`claimant` and
+  `docs.namespace`/`id`/`claimant`/`key_primary`/`key_secondary` now use
+  `octet_length()` rather than `length()`. These bounds exist to budget btree
+  index entries, which are measured in bytes, and clients validate in bytes, so
+  a multi-byte key could previously pass the check while consuming up to four
+  times the intended index space. Collation was never involved: `COLLATE "C"`
+  governs comparison, while `length()` counts characters per the server
+  encoding, so these columns were byte-ordered but character-bounded. The
+  migration adds the new constraints `NOT VALID`, so a database holding legacy
+  multi-byte values still upgrades and the rule binds every new write
+  immediately; run `VALIDATE CONSTRAINT` during a maintenance window to check
+  the existing rows.
+- **Document namespace limit raised from 64 to 1024 bytes.** A namespace is a
+  path carrying the same `/key=value` marker grammar as a queue name, and queue
+  names have no length limit at all, so the 64-byte cap was an asymmetry rather
+  than a design. It also has to hold the `/gc=` activation marker, whose
+  RFC3339Nano form alone is 34 bytes, leaving under half the old budget for the
+  name itself, so a namespace with a tenant path, a run id and a couple of
+  markers reaches 150-250 bytes without trying. Note that `namespace`,
+  `key_primary` and `key_secondary` share one budget: they are the columns of
+  `idx_docs_keys`, and a btree index row cannot exceed 2704 bytes. The new
+  allocation is 1024 + 256 + 256 = 1536, about 57% of that ceiling. Loosening a
+  bound cannot fail against existing rows, so no maintenance window is needed
+  for this part.
 ### Fixed
 
 - **Python client 0.13.1 document listing.** Restores the `key_exact` and `ids`

@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/examples/mrtest"
+	"github.com/shiblon/entroq/pkg/eqmr/eqmrtest"
 )
 
 const mapReduceStatsInterval = 10 * time.Millisecond
@@ -40,11 +40,20 @@ func MapReduce(ctx context.Context, t *testing.T, client *entroq.EntroQ, _ strin
 		t.Fatalf("initial MapReduce queue stats: %v", err)
 	}
 
-	resultsOK := mrtest.MRCheckAt(ctx, client, prefix, numDocs, numMappers, numReducers)
+	checkErr := eqmrtest.Check(ctx, client, eqmrtest.Config{
+		Prefix:       prefix,
+		UniqueWords:  100,
+		WordsPerDoc:  200,
+		NumDocs:      numDocs,
+		MapShards:    numDocs,
+		ReduceShards: numReducers,
+		Mappers:      numMappers,
+		Reducers:     numReducers,
+	})
 	cancelStats()
 	statsResult := <-statsDone
-	if !resultsOK {
-		t.Error("MapReduce pipeline returned incorrect results")
+	if checkErr != nil {
+		t.Errorf("MapReduce pipeline: %v", checkErr)
 	}
 	if statsResult.err != nil {
 		t.Errorf("poll MapReduce queue stats: %v", statsResult.err)

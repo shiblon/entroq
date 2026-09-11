@@ -6,8 +6,8 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/examples/mrtest"
 	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
+	"github.com/shiblon/entroq/pkg/eqmr/eqmrtest"
 	"github.com/shiblon/entroq/pkg/testing/eqtest"
 )
 
@@ -17,7 +17,7 @@ import (
 //
 // This is the environment (gRPC + Postgres) where the lost-claim delivery race
 // historically surfaced as ~30s stalls, and it also exercises the doc store
-// heavily (the map phase tracks shard docs by a "shard/N" key range). Both the
+// heavily (the map phase tracks split docs by a "split/N" key range). Both the
 // claim fix and the doc-key byte-order (COLLATE "C") fix are needed for it to
 // complete: a stalled claim would hang the pipeline, and locale-collated doc
 // key ranges would hide the shard docs and end the map phase prematurely.
@@ -57,8 +57,8 @@ func TestMapReduceOverGRPCPostgres(t *testing.T) {
 		numReducers = 3
 	)
 	for i := 1; i <= runs; i++ {
-		if !mrtest.MRCheck(ctx, client, numDocs, numMappers, numReducers) {
-			t.Fatalf("MapReduce run %d/%d failed: a stalled claim or a mishandled doc key range breaks the pipeline (see logs)", i, runs)
+		if err := eqmrtest.QuickCheck(ctx, client, numDocs, numMappers, numReducers); err != nil {
+			t.Fatalf("MapReduce run %d/%d failed (a stalled claim or a mishandled doc key range breaks the pipeline): %v", i, runs, err)
 		}
 	}
 }

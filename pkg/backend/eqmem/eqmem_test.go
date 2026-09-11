@@ -13,7 +13,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/examples/mrtest"
+	"github.com/shiblon/entroq/pkg/eqmr/eqmrtest"
 	"github.com/shiblon/entroq/pkg/testing/eqtest"
 )
 
@@ -162,7 +162,11 @@ func TestEQMemMapReduce_checkSmall(t *testing.T) {
 			t.Fatalf("Open mem client: %v", err)
 		}
 		defer client.Close()
-		return mrtest.MRCheck(ctx, client, ndocs, nm, nr)
+		if err := eqmrtest.QuickCheck(ctx, client, ndocs, nm, nr); err != nil {
+			t.Error(err)
+			return false
+		}
+		return true
 	}
 	if err := quick.Check(check, config); err != nil {
 		t.Fatal(err)
@@ -186,7 +190,11 @@ func TestEQMemMapReduce_checkLarge(t *testing.T) {
 			t.Fatalf("Open mem client: %v", err)
 		}
 		defer client.Close()
-		return mrtest.MRCheck(ctx, client, ndocs, nm, nr)
+		if err := eqmrtest.QuickCheck(ctx, client, ndocs, nm, nr); err != nil {
+			t.Error(err)
+			return false
+		}
+		return true
 	}
 	if err := quick.Check(check, config); err != nil {
 		t.Fatal(err)
@@ -213,7 +221,11 @@ func TestEQMemMapReduce_checkHuge(t *testing.T) {
 			t.Fatalf("Open mem client: %v", err)
 		}
 		defer client.Close()
-		return mrtest.MRCheck(ctx, client, ndocs, nm, nr)
+		if err := eqmrtest.QuickCheck(ctx, client, ndocs, nm, nr); err != nil {
+			t.Error(err)
+			return false
+		}
+		return true
 	}
 	if err := quick.Check(check, config); err != nil {
 		t.Fatal(err)

@@ -273,7 +273,7 @@ class Transaction:
 # Schema version check (sync: runs once at startup)
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = "1.7.1"
+SCHEMA_VERSION = "1.11.0"
 
 _INIT_HINT = (
     "Initialize the database with:\n\n"
