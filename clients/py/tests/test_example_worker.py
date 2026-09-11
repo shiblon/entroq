@@ -8,6 +8,7 @@ import importlib.util
 from pathlib import Path
 
 from entroq.json import EntroQJSON
+from entroq.types import Modification, TaskData
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _EXAMPLE = _REPO_ROOT / "clients" / "py" / "examples" / "worker" / "example_worker.py"
@@ -29,3 +30,30 @@ async def _run(url: str) -> list:
 def test_example_worker_drains_queue(eqmem_url):
     processed = asyncio.run(asyncio.wait_for(_run(eqmem_url), timeout=30))
     assert sorted(processed) == ["task-1", "task-2", "task-3"]
+
+
+async def test_task_move_releases_claim_over_json(eqmem_url):
+    queue = "/test/python-json/move-release"
+    error_queue = queue + "/error"
+    async with EntroQJSON(eqmem_url) as eq:
+        inserted = await eq.modify(Modification(
+            Modification.inserting(TaskData(queue=queue, value="poison")),
+        ))
+        claimed = await eq.try_claim(queue, duration_ms=60_000)
+        assert claimed is not None
+        assert claimed.id == inserted.tasks_inserted[0].id
+
+        before = await eq.time()
+        moved = await eq.modify(Modification(
+            Modification.changing(claimed, queue=error_queue, err="quarantined"),
+        ))
+        after = await eq.time()
+
+        changed = moved.tasks_changed[0]
+        assert changed.queue == error_queue
+        assert changed.claimant == ""
+        assert before <= changed.at <= after
+
+        reclaimed = await eq.try_claim(error_queue, duration_ms=1_000)
+        assert reclaimed is not None
+        assert reclaimed.id == claimed.id

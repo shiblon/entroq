@@ -39,7 +39,7 @@ class TaskChange:
     id: str
     version: int
     queue: str
-    at: Optional[datetime]          # required - set explicitly or copy from Task
+    at: Optional[datetime] = None   # None -> use backend current time and release
     from_queue: str = ''
     value: Any = None
     attempt: int = 0
@@ -67,14 +67,16 @@ class Task:
         """Return a TaskChange for this task with optional field overrides.
 
         from_queue is fixed to the task's current queue (the source); overriding
-        'queue' moves the task to a new destination.
+        'queue' moves the task to a new destination. By default the change is
+        immediately available and releases the claim; pass ``at`` explicitly to
+        renew or defer it.
         """
         return TaskChange(
             id=self.id,
             version=self.version,
             from_queue=self.queue,
             queue=overrides.get('queue', self.queue),
-            at=overrides.get('at', self.at),
+            at=overrides.get('at', None),
             value=overrides.get('value', self.value),
             attempt=overrides.get('attempt', self.attempt),
             err=overrides.get('err', self.err),

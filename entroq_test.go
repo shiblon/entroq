@@ -610,3 +610,31 @@ func containsAll(s string, subs ...string) bool {
 	}
 	return true
 }
+
+func TestRetryOrQuarantineArrival(t *testing.T) {
+	future := time.Now().Add(time.Hour)
+
+	t.Run("retry honors arrival override", func(t *testing.T) {
+		task := &entroq.Task{ID: "task", Version: 1, Queue: "work"}
+		mod := entroq.NewModification("worker",
+			task.RetryOrQuarantine("retry", "errors", 2, entroq.ArrivalTimeTo(future)),
+		)
+		if got := mod.Changes[0].At; !got.Equal(future) {
+			t.Fatalf("retry arrival = %s, want %s", got, future)
+		}
+	})
+
+	t.Run("quarantine forces immediate arrival", func(t *testing.T) {
+		task := &entroq.Task{ID: "task", Version: 1, Queue: "work", Attempt: 1}
+		mod := entroq.NewModification("worker",
+			task.RetryOrQuarantine("failed", "errors", 2, entroq.ArrivalTimeTo(future)),
+		)
+		change := mod.Changes[0]
+		if change.Queue != "errors" {
+			t.Fatalf("quarantine queue = %q, want %q", change.Queue, "errors")
+		}
+		if !change.At.IsZero() {
+			t.Fatalf("quarantine arrival = %s, want zero time", change.At)
+		}
+	})
+}

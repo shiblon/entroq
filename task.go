@@ -458,12 +458,21 @@ func (t *Task) Depend() ModifyArg {
 // to a "quarantine" queue so that it can be analyzed later.
 // If afterMaxAttempts is 0, both it and the quarantineTo queue are ignored and
 // this will only retry.
+// Arrival-time overrides apply while retrying; quarantine always resets the
+// arrival time so the task is released and immediately available for inspection.
 func (t *Task) RetryOrQuarantine(errMsg, quarantineTo string, afterMaxAttempts int32, overrides ...ChangeArg) ModifyArg {
 	args := []ChangeArg{AttemptToNext(), AppendingErr(errMsg)}
-	if quarantineTo != "" && afterMaxAttempts != 0 && t.Attempt+1 >= afterMaxAttempts {
+	quarantining := quarantineTo != "" && afterMaxAttempts != 0 && t.Attempt+1 >= afterMaxAttempts
+	if quarantining {
 		args = append(args, QueueTo(quarantineTo))
 	}
 	args = append(args, overrides...)
+	if quarantining {
+		// A quarantined task is ready for inspection immediately. Force the
+		// default release after overrides so a retry delay cannot leak into the
+		// quarantine disposition.
+		args = append(args, ArrivalTimeTo(time.Time{}))
+	}
 	return t.Change(args...)
 }
 

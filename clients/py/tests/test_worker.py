@@ -331,6 +331,7 @@ def test_worker_move_error_changes_queue():
 
     tc = client.modify_calls[0].task_changes[0]
     assert tc.queue == 'error-queue'
+    assert tc.at is None
     assert 'bad task' in tc.err
 
 
@@ -496,6 +497,7 @@ def test_worker_max_attempts_moves_task():
     assert work_called == []
     tc = client.modify_calls[0].task_changes[0]
     assert tc.queue == 'err'
+    assert tc.at is None
     assert 'max attempts' in tc.err
 
 

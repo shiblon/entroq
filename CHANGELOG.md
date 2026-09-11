@@ -14,6 +14,12 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Service startup version.** PostgreSQL, in-memory, Redis, and SQLite servers
   log their binary version to standard error before startup setup begins.
 
+### Fixed
+
+- **Immediate task quarantine.** Retry exhaustion and Python worker moves reset
+  task arrival to backend time and release the claim, making quarantined tasks
+  immediately available in their error queue.
+
 ## [1.10.3] - 2026-09-09
 
 Go module `v1.10.3`. No PostgreSQL schema changes. The Python client is
