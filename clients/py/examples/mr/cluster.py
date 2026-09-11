@@ -4,8 +4,8 @@ Each worker runs in its own process (multiprocessing 'spawn', so child processes
 start fresh rather than forking the parent's asyncio state) and drives the async
 client with asyncio.run.
 
-Requires a running EntroQ service at the chosen backend (e.g. `eqmem serve` or
-`eqpg serve` on http://localhost:9100 for the json backend).
+Requires an EntroQ service (for example, `eqmem serve` or `eqpg serve`) on
+http://localhost:9100.
 """
 
 import argparse
@@ -16,7 +16,6 @@ import time
 
 from entroq import Modification, TaskData
 from entroq.json import EntroQJSON
-from entroq.experimental.pg import EntroQ as EntroQPostgres
 
 from mr import MapWorker, ReduceWorker
 from chaos import ChaosWorker
@@ -24,12 +23,8 @@ from chaos import ChaosWorker
 logging.basicConfig(level=logging.INFO, format="%(processName)s | %(levelname)s: %(message)s")
 
 
-def get_client(backend: str):
-    if backend == "pg":
-        return EntroQPostgres("host=localhost port=5432 dbname=entroq user=entroq password=entroq")
-    if backend == "json":
-        return EntroQJSON("http://localhost:9100")  # eqpg/eqmem serve JSON+metrics here
-    raise ValueError(f"Unknown backend {backend}")
+def get_client():
+    return EntroQJSON("http://localhost:9100")
 
 
 def wordcount_map(key: str, value: str, emit):
@@ -45,20 +40,20 @@ def wordcount_reduce(key: str, values) -> str:
 
 # Process entry points: each builds its own client and runs the async loop.
 
-def run_mapper(backend, in_q, out_prefix, shards):
-    asyncio.run(MapWorker(get_client(backend), in_q, out_prefix, wordcount_map, shards).work())
+def run_mapper(in_q, out_prefix, shards):
+    asyncio.run(MapWorker(get_client(), in_q, out_prefix, wordcount_map, shards).work())
 
 
-def run_reducer(backend, map_empty_q, in_q, out_q):
-    asyncio.run(ReduceWorker(get_client(backend), map_empty_q, in_q, out_q, wordcount_reduce).work())
+def run_reducer(map_empty_q, in_q, out_q):
+    asyncio.run(ReduceWorker(get_client(), map_empty_q, in_q, out_q, wordcount_reduce).work())
 
 
-def run_chaos(backend, queues):
-    asyncio.run(ChaosWorker(get_client(backend)).work(queues))
+def run_chaos(queues):
+    asyncio.run(ChaosWorker(get_client()).work(queues))
 
 
-async def seed(backend: str, q_map_in: str):
-    client = get_client(backend)
+async def seed(q_map_in: str):
+    client = get_client()
     seed_text = "the quick brown fox jumps over the lazy dog " * 100 + "dog dog dog"
     words = seed_text.split()
     ops = []
@@ -70,8 +65,8 @@ async def seed(backend: str, q_map_in: str):
     logging.info("Seeded %d map tasks into %s", len(ops), q_map_in)
 
 
-async def monitor(backend, prefix, q_map_in, q_reduce_in, procs):
-    client = get_client(backend)
+async def monitor(prefix, q_map_in, q_reduce_in, procs):
+    client = get_client()
     map_procs, reduce_procs, chaos_procs = procs
     while True:
         qs = await client.queues(prefix=prefix)
@@ -93,7 +88,6 @@ async def monitor(backend, prefix, q_map_in, q_reduce_in, procs):
 def main():
     multiprocessing.set_start_method("spawn", force=True)
     parser = argparse.ArgumentParser()
-    parser.add_argument("--backend", choices=["pg", "json"], default="json")
     parser.add_argument("--mappers", type=int, default=3)
     parser.add_argument("--reducers", type=int, default=2)
     parser.add_argument("--chaos", type=int, default=1)
@@ -105,16 +99,16 @@ def main():
     q_reduce_out = f"{prefix}/reduce/output"
 
     logging.info("Seeding data...")
-    asyncio.run(seed(args.backend, q_map_in))
+    asyncio.run(seed(q_map_in))
 
     map_procs = [multiprocessing.Process(
-        target=run_mapper, args=(args.backend, q_map_in, q_reduce_in, args.reducers),
+        target=run_mapper, args=(q_map_in, q_reduce_in, args.reducers),
         name=f"Mapper-{i}") for i in range(args.mappers)]
     reduce_procs = [multiprocessing.Process(
-        target=run_reducer, args=(args.backend, q_map_in, f"{q_reduce_in}/{i}", q_reduce_out),
+        target=run_reducer, args=(q_map_in, f"{q_reduce_in}/{i}", q_reduce_out),
         name=f"Reducer-{i}") for i in range(args.reducers)]
     chaos_procs = [multiprocessing.Process(
-        target=run_chaos, args=(args.backend, [q_map_in]),
+        target=run_chaos, args=([q_map_in],),
         name=f"Chaos-{i}") for i in range(args.chaos)]
 
     procs = map_procs + reduce_procs + chaos_procs
@@ -123,7 +117,7 @@ def main():
         p.start()
 
     try:
-        asyncio.run(monitor(args.backend, prefix, q_map_in, q_reduce_in,
+        asyncio.run(monitor(prefix, q_map_in, q_reduce_in,
                             (map_procs, reduce_procs, chaos_procs)))
     except KeyboardInterrupt:
         pass

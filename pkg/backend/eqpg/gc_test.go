@@ -8,9 +8,35 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/pkg/queues"
 	"github.com/shiblon/entroq/pkg/testing/eqtest"
 )
+
+var retiredSQLProcedures = []string{
+	"entroq.modify(text,jsonb,jsonb,jsonb,jsonb)",
+	"entroq.modify_docs(text,jsonb,jsonb,jsonb,jsonb)",
+	"entroq.queues(text,text[],integer)",
+	"entroq.tasks(text,integer,boolean)",
+	"entroq.docs(text,text,text,integer,boolean)",
+	"entroq.claim_docs(text,text,interval,text)",
+	"entroq.like_prefix(text)",
+	"entroq.gc_collect(text[],timestamptz[],integer)",
+	"entroq.gc_queues()",
+	"entroq.gc_activation(text)",
+	"entroq._path_param_values(text,text)",
+	"entroq.gc_due(text)",
+}
+
+var retiredSQLTypes = []string{
+	"entroq.task_arg",
+	"entroq.doc_arg",
+	"entroq.task_id",
+	"entroq.doc_id",
+}
+
+var retiredSQLIndexes = []string{
+	"entroq.bygcqueueat",
+	"entroq.bycompoundgcqueueat",
+}
 
 // gcTestClient opens an EntroQ client against the shared test database with the
 // GC loop interval overridden (via the unexported test knob), so tests control
@@ -26,60 +52,7 @@ func gcTestClient(ctx context.Context, t *testing.T, gcInterval time.Duration) *
 	return client
 }
 
-// goActivation derives, from the Go parser, a gc=-marked queue's observable
-// state: malformed (present but unparseable) and, when well-formed, whether it is
-// due at now. This is the Go side of the grammar the SQL gc_activation function
-// reimplements.
-func goActivation(qname string, now time.Time) (malformed, due bool) {
-	at, present, err := queues.GCActivation(qname)
-	if !present {
-		return false, false
-	}
-	if err != nil {
-		return true, false // opted in but unparseable
-	}
-	return false, !at.After(now)
-}
-
-// gcGrammarVectors pin the gc= grammar shared by the Go parser
-// (queues.GCActivation) and the SQL gc_activation function. Timestamps are far in
-// the past or future so "due" is unambiguous regardless of the exact current
-// time. This is the single source of truth guarding the two implementations
-// against drift; the Python client relies on the same SQL, so it needs no parser.
-var gcGrammarVectors = []struct {
-	queue          string
-	malformed, due bool
-}{
-	{"/q/gc=0", false, true},                                         // always on
-	{"/q/gc=/leaf", false, true},                                     // empty value => always on
-	{"/q/gc=1", false, true},                                         // unix seconds, 1970
-	{"/q/gc=946684800", false, true},                                 // unix seconds, 2000
-	{"/q/gc=4102444800", false, false},                               // unix seconds, 2100 (future)
-	{"/q/gc=2000-01-01T00:00:00Z", false, true},                      // RFC3339 past
-	{"/q/gc=2999-01-01T00:00:00Z", false, false},                     // RFC3339 future
-	{"/q/gc=2000-01-01T00:00:00.000Z", false, true},                  // JS toISOString, past
-	{"/q/gc=2000-01-01T00:00:00+00:00", false, true},                 // Python aware isoformat, past
-	{"/q/gc=notatime", true, false},                                  // malformed => never collect
-	{"/q/gc=12.5", true, false},                                      // decimal => malformed
-	{"/q/gc=2000-01-01 00:00:00Z", true, false},                      // space separator => malformed (strict)
-	{"/q/gc=2000-01-01", true, false},                                // bare date => malformed (strict)
-	{"/q/gc=2000-01-01T00:00:00", true, false},                       // no timezone => malformed (strict)
-	{"/q/gc=2000-01-01T00:00:00+0000", true, false},                  // colonless offset => malformed (strict)
-	{"/q/sess=abc;gc=0", false, true},                                // compound, gc last
-	{"/q/gc=0;sess=abc", false, true},                                // compound, gc first
-	{"/q/sess=abc;gc=/leaf", false, true},                            // compound empty value
-	{"/q/gc=;sess=abc/leaf", false, true},                            // compound empty value, gc first
-	{"/q/sess=abc;gc=notatime", true, false},                         // compound malformed
-	{"/a/gc=0/b/gc=2999-01-01T00:00:00Z", false, false},              // last wins: future
-	{"/a/gc=2999-01-01T00:00:00Z/b/gc=0", false, true},               // last wins: always on
-	{"/a/gc=2999-01-01T00:00:00Z;sess=a/b/sess=b;gc=0", false, true}, // last compound gc wins
-}
-
-// TestGCGrammarGoMatchesSQL guards against drift between queues.GCActivation
-// (Go) and entroq.gc_activation (SQL): for every vector, malformed-ness (Go err
-// vs SQL NULL) and due-ness (Go !at.After(now) vs SQL activate_at <= now) must
-// agree with each other and with the expected result.
-func TestGCGrammarGoMatchesSQL(t *testing.T) {
+func TestLegacySQLSurfaceRemoved(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -90,108 +63,38 @@ func TestGCGrammarGoMatchesSQL(t *testing.T) {
 		t.Fatalf("open backend: %v", err)
 	}
 	defer b.Close()
-
-	now := time.Now()
-	for _, v := range gcGrammarVectors {
-		var sqlAt sql.NullTime
-		if err := b.DB.QueryRowContext(ctx, "SELECT entroq.gc_activation($1)", v.queue).Scan(&sqlAt); err != nil {
-			t.Fatalf("gc_activation(%q): %v", v.queue, err)
-		}
-		sqlMalformed := !sqlAt.Valid
-		sqlDue := sqlAt.Valid && !sqlAt.Time.After(now)
-
-		goMalformed, goDue := goActivation(v.queue, now)
-
-		if goMalformed != v.malformed || goDue != v.due {
-			t.Errorf("%q: Go malformed=%v due=%v, want malformed=%v due=%v", v.queue, goMalformed, goDue, v.malformed, v.due)
-		}
-		if sqlMalformed != v.malformed || sqlDue != v.due {
-			t.Errorf("%q: SQL malformed=%v due=%v, want malformed=%v due=%v", v.queue, sqlMalformed, sqlDue, v.malformed, v.due)
-		}
-		if goMalformed != sqlMalformed || goDue != sqlDue {
-			t.Errorf("%q: Go/SQL DISAGREE (go m=%v d=%v, sql m=%v d=%v) -- grammar drift",
-				v.queue, goMalformed, goDue, sqlMalformed, sqlDue)
-		}
-	}
+	assertLegacySQLSurfaceRemoved(ctx, t, b.DB)
 }
 
-func TestGCGrammarEscapedMarkersAreLiteral(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	b, err := Open(ctx, pgHostPort,
-		WithDB("postgres"), WithUsername("postgres"), WithPassword("password"),
-		WithConnectAttempts(10), withGCInterval(time.Hour))
-	if err != nil {
-		t.Fatalf("open backend: %v", err)
-	}
-	defer b.Close()
-
-	for _, queue := range []string{
-		`/q/name=value\;gc=0`,
-		`/q/name=value\/gc=0`,
-		`\/gc=0`,
-	} {
-		if _, present, err := queues.GCActivation(queue); err != nil || present {
-			t.Errorf("GCActivation(%q) = (present=%v, err=%v), want absent", queue, present, err)
+func assertLegacySQLSurfaceRemoved(ctx context.Context, t *testing.T, db *sql.DB) {
+	t.Helper()
+	for _, signature := range retiredSQLProcedures {
+		var present bool
+		if err := db.QueryRowContext(ctx, "SELECT to_regprocedure($1) IS NOT NULL", signature).Scan(&present); err != nil {
+			t.Fatalf("look up procedure %q: %v", signature, err)
 		}
-
-		var count int
-		var activation sql.NullTime
-		if err := b.DB.QueryRowContext(ctx,
-			"SELECT cardinality(entroq._path_param_values($1, 'gc')), entroq.gc_activation($1)",
-			queue,
-		).Scan(&count, &activation); err != nil {
-			t.Fatalf("parse %q: %v", queue, err)
-		}
-		if count != 0 || activation.Valid {
-			t.Errorf("SQL parse %q = (count=%d, activation=%v), want absent", queue, count, activation)
+		if present {
+			t.Errorf("retired GC procedure %q is still installed", signature)
 		}
 	}
-}
 
-func TestGCQueuesDiscoversCompoundMarker(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	b, err := Open(ctx, pgHostPort,
-		WithDB("postgres"), WithUsername("postgres"), WithPassword("password"),
-		WithConnectAttempts(10), withGCInterval(time.Hour))
-	if err != nil {
-		t.Fatalf("open backend: %v", err)
-	}
-	defer b.Close()
-
-	compound := "/test/gc-discovery/sess=abc;gc=0"
-	literal := `/test/gc-discovery/name=abc\;gc=0`
-	if _, err := b.DB.ExecContext(ctx, `
-		INSERT INTO tasks (id, queue, at)
-		VALUES ($1, $2, now()), ($3, $4, now())
-	`, entroq.GenHex16(), compound, entroq.GenHex16(), literal); err != nil {
-		t.Fatalf("insert discovery candidates: %v", err)
-	}
-	defer func() {
-		if _, err := b.DB.ExecContext(context.Background(), "DELETE FROM tasks WHERE queue IN ($1, $2)", compound, literal); err != nil {
-			t.Errorf("clean up discovery candidates: %v", err)
+	for _, name := range retiredSQLTypes {
+		var present bool
+		if err := db.QueryRowContext(ctx, "SELECT to_regtype($1) IS NOT NULL", name).Scan(&present); err != nil {
+			t.Fatalf("look up type %q: %v", name, err)
 		}
-	}()
-
-	for _, test := range []struct {
-		queue string
-		want  bool
-	}{
-		{compound, true},
-		{literal, false},
-	} {
-		var found bool
-		if err := b.DB.QueryRowContext(ctx,
-			"SELECT EXISTS (SELECT 1 FROM entroq.gc_queues() WHERE queue = $1)",
-			test.queue,
-		).Scan(&found); err != nil {
-			t.Fatalf("discover %q: %v", test.queue, err)
+		if present {
+			t.Errorf("retired raw-SQL type %q is still installed", name)
 		}
-		if found != test.want {
-			t.Errorf("gc_queues contains %q = %v, want %v", test.queue, found, test.want)
+	}
+
+	for _, name := range retiredSQLIndexes {
+		var present bool
+		if err := db.QueryRowContext(ctx, "SELECT to_regclass($1) IS NOT NULL", name).Scan(&present); err != nil {
+			t.Fatalf("look up index %q: %v", name, err)
+		}
+		if present {
+			t.Errorf("retired GC index %q is still installed", name)
 		}
 	}
 }

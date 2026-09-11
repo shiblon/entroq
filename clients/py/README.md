@@ -4,27 +4,14 @@ Python client for [EntroQ](https://github.com/shiblon/entroq), a fault-tolerant,
 competing-consumer task queue with exactly-once semantics and an atomic
 `Modify` operation over tasks and a companion key/value doc store.
 
-This package provides an async client and a small worker framework. It speaks to
-EntroQ two ways:
-
-- **`EntroQJSON`** — talks to a Go EntroQ server over its HTTP/Connect API. Use
-  this when a server is already running (`eqpg serve`, `eqmem serve`,
-  `eqredis serve`, or `eqsqlite serve`).
-- **`EntroQ`** (in `entroq.experimental.pg`) — talks **directly to PostgreSQL**,
-  no Go server in the path. It uses the same stored procedures the Go `eqpg`
-  backend does, and bundles the canonical schema so a pip-only environment can
-  initialize a database without a Go toolchain. Requires the `pg` extra.
-
-  > **Experimental.** Anything under `entroq.experimental` has no stability
-  > guarantee and may change or be removed in any release, including patches. The
-  > stable, supported path is `EntroQJSON` against a Go server. Pin an exact
-  > version if you depend on the direct client.
+This package provides an async HTTP/Connect client and a small worker framework.
+Run one of the Go services (`eqpg serve`, `eqmem serve`, `eqredis serve`, or
+`eqsqlite serve`) and connect with `EntroQJSON`.
 
 ## Install
 
 ```sh
-pip install entroq            # client + worker (JSON/HTTP)
-pip install "entroq[pg]"      # adds the direct-PostgreSQL backend (psycopg 3)
+pip install entroq
 ```
 
 ## Quick start
@@ -56,23 +43,6 @@ caller-owned client and timeout policy. Injected clients are not closed by
 `eq.aclose()`.
 Transport failures raise `TransportError`, preserving the original exception
 and indicating whether the request is known to be safe to retry.
-
-Talking straight to PostgreSQL instead of a server (experimental, see above):
-
-```python
-from entroq.experimental.pg import EntroQ
-
-async with EntroQ("host=localhost dbname=entroq user=entroq password=secret") as eq:
-    ...
-```
-
-A worker backed by the direct-PostgreSQL client also carries EntroQ's built-in,
-always-on garbage collection for `/gc=`-marked queues on the backend's behalf; a
-worker talking to a Go server does not, since the server collects for itself.
-Set `worker_gc_enabled=False` on the direct client when another process owns
-garbage collection. Ordinary direct-PostgreSQL operations share `eq.pool`; a
-blocking LISTEN claim retains one dedicated connection until it returns or is
-canceled.
 
 ## Documentation
 

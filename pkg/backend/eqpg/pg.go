@@ -556,11 +556,8 @@ func (b *EQPG) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[stri
 
 	var matchFragments []string
 	for _, m := range qq.MatchPrefix {
-		// Escaping lives in the SQL helper (entroq.like_prefix), so the raw prefix
-		// is passed as-is and LIKE metacharacters (%, _, \) in a queue name are
-		// matched literally rather than acting as wildcards.
-		matchFragments = append(matchFragments, fmt.Sprintf(" queue LIKE entroq.like_prefix($%d) ESCAPE '\\'", len(values)+1))
-		values = append(values, m)
+		matchFragments = append(matchFragments, fmt.Sprintf(" queue LIKE $%d ESCAPE '\\'", len(values)+1))
+		values = append(values, likePrefix(m))
 	}
 	for _, m := range qq.MatchExact {
 		matchFragments = append(matchFragments, fmt.Sprintf(" queue = $%d", len(values)+1))
@@ -1249,8 +1246,15 @@ func (b *EQPG) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, er
 		)
 	} else {
 		rows, err = b.DB.QueryContext(ctx,
-			`SELECT namespace, id, version, claimant, at, key_primary, key_secondary, value, created, modified
-			 FROM entroq.docs($1, $2, $3, $4, $5)`,
+			`SELECT namespace, id, version, claimant, at, key_primary, key_secondary,
+			        CASE WHEN $5 THEN NULL::jsonb ELSE value END AS value,
+			        created, modified
+			 FROM entroq.docs
+			 WHERE ($1 = '' OR namespace = $1)
+			   AND ($2 = '' OR key_primary >= $2)
+			   AND ($3 = '' OR key_primary < $3)
+			 ORDER BY namespace, key_primary, key_secondary
+			 LIMIT NULLIF($4, 0)`,
 			rq.Namespace, rq.KeyStart, rq.KeyEnd, rq.Limit, rq.OmitValues,
 		)
 	}
