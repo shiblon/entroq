@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "entroq"
-version = "0.12.4"
+version = "0.13.1"
 authors = [
   { name="Chris Monson", email="shiblon@gmail.com" },
 ]
@@ -27,7 +27,7 @@ classifiers = [
 
 [project.optional-dependencies]
 pg = [
-    "psycopg>=3.1.8",
+    "psycopg[pool]>=3.1.8",
 ]
 dev = [
     "entroq[pg]",

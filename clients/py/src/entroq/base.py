@@ -48,8 +48,12 @@ class EntroQBase(ABC):
         """Attempt to claim a task; returns None immediately if none available."""
 
     @abstractmethod
-    async def claim(self, queue: Union[str, List[str]], duration_ms: int = 30000, poll_ms: int = 5000, timeout_s: Optional[float] = None) -> Task:
-        """Block until a task is available, then claim it."""
+    async def claim(self, queue: Union[str, List[str]], duration_ms: int = 30000, poll_ms: int = 30000, timeout_s: Optional[float] = None) -> Task:
+        """Block until a task is available, then claim it.
+
+        The wait is indefinite unless ``timeout_s`` is supplied or the calling
+        asyncio task is canceled.
+        """
 
     @abstractmethod
     async def modify(self, modification: Modification, *, unsafe_claimant_id: str | None = None) -> ModifyResult:

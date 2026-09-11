@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import secrets
 from collections.abc import Sequence
 from datetime import datetime, timezone
@@ -9,7 +10,7 @@ import httpx
 from .types import (
     Task, TaskData, TaskChange, TaskID,
     Doc, DocData, DocChange, DocID,
-    DependencyError, Modification, ModifyResult,
+    DependencyError, Modification, ModifyResult, TransportError,
 )
 from .base import EntroQBase
 
@@ -113,17 +114,58 @@ def _doc_change_json(c: DocChange) -> dict:
 class EntroQJSON(EntroQBase):
     """EntroQ client talking to the REST/gRPC-gateway API at /api/v0."""
 
-    def __init__(self, base_url: str, claimant_id: str | None = None) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        claimant_id: str | None = None,
+        *,
+        http_client: httpx.AsyncClient | None = None,
+    ) -> None:
+        """Create a JSON client.
+
+        The default HTTP client has no transport deadlines: EntroQ claims are
+        intentionally long-held requests, and mutating requests must not be
+        abandoned merely because a response takes five seconds. Caller task
+        cancellation remains effective. Connection counts retain httpx's bounded
+        defaults, while idle connections live long enough to span the default
+        task-renewal interval.
+
+        An injected ``http_client`` is public and caller-owned; :meth:`aclose`
+        leaves it open. Otherwise ``http`` is created and owned by this client.
+        """
         self._base_url = base_url.rstrip("/")
         self.claimant_id = claimant_id or secrets.token_hex(8)
-        self._http = httpx.AsyncClient()
+        self._owns_http = http_client is None
+        self.http = http_client or httpx.AsyncClient(
+            timeout=None,
+            limits=httpx.Limits(
+                max_connections=100,
+                max_keepalive_connections=20,
+                keepalive_expiry=60.0,
+            ),
+        )
+        # Preserve the former private escape hatch while callers migrate to the
+        # supported public attribute.
+        self._http = self.http
 
     async def aclose(self) -> None:
-        """Close the underlying HTTP connection pool."""
-        await self._http.aclose()
+        """Close the HTTP client created by this EntroQ client, if any."""
+        if self._owns_http:
+            await self.http.aclose()
 
     async def _request(self, method: str, path: str, *, json=None, params=None) -> dict:
-        resp = await self._http.request(method, f"{self._base_url}{path}", json=json, params=params)
+        try:
+            resp = await self.http.request(method, f"{self._base_url}{path}", json=json, params=params)
+        except httpx.TransportError as e:
+            # Connect and pool failures happen before an HTTP request reaches the
+            # service. Read/write/protocol failures are ambiguous: the service may
+            # already have committed a claim or modification.
+            safe_to_retry = isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))
+            raise TransportError(
+                f"{method} {path}: {e}",
+                cause=e,
+                safe_to_retry=safe_to_retry,
+            ) from e
         if not resp.is_success:
             self._raise_for_error(resp)
         if resp.status_code == 204:
@@ -202,17 +244,26 @@ class EntroQJSON(EntroQBase):
         # (zero-valued fields are not omitted), so check the value, not the key.
         return _task_from_json(data["task"]) if data.get("task") is not None else None
 
-    async def claim(self, queue: str | list[str], duration_ms: int = 30000, poll_ms: int = 5000, timeout_s: float | None = None) -> Task:
+    async def claim(self, queue: str | list[str], duration_ms: int = 30000, poll_ms: int = 30000, timeout_s: float | None = None) -> Task:
         queues = [queue] if isinstance(queue, str) else list(queue)
-        data = await self._request("POST", "/api/v0/claim/wait", json={
-            "claimantId": self.claimant_id,
-            "queues": queues,
-            "durationMs": str(duration_ms),
-            "pollMs": str(poll_ms),
-        })
+        async def wait() -> dict:
+            return await self._request("POST", "/api/v0/claim/wait", json={
+                "claimantId": self.claimant_id,
+                "queues": queues,
+                "durationMs": str(duration_ms),
+                "pollMs": str(poll_ms),
+            })
+
+        if timeout_s is None:
+            data = await wait()
+        else:
+            try:
+                data = await asyncio.wait_for(wait(), timeout=timeout_s)
+            except asyncio.TimeoutError as e:
+                raise TimeoutError(f"claim timed out after {timeout_s}s") from e
         if data.get("task") is not None:
             return _task_from_json(data["task"])
-        raise TimeoutError("claim timed out")
+        raise RuntimeError("blocking claim returned without a task")
 
     async def modify(self, modification: Modification, *, unsafe_claimant_id: str | None = None) -> ModifyResult:
         data = await self._request("POST", "/api/v0/modify", json={

@@ -48,17 +48,31 @@ async def main():
 asyncio.run(main())
 ```
 
+The default HTTP client has no transport deadline. Cancel the calling asyncio
+task directly, wrap it in `asyncio.timeout()`, or pass `timeout_s` to `claim()`
+when a bounded wait is required. The client exposes its configured
+`httpx.AsyncClient` as `eq.http`; pass `http_client=` to supply a customized
+caller-owned client and timeout policy. Injected clients are not closed by
+`eq.aclose()`.
+Transport failures raise `TransportError`, preserving the original exception
+and indicating whether the request is known to be safe to retry.
+
 Talking straight to PostgreSQL instead of a server (experimental, see above):
 
 ```python
 from entroq.experimental.pg import EntroQ
 
-eq = EntroQ("host=localhost dbname=entroq user=entroq password=secret")
+async with EntroQ("host=localhost dbname=entroq user=entroq password=secret") as eq:
+    ...
 ```
 
 A worker backed by the direct-PostgreSQL client also carries EntroQ's built-in,
 always-on garbage collection for `/gc=`-marked queues on the backend's behalf; a
 worker talking to a Go server does not, since the server collects for itself.
+Set `worker_gc_enabled=False` on the direct client when another process owns
+garbage collection. Ordinary direct-PostgreSQL operations share `eq.pool`; a
+blocking LISTEN claim retains one dedicated connection until it returns or is
+canceled.
 
 ## Documentation
 

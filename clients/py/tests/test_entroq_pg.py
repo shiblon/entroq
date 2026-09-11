@@ -32,6 +32,16 @@ async def test_db_time(eq: EntroQ):
     assert await eq.time() is not None
 
 
+async def test_ordinary_operations_reuse_pool_connection(eq: EntroQ):
+    """Sequential operations reuse a session instead of reconnecting per poll."""
+    for _ in range(5):
+        assert await eq.time() is not None
+
+    stats = eq.pool.get_stats()
+    assert stats['requests_num'] == 5
+    assert stats['connections_num'] == 1
+
+
 # ---------------------------------------------------------------------------
 # LISTEN/NOTIFY
 # ---------------------------------------------------------------------------
@@ -60,6 +70,19 @@ async def test_claim_unblocks_on_notify(eq: EntroQ):
     elapsed = time.monotonic() - insert_time
     assert len(claimed) == 1
     assert elapsed < 3.0, f'claim() took {elapsed:.2f}s -- NOTIFY may not have fired'
+
+
+async def test_zero_poll_uses_default_instead_of_busy_loop(eq: EntroQ):
+    """Like Go, poll_ms=0 means the default rather than continuous queries."""
+    before = eq.pool.get_stats().get('requests_num', 0)
+
+    with pytest.raises(TimeoutError):
+        await eq.claim('/test/empty', poll_ms=0, timeout_s=0.05)
+
+    requests = eq.pool.get_stats()['requests_num'] - before
+    # A cold pool may spend the timeout establishing its first connection;
+    # either count still proves the claim did not enter a busy polling loop.
+    assert 1 <= requests <= 2
 
 
 # ---------------------------------------------------------------------------

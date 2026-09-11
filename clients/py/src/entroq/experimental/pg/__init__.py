@@ -5,6 +5,7 @@ Requires psycopg >= 3 (psycopg3).
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -16,9 +17,13 @@ from datetime import datetime
 from typing import AsyncIterator
 
 import psycopg
+from psycopg_pool import AsyncConnectionPool, PoolTimeout
 from psycopg.rows import dict_row
 
-from ...types import Task, Doc, DependencyError, Modification, ModifyResult, _DOC_RELEASE_AT
+from ...types import (
+    Task, Doc, DependencyError, Modification, ModifyResult, TransportError,
+    _DOC_RELEASE_AT,
+)
 from ...base import EntroQBase
 
 
@@ -302,29 +307,82 @@ def _check_schema_version(connstr: str) -> None:
 class EntroQ(EntroQBase):
     """EntroQ client that connects directly to PostgreSQL (async)."""
 
-    def __init__(self, connstr: str) -> None:
+    def __init__(self, connstr: str, *, worker_gc_enabled: bool = True) -> None:
         self._connstr = connstr
         self._claimant = str(uuid.uuid4())
+        self.worker_gc_enabled = worker_gc_enabled
         _check_schema_version(connstr)
 
+        # LISTEN claims keep their own dedicated connection. Ordinary operations
+        # share this pool, so each poll no longer opens a new PostgreSQL session.
+        self.pool = AsyncConnectionPool(
+            connstr,
+            min_size=1,
+            max_size=10,
+            kwargs={
+                'autocommit': True,
+                'row_factory': dict_row,
+                'options': _OPTS,
+            },
+            open=False,
+        )
+        self._pool_open = False
+        self._pool_open_lock = asyncio.Lock()
+
+    async def _ensure_pool_open(self) -> None:
+        if self._pool_open:
+            return
+        async with self._pool_open_lock:
+            if not self._pool_open:
+                await self.pool.open(wait=True)
+                self._pool_open = True
+
+    @asynccontextmanager
+    async def _connection(self) -> AsyncIterator[psycopg.AsyncConnection]:
+        try:
+            await self._ensure_pool_open()
+            async with self.pool.connection() as conn:
+                yield conn
+        except PoolTimeout as e:
+            raise TransportError(
+                f'PostgreSQL pool acquisition: {e}',
+                cause=e,
+                safe_to_retry=True,
+            ) from e
+        except psycopg.OperationalError as e:
+            # A connection may disappear after a statement commits but before
+            # its result arrives, so operational errors are conservatively
+            # marked ambiguous.
+            raise TransportError(
+                f'PostgreSQL transport: {e}',
+                cause=e,
+                safe_to_retry=False,
+            ) from e
+
+    async def aclose(self) -> None:
+        """Close the shared PostgreSQL connection pool."""
+        if self._pool_open:
+            await self.pool.close()
+            self._pool_open = False
+
     async def time(self) -> datetime:
-        async with await psycopg.AsyncConnection.connect(self._connstr, autocommit=True, row_factory=dict_row, options=_OPTS) as conn:
+        async with self._connection() as conn:
             row = await (await conn.execute('SELECT now() AS t')).fetchone()
             return row['t']
 
     async def queues(self, prefix: str = '', exact=(), limit: int = 0) -> list[dict]:
-        async with await psycopg.AsyncConnection.connect(self._connstr, autocommit=True, row_factory=dict_row, options=_OPTS) as conn:
+        async with self._connection() as conn:
             cur = await conn.execute('SELECT * FROM queues(%s, %s, %s)', (prefix, list(exact), limit))
             return await cur.fetchall()
 
     async def tasks(self, queue: str = '', limit: int = 0, omit_values: bool = False) -> list[Task]:
-        async with await psycopg.AsyncConnection.connect(self._connstr, autocommit=True, row_factory=dict_row, options=_OPTS) as conn:
+        async with self._connection() as conn:
             cur = await conn.execute('SELECT * FROM tasks(%s, %s, %s)', (queue, limit, omit_values))
             return [_row_to_task(r) for r in await cur.fetchall()]
 
     async def try_claim(self, queue: str | list[str], duration_ms: int = 30000) -> Task | None:
         queues = [queue] if isinstance(queue, str) else list(queue)
-        async with await psycopg.AsyncConnection.connect(self._connstr, autocommit=True, row_factory=dict_row, options=_OPTS) as conn:
+        async with self._connection() as conn:
             cur = await conn.execute(
                 "SELECT * FROM try_claim(%s, %s, %s::interval)",
                 (queues, self._claimant, _pg_interval(duration_ms)),
@@ -332,35 +390,46 @@ class EntroQ(EntroQBase):
             rows = await cur.fetchall()
         return _row_to_task(rows[0]) if rows else None
 
-    async def claim(self, queue: str | list[str], duration_ms: int = 30000, poll_ms: int = 5000, timeout_s: float | None = None) -> Task:
+    async def claim(self, queue: str | list[str], duration_ms: int = 30000, poll_ms: int = 30000, timeout_s: float | None = None) -> Task:
         queues = [queue] if isinstance(queue, str) else list(queue)
         channels = [_pg_channel_name(q) for q in queues]
         deadline = None if timeout_s is None else time.monotonic() + timeout_s
+        # Match the Go service: zero/negative means use its 30-second default,
+        # not a busy poll loop.
+        effective_poll_ms = poll_ms if poll_ms > 0 else 30000
 
-        async with await psycopg.AsyncConnection.connect(self._connstr, autocommit=True, options=_OPTS) as lconn:
-            for ch in channels:
-                await lconn.execute(f'LISTEN "{ch}"')
+        try:
+            async with await psycopg.AsyncConnection.connect(self._connstr, autocommit=True, options=_OPTS) as lconn:
+                for ch in channels:
+                    await lconn.execute(f'LISTEN "{ch}"')
 
-            while True:
-                task = await self.try_claim(queue, duration_ms)
-                if task is not None:
-                    return task
+                while True:
+                    task = await self.try_claim(queue, duration_ms)
+                    if task is not None:
+                        return task
 
-                if deadline is not None and time.monotonic() >= deadline:
-                    raise TimeoutError(f'claim timed out after {timeout_s}s')
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError(f'claim timed out after {timeout_s}s')
 
-                wait = poll_ms / 1000
-                if deadline is not None:
-                    wait = min(wait, deadline - time.monotonic())
+                    wait = effective_poll_ms / 1000
+                    if deadline is not None:
+                        wait = min(wait, deadline - time.monotonic())
 
-                async for _ in lconn.notifies(timeout=wait):
-                    break  # one notification is enough; retry the claim
+                    async for _ in lconn.notifies(timeout=wait):
+                        break  # one notification is enough; retry the claim
+        except psycopg.OperationalError as e:
+            raise TransportError(
+                f'PostgreSQL LISTEN transport: {e}',
+                cause=e,
+                safe_to_retry=False,
+            ) from e
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[Transaction]:
         """Async context manager: runs EntroQ operations and user SQL in one transaction."""
-        async with await psycopg.AsyncConnection.connect(self._connstr, row_factory=dict_row, options=_OPTS) as conn:
-            yield Transaction(conn, self._claimant)
+        async with self._connection() as conn:
+            async with conn.transaction():
+                yield Transaction(conn, self._claimant)
 
     async def modify(self, modification: Modification, *, unsafe_claimant_id: str | None = None) -> ModifyResult:
         async with self.transaction() as txn:
@@ -379,7 +448,7 @@ class EntroQ(EntroQBase):
         # entroq.docs() only accepts the key-range mode, so the id and
         # exact-key modes are queried directly against the table here. Per the
         # query contract, the id mode ignores limit; both honor omit_values.
-        async with await psycopg.AsyncConnection.connect(self._connstr, autocommit=True, row_factory=dict_row, options=_OPTS) as conn:
+        async with self._connection() as conn:
             if ids:
                 cur = await conn.execute(_DOCS_BY_IDS, {'namespace': namespace, 'ids': list(ids), 'omit_values': omit_values})
             elif key_exact:
@@ -392,7 +461,7 @@ class EntroQ(EntroQBase):
             return [_row_to_doc(r) for r in await cur.fetchall()]
 
     async def claim_docs(self, namespace: str, key: str, duration_ms: int = 30000) -> list[Doc]:
-        async with await psycopg.AsyncConnection.connect(self._connstr, autocommit=True, row_factory=dict_row, options=_OPTS) as conn:
+        async with self._connection() as conn:
             try:
                 cur = await conn.execute(
                     "SELECT * FROM claim_docs(%s, %s, %s::interval, %s)",
@@ -419,7 +488,7 @@ class EntroQ(EntroQBase):
         grammar lives entirely in the SQL (``gc_activation``); this client never
         parses it. Feed these rows straight to :meth:`gc_collect`.
         """
-        async with await psycopg.AsyncConnection.connect(self._connstr, autocommit=True, row_factory=dict_row, options=_OPTS) as conn:
+        async with self._connection() as conn:
             rows = await (await conn.execute('SELECT queue, activate_at FROM gc_queues()')).fetchall()
             return [(r['queue'], r['activate_at']) for r in rows]
 
@@ -436,7 +505,7 @@ class EntroQ(EntroQBase):
         Exposed so a direct-PostgreSQL worker can reap on the backend's behalf
         (a Go server GCs itself; a worker talking to it must not).
         """
-        async with await psycopg.AsyncConnection.connect(self._connstr, autocommit=True, row_factory=dict_row, options=_OPTS) as conn:
+        async with self._connection() as conn:
             rows = await (await conn.execute(
                 'SELECT deleted FROM gc_collect(%s::text[], %s::timestamptz[], %s)',
                 (queues, activations, batch),

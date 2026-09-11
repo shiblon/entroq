@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import AsyncIterator, Callable, Awaitable
 
-from .types import Task, Doc, DependencyError, Modification
+from .types import Task, Doc, DependencyError, Modification, TransportError
 from .base import EntroQBase
 
 
@@ -295,13 +296,30 @@ class EntroQWorker:
         err_queue: str = '',
         retry_delay_s: float = 30.0,
         max_attempts: int = 0,
+        retry_transport_errors: bool = True,
+        transport_retry_base_s: float = 1.0,
+        transport_retry_max_s: float = 30.0,
     ) -> None:
+        """Configure a worker.
+
+        Safe, pre-submit claim transport failures retry with full-jitter
+        exponential backoff by default. Ambiguous transport failures and
+        handler exceptions propagate to :meth:`run`'s caller. Set
+        ``retry_transport_errors=False`` when the caller owns all retry policy.
+        """
+        if transport_retry_base_s < 0:
+            raise ValueError("transport_retry_base_s must be non-negative")
+        if transport_retry_max_s < transport_retry_base_s:
+            raise ValueError("transport_retry_max_s must be at least transport_retry_base_s")
         self._client = client
         self._queues = list(queues)
         self._claim_duration_s = claim_duration_s
         self._err_queue = err_queue
         self._retry_delay_s = retry_delay_s
         self._max_attempts = max_attempts
+        self._retry_transport_errors = retry_transport_errors
+        self._transport_retry_base_s = transport_retry_base_s
+        self._transport_retry_max_s = transport_retry_max_s
         self._stop_event = asyncio.Event()
 
     def stop(self) -> None:
@@ -414,7 +432,8 @@ class EntroQWorker:
         self._stop_event.clear()
         gc_task = (
             asyncio.create_task(self._gc_loop())
-            if hasattr(self._client, 'gc_queues')
+            if (hasattr(self._client, 'gc_queues')
+                and getattr(self._client, 'worker_gc_enabled', True))
             else None
         )
         try:
@@ -459,6 +478,7 @@ class EntroQWorker:
                 pass
 
     async def _run_loop(self, handler: Handler) -> None:
+        retry_cap = self._transport_retry_base_s
         while not self._stop_event.is_set():
             # Race claim() against the stop signal so stop() can unblock a
             # claim() that is waiting indefinitely for a task to appear.
@@ -487,10 +507,18 @@ class EntroQWorker:
 
             try:
                 task = claim_task.result()
-            except Exception as e:
-                logging.exception("Claim failed: %s", e)
-                await asyncio.sleep(1)
+            except TransportError as e:
+                if not self._retry_transport_errors or not e.safe_to_retry:
+                    raise
+                delay = random.uniform(0, retry_cap)
+                logging.warning("Claim transport failed; retrying in %.2fs: %s", delay, e)
+                retry_cap = min(self._transport_retry_max_s, max(retry_cap * 2, self._transport_retry_base_s))
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
+                except asyncio.TimeoutError:
+                    pass
                 continue
+            retry_cap = self._transport_retry_base_s
 
             try:
                 if not await self._process(task, handler):
@@ -499,6 +527,3 @@ class EntroQWorker:
                 raise
             except DependencyError as e:
                 logging.warning("Dependency error, continuing: %s", e)
-            except Exception as e:
-                logging.exception("Worker error, retrying after delay: %s", e)
-                await asyncio.sleep(1)

@@ -71,13 +71,17 @@ def pg_connstr():
 
 
 @pytest.fixture
-def eq(pg_connstr):
+async def eq(pg_connstr):
     """Yield a fresh EntroQ client; truncate all test tables before each test."""
     with psycopg.connect(pg_connstr, autocommit=True) as conn:
         conn.execute('TRUNCATE entroq.tasks')
         conn.execute('TRUNCATE entroq.docs')
         conn.execute('TRUNCATE test_counter')
-    yield EntroQ(pg_connstr)
+    client = EntroQ(pg_connstr)
+    try:
+        yield client
+    finally:
+        await client.aclose()
 
 
 def _free_port() -> int:

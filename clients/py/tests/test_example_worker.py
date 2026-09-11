@@ -57,3 +57,18 @@ async def test_task_move_releases_claim_over_json(eqmem_url):
         reclaimed = await eq.try_claim(error_queue, duration_ms=1_000)
         assert reclaimed is not None
         assert reclaimed.id == claimed.id
+
+
+async def _claim_after_old_httpx_timeout(url: str):
+    queue = "/test/python-json/long-poll"
+    async with EntroQJSON(url) as consumer, EntroQJSON(url) as producer:
+        claim = asyncio.create_task(consumer.claim(queue))
+        await asyncio.sleep(5.25)
+        assert not claim.done(), "claim inherited httpx's former five-second read timeout"
+        await producer.modify(Modification(Modification.inserting(TaskData(queue=queue, value="ready"))))
+        return await asyncio.wait_for(claim, timeout=3)
+
+
+def test_json_claim_stays_open_past_httpx_default(eqmem_url):
+    task = asyncio.run(_claim_after_old_httpx_timeout(eqmem_url))
+    assert task.value == "ready"

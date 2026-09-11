@@ -1,6 +1,11 @@
+import asyncio
+import json
+
 import httpx
+import pytest
 
 from entroq.json import EntroQJSON
+from entroq.types import TransportError
 
 
 async def _docs_query(**kwargs) -> httpx.QueryParams:
@@ -11,13 +16,12 @@ async def _docs_query(**kwargs) -> httpx.QueryParams:
         seen.append(request)
         return httpx.Response(200, json={"docs": []})
 
-    eq = EntroQJSON("http://entroq.example")
-    await eq.aclose()  # discard the real pool; swap in the mock transport.
-    eq._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     try:
+        eq = EntroQJSON("http://entroq.example", http_client=http)
         await eq.docs(**kwargs)
     finally:
-        await eq.aclose()
+        await http.aclose()
     return seen[0].url.params
 
 
@@ -54,16 +58,109 @@ async def test_docs_repeats_ids_under_one_prefixed_name():
 
 async def test_aclose_closes_http_client():
     eq = EntroQJSON("http://localhost")
-    assert not eq._http.is_closed
+    assert eq.http is eq._http
+    assert not eq.http.is_closed
+    assert eq.http.timeout.connect is None
+    assert eq.http.timeout.read is None
+    assert eq.http.timeout.write is None
+    assert eq.http.timeout.pool is None
 
     await eq.aclose()
 
-    assert eq._http.is_closed
+    assert eq.http.is_closed
 
 
 async def test_async_context_manager_closes_http_client():
     async with EntroQJSON("http://localhost") as eq:
-        http = eq._http
+        http = eq.http
         assert not http.is_closed
 
     assert http.is_closed
+
+
+async def test_injected_http_client_is_public_and_caller_owned():
+    http = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(204)))
+
+    async with EntroQJSON("http://localhost", http_client=http) as eq:
+        assert eq.http is http
+
+    assert not http.is_closed
+    await http.aclose()
+
+
+async def test_claim_uses_go_poll_default():
+    requests = []
+
+    async def handle(request):
+        requests.append(request)
+        return httpx.Response(200, json={
+            "task": {"id": "t", "queue": "q", "atMs": "0", "createdMs": "0", "modifiedMs": "0"},
+        })
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    try:
+        eq = EntroQJSON("http://localhost", http_client=http)
+        task = await eq.claim("q")
+    finally:
+        await http.aclose()
+
+    assert task.id == "t"
+    assert json.loads(requests[0].content)["pollMs"] == "30000"
+
+
+async def test_claim_can_be_canceled_by_caller():
+    started = asyncio.Event()
+    blocked = asyncio.Event()
+
+    async def handle(_):
+        started.set()
+        await blocked.wait()
+        raise AssertionError("canceled request continued")
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    try:
+        eq = EntroQJSON("http://localhost", http_client=http)
+        claim = asyncio.create_task(eq.claim("q"))
+        await started.wait()
+        claim.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await claim
+    finally:
+        await http.aclose()
+
+
+async def test_claim_optional_timeout_cancels_wait():
+    async def handle(_):
+        await asyncio.Event().wait()
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    try:
+        eq = EntroQJSON("http://localhost", http_client=http)
+        with pytest.raises(TimeoutError, match="after 0.01s"):
+            await eq.claim("q", timeout_s=0.01)
+    finally:
+        await http.aclose()
+
+
+@pytest.mark.parametrize(
+    ("error_type", "safe_to_retry"),
+    [
+        (httpx.ConnectError, True),
+        (httpx.ReadError, False),
+    ],
+)
+async def test_transport_errors_preserve_retry_safety(error_type, safe_to_retry):
+    async def handle(request):
+        raise error_type("broken", request=request)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    try:
+        eq = EntroQJSON("http://localhost", http_client=http)
+        with pytest.raises(TransportError) as raised:
+            await eq.time()
+    finally:
+        await http.aclose()
+
+    assert raised.value.safe_to_retry is safe_to_retry
+    assert isinstance(raised.value.cause, error_type)
+    assert raised.value.__cause__ is raised.value.cause

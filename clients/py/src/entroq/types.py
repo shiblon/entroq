@@ -180,6 +180,22 @@ class DependencyError(Exception):
         })
 
 
+class TransportError(Exception):
+    """Raised when a client could not complete an exchange with its backend.
+
+    ``safe_to_retry`` is true only when the client knows the operation was not
+    submitted. When it is false, the backend may have committed the operation
+    before the connection failed, so callers should not blindly repeat it.
+    The original transport exception is available as ``cause`` and as the
+    exception's ``__cause__``.
+    """
+
+    def __init__(self, message: str, *, cause: Exception, safe_to_retry: bool) -> None:
+        super().__init__(message)
+        self.cause = cause
+        self.safe_to_retry = safe_to_retry
+
+
 # ---------------------------------------------------------------------------
 # Modification and ModifyResult
 # ---------------------------------------------------------------------------

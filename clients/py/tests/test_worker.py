@@ -6,11 +6,13 @@ external services required.
 import asyncio
 from datetime import datetime, timezone, timedelta
 
+import pytest
+
 from entroq.base import EntroQBase
 from entroq.types import (
     Task, TaskID, TaskChange,
     Doc, DocID,
-    DependencyError, Modification, ModifyResult,
+    DependencyError, Modification, ModifyResult, TransportError,
 )
 from entroq.worker import (
     StopWorker, RetryError, MoveError,
@@ -67,7 +69,7 @@ class FakeClient(EntroQBase):
         except asyncio.QueueEmpty:
             return None
 
-    async def claim(self, queue, duration_ms=30000, poll_ms=5000, timeout_s=None):
+    async def claim(self, queue, duration_ms=30000, poll_ms=30000, timeout_s=None):
         return await self._task_q.get()
 
     async def modify(self, modification, *, unsafe_claimant_id=None):
@@ -95,6 +97,20 @@ class FakeClient(EntroQBase):
 
     async def claim_docs(self, namespace, key, duration_ms=30000):
         return [d for d in self._docs if d.namespace == namespace and d.key == key]
+
+
+class ClaimSequenceClient(FakeClient):
+    """Return tasks or raise exceptions from a prescribed claim sequence."""
+
+    def __init__(self, sequence):
+        super().__init__()
+        self._claim_sequence = list(sequence)
+
+    async def claim(self, queue, duration_ms=30000, poll_ms=30000, timeout_s=None):
+        result = self._claim_sequence.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -435,6 +451,119 @@ def test_worker_dep_error_logs_and_continues():
     assert 'tb' in processed
 
 
+def _transport_error(*, safe_to_retry):
+    cause = OSError("network down")
+    return TransportError(
+        "claim transport failed",
+        cause=cause,
+        safe_to_retry=safe_to_retry,
+    )
+
+
+def test_worker_retries_safe_transport_errors_with_full_jitter(monkeypatch):
+    client = ClaimSequenceClient([
+        _transport_error(safe_to_retry=True),
+        _transport_error(safe_to_retry=True),
+        _task(),
+    ])
+    worker = EntroQWorker(
+        client,
+        'q',
+        transport_retry_base_s=1.0,
+        transport_retry_max_s=8.0,
+    )
+    jitter_ranges = []
+
+    def no_wait(lower, upper):
+        jitter_ranges.append((lower, upper))
+        return 0
+
+    monkeypatch.setattr('entroq.worker.random.uniform', no_wait)
+
+    @EntroQWorker.handler
+    async def handle(task, docs):
+        raise StopWorker
+
+    asyncio.run(worker.run(handle))
+    assert jitter_ranges == [(0, 1.0), (0, 2.0)]
+
+
+def test_worker_resets_transport_backoff_after_a_claim(monkeypatch):
+    client = ClaimSequenceClient([
+        _transport_error(safe_to_retry=True),
+        _task(id='first'),
+        _transport_error(safe_to_retry=True),
+        _task(id='last'),
+    ])
+    worker = EntroQWorker(client, 'q')
+    jitter_ranges = []
+    monkeypatch.setattr(
+        'entroq.worker.random.uniform',
+        lambda lower, upper: jitter_ranges.append((lower, upper)) or 0,
+    )
+
+    @EntroQWorker.handler
+    async def handle(task, docs):
+        if task.id == 'last':
+            raise StopWorker
+        return Modification(Modification.deleting(task))
+
+    asyncio.run(worker.run(handle))
+    assert jitter_ranges == [(0, 1.0), (0, 1.0)]
+
+
+def test_worker_propagates_ambiguous_transport_error():
+    error = _transport_error(safe_to_retry=False)
+    client = ClaimSequenceClient([error])
+    worker = EntroQWorker(client, 'q')
+
+    @EntroQWorker.handler
+    async def handle(task, docs):
+        raise AssertionError("handler should not run")
+
+    with pytest.raises(TransportError) as raised:
+        asyncio.run(worker.run(handle))
+    assert raised.value is error
+
+
+def test_worker_can_delegate_safe_transport_retries_to_caller():
+    error = _transport_error(safe_to_retry=True)
+    client = ClaimSequenceClient([error])
+    worker = EntroQWorker(client, 'q', retry_transport_errors=False)
+
+    @EntroQWorker.handler
+    async def handle(task, docs):
+        raise AssertionError("handler should not run")
+
+    with pytest.raises(TransportError) as raised:
+        asyncio.run(worker.run(handle))
+    assert raised.value is error
+
+
+def test_worker_propagates_unexpected_handler_errors():
+    client = FakeClient(tasks=[_task()])
+    worker = EntroQWorker(client, 'q')
+
+    @EntroQWorker.handler
+    async def handle(task, docs):
+        raise RuntimeError("application bug")
+
+    with pytest.raises(RuntimeError, match="application bug"):
+        asyncio.run(worker.run(handle))
+
+
+def test_worker_rejects_invalid_transport_backoff():
+    with pytest.raises(ValueError, match="non-negative"):
+        EntroQWorker(FakeClient(), 'q', transport_retry_base_s=-1)
+    with pytest.raises(ValueError, match="at least"):
+        EntroQWorker(
+            FakeClient(),
+            'q',
+            transport_retry_base_s=2,
+            transport_retry_max_s=1,
+        )
+
+
 def test_worker_finisher_called_when_do_work_returns_none():
     task = _task(id='t1', version=1)
     client = FakeClient(tasks=[task])
@@ -663,6 +792,20 @@ def test_worker_drives_gc_when_capable(monkeypatch):
 
     asyncio.run(drive())
     assert client.gc_calls >= 1
+
+
+def test_worker_can_disable_direct_client_gc():
+    client = GCFakeClient(tasks=[_task()])
+    client.worker_gc_enabled = False
+    worker = EntroQWorker(client, 'q')
+
+    @EntroQWorker.handler
+    async def handle(task, docs):
+        worker.stop()
+        return Modification(Modification.deleting(task))
+
+    asyncio.run(worker.run(handle))
+    assert client.gc_calls == 0
 
 
 def test_gc_loop_tight_drains_full_batches(monkeypatch):

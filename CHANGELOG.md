@@ -13,6 +13,34 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Service startup version.** PostgreSQL, in-memory, Redis, and SQLite servers
   log their binary version to standard error before startup setup begins.
+- **Python client transport controls.** The JSON client exposes its configured
+  `httpx.AsyncClient` as `http` and accepts caller-owned clients; transport
+  failures preserve their cause and distinguish definitely safe retries from
+  ambiguous outcomes. The experimental direct-PostgreSQL client pools ordinary
+  operations and can opt individual workers out of client-driven garbage
+  collection.
+
+### Changed
+
+- **Python worker failure policy.** Claim transport failures known to occur
+  before submission retry with full-jitter exponential backoff. Ambiguous
+  transport failures and unexpected handler exceptions return to the caller
+  instead of entering synchronized fixed-delay retry loops.
+
+### Fixed
+
+- **Python client 0.13.1 document listing.** Restores the `key_exact` and `ids`
+  filters shipped in 0.12.4, including the `query.` field paths required by the
+  HTTP transcoder. Direct PostgreSQL and HTTP clients again expose the same
+  document-listing modes.
+- **Python 0.13.0 package provenance.** Removes the unreleased claimed-document
+  insertion field and PostgreSQL schema 1.11.0 that were accidentally bundled
+  from a feature branch. The experimental PostgreSQL client is realigned with
+  the released service schema, 1.7.1.
+- **Python long-held claims.** Blocking JSON claims no longer inherit httpx's
+  five-second timeout, remain caller-cancelable, and use the Go client's
+  30-second poll default. Direct-PostgreSQL claims use the same default and no
+  longer busy-loop when passed a zero poll interval.
 
 ### Fixed
 
