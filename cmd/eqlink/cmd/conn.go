@@ -28,6 +28,9 @@ import (
 // It backs both the single-instance commands (via localEQ) and "eqlink handoff",
 // which opens two instances symmetrically, so neither endpoint is privileged.
 func openEntroq(ctx context.Context, g *errgroup.Group, label, addr, certF, keyF, caF, tokenFile string) (*entroq.EntroQ, error) {
+	if entroqStartupTimeout <= 0 {
+		return nil, fmt.Errorf("--entroq-startup-timeout must be positive")
+	}
 	tlsCfg, err := loadTLSConfig(certF, keyF, caF)
 	if err != nil {
 		return nil, fmt.Errorf("%s tls: %w", label, err)
@@ -38,21 +41,32 @@ func openEntroq(ctx context.Context, g *errgroup.Group, label, addr, certF, keyF
 	} else {
 		opts = append(opts, eqgrpc.WithInsecure())
 	}
+	// The default gRPC dial returns before the connection is established. A
+	// health check immediately after that races an EntroQ pod starting beside
+	// eqlink, so make startup connection establishment part of this bounded
+	// operation rather than relying on a process supervisor to retry it.
+	opts = append(opts, eqgrpc.WithBlock())
 
 	var eqOpts []entroq.Option
+	var creds *tokenFileCreds
 	if tokenFile != "" {
-		creds, err := newTokenFileCreds(tokenFile)
+		creds, err = newTokenFileCreds(tokenFile)
 		if err != nil {
 			return nil, err
 		}
 		opts = append(opts, eqgrpc.WithDialOpts(grpc.WithPerRPCCredentials(creds)))
 		eqOpts = append(eqOpts, entroq.WithClaimantID(creds.claimant))
-		watchTokenReload(ctx, g, creds)
 	}
 
-	eq, err := entroq.New(ctx, eqgrpc.Opener(addr, opts...), eqOpts...)
+	startupCtx, cancel := context.WithTimeout(ctx, entroqStartupTimeout)
+	defer cancel()
+
+	eq, err := entroq.New(startupCtx, eqgrpc.Opener(addr, opts...), eqOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("%s entroq: %w", label, err)
+	}
+	if tokenFile != "" {
+		watchTokenReload(ctx, g, creds)
 	}
 	return eq, nil
 }

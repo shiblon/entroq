@@ -9,8 +9,16 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- EQLink now waits up to 30 seconds for EntroQ to become healthy at startup,
+  avoiding sidecar/backend pod startup races without adding a polling loop.
+
 ### Added
 
+- **EQLink streaming smoke test.** An opt-in, low-memory k3d harness exercises
+  concurrent duplex streams, process crashes, and EntroQ outage recovery
+  without joining the normal unit-test suite.
 - **Service startup version.** PostgreSQL, in-memory, Redis, and SQLite servers
   log their binary version to standard error before startup setup begins.
 - **Python client transport controls.** The JSON client exposes its configured

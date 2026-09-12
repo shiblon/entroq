@@ -38,6 +38,7 @@ package eqgrpc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -189,13 +190,24 @@ func Opener(addr string, opts ...Option) entroq.BackendOpener {
 		hclient := hpb.NewHealthClient(conn)
 		resp, err := hclient.Check(ctx, &hpb.HealthCheckRequest{})
 		if err != nil {
-			return nil, fmt.Errorf("health check: %w", err)
+			return nil, closeFailedConnection(conn, fmt.Errorf("health check: %w", err))
 		}
 		if st := resp.GetStatus(); st != hpb.HealthCheckResponse_SERVING {
-			return nil, fmt.Errorf("health serving status: %q", st)
+			return nil, closeFailedConnection(conn, fmt.Errorf("health serving status: %q", st))
 		}
-		return New(conn, opts...)
+		backend, err := New(conn, opts...)
+		if err != nil {
+			return nil, closeFailedConnection(conn, err)
+		}
+		return backend, nil
 	}
+}
+
+func closeFailedConnection(conn *grpc.ClientConn, openErr error) error {
+	if err := conn.Close(); err != nil {
+		return errors.Join(openErr, fmt.Errorf("close failed gRPC connection: %w", err))
+	}
+	return openErr
 }
 
 type backend struct {

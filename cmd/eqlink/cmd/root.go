@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/shiblon/entroq/pkg/version"
 	"github.com/shiblon/entroq/pkg/workgateway"
@@ -12,8 +13,9 @@ import (
 )
 
 var (
-	entroqAddr     string
-	authzTokenFile string
+	entroqAddr           string
+	entroqStartupTimeout time.Duration
+	authzTokenFile       string
 
 	certFile string
 	keyFile  string
@@ -61,6 +63,7 @@ func Execute() {
 func init() {
 	pflags := rootCmd.PersistentFlags()
 	pflags.StringVar(&entroqAddr, "entroq", "localhost:37706", "EntroQ gRPC service address.")
+	pflags.DurationVar(&entroqStartupTimeout, "entroq-startup-timeout", 30*time.Second, "How long to wait for EntroQ to become healthy at startup; must be positive.")
 	pflags.StringVar(&authzTokenFile, "authz-token-file", "", "Path to a bearer token file. Read per-RPC; handles k8s projected token rotation.")
 
 	pflags.StringVar(&certFile, "cert", "", "Path to the TLS certificate file.")
