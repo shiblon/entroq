@@ -1,5 +1,9 @@
 # Local Kubernetes mesh benchmark
 
+For the smaller correctness and failure-recovery check, see the
+[EQLink streaming smoke test](eqlink-smoke/README.md). It uses one capped k3d
+server and is separate from these capacity measurements.
+
 This harness compares matched requests through raw Kubernetes HTTP, an
 OPA-authorized direct proxy, one EntroQ mesh hop, and two EntroQ mesh hops. It is
 a small deployment-shaped benchmark with a selectable EntroQ backend, a 1 KiB

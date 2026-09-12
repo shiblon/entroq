@@ -42,8 +42,9 @@ Stale response queues are garbage-collected by the EntroQ server itself, so the
 sidecar runs no GC of its own.
 
 Graceful shutdown on SIGINT/SIGTERM:
-  1. Receiver workers stop claiming new tasks and finish any in-progress handler.
-  2. Sender drains: waits for all in-flight requests to complete.`,
+  1. Receiver workers stop immediately. Active inbound sessions are interrupted;
+     their peers observe an error or liveness timeout and may reconnect.
+  2. Sender drains: waits for locally initiated in-flight requests to complete.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := context.Background()
 
@@ -144,7 +145,7 @@ func init() {
 	flags.StringVar(&upstream, "upstream", "http://localhost:8000", "Upstream service address for the receiver.")
 	flags.IntVar(&concurrency, "concurrency", 1, "Number of concurrent receiver goroutines.")
 	flags.DurationVar(&requestTimeout, "request_timeout", 3*time.Minute, "Maximum silence from the peer EQLink before ending a session; heartbeats are sent every third of this duration.")
-	flags.DurationVar(&drainTimeout, "drain_timeout", 35*time.Second, "How long to wait for in-flight requests to finish on shutdown.")
+	flags.DurationVar(&drainTimeout, "drain_timeout", 35*time.Second, "How long to wait for locally initiated sender requests to finish on shutdown.")
 	flags.BoolVar(&auditLog, "audit-log", false, "Emit structured JSON audit events to stderr for every request mediated (request_enqueued, request_handled, response_received).")
 	flags.DurationVar(&tokenReloadInterval, "token-reload-interval", 5*time.Minute, "How often to stat the --authz-token-file and reload it if changed. Handles k8s projected token rotation.")
 	runCmd.MarkFlagRequired("queue")
