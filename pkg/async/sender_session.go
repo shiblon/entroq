@@ -151,7 +151,7 @@ func (s *senderSession) handleRequestAck(ctx context.Context, task *entroq.Task,
 		}
 		return worker.Modify(task.Delete()).OnSuccess(func(context.Context) error {
 			s.requestCompleted = true
-			_ = s.source.body.Close()
+			s.source.body.Close()
 			s.requestWorkerCancel()
 			return nil
 		}), nil

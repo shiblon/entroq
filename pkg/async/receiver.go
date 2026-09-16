@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"net/http"
 	"path"
-	"sync"
 	"time"
 
 	"github.com/shiblon/entroq"
@@ -260,15 +259,6 @@ func (r *Receiver) runSession(ctx context.Context, start sessionStart) error {
 		return fmt.Errorf("claim connection doc: %w", err)
 	}
 
-	completed := make(chan struct{})
-	var completeOnce sync.Once
-	complete := func() {
-		completeOnce.Do(func() {
-			close(completed)
-			cancel()
-		})
-	}
-
 	socket := newResponseSocket()
 	state := &receiverSessionState{
 		session:       start.session,
@@ -284,8 +274,8 @@ func (r *Receiver) runSession(ctx context.Context, start sessionStart) error {
 		}
 		return nil
 	})
-	g.Go(func() error { return r.runRequestWorkers(gctx, state, socket, complete) })
-	g.Go(func() error { return r.runResponseWorkers(gctx, start, state, socket, complete) })
+	g.Go(func() error { return r.runRequestWorkers(gctx, state, socket, cancel) })
+	g.Go(func() error { return r.runResponseWorkers(gctx, start, state, socket, cancel) })
 	g.Go(func() error {
 		return state.liveness.run(gctx, func() {
 			log.Printf("receiver session %q peer liveness timeout", start.session)
@@ -296,11 +286,6 @@ func (r *Receiver) runSession(ctx context.Context, start sessionStart) error {
 		return err
 	}
 
-	select {
-	case <-completed:
-		return nil
-	default:
-	}
 	if ctx.Err() != nil {
 		return nil
 	}

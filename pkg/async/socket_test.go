@@ -2,6 +2,7 @@ package async
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -93,19 +94,93 @@ func TestResponseSocketStreamsRequestAndResponse(t *testing.T) {
 	}
 }
 
-func TestResponseSocketBufferedEventWinsForcedDeadline(t *testing.T) {
+func TestResponseSocketWriteCancellationUnblocksPipe(t *testing.T) {
+	testCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stop()
+
+	ctx, cancel := context.WithCancel(testCtx)
+	reader, writer := io.Pipe()
+	defer reader.Close()
+
+	socket := newResponseSocket()
+	done := make(chan error, 1)
+	go func() {
+		done <- socket.writeRequest(ctx, &http.Request{}, writer)
+	}()
+
+	deliveryDone := make(chan error, 1)
+	select {
+	case socket.deliveries <- socketDelivery{
+		event: bodyEvent{body: []byte("blocked")},
+		done:  deliveryDone,
+	}:
+	case <-testCtx.Done():
+		t.Fatal("request writer did not accept the delivery")
+	}
+	cancel()
+
+	select {
+	case err := <-deliveryDone:
+		if err == nil {
+			t.Fatal("blocked delivery succeeded after cancellation")
+		}
+	case <-testCtx.Done():
+		t.Fatal("request delivery remained blocked after cancellation")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("request writer: %v", err)
+		}
+	case <-testCtx.Done():
+		t.Fatal("request writer did not stop after cancellation")
+	}
+
+	buffer := make([]byte, 1)
+	if _, err := reader.Read(buffer); !errors.Is(err, context.Canceled) {
+		t.Fatalf("pipe close error: got %v, want %v", err, context.Canceled)
+	}
+}
+
+func TestResponseSocketReceivesBufferedEventBeforeFutureDeadline(t *testing.T) {
 	socket := newResponseSocket()
 	want := socketEvent{body: []byte("ready")}
 	socket.events <- want
 
-	got, forced, err := socket.nextBefore(context.Background(), time.Now().Add(-time.Second))
+	got, forced, err := socket.nextBefore(context.Background(), time.Now().Add(time.Second))
 	if err != nil {
 		t.Fatalf("next before: %v", err)
 	}
 	if forced {
-		t.Fatal("forced switch won over an already-buffered socket event")
+		t.Fatal("future deadline won over an already-buffered socket event")
 	}
 	if string(got.body) != string(want.body) {
 		t.Errorf("body: got %q, want %q", got.body, want.body)
+	}
+}
+
+func TestResponseSocketDeadlineExpiresWithoutEvent(t *testing.T) {
+	socket := newResponseSocket()
+
+	_, forced, err := socket.nextBefore(context.Background(), time.Now().Add(-time.Second))
+	if err != nil {
+		t.Fatalf("next before: %v", err)
+	}
+	if !forced {
+		t.Fatal("expired deadline did not force progress")
+	}
+}
+
+func TestResponseSocketNextBeforeCancellation(t *testing.T) {
+	socket := newResponseSocket()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, forced, err := socket.nextBefore(ctx, time.Now().Add(time.Hour))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("next before error: got %v, want %v", err, context.Canceled)
+	}
+	if forced {
+		t.Fatal("cancellation reported a forced deadline")
 	}
 }

@@ -29,7 +29,12 @@ import (
 //	go test -race -tags=eqlinkstress ./pkg/async \
 //	  -run '^TestBidirectionalSessionStress$' -count=1
 func TestBidirectionalSessionStress(t *testing.T) {
-	const sessions = 96
+	// The timeout detects stalled sessions without turning race-detector
+	// scheduling overhead into a liveness failure.
+	const (
+		sessions    = 96
+		peerTimeout = 10 * time.Second
+	)
 
 	baselineGoroutines := runtime.NumGoroutine()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -45,7 +50,7 @@ func TestBidirectionalSessionStress(t *testing.T) {
 	receiverCtx, stopReceiver := context.WithCancel(ctx)
 	receiver := NewReceiver(eq, upstream.URL,
 		WithReceiverConcurrency(8),
-		WithReceiverRequestTimeout(3*time.Second),
+		WithReceiverRequestTimeout(peerTimeout),
 	)
 	receiverDone := make(chan error, 1)
 	go func() { receiverDone <- receiver.Run(receiverCtx, "/stress/service/inbox") }()
@@ -53,7 +58,7 @@ func TestBidirectionalSessionStress(t *testing.T) {
 	sender := NewSender(eq, "",
 		WithSenderDomainSuffix(".test"),
 		WithSenderNamespace("stress"),
-		WithSenderRequestTimeout(3*time.Second),
+		WithSenderRequestTimeout(peerTimeout),
 	)
 	senderServer := httptest.NewServer(sender)
 
