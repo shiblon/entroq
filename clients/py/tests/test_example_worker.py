@@ -5,10 +5,11 @@ The server comes from the ``eqmem_url`` fixture in conftest.py.
 """
 import asyncio
 import importlib.util
+import uuid
 from pathlib import Path
 
 from entroq.json import EntroQJSON
-from entroq.types import Modification, TaskData
+from entroq.types import DocData, Modification, TaskData
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _EXAMPLE = _REPO_ROOT / "clients" / "py" / "examples" / "worker" / "example_worker.py"
@@ -72,3 +73,35 @@ async def _claim_after_old_httpx_timeout(url: str):
 def test_json_claim_stays_open_past_httpx_default(eqmem_url):
     task = asyncio.run(_claim_after_old_httpx_timeout(eqmem_url))
     assert task.value == "ready"
+
+
+async def test_json_docs_filters_against_live_server(eqmem_url):
+    """Exercise the nested DocQuery field paths against real transcoding.
+
+    Recovered from a 2026-09-11 stash. Client-side field-path construction can
+    fail silently -- a wrong or missing nested name yields an empty filter
+    rather than an error -- so these paths are only worth testing against a
+    real server.
+    """
+    ns = f"live-{uuid.uuid4().hex}"
+    async with EntroQJSON(eqmem_url) as eq:
+        res = await eq.modify(Modification(*[
+            Modification.inserting(DocData(
+                namespace=ns, key=key, secondary_key=sub, content={'k': key},
+            ))
+            for key, sub in (('a', '1'), ('b', '1'), ('b', '2'), ('c', '1'))
+        ]))
+        assert len(res.docs_inserted) == 4
+
+        await eq.docs()  # An unfiltered request must reach the server.
+        listed = await eq.docs(namespace=ns)
+        exact = await eq.docs(namespace=ns, key_exact='b')
+        by_id = await eq.docs(namespace=ns, ids=[listed[0].id, listed[3].id])
+
+        assert [(d.key, d.secondary_key) for d in listed] == [
+            ('a', '1'), ('b', '1'), ('b', '2'), ('c', '1'),
+        ]
+        assert [(d.key, d.secondary_key) for d in exact] == [
+            ('b', '1'), ('b', '2'),
+        ]
+        assert [d.id for d in by_id] == [listed[0].id, listed[3].id]
