@@ -18,6 +18,9 @@ import (
 // into memory; a run whose output does not fit should read partitions
 // individually with ResultsForPartition instead.
 func (c *Controller) Results(ctx context.Context) ([]*KV, error) {
+	if err := c.requireCompletedRun(ctx); err != nil {
+		return nil, fmt.Errorf("eqmr results: %w", err)
+	}
 	docs, err := c.client.Docs(ctx, &entroq.DocQuery{
 		Namespace: c.DocNS(),
 		KeyStart:  resultPrefix,
@@ -48,6 +51,9 @@ func (c *Controller) ResultsForPartition(ctx context.Context, p int) ([]*KV, err
 	if p < 0 {
 		return nil, fmt.Errorf("eqmr results: negative partition %d", p)
 	}
+	if err := c.requireCompletedRun(ctx); err != nil {
+		return nil, fmt.Errorf("eqmr results partition %d: %w", p, err)
+	}
 	docs, err := c.client.Docs(ctx, &entroq.DocQuery{
 		Namespace: c.DocNS(),
 		KeyExact:  resultDocKey(p),
@@ -63,6 +69,21 @@ func (c *Controller) ResultsForPartition(ctx context.Context, p int) ([]*KV, err
 		return nil, fmt.Errorf("eqmr results partition %d: parse: %w", p, err)
 	}
 	return out, nil
+}
+
+func (c *Controller) requireCompletedRun(ctx context.Context) error {
+	phase, reason, err := c.Status(ctx)
+	if err != nil {
+		return err
+	}
+	switch phase {
+	case PhaseDone:
+		return nil
+	case PhaseFailed:
+		return fmt.Errorf("run failed: %s", reason)
+	default:
+		return fmt.Errorf("run is in %q phase, not %q", phase, PhaseDone)
+	}
 }
 
 // mergeKVRuns merges key-sorted runs into one key-sorted slice. Partitions are
@@ -163,6 +184,9 @@ type RunOptions struct {
 
 	// Combiner, if set, is applied by every mapper.
 	Combiner Combiner
+	// IntermediateRunBytes bounds each mapper's in-memory sorting buffer.
+	// Non-positive values use DefaultIntermediateRunBytes.
+	IntermediateRunBytes int
 }
 
 // Run performs a whole MapReduce in this process: Setup, then mapper, reducer,
@@ -204,6 +228,9 @@ func (c *Controller) Run(ctx context.Context, input []*KV, mapFn Mapper, reduceF
 	var mapperOpts []MapperOption
 	if opts.Combiner != nil {
 		mapperOpts = append(mapperOpts, WithCombiner(opts.Combiner))
+	}
+	if opts.IntermediateRunBytes > 0 {
+		mapperOpts = append(mapperOpts, WithIntermediateRunBytes(opts.IntermediateRunBytes))
 	}
 
 	for range opts.Mappers {

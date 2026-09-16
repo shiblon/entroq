@@ -3,21 +3,14 @@ package eqmr
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"sort"
+	"log"
 	"time"
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/worker"
 )
-
-// keyValues is one intermediate key with all of its values from a single map
-// split. A map-output doc holds a slice of these, sorted by key, which is what makes
-// the reducer's merge a linear k-way merge rather than a full sort.
-type keyValues struct {
-	Key    string   `json:"key"`
-	Values []string `json:"values"`
-}
 
 // reduceClaim is the value of a reduce task: one partition of the shuffle.
 type reduceClaim struct {
@@ -170,29 +163,38 @@ func splitInput(input []*KV, n int) [][]*KV {
 type MapperOption func(*mapperOpts)
 
 type mapperOpts struct {
-	combiner Combiner
+	combiner             Combiner
+	intermediateRunBytes int
 }
 
-// WithCombiner applies a Combiner to each key's values before they are written
-// to map-output docs. This is the cheapest place to combine and usually the most
-// effective, because it shrinks the data before it is ever stored. See Combiner
-// for the contract it must satisfy.
+// WithCombiner applies a Combiner to each bounded sorted run before it is
+// stored. A split may produce multiple runs, so the Combiner contract permits
+// repeated application. See Combiner.
 func WithCombiner(cb Combiner) MapperOption {
 	return func(o *mapperOpts) { o.combiner = cb }
+}
+
+// WithIntermediateRunBytes bounds the mapper memory used to sort one batch of
+// intermediate records before writing an immutable run. Non-positive values
+// use DefaultIntermediateRunBytes. A single record may exceed the bound.
+func WithIntermediateRunBytes(n int) MapperOption {
+	return func(o *mapperOpts) { o.intermediateRunBytes = n }
 }
 
 // MapperWorker returns a worker that consumes input splits. Run it with
 // RunOptions, or use the Run helper for the standard configuration.
 //
-// The worker claims its split doc before working, and commits the split doc's
-// deletion in the same Modify that writes its map-output docs. That single atomic
-// step is what makes "no split docs remain" a sound completion barrier.
+// The worker reads its split without claiming it, writes immutable run payloads,
+// then commits the split deletion in the same Modify that publishes their
+// pointer docs. That atomic publication makes "no split docs remain" a sound
+// completion barrier.
 func (c *Controller) MapperWorker(mapFn Mapper, opts ...MapperOption) *worker.Worker[docRef] {
 	o := new(mapperOpts)
 	for _, opt := range opts {
 		opt(o)
 	}
 
+	store := c.intermediateStore()
 	return worker.New[docRef](c.client,
 		worker.WithErrQMap[docRef](c.errQMap),
 		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, ref docRef, _ []*entroq.Doc) (*worker.Result, error) {
@@ -222,50 +224,47 @@ func (c *Controller) MapperWorker(mapFn Mapper, opts ...MapperOption) *worker.Wo
 				return nil, worker.MoveErrorf("parse split doc %q: %v", ref.Key, err)
 			}
 
-			grouped, order, err := runMapper(ctx, mapFn, split)
-			if err != nil {
-				return nil, err
-			}
-			if o.combiner != nil {
-				for _, k := range order {
-					combined, err := o.combiner(ctx, k, grouped[k])
-					if err != nil {
-						return nil, fmt.Errorf("combine %q: %w", k, err)
-					}
-					grouped[k] = combined
-				}
-			}
-
 			// The partition count comes from the task, not from this process's
 			// configuration, so a mapper deployment cannot disagree with the
 			// run it is serving.
 			if ref.ReduceShards <= 0 {
 				return nil, worker.MoveErrorf("map task for %q carries no partition count", ref.Key)
 			}
-			buckets := partition(grouped, order, ref.ReduceShards)
+			sink := newIntermediateSink(store, ref.ReduceShards, o.intermediateRunBytes, o.combiner)
+			if err := runMapper(ctx, mapFn, split, sink); err != nil {
+				abortIntermediate(ctx, sink, ref.Key)
+				return nil, err
+			}
+			runs, err := sink.finish(ctx)
+			if err != nil {
+				abortIntermediate(ctx, sink, ref.Key)
+				return nil, err
+			}
 
 			// doc.Delete() is pinned to the version read above, so this whole
 			// modification is rejected if another worker committed the same
-			// split first. Rejection is atomic: the losing worker's map-output docs
-			// are never written, so a race costs duplicated compute and nothing
-			// else.
+			// split first. Run payloads are durable already, while the pointer docs
+			// below are published atomically with this deletion. A losing worker
+			// removes its unpublished payloads in OnDependency.
 			modArgs := []entroq.ModifyArg{task.Delete(), doc.Delete()}
-			for p, entries := range buckets {
-				if len(entries) == 0 {
-					continue
-				}
+			for _, run := range runs {
 				modArgs = append(modArgs, entroq.PuttingDocInto(c.DocNS(),
-					// No secondary key. A reducer takes a whole partition in
-					// one ClaimDocs, the merge is order-independent, and the
-					// reducer sorts values itself, so nothing here needs the
-					// intra-group ordering a secondary key provides.
-					entroq.WithKeys(mapOutDocKey(p), ""),
-					entroq.WithContent(entries),
+					entroq.WithKeys(mapOutDocKey(run.Partition), ""),
+					entroq.WithContent(run),
 				))
 			}
-			return worker.Modify(modArgs...).OnDependency(lostRace), nil
+			return worker.Modify(modArgs...).OnDependency(func(ctx context.Context, de *entroq.DependencyError) error {
+				abortIntermediate(ctx, sink, ref.Key)
+				return lostRace(ctx, de)
+			}), nil
 		}),
 	)
+}
+
+func abortIntermediate(ctx context.Context, sink *intermediateSink, split string) {
+	if err := sink.abort(ctx); err != nil {
+		log.Printf("eqmr: clean up unpublished runs for split %q: %v", split, err)
+	}
 }
 
 // lostRace is the disposition for a commit that failed on a dependency.
@@ -302,12 +301,9 @@ func lostRace(_ context.Context, de *entroq.DependencyError) error {
 	}
 }
 
-// runMapper runs mapFn over every KV in a split, collecting emitted pairs
-// grouped by key and remembering first-emit order for deterministic bucketing.
-func runMapper(ctx context.Context, mapFn Mapper, split []*KV) (map[string][]string, []string, error) {
-	grouped := make(map[string][]string)
-	var order []string
-
+// runMapper streams every emitted record into sink. sink cuts sorted durable
+// runs as its memory threshold is reached.
+func runMapper(ctx context.Context, mapFn Mapper, split []*KV, sink *intermediateSink) error {
 	// Validate at the point of emission, so a bad pair names the mapper call
 	// that produced it.
 	//
@@ -321,47 +317,24 @@ func runMapper(ctx context.Context, mapFn Mapper, split []*KV) (map[string][]str
 		if err := ValidateText(fmt.Sprintf("value emitted for key %q", k), v); err != nil {
 			return worker.MoveErrorf("%v", err)
 		}
-		if _, seen := grouped[k]; !seen {
-			order = append(order, k)
-		}
-		grouped[k] = append(grouped[k], v)
-		return nil
+		return sink.write(ctx, k, "", v)
 	}
 
 	for _, kv := range split {
 		if err := mapFn(ctx, kv.Key, kv.Value, emit); err != nil {
-			return nil, nil, fmt.Errorf("map %s: %w", kv, err)
+			return fmt.Errorf("map %s: %w", kv, err)
 		}
 	}
-	return grouped, order, nil
+	return sink.err
 }
-
-// partition assigns each key to a reduce shard and returns per-shard entries
-// sorted by key, which is the precondition for the reducer's merge.
-func partition(grouped map[string][]string, order []string, shards int) [][]*keyValues {
-	buckets := make([][]*keyValues, shards)
-	for _, key := range order {
-		p := ShardForKey(key, shards)
-		vals := grouped[key]
-		sortValues(vals)
-		buckets[p] = append(buckets[p], &keyValues{Key: key, Values: vals})
-	}
-	for _, entries := range buckets {
-		sort.Slice(entries, func(i, j int) bool { return entries[i].Key < entries[j].Key })
-	}
-	return buckets
-}
-
-func sortValues(vals []string) { sort.Strings(vals) }
 
 // ReducerWorker returns a worker that consumes one reduce partition per task.
 //
-// It claims every map-output doc sharing the partition's primary key in a single
-// ClaimDocs, merges those sorted runs, runs reduceFn once per distinct key, and
-// commits the map output deletions together with the partition's result doc. As in
-// the map phase, that atomicity is what makes "no map-output docs remain" a sound
-// barrier.
+// It reads every map-output pointer for the partition, heap-merges the referenced
+// sorted runs, runs reduceFn once per distinct key, and commits the pointer
+// deletions together with the partition's result doc.
 func (c *Controller) ReducerWorker(reduceFn Reducer) *worker.Worker[reduceClaim] {
+	store := c.intermediateStore()
 	return worker.New[reduceClaim](c.client,
 		worker.WithErrQMap[reduceClaim](c.errQMap),
 		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, rc reduceClaim, _ []*entroq.Doc) (*worker.Result, error) {
@@ -398,30 +371,25 @@ func (c *Controller) ReducerWorker(reduceFn Reducer) *worker.Worker[reduceClaim]
 					OnDependency(lostRace), nil
 			}
 
-			runs := make([][]*keyValues, 0, len(docs))
+			runs := make([]intermediateRun, 0, len(docs))
 			for _, d := range docs {
-				var entries []*keyValues
-				if err := json.Unmarshal(d.Content, &entries); err != nil {
-					return nil, worker.MoveErrorf("parse map-output doc %q: %v", d.ID, err)
+				var run intermediateRun
+				if err := json.Unmarshal(d.Content, &run); err != nil {
+					return nil, worker.MoveErrorf("parse map-output pointer %q: %v", d.ID, err)
 				}
-				runs = append(runs, entries)
+				if run.Partition != rc.Partition {
+					return nil, worker.MoveErrorf("map-output pointer %q names partition %d, want %d", d.ID, run.Partition, rc.Partition)
+				}
+				runs = append(runs, run)
 			}
 
-			var out []*KV
-			err = mergeRuns(runs, func(key string, values []string) error {
-				// Values arrive as the concatenation of per-split runs, each
-				// internally sorted. Sorting again makes a key's reduce input
-				// independent of split count and combine order, so results are
-				// reproducible across differently sharded runs of the same input.
-				sortValues(values)
-				result, err := reduceFn(ctx, &sliceInput{key: key, values: values})
-				if err != nil {
-					return fmt.Errorf("reduce %q: %w", key, err)
-				}
-				out = append(out, NewKV(key, result))
-				return nil
-			})
+			merged, err := openMergedIntermediate(ctx, store, runs)
 			if err != nil {
+				return nil, fmt.Errorf("open partition %d: %w", rc.Partition, err)
+			}
+			out, reduceErr := reduceIntermediate(ctx, merged, reduceFn)
+			closeErr := merged.Close()
+			if err := errors.Join(reduceErr, closeErr); err != nil {
 				return nil, err
 			}
 
@@ -438,6 +406,28 @@ func (c *Controller) ReducerWorker(reduceFn Reducer) *worker.Worker[reduceClaim]
 	)
 }
 
+func reduceIntermediate(ctx context.Context, merged *mergedIntermediate, reduceFn Reducer) ([]*KV, error) {
+	stream := newGroupedIntermediate(ctx, merged)
+	var out []*KV
+	for {
+		input, ok := stream.nextGroup()
+		if !ok {
+			if stream.err != nil {
+				return nil, fmt.Errorf("read intermediate records: %w", stream.err)
+			}
+			return out, nil
+		}
+		result, err := reduceFn(ctx, input)
+		if err != nil {
+			return nil, fmt.Errorf("reduce %q: %w", input.Key(), err)
+		}
+		if err := input.drain(); err != nil {
+			return nil, fmt.Errorf("drain reduce input %q: %w", input.Key(), err)
+		}
+		out = append(out, NewKV(input.Key(), result))
+	}
+}
+
 // resultInsert builds the insert for one partition's output. The explicit
 // document id is what stops two racing workers from both recording a result.
 func (c *Controller) resultInsert(partition int, out []*KV) entroq.ModifyArg {
@@ -445,40 +435,4 @@ func (c *Controller) resultInsert(partition int, out []*KV) entroq.ModifyArg {
 		entroq.WithIDKeys(resultDocID(partition), resultDocKey(partition), ""),
 		entroq.WithContent(out),
 	)
-}
-
-// mergeRuns performs a k-way merge over runs that are each sorted by key,
-// calling visit once per distinct key with every value for it, in key order.
-//
-// Cursor-per-run with a linear minimum scan is O(k) per key. With k equal to
-// the number of map splits that is comfortably cheaper than the reduce work
-// itself; swapping in a heap becomes worthwhile only once map outputs are read
-// lazily rather than unmarshaled up front.
-func mergeRuns(runs [][]*keyValues, visit func(key string, values []string) error) error {
-	cursors := make([]int, len(runs))
-	for {
-		minKey, have := "", false
-		for i, run := range runs {
-			if cursors[i] >= len(run) {
-				continue
-			}
-			if k := run[cursors[i]].Key; !have || k < minKey {
-				minKey, have = k, true
-			}
-		}
-		if !have {
-			return nil
-		}
-
-		var values []string
-		for i, run := range runs {
-			for cursors[i] < len(run) && run[cursors[i]].Key == minKey {
-				values = append(values, run[cursors[i]].Values...)
-				cursors[i]++
-			}
-		}
-		if err := visit(minKey, values); err != nil {
-			return err
-		}
-	}
 }

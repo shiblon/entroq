@@ -20,7 +20,7 @@ each role scales independently:
               |  (scale N)    |      | (scale to R)  |       | (scale 1..k)  |
               +---------------+      +---------------+       +---------------+
                       |                      |                       |
-   docs:  split/NNNNNN  ->  mapout/NNNNNN  ->  result/NNNNNN
+   docs:  split/NNNNNN  ->  run/... + mapout/NNNNNN  ->  result/NNNNNN
 ```
 
 One process does `Setup` to write the splits and create the control task. After
@@ -64,25 +64,29 @@ reporting, because a mapper commits once at the end of its split, so finer
 granularity comes from cutting smaller splits rather than from progress
 messages.
 
-Both barriers are sound for the same reason: a worker deletes its input doc in
-the *same* `Modify` that writes its output docs. So "no split docs remain"
-atomically implies "every map-output doc exists". No coordinator state is required,
-and a worker that dies mid-task simply loses its claim.
+Mappers write immutable run payloads first, then delete the split doc in the
+*same* `Modify` that publishes map-output pointers. So "no split docs remain"
+atomically implies every map output is durable and reachable. No coordinator
+state is required, and a worker that dies mid-task simply loses its claim.
 
 ## Shuffle
 
-Mappers assign each intermediate key to one of the run's reduce partitions
-by `ShardForKey`, and write one map-output doc per non-empty partition, keyed
-`mapout/<partition>`. A reducer claims a whole partition in one `ClaimDocs`,
-merges the per-split sorted runs, and reduces each key once.
+Mappers assign each intermediate key to one of the run's reduce partitions by
+`ShardForKey`. They buffer up to `DefaultIntermediateRunBytes`, sort records by
+primary key, secondary key, and value, and write immutable runs. Document-backed
+runs are themselves split into bounded ordered chunks, so a reader holds only
+its current chunk. `WithIntermediateRunBytes` changes the mapper bound.
 
-Map-output docs carry **no secondary key**, on purpose. A secondary key keeps subsets
-of a primary-key group located together; it does not define the group. Here the
-group is the whole partition, taken in one `ClaimDocs`, and it has no subset that
-needs co-locating: the merge is order-independent and the reducer sorts values
-itself. The field is left free rather than filled with something nothing reads,
-so a later job-specific use (MapReduce's classic one being secondary sort) still
-has it.
+Each durable run gets a small pointer document keyed `mapout/<partition>`. The
+pointer becomes visible in the same atomic modification that deletes the input
+split. Reducers read those pointers, open the runs, and use a heap merge to feed
+one primary-key group at a time through `ReducerInput`.
+
+The storage record is `(primary key, secondary key, value)`. The current Mapper
+API fills the secondary key with the empty string. It remains a real sort
+dimension in the storage format for a later source or mapper API that exposes
+secondary sort. EntroQ document secondary keys organize pointer documents and
+do not carry record secondary keys.
 
 That makes reduce work proportional to the partition count, not to the number of
 distinct keys.
@@ -105,8 +109,9 @@ wrong, silently; there is one writer instead, and no way to disagree.
 ## Combiners
 
 A `Combiner` differs from a `Reducer` in the way that matters: its output has
-the same type as its input, so it is closed over its own output and can run more
-than once, at more than one stage. It must satisfy
+the same type as its input, so it is closed over its own output. A mapper applies
+it independently to each bounded run, which means it may run several times
+within one split. It must satisfy
 
 ```
 C(C(a) ++ C(b))  ==  C(a ++ b)
@@ -150,9 +155,9 @@ killing a worker repeatedly over input that cannot succeed.
 
 Workers **read** their input document; they do not claim it. Exclusion happens
 when they commit, through a version-pinned delete of that document. So two
-workers may process the same unit at once, and the first to commit wins: the
-loser's whole modification is rejected atomically, its output is never written,
-and it costs duplicated compute and nothing else.
+workers may process the same unit at once, and the first to commit wins. Both
+may write immutable payloads, but only the winner publishes pointers. The loser
+deletes its unpublished payloads after the rejected commit.
 
 That makes the classic backup-task strategy available. Insert a second task for a
 unit that has been in flight too long and the two race, rather than the duplicate
@@ -221,19 +226,18 @@ wrong for intermediates.
 
 ## Known limits
 
-- A split doc holds all of its input KVs in one value, and a map-output doc holds one
-  partition's output from one split. Both must fit the backend message size
-  limit (10MB by default for the gRPC service).
-- A reducer holds an entire partition in memory. **`ReduceShards` is the knob
-  for this**: more partitions means smaller ones. A merger worker would not
-  help, because `ClaimDocs` returns document content and `DocClaim` has no
-  `OmitValues`, so claiming a partition materializes all of it either way.
-- The `Combiner` runs only within a split. Values for one key emitted by
-  different splits accumulate untouched until the reducer. A merger worker that
-  combined map-output documents across splits, concurrently with the map phase, would
-  close that gap and cut intermediate volume; it is worth doing for throughput
-  and map output size, but not as a memory bound. Inserting a new map output into a
-  partition whose documents are claimed does work (doc inserts use generated
-  IDs, and only an explicit-ID collision is rejected), so such a merger can run
-  alongside mappers safely.
+- A split doc holds all of its input KVs in one value and must fit the backend
+  message-size limit (10MB by default for the gRPC service).
+- Mapper memory is bounded by `IntermediateRunBytes`, except for a single record.
+  The document store keeps each physical run chunk below 64KiB by the same
+  estimate. A single oversized record still has to fit the backend limit.
+- A reducer holds one current chunk per input run plus the whole result partition.
+  Many small runs increase heap and reader memory; a later map-phase merger can
+  reduce that fan-in. Result output remains one document per reduce partition.
+- A mapper publishes one pointer document per run in its final atomic `Modify`.
+  Extreme map expansion or an unusually small run limit can make that metadata
+  modification reach the backend message-size limit; a map-phase merger will
+  also reduce this fan-in.
+- A Combiner works within each mapper run. Values for one key emitted into
+  different runs or splits reach the reducer separately.
 - `Setup` is not idempotent; use a fresh `Prefix` per run.

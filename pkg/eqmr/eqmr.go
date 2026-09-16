@@ -10,11 +10,11 @@
 //
 //   - Mappers (RunMapper) claim one input split, run the Mapper over every pair
 //     in it, optionally apply a Combiner, assign each emitted key to a
-//     partition, and write one map-output document per non-empty partition.
+//     partition, and write bounded immutable runs plus map-output pointers.
 //     Scale them freely.
-//   - Reducers (RunReducer) claim every map-output document for one partition,
-//     merge those sorted runs by key, run the Reducer once per key, and write
-//     the partition's result. There is one unit per partition, so scale to the
+//   - Reducers (RunReducer) open every published run for one partition, merge
+//     their record streams by key, run the Reducer once per key, and write the
+//     partition's result. There is one unit per partition, so scale to the
 //     partition count.
 //   - Controllers (RunController) drive the phase machine. The control queue
 //     holds exactly one task, so a claim makes exactly one controller act at a
@@ -49,9 +49,9 @@
 //
 // # Completion
 //
-// Each worker deletes its input document in the same Modify that writes its
-// output, so document state alone says how far a run has got. No split
-// documents remain exactly when every map-output document exists, and every
+// Each mapper makes its immutable runs durable, then deletes its input document
+// in the same Modify that publishes their pointer documents. No split documents
+// remain exactly when every map output is durable and reachable. Every reduce
 // partition writes a result, empty ones included, so counting results measures
 // the reduce phase. Progress reports both; no queue is consulted to decide
 // completion.
@@ -63,7 +63,7 @@
 // invalid UTF-8. ValidateText states the rule, and Setup and every emit apply
 // it, so a violation fails where it was produced. Encode binary keys in the job
 // that needs them. Document keys are readable text: "split/000007",
-// "mapout/000003", "result/000003".
+// "run/<timestamp>-<nonce>/000000", "mapout/000003", "result/000003".
 package eqmr
 
 import (

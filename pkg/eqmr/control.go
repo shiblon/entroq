@@ -88,8 +88,8 @@ func (c *Controller) step(ctx context.Context, state controlState) (controlState
 
 	switch state.Phase {
 	case PhaseMap:
-		// Split docs are deleted in the same Modify that writes their map outputs,
-		// so their absence means every map-output doc exists.
+		// Split docs are deleted in the same Modify that publishes pointers to
+		// already-durable runs, so their absence means every map output is reachable.
 		remaining, err := c.countDocs(ctx, splitPrefix)
 		if err != nil {
 			return state, nil, fmt.Errorf("eqmr control: %w", err)

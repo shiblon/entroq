@@ -27,11 +27,14 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Experimental MapReduce package (`pkg/eqmr`).** A MapReduce that runs
   entirely on EntroQ tasks and documents, promoted from the `examples/mr`
   sketch. It adds a real shuffle step: mappers partition intermediate keys into
-  a configured number of reduce shards and write per-partition map-output documents,
-  so reduce work is proportional to the partition count rather than to the
-  number of distinct keys. It adds combiners, which differ from reducers in
-  being closed over their own output and so may run at more than one stage. The
-  controller is now a single self-requeueing control task rather than in-process
+  a configured number of reduce shards, cut bounded sorted immutable runs, and
+  atomically publish per-partition pointer documents. Document-backed runs use
+  ordered chunks so reducers heap-merge one current chunk per run instead of
+  materializing whole partitions. Reduce work is proportional to the partition
+  count rather than to the number of distinct keys. It adds combiners, which
+  differ from reducers in being closed over their own output and so may run at
+  more than one stage. The controller is now a single self-requeueing control
+  task rather than in-process
   goroutines, so it can run in its own pod, in as many replicas as desired, with
   the claim providing the single-actor guarantee and lease expiry providing
   failover. Both shard counts must be configured explicitly. Also included:
@@ -39,15 +42,17 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   driving a status view, and validation of namespaces and document keys as
   NUL-free UTF-8 within the backend length limits. Map keys and values are text
   rather than bytes, validated on input and on every emit, which drops base64
-  from every intermediate document: measured, map-output documents are 22% smaller
-  and readable in psql. A job with genuinely binary keys encodes them itself. Phase completion is judged
+  from every intermediate document and keeps them readable in psql. A job with
+  genuinely binary keys encodes them itself. Phase completion is judged
   purely from documents: every partition writes a result document, empty ones
   included, so finishing is a recorded fact rather than an absence and no queue
   is consulted to decide it. Workers read their input document rather than
   claiming it, taking exclusion at commit time through a version-pinned delete,
   which makes backup tasks (speculative execution against stragglers) possible:
-  a duplicate task races the original instead of blocking on its claim, and the
-  loser's work is rejected atomically. No straggler policy ships with it. The
+  a duplicate task races the original instead of blocking on its claim; only the
+  winner publishes pointers, and the loser removes its unpublished runs. Result
+  readers reject incomplete or failed runs rather than returning partial output.
+  No straggler policy ships with it. The
   Configuration is by functional option, `New(eq, prefix, opts...)`, and shard
   counts are required only by `Setup`: a mapper or reducer pod builds a
   controller from a run prefix alone, because the partition count a mapper must

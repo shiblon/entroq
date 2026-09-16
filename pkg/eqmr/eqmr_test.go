@@ -529,6 +529,11 @@ func TestQuarantinedWorkFailsRun(t *testing.T) {
 	if !strings.Contains(reason, "quarantined") {
 		t.Errorf("reason %q does not explain the failure", reason)
 	}
+	if results, err := ctrl.Results(ctx); err == nil {
+		t.Fatalf("Results returned %v for a failed run", results)
+	} else if !strings.Contains(err.Error(), reason) {
+		t.Errorf("Results error %q does not preserve failure reason %q", err, reason)
+	}
 }
 
 // TestMaxClaimsDefault pins that a run gets a claim ceiling without asking, and

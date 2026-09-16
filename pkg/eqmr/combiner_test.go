@@ -11,8 +11,8 @@ import (
 	"github.com/shiblon/entroq/pkg/worker"
 )
 
-// mapOutBytes runs only the map phase and reports the total size of the map output
-// docs it produced: the intermediate data the reduce phase has to move.
+// mapOutBytes runs only the map phase and reports the total size of its durable
+// run payloads: the intermediate data the reduce phase has to move.
 func mapOutBytes(t *testing.T, input []*eqmr.KV, combiner eqmr.Combiner, mapShards int) int {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -67,7 +67,7 @@ func mapOutBytes(t *testing.T, input []*eqmr.KV, combiner eqmr.Combiner, mapShar
 	stopMappers()
 
 	outs, err := eq.Docs(ctx, &entroq.DocQuery{
-		Namespace: ctrl.DocNS(), KeyStart: "mapout/", KeyEnd: "mapout0",
+		Namespace: ctrl.DocNS(), KeyStart: "run/", KeyEnd: "run0",
 	})
 	if err != nil {
 		t.Fatalf("read map outputs: %v", err)
