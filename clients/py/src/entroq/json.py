@@ -184,19 +184,43 @@ class EntroQJSON(EntroQBase):
                 _DEP_TYPES = {"INSERT", "CHANGE", "DELETE", "DEPEND", "CLAIM", "DETAIL"}
                 if any(d.get("type") in _DEP_TYPES for d in details):
                     kwargs: dict = {"message": body.get("message", "")}
+                    # A ModifyDep carries either a task id or a doc_id, never
+                    # both. Reading only "id" collapses every doc dependency to
+                    # None, which is what made doc failures uninspectable.
+                    _TASK_KEY = {
+                        "INSERT": "inserts", "CHANGE": "changes", "DELETE": "deletes",
+                        "DEPEND": "depends", "CLAIM": "claims",
+                    }
+                    _DOC_KEY = {
+                        "INSERT": "doc_inserts", "CHANGE": "doc_changes",
+                        "DELETE": "doc_deletes", "DEPEND": "doc_depends",
+                        "CLAIM": "doc_claims",
+                    }
                     for d in details:
                         dtype = d.get("type")
+                        if dtype == "DETAIL":
+                            kwargs["message"] = d.get("msg", kwargs["message"])
+                            continue
+                        did_raw = d.get("docId")
+                        if did_raw:
+                            key = _DOC_KEY.get(dtype)
+                            if key:
+                                kwargs.setdefault(key, []).append(DocID(
+                                    namespace=did_raw.get("namespace", ""),
+                                    id=did_raw["id"],
+                                    version=int(did_raw.get("version", 0)),
+                                ))
+                            continue
                         tid_raw = d.get("id")
-                        tid = (
-                            TaskID(id=tid_raw["id"], version=int(tid_raw.get("version", 0)), queue=tid_raw.get("queue", ""))
-                            if tid_raw else None
-                        )
-                        if dtype == "INSERT":   kwargs.setdefault("inserts", []).append(tid)
-                        elif dtype == "CHANGE": kwargs.setdefault("changes", []).append(tid)
-                        elif dtype == "DELETE": kwargs.setdefault("deletes", []).append(tid)
-                        elif dtype == "DEPEND": kwargs.setdefault("depends", []).append(tid)
-                        elif dtype == "CLAIM":  kwargs.setdefault("claims", []).append(tid)
-                        elif dtype == "DETAIL": kwargs["message"] = d.get("msg", kwargs["message"])
+                        if not tid_raw:
+                            continue
+                        key = _TASK_KEY.get(dtype)
+                        if key:
+                            kwargs.setdefault(key, []).append(TaskID(
+                                id=tid_raw["id"],
+                                version=int(tid_raw.get("version", 0)),
+                                queue=tid_raw.get("queue", ""),
+                            ))
                     kwargs["missing"] = kwargs.get("depends", []) + kwargs.get("deletes", [])
                     kwargs["collisions"] = kwargs.get("inserts", [])
                     raise DependencyError(**kwargs)

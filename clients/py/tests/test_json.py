@@ -6,7 +6,9 @@ import httpx
 import pytest
 
 from entroq.json import EntroQJSON, _doc_insert_json
-from entroq.types import DocData, TransportError
+from entroq.types import (
+    DependencyError, DocData, DocID, Modification, TaskID, TransportError,
+)
 
 
 async def _docs_query(**kwargs) -> httpx.QueryParams:
@@ -165,6 +167,56 @@ async def test_transport_errors_preserve_retry_safety(error_type, safe_to_retry)
     assert raised.value.safe_to_retry is safe_to_retry
     assert isinstance(raised.value.cause, error_type)
     assert raised.value.__cause__ is raised.value.cause
+
+
+async def _modify_dep_error(details: list[dict]) -> DependencyError:
+    """Return the DependencyError the client decodes from these wire details."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(409, json={"message": "dependency", "details": details})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        eq = EntroQJSON("http://entroq.example", http_client=http)
+        with pytest.raises(DependencyError) as raised:
+            await eq.modify(Modification())
+        return raised.value
+    finally:
+        await http.aclose()
+
+
+async def test_dependency_error_decodes_doc_ids():
+    """A ModifyDep carries `docId` for docs; reading only `id` loses them."""
+    err = await _modify_dep_error([
+        {"type": "DEPEND", "docId": {"namespace": "ns", "id": "d1", "version": 3}},
+        {"type": "CLAIM", "docId": {"namespace": "ns", "id": "d2", "version": 4}},
+    ])
+    assert err.doc_depends == [DocID(namespace="ns", id="d1", version=3)]
+    assert err.doc_claims == [DocID(namespace="ns", id="d2", version=4)]
+    assert err.has_missing_docs()
+    assert err.has_claimed_docs()
+    # Doc details must not leak into the task-scoped buckets as None padding.
+    assert err.depends == []
+    assert err.claims == []
+    assert err.missing == []
+
+
+async def test_dependency_error_keeps_task_ids_separate():
+    err = await _modify_dep_error([
+        {"type": "CLAIM", "id": {"id": "t1", "version": 2, "queue": "q"}},
+    ])
+    assert err.claims == [TaskID(id="t1", version=2, queue="q")]
+    assert err.doc_claims == []
+    assert not err.has_claimed_docs()
+    assert not err.has_missing_docs()
+
+
+async def test_dependency_error_contended_doc_is_not_missing():
+    """Contention must not read as a poison pill: the dispositions differ."""
+    err = await _modify_dep_error([
+        {"type": "CLAIM", "docId": {"namespace": "ns", "id": "d1", "version": 1}},
+    ])
+    assert err.has_claimed_docs()
+    assert not err.has_missing_docs()
 
 
 def test_doc_insert_encodes_future_arrival():

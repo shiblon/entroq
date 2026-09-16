@@ -154,8 +154,16 @@ class Doc:
 
 
 class DependencyError(Exception):
-    """Raised when a modify call fails due to dependency constraints."""
-    def __init__(self, message="", missing=(), mismatched=(), collisions=(), inserts=(), depends=(), deletes=(), changes=(), claims=()):
+    """Raised when a modify call fails due to dependency constraints.
+
+    Task-scoped and doc-scoped failures are kept apart. The ``doc_*`` lists
+    hold :class:`DocID` values; the rest hold :class:`TaskID` values. Workers
+    use :meth:`has_missing_docs` and :meth:`has_claimed_docs` to tell a poison
+    pill (a required doc is gone) from transient contention (another claimant
+    holds it), mirroring the Go client.
+    """
+    def __init__(self, message="", missing=(), mismatched=(), collisions=(), inserts=(), depends=(), deletes=(), changes=(), claims=(),
+                 doc_inserts=(), doc_depends=(), doc_deletes=(), doc_changes=(), doc_claims=()):
         super().__init__(message)
         self.message = message
         self.missing = list(missing)
@@ -166,6 +174,23 @@ class DependencyError(Exception):
         self.deletes = list(deletes)
         self.changes = list(changes)
         self.claims = list(claims)
+        self.doc_inserts = list(doc_inserts)
+        self.doc_depends = list(doc_depends)
+        self.doc_deletes = list(doc_deletes)
+        self.doc_changes = list(doc_changes)
+        self.doc_claims = list(doc_claims)
+
+    def has_missing_docs(self) -> bool:
+        """True when a required doc is absent, not merely claimed elsewhere.
+
+        A task whose required doc no longer exists is a poison pill: retrying
+        cannot help.
+        """
+        return bool(self.doc_depends or self.doc_deletes or self.doc_changes)
+
+    def has_claimed_docs(self) -> bool:
+        """True when a required doc is held by another claimant (transient)."""
+        return bool(self.doc_claims)
 
     def __str__(self):
         return json.dumps({
@@ -178,6 +203,11 @@ class DependencyError(Exception):
             'deletes': [str(t) for t in self.deletes],
             'changes': [str(t) for t in self.changes],
             'claims': [str(t) for t in self.claims],
+            'docInserts': [str(d) for d in self.doc_inserts],
+            'docDepends': [str(d) for d in self.doc_depends],
+            'docDeletes': [str(d) for d in self.doc_deletes],
+            'docChanges': [str(d) for d in self.doc_changes],
+            'docClaims': [str(d) for d in self.doc_claims],
         })
 
 
