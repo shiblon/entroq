@@ -43,6 +43,7 @@ type Conn interface {
 type Config struct {
 	Queues      []string // queues the worker serves (at least one required)
 	MaxAttempts int32    // 0 means unlimited
+	MaxClaims   int32    // 0 means unlimited
 	TakeDocs    bool     // worker implements the takeDocs phase
 	Work        bool     // worker implements the work phase (required)
 	Success     bool     // worker implements the success phase (post-commit)
@@ -214,6 +215,7 @@ func (b *Bridge) runWorker(ctx context.Context, eq *entroq.EntroQ) error {
 		worker.Watching(b.cfg.Queues...),
 		worker.WithLease(b.lease),
 		worker.WithMaxAttempts(b.cfg.MaxAttempts),
+		worker.WithMaxClaims(b.cfg.MaxClaims),
 	)
 }
 
