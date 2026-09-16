@@ -1,4 +1,9 @@
-"""EntroQ async worker framework."""
+"""EntroQ async worker framework.
+
+This is a port of Go's ``pkg/worker``, which is the reference implementation for
+EntroQ worker semantics. Match it rather than inventing behavior here; see
+"The Go worker is the reference implementation" in AGENTS.md.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -22,11 +27,19 @@ class StopWorker(Exception):
 
 
 class RetryError(Exception):
-    """Raise from do_work to re-queue the task for retry after a delay."""
+    """Raise from do_work to re-queue the task for retry after a delay.
 
-    def __init__(self, message: str = "", *, delay_s: float | None = None) -> None:
+    ``delay_s`` overrides the worker's ``retry_delay_s`` for this failure.
+    ``or_move_to`` overrides the queue the task is quarantined to once it
+    exhausts ``max_attempts``; it has no effect on the retries themselves.
+    Mirrors the Go client's ``RetryError.After`` and ``RetryError.OrMoveTo``.
+    """
+
+    def __init__(self, message: str = "", *, delay_s: float | None = None,
+                 or_move_to: str = "") -> None:
         super().__init__(message)
         self.delay_s = delay_s
+        self.or_move_to = or_move_to
 
 
 class MoveError(Exception):
@@ -35,6 +48,19 @@ class MoveError(Exception):
     def __init__(self, message: str = "", *, queue: str = "") -> None:
         super().__init__(message)
         self.queue = queue
+
+
+# ---------------------------------------------------------------------------
+# Error queue mapping
+# ---------------------------------------------------------------------------
+
+def default_err_q_map(inbox: str) -> str:
+    """Return the default error queue for an inbox: the inbox plus ``/err``.
+
+    This matches the Go worker's ``DefaultErrQMap`` so that both clients
+    quarantine to the same place by default.
+    """
+    return inbox + '/err'
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +202,19 @@ class _RenewState:
         self.task = task
         self.docs = list(docs)
         self.error: Exception | None = None
+        # Set by the renewer when the claim is lost, so _process can tell its
+        # own cancellation apart from one arriving from outside the worker.
+        self.claim_lost = False
+        # The in-flight handler task, registered by _process so the renewer can
+        # abort work the moment the claim stops being ours.
+        self.work: asyncio.Task | None = None
+
+    def lose_claim(self, err: Exception) -> None:
+        """Record claim loss and cancel the handler if one is running."""
+        self.error = err
+        self.claim_lost = True
+        if self.work is not None and not self.work.done():
+            self.work.cancel()
 
 
 @asynccontextmanager
@@ -205,7 +244,10 @@ async def _renewing(
                     updated = {(d.namespace, d.id): d for d in result.docs_changed}
                     state.docs = [updated.get((d.namespace, d.id), d) for d in state.docs]
             except DependencyError as e:
-                state.error = e
+                # The claim is gone. Work done from here cannot be committed,
+                # and may duplicate whatever the new claimant is doing, so stop
+                # the handler now rather than letting it run to completion.
+                state.lose_claim(e)
                 return
             except Exception as e:
                 logging.warning("Renewal error for task %s (will retry): %s", task.id, e)
@@ -277,13 +319,26 @@ class EntroQWorker:
         *queues: str,
         claim_duration_s: float = 30.0,
         err_queue: str = '',
+        err_q_map: Callable[[str], str] | None = None,
         retry_delay_s: float = 30.0,
         max_attempts: int = 0,
+        max_claims: int = 0,
         retry_transport_errors: bool = True,
         transport_retry_base_s: float = 1.0,
         transport_retry_max_s: float = 30.0,
     ) -> None:
         """Configure a worker.
+
+        Failures are quarantined to an error queue chosen by
+        :meth:`error_queue_for`. Pass ``err_queue`` to send every failure to one
+        fixed queue, or ``err_q_map`` to compute it per inbox (the Go worker's
+        ``WithErrQMap``); they are mutually exclusive. With neither,
+        :func:`default_err_q_map` appends ``/err`` to the task's own queue.
+
+        ``max_claims`` bounds how many times a task may be claimed before it
+        is moved to the error queue without invoking the handler; it catches
+        tasks that crash or wedge their worker, which ``max_attempts`` (driven
+        by :class:`RetryError`) cannot see. 0 (the default) means no maximum.
 
         Safe, pre-submit claim transport failures retry with full-jitter
         exponential backoff by default. Ambiguous transport failures and
@@ -294,12 +349,18 @@ class EntroQWorker:
             raise ValueError("transport_retry_base_s must be non-negative")
         if transport_retry_max_s < transport_retry_base_s:
             raise ValueError("transport_retry_max_s must be at least transport_retry_base_s")
+        if err_queue and err_q_map is not None:
+            raise ValueError("err_queue and err_q_map are mutually exclusive")
         self._client = client
         self._queues = list(queues)
         self._claim_duration_s = claim_duration_s
-        self._err_queue = err_queue
+        if err_queue:
+            self._err_q_map: Callable[[str], str] = lambda inbox: err_queue
+        else:
+            self._err_q_map = err_q_map if err_q_map is not None else default_err_q_map
         self._retry_delay_s = retry_delay_s
         self._max_attempts = max_attempts
+        self._max_claims = max_claims
         self._retry_transport_errors = retry_transport_errors
         self._transport_retry_base_s = transport_retry_base_s
         self._transport_retry_max_s = transport_retry_max_s
@@ -308,6 +369,13 @@ class EntroQWorker:
     def stop(self) -> None:
         """Signal the worker to stop. Unblocks any waiting claim() immediately."""
         self._stop_event.set()
+
+    def error_queue_for(self, inbox: str) -> str:
+        """Return the error queue for an inbox, using this worker's mapping.
+
+        Mirrors the Go worker's ``ErrorQueueFor``.
+        """
+        return self._err_q_map(inbox)
 
     @classmethod
     def handler(
@@ -347,26 +415,80 @@ class EntroQWorker:
             docs.extend(claimed)
         return docs
 
+    async def _dispose(self, task: Task, docs: list[Doc],
+                       exc: RetryError | MoveError) -> None:
+        """Apply a sentinel's disposition to a claimed task, releasing its docs.
+
+        Retry and quarantine are one decision, taken here at the moment of
+        failure, as the Go client's ``RetryOrQuarantine`` does. Deferring the
+        ceiling check to the next claim would mean an exhausted task is only
+        quarantined if a worker happens to come back for it, and none may.
+        """
+        attempt = task.attempt + 1
+
+        def quarantine(dest: str) -> Modification:
+            # at=None releases the task immediately: a quarantined task is for
+            # inspection, so a retry delay must not leak into its arrival time.
+            return Modification.changing(task, queue=dest, at=None,
+                                         attempt=attempt, err=str(exc))
+
+        if isinstance(exc, MoveError):
+            dest = exc.queue or self.error_queue_for(task.queue)
+            if not dest:
+                return  # custom map declined a destination: claim expires
+            change = quarantine(dest)
+        elif self._max_attempts and attempt >= self._max_attempts:
+            change = quarantine(exc.or_move_to or self.error_queue_for(task.queue))
+        else:
+            delay = exc.delay_s if exc.delay_s is not None else self._retry_delay_s
+            at = datetime.now(tz=timezone.utc) + timedelta(seconds=delay)
+            change = Modification.changing(task, at=at, attempt=attempt, err=str(exc))
+
+        ops = [change]
+        for doc in docs:
+            ops.append(Modification.changing(doc, at=None))
+        await self._client.modify(Modification(*ops))
+
     async def _process(self, task: Task, handler: Handler) -> bool:
         """Process one already-claimed task. Returns False if the worker should stop."""
-        if self._max_attempts and task.attempt >= self._max_attempts:
-            dest = self._err_queue or task.queue + '/error'
+        # Claim count is checked first: a task over the claim ceiling has been
+        # wedging workers, so it must not reach the handler at all.
+        if self._max_claims > 0 and task.claims > self._max_claims:
+            dest = self.error_queue_for(task.queue)
             await self._client.modify(Modification(
                 Modification.changing(task, queue=dest,
-                                      err=f"max attempts ({self._max_attempts}) exceeded"),
+                                      err=f"maximum claims exceeded ({self._max_claims})"),
             ))
             return True
 
-        docs = await self._claim_docs(task, handler)
+        try:
+            docs = await self._claim_docs(task, handler)
+        except DependencyError as e:
+            # Classify rather than swallow: a missing doc can never be claimed,
+            # so the task is a poison pill; a doc held by someone else is
+            # transient and deserves a backoff. Either way the reason is
+            # recorded on the task instead of vanishing into a log line.
+            if e.has_missing_docs():
+                await self._dispose(task, [], MoveError(f"required doc missing: {e}"))
+            else:
+                await self._dispose(task, [], RetryError(f"doc contention: {e}"))
+            return True
 
         do_work_exc: Exception | None = None
         result: Modification | None = None
 
         async with _renewing(self._client, task, docs, self._claim_duration_s) as state:
+            work = asyncio.ensure_future(handler.do_work(task, docs))
+            state.work = work
             try:
-                result = await handler.do_work(task, docs)
+                result = await work
             except (StopWorker, RetryError, MoveError) as e:
                 do_work_exc = e
+            except asyncio.CancelledError:
+                # Only swallow a cancellation the renewer caused; anything else
+                # is the caller stopping us and must keep propagating.
+                if not state.claim_lost:
+                    raise
             # Other exceptions propagate; the renewer is still cleaned up.
 
         if state.error:
@@ -375,25 +497,9 @@ class EntroQWorker:
         if isinstance(do_work_exc, StopWorker):
             return False  # claim expires naturally
 
-        if isinstance(do_work_exc, RetryError):
-            delay = do_work_exc.delay_s if do_work_exc.delay_s is not None else self._retry_delay_s
-            at = datetime.now(tz=timezone.utc) + timedelta(seconds=delay)
-            ops = [Modification.changing(state.task, at=at,
-                                         attempt=state.task.attempt + 1,
-                                         err=str(do_work_exc))]
-            for doc in state.docs:
-                ops.append(Modification.changing(doc, at=None))
-            await self._client.modify(Modification(*ops))
+        if isinstance(do_work_exc, (RetryError, MoveError)):
+            await self._dispose(state.task, state.docs, do_work_exc)
             return True
-
-        if isinstance(do_work_exc, MoveError):
-            dest = do_work_exc.queue or self._err_queue
-            if dest:
-                ops = [Modification.changing(state.task, queue=dest, err=str(do_work_exc))]
-                for doc in state.docs:
-                    ops.append(Modification.changing(doc, at=None))
-                await self._client.modify(Modification(*ops))
-            return True  # no dest: claim expires naturally
 
         if result is not None:
             _fix_versions(result, state.task, state.docs)

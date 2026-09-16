@@ -1,5 +1,11 @@
 // Package worker provides a high-level looping protocol for processing tasks.
 //
+// This package is the reference implementation of EntroQ's worker semantics.
+// The Python and JS clients are ports of it, and pkg/workgateway hosts foreign
+// workers on it directly; a client that disagrees with this package is wrong by
+// definition. See AGENTS.md before changing behavior here, because a change
+// here is a change to every client's contract.
+//
 // It handles the "Claim -> Work -> Renew -> Modify" lifecycle, ensuring that:
 // 1. Tasks are renewed in the background while work is ongoing.
 // 2. Renewal stops before finalization to ensure a stable task version.

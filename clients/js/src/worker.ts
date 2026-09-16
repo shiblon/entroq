@@ -1,4 +1,12 @@
+/**
+ * EntroQ worker loop.
+ *
+ * This is a port of Go's `pkg/worker`, which is the reference implementation
+ * for EntroQ worker semantics. Match it rather than inventing behavior here;
+ * see "The Go worker is the reference implementation" in AGENTS.md.
+ */
 import { Task, Doc, ModifyRequest, TaskID, DocID, ClaimResponse, EntroQClientInterface } from "./types";
+import { EntroQDependencyError } from "./client";
 
 /**
  * EntroQStopWorker signals the worker to stop cleanly after the current task.
@@ -12,9 +20,18 @@ export class EntroQStopWorker extends Error {
 
 /**
  * EntroQRetryError re-queues the task for retry after a delay.
+ *
+ * `delayMs` overrides the worker's retryDelayMs for this failure. `orMoveTo`
+ * overrides the queue the task is quarantined to once it exhausts maxAttempts;
+ * it does not divert the retries themselves. Mirrors the Go client's
+ * RetryError.After and RetryError.OrMoveTo.
  */
 export class EntroQRetryError extends Error {
-  constructor(message: string, public readonly delayMs?: number) {
+  constructor(
+    message: string,
+    public readonly delayMs?: number,
+    public readonly orMoveTo: string = "",
+  ) {
     super(message);
     this.name = "EntroQRetryError";
   }
@@ -22,13 +39,22 @@ export class EntroQRetryError extends Error {
 
 /**
  * EntroQMoveError moves the task to a different queue.
- * If queue is empty, the claim expires naturally (uses worker errQueue if set).
+ * With no queue, the worker's error-queue mapping chooses the destination, so
+ * a move always records the failure somewhere.
  */
 export class EntroQMoveError extends Error {
   constructor(message: string, public readonly queue: string = "") {
     super(message);
     this.name = "EntroQMoveError";
   }
+}
+
+/**
+ * Default error queue for an inbox: the inbox plus "/err". Matches the Go
+ * worker's DefaultErrQMap so every client quarantines to the same place.
+ */
+export function defaultErrQMap(inbox: string): string {
+  return `${inbox}/err`;
 }
 
 /**
@@ -48,18 +74,43 @@ export interface WorkerOptions {
   pollMs?: number;
   /** Backoff after an infrastructure error. Default: 10000ms. */
   backoffMs?: number;
-  /** Default error queue for EntroQMoveError with no queue. Default: "". */
+  /**
+   * Send every quarantined task to this one fixed queue. Mutually exclusive
+   * with errQMap. Default: "" (use errQMap).
+   */
   errQueue?: string;
+  /**
+   * Compute the error queue from the task's own queue, so a worker watching
+   * several queues can quarantine each to its own error box. Mirrors the Go
+   * worker's WithErrQMap. Default: defaultErrQMap ("<queue>/err").
+   */
+  errQMap?: (inbox: string) => string;
   /** Default retry delay for EntroQRetryError with no delayMs. Default: 30000ms. */
   retryDelayMs?: number;
   /**
-   * If > 0, tasks at or above this attempt count are moved to errQueue (or
-   * queue + "/error") instead of being dispatched. Default: 0 (disabled).
+   * If > 0, a task that exhausts this many attempts is quarantined at the
+   * moment of its final failure rather than retried. Default: 0 (unlimited).
    */
   maxAttempts?: number;
+  /**
+   * If > 0, a task claimed more than this many times is quarantined without
+   * being dispatched. Catches tasks that wedge or kill their worker, which
+   * maxAttempts cannot see. Default: 0 (unlimited).
+   */
+  maxClaims?: number;
 }
 
-type DoWorkFn = (task: Task, docs: Doc[]) => Promise<Omit<ModifyRequest, "claimantId"> | void>;
+/**
+ * A doWork function. `signal` aborts when the worker loses the task claim, so
+ * long-running handlers can stop instead of finishing work that can no longer
+ * be committed. JavaScript cannot cancel a promise from outside, so honoring
+ * it is cooperative, exactly as with a Go context.
+ */
+type DoWorkFn = (
+  task: Task,
+  docs: Doc[],
+  signal: AbortSignal,
+) => Promise<Omit<ModifyRequest, "claimantId"> | void>;
 type SelectorFn = (task: Task) => Promise<WorkerDocClaim[]>;
 type FinisherFn = (task: Task, docs: Doc[]) => Promise<void>;
 
@@ -118,14 +169,25 @@ export class EntroQWorker {
     private readonly _client: EntroQClientInterface,
     options: WorkerOptions = {},
   ) {
+    if (options.errQueue && options.errQMap) {
+      throw new Error("errQueue and errQMap are mutually exclusive");
+    }
+    const fixed = options.errQueue ?? "";
     this._opts = {
       leaseMs: options.leaseMs ?? 30000,
       pollMs: options.pollMs ?? 5000,
       backoffMs: options.backoffMs ?? 10000,
-      errQueue: options.errQueue ?? "",
+      errQueue: fixed,
+      errQMap: fixed ? () => fixed : (options.errQMap ?? defaultErrQMap),
       retryDelayMs: options.retryDelayMs ?? 30000,
       maxAttempts: options.maxAttempts ?? 0,
+      maxClaims: options.maxClaims ?? 0,
     };
+  }
+
+  /** Return the error queue for an inbox, using this worker's mapping. */
+  errorQueueFor(inbox: string): string {
+    return this._opts.errQMap(inbox);
   }
 
   /** Build a HandlerBuilder from a doWork function. */
@@ -213,31 +275,92 @@ export class EntroQWorker {
     return docs;
   }
 
+  /**
+   * Apply a sentinel's disposition to a claimed task, releasing its docs.
+   *
+   * Retry and quarantine are one decision, taken here at the moment of
+   * failure, as Go's RetryOrQuarantine does. Deferring the ceiling check to the
+   * next claim would mean an exhausted task is only quarantined if a worker
+   * comes back for it, and none may.
+   */
+  private async _dispose(
+    task: Task,
+    docs: Doc[],
+    err: EntroQRetryError | EntroQMoveError,
+  ): Promise<void> {
+    const attempt = task.attempt + 1;
+
+    // A quarantined task is for inspection, so atMs "0" releases it now: a
+    // retry delay must never leak into its arrival time.
+    const quarantine = (dest: string) => ({
+      oldId: toTaskID(task),
+      newData: { queue: dest, atMs: "0", value: task.value, attempt, err: err.message },
+    });
+
+    let change;
+    if (err instanceof EntroQMoveError) {
+      const dest = err.queue || this.errorQueueFor(task.queue);
+      if (!dest) return; // custom map declined a destination: claim expires
+      change = quarantine(dest);
+    } else if (this._opts.maxAttempts > 0 && attempt >= this._opts.maxAttempts) {
+      change = quarantine(err.orMoveTo || this.errorQueueFor(task.queue));
+    } else {
+      const delay = err.delayMs ?? this._opts.retryDelayMs;
+      change = {
+        oldId: toTaskID(task),
+        newData: {
+          queue: task.queue,
+          atMs: String(Date.now() + delay),
+          value: task.value,
+          attempt,
+          err: err.message,
+        },
+      };
+    }
+
+    const docChanges = docs.map(d => ({
+      oldId: toDocID(d),
+      newData: { namespace: d.namespace, id: d.id, key: d.key, secondaryKey: d.secondaryKey, content: d.content, atMs: "0" },
+    }));
+    await this._client.modify({
+      changes: [change],
+      docChanges: docChanges.length ? docChanges : undefined,
+    });
+  }
+
   private async _process(task: Task, h: HandlerBuilder): Promise<boolean> {
-    if (this._opts.maxAttempts > 0 && task.attempt >= this._opts.maxAttempts) {
-      const dest = this._opts.errQueue || `${task.queue}/error`;
-      await this._client.modify({
-        changes: [{
-          oldId: toTaskID(task),
-          newData: {
-            queue: dest,
-            atMs: "0",
-            value: task.value,
-            attempt: task.attempt,
-            err: `max attempts (${this._opts.maxAttempts}) exceeded`,
-          },
-        }],
-      });
+    // Claim count is checked first: a task over the ceiling has been wedging
+    // workers, so it must not reach the handler at all.
+    if (this._opts.maxClaims > 0 && task.claims > this._opts.maxClaims) {
+      await this._dispose(task, [], new EntroQMoveError(
+        `maximum claims exceeded (${this._opts.maxClaims})`));
       return true;
     }
 
-    const docs = await this._claimDocs(task, h);
+    let docs: Doc[];
+    try {
+      docs = await this._claimDocs(task, h);
+    } catch (err) {
+      // Classify rather than swallow: a missing doc can never be claimed, so
+      // the task is a poison pill; a doc held by someone else is transient.
+      if (err instanceof EntroQDependencyError) {
+        await this._dispose(task, [], err.hasMissingDocs()
+          ? new EntroQMoveError(`required doc missing: ${err.message}`)
+          : new EntroQRetryError(`doc contention: ${err.message}`));
+        return true;
+      }
+      throw err;
+    }
 
     let currentTask = task;
     let currentDocs = [...docs];
     let renewalErr: unknown = undefined;
 
     const ac = new AbortController();
+    // Separate from `ac`, which merely stops scheduling renewals when work
+    // ends. This one fires only when the claim is actually lost, so a handler
+    // watching it is not told to abort by its own successful completion.
+    const claimLost = new AbortController();
     let renewHandle: ReturnType<typeof setTimeout> | null = null;
 
     const renew = async (): Promise<void> => {
@@ -262,8 +385,11 @@ export class EntroQWorker {
         }
         scheduleRenew();
       } catch (err) {
+        // The claim is gone. Work from here cannot be committed, and may
+        // duplicate whatever the new claimant is doing, so tell the handler.
         renewalErr = err;
         ac.abort();
+        claimLost.abort(err);
       }
     };
 
@@ -278,7 +404,7 @@ export class EntroQWorker {
     let handlerErr: unknown = undefined;
 
     try {
-      result = await h._doWork(task, docs);
+      result = await h._doWork(task, docs, claimLost.signal);
     } catch (err) {
       handlerErr = err;
     } finally {
@@ -293,39 +419,8 @@ export class EntroQWorker {
 
     if (handlerErr instanceof EntroQStopWorker) return false;
 
-    if (handlerErr instanceof EntroQRetryError) {
-      const delay = handlerErr.delayMs ?? this._opts.retryDelayMs;
-      const atMs = String(Date.now() + delay);
-      const docChanges = currentDocs.map(d => ({
-        oldId: toDocID(d),
-        newData: { namespace: d.namespace, id: d.id, key: d.key, secondaryKey: d.secondaryKey, content: d.content, atMs: "0" },
-      }));
-      await this._client.modify({
-        changes: [{
-          oldId: toTaskID(currentTask),
-          newData: { queue: currentTask.queue, atMs, value: currentTask.value, attempt: currentTask.attempt + 1, err: handlerErr.message },
-        }],
-        docChanges: docChanges.length ? docChanges : undefined,
-      });
-      return true;
-    }
-
-    if (handlerErr instanceof EntroQMoveError) {
-      const dest = handlerErr.queue || this._opts.errQueue;
-      if (dest) {
-        const docChanges = currentDocs.map(d => ({
-          oldId: toDocID(d),
-          newData: { namespace: d.namespace, id: d.id, key: d.key, secondaryKey: d.secondaryKey, content: d.content, atMs: "0" },
-        }));
-        await this._client.modify({
-          changes: [{
-            oldId: toTaskID(currentTask),
-            newData: { queue: dest, atMs: "0", value: currentTask.value, attempt: currentTask.attempt, err: handlerErr.message },
-          }],
-          docChanges: docChanges.length ? docChanges : undefined,
-        });
-      }
-      // No dest: both task and doc claims expire naturally.
+    if (handlerErr instanceof EntroQRetryError || handlerErr instanceof EntroQMoveError) {
+      await this._dispose(currentTask, currentDocs, handlerErr);
       return true;
     }
 
