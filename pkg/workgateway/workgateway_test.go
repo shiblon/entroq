@@ -796,6 +796,47 @@ func TestBridge_RetryMoves(t *testing.T) {
 	s.stop()
 }
 
+// TestBridge_MaxClaims checks that a task over the claim ceiling is quarantined
+// without ever being dispatched. A worker that wedges or dies mid-task never
+// reports a retry, so maxAttempts cannot see it; only the claim count can.
+func TestBridge_MaxClaims(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	eq := newEQ(t, ctx)
+	insertTask(t, ctx, eq, "in", "hello")
+
+	// Burn a claim and let it lapse, standing in for a worker that died holding
+	// the task. The gateway's claim is then the second one.
+	if _, err := eq.Claim(ctx, entroq.From("in"), entroq.ClaimFor(50*time.Millisecond)); err != nil {
+		t.Fatalf("priming claim: %v", err)
+	}
+	time.Sleep(250 * time.Millisecond)
+
+	cfg := workCfg()
+	cfg.MaxClaims = 1
+	s := newSession(t, ctx, eq, cfg, time.Second)
+
+	// The test never answers a doWork phase, so the task can only reach the
+	// error queue by being quarantined before dispatch.
+	errQ := worker.DefaultErrQMap("in")
+	deadline := time.After(10 * time.Second)
+	for {
+		tasks, err := eq.Tasks(ctx, errQ)
+		if err != nil {
+			t.Fatalf("tasks: %v", err)
+		}
+		if len(tasks) == 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("task never quarantined to %q", errQ)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	s.stop()
+}
+
 // TestBridge_Fatal checks that a fatal outcome from doWork stops the worker.
 func TestBridge_Fatal(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

@@ -94,31 +94,9 @@ func (s *responseSocket) write(ctx context.Context, event bodyEvent) error {
 	}
 }
 
-// nextBefore returns forced=true when deadline arrives before a response
-// event. An already-buffered event wins at the exact boundary so ordinary data
-// receives the first opportunity to piggyback a queue switch.
+// nextBefore returns the next response event, or forced=true when deadline wins.
 func (s *responseSocket) nextBefore(ctx context.Context, deadline time.Time) (event socketEvent, forced bool, err error) {
-	select {
-	case event := <-s.events:
-		return event, false, nil
-	default:
-	}
-
-	timer := time.NewTimer(time.Until(deadline))
-	defer timer.Stop()
-	select {
-	case event := <-s.events:
-		return event, false, nil
-	case <-timer.C:
-		select {
-		case event := <-s.events:
-			return event, false, nil
-		default:
-			return socketEvent{}, true, nil
-		}
-	case <-ctx.Done():
-		return socketEvent{}, false, ctx.Err()
-	}
+	return receiveBefore(ctx, s.events, deadline)
 }
 
 func (s *responseSocket) send(ctx context.Context, event socketEvent) error {
@@ -165,8 +143,8 @@ func newUpstreamRequest(ctx context.Context, upstream string, env Envelope) (*ht
 	reader, writer := io.Pipe()
 	request, err := http.NewRequestWithContext(ctx, env.Method, upstream+env.Path, reader)
 	if err != nil {
-		_ = reader.Close()
-		_ = writer.Close()
+		reader.Close()
+		writer.Close()
 		return nil, nil, fmt.Errorf("build upstream request: %w", err)
 	}
 	maps.Copy(request.Header, env.Headers)
@@ -181,15 +159,8 @@ func newUpstreamRequest(ctx context.Context, upstream string, env Envelope) (*ht
 }
 
 func (s *responseSocket) writeRequest(ctx context.Context, request *http.Request, body *io.PipeWriter) error {
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = body.CloseWithError(context.Cause(ctx))
-		case <-done:
-		}
-	}()
+	stopClose := context.AfterFunc(ctx, func() { body.CloseWithError(context.Cause(ctx)) })
+	defer stopClose()
 
 	for {
 		var delivery socketDelivery
@@ -204,7 +175,7 @@ func (s *responseSocket) writeRequest(ctx context.Context, request *http.Request
 			_, writeErr = body.Write(delivery.event.body)
 		}
 		if writeErr != nil {
-			_ = body.CloseWithError(writeErr)
+			body.CloseWithError(writeErr)
 			delivery.done <- writeErr
 			return nil
 		}
@@ -237,22 +208,15 @@ func (s *responseSocket) readResponse(ctx context.Context, client *http.Client, 
 		}
 		return nil
 	}
-	readDone := make(chan struct{})
-	defer close(readDone)
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = response.Body.Close()
-		case <-readDone:
-		}
-	}()
+	stopClose := context.AfterFunc(ctx, func() { response.Body.Close() })
+	defer stopClose()
 
 	if err := s.send(ctx, socketEvent{
 		statusCode:  response.StatusCode,
 		headers:     copyHeaders(response.Header),
 		trailerKeys: trailerKeys(response.Trailer),
 	}); err != nil {
-		_ = response.Body.Close()
+		response.Body.Close()
 		return nil
 	}
 
@@ -281,7 +245,7 @@ func (s *responseSocket) readResponse(ctx context.Context, client *http.Client, 
 			event.trailers = copyHeaders(response.Trailer)
 		}
 		if err := s.send(ctx, event); err != nil {
-			_ = response.Body.Close()
+			response.Body.Close()
 			return nil
 		}
 		if event.end {

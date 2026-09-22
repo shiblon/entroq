@@ -7,12 +7,60 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [Unreleased]
+## [1.11.0] - 2026-09-22
+
+### Fixed
+
+- EQLink now waits up to 30 seconds for EntroQ to become healthy at startup,
+  avoiding sidecar/backend pod startup races without adding a polling loop.
 
 ### Added
 
+- **EQLink streaming smoke test.** An opt-in, low-memory k3d harness exercises
+  concurrent duplex streams, process crashes, and EntroQ outage recovery
+  without joining the normal unit-test suite.
 - **Service startup version.** PostgreSQL, in-memory, Redis, and SQLite servers
   log their binary version to standard error before startup setup begins.
+- **Python worker claim limit.** `EntroQWorker` accepts `max_claims=N`,
+  matching the Go worker's `WithMaxClaims`. Claim `N` may run; a later claim is
+  moved to the error queue without invoking the handler. Zero, the default,
+  keeps the existing unlimited behavior. This closes a parity gap: `max_attempts`
+  only counts `RetryError` returns, so it cannot see a task that wedges or
+  crashes its worker before the handler returns.
+- **Python worker error-queue mapping.** `EntroQWorker` accepts
+  `err_q_map=fn`, matching the Go worker's `WithErrQMap`, so a worker watching
+  several queues can quarantine each to its own error box instead of funneling
+  every failure into one. `err_queue` still pins a single fixed destination and
+  is mutually exclusive with `err_q_map`. The resolved queue is available as
+  `worker.error_queue_for(inbox)`, and `entroq.default_err_q_map` is exported.
+- **JS worker parity with Go.** `EntroQWorker` gains `maxClaims`, `errQMap`
+  (with `defaultErrQMap` and `worker.errorQueueFor`), and
+  `EntroQRetryError`'s third `orMoveTo` argument, matching `WithMaxClaims`,
+  `WithErrQMap`, and `RetryError.OrMoveTo`. `errQueue` and `errQMap` together
+  throw.
+- **JS doWork receives an AbortSignal.** Its third argument aborts when the
+  worker loses the task claim, so a long-running handler can stop instead of
+  finishing work that can no longer be committed. JavaScript cannot cancel a
+  promise from outside, so honoring it is cooperative, as with a Go context.
+  Existing two-argument handlers are unaffected.
+- **JS doc dependency detail.** `EntroQDependencyError` now decodes the `docId`
+  side of a `ModifyDep` into `docInserts`, `docDepends`, `docDeletes`,
+  `docChanges`, and `docClaims`, with `hasMissingDocs()` and
+  `hasClaimedDocs()`. Previously only `id` was read and doc dependencies were
+  discarded outright.
+- **`eqlink work --max-claims`.** The work gateway now exposes the worker's
+  claim ceiling, in stdio mode as a flag and over WebSocket as a `maxClaims`
+  query param. Gateway-hosted workers are exactly the ones that can wedge
+  without reporting a retry, which is what `maxAttempts` cannot see.
+- **Python `RetryError(or_move_to=...)`.** Overrides the queue a task is
+  quarantined to once it exhausts `max_attempts`, matching the Go client's
+  `RetryError.OrMoveTo`. It selects the quarantine destination only; retries
+  before the ceiling still return to their own queue.
+- **Python doc dependency detail.** `DependencyError` now decodes the `docId`
+  side of a `ModifyDep` into `doc_inserts`, `doc_depends`, `doc_deletes`,
+  `doc_changes`, and `doc_claims`, with `has_missing_docs()` and
+  `has_claimed_docs()` helpers. Previously only `id` was read, so every doc
+  dependency decoded to a bare `None` and doc failures could not be inspected.
 - **Python client transport controls.** The JSON client exposes its configured
   `httpx.AsyncClient` as `http` and accepts caller-owned clients; transport
   failures preserve their cause and distinguish definitely safe retries from
@@ -60,18 +108,20 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   wire each role to its own queue, lease and claim ceiling. The API and the
   document layout may change without a migration path.
 
-- **Experimental EQLink response streaming.** EQLink buffers request bodies and
-  relays HTTP/1.1 response bodies through an acknowledged, stop-and-wait queue
-  lane, including SSE and NDJSON. Session queues use 30-minute `gc=` generations,
-  rotate opportunistically with data in their final ten minutes, and force a
-  blank reciprocal switch in their final five minutes. A receiver-owned
-  connection doc keeps autoscaling replicas alive while a session is active.
+- **Experimental EQLink bidirectional streaming.** EQLink relays concurrent
+  request and response bodies through independent acknowledged, stop-and-wait
+  queue lanes, including HTTP/2 request streaming, SSE, NDJSON, and trailers.
+  Session queues use 30-minute `gc=` generations, rotate opportunistically with
+  data in their final ten minutes, and force a blank reciprocal switch in their
+  final five minutes. The public inbox task represents an attempted session;
+  after acceptance, the one claimed response-direction token represents the
+  active session and alternates between sender and receiver with protocol turns.
 
 - **Queue-driven Kubernetes autoscaling.** The Helm chart can publish an
   optional Prometheus `ServiceMonitor`; the service exports queue and doc
   namespace size gauges; and the greetings demo includes a KEDA `ScaledObject`
-  that scales an eqlink receiver between zero and one replica from queued work
-  or durable workflow-status docs.
+  that scales an EQLink receiver between zero and one replica from its inbox and
+  claimed response-lane tasks.
 
 ### Removed
 
@@ -88,6 +138,49 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Breaking: JS worker matches Go's quarantine semantics.** The same four
+  defects fixed in the Python worker, all introduced together in the June 2026
+  async rewrite: retry and quarantine are now one decision taken at the moment
+  of failure rather than a ceiling check deferred to the next claim; a
+  `EntroQMoveError` with no destination quarantines through the error-queue
+  mapping instead of issuing no modification at all; doc acquisition failures
+  are classified into poison pill and contention; and a move increments the
+  attempt count. Quarantining forces `atMs` to `"0"` so a retry delay cannot
+  leak into a task awaiting inspection.
+- **Breaking: JS worker default error queue is now `/err`.** It was
+  `<queue>/error`, disagreeing with Go's `DefaultErrQMap`. Pass
+  `errQMap: q => q + "/error"` to keep the old name.
+- **Breaking: Python worker retries and quarantines in one decision.** The
+  worker no longer re-queues unconditionally and checks `max_attempts` on the
+  next claim. It now decides retry-versus-quarantine at the moment of failure,
+  as Go's `RetryOrQuarantine` does. The old split meant an exhausted task was
+  quarantined only if a worker came back to claim it, and none may: scale to
+  zero or drain the queue and it sat in the inbox looking retryable forever.
+  The quarantining change forces `at` to null so a retry delay cannot leak into
+  a task that is waiting to be inspected. `MoveError` now increments the
+  attempt count, as Go's `Quarantine` always has.
+- **Breaking: Python doc acquisition failures are classified.** A failure to
+  claim required docs was caught by the run loop, logged as "Dependency error,
+  continuing", and retried forever with nothing recorded on the task. A missing
+  doc is now quarantined as a poison pill and a contended doc is retried with
+  backoff, matching Go's `acquireDocs`. The error names the doc.
+- **Breaking: Python handlers are cancelled when the claim is lost.** The
+  renewer previously recorded a lost claim and let the handler run to
+  completion against work that could no longer be committed, and that another
+  claimant might already be redoing. It now cancels the handler task, raising
+  `asyncio.CancelledError` at its next await point. Cancellation arriving from
+  outside the worker still propagates untouched.
+- **Breaking: Python worker default error queue is now `/err`.** It was
+  `<queue>/error`, which disagreed with the Go worker's `DefaultErrQMap`
+  (`<queue>/err`), so Go tooling watching `/err` never saw tasks quarantined by
+  a Python worker. Both clients now default to the same place. Deployments
+  relying on the old name should pass `err_q_map=lambda q: q + '/error'` to
+  keep it.
+- **Breaking: Python `MoveError` without a destination now quarantines.** On a
+  worker with no configured error queue it previously issued no modification at
+  all, leaving the task to be reclaimed on lease expiry and moved again, and
+  again, with nothing recorded. It now falls back to the worker's error-queue
+  mapping, as the Go worker always has.
 - **Claimed document insertion.** `WithDocArrivalTime` and
   `WithDocArrivalTimeBy` now apply to document inserts as well as changes. A
   future arrival atomically creates the document under the inserting client's

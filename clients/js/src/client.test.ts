@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { EntroQClient } from "./client";
+import { EntroQClient, EntroQDependencyError } from "./client";
 
 describe("EntroQClient", () => {
   const baseUrl = "http://localhost:9100";
@@ -103,5 +103,44 @@ describe("EntroQClient", () => {
     await expect(client.tryClaim(["q1"])).rejects.toThrow(
       "EntroQ request failed (400): Bad Queue Name"
     );
+  });
+
+  describe("EntroQDependencyError doc details", () => {
+    // A ModifyDep carries either `id` or `docId`. Reading only `id` discarded
+    // every doc dependency, leaving doc failures uninspectable.
+    const docId = { namespace: "ns", id: "d1", version: 3 };
+
+    it("decodes docId into the doc-scoped buckets", () => {
+      const err = new EntroQDependencyError("nope", [
+        { type: "DEPEND", docId },
+        { type: "CLAIM", docId: { ...docId, id: "d2" } },
+        { type: "CHANGE", id: { id: "t1", version: 1, queue: "q" } },
+      ]);
+      expect(err.docDepends).toEqual([docId]);
+      expect(err.docClaims).toEqual([{ ...docId, id: "d2" }]);
+      expect(err.changes).toHaveLength(1);
+      expect(err.depends).toHaveLength(0);
+    });
+
+    it("reports a missing doc as a poison pill", () => {
+      const err = new EntroQDependencyError("gone", [{ type: "DEPEND", docId }]);
+      expect(err.hasMissingDocs()).toBe(true);
+      expect(err.hasClaimedDocs()).toBe(false);
+    });
+
+    it("reports a contended doc as transient", () => {
+      const err = new EntroQDependencyError("held", [{ type: "CLAIM", docId }]);
+      expect(err.hasMissingDocs()).toBe(false);
+      expect(err.hasClaimedDocs()).toBe(true);
+    });
+
+    it("keeps task and doc dependencies apart", () => {
+      const err = new EntroQDependencyError("mixed", [
+        { type: "CLAIM", id: { id: "t1", version: 1, queue: "q" } },
+      ]);
+      expect(err.claims).toHaveLength(1);
+      expect(err.docClaims).toHaveLength(0);
+      expect(err.hasClaimedDocs()).toBe(false);
+    });
   });
 });

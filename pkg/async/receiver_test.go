@@ -114,7 +114,7 @@ func testSessionQueueRotation(t *testing.T, timing laneTiming, force bool) {
 	sender.laneTiming = timing
 	w := &notifyingResponseWriter{ResponseRecorder: httptest.NewRecorder(), flushed: make(chan struct{}, 8)}
 	request := httptest.NewRequest(http.MethodGet, "http://service/events", nil)
-	session := newSenderSession(sender, w, request, sessionID, requestAck, responseData, time.Now())
+	session := newSenderSession(sender, w, request, sessionID, requestAck, responseData, nil, time.Now())
 	senderDone := make(chan error, 1)
 	go func() { senderDone <- session.run(ctx) }()
 
@@ -195,6 +195,112 @@ func waitForFlush(t *testing.T, ctx context.Context, flushed <-chan struct{}, de
 	}
 }
 
+func waitForDocCount(t *testing.T, ctx context.Context, eq *entroq.EntroQ, namespace string, want int) []*entroq.Doc {
+	t.Helper()
+	for {
+		docs, err := eq.Docs(ctx, &entroq.DocQuery{Namespace: namespace})
+		if err != nil {
+			t.Fatalf("read docs from %q: %v", namespace, err)
+		}
+		if len(docs) == want {
+			return docs
+		}
+		select {
+		case <-time.After(10 * time.Millisecond):
+		case <-ctx.Done():
+			t.Fatalf("docs in %q: got %d, want %d", namespace, len(docs), want)
+		}
+	}
+}
+
+func waitForQueueSize(t *testing.T, ctx context.Context, eq *entroq.EntroQ, queue string, want int) {
+	t.Helper()
+	for {
+		stats, err := eq.QueueStats(ctx, entroq.MatchExact(queue))
+		if err != nil {
+			t.Fatalf("read stats for %q: %v", queue, err)
+		}
+		got := 0
+		if stat := stats[queue]; stat != nil {
+			got = stat.Size
+		}
+		if got == want {
+			return
+		}
+		select {
+		case <-time.After(10 * time.Millisecond):
+		case <-ctx.Done():
+			t.Fatalf("queue %q size: got %d, want %d", queue, got, want)
+		}
+	}
+}
+
+func claimedResponseLanes(ctx context.Context, eq *entroq.EntroQ, prefix string) (int, error) {
+	stats, err := eq.QueueStats(ctx, entroq.MatchPrefix(prefix+"/"))
+	if err != nil {
+		return 0, err
+	}
+	claimed := 0
+	for queue, stat := range stats {
+		if strings.HasSuffix(queue, "/response-ack") || strings.HasSuffix(queue, "/response-data") {
+			claimed += stat.Claimed
+		}
+	}
+	return claimed, nil
+}
+
+func waitForClaimedResponseLanes(t *testing.T, ctx context.Context, eq *entroq.EntroQ, prefix string, want int) {
+	t.Helper()
+	for {
+		got, err := claimedResponseLanes(ctx, eq, prefix)
+		if err != nil {
+			t.Fatalf("read response lane stats under %q: %v", prefix, err)
+		}
+		if got == want {
+			return
+		}
+		select {
+		case <-time.After(10 * time.Millisecond):
+		case <-ctx.Done():
+			t.Fatalf("claimed response lanes under %q: got %d, want %d", prefix, got, want)
+		}
+	}
+}
+
+func TestPendingSenderInboxDemandIsCanceled(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	eq, err := entroq.New(ctx, eqmem.Opener())
+	if err != nil {
+		t.Fatalf("new EntroQ: %v", err)
+	}
+	defer eq.Close()
+
+	const peerTimeout = 2 * time.Second
+	sender := NewSender(eq, "",
+		WithSenderDomainSuffix(".test"),
+		WithSenderRequestTimeout(peerTimeout),
+	)
+	requestCtx, cancelRequest := context.WithCancel(ctx)
+	senderDone := make(chan struct{})
+	go func() {
+		defer close(senderDone)
+		request := httptest.NewRequest(http.MethodGet, "http://service.test/pending", nil).WithContext(requestCtx)
+		sender.ServeHTTP(httptest.NewRecorder(), request)
+	}()
+
+	waitForQueueSize(t, ctx, eq, "/service/inbox", 1)
+
+	cancelRequest()
+	select {
+	case <-senderDone:
+	case <-ctx.Done():
+		t.Fatal("sender did not stop after caller cancellation")
+	}
+	waitForQueueSize(t, ctx, eq, "/service/inbox", 0)
+}
+
 func TestHeartbeatsKeepIdleSessionAlive(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -237,6 +343,7 @@ func TestHeartbeatsKeepIdleSessionAlive(t *testing.T) {
 		senderDone <- nil
 	}()
 	waitForFlush(t, ctx, writer.flushed, "response headers")
+	waitForClaimedResponseLanes(t, ctx, eq, "/service", 1)
 
 	timer := time.NewTimer(3 * peerTimeout)
 	select {
@@ -246,6 +353,10 @@ func TestHeartbeatsKeepIdleSessionAlive(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("timed out while observing healthy heartbeats")
 	}
+	// The GET request body has already half-closed. While the sender waits for a
+	// server push, heartbeat turns keep exactly one response-direction token
+	// claimed, which is the active-session autoscaling signal.
+	waitForClaimedResponseLanes(t, ctx, eq, "/service", 1)
 	if _, err := responseWriter.Write([]byte("still alive")); err != nil {
 		t.Fatalf("write response after idle interval: %v", err)
 	}
@@ -260,6 +371,8 @@ func TestHeartbeatsKeepIdleSessionAlive(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("session did not finish after idle interval")
 	}
+	waitForClaimedResponseLanes(t, ctx, eq, "/service", 0)
+	waitForDocCount(t, ctx, eq, receiverSessionDocNamespace("/service"), 0)
 
 	stopReceiver()
 	select {
@@ -292,7 +405,7 @@ func TestSenderWorkersStopAtQueueGCDeadline(t *testing.T) {
 	sender := NewSender(eq, "", WithSenderRequestTimeout(4*time.Second))
 	sender.laneTiming = timing
 	request := httptest.NewRequest(http.MethodGet, "http://service/events", nil)
-	session := newSenderSession(sender, httptest.NewRecorder(), request, "expired-session", requestAck, responseData, time.Now())
+	session := newSenderSession(sender, httptest.NewRecorder(), request, "expired-session", requestAck, responseData, nil, time.Now())
 	if err := session.run(ctx); !errors.Is(err, errSenderQueueExpired) {
 		t.Fatalf("sender error: got %v, want %v", err, errSenderQueueExpired)
 	}
@@ -314,7 +427,7 @@ func TestSenderCancellationNotifiesLastRequestDataQueue(t *testing.T) {
 	peer := newReceiveLane("/service", sessionID, "request-data", time.Now(), defaultLaneTiming)
 	sender := NewSender(eq, "")
 	request := httptest.NewRequest(http.MethodPost, "http://service/work", strings.NewReader("pending"))
-	session := newSenderSession(sender, httptest.NewRecorder(), request, sessionID, requestAck, responseData, time.Now())
+	session := newSenderSession(sender, httptest.NewRecorder(), request, sessionID, requestAck, responseData, nil, time.Now())
 	if _, err := session.requestLanes.observePeer(peer.queue); err != nil {
 		t.Fatalf("observe peer queue: %v", err)
 	}
@@ -393,13 +506,7 @@ func TestReceiverConcurrentSessionLifecycles(t *testing.T) {
 		t.Error(err)
 	}
 
-	docs, err := eq.Docs(ctx, &entroq.DocQuery{Namespace: connectionDocNamespace("/service")})
-	if err != nil {
-		t.Fatalf("get connection docs: %v", err)
-	}
-	if len(docs) != 0 {
-		t.Fatalf("connection docs remain after sessions completed: %d", len(docs))
-	}
+	waitForDocCount(t, ctx, eq, receiverSessionDocNamespace("/service"), 0)
 
 	stopReceiver()
 	select {
@@ -622,15 +729,15 @@ func TestReceiverCrashLeavesOnlyGCManagedSessionState(t *testing.T) {
 
 func assertOnlyGCManagedSessionState(t *testing.T, ctx context.Context, eq *entroq.EntroQ, prefix string) {
 	t.Helper()
-	docNS := connectionDocNamespace(prefix)
+	docNS := receiverSessionDocNamespace(prefix)
 	if _, present, err := queues.GCActivation(docNS); err != nil || !present {
-		t.Fatalf("connection namespace is not GC-managed: namespace=%q present=%v err=%v", docNS, present, err)
+		t.Fatalf("receiver session namespace is not GC-managed: namespace=%q present=%v err=%v", docNS, present, err)
 	}
 	if _, err := eq.Docs(ctx, &entroq.DocQuery{Namespace: docNS}); err != nil {
-		t.Fatalf("read abandoned connection docs: %v", err)
+		t.Fatalf("read abandoned receiver session docs from %q: %v", docNS, err)
 	}
 	// A terminal frame may commit concurrently with the simulated crash and
-	// delete the singleton doc. If it does not, the namespace marker above
+	// delete the receiver's doc. If it does not, the namespace marker above
 	// guarantees that the abandoned doc remains eligible for collection.
 
 	stats, err := eq.QueueStats(ctx, entroq.MatchPrefix(prefix+"/"))

@@ -17,6 +17,7 @@ var (
 	workLease         time.Duration
 	workQueues        []string
 	workMaxAttempts   int32
+	workMaxClaims     int32
 	workTakeDocs      bool
 	workWork          bool
 	workSuccess       bool
@@ -39,9 +40,9 @@ phase framing) is gateway-specific.
 
 Registration is out-of-band and set at connection time. In stdio mode (the
 default) the client typically spawns this process and declares its registration
-with flags: the queues it serves, its max-attempts, and which phases it
-implements (--take-docs, --work, --success, --dependency). A work handler is
-required.
+with flags: the queues it serves, its claim and attempt ceilings, and which
+phases it implements (--take-docs, --work, --success, --dependency). A work
+handler is required.
 
 Then, per claimed task, the gateway sends only the registered phases and reads a
 reply. Exactly one post-commit phase (success or dependency) fires, and only if
@@ -106,6 +107,7 @@ WebSocket close codes (1013 transient, 1008 caller, 1011 gateway).`,
 		cfg := workgateway.Config{
 			Queues:      workQueues,
 			MaxAttempts: workMaxAttempts,
+			MaxClaims:   workMaxClaims,
 			TakeDocs:    workTakeDocs,
 			Work:        workWork,
 			Success:     workSuccess,
@@ -124,6 +126,7 @@ func init() {
 	flags.DurationVar(&workLease, "lease", entroq.DefaultClaimDuration, "Claim lease and renewal interval (gateway-owned; not client-chosen).")
 	flags.StringArrayVar(&workQueues, "queue", nil, "A queue this worker serves (repeatable). Required in stdio mode.")
 	flags.Int32Var(&workMaxAttempts, "max-attempts", 0, "Max attempts before a retry is quarantined; 0 means unlimited.")
+	flags.Int32Var(&workMaxClaims, "max-claims", 0, "Max times a task may be claimed before it is quarantined without being dispatched; catches tasks that wedge or kill their worker. 0 means unlimited.")
 	flags.BoolVar(&workTakeDocs, "take-docs", false, "The worker implements the takeDocs phase.")
 	flags.BoolVar(&workWork, "work", false, "The worker implements the work phase (required).")
 	flags.BoolVar(&workSuccess, "success", false, "The worker implements the success phase (post-commit).")

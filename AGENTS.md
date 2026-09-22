@@ -14,6 +14,44 @@ schema through the Go service rather than executing it directly.
 
 `TestSchemaVersion` in `pkg/backend/eqpg` enforces this invariant.
 
+## The Go worker is the reference implementation
+
+`pkg/worker` defines EntroQ's worker semantics. The Python, JS, and gateway
+workers are ports of it, so "parity" means parity **with Go** — not with each
+other, and not with whatever a client happens to do today. When a client
+diverges, the fix is to change the client.
+
+This holds even when the divergent behavior is documented in the client. A
+comment asserting the behavior is evidence that someone wrote it deliberately,
+not evidence that it is right: the June 2026 client rewrite documented
+"if queue is empty, the claim expires naturally" for a move with no
+destination, and that was a task-losing bug in both Python and JS for a year.
+
+Read these before changing any client worker:
+
+- `pkg/worker/worker.go` — the run loop, the phase order, and the error ladder
+  (sentinel → dependency → cancellation → exit).
+- `Task.RetryOrQuarantine` (`task.go`) — retry and quarantine are **one**
+  decision, taken at the moment of failure. A client that re-queues and then
+  checks the attempt ceiling on the *next* claim has a bug: an exhausted task
+  gets quarantined only if a worker comes back for it, and none may. Quarantine
+  also resets the arrival time, so a retry delay cannot leak into a task that is
+  waiting to be inspected.
+- `worker.DefaultErrQMap` — the default error queue is `<inbox>/err`, and
+  `WithErrQMap` computes it per inbox. A move with no destination falls back to
+  it; it never becomes a no-op.
+- `acquireDocs` — a missing doc is a poison pill (move); a doc claimed by
+  someone else is transient (retry with backoff). Both are recorded on the task,
+  not just logged.
+- `DependencyError` (`entroq.go`) — task and doc failures are separate fields.
+  A `ModifyDep` carries either `id` or `doc_id`; a decoder that reads only `id`
+  silently discards every doc dependency.
+
+The ports live in `clients/py/src/entroq/worker.py` and
+`clients/js/src/worker.ts`. `pkg/workgateway` hosts foreign workers on the Go
+worker directly, so it inherits these semantics rather than reimplementing them
+— but it must still pass through each run option it means to support.
+
 ## Releasing goes through the scripts, off `develop`
 
 Do not hand-roll a release. Releases are cut from `develop` (not `main`, which

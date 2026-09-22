@@ -321,10 +321,12 @@ end-to-end example with three Python services, deployment manifests, and a
 step-by-step walkthrough.
 
 Queue receivers can scale to zero with KEDA while EntroQ durably holds their
-inbox work. A status doc can keep fan-out workers alive after their root task
-disappears. The Helm chart can publish queue and doc-namespace metrics through
-an optional Prometheus `ServiceMonitor`; the greetings demo includes a
-zero-to-one eqlink receiver example. See the chart's
+inbox work. Experimental EQLink receivers scale up from the public inbox, then
+stay up while the session's response-direction queue token is claimed by either
+endpoint. A status doc can provide an analogous lifetime signal for fan-out
+workers after their root task disappears. The Helm chart can publish queue and
+doc-namespace metrics through an optional Prometheus `ServiceMonitor`; the
+greetings demo includes a zero-to-one EQLink receiver example. See the chart's
 [`Queue-driven autoscaling`](charts/entroq/README.md#queue-driven-autoscaling)
 section for the deployment contract.
 

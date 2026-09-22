@@ -48,27 +48,18 @@ func (l *peerLiveness) observed() {
 	}
 }
 
+// run resets the peer deadline after every observed frame and calls timeout
+// once when no frame arrives in time. Reset safely replaces either an active or
+// expired deadline, so no separate stop-and-drain handshake is needed.
 func (l *peerLiveness) run(ctx context.Context, timeout func()) error {
 	timer := time.NewTimer(l.timing.timeout)
 	defer timer.Stop()
 	for {
 		select {
 		case <-timer.C:
-			select {
-			case <-l.activity:
-				timer.Reset(l.timing.timeout)
-				continue
-			default:
-			}
 			timeout()
 			return nil
 		case <-l.activity:
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
 			timer.Reset(l.timing.timeout)
 		case <-ctx.Done():
 			return nil

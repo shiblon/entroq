@@ -38,16 +38,12 @@ func newBodySource(body io.ReadCloser, trailers http.Header) *bodySource {
 	}
 }
 
+// run is the sole reader of the local request body. It publishes bounded body
+// events until EOF or a read failure; canceling ctx closes the body to release
+// a blocked Read, while normal completion stops that cancellation callback.
 func (s *bodySource) run(ctx context.Context) error {
-	readDone := make(chan struct{})
-	defer close(readDone)
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = s.body.Close()
-		case <-readDone:
-		}
-	}()
+	stopClose := context.AfterFunc(ctx, func() { s.body.Close() })
+	defer stopClose()
 
 	buffer := make([]byte, streamReadBufferSize)
 	emptyReads := 0
@@ -80,27 +76,21 @@ func (s *bodySource) run(ctx context.Context) error {
 	}
 }
 
+// nextBefore returns the next body event, or forced=true when deadline wins.
 func (s *bodySource) nextBefore(ctx context.Context, deadline time.Time) (event bodyEvent, forced bool, err error) {
-	select {
-	case event := <-s.events:
-		return event, false, nil
-	default:
-	}
+	return receiveBefore(ctx, s.events, deadline)
+}
 
-	timer := time.NewTimer(time.Until(deadline))
-	defer timer.Stop()
+// receiveBefore waits for an event until an absolute deadline. When both the
+// event and deadline are ready, ordinary select semantics choose the result.
+func receiveBefore[T any](ctx context.Context, events <-chan T, deadline time.Time) (event T, forced bool, err error) {
 	select {
-	case event := <-s.events:
+	case event = <-events:
 		return event, false, nil
-	case <-timer.C:
-		select {
-		case event := <-s.events:
-			return event, false, nil
-		default:
-			return bodyEvent{}, true, nil
-		}
+	case <-time.After(time.Until(deadline)):
+		return event, true, nil
 	case <-ctx.Done():
-		return bodyEvent{}, false, ctx.Err()
+		return event, false, ctx.Err()
 	}
 }
 

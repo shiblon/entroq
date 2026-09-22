@@ -16,7 +16,7 @@ from entroq.types import (
 )
 from entroq.worker import (
     StopWorker, RetryError, MoveError,
-    DocClaim, Handler, EntroQWorker,
+    DocClaim, Handler, EntroQWorker, default_err_q_map,
     _fix_versions, _renewing,
 )
 
@@ -25,12 +25,12 @@ from entroq.worker import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _task(id='t1', version=1, queue='q', attempt=0, err='') -> Task:
+def _task(id='t1', version=1, queue='q', attempt=0, claims=0, err='') -> Task:
     return Task(
         id=id, version=version, queue=queue,
         at=datetime.now(tz=timezone.utc),
         claimant='claimant', value=None,
-        attempt=attempt, err=err,
+        attempt=attempt, claims=claims, err=err,
     )
 
 
@@ -97,6 +97,34 @@ class FakeClient(EntroQBase):
 
     async def claim_docs(self, namespace, key, duration_ms=30000):
         return [d for d in self._docs if d.namespace == namespace and d.key == key]
+
+
+class DocFailClient(FakeClient):
+    """Fails claim_docs with a prescribed DependencyError."""
+
+    def __init__(self, tasks=(), error=None):
+        super().__init__(tasks=tasks)
+        self._doc_error = error
+
+    async def claim_docs(self, namespace, key, duration_ms=30000):
+        raise self._doc_error
+
+
+class RenewFailClient(FakeClient):
+    """Fails only renewal modifies (those that just push `at` forward)."""
+
+    def __init__(self, tasks=(), error=None):
+        super().__init__(tasks=tasks)
+        self._renew_error = error
+
+    async def modify(self, modification, *, unsafe_claimant_id=None):
+        changes = modification.task_changes
+        is_renewal = bool(changes) and all(
+            c.at is not None and c.queue == c.from_queue for c in changes
+        )
+        if is_renewal and self._renew_error is not None:
+            raise self._renew_error
+        return await super().modify(modification)
 
 
 class ClaimSequenceClient(FakeClient):
@@ -368,8 +396,9 @@ def test_worker_move_error_uses_err_queue():
     assert client.modify_calls[0].task_changes[0].queue == 'global-err'
 
 
-def test_worker_move_error_no_queue_no_modify():
-    task = _task(id='t1', version=1)
+def test_worker_move_error_no_queue_uses_default_map():
+    """An unconfigured worker still quarantines; it must not drop the task."""
+    task = _task(id='t1', version=1, queue='q')
     client = FakeClient(tasks=[task])
     worker = EntroQWorker(client, 'q', claim_duration_s=60.0, err_queue='')
 
@@ -382,7 +411,43 @@ def test_worker_move_error_no_queue_no_modify():
 
     asyncio.run(run())
 
-    assert len(client.modify_calls) == 0
+    assert client.modify_calls[0].task_changes[0].queue == 'q/err'
+
+
+def test_default_err_q_map_matches_go():
+    assert default_err_q_map('/my/inbox') == '/my/inbox/err'
+
+
+def test_worker_error_queue_for_precedence():
+    client = FakeClient()
+    assert EntroQWorker(client, 'q').error_queue_for('/in') == '/in/err'
+    assert EntroQWorker(client, 'q', err_queue='fixed').error_queue_for('/in') == 'fixed'
+    mapped = EntroQWorker(client, 'q', err_q_map=lambda inbox: inbox + '/dead')
+    assert mapped.error_queue_for('/in') == '/in/dead'
+
+
+def test_worker_rejects_both_err_queue_and_map():
+    with pytest.raises(ValueError):
+        EntroQWorker(FakeClient(), 'q', err_queue='fixed', err_q_map=lambda q: q)
+
+
+def test_worker_err_q_map_routes_per_inbox():
+    """A worker watching several queues quarantines each to its own error box."""
+    task = _task(id='t1', version=1, queue='/b')
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, '/a', '/b', claim_duration_s=60.0,
+                          err_q_map=lambda inbox: inbox + '/quarantine')
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            raise MoveError("poison")
+
+        await worker._process(task, process)
+
+    asyncio.run(run())
+
+    assert client.modify_calls[0].task_changes[0].queue == '/b/quarantine'
 
 
 def test_worker_stop_event_exits_after_current_task():
@@ -606,10 +671,80 @@ def test_worker_finisher_called_even_when_do_work_returns_modification():
     assert finished == ['t1']
 
 
-def test_worker_max_attempts_moves_task():
-    task = _task(id='t1', version=1, attempt=3)
+def _run_retry(task, *, max_attempts=0, err_queue='', exc=None):
+    """Drive one RetryError through _process and return the emitted TaskChange."""
     client = FakeClient(tasks=[task])
-    worker = EntroQWorker(client, 'q', claim_duration_s=60.0, max_attempts=3, err_queue='err')
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0,
+                          max_attempts=max_attempts, err_queue=err_queue)
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            raise exc
+
+        await worker._process(task, process)
+
+    asyncio.run(run())
+    return client.modify_calls[0].task_changes[0]
+
+
+def test_worker_retry_quarantines_on_final_attempt():
+    """The last failure quarantines inline, not on some later claim."""
+    tc = _run_retry(_task(id='t1', attempt=2), max_attempts=3, err_queue='err',
+                    exc=RetryError("still broken"))
+    assert tc.queue == 'err'
+    assert tc.attempt == 3
+    assert 'still broken' in tc.err
+
+
+def test_worker_retry_below_ceiling_still_retries():
+    tc = _run_retry(_task(id='t1', attempt=0), max_attempts=3, err_queue='err',
+                    exc=RetryError("transient"))
+    assert tc.queue == 'q'
+    assert tc.at is not None
+    assert tc.attempt == 1
+
+
+def test_worker_quarantine_does_not_inherit_retry_delay():
+    """A quarantined task is for inspection: the retry delay must not leak in."""
+    tc = _run_retry(_task(id='t1', attempt=2), max_attempts=3, err_queue='err',
+                    exc=RetryError("late", delay_s=600.0))
+    assert tc.queue == 'err'
+    assert tc.at is None
+
+
+def test_worker_retry_or_move_to_overrides_quarantine_queue():
+    tc = _run_retry(_task(id='t1', attempt=2), max_attempts=3, err_queue='err',
+                    exc=RetryError("needs a human", or_move_to='/manual-review'))
+    assert tc.queue == '/manual-review'
+
+
+def test_worker_retry_or_move_to_ignored_before_ceiling():
+    """or_move_to picks the quarantine queue; it must not divert a retry."""
+    tc = _run_retry(_task(id='t1', attempt=0), max_attempts=3, err_queue='err',
+                    exc=RetryError("transient", or_move_to='/manual-review'))
+    assert tc.queue == 'q'
+
+
+def test_worker_retry_without_ceiling_never_quarantines():
+    """max_attempts=0 means unlimited, matching Go."""
+    tc = _run_retry(_task(id='t1', attempt=99), exc=RetryError("forever"))
+    assert tc.queue == 'q'
+    assert tc.at is not None
+
+
+def test_worker_move_error_increments_attempt():
+    """Go's Quarantine increments the attempt count; Python now matches."""
+    tc = _run_retry(_task(id='t1', attempt=1), err_queue='err',
+                    exc=MoveError("poison"))
+    assert tc.queue == 'err'
+    assert tc.attempt == 2
+
+
+def test_worker_max_claims_moves_task_without_running_handler():
+    task = _task(id='t1', version=1, claims=4)
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0, max_claims=3, err_queue='err')
 
     work_called = []
 
@@ -627,7 +762,177 @@ def test_worker_max_attempts_moves_task():
     tc = client.modify_calls[0].task_changes[0]
     assert tc.queue == 'err'
     assert tc.at is None
-    assert 'max attempts' in tc.err
+    assert 'maximum claims' in tc.err
+
+
+def test_worker_max_claims_unconfigured_uses_default_map():
+    task = _task(id='t1', version=1, queue='q', claims=4)
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0, max_claims=3)
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            raise StopWorker
+
+        await worker._process(task, process)
+
+    asyncio.run(run())
+
+    assert client.modify_calls[0].task_changes[0].queue == 'q/err'
+
+
+def test_worker_max_claims_allows_task_at_the_ceiling():
+    """claims == max_claims is the last allowed run, matching the Go worker."""
+    task = _task(id='t1', version=1, claims=3)
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0, max_claims=3, err_queue='err')
+
+    work_called = []
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            work_called.append(t.id)
+            raise StopWorker
+
+        await worker._process(task, process)
+
+    asyncio.run(run())
+
+    assert work_called == ['t1']
+    assert client.modify_calls == []
+
+
+def test_worker_max_claims_zero_means_no_limit():
+    task = _task(id='t1', version=1, claims=1000)
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0, err_queue='err')
+
+    work_called = []
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            work_called.append(t.id)
+            raise StopWorker
+
+        await worker._process(task, process)
+
+    asyncio.run(run())
+
+    assert work_called == ['t1']
+
+
+# ---------------------------------------------------------------------------
+# Doc acquisition failures
+# ---------------------------------------------------------------------------
+
+def _doc_dispose(error):
+    """Fail doc acquisition with `error` and return the emitted TaskChange."""
+    task = _task(id='t1', version=1, queue='q')
+    client = DocFailClient(tasks=[task], error=error)
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0)
+    work_called = []
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            work_called.append(t.id)
+            return None
+
+        @process.selector
+        async def process(t):
+            return [DocClaim('ns', 'k')]
+
+        await worker._process(task, process)
+
+    asyncio.run(run())
+    assert work_called == [], "handler must not run when docs were not acquired"
+    return client.modify_calls[0].task_changes[0]
+
+
+def test_worker_missing_doc_is_a_poison_pill():
+    """A required doc that no longer exists can never be claimed: quarantine."""
+    tc = _doc_dispose(DependencyError(
+        "gone", doc_depends=[DocID(namespace='ns', id='d1', version=3)]))
+    assert tc.queue == 'q/err'
+    assert 'required doc missing' in tc.err
+    assert 'd1' in tc.err, "the error must name the doc, not just its absence"
+
+
+def test_worker_contended_doc_retries_with_backoff():
+    """A doc held by another claimant is transient: back off and retry."""
+    tc = _doc_dispose(DependencyError(
+        "held", doc_claims=[DocID(namespace='ns', id='d1', version=3)]))
+    assert tc.queue == 'q'
+    assert tc.at is not None
+    assert 'doc contention' in tc.err
+    assert tc.attempt == 1
+
+
+def test_worker_missing_doc_wins_over_contention():
+    """Mixed failure: an absent doc cannot be waited out, so it dominates."""
+    tc = _doc_dispose(DependencyError(
+        "both",
+        doc_depends=[DocID(namespace='ns', id='gone', version=1)],
+        doc_claims=[DocID(namespace='ns', id='held', version=1)]))
+    assert tc.queue == 'q/err'
+
+
+# ---------------------------------------------------------------------------
+# Claim loss during work
+# ---------------------------------------------------------------------------
+
+def test_worker_cancels_handler_when_claim_is_lost():
+    """Losing the claim mid-work aborts the handler instead of letting it finish.
+
+    The handler's sleep is short enough to finish well inside the outer
+    timeout, so `reached_end` staying empty means the work was genuinely
+    cancelled rather than merely outlived by the test.
+    """
+    task = _task(id='t1', version=1, queue='q')
+    client = RenewFailClient(tasks=[task], error=DependencyError("claim lost"))
+    worker = EntroQWorker(client, 'q', claim_duration_s=0.02)
+
+    reached_end = []
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            await asyncio.sleep(1.0)
+            reached_end.append(t.id)
+            return None
+
+        started = asyncio.get_event_loop().time()
+        with pytest.raises(DependencyError):
+            await worker._process(task, process)
+        return asyncio.get_event_loop().time() - started
+
+    elapsed = asyncio.run(asyncio.wait_for(run(), timeout=10))
+    assert reached_end == [], "handler kept running after the claim was gone"
+    assert elapsed < 0.5, f"claim loss took {elapsed:.2f}s to stop the handler"
+
+
+def test_worker_outer_cancellation_still_propagates():
+    """A cancel that did not come from claim loss must not be swallowed."""
+    task = _task(id='t1', version=1, queue='q')
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0)
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            await asyncio.sleep(5)
+            return None
+
+        proc = asyncio.ensure_future(worker._process(task, process))
+        await asyncio.sleep(0.05)
+        proc.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await proc
+
+    asyncio.run(asyncio.wait_for(run(), timeout=5))
 
 
 # ---------------------------------------------------------------------------

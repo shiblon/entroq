@@ -210,11 +210,26 @@ series, while `type="maxClaims"` reports their maximum.
 KEDA and Prometheus are cluster-level dependencies and are not installed by
 this chart. Each application owns its `ScaledObject` beside the Deployment it
 scales, because the application knows its queue, concurrency, replica limits,
-and acceptable cold-start latency. For a receiver, scale on the sum of
-`type="available"` and `type="claimed"`: available tasks wake the Deployment,
+and acceptable cold-start latency. An ordinary task worker scales on the sum
+of `type="available"` and `type="claimed"`: available tasks wake the Deployment,
 while claimed tasks keep it alive until in-flight work finishes. Excluding
 `type="future"` avoids waking a worker solely for a task whose arrival time has
 not elapsed.
+
+Experimental EQLink receivers scale up from `available + claimed` on the
+service's public inbox. After bootstrap consumes that task, exactly one token in
+the response direction is claimed between protocol handoffs: the receiver
+claims `response-ack` while waiting to send, and the initiator claims
+`response-data` while consuming. Scale retention therefore sums `claimed` for
+the folded `/*/response-ack` and `/*/response-data` queue labels. Counting only
+the response direction avoids counting a bidirectional session twice.
+
+The delete-and-insert handoff between lanes is atomic, but the newly inserted
+token is briefly unclaimed before the peer worker claims it. Set KEDA's
+scale-down cooldown longer than the metric interval and polling interval so
+those handoffs and sampling alignment cannot cause churn. Available orphaned
+session tokens do not retain replicas; after an endpoint dies, claim expiry
+drops the signal while the queue remains eligible for ordinary `gc=` cleanup.
 
 Queue depth measures back pressure, not the lifetime of a workflow. A worker
 that fans out can consume its root task immediately and still have substantial
@@ -236,8 +251,7 @@ interval, with heartbeats every third of that duration) longer than their
 combined worst case plus pod startup time, and set the scale-down cooldown
 longer than the metric interval. See
 [`examples/greetings-demo/k8s/svc-c-autoscaling.yaml`](../../examples/greetings-demo/k8s/svc-c-autoscaling.yaml)
-for a zero-to-one receiver. Its status-namespace term is dormant in the simple
-request-response demo, but shows the complete query for a fan-out worker.
+for a zero-to-one EQLink receiver.
 
 ## Configuration
 

@@ -1,0 +1,177 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: eqlink-smoke
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: entroq
+  namespace: eqlink-smoke
+spec:
+  selector:
+    app: entroq
+  ports:
+  - name: grpc
+    port: 37706
+    targetPort: grpc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: entroq
+  namespace: eqlink-smoke
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: entroq
+  template:
+    metadata:
+      labels:
+        app: entroq
+    spec:
+      containers:
+      - name: entroq
+        image: @IMAGE@
+        imagePullPolicy: Never
+        command: [/bin/eqmem]
+        args: [serve, --port=37706, --http_port=9100, --authn=none, --authz=none]
+        ports:
+        - name: grpc
+          containerPort: 37706
+        readinessProbe:
+          tcpSocket:
+            port: grpc
+          periodSeconds: 2
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 500m
+            memory: 128Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sender
+  namespace: eqlink-smoke
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sender
+  template:
+    metadata:
+      labels:
+        app: sender
+    spec:
+      containers:
+      - name: eqlink
+        image: @IMAGE@
+        imagePullPolicy: Never
+        command: [/bin/eqlink]
+        args:
+        - run
+        - --entroq=entroq.eqlink-smoke.svc.cluster.local:37706
+        - --entroq-startup-timeout=30s
+        - --queue=/eqlink-smoke/sender
+        - --addr=:8080
+        - --namespace=eqlink-smoke
+        - --domain-suffix=.test
+        - --request_timeout=9s
+        - --drain_timeout=15s
+        - --metrics_addr=:9090
+        ports:
+        - name: http
+          containerPort: 8080
+        readinessProbe:
+          tcpSocket:
+            port: http
+          periodSeconds: 2
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+          limits:
+            cpu: 500m
+            memory: 96Mi
+      - name: probe
+        image: @IMAGE@
+        imagePullPolicy: Never
+        command: [/bin/probe]
+        args: [hold]
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 250m
+            memory: 64Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: receiver
+  namespace: eqlink-smoke
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: receiver
+  template:
+    metadata:
+      labels:
+        app: receiver
+    spec:
+      containers:
+      - name: app
+        image: @IMAGE@
+        imagePullPolicy: Never
+        command: [/bin/probe]
+        args: [serve, --addr=:8000]
+        ports:
+        - name: app
+          containerPort: 8000
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: app
+          periodSeconds: 2
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 250m
+            memory: 64Mi
+      - name: eqlink
+        image: @IMAGE@
+        imagePullPolicy: Never
+        command: [/bin/eqlink]
+        args:
+        - run
+        - --entroq=entroq.eqlink-smoke.svc.cluster.local:37706
+        - --entroq-startup-timeout=30s
+        - --queue=/eqlink-smoke/receiver
+        - --addr=:8080
+        - --namespace=eqlink-smoke
+        - --domain-suffix=.test
+        - --upstream=http://localhost:8000
+        - --concurrency=8
+        - --request_timeout=9s
+        - --drain_timeout=15s
+        - --metrics_addr=:9090
+        readinessProbe:
+          httpGet:
+            path: /metrics
+            port: 9090
+          periodSeconds: 2
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+          limits:
+            cpu: 500m
+            memory: 96Mi

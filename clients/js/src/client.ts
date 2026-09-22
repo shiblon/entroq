@@ -1,6 +1,7 @@
 import {
   Task,
   TaskID,
+  DocID,
   ClaimRequest,
   ClaimResponse,
   ModifyRequest,
@@ -43,10 +44,29 @@ export class EntroQDependencyError extends Error {
   readonly depends: TaskID[] = [];
   readonly claims: TaskID[] = [];
 
+  readonly docInserts: DocID[] = [];
+  readonly docChanges: DocID[] = [];
+  readonly docDeletes: DocID[] = [];
+  readonly docDepends: DocID[] = [];
+  readonly docClaims: DocID[] = [];
+
   constructor(message: string, details: any[] = []) {
     super(message);
     this.name = "EntroQDependencyError";
     for (const d of details) {
+      // A ModifyDep carries either a task id or a docId, never both. Reading
+      // only `id` silently discarded every doc dependency.
+      const docId: DocID | undefined = d?.docId ?? undefined;
+      if (docId) {
+        switch (d?.type) {
+          case "INSERT": this.docInserts.push(docId); break;
+          case "CHANGE": this.docChanges.push(docId); break;
+          case "DELETE": this.docDeletes.push(docId); break;
+          case "DEPEND": this.docDepends.push(docId); break;
+          case "CLAIM":  this.docClaims.push(docId); break;
+        }
+        continue;
+      }
       const id: TaskID | undefined = d?.id ?? undefined;
       switch (d?.type) {
         case "INSERT": if (id) this.inserts.push(id); break;
@@ -57,6 +77,19 @@ export class EntroQDependencyError extends Error {
         case "DETAIL": if (d.msg) this.message = `${this.message}: ${d.msg}`; break;
       }
     }
+  }
+
+  /**
+   * True when a required doc is absent rather than merely claimed elsewhere.
+   * Such a task is a poison pill: retrying cannot help.
+   */
+  hasMissingDocs(): boolean {
+    return this.docDepends.length > 0 || this.docDeletes.length > 0 || this.docChanges.length > 0;
+  }
+
+  /** True when a required doc is held by another claimant (transient). */
+  hasClaimedDocs(): boolean {
+    return this.docClaims.length > 0;
   }
 }
 

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { EntroQClient } from "./client";
+import { EntroQClient, EntroQDependencyError } from "./client";
 import { EntroQWorker, EntroQRetryError, EntroQMoveError, EntroQStopWorker } from "./worker";
 import type { Task, Doc } from "./types";
 
@@ -146,7 +146,9 @@ describe("EntroQWorker", () => {
     }));
   });
 
-  it("should let claim expire when EntroQMoveError has no queue and no errQueue", async () => {
+  it("quarantines via the default map when EntroQMoveError has no queue", async () => {
+    // An unconfigured worker must still record the failure somewhere: dropping
+    // the move leaves the task to be reclaimed and re-moved forever.
     const task = makeTask();
     vi.spyOn(client, "claim").mockResolvedValueOnce({ task });
     const modifySpy = vi.spyOn(client, "modify").mockResolvedValue({ changed: [] });
@@ -159,7 +161,11 @@ describe("EntroQWorker", () => {
     await vi.runOnlyPendingTimersAsync();
     await runPromise;
 
-    expect(modifySpy).not.toHaveBeenCalled();
+    expect(modifySpy).toHaveBeenCalledWith(expect.objectContaining({
+      changes: [expect.objectContaining({
+        newData: expect.objectContaining({ queue: "q1/err", err: "no dest" }),
+      })],
+    }));
   });
 
   it("should handle EntroQStopWorker", async () => {
@@ -311,10 +317,79 @@ describe("EntroQWorker", () => {
     expect(lastCall.deletes?.[0].version).toBe(2);
   });
 
-  it("should move task to error queue when maxAttempts exceeded", async () => {
-    const task = makeTask({ attempt: 5 });
-    worker = new EntroQWorker(client, { leaseMs: 1000, maxAttempts: 5 });
-    // First claim returns the task; second blocks so stop() can unblock it.
+  /** Drive one sentinel through the worker and return the emitted newData. */
+  async function disposeOnce(
+    task: Task,
+    opts: ConstructorParameters<typeof EntroQWorker>[1],
+    thrown: Error,
+  ): Promise<any> {
+    worker = new EntroQWorker(client, { leaseMs: 1000, ...opts });
+    vi.spyOn(client, "claim").mockResolvedValueOnce({ task });
+    const modifySpy = vi.spyOn(client, "modify").mockResolvedValue({ changed: [] });
+
+    const runPromise = worker.run(["q1"], async () => {
+      worker.stop();
+      throw thrown;
+    });
+    await vi.runOnlyPendingTimersAsync();
+    await runPromise;
+
+    return modifySpy.mock.calls[modifySpy.mock.calls.length - 1][0].changes![0].newData;
+  }
+
+  it("quarantines on the final attempt rather than on a later claim", async () => {
+    const d = await disposeOnce(makeTask({ attempt: 2 }), { maxAttempts: 3 },
+      new EntroQRetryError("still broken"));
+    expect(d.queue).toBe("q1/err");
+    expect(d.attempt).toBe(3);
+    expect(d.err).toBe("still broken");
+  });
+
+  it("retries while attempts remain", async () => {
+    const d = await disposeOnce(makeTask({ attempt: 0 }), { maxAttempts: 3 },
+      new EntroQRetryError("transient"));
+    expect(d.queue).toBe("q1");
+    expect(d.attempt).toBe(1);
+    expect(Number(d.atMs)).toBeGreaterThan(0);
+  });
+
+  it("does not let a retry delay leak into a quarantined task", async () => {
+    const d = await disposeOnce(makeTask({ attempt: 2 }), { maxAttempts: 3 },
+      new EntroQRetryError("late", 600000));
+    expect(d.queue).toBe("q1/err");
+    expect(d.atMs).toBe("0");
+  });
+
+  it("honors orMoveTo when attempts are exhausted", async () => {
+    const d = await disposeOnce(makeTask({ attempt: 2 }), { maxAttempts: 3 },
+      new EntroQRetryError("needs a human", undefined, "/manual-review"));
+    expect(d.queue).toBe("/manual-review");
+  });
+
+  it("ignores orMoveTo while attempts remain", async () => {
+    const d = await disposeOnce(makeTask({ attempt: 0 }), { maxAttempts: 3 },
+      new EntroQRetryError("transient", undefined, "/manual-review"));
+    expect(d.queue).toBe("q1");
+  });
+
+  it("never quarantines when maxAttempts is unset", async () => {
+    const d = await disposeOnce(makeTask({ attempt: 99 }), {},
+      new EntroQRetryError("forever"));
+    expect(d.queue).toBe("q1");
+  });
+
+  it("increments the attempt count on a move, as Go's Quarantine does", async () => {
+    const d = await disposeOnce(makeTask({ attempt: 1 }), { errQueue: "err" },
+      new EntroQMoveError("poison"));
+    expect(d.queue).toBe("err");
+    expect(d.attempt).toBe(2);
+  });
+
+  it("quarantines a task over the claim ceiling without running it", async () => {
+    const task = makeTask({ claims: 4 });
+    worker = new EntroQWorker(client, { leaseMs: 1000, maxClaims: 3 });
+    // First claim returns the task; later ones block so stop() can unblock them.
+    // The handler must not run, so it cannot be what stops the worker.
     vi.spyOn(client, "claim")
       .mockResolvedValueOnce({ task })
       .mockReturnValue(new Promise(() => {}));
@@ -323,18 +398,106 @@ describe("EntroQWorker", () => {
     let handlerRan = false;
     const runPromise = worker.run(["q1"], async () => { handlerRan = true; });
 
-    // Yield to let the first iteration (claim + max-attempts check) complete.
+    // Yield to let the first iteration (claim + claim-ceiling check) finish.
+    await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
     worker.stop();
     await runPromise;
 
     expect(handlerRan).toBe(false);
-    expect(modifySpy).toHaveBeenCalledWith(expect.objectContaining({
-      changes: [expect.objectContaining({
-        newData: expect.objectContaining({ queue: "q1/error" }),
-      })],
-    }));
+    const d = modifySpy.mock.calls[0][0].changes![0].newData;
+    expect(d.queue).toBe("q1/err");
+    expect(d.err).toContain("maximum claims exceeded");
+  });
+
+  it("routes each inbox to its own error queue via errQMap", async () => {
+    const d = await disposeOnce(makeTask({ queue: "q1" }),
+      { errQMap: (inbox: string) => `${inbox}/quarantine` },
+      new EntroQMoveError("poison"));
+    expect(d.queue).toBe("q1/quarantine");
+  });
+
+  it("quarantines a task whose required doc is missing", async () => {
+    const task = makeTask();
+    vi.spyOn(client, "claim").mockResolvedValueOnce({ task })
+      .mockReturnValue(new Promise(() => {}));
+    vi.spyOn(client, "claimDocs").mockRejectedValue(new EntroQDependencyError(
+      "gone", [{ type: "DEPEND", docId: { namespace: "ns", id: "d1", version: 3 } }]));
+    const modifySpy = vi.spyOn(client, "modify").mockResolvedValue({ changed: [] });
+
+    let handlerRan = false;
+    const handle = EntroQWorker.handler(async () => { handlerRan = true; })
+      .selector(async () => [{ namespace: "ns", key: "k1" }]);
+    const runPromise = worker.run(["q1"], handle);
+
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    worker.stop();
+    await runPromise;
+
+    expect(handlerRan).toBe(false);
+    const d = modifySpy.mock.calls[0][0].changes![0].newData;
+    expect(d.queue).toBe("q1/err");
+    expect(d.err).toContain("required doc missing");
+  });
+
+  it("retries a task whose required doc is merely claimed elsewhere", async () => {
+    const task = makeTask();
+    vi.spyOn(client, "claim").mockResolvedValueOnce({ task })
+      .mockReturnValue(new Promise(() => {}));
+    vi.spyOn(client, "claimDocs").mockRejectedValue(new EntroQDependencyError(
+      "held", [{ type: "CLAIM", docId: { namespace: "ns", id: "d1", version: 3 } }]));
+    const modifySpy = vi.spyOn(client, "modify").mockResolvedValue({ changed: [] });
+
+    const handle = EntroQWorker.handler(async () => {})
+      .selector(async () => [{ namespace: "ns", key: "k1" }]);
+    const runPromise = worker.run(["q1"], handle);
+
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    worker.stop();
+    await runPromise;
+
+    const d = modifySpy.mock.calls[0][0].changes![0].newData;
+    expect(d.queue).toBe("q1");
+    expect(Number(d.atMs)).toBeGreaterThan(0);
+    expect(d.err).toContain("doc contention");
+  });
+
+  it("aborts the handler's signal when the claim is lost", async () => {
+    const task = makeTask();
+    worker = new EntroQWorker(client, { leaseMs: 1000, pollMs: 100, backoffMs: 1 });
+    vi.spyOn(client, "claim").mockResolvedValueOnce({ task })
+      .mockReturnValue(new Promise(() => {}));
+    // Every modify is a renewal here, and it fails: the claim is gone.
+    vi.spyOn(client, "modify").mockRejectedValue(
+      new EntroQDependencyError("claim lost", []));
+
+    let sawAbort = false;
+    const runPromise = worker.run(["q1"], async (_t, _d, signal) => {
+      await new Promise<void>(resolve => {
+        if (signal.aborted) return resolve();
+        signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+      sawAbort = signal.aborted;
+    });
+
+    await vi.runOnlyPendingTimersAsync();
+    worker.stop();
+    await vi.runOnlyPendingTimersAsync();
+    await runPromise;
+
+    expect(sawAbort).toBe(true);
+  });
+
+  it("rejects errQueue and errQMap together", () => {
+    expect(() => new EntroQWorker(client, { errQueue: "e", errQMap: (q: string) => q }))
+      .toThrow(/mutually exclusive/);
   });
 
   it("HandlerBuilder chaining is immutable", () => {

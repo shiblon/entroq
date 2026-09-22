@@ -56,7 +56,7 @@ import (
 // different value on each replay, which defeats idempotency.
 //
 // If the sender disconnects, the upstream may continue until its current lane
-// expires. Ephemeral tasks and the receiver-owned connection document are then
+// expires. Ephemeral tasks and the receiver-owned session document are then
 // garbage-collected. Upstream work cannot be undone; callers that care about
 // exactly-once effects must track completion state themselves.
 type Sender struct {
@@ -344,11 +344,17 @@ func (s *Sender) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := s.eq.Modify(ctx,
+	modifyResp, err := s.eq.Modify(ctx,
 		entroq.InsertingInto(targetInbox, entroq.WithRawValue(envValue)),
-	); err != nil {
+	)
+	if err != nil {
 		log.Printf("sender enqueue to %s: %v", targetInbox, err)
 		http.Error(w, fmt.Sprintf("enqueue task: %v", err), http.StatusBadGateway)
+		return
+	}
+	if len(modifyResp.InsertedTasks) != 1 {
+		log.Printf("sender enqueue to %s returned %d tasks, want 1", targetInbox, len(modifyResp.InsertedTasks))
+		http.Error(w, "enqueue task: invalid modification response", http.StatusBadGateway)
 		return
 	}
 	if s.auditLog != nil {
@@ -361,7 +367,7 @@ func (s *Sender) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		)
 	}
 
-	sessionState := newSenderSession(s, w, r, session, requestAckLane, responseDataLane, start)
+	sessionState := newSenderSession(s, w, r, session, requestAckLane, responseDataLane, modifyResp.InsertedTasks[0], start)
 	if err := sessionState.run(ctx); err != nil {
 		log.Printf("sender session %q: %v", session, err)
 		if ctx.Err() != nil {
