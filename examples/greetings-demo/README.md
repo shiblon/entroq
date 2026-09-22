@@ -3,6 +3,10 @@
 A three-service example showing how ordinary HTTP microservices communicate
 through an EntroQ mesh without any queue-awareness in their code.
 
+> [!WARNING]
+> EQLink and its KEDA integration are experimental. Their queue protocol,
+> document layout, and command surface may change without backward compatibility.
+
 ## Services
 
 ```
@@ -140,16 +144,16 @@ kubectl get scaledobject,hpa,pods -n greetings --watch
 
 After five idle minutes, KEDA scales the `svc-c` Deployment to zero. The next
 greeting leaves a durable task in svc-c's EntroQ inbox; Prometheus observes the
-queue and KEDA starts one replica. The one-minute scrape and polling intervals
-can take nearly two minutes in the worst alignment, so the svc-a and svc-b
-eqlink senders use request timeouts long enough to cover observation and pod
-startup.
+task and KEDA starts one replica. Once svc-c accepts the request, the response
+direction keeps one token claimed between handoffs: svc-c holds `response-ack`
+while waiting to send, and the caller holds `response-data` while consuming.
+That claim keeps the replica up for an open session, including while the caller
+waits for a server push after its request body has ended.
 
-The Prometheus query counts available and claimed tasks, but not future tasks.
-It also includes docs in `/greetings/svc-c/status`, illustrating the status-doc
-pattern for a fan-out worker. This simple service does not create those docs, so
-that term remains zero here. A fan-out worker would atomically insert its root
-task and one status doc per workflow, then delete the doc only after all work
-completes. The status namespace is the autoscaling domain; each workflow's
-primary key remains internal rather than becoming a high-cardinality metric
-label.
+The one-minute scrape and polling intervals can take nearly two minutes in the
+worst alignment, so the svc-a and svc-b eqlink senders use request timeouts long
+enough to cover observation and pod startup. KEDA's five-minute scale-down
+cooldown also bridges the short interval between an atomic lane handoff and the
+peer claiming the new token. If an endpoint disappears, heartbeat turns stop;
+the claim expires, no longer retains a replica, and the orphaned session queue
+remains eligible for normal `gc=` cleanup.

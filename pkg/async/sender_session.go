@@ -22,10 +22,11 @@ var (
 )
 
 type senderSession struct {
-	sender  *Sender
-	writer  http.ResponseWriter
-	session string
-	source  *bodySource
+	sender        *Sender
+	writer        http.ResponseWriter
+	session       string
+	bootstrapTask *entroq.Task
+	source        *bodySource
 
 	requestLanes  sessionLanes
 	responseLanes sessionLanes
@@ -45,11 +46,12 @@ type senderSession struct {
 	responseErr     error
 }
 
-func newSenderSession(sender *Sender, writer http.ResponseWriter, request *http.Request, session string, requestAck, responseData *receiveLane, startedAt time.Time) *senderSession {
+func newSenderSession(sender *Sender, writer http.ResponseWriter, request *http.Request, session string, requestAck, responseData *receiveLane, bootstrapTask *entroq.Task, startedAt time.Time) *senderSession {
 	return &senderSession{
 		sender:        sender,
 		writer:        writer,
 		session:       session,
+		bootstrapTask: bootstrapTask,
 		source:        newBodySource(request.Body, request.Trailer),
 		requestLanes:  sessionLanes{local: requestAck},
 		responseLanes: sessionLanes{local: responseData},
@@ -72,6 +74,7 @@ func (s *senderSession) run(parent context.Context) error {
 	})
 
 	err := g.Wait()
+	s.deleteBootstrapTask(parent)
 	if s.responseCompleted {
 		return s.responseErr
 	}
@@ -88,6 +91,23 @@ func (s *senderSession) run(parent context.Context) error {
 		return cause
 	}
 	return fmt.Errorf("session workers exited before terminal response committed")
+}
+
+// deleteBootstrapTask removes unaccepted demand after a local cancellation or
+// failure. A dependency error means the receiver already claimed or consumed
+// the task and owns the session's remaining cleanup.
+func (s *senderSession) deleteBootstrapTask(parent context.Context) {
+	if s.bootstrapTask == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), 5*time.Second)
+	defer cancel()
+	if _, err := s.sender.eq.Modify(ctx, s.bootstrapTask.Delete()); err != nil {
+		if _, ok := entroq.AsDependency(err); ok {
+			return
+		}
+		log.Printf("sender session %q delete unaccepted inbox task: %v", s.session, err)
+	}
 }
 
 // notifyPeerCanceled is a best-effort courtesy. The request data queue is the

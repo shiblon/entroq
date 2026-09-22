@@ -103,18 +103,20 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   wire each role to its own queue, lease and claim ceiling. The API and the
   document layout may change without a migration path.
 
-- **Experimental EQLink response streaming.** EQLink buffers request bodies and
-  relays HTTP/1.1 response bodies through an acknowledged, stop-and-wait queue
-  lane, including SSE and NDJSON. Session queues use 30-minute `gc=` generations,
-  rotate opportunistically with data in their final ten minutes, and force a
-  blank reciprocal switch in their final five minutes. A receiver-owned
-  connection doc keeps autoscaling replicas alive while a session is active.
+- **Experimental EQLink bidirectional streaming.** EQLink relays concurrent
+  request and response bodies through independent acknowledged, stop-and-wait
+  queue lanes, including HTTP/2 request streaming, SSE, NDJSON, and trailers.
+  Session queues use 30-minute `gc=` generations, rotate opportunistically with
+  data in their final ten minutes, and force a blank reciprocal switch in their
+  final five minutes. The public inbox task represents an attempted session;
+  after acceptance, the one claimed response-direction token represents the
+  active session and alternates between sender and receiver with protocol turns.
 
 - **Queue-driven Kubernetes autoscaling.** The Helm chart can publish an
   optional Prometheus `ServiceMonitor`; the service exports queue and doc
   namespace size gauges; and the greetings demo includes a KEDA `ScaledObject`
-  that scales an eqlink receiver between zero and one replica from queued work
-  or durable workflow-status docs.
+  that scales an EQLink receiver between zero and one replica from its inbox and
+  claimed response-lane tasks.
 
 ### Removed
 

@@ -79,15 +79,15 @@ func TestBidirectionalSessionStress(t *testing.T) {
 		t.Error(err)
 	}
 
-	docNS := connectionDocNamespace("/stress/service")
+	docNS := receiverSessionDocNamespace("/stress/service")
 	if _, present, err := queues.GCActivation(docNS); err != nil || !present {
-		t.Errorf("connection docs are not GC-managed: namespace=%q present=%v err=%v", docNS, present, err)
+		t.Errorf("receiver session docs are not GC-managed: namespace=%q present=%v err=%v", docNS, present, err)
 	}
 	docs, err := eq.Docs(ctx, &entroq.DocQuery{Namespace: docNS})
 	if err != nil {
-		t.Errorf("list connection docs: %v", err)
+		t.Errorf("list receiver session docs from %q: %v", docNS, err)
 	} else if len(docs) > sessions/5+1 {
-		t.Errorf("connection docs after stress: got %d, want at most %d canceled sessions", len(docs), sessions/5+1)
+		t.Errorf("receiver session docs after stress: got %d, want at most %d canceled sessions", len(docs), sessions/5+1)
 	}
 	stats, err := eq.QueueStats(ctx, entroq.MatchPrefix("/stress/service/"))
 	if err != nil {

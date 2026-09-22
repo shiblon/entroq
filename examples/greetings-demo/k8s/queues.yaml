@@ -18,3 +18,17 @@ spec:
     allowedCallers:
     - labels:
         tier: backend
+
+  # Receivers keep internal protocol-fencing docs. They are deliberately not
+  # included in the autoscaling query.
+  namespaces:
+  - pattern: /greetings/svc-b/receiver-sessions/gc=
+    matchType: Exact
+    allowedCallers:
+    - labels:
+        app: svc-b
+  - pattern: /greetings/svc-c/receiver-sessions/gc=
+    matchType: Exact
+    allowedCallers:
+    - labels:
+        app: svc-c

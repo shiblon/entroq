@@ -45,13 +45,13 @@ type Receiver struct {
 }
 
 type sessionStart struct {
-	requestData *receiveLane
-	responseAck *receiveLane
-	docNS       string
-	session     string
-	method      string
-	path        string
-	startedAt   time.Time
+	requestData   *receiveLane
+	responseAck   *receiveLane
+	receiverDocNS string
+	session       string
+	method        string
+	path          string
+	startedAt     time.Time
 }
 
 // WithReceiverMeterProvider sets the OTel MeterProvider for the receiver.
@@ -209,13 +209,13 @@ func (r *Receiver) bootstrapHandler(runCtx context.Context, starts chan<- sessio
 		prefix := path.Dir(task.Queue)
 		startedAt := time.Now()
 		start := sessionStart{
-			requestData: newReceiveLane(prefix, env.Session, "request-data", startedAt, r.cfg.laneTiming),
-			responseAck: newReceiveLane(prefix, env.Session, "response-ack", startedAt, r.cfg.laneTiming),
-			docNS:       connectionDocNamespace(prefix),
-			session:     env.Session,
-			method:      env.Method,
-			path:        env.Path,
-			startedAt:   startedAt,
+			requestData:   newReceiveLane(prefix, env.Session, "request-data", startedAt, r.cfg.laneTiming),
+			responseAck:   newReceiveLane(prefix, env.Session, "response-ack", startedAt, r.cfg.laneTiming),
+			receiverDocNS: receiverSessionDocNamespace(prefix),
+			session:       env.Session,
+			method:        env.Method,
+			path:          env.Path,
+			startedAt:     startedAt,
 		}
 		envValue, err := json.Marshal(env)
 		if err != nil {
@@ -233,9 +233,9 @@ func (r *Receiver) bootstrapHandler(runCtx context.Context, starts chan<- sessio
 			task.Delete(),
 			entroq.InsertingInto(start.requestData.queue, entroq.WithRawValue(envValue)),
 			entroq.InsertingInto(start.responseAck.queue, entroq.WithRawValue(seedValue)),
-			entroq.PuttingDocInto(start.docNS,
+			entroq.PuttingDocInto(start.receiverDocNS,
 				entroq.WithIDKeys(env.Session, env.Session, ""),
-				entroq.WithDocArrivalTimeBy(entroq.DefaultClaimDuration),
+				entroq.WithDocArrivalTimeBy(r.cfg.heartbeat.timeout),
 			),
 		).OnSuccess(func(context.Context) error {
 			select {
@@ -252,11 +252,11 @@ func (r *Receiver) runSession(ctx context.Context, start sessionStart) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	if _, err := r.eq.TryClaimDocByID(ctx, start.docNS, start.session, entroq.DefaultClaimDuration); err != nil {
+	if _, err := r.eq.TryClaimDocByID(ctx, start.receiverDocNS, start.session, r.cfg.heartbeat.timeout); err != nil {
 		if ctx.Err() != nil {
 			return nil
 		}
-		return fmt.Errorf("claim connection doc: %w", err)
+		return fmt.Errorf("claim receiver session doc: %w", err)
 	}
 
 	socket := newResponseSocket()
@@ -449,19 +449,25 @@ func (r *Receiver) runResponseWorkers(ctx context.Context, start sessionStart, s
 		state.responseWorkerCancel = stopWorker
 		state.responseWorkerSwitched = false
 		responseWorker := worker.New(r.eq,
-			// Only this lane touches the singleton connection doc. Letting both
-			// concurrent workers claim it under the same claimant ID would remove
-			// mutual exclusion and create version races between doc renewals.
+			// Only this lane touches the singleton receiver session doc.
+			// Letting both concurrent workers claim it under the same claimant
+			// ID would remove mutual exclusion and create version races between
+			// doc renewals.
 			worker.WithTakeDocs(func(_ context.Context, _ *entroq.Task, ack Response) ([]*entroq.DocClaim, error) {
 				if ack.Session != start.session {
 					return nil, worker.FatalErrorf("session mismatch: ACK %q, worker %q", ack.Session, start.session)
 				}
-				return []*entroq.DocClaim{entroq.ClaimKey(start.docNS, start.session)}, nil
+				return []*entroq.DocClaim{
+					entroq.ClaimKey(start.receiverDocNS, start.session),
+				}, nil
 			}),
 			worker.WithDoModify(r.responseHandler(start, state, socket, complete)),
 			worker.WithMeterProvider[Response](r.cfg.mp),
 		)
-		err := responseWorker.Run(workerCtx, worker.Watching(state.responseLanes.local.queue))
+		err := responseWorker.Run(workerCtx,
+			worker.Watching(state.responseLanes.local.queue),
+			worker.WithLease(r.cfg.heartbeat.timeout),
+		)
 		workerErr := workerCtx.Err()
 		stopWorker()
 		if err != nil {
@@ -485,7 +491,7 @@ func (r *Receiver) runResponseWorkers(ctx context.Context, start sessionStart, s
 func (r *Receiver) responseHandler(start sessionStart, state *receiverSessionState, socket *responseSocket, complete func()) worker.DoModifyRun[Response] {
 	return func(ctx context.Context, task *entroq.Task, ack Response, docs []*entroq.Doc) (*worker.Result, error) {
 		if len(docs) != 1 {
-			return nil, worker.FatalErrorf("session %q claimed %d connection docs", ack.Session, len(docs))
+			return nil, worker.FatalErrorf("session %q claimed %d receiver session docs", ack.Session, len(docs))
 		}
 		if !responseDataEmpty(ack) {
 			return nil, worker.FatalErrorf("session %q received response data where an ACK was expected", ack.Session)
@@ -574,7 +580,7 @@ func (r *Receiver) responseHandler(start sessionStart, state *receiverSessionSta
 		if resp.Final {
 			mods = append(mods, docs[0].Delete())
 		} else {
-			mods = append(mods, docs[0].Change(entroq.WithDocArrivalTimeBy(entroq.DefaultClaimDuration)))
+			mods = append(mods, docs[0].Change(entroq.WithDocArrivalTimeBy(r.cfg.heartbeat.timeout)))
 		}
 
 		result := worker.Modify(mods...)
@@ -619,6 +625,8 @@ func hasRequestMetadata(env Envelope) bool {
 	return env.ResponseQueue != "" || env.Method != "" || env.Path != "" || env.ProtocolMajor != 0 || env.ContentLength != 0 || len(env.Headers) != 0 || len(env.TrailerKeys) != 0
 }
 
-func connectionDocNamespace(prefix string) string {
-	return path.Join(prefix, "connections", "gc=")
+// receiverSessionDocNamespace holds receiver-owned protocol fencing state. It
+// is not autoscaling demand and must not let a deployment count its own supply.
+func receiverSessionDocNamespace(prefix string) string {
+	return path.Join(prefix, "receiver-sessions", "gc=")
 }

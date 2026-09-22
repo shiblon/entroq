@@ -346,11 +346,11 @@ func TestSidecarDroppedUpstreamConnectionAbortsResponse(t *testing.T) {
 		}
 	}
 
-	docNamespace := "/drops/svc/connections/gc="
+	docNamespace := "/drops/svc/receiver-sessions/gc="
 	for {
 		docs, docsErr := eq.Docs(ctx, &entroq.DocQuery{Namespace: docNamespace})
 		if docsErr != nil {
-			t.Fatalf("read connection docs: %v", docsErr)
+			t.Fatalf("read receiver session docs: %v", docsErr)
 		}
 		if len(docs) == 0 {
 			break
@@ -358,7 +358,7 @@ func TestSidecarDroppedUpstreamConnectionAbortsResponse(t *testing.T) {
 		select {
 		case <-time.After(20 * time.Millisecond):
 		case <-ctx.Done():
-			t.Fatalf("connection doc remained after broken upstream response: %+v", docs)
+			t.Fatalf("receiver session doc remained after broken upstream response: %+v", docs)
 		}
 	}
 }

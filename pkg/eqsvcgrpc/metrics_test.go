@@ -137,6 +137,22 @@ func TestFoldQueueMetricStats(t *testing.T) {
 	}
 }
 
+func TestFoldQueueMetricStatsPreservesEQLinkLane(t *testing.T) {
+	stats := map[string]*entroq.QueueStat{
+		"/service/sess=a;gc=1/response-ack":  {Claimed: 1},
+		"/service/sess=b;gc=1/response-ack":  {Claimed: 2},
+		"/service/sess=c;gc=1/response-data": {Claimed: 3},
+	}
+
+	folded := foldQueueMetricStats(stats)
+	if got := folded["/service/*/response-ack"]; got == nil || got.Claimed != 3 {
+		t.Errorf("folded response-ack stat = %+v, want Claimed=3", got)
+	}
+	if got := folded["/service/*/response-data"]; got == nil || got.Claimed != 3 {
+		t.Errorf("folded response-data stat = %+v, want Claimed=3", got)
+	}
+}
+
 func TestFoldNamespaceMetricStats(t *testing.T) {
 	stats := map[string]*entroq.NamespaceStat{
 		"/metrics/sess=a/status":      {Size: 2, Claimed: 1},
