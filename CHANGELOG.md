@@ -10,8 +10,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 Release note: the next release must be a minor (v1.13.0 or later), not a
-patch. It adds public API (`entroq.InvalidArgumentError`) and moves the SQLite
-schema to version 2. The PostgreSQL schema is unchanged (stays 1.11.0).
+patch. It adds public API (`entroq.InvalidArgumentError`), moves the SQLite
+schema to version 2, adds `eqc work --max-claims`, and removes the
+`eqc mod --reset` flag. The PostgreSQL schema is unchanged (stays 1.11.0).
 
 ### Added
 
