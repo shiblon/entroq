@@ -760,6 +760,21 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 		}
 		foundDeps = fd
 	}
+	// Documents inserted by eqmem before v1.12.1 began at v1. Their journaled
+	// first change therefore carries final version v2, which the player above
+	// presents here as predecessor v1. New replay reconstructs that versionless
+	// insert at v0. Accept exactly that one-version ambiguity on trusted replay;
+	// applying the recorded change still restores its historical final version
+	// v2, after which later changes use ordinary exact version matching.
+	if replay && foundDeps != nil {
+		foundDeps.DocChanges = slices.DeleteFunc(foundDeps.DocChanges, func(failed *entroq.DocID) bool {
+			foundDoc, ok := foundDocs[entroq.DocKey(failed.Namespace, failed.ID)]
+			return ok && foundDoc.Version == 0 && failed.Version == 1
+		})
+		if !foundDeps.HasAny() {
+			foundDeps = nil
+		}
+	}
 	// Merge the queue-integrity failures (computed under the global lock in
 	// modPrep) with the found-based failures so a single DependencyError reports
 	// every failure class -- notably, insert collisions are still reported even

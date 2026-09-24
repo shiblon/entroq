@@ -631,6 +631,71 @@ func TestEQMemJournalDocVersions(t *testing.T) {
 	}
 }
 
+func TestEQMemReplaysLegacyInitialDocVersion(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	opener := WithJournal(t.TempDir())
+	m, err := New(ctx, opener)
+	if err != nil {
+		t.Fatalf("Open journaled backend: %v", err)
+	}
+
+	const namespace = "/journal/legacy_doc_version"
+	resp, err := m.Modify(ctx, entroq.NewModification("",
+		entroq.PuttingDocInto(namespace,
+			entroq.WithIDKeys("doc-1", "", ""),
+			entroq.WithContent("initial"),
+		),
+	))
+	if err != nil {
+		t.Fatalf("Insert doc: %v", err)
+	}
+
+	// Before v1.12.1 this insert would have produced v1, making its first
+	// changed state v2. Append that historical final-state record directly so
+	// reopening exercises the real journal player and its version decrement.
+	legacyChange := resp.InsertedDocs[0].Copy()
+	legacyChange.Version = 1
+	legacyChange.Content = json.RawMessage(`"changed"`)
+	if _, err := m.Modify(ctx, &entroq.Modification{DocChanges: []*entroq.Doc{legacyChange}}); err == nil {
+		t.Fatal("Live modification accepted legacy predecessor version")
+	} else if !entroq.IsDependency(err) {
+		t.Fatalf("Live legacy-version change: want dependency error, got %v", err)
+	}
+	legacyChange.Version = 2
+	journalRecord, err := json.Marshal(&entroq.Modification{DocChanges: []*entroq.Doc{legacyChange}})
+	if err != nil {
+		t.Fatalf("Marshal legacy journal change: %v", err)
+	}
+	if err := m.journal.Append(journalRecord); err != nil {
+		t.Fatalf("Append legacy journal change: %v", err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatalf("Close journaled backend: %v", err)
+	}
+
+	m, err = New(ctx, opener)
+	if err != nil {
+		t.Fatalf("Replay legacy journal: %v", err)
+	}
+	defer m.Close()
+
+	docs, err := m.Docs(ctx, &entroq.DocQuery{Namespace: namespace, IDs: []string{"doc-1"}})
+	if err != nil {
+		t.Fatalf("Read replayed doc: %v", err)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("Replayed docs length: want 1, got %d", len(docs))
+	}
+	if got := docs[0].Version; got != 2 {
+		t.Errorf("Replayed legacy doc version: want 2, got %d", got)
+	}
+	if got := string(docs[0].Content); got != `"changed"` {
+		t.Errorf("Replayed legacy doc content: want %q, got %q", `"changed"`, got)
+	}
+}
+
 // TestEQMemReplayBackfillsMissingQueue covers the journal read path for older
 // journals: a change recorded before the queue-as-modify-key requirement carries
 // its queue but an empty FromQueue. Such an op must be rejected on the live write
