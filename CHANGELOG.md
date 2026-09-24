@@ -7,7 +7,11 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [Unreleased]
+## [1.12.3] - 2026-09-24
+
+Go module `v1.12.3`. A bug-fix release for the in-memory backend and the gRPC
+service. No proto or schema change (schema version stays 1.11.0) and no client
+changes.
 
 ### Fixed
 
