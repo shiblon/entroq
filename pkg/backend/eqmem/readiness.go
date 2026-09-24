@@ -7,7 +7,9 @@ import (
 	"github.com/shiblon/entroq"
 )
 
-const defaultReadinessInterval = 5 * time.Second
+// DefaultReadinessInterval is how often the backend checks for tasks that
+// become available solely through the passage of time.
+const DefaultReadinessInterval = 5 * time.Second
 
 // WithReadinessInterval sets how often the backend checks for tasks that
 // became available solely through the passage of time. A non-positive interval

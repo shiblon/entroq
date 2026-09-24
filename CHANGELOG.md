@@ -14,7 +14,8 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **In-memory claim readiness.** The in-memory backend checks queue heap heads
   every five seconds and wakes blocked claims when scheduled or expired tasks
   become available, instead of relying on the 30-second claim poll fallback.
-  `eqmem.WithReadinessInterval` controls or disables the check.
+  `eqmem.WithReadinessInterval` and `eqmem serve --readiness_interval` control
+  or disable the check.
 - **In-memory queue-stat contention.** Queue stats snapshot queue pointers once
   instead of reacquiring the global queue-registry lock for every queue.
 

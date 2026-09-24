@@ -194,7 +194,7 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 		claimDuration:      claimDuration,
 		modifyDuration:     modifyDuration,
 		gcMetrics:          gcMetrics,
-		readinessInterval:  defaultReadinessInterval,
+		readinessInterval:  DefaultReadinessInterval,
 		gcInterval:         defaultGCInterval,
 		gcBatchSize:        defaultGCBatchSize,
 	}
