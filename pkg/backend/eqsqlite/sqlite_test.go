@@ -24,6 +24,8 @@ func TestBackendContract(t *testing.T) {
 		{"InsertWithID", eqtest.InsertWithID},
 		{"SimpleSequence", eqtest.SimpleSequence},
 		{"SimpleChange", eqtest.SimpleChange},
+		{"ChangeKeepsStoredFields", eqtest.ChangeKeepsStoredFields},
+		{"InsertKeepsAttemptAndErr", eqtest.InsertKeepsAttemptAndErr},
 		{"TaskChangeFutureArrival", eqtest.TaskChangeFutureArrival},
 		{"TaskChangeFarPastArrivalNormalized", eqtest.TaskChangeFarPastArrivalNormalized},
 		{"ModifyRejectsWrongQueue", eqtest.ModifyRejectsWrongQueue},

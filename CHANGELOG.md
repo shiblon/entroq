@@ -7,6 +7,19 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **In-memory stored fields.** The in-memory backend took a changed task's
+  claim count and creation time, and a changed doc's creation time, from the
+  caller. Through the gRPC service these arrived empty, so every renewal, retry,
+  or move reset claims to 0 (disabling `worker.WithMaxClaims`) and cleared the
+  creation time. Changes now keep the stored values. Inserted tasks also keep
+  their `Attempt` and `Err`, and journal replay restores the recorded
+  modification time instead of the replay time. Values already journaled replay
+  as recorded.
+
 ## [1.12.2] - 2026-09-23
 
 ### Added

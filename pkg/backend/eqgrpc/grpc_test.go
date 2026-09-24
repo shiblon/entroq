@@ -107,6 +107,14 @@ func TestGRPCSimpleChange(t *testing.T) {
 	RunQTest(t, eqtest.SimpleChange)
 }
 
+func TestGRPCChangeKeepsStoredFields(t *testing.T) {
+	RunQTest(t, eqtest.ChangeKeepsStoredFields)
+}
+
+func TestGRPCInsertKeepsAttemptAndErr(t *testing.T) {
+	RunQTest(t, eqtest.InsertKeepsAttemptAndErr)
+}
+
 func TestGRPCTaskChangeFutureArrival(t *testing.T) {
 	RunQTest(t, eqtest.TaskChangeFutureArrival)
 }

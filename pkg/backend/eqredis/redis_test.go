@@ -105,6 +105,14 @@ func TestSimpleChange(t *testing.T) {
 	RunQTest(t, eqtest.SimpleChange)
 }
 
+func TestChangeKeepsStoredFields(t *testing.T) {
+	RunQTest(t, eqtest.ChangeKeepsStoredFields)
+}
+
+func TestInsertKeepsAttemptAndErr(t *testing.T) {
+	RunQTest(t, eqtest.InsertKeepsAttemptAndErr)
+}
+
 func TestTaskChangeFarPastArrivalNormalized(t *testing.T) {
 	RunQTest(t, eqtest.TaskChangeFarPastArrivalNormalized)
 }

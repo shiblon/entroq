@@ -1011,3 +1011,97 @@ func ModifyReportsAllFailureClasses(ctx context.Context, t *testing.T, client *e
 		t.Errorf("both bad deletes (f-del wrong-queue, ghost missing) not reported: got Deletes=%v", depErr.Deletes)
 	}
 }
+
+// ChangeKeepsStoredFields checks that a task's claim count and creation time
+// are owned by the backend: a renewal, an in-place change, and a move all keep
+// the stored values rather than taking them from the caller. Over the gRPC
+// service the caller cannot send either field, so a backend that copies the
+// caller's task would reset them.
+func ChangeKeepsStoredFields(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	inQueue := path.Join(qPrefix, "change_keeps_stored", "in")
+	outQueue := path.Join(qPrefix, "change_keeps_stored", "out")
+
+	resp, err := client.Modify(ctx, entroq.InsertingInto(inQueue, entroq.WithValue("v0")))
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	inserted := resp.InsertedTasks[0]
+
+	task, err := client.Claim(ctx, entroq.From(inQueue), entroq.ClaimFor(time.Minute))
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if task.Claims != 1 {
+		t.Fatalf("Claim: want claims 1, got %d", task.Claims)
+	}
+
+	check := func(step string, got *entroq.Task) {
+		t.Helper()
+		if got.Claims != 1 {
+			t.Errorf("%s: want claims 1, got %d", step, got.Claims)
+		}
+		if !got.Created.Equal(inserted.Created) {
+			t.Errorf("%s: want created %v, got %v", step, inserted.Created, got.Created)
+		}
+		stored, err := client.Tasks(ctx, got.Queue, entroq.WithTaskID(got.ID))
+		if err != nil {
+			t.Fatalf("%s: list: %v", step, err)
+		}
+		if len(stored) != 1 {
+			t.Fatalf("%s: want 1 stored task, got %d", step, len(stored))
+		}
+		if stored[0].Claims != 1 {
+			t.Errorf("%s: stored: want claims 1, got %d", step, stored[0].Claims)
+		}
+		if !stored[0].Created.Equal(inserted.Created) {
+			t.Errorf("%s: stored: want created %v, got %v", step, inserted.Created, stored[0].Created)
+		}
+	}
+
+	if task, err = client.RenewFor(ctx, task, time.Minute); err != nil {
+		t.Fatalf("Renew: %v", err)
+	}
+	check("renew", task)
+
+	resp, err = client.Modify(ctx, task.Change(entroq.ValueTo("v1"), entroq.ArrivalTimeBy(time.Minute)))
+	if err != nil {
+		t.Fatalf("Change value: %v", err)
+	}
+	task = resp.ChangedTasks[0]
+	check("change value", task)
+
+	resp, err = client.Modify(ctx, task.Change(entroq.QueueTo(outQueue)))
+	if err != nil {
+		t.Fatalf("Move: %v", err)
+	}
+	check("move", resp.ChangedTasks[0])
+}
+
+// InsertKeepsAttemptAndErr checks that an inserted task stores the attempt
+// count and error it was given.
+func InsertKeepsAttemptAndErr(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	queue := path.Join(qPrefix, "insert_keeps_attempt_err")
+
+	resp, err := client.Modify(ctx, entroq.InsertingInto(queue,
+		entroq.WithAttempt(3),
+		entroq.WithErr("earlier failure"),
+	))
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	inserted := resp.InsertedTasks[0]
+	if inserted.Attempt != 3 || inserted.Err != "earlier failure" {
+		t.Errorf("Inserted: want attempt 3 and err %q, got %s", "earlier failure", inserted)
+	}
+
+	stored, err := client.Tasks(ctx, queue, entroq.WithTaskID(inserted.ID))
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(stored) != 1 {
+		t.Fatalf("Want 1 stored task, got %d", len(stored))
+	}
+	if stored[0].Attempt != 3 || stored[0].Err != "earlier failure" {
+		t.Errorf("Stored: want attempt 3 and err %q, got %s", "earlier failure", stored[0])
+	}
+}

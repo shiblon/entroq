@@ -830,6 +830,14 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 	for _, c := range mod.Changes {
 		newTask := c.Copy()
 		newTask.Version++
+		// Claims and Created belong to the backend, not the caller (who cannot
+		// send them over the wire). Replay applies the journaled final state
+		// as-is: claims are journaled as changes carrying the new count.
+		if !replay {
+			old := found[c.ID]
+			newTask.Claims = old.Claims
+			newTask.Created = old.Created
+		}
 		// Cap a far-past arrival to now (backend Modify contract): an omitted At
 		// arrives now and is ordered at now, not in the distant past.
 		newTask.At = entroq.NormalizeArrival(newTask.At, now)
@@ -837,7 +845,9 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 		if !newTask.At.After(now) {
 			newTask.Claimant = ""
 		}
-		newTask.Modified = now
+		if !replay || newTask.Modified.IsZero() {
+			newTask.Modified = now
+		}
 		if c.FromQueue != c.Queue {
 			deleteID(c.FromQueue, c.ID)
 			insertTask(newTask)
@@ -866,6 +876,8 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 			Claimant: mod.Claimant,
 			Created:  created,
 			Modified: modified,
+			Attempt:  td.Attempt,
+			Err:      td.Err,
 		}
 		insertTask(newTask)
 		resp.InsertedTasks = append(resp.InsertedTasks, newTask)
@@ -877,6 +889,10 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 	for _, c := range mod.DocChanges {
 		newRes := c.Copy()
 		newRes.Version++
+		// Created belongs to the backend, as for tasks above.
+		if !replay {
+			newRes.Created = foundDocs[entroq.DocKey(c.Namespace, c.ID)].Created
+		}
 		// Cap a far-past arrival to now (backend Modify contract), same as tasks.
 		newRes.At = entroq.NormalizeArrival(newRes.At, now)
 		// Claim/renew if requested.At is in the future; release otherwise.
@@ -885,7 +901,9 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 		} else {
 			newRes.Claimant = ""
 		}
-		newRes.Modified = now
+		if !replay || newRes.Modified.IsZero() {
+			newRes.Modified = now
+		}
 		setRes(newRes)
 		resp.ChangedDocs = append(resp.ChangedDocs, newRes)
 	}

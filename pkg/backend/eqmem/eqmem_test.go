@@ -59,6 +59,14 @@ func TestEQMemSimpleChange(t *testing.T) {
 	RunQTest(t, eqtest.SimpleChange)
 }
 
+func TestEQMemChangeKeepsStoredFields(t *testing.T) {
+	RunQTest(t, eqtest.ChangeKeepsStoredFields)
+}
+
+func TestEQMemInsertKeepsAttemptAndErr(t *testing.T) {
+	RunQTest(t, eqtest.InsertKeepsAttemptAndErr)
+}
+
 func TestEQMemTaskChangeFutureArrival(t *testing.T) {
 	RunQTest(t, eqtest.TaskChangeFutureArrival)
 }
@@ -628,6 +636,73 @@ func TestEQMemJournalDocVersions(t *testing.T) {
 	}
 	if got := docs[0].Version; got != 1 {
 		t.Errorf("Replayed doc version: want 1, got %d", got)
+	}
+}
+
+func TestEQMemJournalReplayKeepsStoredFields(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	opener := Opener(WithJournal(t.TempDir()))
+	eq, err := entroq.New(ctx, opener)
+	if err != nil {
+		t.Fatalf("Open journaled client: %v", err)
+	}
+
+	const queue = "/journal/stored_fields"
+	if _, err := eq.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue("v0"))); err != nil {
+		t.Fatalf("Insert task: %v", err)
+	}
+	task, err := eq.Claim(ctx, entroq.From(queue), entroq.ClaimFor(time.Minute))
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	resp, err := eq.Modify(ctx, task.Change(entroq.ValueTo("v1")))
+	if err != nil {
+		t.Fatalf("Change task: %v", err)
+	}
+	wantTask := resp.ChangedTasks[0]
+
+	const namespace = "/journal/stored_fields"
+	resp, err = eq.Modify(ctx, entroq.PuttingDocInto(namespace, entroq.WithContent("v0")))
+	if err != nil {
+		t.Fatalf("Insert doc: %v", err)
+	}
+	resp, err = eq.Modify(ctx, resp.InsertedDocs[0].Change(entroq.WithContent("v1")))
+	if err != nil {
+		t.Fatalf("Change doc: %v", err)
+	}
+	wantDoc := resp.ChangedDocs[0]
+
+	if err := eq.Close(); err != nil {
+		t.Fatalf("Close journaled client: %v", err)
+	}
+	eq, err = entroq.New(ctx, opener)
+	if err != nil {
+		t.Fatalf("Reopen journaled client: %v", err)
+	}
+	defer eq.Close()
+
+	tasks, err := eq.Tasks(ctx, queue, entroq.WithTaskID(wantTask.ID))
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("Read replayed task: %v (%d tasks)", err, len(tasks))
+	}
+	got := tasks[0]
+	if got.Claims != 1 {
+		t.Errorf("Replayed claims: want 1, got %d", got.Claims)
+	}
+	if !got.Created.Equal(wantTask.Created) || !got.Modified.Equal(wantTask.Modified) {
+		t.Errorf("Replayed task times: want created %v, modified %v; got created %v, modified %v",
+			wantTask.Created, wantTask.Modified, got.Created, got.Modified)
+	}
+
+	docs, err := eq.Docs(ctx, &entroq.DocQuery{Namespace: namespace, IDs: []string{wantDoc.ID}})
+	if err != nil || len(docs) != 1 {
+		t.Fatalf("Read replayed doc: %v (%d docs)", err, len(docs))
+	}
+	if !docs[0].Created.Equal(wantDoc.Created) || !docs[0].Modified.Equal(wantDoc.Modified) {
+		t.Errorf("Replayed doc times: want created %v, modified %v; got created %v, modified %v",
+			wantDoc.Created, wantDoc.Modified, docs[0].Created, docs[0].Modified)
 	}
 }
 
