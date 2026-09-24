@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -422,6 +423,33 @@ func TestWorkRecurInReinsertsFreshTask(t *testing.T) {
 	}
 }
 
+func TestWorkMaxClaimsMovesInputAndResetRevivesIt(t *testing.T) {
+	in := uniqueQueue(t, "in")
+	errQ := uniqueQueue(t, "dead")
+
+	mustRun(t, "ins", "-q", in, "-v", `{"x":1}`)
+	// A claim that expires stands in for a run that killed its worker.
+	mustRun(t, "claim", "-q", in, "-d", "1")
+
+	work := startRun(t, "work", "-q", in, "--max-claims", "1", "--error-queue", errQ, "--", "true")
+	defer work.stop(t)
+
+	waitFor(t, "over-claimed task in error queue", work, func() bool {
+		return len(tasksInQueue(t, errQ)) == 1
+	})
+	assertQueueEmpty(t, in)
+	dead := tasksInQueue(t, errQ)[0]
+	if !strings.Contains(dead.Err, "maximum claims exceeded") {
+		t.Fatalf("error queue task err: got %q, want maximum claims exceeded", dead.Err)
+	}
+
+	mustRun(t, "mod", "-t", dead.ID, "-R", in)
+
+	waitFor(t, "reset task processed", work, func() bool {
+		return len(tasksInQueue(t, in)) == 0 && len(tasksInQueue(t, errQ)) == 0
+	})
+}
+
 func TestWorkMaxOutputBytesMovesInputToErrorQueue(t *testing.T) {
 	in := uniqueQueue(t, "in")
 	outQ := uniqueQueue(t, "out")
@@ -436,6 +464,95 @@ func TestWorkMaxOutputBytesMovesInputToErrorQueue(t *testing.T) {
 
 	assertQueueEmpty(t, in)
 	assertQueueEmpty(t, outQ)
+}
+
+func TestModResetToQueueInsertsFreshTask(t *testing.T) {
+	errQ := uniqueQueue(t, "in/err")
+	in := uniqueQueue(t, "in")
+
+	out := mustRun(t, "ins", "-q", errQ, "-v", `{"x":1}`)
+	var inserted []*entroq.Task
+	if err := json.Unmarshal(out, &inserted); err != nil {
+		t.Fatalf("parse inserted: %v\noutput: %s", err, out)
+	}
+	// A claim held by another claimant raises the claim count, which only a
+	// fresh task starts over.
+	mustRun(t, "claim", "-q", errQ, "-d", "60")
+	if claimed := tasksInQueue(t, errQ); len(claimed) != 1 || claimed[0].Claims != 1 {
+		t.Fatalf("expected one task with 1 claim in %q, got %v", errQ, claimed)
+	}
+
+	out = mustRun(t, "mod", "-t", inserted[0].ID, "-R", in, "-f")
+	var fresh entroq.Task
+	if err := json.Unmarshal(out, &fresh); err != nil {
+		t.Fatalf("parse reset task: %v\noutput: %s", err, out)
+	}
+
+	assertQueueEmpty(t, errQ)
+	tasks := tasksInQueue(t, in)
+	if len(tasks) != 1 {
+		t.Fatalf("expected 1 task in %q, got %d", in, len(tasks))
+	}
+	got := tasks[0]
+	if got.ID != fresh.ID {
+		t.Errorf("printed ID %q, stored ID %q", fresh.ID, got.ID)
+	}
+	if got.ID == inserted[0].ID {
+		t.Errorf("reset kept the old ID %q", got.ID)
+	}
+	if got.Claims != 0 || got.Attempt != 0 || got.Err != "" {
+		t.Errorf("reset task not fresh: claims=%d attempt=%d err=%q", got.Claims, got.Attempt, got.Err)
+	}
+	if got.At.After(time.Now()) {
+		t.Errorf("reset task not available: at=%s", got.At.Format(time.RFC3339Nano))
+	}
+	if v := string(got.Value); v != `{"x":1}` {
+		t.Errorf("value: got %s, want {\"x\":1}", v)
+	}
+}
+
+func TestModResetToQueueSetsValue(t *testing.T) {
+	errQ := uniqueQueue(t, "in/err")
+	in := uniqueQueue(t, "in")
+
+	out := mustRun(t, "ins", "-q", errQ, "-v", `{"x":1}`)
+	var inserted []*entroq.Task
+	if err := json.Unmarshal(out, &inserted); err != nil {
+		t.Fatalf("parse inserted: %v\noutput: %s", err, out)
+	}
+
+	mustRun(t, "mod", "-t", inserted[0].ID, "--reset_to_queue", in, "-v", `{"x":2}`)
+
+	tasks := tasksInQueue(t, in)
+	if len(tasks) != 1 {
+		t.Fatalf("expected 1 task in %q, got %d", in, len(tasks))
+	}
+	if v := string(tasks[0].Value); v != `{"x":2}` {
+		t.Errorf("value: got %s, want {\"x\":2}", v)
+	}
+}
+
+func TestModRejectsRemovedAndConflictingFlags(t *testing.T) {
+	errQ := uniqueQueue(t, "in/err")
+
+	out := mustRun(t, "ins", "-q", errQ)
+	var inserted []*entroq.Task
+	if err := json.Unmarshal(out, &inserted); err != nil {
+		t.Fatalf("parse inserted: %v\noutput: %s", err, out)
+	}
+	id := inserted[0].ID
+
+	for _, args := range [][]string{
+		{"mod", "-t", id, "-Q", "elsewhere", "-r"},
+		{"mod", "-t", id, "-Q", "a", "-R", "b"},
+	} {
+		if _, err := run(args...); err == nil {
+			t.Errorf("eqc %v: expected an error", args)
+		}
+	}
+	if tasks := tasksInQueue(t, errQ); len(tasks) != 1 || tasks[0].ID != id || tasks[0].Version != inserted[0].Version {
+		t.Errorf("rejected mod changed the task: %v", tasks)
+	}
 }
 
 // splitLines returns non-empty lines from output as byte slices.

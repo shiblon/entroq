@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/shiblon/entroq"
@@ -23,11 +24,12 @@ import (
 )
 
 var flagMod = struct {
-	id      string
-	queueTo string
-	val     string
-	force   bool
-	reset   bool
+	id           string
+	queueTo      string
+	resetToQueue string
+	val          string
+	force        bool
+	reset        bool
 }{}
 
 func init() {
@@ -35,10 +37,17 @@ func init() {
 
 	modCmd.Flags().StringVarP(&flagMod.id, "task", "t", "", "Task ID to modify. Note that this will modify *any* version of this task ID without regard for what else is happening. Use with care.")
 	modCmd.MarkFlagRequired("task")
-	modCmd.Flags().StringVarP(&flagMod.queueTo, "queue_to", "Q", "", "New queue for task, if a change is desired.")
-	modCmd.Flags().BoolVarP(&flagMod.reset, "reset", "r", false, "Reset Attempt and Err while changing the task, e.g., moving from an error queue back into service. Does not work on wrapped tasks (will just move the wrapping task, not the internals).")
+	modCmd.Flags().StringVarP(&flagMod.queueTo, "queue_to", "Q", "", "New queue for task, if a change is desired. Keeps the task's ID, claim count, attempt, and error.")
+	modCmd.Flags().StringVarP(&flagMod.resetToQueue, "reset_to_queue", "R", "", "Put the task back into service in this queue as a fresh task, e.g., out of an error queue. Deletes the task and inserts its value (or --val) with a new ID, zero claims and attempts, no error, and an arrival time of now, in one atomic modification. Prints the new task. Does not work on wrapped tasks (will just move the wrapping task, not the internals).")
+	modCmd.MarkFlagsMutuallyExclusive("queue_to", "reset_to_queue")
 	modCmd.Flags().StringVarP(&flagMod.val, "val", "v", "", "Value to set in task.")
 	modCmd.Flags().BoolVarP(&flagMod.force, "force", "f", false, "Force by spoofing the claimant if already claimed.")
+
+	// The old --reset reset attempts and errors but kept the claim count, so a
+	// worker with a claim ceiling quarantined the task again on its first claim.
+	// Kept only to point at its replacement.
+	modCmd.Flags().BoolVarP(&flagMod.reset, "reset", "r", false, "Removed: use --reset_to_queue.")
+	modCmd.Flags().MarkHidden("reset")
 }
 
 // modCmd represents the mod command
@@ -46,6 +55,10 @@ var modCmd = &cobra.Command{
 	Use:   "mod",
 	Short: "Modify a task by ID.",
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if flagMod.reset {
+			return fmt.Errorf("--reset has been removed: it kept the claim count, so a worker's claim ceiling could quarantine the task again; use --reset_to_queue <queue>")
+		}
+
 		tasks, err := eq.Tasks(context.Background(), "", entroq.WithTaskID(flagMod.id))
 		if err != nil {
 			return fmt.Errorf("get task %q: %w", flagMod.id, err)
@@ -59,28 +72,46 @@ var modCmd = &cobra.Command{
 
 		task := tasks[0]
 
-		var chgArgs []entroq.ChangeArg
+		var raw json.RawMessage
 		if flagMod.val != "" {
-			raw, err := cliJSON(flagMod.val)
-			if err != nil {
+			if raw, err = cliJSON(flagMod.val); err != nil {
 				return err
 			}
-			chgArgs = append(chgArgs, entroq.RawValueTo(raw))
-		}
-		if flagMod.queueTo != "" {
-			chgArgs = append(chgArgs, entroq.QueueTo(flagMod.queueTo))
-		}
-		if flagMod.reset {
-			chgArgs = append(chgArgs, entroq.AttemptToZero(), entroq.ErrToZero())
 		}
 
-		modArgs := []entroq.ModifyArg{task.Change(chgArgs...)}
+		var modArgs []entroq.ModifyArg
+		if flagMod.resetToQueue != "" {
+			// Claims is backend-owned and survives every change, so only a
+			// fresh task starts it over. Deleting at the version just read
+			// keeps a concurrent change from leaving a duplicate behind.
+			value := task.Value
+			if raw != nil {
+				value = raw
+			}
+			modArgs = append(modArgs,
+				task.Delete(),
+				entroq.InsertingInto(flagMod.resetToQueue, entroq.WithRawValue(value)),
+			)
+		} else {
+			var chgArgs []entroq.ChangeArg
+			if raw != nil {
+				chgArgs = append(chgArgs, entroq.RawValueTo(raw))
+			}
+			if flagMod.queueTo != "" {
+				chgArgs = append(chgArgs, entroq.QueueTo(flagMod.queueTo))
+			}
+			modArgs = append(modArgs, task.Change(chgArgs...))
+		}
 		if flagMod.force {
 			modArgs = append(modArgs, entroq.ModifyAs(task.Claimant))
 		}
 
-		if _, err := eq.Modify(context.Background(), modArgs...); err != nil {
+		resp, err := eq.Modify(context.Background(), modArgs...)
+		if err != nil {
 			return fmt.Errorf("modify task %q: %w", flagMod.id, err)
+		}
+		if flagMod.resetToQueue != "" {
+			fmt.Println(mustTaskString(resp.InsertedTasks[0]))
 		}
 		return nil
 	},

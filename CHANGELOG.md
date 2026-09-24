@@ -13,6 +13,26 @@ Release note: the next release must be a minor (v1.13.0 or later), not a
 patch. It adds public API (`entroq.InvalidArgumentError`) and moves the SQLite
 schema to version 2. The PostgreSQL schema is unchanged (stays 1.11.0).
 
+### Added
+
+- **`eqc work --max-claims`.** Passes the worker's claim ceiling through, as
+  `eqlink work` already does: claim `N` may run, and a later claim moves the
+  task to the error queue without running the command. The default 0 means no
+  maximum, matching `worker.WithMaxClaims`. Tasks the worker moves itself now
+  honor `--error-queue` too.
+
+### Changed
+
+- **`eqc mod --reset_to_queue` replaces `--reset`.** `eqc mod -Q <queue> -r`
+  reset a task's attempt and error but kept its claim count, which the backend
+  owns and every change preserves. A task quarantined by `worker.WithMaxClaims`
+  went straight back to its error queue on the first claim. `--reset_to_queue`
+  (`-R`) deletes the task and inserts its value, or `--val`, into the named
+  queue as a fresh task in one atomic modification: new ID, zero claims and
+  attempts, no error, available now. It prints the new task. It cannot be
+  combined with `--queue_to`. `--reset` now fails with a pointer to the new
+  flag.
+
 ### Fixed
 
 - **SQLite length limits count bytes.** The experimental SQLite backend
