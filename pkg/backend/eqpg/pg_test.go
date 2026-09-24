@@ -526,6 +526,10 @@ func TestPGSimpleDocLifecycle(t *testing.T) {
 	RunQTest(t, eqtest.SimpleDocLifecycle)
 }
 
+func TestPGInitialVersions(t *testing.T) {
+	RunQTest(t, eqtest.InitialVersions)
+}
+
 func TestPGDocMultiOp(t *testing.T) {
 	RunQTest(t, eqtest.DocMultiOp)
 }

@@ -194,6 +194,10 @@ func TestSimpleDocLifecycle(t *testing.T) {
 	RunQTest(t, eqtest.SimpleDocLifecycle)
 }
 
+func TestInitialVersions(t *testing.T) {
+	RunQTest(t, eqtest.InitialVersions)
+}
+
 func TestDocMultiOp(t *testing.T) {
 	RunQTest(t, eqtest.DocMultiOp)
 }

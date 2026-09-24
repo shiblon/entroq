@@ -543,6 +543,10 @@ func TestEQMemSimpleDocLifecycle(t *testing.T) {
 	RunQTest(t, eqtest.SimpleDocLifecycle)
 }
 
+func TestEQMemInitialVersions(t *testing.T) {
+	RunQTest(t, eqtest.InitialVersions)
+}
+
 func TestEQMemDocMultiOp(t *testing.T) {
 	RunQTest(t, eqtest.DocMultiOp)
 }
@@ -573,6 +577,58 @@ func TestEQMemQueueStatsAccuracy(t *testing.T) {
 
 func TestEQMemNamespaceStats(t *testing.T) {
 	RunQTest(t, eqtest.NamespaceStats)
+}
+
+func TestEQMemJournalDocVersions(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	opener := Opener(WithJournal(t.TempDir()))
+	eq, err := entroq.New(ctx, opener)
+	if err != nil {
+		t.Fatalf("Open journaled client: %v", err)
+	}
+
+	const namespace = "/journal/doc_versions"
+	resp, err := eq.Modify(ctx, entroq.PuttingDocInto(namespace,
+		entroq.WithIDKeys("doc-1", "", ""),
+		entroq.WithContent("initial"),
+	))
+	if err != nil {
+		t.Fatalf("Insert doc: %v", err)
+	}
+	inserted := resp.InsertedDocs[0]
+	if inserted.Version != 0 {
+		t.Fatalf("Inserted doc version: want 0, got %d", inserted.Version)
+	}
+
+	resp, err = eq.Modify(ctx, inserted.Change(entroq.WithContent("changed")))
+	if err != nil {
+		t.Fatalf("Change doc: %v", err)
+	}
+	if got := resp.ChangedDocs[0].Version; got != 1 {
+		t.Fatalf("Changed doc version: want 1, got %d", got)
+	}
+	if err := eq.Close(); err != nil {
+		t.Fatalf("Close journaled client: %v", err)
+	}
+
+	eq, err = entroq.New(ctx, opener)
+	if err != nil {
+		t.Fatalf("Reopen journaled client: %v", err)
+	}
+	defer eq.Close()
+
+	docs, err := eq.Docs(ctx, &entroq.DocQuery{Namespace: namespace, IDs: []string{"doc-1"}})
+	if err != nil {
+		t.Fatalf("Read replayed doc: %v", err)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("Replayed docs length: want 1, got %d", len(docs))
+	}
+	if got := docs[0].Version; got != 1 {
+		t.Errorf("Replayed doc version: want 1, got %d", got)
+	}
 }
 
 // TestEQMemReplayBackfillsMissingQueue covers the journal read path for older

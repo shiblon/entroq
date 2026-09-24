@@ -45,6 +45,7 @@ func TestBackendContract(t *testing.T) {
 		{"MapReduce", eqtest.MapReduce},
 		{"WorkerCompactDependencyHandler", eqtest.WorkerCompactDependencyHandler},
 		{"WorkerDependencyMove", eqtest.WorkerDependencyMove},
+		{"InitialVersions", eqtest.InitialVersions},
 		{"SimpleDocLifecycle", eqtest.SimpleDocLifecycle},
 		{"DocMultiOp", eqtest.DocMultiOp},
 		{"DocListing", eqtest.DocListing},

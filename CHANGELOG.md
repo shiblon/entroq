@@ -7,6 +7,15 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **In-memory document versions.** Newly inserted documents now begin at v0,
+  matching tasks and every other backend. Replaying an older eqmem journal can
+  reconstruct insert-only documents one version lower, and can fail when a
+  later document change expects the former v1 initial state.
+
 ## [1.12.0] - 2026-09-23
 
 ### Changed

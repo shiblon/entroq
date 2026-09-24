@@ -892,6 +892,7 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 		newRes := &entroq.Doc{
 			Namespace:    rd.Namespace,
 			ID:           id,
+			Version:      0,
 			At:           at,
 			Content:      rd.Content,
 			Key:          rd.Key,
@@ -899,7 +900,6 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 			Claimant:     claimant,
 			Created:      created,
 			Modified:     modified,
-			Version:      1,
 		}
 		setRes(newRes)
 		resp.InsertedDocs = append(resp.InsertedDocs, newRes)

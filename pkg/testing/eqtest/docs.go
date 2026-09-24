@@ -14,6 +14,59 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// InitialVersions verifies that newly inserted tasks and docs both begin at
+// version zero. Their first changes must therefore advance them to version one.
+func InitialVersions(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	queue := path.Join(qPrefix, "initial_versions", "tasks")
+	namespace := path.Join(qPrefix, "initial_versions", "docs")
+
+	resp, err := client.Modify(ctx,
+		entroq.InsertingInto(queue,
+			entroq.WithID("task-1"),
+			entroq.WithValue("task"),
+		),
+		entroq.PuttingDocInto(namespace,
+			entroq.WithIDKeys("doc-1", "", ""),
+			entroq.WithContent("doc"),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Insert task and doc: %v", err)
+	}
+	if len(resp.InsertedTasks) != 1 {
+		t.Fatalf("InsertedTasks length: want 1, got %d", len(resp.InsertedTasks))
+	}
+	if len(resp.InsertedDocs) != 1 {
+		t.Fatalf("InsertedDocs length: want 1, got %d", len(resp.InsertedDocs))
+	}
+	if got := resp.InsertedTasks[0].Version; got != 0 {
+		t.Errorf("Initial task version: want 0, got %d", got)
+	}
+	if got := resp.InsertedDocs[0].Version; got != 0 {
+		t.Errorf("Initial doc version: want 0, got %d", got)
+	}
+
+	resp, err = client.Modify(ctx,
+		resp.InsertedTasks[0].Change(entroq.ValueTo("changed task")),
+		resp.InsertedDocs[0].Change(entroq.WithContent("changed doc")),
+	)
+	if err != nil {
+		t.Fatalf("Change task and doc: %v", err)
+	}
+	if len(resp.ChangedTasks) != 1 {
+		t.Fatalf("ChangedTasks length: want 1, got %d", len(resp.ChangedTasks))
+	}
+	if len(resp.ChangedDocs) != 1 {
+		t.Fatalf("ChangedDocs length: want 1, got %d", len(resp.ChangedDocs))
+	}
+	if got := resp.ChangedTasks[0].Version; got != 1 {
+		t.Errorf("First changed task version: want 1, got %d", got)
+	}
+	if got := resp.ChangedDocs[0].Version; got != 1 {
+		t.Errorf("First changed doc version: want 1, got %d", got)
+	}
+}
+
 // SimpleDocLifecycle tests basic insertion, change, and deletion of a doc.
 func SimpleDocLifecycle(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	ns := path.Join(qPrefix, "simple_doc")

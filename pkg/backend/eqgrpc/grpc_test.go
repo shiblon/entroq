@@ -167,6 +167,10 @@ func TestGRPCSimpleDocLifecycle(t *testing.T) {
 	RunQTest(t, eqtest.SimpleDocLifecycle)
 }
 
+func TestGRPCInitialVersions(t *testing.T) {
+	RunQTest(t, eqtest.InitialVersions)
+}
+
 func TestGRPCDocMultiOp(t *testing.T) {
 	RunQTest(t, eqtest.DocMultiOp)
 }
