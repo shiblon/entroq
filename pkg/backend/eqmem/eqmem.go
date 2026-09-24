@@ -67,6 +67,10 @@ type EQMem struct {
 	modifyDuration metric.Float64Histogram
 	gcMetrics      *gcmetrics.Metrics
 
+	readinessInterval time.Duration
+	stopReadiness     func()
+	readinessDone     chan struct{}
+
 	gcInterval  time.Duration
 	gcBatchSize int
 	stopGC      func()
@@ -190,6 +194,7 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 		claimDuration:      claimDuration,
 		modifyDuration:     modifyDuration,
 		gcMetrics:          gcMetrics,
+		readinessInterval:  defaultReadinessInterval,
 		gcInterval:         defaultGCInterval,
 		gcBatchSize:        defaultGCBatchSize,
 	}
@@ -257,13 +262,20 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 		}
 	}
 
-	// Garbage collection is a first-class, always-on backend behavior. It is not
-	// started in snapshot-and-quit mode (a load-dump-exit tool). Its context is
-	// rooted at context.Background(), NOT the constructor's ctx: the loop's
-	// lifetime is the backend's, ended by Close, whereas the constructor ctx
-	// scopes only construction (a caller may bound New with a timeout and defer
-	// cancel()). Close cancels it and waits for it to exit.
+	// Background loops are not started in snapshot-and-quit mode. Their contexts
+	// are rooted at context.Background(), not the constructor's ctx: their
+	// lifetime is the backend's and is ended by Close.
 	if !m.outputSnapshot {
+		if m.readinessInterval > 0 {
+			readinessCtx, cancel := context.WithCancel(context.Background())
+			m.stopReadiness = cancel
+			m.readinessDone = make(chan struct{})
+			go func() {
+				defer close(m.readinessDone)
+				m.runReadinessLoop(readinessCtx, m.readinessInterval)
+			}()
+		}
+
 		gcCtx, cancel := context.WithCancel(context.Background())
 		m.stopGC = cancel
 		m.gcDone = make(chan struct{})
@@ -955,6 +967,24 @@ func (m *EQMem) queueTasks(queue string) (*taskQueue, bool) {
 	return q, ok
 }
 
+// snapshotQueueLocks returns the queue lock structures present while the
+// global registry lock is held. It does not acquire the individual queue
+// locks.
+//
+// A returned pointer remains valid if its queue is subsequently removed from
+// the registry. Callers may read the immutable queue name and concurrency-safe
+// task store directly, but must acquire the queue lock before inspecting the
+// heap.
+func (m *EQMem) snapshotQueueLocks() []*qLock {
+	defer un(lock(m))
+
+	qls := make([]*qLock, 0, len(m.locksSuperUnsafe))
+	for _, ql := range m.locksSuperUnsafe {
+		qls = append(qls, ql)
+	}
+	return qls
+}
+
 // Tasks lists tasks according to the given query. If specific IDs are given,
 // it will block for brief periods to look up corresponding queues for them.
 func (m *EQMem) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Task, error) {
@@ -1048,31 +1078,21 @@ func (m *EQMem) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[str
 	if err != nil {
 		return nil, fmt.Errorf("queue stats time: %w", err)
 	}
-	var qnames []string
-	func() {
-		defer un(lock(m))
-		for q := range m.queues {
-			qnames = append(qnames, q)
-		}
-	}()
 
 	qs := make(map[string]*entroq.QueueStat)
-	for _, q := range qnames {
+	for _, ql := range m.snapshotQueueLocks() {
+		q := ql.queue
 		if !matchesQuery(q, qq) {
 			continue
 		}
 		if qq.Limit > 0 && len(qs) >= qq.Limit {
 			break
 		}
-		qts, ok := m.queueTasks(q)
-		if !ok {
-			continue
-		}
 
 		stats := &entroq.QueueStat{
 			Name: q,
 		}
-		qts.Range(func(_ string, t *entroq.Task) bool {
+		ql.tasks.Range(func(_ string, t *entroq.Task) bool {
 			stats.Size++
 			if t.At.After(now) {
 				if t.Claims > 0 {
@@ -1097,6 +1117,10 @@ func (m *EQMem) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[str
 
 // Close cleans up this implementation.
 func (m *EQMem) Close() error {
+	if m.stopReadiness != nil {
+		m.stopReadiness()
+		<-m.readinessDone
+	}
 	if m.stopGC != nil {
 		m.stopGC()
 		<-m.gcDone // wait for the GC loop to exit before tearing down
