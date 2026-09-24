@@ -1,0 +1,109 @@
+package eqredis
+
+import (
+	"context"
+	"encoding/json"
+	"testing"
+
+	"github.com/redis/go-redis/v9"
+	"github.com/shiblon/entroq"
+)
+
+func docContent(ctx context.Context, t *testing.T, client *entroq.EntroQ, ns, id string) string {
+	t.Helper()
+	docs, err := client.Docs(ctx, &entroq.DocQuery{Namespace: ns, IDs: []string{id}})
+	if err != nil {
+		t.Fatalf("docs in %q: %v", ns, err)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("docs in %q: got %d, want 1", ns, len(docs))
+	}
+	var s string
+	if err := json.Unmarshal(docs[0].Content, &s); err != nil {
+		t.Fatalf("doc content in %q: %v", ns, err)
+	}
+	return s
+}
+
+// TestDocKeysDistinguishEscapedNamespaces checks that namespaces "a/b" and
+// "a%2Fb" no longer share doc keys. Before "%" was escaped, a doc in one
+// overwrote the doc with the same ID in the other.
+func TestDocKeysDistinguishEscapedNamespaces(t *testing.T) {
+	ctx := context.Background()
+	client, err := redisClient(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	slash, escaped := "keycollide/a/b", "keycollide/a%2Fb"
+	if _, err := client.Modify(ctx,
+		entroq.PuttingDocInto(slash, entroq.WithIDKeys("d", "k", ""), entroq.WithContent("slash")),
+		entroq.PuttingDocInto(escaped, entroq.WithIDKeys("d", "k", ""), entroq.WithContent("escaped")),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if got := docContent(ctx, t, client, slash, "d"); got != "slash" {
+		t.Errorf("doc in %q = %q, want %q", slash, got, "slash")
+	}
+	if got := docContent(ctx, t, client, escaped, "d"); got != "escaped" {
+		t.Errorf("doc in %q = %q, want %q", escaped, got, "escaped")
+	}
+}
+
+// TestMigrateDocKeys stores docs under the legacy key encoding and checks
+// that opening the backend moves them to their current keys, leaving alone a
+// legacy key that holds the colliding namespace's doc.
+func TestMigrateDocKeys(t *testing.T) {
+	ctx := context.Background()
+	client, err := redisClient(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
+	defer rdb.Close()
+
+	// "pct%" is the only namespace whose encoding changes. "col/x" and
+	// "col%2Fx" collided under the legacy encoding; "col/x" keeps its key.
+	moved, kept, lost := "migrate/pct%", "migrate/col/x", "migrate/col%2Fx"
+	if _, err := client.Modify(ctx,
+		entroq.PuttingDocInto(moved, entroq.WithIDKeys("d", "k", ""), entroq.WithContent("moved")),
+		entroq.PuttingDocInto(kept, entroq.WithIDKeys("d", "k", ""), entroq.WithContent("kept")),
+	); err != nil {
+		t.Fatal(err)
+	}
+	// Put the "pct%" doc back at its legacy key, as an older server stored it.
+	if err := rdb.Rename(ctx, docKey(moved, "d"), legacyDocKey(moved, "d")).Err(); err != nil {
+		t.Fatal(err)
+	}
+	// Index "col%2Fx" as holding doc "d", whose legacy key is the "col/x" doc:
+	// the state an older server left after one overwrote the other.
+	if err := rdb.ZAdd(ctx, docNSIndexKey(lost), redis.Z{Member: docIndexMember("k", "", "d")}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rdb.SAdd(ctx, namespacesKey, lost).Err(); err != nil {
+		t.Fatal(err)
+	}
+	defer rdb.Del(ctx, docNSIndexKey(lost))
+	defer rdb.SRem(ctx, namespacesKey, lost)
+	if legacyDocKey(lost, "d") != docKey(kept, "d") {
+		t.Fatalf("test setup: %q and %q should collide under the legacy encoding", lost, kept)
+	}
+
+	reopened, err := redisClient(ctx)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+
+	if got := docContent(ctx, t, reopened, moved, "d"); got != "moved" {
+		t.Errorf("doc in %q = %q, want %q", moved, got, "moved")
+	}
+	if n, err := rdb.Exists(ctx, legacyDocKey(moved, "d")).Result(); err != nil || n != 0 {
+		t.Errorf("legacy key for %q still exists (n=%d, err=%v)", moved, n, err)
+	}
+	if got := docContent(ctx, t, reopened, kept, "d"); got != "kept" {
+		t.Errorf("doc in %q = %q, want %q", kept, got, "kept")
+	}
+}

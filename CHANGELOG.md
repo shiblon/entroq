@@ -38,6 +38,14 @@ schema to version 2. The PostgreSQL schema is unchanged (stays 1.11.0).
   they store nothing. In-memory journal replay is not checked, so an existing
   journal still loads. The schema CHECKs remain as a backstop, and a shared
   contract test runs the limits against every backend.
+- **Redis doc keys no longer collide.** The Redis backend escaped `/` in a
+  namespace as `%2F` but left `%` alone, so namespaces such as `a/b` and
+  `a%2Fb` shared doc keys and a doc in one overwrote the doc with the same ID
+  in the other. `%` is now escaped too. Opening the backend moves docs in
+  namespaces containing `%` to their new keys; a doc already lost to a
+  collision cannot be recovered. The move reruns on every open, but a server
+  running the previous version against the same Redis keeps writing old keys,
+  so upgrade all servers sharing a database together.
 
 ## [1.12.3] - 2026-09-24
 

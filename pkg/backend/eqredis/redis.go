@@ -29,8 +29,10 @@
 //
 // Notifications:
 //
-//	SubQ is used for "something changed" signals. A background ticker handles
-//	passage-of-time wakeups by scanning queue ZSETs for tasks that became ready.
+//	SubQ is used for in-process "something changed" signals only: a change
+//	made through another process sharing the same Redis does not wake local
+//	waiters. Tasks that become ready with the passage of time, and changes
+//	from other processes, are found by the claim poll (ClaimQuery.PollTime).
 package eqredis
 
 import (
@@ -78,10 +80,18 @@ func nsclaimedKey(ns string) string {
 	return keyPrefix + "nsclaimed:" + ns
 }
 
+// docKeyEscaper percent-escapes "%" and "/" in a namespace, so the first "/"
+// in a doc key always ends the namespace and no two namespaces share an
+// encoding. The id follows unescaped and may contain "/".
+var docKeyEscaper = strings.NewReplacer("%", "%25", "/", "%2F")
+
 func docKey(namespace, id string) string {
-	// Encode namespace and id with a separator that cannot appear in either.
-	// Namespace and id are limited to 64 chars, so "/" is safe as a separator
-	// as long as we escape any "/" in the namespace itself.
+	return keyPrefix + "d:" + docKeyEscaper.Replace(namespace) + "/" + id
+}
+
+// legacyDocKey is the doc key encoding before "%" was escaped, under which
+// namespaces "a/b" and "a%2Fb" shared keys. Only migrateDocKeys uses it.
+func legacyDocKey(namespace, id string) string {
 	return keyPrefix + "d:" + strings.ReplaceAll(namespace, "/", "%2F") + "/" + id
 }
 
@@ -173,6 +183,10 @@ func Open(ctx context.Context, opts ...RedisOpt) (*EQRedis, error) {
 
 	if err := client.Ping(ctx).Err(); err != nil {
 		return nil, fmt.Errorf("eqredis open: ping redis: %w", err)
+	}
+	if err := migrateDocKeys(ctx, client); err != nil {
+		client.Close()
+		return nil, fmt.Errorf("eqredis open: migrate doc keys: %w", err)
 	}
 
 	nw := o.nw
