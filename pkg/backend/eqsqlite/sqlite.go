@@ -23,7 +23,7 @@ import (
 )
 
 // SchemaVersion is the current database schema version.
-const SchemaVersion = 1
+const SchemaVersion = 2
 
 //go:embed schema.sql
 var schemaSQL string
@@ -189,10 +189,50 @@ func openWriteDB(ctx context.Context, path string, timeout time.Duration) (_ *sq
 	if err := conn.QueryRowContext(ctx, "SELECT schema_version FROM entroq_meta WHERE id = 1").Scan(&schemaVersion); err != nil {
 		return nil, fmt.Errorf("schema version: %w", err)
 	}
+	if schemaVersion == 1 {
+		if err := migrateV1ToV2(ctx, conn); err != nil {
+			return nil, fmt.Errorf("migrate schema 1 to 2: %w", err)
+		}
+		schemaVersion = 2
+	}
 	if schemaVersion != SchemaVersion {
 		return nil, fmt.Errorf("schema version %d, backend requires %d", schemaVersion, SchemaVersion)
 	}
 	return db, nil
+}
+
+// migrateV1ToV2 rebuilds tasks and docs so their length CHECKs count bytes.
+// SQLite cannot alter a CHECK in place: the old tables are renamed aside,
+// schemaSQL creates the new ones, and the rows are copied across. Column
+// order is unchanged between versions, so SELECT * lines up. A row that
+// violates the new limits fails the copy and rolls back the whole migration,
+// leaving the version 1 database untouched.
+func migrateV1ToV2(ctx context.Context, conn *sql.Conn) (err error) {
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, tx.Rollback())
+		}
+	}()
+	steps := []struct{ name, sql string }{
+		{"set aside tasks", "ALTER TABLE tasks RENAME TO tasks_v1"},
+		{"set aside docs", "ALTER TABLE docs RENAME TO docs_v1"},
+		{"drop old indexes", "DROP INDEX tasks_queue_at; DROP INDEX docs_namespace_keys; DROP INDEX docs_namespace_at"},
+		{"create tables", schemaSQL},
+		{"copy tasks (an id or claimant may exceed 64 bytes)", "INSERT INTO tasks SELECT * FROM tasks_v1"},
+		{"copy docs (an id, claimant, or key may exceed its byte limit)", "INSERT INTO docs SELECT * FROM docs_v1"},
+		{"drop old tables", "DROP TABLE tasks_v1; DROP TABLE docs_v1"},
+		{"stamp version", "UPDATE entroq_meta SET schema_version = 2 WHERE id = 1"},
+	}
+	for _, step := range steps {
+		if _, err := tx.ExecContext(ctx, step.sql); err != nil {
+			return fmt.Errorf("%s: %w", step.name, err)
+		}
+	}
+	return tx.Commit()
 }
 
 func openReadDB(ctx context.Context, path string, timeout time.Duration) (_ *sql.DB, err error) {

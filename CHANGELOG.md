@@ -7,6 +7,24 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [Unreleased]
+
+Release note: the next release must be a minor (v1.13.0 or later), not a
+patch. It moves the SQLite schema to version 2. The PostgreSQL schema is
+unchanged (stays 1.11.0).
+
+### Fixed
+
+- **SQLite length limits count bytes.** The experimental SQLite backend
+  checked id, claimant, namespace, and doc key lengths with `length()`, which
+  counts characters and stops at the first NUL. Multibyte values up to twice
+  the limit, and anything after a NUL, got through. The checks now use
+  `octet_length()`, matching PostgreSQL, and the doc namespace limit rises from
+  64 to PostgreSQL's 1024 bytes. The SQLite schema moves to version 2; opening
+  a version 1 database rebuilds its tables in one transaction. If any stored
+  row exceeds the byte limits, the migration rolls back and the file stays at
+  version 1.
+
 ## [1.12.3] - 2026-09-24
 
 Go module `v1.12.3`. A bug-fix release for the in-memory backend and the gRPC

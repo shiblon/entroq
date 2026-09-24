@@ -5,8 +5,11 @@ CREATE TABLE IF NOT EXISTS entroq_meta (
     schema_version INTEGER NOT NULL
 );
 
-INSERT OR IGNORE INTO entroq_meta (id, schema_version) VALUES (1, 1);
+INSERT OR IGNORE INTO entroq_meta (id, schema_version) VALUES (1, 2);
 
+-- Length limits count bytes (octet_length), matching the PostgreSQL schema.
+-- SQLite's length() counts characters and stops at the first NUL, so it both
+-- admits oversized multibyte values and ignores everything after a NUL.
 CREATE TABLE IF NOT EXISTS tasks (
     id          TEXT PRIMARY KEY COLLATE BINARY,
     version     INTEGER NOT NULL,
@@ -19,8 +22,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     modified_ms INTEGER NOT NULL,
     attempt     INTEGER NOT NULL,
     err         TEXT NOT NULL,
-    CHECK (length(id) <= 64),
-    CHECK (length(claimant) <= 64)
+    CHECK (octet_length(id) <= 64),
+    CHECK (octet_length(claimant) <= 64)
 );
 
 CREATE INDEX IF NOT EXISTS tasks_queue_at
@@ -38,11 +41,11 @@ CREATE TABLE IF NOT EXISTS docs (
     created_ms    INTEGER NOT NULL,
     modified_ms   INTEGER NOT NULL,
     PRIMARY KEY (namespace, id),
-    CHECK (length(namespace) <= 64),
-    CHECK (length(id) <= 64),
-    CHECK (length(claimant) <= 64),
-    CHECK (length(key_primary) <= 256),
-    CHECK (length(key_secondary) <= 256)
+    CHECK (octet_length(namespace) <= 1024),
+    CHECK (octet_length(id) <= 64),
+    CHECK (octet_length(claimant) <= 64),
+    CHECK (octet_length(key_primary) <= 256),
+    CHECK (octet_length(key_secondary) <= 256)
 );
 
 CREATE INDEX IF NOT EXISTS docs_namespace_keys
