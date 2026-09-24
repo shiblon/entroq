@@ -559,6 +559,10 @@ func TestEQMemDocMultiOp(t *testing.T) {
 	RunQTest(t, eqtest.DocMultiOp)
 }
 
+func TestEQMemDocTimestamps(t *testing.T) {
+	RunQTest(t, eqtest.DocTimestamps)
+}
+
 func TestEQMemDocListing(t *testing.T) {
 	RunQTest(t, eqtest.DocListing)
 }

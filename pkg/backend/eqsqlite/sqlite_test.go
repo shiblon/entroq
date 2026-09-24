@@ -50,6 +50,7 @@ func TestBackendContract(t *testing.T) {
 		{"InitialVersions", eqtest.InitialVersions},
 		{"SimpleDocLifecycle", eqtest.SimpleDocLifecycle},
 		{"DocMultiOp", eqtest.DocMultiOp},
+		{"DocTimestamps", eqtest.DocTimestamps},
 		{"DocListing", eqtest.DocListing},
 		{"DocKeyRangeByteOrder", eqtest.DocKeyRangeByteOrder},
 		{"DocClaimLocking", eqtest.DocClaimLocking},

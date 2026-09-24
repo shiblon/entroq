@@ -11,6 +11,11 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Doc timestamps over gRPC.** A doc inserted through the gRPC service without
+  explicit timestamps was stored with a 1754 (Go client) or 1970 (Python, JS)
+  creation and modification time on every backend. The service now reads a
+  non-positive `created_ms` or `modified_ms` as unset, so the backend assigns
+  the current time; the Go client sends 0 for an unset time.
 - **In-memory stored fields.** The in-memory backend took a changed task's
   claim count and creation time, and a changed doc's creation time, from the
   caller. Through the gRPC service these arrived empty, so every renewal, retry,

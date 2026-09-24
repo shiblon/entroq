@@ -542,6 +542,10 @@ func TestPGDocMultiOp(t *testing.T) {
 	RunQTest(t, eqtest.DocMultiOp)
 }
 
+func TestPGDocTimestamps(t *testing.T) {
+	RunQTest(t, eqtest.DocTimestamps)
+}
+
 func TestPGDocListing(t *testing.T) {
 	RunQTest(t, eqtest.DocListing)
 }

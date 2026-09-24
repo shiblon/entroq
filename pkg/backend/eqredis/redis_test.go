@@ -210,6 +210,10 @@ func TestDocMultiOp(t *testing.T) {
 	RunQTest(t, eqtest.DocMultiOp)
 }
 
+func TestDocTimestamps(t *testing.T) {
+	RunQTest(t, eqtest.DocTimestamps)
+}
+
 func TestDocListing(t *testing.T) {
 	RunQTest(t, eqtest.DocListing)
 }

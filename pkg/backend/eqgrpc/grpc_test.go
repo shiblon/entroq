@@ -183,6 +183,10 @@ func TestGRPCDocMultiOp(t *testing.T) {
 	RunQTest(t, eqtest.DocMultiOp)
 }
 
+func TestGRPCDocTimestamps(t *testing.T) {
+	RunQTest(t, eqtest.DocTimestamps)
+}
+
 func TestGRPCDocListing(t *testing.T) {
 	RunQTest(t, eqtest.DocListing)
 }

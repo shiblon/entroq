@@ -824,3 +824,46 @@ func ModifyRejectsWrongNamespace(ctx context.Context, t *testing.T, client *entr
 		t.Errorf("doc should be untouched in %q at v%d: got %+v", realNS, doc.Version, docs)
 	}
 }
+
+// DocTimestamps checks that a backend owns a doc's timestamps: an insert that
+// does not supply them gets the current time, and a change keeps the stored
+// creation time rather than taking it from the caller. Over the gRPC service
+// an unset timestamp must not arrive as a real far-past date.
+func DocTimestamps(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	ns := path.Join(qPrefix, "doc_timestamps")
+
+	before, err := client.Time(ctx)
+	if err != nil {
+		t.Fatalf("Time: %v", err)
+	}
+	// Allow for millisecond truncation on the wire.
+	before = before.Add(-time.Second)
+
+	resp, err := client.Modify(ctx, entroq.PuttingDocInto(ns, entroq.WithContent("v0")))
+	if err != nil {
+		t.Fatalf("Insert doc: %v", err)
+	}
+	inserted := resp.InsertedDocs[0]
+	if inserted.Created.Before(before) || inserted.Modified.Before(before) {
+		t.Fatalf("Inserted: want created and modified after %v, got created %v, modified %v", before, inserted.Created, inserted.Modified)
+	}
+
+	resp, err = client.Modify(ctx, inserted.Change(entroq.WithContent("v1")))
+	if err != nil {
+		t.Fatalf("Change doc: %v", err)
+	}
+	if got := resp.ChangedDocs[0].Created; !got.Equal(inserted.Created) {
+		t.Errorf("Changed: want created %v, got %v", inserted.Created, got)
+	}
+
+	docs, err := client.Docs(ctx, &entroq.DocQuery{Namespace: ns, IDs: []string{inserted.ID}})
+	if err != nil {
+		t.Fatalf("Read doc: %v", err)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("Want 1 stored doc, got %d", len(docs))
+	}
+	if got := docs[0].Created; !got.Equal(inserted.Created) {
+		t.Errorf("Stored: want created %v, got %v", inserted.Created, got)
+	}
+}
