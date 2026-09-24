@@ -6,20 +6,22 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/shiblon/entroq/cmd/internal/eqflags"
 	"github.com/shiblon/entroq/pkg/version"
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
 )
 
 var (
-	cfgFile string
-	dbPath  string
+	cfgFile  string
+	settings = eqflags.NewEnvironment("EQSQLITE")
+	dbPath   string
 )
 
 var rootCmd = &cobra.Command{
-	Use:     "eqsqlite",
-	Version: version.Version,
-	Short:   "Experimental SQLite-backed EntroQ service.",
+	Use:               "eqsqlite",
+	Version:           version.Version,
+	Short:             "Experimental SQLite-backed EntroQ service.",
+	PersistentPreRunE: eqflags.Apply(settings),
 }
 
 // Execute is the entry point called from main.
@@ -35,33 +37,32 @@ func init() {
 	pflags := rootCmd.PersistentFlags()
 	pflags.StringVar(&cfgFile, "config", "", "config file (default is $HOME/.config/eqsqlite.yml)")
 	pflags.StringVar(&dbPath, "path", "entroq.db", "SQLite database path. Overrides EQ_SQLITE_PATH.")
-	viper.BindPFlag("path", pflags.Lookup("path"))
 }
 
 func resolveSQLiteFlags() {
 	if !rootCmd.PersistentFlags().Changed("path") {
 		if path := os.Getenv("EQ_SQLITE_PATH"); path != "" {
 			dbPath = path
-		} else if viper.IsSet("path") {
-			dbPath = viper.GetString("path")
 		}
 	}
 }
 
 func initConfig() {
+	if cfgFile == "" {
+		cfgFile = settings.GetString("config")
+	}
 	if cfgFile != "" {
-		viper.SetConfigFile(cfgFile)
+		settings.SetConfigFile(cfgFile)
 	} else {
 		home, err := os.UserHomeDir()
 		if err != nil {
 			fmt.Println(err)
 			os.Exit(1)
 		}
-		viper.AddConfigPath(filepath.Join(home, ".config"))
-		viper.SetConfigName("eqsqlite.yml")
+		settings.AddConfigPath(filepath.Join(home, ".config"))
+		settings.SetConfigName("eqsqlite.yml")
 	}
-	viper.AutomaticEnv()
-	if err := viper.ReadInConfig(); err == nil {
-		fmt.Println("Using config file:", viper.ConfigFileUsed())
+	if err := settings.ReadInConfig(); err == nil {
+		fmt.Println("Using config file:", settings.ConfigFileUsed())
 	}
 }

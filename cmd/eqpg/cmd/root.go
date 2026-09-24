@@ -8,14 +8,15 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/shiblon/entroq/cmd/internal/eqflags"
 	"github.com/shiblon/entroq/pkg/backend/eqpg"
 	"github.com/shiblon/entroq/pkg/version"
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
 )
 
 var (
-	cfgFile string
+	cfgFile  string
+	settings = eqflags.NewEnvironment("EQPG")
 
 	dbAddr string
 	dbName string
@@ -30,9 +31,10 @@ var (
 )
 
 var rootCmd = &cobra.Command{
-	Use:     "eqpg",
-	Version: version.Version,
-	Short:   "PostgreSQL-backed EntroQ: service management and schema utilities.",
+	Use:               "eqpg",
+	Version:           version.Version,
+	Short:             "PostgreSQL-backed EntroQ: service management and schema utilities.",
+	PersistentPreRunE: eqflags.Apply(settings),
 }
 
 // Execute is the entry point called from main.
@@ -56,16 +58,6 @@ func init() {
 	pflags.StringVar(&dbSSLRootCert, "dbsslrootcert", "", "PostgreSQL TLS root certificate file. Overrides PGSSLROOTCERT environment.")
 	pflags.StringVar(&dbSSLCert, "dbsslcert", "", "PostgreSQL TLS client certificate file. Overrides PGSSLCERT environment.")
 	pflags.StringVar(&dbSSLKey, "dbsslkey", "", "PostgreSQL TLS client key file. Overrides PGSSLKEY environment.")
-
-	viper.BindPFlag("dbaddr", pflags.Lookup("dbaddr"))
-	viper.BindPFlag("dbname", pflags.Lookup("dbname"))
-	viper.BindPFlag("dbuser", pflags.Lookup("dbuser"))
-	viper.BindPFlag("dbpwd", pflags.Lookup("dbpwd"))
-	viper.BindPFlag("dburl", pflags.Lookup("dburl"))
-	viper.BindPFlag("dbsslmode", pflags.Lookup("dbsslmode"))
-	viper.BindPFlag("dbsslrootcert", pflags.Lookup("dbsslrootcert"))
-	viper.BindPFlag("dbsslcert", pflags.Lookup("dbsslcert"))
-	viper.BindPFlag("dbsslkey", pflags.Lookup("dbsslkey"))
 }
 
 // resolveDBFlags fills in DB connection variables from environment when the
@@ -150,21 +142,22 @@ func databaseDescription(target string) string {
 
 // initConfig reads in config file and ENV variables if set.
 func initConfig() {
+	if cfgFile == "" {
+		cfgFile = settings.GetString("config")
+	}
 	if cfgFile != "" {
-		viper.SetConfigFile(cfgFile)
+		settings.SetConfigFile(cfgFile)
 	} else {
 		home, err := os.UserHomeDir()
 		if err != nil {
 			fmt.Println(err)
 			os.Exit(1)
 		}
-		viper.AddConfigPath(filepath.Join(home, ".config"))
-		viper.SetConfigName("eqpg.yml")
+		settings.AddConfigPath(filepath.Join(home, ".config"))
+		settings.SetConfigName("eqpg.yml")
 	}
 
-	viper.AutomaticEnv()
-
-	if err := viper.ReadInConfig(); err == nil {
-		fmt.Println("Using config file:", viper.ConfigFileUsed())
+	if err := settings.ReadInConfig(); err == nil {
+		fmt.Println("Using config file:", settings.ConfigFileUsed())
 	}
 }

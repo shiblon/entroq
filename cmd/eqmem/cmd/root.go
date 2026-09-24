@@ -6,17 +6,21 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/shiblon/entroq/cmd/internal/eqflags"
 	"github.com/shiblon/entroq/pkg/version"
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
 )
 
-var cfgFile string
+var (
+	cfgFile  string
+	settings = eqflags.NewEnvironment("EQMEM")
+)
 
 var rootCmd = &cobra.Command{
-	Use:     "eqmem",
-	Version: version.Version,
-	Short:   "In-memory EntroQ service. Run 'eqmem serve' to start.",
+	Use:               "eqmem",
+	Version:           version.Version,
+	Short:             "In-memory EntroQ service. Run 'eqmem serve' to start.",
+	PersistentPreRunE: eqflags.Apply(settings),
 }
 
 // Execute is the entry point called from main.
@@ -33,19 +37,21 @@ func init() {
 }
 
 func initConfig() {
+	if cfgFile == "" {
+		cfgFile = settings.GetString("config")
+	}
 	if cfgFile != "" {
-		viper.SetConfigFile(cfgFile)
+		settings.SetConfigFile(cfgFile)
 	} else {
 		home, err := os.UserHomeDir()
 		if err != nil {
 			fmt.Println(err)
 			os.Exit(1)
 		}
-		viper.AddConfigPath(filepath.Join(home, ".config"))
-		viper.SetConfigName("eqmem.yml")
+		settings.AddConfigPath(filepath.Join(home, ".config"))
+		settings.SetConfigName("eqmem.yml")
 	}
-	viper.AutomaticEnv()
-	if err := viper.ReadInConfig(); err == nil {
-		fmt.Println("Using config file:", viper.ConfigFileUsed())
+	if err := settings.ReadInConfig(); err == nil {
+		fmt.Println("Using config file:", settings.ConfigFileUsed())
 	}
 }

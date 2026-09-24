@@ -36,7 +36,11 @@ HTTP/JSON + Connect API (--http_port, default 9100, which also serves /metrics).
 
 State is held in memory. Pass --journal to persist it to a write-ahead journal
 that replays quickly on restart; without one, a restart starts empty. Best for
-tests, development, and light-duty singleton services.`,
+tests, development, and light-duty singleton services.
+
+Each flag also has an EQMEM_-prefixed environment variable; for example,
+EQMEM_READINESS_INTERVAL=2s sets --readiness_interval. Explicit command-line
+flags take precedence.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 

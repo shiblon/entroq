@@ -7,6 +7,18 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Service environment overrides.** Every flag on `eqmem`, `eqpg`, `eqredis`,
+  `eqsqlite`, `eqlink`, `eqk8s`, and `eqprocworker` accepts a service-prefixed
+  environment variable, such as
+  `EQMEM_READINESS_INTERVAL=2s`, `EQPG_PORT=37707`, or
+  `EQLINK_ENTROQ_STARTUP_TIMEOUT=1m`. Explicit command-line flags take
+  precedence. The `PG*`, `EQ_REDIS_*`, and `EQ_SQLITE_PATH` aliases are also
+  accepted.
+
 ## [1.12.1] - 2026-09-23
 
 ### Fixed

@@ -20,6 +20,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"flag"
+	"fmt"
 	"os"
 	"time"
 
@@ -41,6 +42,7 @@ import (
 	entroqv1alpha1 "github.com/shiblon/entroq/cmd/eqk8s/api/v1alpha1"
 	"github.com/shiblon/entroq/cmd/eqk8s/internal/controller"
 	eqwebhook "github.com/shiblon/entroq/cmd/eqk8s/internal/webhook"
+	"github.com/shiblon/entroq/cmd/internal/eqflags"
 	"github.com/shiblon/entroq/pkg/eqk8s"
 	// +kubebuilder:scaffold:imports
 )
@@ -99,6 +101,10 @@ func main() {
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
+	if err := eqflags.ApplyGoSet(eqflags.NewEnvironment("EQK8S"), flag.CommandLine); err != nil {
+		fmt.Fprintf(os.Stderr, "eqk8s configuration: %v\n", err)
+		os.Exit(2)
+	}
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	if legacyOPAURL != "" {

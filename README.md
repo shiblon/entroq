@@ -64,6 +64,26 @@ The service will be available at:
 - **Prometheus Metrics**: `localhost:9100/metrics`
 - **Grafana Dashboards**: `localhost:3000`
 
+### Service Configuration
+
+Every flag on a long-running EntroQ binary has an environment-variable form.
+Uppercase the flag name, replace hyphens with underscores, and prepend the
+binary's prefix:
+
+| Binary | Prefix | Example |
+| --- | --- | --- |
+| `eqmem` | `EQMEM_` | `EQMEM_READINESS_INTERVAL=2s` |
+| `eqpg` | `EQPG_` | `EQPG_PORT=37707` |
+| `eqredis` | `EQREDIS_` | `EQREDIS_DB=2` |
+| `eqsqlite` | `EQSQLITE_` | `EQSQLITE_PATH=/data/entroq.db` |
+| `eqlink` | `EQLINK_` | `EQLINK_ENTROQ_STARTUP_TIMEOUT=1m` |
+| `eqk8s` | `EQK8S_` | `EQK8S_RESYNC_INTERVAL=2m` |
+| `eqprocworker` | `EQPROCWORKER_` | `EQPROCWORKER_INBOX=/jobs/inbox` |
+
+Explicit command-line flags take precedence. The conventional PostgreSQL
+`PG*` variables and the `EQ_REDIS_*` and `EQ_SQLITE_PATH` aliases are also
+accepted.
+
 ### Command Line
 You can poke at the running service using the Go-based command line client:
 
