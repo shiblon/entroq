@@ -16,6 +16,7 @@ import (
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/backend/internal/gcmetrics"
+	"github.com/shiblon/entroq/pkg/backend/internal/limits"
 	"github.com/shiblon/entroq/pkg/subq"
 	"github.com/shiblon/stuffedio/wal"
 	"go.opentelemetry.io/otel/metric"
@@ -406,6 +407,9 @@ func (m *EQMem) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task,
 // TryClaim attempts to claim a task from the given queue query. If no task is
 // available, returns nil (not an error).
 func (m *EQMem) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
+	if err := limits.Claimant(cq.Claimant); err != nil {
+		return nil, fmt.Errorf("eqmem claim: %w", err)
+	}
 	start := time.Now()
 	defer func() {
 		m.claimDuration.Record(ctx, time.Since(start).Seconds())
@@ -625,6 +629,9 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (*entroq.M
 	// goes straight to modifyImpl and skips this: it is trusted and its ops
 	// already carry valid keys.
 	if err := mod.EnsureModifyKeys(); err != nil {
+		return nil, fmt.Errorf("eqmem modify: %w", err)
+	}
+	if err := limits.Modification(mod); err != nil {
 		return nil, fmt.Errorf("eqmem modify: %w", err)
 	}
 	start := time.Now()

@@ -849,9 +849,9 @@ DROP FUNCTION IF EXISTS entroq.gc_due(text);
 --   (1) Text length CHECKs count bytes, not characters: length() becomes
 --       octet_length() on tasks.id/claimant and
 --       docs.namespace/id/claimant/key_primary/key_secondary. These bounds
---       budget btree index entries, which are measured in bytes, and every
---       client validates in bytes (Go's len()), so a multi-byte key could pass
---       the old check while consuming up to 4x the intended index space.
+--       budget btree index entries, which are measured in bytes, so a
+--       multi-byte key could pass the old check while consuming up to 4x the
+--       intended index space.
 --       Collation is not involved: COLLATE "C" governs comparison, while
 --       length() counts characters per the server encoding, so the columns
 --       were byte-ordered but character-bounded. The new constraints are added

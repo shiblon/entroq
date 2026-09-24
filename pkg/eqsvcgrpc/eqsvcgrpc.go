@@ -413,6 +413,9 @@ func autoCodeErrorf(format string, vals ...any) error {
 	if entroq.IsCanceled(err) {
 		return status.New(codes.Canceled, err.Error()).Err()
 	}
+	if entroq.IsInvalidArgument(err) {
+		return status.New(codes.InvalidArgument, err.Error()).Err()
+	}
 	return err
 }
 

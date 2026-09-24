@@ -135,6 +135,10 @@ func TestEQMemTasksClaimantLimit(t *testing.T) {
 	RunQTest(t, eqtest.TasksClaimantLimit)
 }
 
+func TestEQMemLengthLimits(t *testing.T) {
+	RunQTest(t, eqtest.LengthLimits)
+}
+
 func TestEQMemClaimLongDuration(t *testing.T) {
 	RunQTest(t, eqtest.ClaimLongDuration)
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/backend/internal/limits"
 )
 
 // ClaimDocs claims all docs with the requested primary key in a namespace.
@@ -15,6 +16,9 @@ func (b *EQSQLite) ClaimDocs(ctx context.Context, q *entroq.DocClaim) ([]*entroq
 		return nil, fmt.Errorf("eqsqlite claim docs: nil query")
 	}
 	if err := q.Validate(); err != nil {
+		return nil, fmt.Errorf("eqsqlite claim docs: %w", err)
+	}
+	if err := limits.DocClaim(q); err != nil {
 		return nil, fmt.Errorf("eqsqlite claim docs: %w", err)
 	}
 	value, err := b.write(ctx, func(ctx context.Context, tx *sql.Tx) (any, error) {

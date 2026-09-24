@@ -182,7 +182,7 @@ func WithErr(value string) InsertArg {
 // where assigning an explicit insertion ID (always being careful that it is
 // unique) can be useful, however.
 //
-// NOTE: IDs must be <= 64 characters in length for some backends.
+// NOTE: IDs must be <= 64 bytes long; every backend rejects longer ones.
 //
 // For example, a not uncommon need is for a worker to do the following:
 //

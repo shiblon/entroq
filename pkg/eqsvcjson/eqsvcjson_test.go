@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/shiblon/entroq/pkg/backend/eqmem"
@@ -104,5 +105,42 @@ func TestModifyDependencyErrorIs409(t *testing.T) {
 	}
 	if !foundDelete {
 		t.Errorf("expected a flat DELETE ModifyDep detail, got %v", details)
+	}
+}
+
+// TestOverLimitValuesAre400 checks that a value over its length limit is
+// reported as a bad request, not a server error: the backend returns an
+// entroq.InvalidArgumentError, which must survive as InvalidArgument.
+func TestOverLimitValuesAre400(t *testing.T) {
+	ts, cleanup := newTestServer(t)
+	defer cleanup()
+
+	long := strings.Repeat("c", 65)
+	tests := []struct {
+		name string
+		path string
+		body map[string]any
+	}{
+		{"claim claimant", "/api/v0/claim", map[string]any{
+			"claimantId": long,
+			"queues":     []string{"/q"},
+			"durationMs": 1000,
+		}},
+		{"modify claimant", "/api/v0/modify", map[string]any{
+			"claimantId": long,
+			"inserts":    []map[string]any{{"queue": "/q"}},
+		}},
+		{"task id", "/api/v0/modify", map[string]any{
+			"claimantId": "test",
+			"inserts":    []map[string]any{{"queue": "/q", "id": long}},
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			code, out := postJSON(t, ts.URL+test.path, test.body)
+			if code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body=%v", code, out)
+			}
+		})
 	}
 }

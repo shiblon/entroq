@@ -29,6 +29,7 @@ import (
 	"github.com/lib/pq"
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/backend/internal/gcmetrics"
+	"github.com/shiblon/entroq/pkg/backend/internal/limits"
 	"github.com/shiblon/entroq/pkg/subq"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
@@ -681,6 +682,9 @@ func (b *EQPG) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 	if cq.Duration == 0 {
 		return nil, fmt.Errorf("no duration set for claim %q", cq.Queues)
 	}
+	if err := limits.Claimant(cq.Claimant); err != nil {
+		return nil, fmt.Errorf("eqpg claim: %w", err)
+	}
 	start := time.Now()
 	defer func() {
 		b.claimDuration.Record(ctx, time.Since(start).Seconds())
@@ -754,6 +758,9 @@ func (b *EQPG) Modify(ctx context.Context, mod *entroq.Modification) (*entroq.Mo
 	// Reject writes to an empty queue/namespace before touching the database, so
 	// an empty queue is never written.
 	if err := mod.EnsureModifyKeys(); err != nil {
+		return nil, fmt.Errorf("eqpg modify: %w", err)
+	}
+	if err := limits.Modification(mod); err != nil {
 		return nil, fmt.Errorf("eqpg modify: %w", err)
 	}
 	start := time.Now()
@@ -1270,6 +1277,9 @@ func (b *EQPG) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, er
 // another claimant. Returns an empty slice (not an error) if none exist.
 func (b *EQPG) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.Doc, error) {
 	if err := cq.Validate(); err != nil {
+		return nil, fmt.Errorf("claim docs: %w", err)
+	}
+	if err := limits.DocClaim(cq); err != nil {
 		return nil, fmt.Errorf("claim docs: %w", err)
 	}
 

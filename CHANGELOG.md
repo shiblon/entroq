@@ -10,8 +10,8 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 Release note: the next release must be a minor (v1.13.0 or later), not a
-patch. It moves the SQLite schema to version 2. The PostgreSQL schema is
-unchanged (stays 1.11.0).
+patch. It adds public API (`entroq.InvalidArgumentError`) and moves the SQLite
+schema to version 2. The PostgreSQL schema is unchanged (stays 1.11.0).
 
 ### Fixed
 
@@ -24,6 +24,20 @@ unchanged (stays 1.11.0).
   a version 1 database rebuilds its tables in one transaction. If any stored
   row exceeds the byte limits, the migration rolls back and the file stays at
   version 1.
+- **Length limits on every backend, reported as 400.** The in-memory and
+  Redis backends enforced no length limits at all, and PostgreSQL and SQLite
+  enforced them only through schema CHECKs, whose failures reached callers as
+  an unclassified error: the service returned gRPC `Unknown`, which HTTP/JSON
+  clients saw as a 500. Every backend now checks the limits in Go before
+  touching storage (task and doc IDs and claimants 64 bytes, doc namespaces
+  1024 bytes, doc keys 256 bytes) and returns the new
+  `entroq.InvalidArgumentError`, which the service reports as
+  `InvalidArgument` (HTTP 400) and the gRPC backend turns back into the same
+  error (`entroq.IsInvalidArgument`). Claims, doc claims, and modifications
+  that insert or change rows are checked; deletes and depends are not, since
+  they store nothing. In-memory journal replay is not checked, so an existing
+  journal still loads. The schema CHECKs remain as a backstop, and a shared
+  contract test runs the limits against every backend.
 
 ## [1.12.3] - 2026-09-24
 
