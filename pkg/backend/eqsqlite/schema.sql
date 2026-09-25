@@ -1,8 +1,12 @@
 PRAGMA foreign_keys = ON;
 
+-- schema_digest is the SHA-256 of this file for the build that created or
+-- last migrated the database; a database at the current version with another
+-- digest came from a development build with a different layout.
 CREATE TABLE IF NOT EXISTS entroq_meta (
     id             INTEGER PRIMARY KEY CHECK (id = 1),
-    schema_version INTEGER NOT NULL
+    schema_version INTEGER NOT NULL,
+    schema_digest  TEXT NOT NULL DEFAULT ''
 );
 
 INSERT OR IGNORE INTO entroq_meta (id, schema_version) VALUES (1, 3);
@@ -29,21 +33,22 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE INDEX IF NOT EXISTS tasks_queue_at
     ON tasks (queue, at_ms, id);
 
+-- A doc's version, claimant, and arrival time are its group's, in doc_locks.
+-- The reference is checked at commit, so a modification may write a group's
+-- docs before its lock.
 CREATE TABLE IF NOT EXISTS docs (
     namespace     TEXT NOT NULL COLLATE BINARY CHECK (namespace <> ''),
     id            TEXT NOT NULL COLLATE BINARY,
-    version       INTEGER NOT NULL,
-    claimant      TEXT NOT NULL COLLATE BINARY,
-    at_ms         INTEGER NOT NULL,
     key_primary   TEXT NOT NULL COLLATE BINARY,
     key_secondary TEXT NOT NULL COLLATE BINARY,
     content       TEXT CHECK (content IS NULL OR json_valid(content)),
     created_ms    INTEGER NOT NULL,
     modified_ms   INTEGER NOT NULL,
     PRIMARY KEY (namespace, id),
+    FOREIGN KEY (namespace, key_primary) REFERENCES doc_locks (namespace, key_primary)
+        DEFERRABLE INITIALLY DEFERRED,
     CHECK (octet_length(namespace) <= 1024),
     CHECK (octet_length(id) <= 64),
-    CHECK (octet_length(claimant) <= 64),
     CHECK (octet_length(key_primary) <= 256),
     CHECK (octet_length(key_secondary) <= 256)
 );
@@ -51,13 +56,9 @@ CREATE TABLE IF NOT EXISTS docs (
 CREATE INDEX IF NOT EXISTS docs_namespace_keys
     ON docs (namespace, key_primary, key_secondary, id);
 
-CREATE INDEX IF NOT EXISTS docs_namespace_at
-    ON docs (namespace, at_ms, id);
-
 -- Each doc group (the docs sharing a primary key in a namespace) has one lock
 -- holding the only version, claimant, and arrival time its members have. A
--- group can be claimed before it has docs, so locks are kept apart from docs;
--- the docs table's version, claimant, and at_ms columns are no longer read.
+-- group can be claimed before it has docs, so locks are kept apart from docs.
 CREATE TABLE IF NOT EXISTS doc_locks (
     namespace   TEXT NOT NULL COLLATE BINARY,
     key_primary TEXT NOT NULL COLLATE BINARY,
@@ -69,3 +70,7 @@ CREATE TABLE IF NOT EXISTS doc_locks (
     CHECK (octet_length(key_primary) <= 256),
     CHECK (octet_length(claimant) <= 64)
 );
+
+-- Held groups, for counting claimed docs without reading every doc.
+CREATE INDEX IF NOT EXISTS doc_locks_held
+    ON doc_locks (namespace, at_ms) WHERE claimant <> '';

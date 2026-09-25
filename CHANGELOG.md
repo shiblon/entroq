@@ -13,9 +13,11 @@ Release note: the next release must be a minor (v1.13.0 or later), not a
 patch. It adds public API (`entroq.InvalidArgumentError`), moves the SQLite
 schema to version 3, adds `eqc work --max-claims`, removes the
 `eqc mod --reset` flag, and changes how doc versions and claims work (see the
-doc groups entry). The PostgreSQL schema moves to 1.13.0: run
+doc groups entry). The PostgreSQL schema moves to 1.13.0: stop 1.12 services
+first, since the upgrade drops the doc functions they call, then run
 `eqpg schema upgrade` (or serve with `--init_schema`) before starting the new
-service.
+service. The upgrade moves data and holds a lock on the docs table while it
+runs, so plan a short maintenance window on large doc tables.
 
 ### Added
 
@@ -54,18 +56,35 @@ service.
   insert, change, or delete in it; a depend still succeeds, since it only
   reads. A writer acting as the holder (`entroq.ModifyAs`, as
   `eqc mod --force` does) still may. The holder's commit releases the group
-  unless it carries a future arrival time, which renews it. A group can be
+  unless it carries a future arrival time, which renews it. When one
+  modification gives docs of a group different future arrival times, the
+  latest wins. A group can be
   claimed before it has docs: `ClaimDocs` then succeeds and returns none, where
   it used to return none and lock nothing. The Go worker therefore no longer
   moves a task to its error queue for a "required doc missing"; a group held by
   someone else still retries with backoff, and a handler decides what an empty
   group means. Docs keep their keys: a change replaces content only.
   Upgrading gives every existing group a lock one version past its highest
-  member and releases claims held at the time: PostgreSQL gains the
-  `entroq.doc_locks` table, SQLite moves to schema version 3, Redis migrates on
-  its first open, and the in-memory backend rebuilds locks when its journal
-  loads. PostgreSQL's doc operations now run in Go on the same rules as every
-  other backend, and the schema drops `_modify_docs` and `_claim_docs`.
+  member, so no version read before the upgrade can match one written after,
+  and releases claims held at the time. The version, claimant, and arrival
+  time then live only in the lock: PostgreSQL gains the `entroq.doc_locks`
+  table, drops those columns from `entroq.docs`, and ties every doc to its
+  group's lock with a foreign key; SQLite does the same in schema version 3;
+  Redis migrates on its first open and removes the fields from doc hashes; and
+  the in-memory backend rebuilds locks when its journal loads. Namespace stats
+  count claimed docs from the held locks instead of reading every doc.
+  PostgreSQL's doc operations now run in Go on the same rules as every other
+  backend, and the schema drops `_modify_docs` and `_claim_docs`.
+- **Schemas carry a digest, and unreleased ones a `-dev` version.**
+  `eqpg.InitSchema` records `eqpg.SchemaDigest`, the SHA-256 of the schema it
+  applies, and `eqpg.Open` refuses a database at the right version whose
+  digest differs or is missing, directing you to `eqpg schema upgrade`. Between
+  releases `eqpg.SchemaVersion` ends in `-dev`, and `eqpg schema upgrade`
+  always re-applies such a schema, so a database created by one development
+  build upgrades cleanly to the next. A schema applied by hand rather than by
+  `eqpg` has no digest, so run `eqpg schema upgrade` once to record it. SQLite
+  records a digest too, and refuses a file that a development build created
+  with a different layout.
 - **Breaking: PostgreSQL no longer uses LISTEN/NOTIFY.** The service is the
   database's only client, so the backend now runs the same readiness loop as
   the other backends: a batched, read-only count of available tasks on the
@@ -90,6 +109,10 @@ service.
 
 ### Deprecated
 
+- **`EntroQ.TryClaimDocByID`.** A doc has no claim of its own: it claimed the
+  doc's whole group and returned only the named doc. Claim the group with
+  `ClaimDocs(ctx, entroq.ClaimKey(ns, doc.Key))`, which also works for a group
+  with no docs.
 - **In-memory journal replay no longer checks doc versions.** Journals written
   before doc groups had locks did not record doc claims, so their doc versions
   can trail what later records name. Replay applies the recorded state anyway,
@@ -100,6 +123,14 @@ service.
 
 ### Fixed
 
+- **The Go worker keeps an empty doc group it claimed.** Renewing a group's
+  docs renewed the group, but a group claimed with no docs had none to renew,
+  so its claim lapsed after one lease while the handler still ran, and another
+  claimant could take it. The worker now claims such groups again each time it
+  renews. A group the handler does not write is still released only when its
+  lease runs out.
+- **`eqpg.Open` closes its connections when it fails.** A failed open, such as
+  one refused for a schema mismatch, left its connection pool open.
 - **In-memory snapshots keep docs.** A snapshot saved only tasks, and taking
   one with cleanup removed the journals, so every doc was lost. Snapshots now
   hold docs and doc group locks, and snapshots written before this still load.

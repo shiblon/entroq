@@ -68,6 +68,11 @@ func WithContent(v any) DocOpt {
 // WithDocArrivalTime sets the arrival time on a doc insertion or change. When
 // non-zero and in the future, the backend also records the caller as the
 // claimant so the doc can be renewed or released.
+//
+// The arrival time belongs to the doc's group, not the doc: setting it claims
+// or renews the whole group. When one modification sets different future
+// arrival times on docs of one group, the latest wins; if none is in the
+// future, the modification releases the group.
 func WithDocArrivalTime(t time.Time) DocOpt {
 	return func(o *docOpts) {
 		o.at = t

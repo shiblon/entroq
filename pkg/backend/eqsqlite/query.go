@@ -138,7 +138,7 @@ func (b *EQSQLite) Docs(ctx context.Context, q *entroq.DocQuery) ([]*entroq.Doc,
 	if q == nil {
 		return nil, fmt.Errorf("eqsqlite docs: nil query")
 	}
-	columns := groupDocColumns
+	columns := docColumns
 	if q.OmitValues {
 		columns = strings.Replace(columns, "d.content", "NULL", 1)
 	}
@@ -188,16 +188,27 @@ func (b *EQSQLite) Docs(ctx context.Context, q *entroq.DocQuery) ([]*entroq.Doc,
 // NamespaceStats returns document statistics for each matching namespace.
 func (b *EQSQLite) NamespaceStats(ctx context.Context, q *entroq.MatchQuery) (map[string]*entroq.NamespaceStat, error) {
 	now := nowUTC().UnixMilli()
-	// A doc is claimed while its group is held.
-	where, args := appendMatch(nil, nil, "d.namespace", q)
-	query := `SELECT d.namespace, count(*),
-        coalesce(sum(CASE WHEN l.claimant <> '' AND l.at_ms > ? THEN 1 ELSE 0 END), 0)
-        FROM ` + docsWithLocks
-	args = append([]any{now}, args...)
-	if len(where) > 0 {
-		query += " WHERE " + strings.Join(where, " AND ")
-	}
-	query += " GROUP BY d.namespace ORDER BY d.namespace"
+	// A doc is claimed while its group is held. Counting docs needs only the
+	// docs table; counting claimed ones starts from the held locks, which are
+	// few, and counts their members.
+	sizeWhere, args := appendMatch([]string{"TRUE"}, nil, "d.namespace", q)
+	claimedWhere, claimedArgs := appendMatch([]string{"l.claimant <> ''", "l.at_ms > ?"}, []any{now}, "l.namespace", q)
+	args = append(args, claimedArgs...)
+	query := `WITH sizes AS (
+			SELECT d.namespace, count(*) AS size FROM docs d
+			WHERE ` + strings.Join(sizeWhere, " AND ") + `
+			GROUP BY d.namespace
+		),
+		claimed AS (
+			SELECT l.namespace, count(*) AS claimed
+			FROM doc_locks l
+			JOIN docs d ON d.namespace = l.namespace AND d.key_primary = l.key_primary
+			WHERE ` + strings.Join(claimedWhere, " AND ") + `
+			GROUP BY l.namespace
+		)
+		SELECT s.namespace, s.size, coalesce(c.claimed, 0)
+		FROM sizes s LEFT JOIN claimed c ON c.namespace = s.namespace
+		ORDER BY s.namespace`
 	if q != nil && q.Limit > 0 {
 		query += " LIMIT ?"
 		args = append(args, q.Limit)

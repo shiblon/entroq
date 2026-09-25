@@ -144,7 +144,7 @@ func TestMigrateDocLocks(t *testing.T) {
 		rdb.HSet(ctx, docKey(ns, "b"), "version", "7", "claimant", "holder", "at", future),
 		rdb.HSet(ctx, docKey(ns, "c"), "version", "0"),
 		rdb.Del(ctx, lockKey(docgroup.Group{Namespace: ns, Key: "k"}), lockKey(docgroup.Group{Namespace: ns, Key: "other"}),
-			lockIndexKey(ns), heldGroupsKey(ns), docLocksMigratedKey),
+			lockIndexKey(ns), heldGroupsKey(ns), docLocksMigratedKey, docFieldsMigratedKey),
 	} {
 		if err := cmd.Err(); err != nil {
 			t.Fatalf("simulate legacy state: %v", err)
@@ -169,5 +169,59 @@ func TestMigrateDocLocks(t *testing.T) {
 	}
 	if _, err := reopened.Modify(ctx, docs[0].Change(entroq.WithContent("after"))); err != nil {
 		t.Errorf("change after migration: %v", err)
+	}
+	checkNoDocFields(ctx, t, rdb, ns, "a", "b", "c")
+}
+
+// checkNoDocFields fails for each doc in ns whose hash still holds its own
+// version, claimant, or arrival time.
+func checkNoDocFields(ctx context.Context, t *testing.T, rdb *redis.Client, ns string, ids ...string) {
+	t.Helper()
+	for _, id := range ids {
+		for _, field := range []string{"version", "claimant", "at"} {
+			if ok, err := rdb.HExists(ctx, docKey(ns, id), field).Result(); err != nil || ok {
+				t.Errorf("doc %q still has field %q (err %v)", id, field, err)
+			}
+		}
+	}
+}
+
+// TestMigrateDocFieldsAfterLocks covers a database a development build left
+// with group locks, and the lock migration marked done, but with doc hashes
+// still holding their own versions and claims. The fields go; the locks stay.
+func TestMigrateDocFieldsAfterLocks(t *testing.T) {
+	ctx := context.Background()
+	client, err := redisClient(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
+	defer rdb.Close()
+
+	ns := "migrate-fields-" + entroq.GenHex16()
+	resp, err := client.Modify(ctx, entroq.PuttingDocInto(ns, entroq.WithIDKeys("a", "k", "")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	version := resp.InsertedDocs[0].Version
+	for _, cmd := range []redis.Cmder{
+		rdb.HSet(ctx, docKey(ns, "a"), "version", "99", "claimant", "", "at", "0"),
+		rdb.Del(ctx, docFieldsMigratedKey),
+	} {
+		if err := cmd.Err(); err != nil {
+			t.Fatalf("simulate development state: %v", err)
+		}
+	}
+
+	reopened, err := redisClient(ctx)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	checkNoDocFields(ctx, t, rdb, ns, "a")
+	docs, err := reopened.Docs(ctx, &entroq.DocQuery{Namespace: ns})
+	if err != nil || len(docs) != 1 || docs[0].Version != version {
+		t.Errorf("doc after field migration: want version %d from its lock, got %v, %v", version, docs, err)
 	}
 }

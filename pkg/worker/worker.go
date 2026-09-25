@@ -640,18 +640,22 @@ func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, ta
 // It calls the provided take function to learn what is needed, then claims
 // ownership of those documents.
 //
+// It also returns the claims of groups that had no docs. Renewing the docs
+// renews their groups, but nothing renews an empty group, so the caller
+// re-claims those as it renews.
+//
 // Returns a *entroq.DependencyError while another claimant holds a group; the
 // caller retries the task with backoff.
-func acquireDocs[T any](ctx context.Context, eqc *entroq.EntroQ, task *entroq.Task, value T, lease time.Duration, take TakeRun[T]) ([]*entroq.Doc, error) {
+func acquireDocs[T any](ctx context.Context, eqc *entroq.EntroQ, task *entroq.Task, value T, lease time.Duration, take TakeRun[T]) (docs []*entroq.Doc, empty []*entroq.DocClaim, err error) {
 	if take == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	req, err := take(ctx, task, value)
 	if err != nil {
-		return nil, fmt.Errorf("take docs: %w", err)
+		return nil, nil, fmt.Errorf("take docs: %w", err)
 	}
 	if req == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	// Sort to avoid livelock from dining philosophers.
@@ -662,18 +666,18 @@ func acquireDocs[T any](ctx context.Context, eqc *entroq.EntroQ, task *entroq.Ta
 		return req[i].Key < req[j].Key
 	})
 
-	var acquired []*entroq.Doc
-
 	for _, cq := range req {
 		cq.Duration = lease
 		results, err := eqc.ClaimDocs(ctx, cq)
 		if err != nil {
-			return nil, err // caller inspects DependencyError
+			return nil, nil, err // caller inspects DependencyError
 		}
-		acquired = append(acquired, results...)
+		if len(results) == 0 {
+			empty = append(empty, cq)
+		}
+		docs = append(docs, results...)
 	}
-
-	return acquired, nil
+	return docs, empty, nil
 }
 
 // runOne claims one task, unmarshals its value into T, runs the work function
@@ -724,7 +728,7 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt, slot *workerSlot) 
 	// Phase 2: Acquire docs before renewal starts. Doc claims are sorted by
 	// (namespace, key) to prevent dining-philosopher livelock when multiple
 	// doc groups are acquired.
-	docs, err := acquireDocs(rCtx, w.eqc, task, value, opts.lease, handler.TakeDocs)
+	docs, emptyGroups, err := acquireDocs(rCtx, w.eqc, task, value, opts.lease, handler.TakeDocs)
 	if err != nil {
 		// A claim fails only while someone else holds the group, which is
 		// transient: retry with backoff.
@@ -746,7 +750,7 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt, slot *workerSlot) 
 		finalDocs   []*entroq.Doc
 	)
 
-	handleErr := doWhileRenewing(rCtx, w.eqc,
+	handleErr := doWhileRenewing(rCtx, w.eqc, emptyGroups,
 		func(ctx context.Context, stop finalizeRenew) error {
 			defer func() {
 				stable := stop()
@@ -1024,8 +1028,11 @@ type finalizeRenew func() *entroq.RenewResponse
 // workFn handles tasks and docs while renewal runs in the background.
 type workFn func(ctx context.Context, stop finalizeRenew) error
 
-// doWhileRenewing runs the given work function while keeping the provided tasks and docs claimed in the background.
-func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, work workFn, opts ...entroq.RenewOption) error {
+// doWhileRenewing runs the given work function while keeping the provided
+// tasks and docs claimed in the background. Groups in empty had no docs when
+// claimed, so renewing docs cannot renew them; each renewal claims them again,
+// which extends a claim its holder already has.
+func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, empty []*entroq.DocClaim, work workFn, opts ...entroq.RenewOption) error {
 	conf := entroq.NewRenewConfig(opts...)
 	if conf.IsEmpty() {
 		return fmt.Errorf("do while renewing: nothing to renew")
@@ -1065,6 +1072,9 @@ func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, work workFn, opts ..
 					entroq.RenewingTasks(renewed),
 					entroq.RenewingDocs(renewedDocs),
 					entroq.WithRenewInterval(conf.Interval))
+				if err == nil {
+					err = reclaimGroups(ctx, c, empty)
+				}
 				if err != nil {
 					if entroq.IsCanceled(err) {
 						out = taskCh
@@ -1124,6 +1134,18 @@ func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, work workFn, opts ..
 
 	if err := g.Wait(); err != nil {
 		return fmt.Errorf("do with renew all: %w", err)
+	}
+	return nil
+}
+
+// reclaimGroups claims each group again, extending its holder's claim. A group
+// that has gained docs since is still renewed this way; its docs are not
+// tracked, as the handler did not receive them.
+func reclaimGroups(ctx context.Context, c *entroq.EntroQ, claims []*entroq.DocClaim) error {
+	for _, cq := range claims {
+		if _, err := c.ClaimDocs(ctx, cq); err != nil {
+			return fmt.Errorf("renew doc group %q in %q: %w", cq.Key, cq.Namespace, err)
+		}
 	}
 	return nil
 }

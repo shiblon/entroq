@@ -270,13 +270,19 @@ func OpenDB(target string, opts ...PGOpt) (*sql.DB, error) {
 // PostgreSQL URL, verifying that the database schema is present and at the
 // expected version. Fails loudly if the schema is uninitialized or at the wrong
 // version; run "eqpg schema init" or "eqpg schema upgrade" first.
-func Open(ctx context.Context, target string, opts ...PGOpt) (*EQPG, error) {
+func Open(ctx context.Context, target string, opts ...PGOpt) (b *EQPG, err error) {
 	options := defaultOptions(opts)
 
 	db, err := OpenDB(target, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open postgres DB: %w", err)
 	}
+	// The backend owns db once New succeeds; until then, Open does.
+	defer func() {
+		if err != nil {
+			db.Close()
+		}
+	}()
 
 	if options.nw == nil {
 		options.nw = subq.New()

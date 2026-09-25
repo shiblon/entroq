@@ -2,8 +2,11 @@ package eqpg
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	_ "embed"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -45,15 +48,60 @@ var SchemaSQL string
 //     1.7.0 is skipped because it named a queue-array-only schema on develop
 //     that lacked the 1.7.1 collation change.
 //   - Schemas predating 1.0 cannot be migrated; see UpgradeSchema.
-const SchemaVersion = "1.13.0"
+//   - Between releases the version carries a -dev suffix, and a database
+//     stamped with one is never current: UpgradeSchema always re-applies
+//     schema.sql, since the schema may have changed between development builds.
+//     The release drops the suffix (scripts/tag-release.sh refuses to tag
+//     while it is present).
+const SchemaVersion = "1.13.0-dev"
 
-// InitSchema applies the full idempotent EntroQ DDL to db. Safe to run on an
-// already-initialized database.
+// SchemaDigest identifies the exact schema this build applies: the hex
+// SHA-256 of SchemaSQL. InitSchema records it beside the version, and a
+// database whose digest differs was initialized from another schema, even at
+// the same version, so Open refuses it and UpgradeSchema re-applies.
+var SchemaDigest = schemaDigest(SchemaSQL)
+
+func schemaDigest(schema string) string {
+	sum := sha256.Sum256([]byte(schema))
+	return hex.EncodeToString(sum[:])
+}
+
+// isDevVersion reports whether a schema version names an unreleased schema.
+func isDevVersion(v string) bool {
+	return strings.HasSuffix(v, "-dev")
+}
+
+// InitSchema applies the full idempotent EntroQ DDL to db and records
+// SchemaDigest. Safe to run on an already-initialized database.
+//
+// The schema and the digest's statement are sent as one multi-statement
+// query, which PostgreSQL runs as a single implicit transaction, so the
+// migration and both stamps commit together or not at all. The digest covers
+// schema.sql alone, not the statement recording it.
 func InitSchema(ctx context.Context, db *sql.DB) error {
-	if _, err := db.ExecContext(ctx, SchemaSQL); err != nil {
+	stamp := fmt.Sprintf(`
+INSERT INTO entroq.meta (key, value) VALUES ('schema_digest', '%s')
+    ON CONFLICT (key) DO UPDATE SET value = excluded.value;`, SchemaDigest)
+	if _, err := db.ExecContext(ctx, SchemaSQL+stamp); err != nil {
 		return fmt.Errorf("init schema: %w", err)
 	}
 	return nil
+}
+
+// StoredSchemaDigest returns the schema_digest value recorded in entroq.meta,
+// or "" if none is recorded, as for a schema applied other than by InitSchema.
+func StoredSchemaDigest(ctx context.Context, db *sql.DB) (string, error) {
+	var d string
+	err := db.QueryRowContext(ctx,
+		`SELECT value FROM meta WHERE key = 'schema_digest'`,
+	).Scan(&d)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("stored schema digest: %w", err)
+	}
+	return d, nil
 }
 
 // StoredSchemaVersion returns the schema_version value recorded in entroq.meta.
@@ -96,7 +144,9 @@ func (r UpgradeResult) String() string {
 
 // UpgradeSchema brings the database to SchemaVersion:
 //
-//   - Already at SchemaVersion: returns UpgradeAlreadyCurrent; nothing is changed.
+//   - Already at SchemaVersion, with SchemaDigest recorded: returns
+//     UpgradeAlreadyCurrent; nothing is changed. A -dev version is never
+//     current, and neither is a missing or different digest.
 //   - 1.x schema at an older minor version: re-applies schema.sql idempotently
 //     and returns UpgradeApplied. Most upgrades are additive, but a minor may
 //     include a client-transparent non-additive migration (see SchemaVersion),
@@ -108,7 +158,11 @@ func (r UpgradeResult) String() string {
 func UpgradeSchema(ctx context.Context, db *sql.DB) (UpgradeResult, error) {
 	stored, err := StoredSchemaVersion(ctx, db)
 	if err == nil {
-		if stored == SchemaVersion {
+		digest, err := StoredSchemaDigest(ctx, db)
+		if err != nil {
+			return 0, fmt.Errorf("upgrade: %w", err)
+		}
+		if stored == SchemaVersion && !isDevVersion(stored) && digest == SchemaDigest {
 			return UpgradeAlreadyCurrent, nil
 		}
 		if strings.HasPrefix(stored, "0.") {
@@ -136,20 +190,29 @@ func (b *EQPG) UpgradeSchema(ctx context.Context) (UpgradeResult, error) {
 // initDB checks the stored schema version and either confirms compatibility or
 // returns an actionable error.
 //
-// Three cases:
-//   - Version matches SchemaVersion: return nil.
+// Four cases:
+//   - Version matches SchemaVersion and the digest SchemaDigest: return nil.
 //   - Version exists but mismatches: return a descriptive error directing the
 //     operator to run "eqpg schema init".
+//   - Version matches but the digest differs or is missing: the schema came
+//     from another build at the same version, such as a development build, so
+//     direct the operator to run "eqpg schema upgrade".
 //   - No version row / meta table missing: return an error directing the
 //     operator to run "eqpg schema init" first.
 func (b *EQPG) initDB(ctx context.Context) error {
 	stored, err := StoredSchemaVersion(ctx, b.DB)
-	switch {
-	case err == nil && stored == SchemaVersion:
-		return nil
-	case err == nil:
-		return fmt.Errorf("schema version mismatch: database has %q, code expects %q; run: eqpg schema init", stored, SchemaVersion)
-	default:
+	if err != nil {
 		return fmt.Errorf("schema not initialized (run: eqpg schema init): %w", err)
 	}
+	if stored != SchemaVersion {
+		return fmt.Errorf("schema version mismatch: database has %q, code expects %q; run: eqpg schema init", stored, SchemaVersion)
+	}
+	digest, err := StoredSchemaDigest(ctx, b.DB)
+	if err != nil {
+		return err
+	}
+	if digest != SchemaDigest {
+		return fmt.Errorf("schema %q in the database differs from this build's (digest %q, want %q); run: eqpg schema upgrade", stored, digest, SchemaDigest)
+	}
+	return nil
 }

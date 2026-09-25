@@ -187,6 +187,10 @@ func TestGRPCWorkerDependencyMove(t *testing.T) {
 	RunQTest(t, eqtest.WorkerDependencyMove)
 }
 
+func TestGRPCWorkerHoldsEmptyGroup(t *testing.T) {
+	RunQTest(t, eqtest.WorkerHoldsEmptyGroup)
+}
+
 func TestGRPCSimpleDocLifecycle(t *testing.T) {
 	RunQTest(t, eqtest.SimpleDocLifecycle)
 }

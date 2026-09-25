@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -189,49 +190,84 @@ func TestUpgradeDropsRetiredReadiness(t *testing.T) {
 	}
 }
 
-// TestUpgradeCreatesDocLocks puts a namespace back the way a schema before doc
-// group locks left it, per-doc versions and claims with no locks, then
-// reapplies the schema and checks that each group has a lock one version past
-// its highest member, with any claim released.
-func TestUpgradeCreatesDocLocks(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+// freshDB creates an empty database in the shared PostgreSQL instance and
+// drops it when the test ends.
+func freshDB(ctx context.Context, t *testing.T, name string) *sql.DB {
+	t.Helper()
+	admin, err := OpenDB(pgHostPort, WithDB("postgres"), WithUsername("postgres"), WithPassword("password"))
+	if err != nil {
+		t.Fatalf("Open admin db: %v", err)
+	}
+	t.Cleanup(func() { admin.Close() })
+	if _, err := admin.ExecContext(ctx, "DROP DATABASE IF EXISTS "+name); err != nil {
+		t.Fatalf("Drop stale database: %v", err)
+	}
+	if _, err := admin.ExecContext(ctx, "CREATE DATABASE "+name); err != nil {
+		t.Fatalf("Create database: %v", err)
+	}
+	db, err := OpenDB(pgHostPort, WithDB(name), WithUsername("postgres"), WithPassword("password"))
+	if err != nil {
+		t.Fatalf("Open fresh db: %v", err)
+	}
+	t.Cleanup(func() {
+		db.Close()
+		if _, err := admin.ExecContext(context.Background(), "DROP DATABASE "+name); err != nil {
+			t.Logf("Drop test database (non-fatal): %v", err)
+		}
+	})
+	return db
+}
+
+// TestUpgradeFrom1_11 upgrades a database initialized with the last released
+// schema (1.11.0, shipped through 1.12.x), whose docs carried their own
+// versions and claims. Each group must get a lock one version past its
+// highest member, with claims released; the per-doc columns must be gone and
+// every doc tied to its group's lock; and the digest must let the backend
+// open, and stop it opening once it no longer matches.
+func TestUpgradeFrom1_11(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	const name = "entroq_upgrade_from_1_11"
+	db := freshDB(ctx, t, name)
 
-	client, err := pgClient(ctx)
+	old, err := os.ReadFile("testdata/schema-1.11.0.sql")
 	if err != nil {
-		t.Fatalf("Open client: %v", err)
+		t.Fatalf("Read 1.11.0 schema: %v", err)
 	}
-	defer client.Close()
-	backend, err := Open(ctx, pgHostPort, WithDB("postgres"), WithUsername("postgres"), WithPassword("password"), WithConnectAttempts(10))
-	if err != nil {
-		t.Fatalf("Open backend: %v", err)
+	if _, err := db.ExecContext(ctx, string(old)); err != nil {
+		t.Fatalf("Apply 1.11.0 schema: %v", err)
 	}
-	defer backend.Close()
-	db := backend.DB
+	if _, err := db.ExecContext(ctx, `INSERT INTO entroq.docs (namespace, id, version, claimant, at, key_primary, key_secondary, value) VALUES
+		('ns', 'a', 2, '', now(), 'k', '1', '"a"'),
+		('ns', 'b', 7, 'holder', now() + interval '1 hour', 'k', '2', '"b"'),
+		('ns', 'c', 0, '', now(), 'other', '', '"c"')`); err != nil {
+		t.Fatalf("Insert 1.11.0 docs: %v", err)
+	}
 
-	ns := fmt.Sprintf("/test/upgrade-locks/%d", time.Now().UnixNano())
-	if _, err := client.Modify(ctx,
-		entroq.PuttingDocInto(ns, entroq.WithIDKeys("a", "k", "1")),
-		entroq.PuttingDocInto(ns, entroq.WithIDKeys("b", "k", "2")),
-		entroq.PuttingDocInto(ns, entroq.WithIDKeys("c", "other", "")),
-	); err != nil {
-		t.Fatalf("Insert docs: %v", err)
-	}
-	for _, stmt := range []string{
-		"DELETE FROM entroq.doc_locks WHERE namespace = $1",
-		"UPDATE entroq.docs SET version = 2 WHERE namespace = $1 AND id = 'a'",
-		"UPDATE entroq.docs SET version = 7, claimant = 'holder', at = now() + interval '1 hour' WHERE namespace = $1 AND id = 'b'",
-	} {
-		if _, err := db.ExecContext(ctx, stmt, ns); err != nil {
-			t.Fatalf("Simulate legacy state: %v\n%s", err, stmt)
+	for range 2 { // the second pass must change nothing
+		if _, err := UpgradeSchema(ctx, db); err != nil {
+			t.Fatalf("Upgrade: %v", err)
 		}
 	}
 
-	if err := InitSchema(ctx, db); err != nil {
-		t.Fatalf("Reapply schema: %v", err)
+	var dropped int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM pg_attribute
+		WHERE attrelid = 'entroq.docs'::regclass AND attname IN ('version', 'claimant', 'at') AND NOT attisdropped`).Scan(&dropped); err != nil {
+		t.Fatalf("Read docs columns: %v", err)
+	}
+	if dropped != 0 {
+		t.Errorf("Docs keep %d of their per-doc version, claimant, and at columns", dropped)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO entroq.docs (namespace, id, key_primary) VALUES ('ns', 'orphan', 'nolock')`); err == nil {
+		t.Error("Inserted a doc whose group has no lock")
 	}
 
-	docs, err := client.Docs(ctx, &entroq.DocQuery{Namespace: ns})
+	b, err := Open(ctx, pgHostPort, WithDB(name), WithUsername("postgres"), WithPassword("password"), WithConnectAttempts(10))
+	if err != nil {
+		t.Fatalf("Open upgraded database: %v", err)
+	}
+	defer b.Close()
+	docs, err := b.Docs(ctx, &entroq.DocQuery{Namespace: "ns"})
 	if err != nil || len(docs) != 3 {
 		t.Fatalf("Docs after upgrade: %v, %v", docs, err)
 	}
@@ -241,8 +277,28 @@ func TestUpgradeCreatesDocLocks(t *testing.T) {
 			t.Errorf("Upgraded doc %q: want version %d and no claimant, got version %d, claimant %q", d.ID, want[d.ID], d.Version, d.Claimant)
 		}
 	}
-	if _, err := client.Modify(ctx, docs[0].Change(entroq.WithContent("after"))); err != nil {
+	if _, err := b.Modify(ctx, entroq.NewModification("me", docs[0].Change(entroq.WithContent("after")))); err != nil {
 		t.Errorf("Change after upgrade: %v", err)
+	}
+
+	// Another build's schema at the same version, or one applied without a
+	// digest, must not open.
+	for _, stmt := range []string{
+		`UPDATE entroq.meta SET value = 'other' WHERE key = 'schema_digest'`,
+		`DELETE FROM entroq.meta WHERE key = 'schema_digest'`,
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("Change digest: %v", err)
+		}
+		if bad, err := Open(ctx, pgHostPort, WithDB(name), WithUsername("postgres"), WithPassword("password"), WithConnectAttempts(1)); err == nil {
+			bad.Close()
+			t.Errorf("Opened a database after %q", stmt)
+		} else if !strings.Contains(err.Error(), "schema upgrade") {
+			t.Errorf("Open after %q: want advice to run schema upgrade, got %v", stmt, err)
+		}
+		if res, err := UpgradeSchema(ctx, db); err != nil || res != UpgradeApplied {
+			t.Fatalf("Upgrade after %q: %v, %v", stmt, res, err)
+		}
 	}
 }
 
@@ -581,6 +637,10 @@ func TestWorkerCompactDependencyHandler(t *testing.T) {
 
 func TestWorkerDependencyMove(t *testing.T) {
 	RunQTest(t, eqtest.WorkerDependencyMove)
+}
+
+func TestWorkerHoldsEmptyGroup(t *testing.T) {
+	RunQTest(t, eqtest.WorkerHoldsEmptyGroup)
 }
 
 func TestPGSimpleDocLifecycle(t *testing.T) {

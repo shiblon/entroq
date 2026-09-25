@@ -567,6 +567,10 @@ func TestEQMemWorkerDependencyMove(t *testing.T) {
 	RunQTest(t, eqtest.WorkerDependencyMove)
 }
 
+func TestEQMemWorkerHoldsEmptyGroup(t *testing.T) {
+	RunQTest(t, eqtest.WorkerHoldsEmptyGroup)
+}
+
 func TestEQMemSimpleDocLifecycle(t *testing.T) {
 	RunQTest(t, eqtest.SimpleDocLifecycle)
 }

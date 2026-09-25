@@ -6,8 +6,10 @@ package eqsqlite
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	_ "embed"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/url"
@@ -201,6 +203,13 @@ func openWriteDB(ctx context.Context, path string, timeout time.Duration) (_ *sq
 	if journalMode != "wal" {
 		return nil, fmt.Errorf("requested WAL, got %q", journalMode)
 	}
+	// A database without the meta table is new; everything else was created
+	// by some earlier build, and its version and digest say which.
+	var tables int
+	if err := conn.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'entroq_meta'").Scan(&tables); err != nil {
+		return nil, fmt.Errorf("find schema: %w", err)
+	}
+	fresh := tables == 0
 	if _, err := conn.ExecContext(ctx, schemaSQL); err != nil {
 		return nil, fmt.Errorf("schema: %w", err)
 	}
@@ -208,63 +217,67 @@ func openWriteDB(ctx context.Context, path string, timeout time.Duration) (_ *sq
 	if err := conn.QueryRowContext(ctx, "SELECT schema_version FROM entroq_meta WHERE id = 1").Scan(&schemaVersion); err != nil {
 		return nil, fmt.Errorf("schema version: %w", err)
 	}
-	if schemaVersion == 1 {
-		if err := migrateV1ToV2(ctx, conn); err != nil {
-			return nil, fmt.Errorf("migrate schema 1 to 2: %w", err)
+	switch {
+	case fresh:
+		if _, err := conn.ExecContext(ctx, "UPDATE entroq_meta SET schema_digest = ? WHERE id = 1", schemaDigest); err != nil {
+			return nil, fmt.Errorf("stamp schema digest: %w", err)
 		}
-		schemaVersion = 2
-	}
-	if schemaVersion == 2 {
-		if err := migrateV2ToV3(ctx, conn); err != nil {
-			return nil, fmt.Errorf("migrate schema 2 to 3: %w", err)
+	case schemaVersion == 1 || schemaVersion == 2:
+		if err := migrateToV3(ctx, conn, schemaVersion); err != nil {
+			return nil, fmt.Errorf("migrate schema %d to 3: %w", schemaVersion, err)
 		}
-		schemaVersion = 3
-	}
-	if schemaVersion != SchemaVersion {
+	case schemaVersion != SchemaVersion:
 		return nil, fmt.Errorf("schema version %d, backend requires %d", schemaVersion, SchemaVersion)
+	}
+	digest, err := storedDigest(ctx, conn)
+	if err != nil {
+		return nil, err
+	}
+	if digest != schemaDigest {
+		return nil, fmt.Errorf("schema version %d was created by a development build with a different layout; "+
+			"move the file aside and let this build create a new one", schemaVersion)
 	}
 	return db, nil
 }
 
-// migrateV1ToV2 rebuilds tasks and docs so their length CHECKs count bytes.
-// SQLite cannot alter a CHECK in place: the old tables are renamed aside,
-// schemaSQL creates the new ones, and the rows are copied across. Column
-// order is unchanged between versions, so SELECT * lines up. A row that
-// violates the new limits fails the copy and rolls back the whole migration,
-// leaving the version 1 database untouched.
-func migrateV1ToV2(ctx context.Context, conn *sql.Conn) (err error) {
-	tx, err := conn.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin: %w", err)
+// schemaDigest identifies the exact schema this build creates. Version 3
+// changed on unreleased development builds, so a version alone cannot tell
+// those layouts apart; a file whose digest differs is refused rather than
+// run on the wrong layout.
+var schemaDigest = func() string {
+	sum := sha256.Sum256([]byte(schemaSQL))
+	return hex.EncodeToString(sum[:])
+}()
+
+// storedDigest reads the recorded schema digest, or "" for a database created
+// before digests were recorded.
+func storedDigest(ctx context.Context, conn *sql.Conn) (string, error) {
+	var columns int
+	if err := conn.QueryRowContext(ctx, "SELECT count(*) FROM pragma_table_info('entroq_meta') WHERE name = 'schema_digest'").Scan(&columns); err != nil {
+		return "", fmt.Errorf("find schema digest: %w", err)
 	}
-	defer func() {
-		if err != nil {
-			err = errors.Join(err, tx.Rollback())
-		}
-	}()
-	steps := []struct{ name, sql string }{
-		{"set aside tasks", "ALTER TABLE tasks RENAME TO tasks_v1"},
-		{"set aside docs", "ALTER TABLE docs RENAME TO docs_v1"},
-		{"drop old indexes", "DROP INDEX tasks_queue_at; DROP INDEX docs_namespace_keys; DROP INDEX docs_namespace_at"},
-		{"create tables", schemaSQL},
-		{"copy tasks (an id or claimant may exceed 64 bytes)", "INSERT INTO tasks SELECT * FROM tasks_v1"},
-		{"copy docs (an id, claimant, or key may exceed its byte limit)", "INSERT INTO docs SELECT * FROM docs_v1"},
-		{"drop old tables", "DROP TABLE tasks_v1; DROP TABLE docs_v1"},
-		{"stamp version", "UPDATE entroq_meta SET schema_version = 2 WHERE id = 1"},
+	if columns == 0 {
+		return "", nil
 	}
-	for _, step := range steps {
-		if _, err := tx.ExecContext(ctx, step.sql); err != nil {
-			return fmt.Errorf("%s: %w", step.name, err)
-		}
+	var digest string
+	if err := conn.QueryRowContext(ctx, "SELECT schema_digest FROM entroq_meta WHERE id = 1").Scan(&digest); err != nil {
+		return "", fmt.Errorf("schema digest: %w", err)
 	}
-	return tx.Commit()
+	return digest, nil
 }
 
-// migrateV2ToV3 gives every existing doc group a lock. Before version 3 each
-// doc carried its own version and claim; a group's lock starts one version past
-// its highest member, so any version read before the migration is stale.
-// Claims held at migration time are released.
-func migrateV2ToV3(ctx context.Context, conn *sql.Conn) (err error) {
+// migrateToV3 rebuilds a version 1 or 2 database in the version 3 layout, in
+// one transaction; any failure leaves the file as it was.
+//
+// Version 2 made the length CHECKs count bytes, which SQLite cannot alter in
+// place, so a version 1 database rebuilds tasks too. Version 3 moves each
+// doc's version, claimant, and arrival time to its group's lock: every group
+// gets a lock one version past its highest member, so no version read before
+// the migration can match one written after it, and claims held at migration
+// time are released. The old tables are renamed aside, schemaSQL creates the
+// new ones, and the rows are copied across. A row that violates the new
+// limits fails its copy and rolls back the whole migration.
+func migrateToV3(ctx context.Context, conn *sql.Conn, from int) (err error) {
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin: %w", err)
@@ -274,14 +287,33 @@ func migrateV2ToV3(ctx context.Context, conn *sql.Conn) (err error) {
 			err = errors.Join(err, tx.Rollback())
 		}
 	}()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO doc_locks (namespace, key_primary, version, claimant, at_ms)
-		SELECT namespace, key_primary, max(version) + 1, '', ? FROM docs
-		GROUP BY namespace, key_primary
-		ON CONFLICT (namespace, key_primary) DO NOTHING`, nowUTC().UnixMilli()); err != nil {
-		return fmt.Errorf("create doc group locks: %w", err)
+	type step struct{ name, sql string }
+	var steps []step
+	if from == 1 {
+		steps = append(steps,
+			step{"set aside tasks", "ALTER TABLE tasks RENAME TO tasks_old; DROP INDEX tasks_queue_at"})
 	}
-	if _, err := tx.ExecContext(ctx, "UPDATE entroq_meta SET schema_version = 3 WHERE id = 1"); err != nil {
-		return fmt.Errorf("stamp version: %w", err)
+	steps = append(steps,
+		step{"set aside docs", "ALTER TABLE docs RENAME TO docs_old; DROP INDEX docs_namespace_keys; DROP INDEX IF EXISTS docs_namespace_at"},
+		step{"create tables", schemaSQL + "; ALTER TABLE entroq_meta ADD COLUMN schema_digest TEXT NOT NULL DEFAULT ''"})
+	if from == 1 {
+		steps = append(steps,
+			step{"copy tasks (an id or claimant may exceed 64 bytes)", "INSERT INTO tasks SELECT * FROM tasks_old"},
+			step{"drop old tasks", "DROP TABLE tasks_old"})
+	}
+	steps = append(steps,
+		step{"create doc group locks", fmt.Sprintf(`INSERT INTO doc_locks (namespace, key_primary, version, claimant, at_ms)
+			SELECT namespace, key_primary, max(version) + 1, '', %d FROM docs_old
+			GROUP BY namespace, key_primary`, nowUTC().UnixMilli())},
+		step{"copy docs (an id or key may exceed its byte limit)", `INSERT INTO docs
+			(namespace, id, key_primary, key_secondary, content, created_ms, modified_ms)
+			SELECT namespace, id, key_primary, key_secondary, content, created_ms, modified_ms FROM docs_old`},
+		step{"drop old docs", "DROP TABLE docs_old"},
+		step{"stamp version", fmt.Sprintf("UPDATE entroq_meta SET schema_version = 3, schema_digest = '%s' WHERE id = 1", schemaDigest)})
+	for _, st := range steps {
+		if _, err := tx.ExecContext(ctx, st.sql); err != nil {
+			return fmt.Errorf("%s: %w", st.name, err)
+		}
 	}
 	return tx.Commit()
 }

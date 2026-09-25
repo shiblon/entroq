@@ -14,6 +14,16 @@ schema through the Go service rather than executing it directly.
 
 `TestSchemaVersion` in `pkg/backend/eqpg` enforces this invariant.
 
+Between releases the version carries a `-dev` suffix (`1.13.0-dev`), and a
+`-dev` database is never current: `eqpg schema upgrade` always re-applies it.
+The version alone cannot tell two builds' schemas apart, so `InitSchema` also
+records `SchemaDigest`, the SHA-256 of `schema.sql`, and `Open` refuses a
+database whose digest differs or is missing. Any edit to `schema.sql` changes
+the digest; that is the point. The release drops the suffix, and
+`scripts/tag-release.sh` refuses to tag while it is present. The SQLite backend
+records a digest the same way; a file at the current version with another
+digest came from a development build and is refused.
+
 ## The Go worker is the reference implementation
 
 `pkg/worker` defines EntroQ's worker semantics. The Python, JS, and gateway

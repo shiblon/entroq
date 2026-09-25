@@ -202,6 +202,10 @@ func Open(ctx context.Context, opts ...RedisOpt) (*EQRedis, error) {
 		client.Close()
 		return nil, fmt.Errorf("eqredis open: migrate doc locks: %w", err)
 	}
+	if err := migrateDocFields(ctx, client); err != nil {
+		client.Close()
+		return nil, fmt.Errorf("eqredis open: migrate doc fields: %w", err)
+	}
 
 	nw := o.nw
 	if nw == nil {

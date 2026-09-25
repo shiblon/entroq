@@ -893,6 +893,12 @@ func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (*ModifyRespo
 // read and the change, the backend returns a DependencyError and the caller
 // may retry. If the doc is currently claimed by another claimant, a
 // DependencyError with DocClaims set is returned.
+//
+// A doc has no claim of its own: this claims the doc's whole group, the docs
+// sharing its primary key, and returns only the named doc.
+//
+// Deprecated: claim the group with ClaimDocs(ctx, ClaimKey(ns, doc.Key)),
+// which also works for a group with no docs.
 func (c *EntroQ) TryClaimDocByID(ctx context.Context, ns, id string, duration time.Duration) (*Doc, error) {
 	docs, err := c.Docs(ctx, &DocQuery{Namespace: ns, IDs: []string{id}})
 	if err != nil {

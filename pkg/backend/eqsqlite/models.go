@@ -63,16 +63,15 @@ func scanDoc(s scanner) (*entroq.Doc, error) {
 }
 
 const taskColumns = `id, version, queue, at_ms, claimant, claims, value, created_ms, modified_ms, attempt, err`
-const docColumns = `namespace, id, version, claimant, at_ms, key_primary, key_secondary, content, created_ms, modified_ms`
 
-// groupDocColumns are docColumns read through docsWithLocks: each doc's
-// version, claimant, and at come from its group's lock, the only ones a member
-// has.
-const groupDocColumns = `d.namespace, d.id, coalesce(l.version, d.version), coalesce(l.claimant, d.claimant), coalesce(l.at_ms, d.at_ms),
+// docColumns reads a doc through docsWithLocks: each doc's version, claimant,
+// and at come from its group's lock, the only ones a member has.
+const docColumns = `d.namespace, d.id, l.version, l.claimant, l.at_ms,
 	d.key_primary, d.key_secondary, d.content, d.created_ms, d.modified_ms`
 
-// docsWithLocks joins each doc to its group's lock, as d and l.
-const docsWithLocks = `docs d LEFT JOIN doc_locks l ON l.namespace = d.namespace AND l.key_primary = d.key_primary`
+// docsWithLocks joins each doc to its group's lock, as d and l. Every doc has
+// one: docs references doc_locks.
+const docsWithLocks = `docs d JOIN doc_locks l ON l.namespace = d.namespace AND l.key_primary = d.key_primary`
 
 func jsonValue(v json.RawMessage) any {
 	if v == nil {

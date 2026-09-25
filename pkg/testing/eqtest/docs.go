@@ -1012,6 +1012,92 @@ func DocGroups(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix
 		}
 	})
 
+	t.Run("an insert and a change move an unheld group once", func(t *testing.T) {
+		before := readGroup("g")
+		resp, err := client.Modify(ctx,
+			entroq.PuttingDocInto(ns, entroq.WithKeys("g", "with-change")),
+			before[0].Change(entroq.WithContent("with-insert")),
+		)
+		if err != nil {
+			t.Fatalf("Insert and change: %v", err)
+		}
+		want := before[0].Version + 1
+		if got := resp.InsertedDocs[0].Version; got != want {
+			t.Errorf("Inserted doc at version %d, want %d", got, want)
+		}
+		if got := resp.ChangedDocs[0].Version; got != want {
+			t.Errorf("Changed doc at version %d, want %d", got, want)
+		}
+		for _, d := range readGroup("g") {
+			if d.Version != want {
+				t.Errorf("Member %q at version %d after one write, want %d", d.ID, d.Version, want)
+			}
+		}
+	})
+
+	t.Run("a held group and an unheld one in one modification", func(t *testing.T) {
+		held, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "g").For(lease))
+		if err != nil || len(held) == 0 {
+			t.Fatalf("Claim: %v, %d docs", err, len(held))
+		}
+		sideResp, err := client.Modify(ctx, entroq.PuttingDocInto(ns, entroq.WithKeys("side", "a")))
+		if err != nil {
+			t.Fatalf("Insert into side group: %v", err)
+		}
+		side := sideResp.InsertedDocs[0]
+
+		// A group someone else holds fails the whole modification, so the
+		// caller keeps the group it holds.
+		if _, err := client.ClaimDocs(ctx, &entroq.DocClaim{Namespace: ns, Key: "blocked", Claimant: intruder, Duration: lease}); err != nil {
+			t.Fatalf("Intruder claim: %v", err)
+		}
+		if _, err := client.Modify(ctx,
+			held[0].Change(entroq.WithContent("mixed")),
+			entroq.PuttingDocInto(ns, entroq.WithKeys("blocked", "x")),
+		); !entroq.IsDependency(err) {
+			t.Fatalf("Modify touching a group held by someone else: want a dependency error, got %v", err)
+		}
+		if _, err := client.Modify(ctx, entroq.PuttingDocInto(ns, entroq.WithKeys("g", "sneak")), entroq.ModifyAs(intruder)); !entroq.IsDependency(err) {
+			t.Errorf("Held group released by a failed modification: intruder insert got %v", err)
+		}
+
+		resp, err := client.Modify(ctx,
+			held[0].Change(entroq.WithContent("mixed")),
+			entroq.PuttingDocInto(ns, entroq.WithKeys("side", "b")),
+		)
+		if err != nil {
+			t.Fatalf("Holder commit with an insert elsewhere: %v", err)
+		}
+		if got := resp.ChangedDocs[0]; got.Version != held[0].Version+1 || got.Claimant != "" {
+			t.Errorf("Held group after the holder's commit: want released at version %d, got %+v", held[0].Version+1, got)
+		}
+		if got := resp.InsertedDocs[0].Version; got != side.Version {
+			t.Errorf("Unheld group moved to version %d on an insert, want %d", got, side.Version)
+		}
+	})
+
+	t.Run("a change keeps the stored keys and creation time", func(t *testing.T) {
+		d := readGroup("g")[0]
+		moved := &entroq.Doc{Namespace: ns, ID: d.ID, Key: "elsewhere", SecondaryKey: "moved", Version: d.Version}
+		resp, err := client.Modify(ctx, moved.Change(entroq.WithContent("kept")))
+		if err != nil {
+			t.Fatalf("Change naming other keys: %v", err)
+		}
+		got := resp.ChangedDocs[0]
+		if got.Key != d.Key || got.SecondaryKey != d.SecondaryKey || !got.Created.Equal(d.Created) {
+			t.Errorf("Change returned keys %q/%q created %v, want the stored %q/%q created %v",
+				got.Key, got.SecondaryKey, got.Created, d.Key, d.SecondaryKey, d.Created)
+		}
+		stored, err := client.Docs(ctx, &entroq.DocQuery{Namespace: ns, IDs: []string{d.ID}})
+		if err != nil || len(stored) != 1 {
+			t.Fatalf("Read changed doc: %v, %d docs", err, len(stored))
+		}
+		if s := stored[0]; s.Key != d.Key || s.SecondaryKey != d.SecondaryKey || !s.Created.Equal(d.Created) {
+			t.Errorf("Stored doc has keys %q/%q created %v, want %q/%q created %v",
+				s.Key, s.SecondaryKey, s.Created, d.Key, d.SecondaryKey, d.Created)
+		}
+	})
+
 	t.Run("concurrent inserts into one group", func(t *testing.T) {
 		const writers = 8
 		insertAll := func(opts func(i int) []entroq.DocOpt) []error {

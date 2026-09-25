@@ -40,6 +40,11 @@ fi
 #    advances when the schema itself changes, so it may lag the module (a
 #    schema-unchanged release is fine); it must never exceed the module version,
 #    which would imply code expecting a release that does not exist.
+#    Between releases it carries a -dev suffix, which the release must drop:
+#    a -dev schema is never current, so every start would re-apply it.
+if grep -q 'SchemaVersion\s*=\s*"[^"]*-dev"' pkg/backend/eqpg/schema.go; then
+    fail "SchemaVersion still ends in -dev; set it to the release version in pkg/backend/eqpg/schema.go and schema.sql"
+fi
 SCHEMA_VER="$(grep 'SchemaVersion\s*=' pkg/backend/eqpg/schema.go | sed 's/.*"\([0-9]*\.[0-9]*\.[0-9]*\)".*/\1/')"
 if [ "$(printf '%s\n%s\n' "${SCHEMA_VER}" "${VERSION}" | sort -V | tail -n1)" != "${VERSION}" ]; then
     fail "SchemaVersion (${SCHEMA_VER}) is ahead of release tag (${VERSION}); the schema must not outrun the module"

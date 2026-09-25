@@ -15,12 +15,12 @@ import (
 
 // docColumns reads a doc through its group's lock, joined as l to the doc d:
 // the lock holds the only version, claimant, and arrival time a member has.
-// A doc whose group has no lock keeps its own.
-const docColumns = `d.namespace, d.id, coalesce(l.version, d.version), coalesce(l.claimant, d.claimant), coalesce(l.at, d.at),
+const docColumns = `d.namespace, d.id, l.version, l.claimant, l.at,
 	d.key_primary, d.key_secondary, d.value, d.created, d.modified`
 
-// docsWithLocks joins each doc to its group's lock, as d and l.
-const docsWithLocks = `entroq.docs d LEFT JOIN entroq.doc_locks l ON l.namespace = d.namespace AND l.key_primary = d.key_primary`
+// docsWithLocks joins each doc to its group's lock, as d and l. Every doc has
+// one (docs_group_fk).
+const docsWithLocks = `entroq.docs d JOIN entroq.doc_locks l ON l.namespace = d.namespace AND l.key_primary = d.key_primary`
 
 // lockMembers reads the stored docs mod's doc operations name, locking them.
 // Rows are locked in (namespace, id) order, before any group lock, so
@@ -49,11 +49,10 @@ func lockMembers(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (map
 	if len(ids) == 0 {
 		return members, nil
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT namespace, id, version, claimant, at, key_primary, key_secondary, value, created, modified
-		FROM entroq.docs
-		WHERE (namespace, id) IN (SELECT * FROM unnest($1::text[], $2::text[]))
-		ORDER BY namespace, id
-		FOR UPDATE`, pq.Array(ns), pq.Array(ids))
+	rows, err := tx.QueryContext(ctx, `SELECT `+docColumns+` FROM `+docsWithLocks+`
+		WHERE (d.namespace, d.id) IN (SELECT * FROM unnest($1::text[], $2::text[]))
+		ORDER BY d.namespace, d.id
+		FOR UPDATE OF d`, pq.Array(ns), pq.Array(ids))
 	if err != nil {
 		return nil, fmt.Errorf("lock doc members: %w", err)
 	}
@@ -303,24 +302,24 @@ func writeDocGroups(ctx context.Context, tx *sql.Tx, deletes []*entroq.DocID, in
 			WHERE d.namespace = x.namespace AND d.id = x.id
 		),
 		ins AS (
-			INSERT INTO entroq.docs (namespace, id, version, claimant, at, key_primary, key_secondary, value, created, modified)
-			SELECT namespace, id, version, claimant, at, key_primary, key_secondary, value::jsonb, $24, $24
-			FROM unnest($3::text[], $4::text[], $5::integer[], $6::text[], $7::timestamptz[], $8::text[], $9::text[], $10::text[])
-				AS r(namespace, id, version, claimant, at, key_primary, key_secondary, value)
+			INSERT INTO entroq.docs (namespace, id, key_primary, key_secondary, value, created, modified)
+			SELECT namespace, id, key_primary, key_secondary, value::jsonb, $18, $18
+			FROM unnest($3::text[], $4::text[], $5::text[], $6::text[], $7::text[])
+				AS r(namespace, id, key_primary, key_secondary, value)
 			ON CONFLICT (namespace, id) DO NOTHING
 			RETURNING namespace, id
 		),
 		upd AS (
 			UPDATE entroq.docs d
-			SET version = c.version, claimant = c.claimant, at = c.at, value = c.value::jsonb, modified = $24
-			FROM unnest($11::text[], $12::text[], $13::integer[], $14::text[], $15::timestamptz[], $16::text[], $17::text[], $18::text[])
-				AS c(namespace, id, version, claimant, at, key_primary, key_secondary, value)
+			SET value = c.value::jsonb, modified = $18
+			FROM unnest($8::text[], $9::text[], $10::text[], $11::text[], $12::text[])
+				AS c(namespace, id, key_primary, key_secondary, value)
 			WHERE d.namespace = c.namespace AND d.id = c.id
 		),
 		lck AS (
 			UPDATE entroq.doc_locks l
 			SET version = u.version, claimant = u.claimant, at = u.at
-			FROM unnest($19::text[], $20::text[], $21::integer[], $22::text[], $23::timestamptz[])
+			FROM unnest($13::text[], $14::text[], $15::integer[], $16::text[], $17::timestamptz[])
 				AS u(namespace, key_primary, version, claimant, at)
 			WHERE l.namespace = u.namespace AND l.key_primary = u.key_primary
 		)
@@ -353,24 +352,19 @@ func writeDocGroups(ctx context.Context, tx *sql.Tx, deletes []*entroq.DocID, in
 }
 
 // docArrays splits docs into the parallel arrays writeDocGroups expands:
-// namespace, id, version, claimant, at, key, secondary key, and content.
+// namespace, id, key, secondary key, and content. A doc's version and claim
+// are its group's, written to the lock.
 func docArrays(docs []*entroq.Doc) []any {
-	var ns, ids, claimants, pks, sks []string
-	var versions []int32
-	var ats []time.Time
+	var ns, ids, pks, sks []string
 	var values []*string
 	for _, d := range docs {
 		ns = append(ns, d.Namespace)
 		ids = append(ids, d.ID)
-		versions = append(versions, d.Version)
-		claimants = append(claimants, d.Claimant)
-		ats = append(ats, d.At)
 		pks = append(pks, d.Key)
 		sks = append(sks, d.SecondaryKey)
 		values = append(values, jsonTextVal(d.Content))
 	}
-	return []any{pq.Array(ns), pq.Array(ids), pq.Array(versions), pq.Array(claimants),
-		pq.Array(ats), pq.Array(pks), pq.Array(sks), pq.Array(values)}
+	return []any{pq.Array(ns), pq.Array(ids), pq.Array(pks), pq.Array(sks), pq.Array(values)}
 }
 
 // lockArrays splits locks into parallel arrays: namespace, key, version,
@@ -405,9 +399,9 @@ func claimDocs(ctx context.Context, tx *sql.Tx, cq *entroq.DocClaim) ([]*entroq.
 	if err != nil {
 		return nil, err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT namespace, id, version, claimant, at, key_primary, key_secondary, value, created, modified
-		FROM entroq.docs WHERE namespace = $1 AND key_primary = $2
-		ORDER BY key_secondary, id`, cq.Namespace, cq.Key)
+	rows, err := tx.QueryContext(ctx, `SELECT `+docColumns+` FROM `+docsWithLocks+`
+		WHERE d.namespace = $1 AND d.key_primary = $2
+		ORDER BY d.key_secondary, d.id`, cq.Namespace, cq.Key)
 	if err != nil {
 		return nil, fmt.Errorf("read doc group: %w", err)
 	}

@@ -230,6 +230,10 @@ func TestWorkerDependencyMove(t *testing.T) {
 	RunQTest(t, eqtest.WorkerDependencyMove)
 }
 
+func TestWorkerHoldsEmptyGroup(t *testing.T) {
+	RunQTest(t, eqtest.WorkerHoldsEmptyGroup)
+}
+
 func TestSimpleDocLifecycle(t *testing.T) {
 	RunQTest(t, eqtest.SimpleDocLifecycle)
 }

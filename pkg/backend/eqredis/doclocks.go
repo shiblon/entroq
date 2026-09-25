@@ -34,6 +34,12 @@ func heldGroupsKey(ns string) string {
 // docLocksMigratedKey marks a database whose doc groups all have locks.
 const docLocksMigratedKey = keyPrefix + "migrated:doclocks"
 
+// docFieldsMigratedKey marks a database whose doc hashes no longer hold their
+// own version, claimant, and arrival time. It is separate from
+// docLocksMigratedKey because development builds set that marker while still
+// writing the fields.
+const docFieldsMigratedKey = keyPrefix + "migrated:docfields"
+
 // groupMembersRange bounds a group's entries in the namespace doc index, which
 // continue with docIndexSep after the primary key.
 func groupMembersRange(key string) (min, max string) {
@@ -184,6 +190,41 @@ func migrateDocLocks(ctx context.Context, client *redis.Client) error {
 	}
 	if err := client.Set(ctx, docLocksMigratedKey, "1", 0).Err(); err != nil {
 		return fmt.Errorf("mark doc lock migration: %w", err)
+	}
+	return nil
+}
+
+// migrateDocFields removes the version, claimant, and arrival time from every
+// doc hash, once per database, after migrateDocLocks has read them into group
+// locks. Reads replace them with the lock's, so the fields only cost memory.
+func migrateDocFields(ctx context.Context, client *redis.Client) error {
+	done, err := client.Exists(ctx, docFieldsMigratedKey).Result()
+	if err != nil {
+		return fmt.Errorf("check doc field migration: %w", err)
+	}
+	if done == 1 {
+		return nil
+	}
+	namespaces, err := client.SMembers(ctx, namespacesKey).Result()
+	if err != nil {
+		return fmt.Errorf("list namespaces: %w", err)
+	}
+	for _, ns := range namespaces {
+		members, err := client.ZRange(ctx, docNSIndexKey(ns), 0, -1).Result()
+		if err != nil {
+			return fmt.Errorf("list docs in %q: %w", ns, err)
+		}
+		pipe := client.Pipeline()
+		for _, m := range members {
+			_, _, id := parseDocIndexMember(m)
+			pipe.HDel(ctx, docKey(ns, id), "version", "claimant", "at")
+		}
+		if _, err := pipe.Exec(ctx); err != nil {
+			return fmt.Errorf("remove doc fields in %q: %w", ns, err)
+		}
+	}
+	if err := client.Set(ctx, docFieldsMigratedKey, "1", 0).Err(); err != nil {
+		return fmt.Errorf("mark doc field migration: %w", err)
 	}
 	return nil
 }

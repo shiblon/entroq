@@ -24,11 +24,14 @@ git checkout develop && git pull
 - Set `appVersion` in `charts/entroq/Chart.yaml` to `<version>` so the chart
   defaults to binaries from the release. If the chart itself changed, also
   advance its independent `version`. `tag-release.sh` enforces `appVersion`.
-- If the PostgreSQL schema changed, bump `SchemaVersion` in
+- If the PostgreSQL schema changed, set `SchemaVersion` in
   `pkg/backend/eqpg/schema.go` **and** the matching `INSERT` in
-  `pkg/backend/eqpg/schema.sql`. `tag-release.sh` enforces that
-  `SchemaVersion` does not exceed the release tag. It advances only when the
-  schema changes, so a schema-unchanged release leaves it alone.
+  `pkg/backend/eqpg/schema.sql` to the release version, dropping the `-dev`
+  suffix develop carries while the schema is unreleased. `tag-release.sh`
+  refuses a `-dev` version and enforces that `SchemaVersion` does not exceed
+  the release tag. It advances only when the schema changes, so a
+  schema-unchanged release leaves it alone. After the release, a schema change
+  on develop starts the next version with `-dev` again.
 - If the Python client changed, bump its independent version in
   `clients/py/pyproject.toml` (it is not tied to the Go module version).
 
@@ -50,8 +53,8 @@ git push origin develop
 ```
 
 The script runs pre-flight checks (clean tree; no `replace` directives in
-`go.mod`; a `CHANGELOG.md` entry for the version; `SchemaVersion` does not
-exceed the tag; Helm `appVersion` matches the tag; the tag does not already
+`go.mod`; a `CHANGELOG.md` entry for the version; `SchemaVersion` has no `-dev`
+suffix and does not exceed the tag; Helm `appVersion` matches the tag; the tag does not already
 exist), then creates and pushes `v<version>`.
 
 ### 3. Build and push Docker images

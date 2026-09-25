@@ -289,13 +289,13 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 		}
 		// withLock gives a written member its group's new lock, the only
 		// version and claim a member has.
-		withLock := func(f *docFields) {
+		withLock := func(f *docFields) *entroq.Doc {
 			g := docgroup.Group{Namespace: f.Namespace, Key: f.KeyPrimary}
 			l, ok := docPlan.Locks[g]
 			if !ok {
 				l = locks[g]
 			}
-			f.Version, f.Claimant, f.AtMs = l.Version, l.Claimant, l.At.UnixMilli()
+			return docgroup.Overlay(f.toDoc(), l)
 		}
 		if depErr.HasAny() {
 			return depErr
@@ -421,14 +421,13 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 					Created:      nowMs,
 					Modified:     nowMs,
 				}
-				withLock(f)
 				pipe.HSet(ctx, docKey(dd.Namespace, id), f.toMap())
 				pipe.ZAdd(ctx, docNSIndexKey(dd.Namespace), redis.Z{
 					Score:  0,
 					Member: docIndexMember(dd.Key, dd.SecondaryKey, id),
 				})
 				pipe.SAdd(ctx, namespacesKey, dd.Namespace)
-				resp.InsertedDocs = append(resp.InsertedDocs, f.toDoc())
+				resp.InsertedDocs = append(resp.InsertedDocs, withLock(f))
 			}
 
 			// Doc changes replace content; keys and Created belong to the stored
@@ -444,9 +443,8 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 					Created:      st.fields.Created,
 					Modified:     nowMs,
 				}
-				withLock(f)
 				pipe.HSet(ctx, docKey(d.Namespace, d.ID), f.toMap())
-				resp.ChangedDocs = append(resp.ChangedDocs, f.toDoc())
+				resp.ChangedDocs = append(resp.ChangedDocs, withLock(f))
 			}
 
 			for g, l := range docPlan.Locks {

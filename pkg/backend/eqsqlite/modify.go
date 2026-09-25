@@ -241,19 +241,19 @@ func deleteDocs(ctx context.Context, tx *sql.Tx, deletes []*entroq.DocID) error 
 	})
 }
 
+// insertDocs writes new docs. A doc's version and claim are its group's,
+// written to doc_locks.
 func insertDocs(ctx context.Context, tx *sql.Tx, docs []*entroq.Doc) error {
-	const columns = 10
+	const columns = 7
 	return batchRanges(len(docs), columns, func(start, end int) error {
 		args := make([]any, 0, columns*(end-start))
 		for _, doc := range docs[start:end] {
-			args = append(args, doc.Namespace, doc.ID, doc.Version, doc.Claimant, doc.At.UnixMilli(), doc.Key, doc.SecondaryKey,
+			args = append(args, doc.Namespace, doc.ID, doc.Key, doc.SecondaryKey,
 				jsonValue(doc.Content), doc.Created.UnixMilli(), doc.Modified.UnixMilli())
 		}
 		query := `INSERT INTO docs
-			(namespace, id, version, claimant, at_ms, key_primary, key_secondary, content, created_ms, modified_ms)
-			VALUES `
-		row := "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?),"
-		query += strings.TrimSuffix(strings.Repeat(row, end-start), ",")
+			(namespace, id, key_primary, key_secondary, content, created_ms, modified_ms)
+			VALUES ` + rowPlaceholders(end-start, columns)
 		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 			return fmt.Errorf("insert docs: %w", err)
 		}
@@ -261,23 +261,18 @@ func insertDocs(ctx context.Context, tx *sql.Tx, docs []*entroq.Doc) error {
 	})
 }
 
+// changeDocs replaces docs' content; keys belong to the stored doc, and the
+// version and claim to its group's lock.
 func changeDocs(ctx context.Context, tx *sql.Tx, docs []*entroq.Doc) error {
-	const columns = 9
+	const columns = 4
 	return batchRanges(len(docs), columns, func(start, end int) error {
 		args := make([]any, 0, columns*(end-start))
 		for _, doc := range docs[start:end] {
-			args = append(args, doc.Namespace, doc.ID, doc.Version, doc.Claimant, doc.At.UnixMilli(),
-				doc.Key, doc.SecondaryKey, jsonValue(doc.Content), doc.Modified.UnixMilli())
+			args = append(args, doc.Namespace, doc.ID, jsonValue(doc.Content), doc.Modified.UnixMilli())
 		}
-		query := `WITH changes(namespace, id, new_version, new_claimant, new_at_ms,
-			new_key_primary, new_key_secondary, new_content, new_modified_ms) AS (VALUES ` +
+		query := `WITH changes(namespace, id, new_content, new_modified_ms) AS (VALUES ` +
 			rowPlaceholders(end-start, columns) + `)
 			UPDATE docs SET
-				version = changes.new_version,
-				claimant = changes.new_claimant,
-				at_ms = changes.new_at_ms,
-				key_primary = changes.new_key_primary,
-				key_secondary = changes.new_key_secondary,
 				content = changes.new_content,
 				modified_ms = changes.new_modified_ms
 			FROM changes
@@ -351,7 +346,7 @@ func loadDependencies(ctx context.Context, tx *sql.Tx, mod *entroq.Modification)
 		for _, doc := range docIDs[start:end] {
 			args = append(args, doc.namespace, doc.id)
 		}
-		query := "SELECT " + docColumns + " FROM docs WHERE (namespace, id) IN (VALUES " +
+		query := "SELECT " + docColumns + " FROM " + docsWithLocks + " WHERE (d.namespace, d.id) IN (VALUES " +
 			rowPlaceholders(end-start, 2) + ")"
 		rows, err := tx.QueryContext(ctx, query, args...)
 		if err != nil {

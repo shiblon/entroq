@@ -134,7 +134,7 @@ func TestWorkerRenewal(t *testing.T) {
 	}
 
 	// Renewal fires at interval/2 = 3 s; 10 s → 3 renewals expected.
-	if err := doWhileRenewing(ctx, client, func(ctx context.Context, stop finalizeRenew) error {
+	if err := doWhileRenewing(ctx, client, nil, func(ctx context.Context, stop finalizeRenew) error {
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("doWhileRenewing: %w", ctx.Err())
@@ -174,7 +174,7 @@ func TestDoWhileRenewing_ImmediateCancellationOnLeaseLoss(t *testing.T) {
 
 	errChan := make(chan error, 1)
 	go func() {
-		errChan <- doWhileRenewing(ctx, client, func(ctx context.Context, _ finalizeRenew) error {
+		errChan <- doWhileRenewing(ctx, client, nil, func(ctx context.Context, _ finalizeRenew) error {
 			<-ctx.Done()
 			return ctx.Err()
 		}, entroq.RenewingTask(claimed), entroq.WithRenewInterval(100*time.Millisecond))

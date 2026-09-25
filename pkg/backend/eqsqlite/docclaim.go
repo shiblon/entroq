@@ -26,9 +26,9 @@ func (b *EQSQLite) ClaimDocs(ctx context.Context, q *entroq.DocClaim) ([]*entroq
 	}
 	value, err := b.write(ctx, func(ctx context.Context, tx *sql.Tx) (any, error) {
 		now := nowUTC()
-		rows, err := tx.QueryContext(ctx, "SELECT "+docColumns+` FROM docs
-                    WHERE namespace = ? AND key_primary = ?
-                    ORDER BY key_secondary, id`, q.Namespace, q.Key)
+		rows, err := tx.QueryContext(ctx, "SELECT "+docColumns+" FROM "+docsWithLocks+`
+                    WHERE d.namespace = ? AND d.key_primary = ?
+                    ORDER BY d.key_secondary, d.id`, q.Namespace, q.Key)
 		if err != nil {
 			return nil, err
 		}

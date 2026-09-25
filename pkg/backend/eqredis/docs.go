@@ -64,13 +64,11 @@ func parseDocIndexMember(member string) (keyPrimary, keySecondary, id string) {
 	return member, "", ""
 }
 
-// docFields holds all fields stored in a doc Hash.
+// docFields holds all fields stored in a doc Hash. A doc's version, claimant,
+// and arrival time are its group's, stored in the group's lock (lockKey).
 type docFields struct {
 	Namespace    string
 	ID           string
-	Version      int32
-	Claimant     string
-	AtMs         int64
 	KeyPrimary   string
 	KeySecondary string
 	Content      []byte
@@ -78,17 +76,11 @@ type docFields struct {
 	Modified     int64
 }
 
+// toDoc returns the stored doc without its group's lock; see docgroup.Overlay.
 func (f *docFields) toDoc() *entroq.Doc {
-	var at time.Time
-	if f.AtMs > 0 {
-		at = time.UnixMilli(f.AtMs).UTC()
-	}
 	return &entroq.Doc{
 		Namespace:    f.Namespace,
 		ID:           f.ID,
-		Version:      f.Version,
-		Claimant:     f.Claimant,
-		At:           at,
 		Key:          f.KeyPrimary,
 		SecondaryKey: f.KeySecondary,
 		Content:      f.Content,
@@ -101,9 +93,6 @@ func (f *docFields) toMap() map[string]any {
 	return map[string]any{
 		"namespace":     f.Namespace,
 		"id":            f.ID,
-		"version":       strconv.FormatInt(int64(f.Version), 10),
-		"claimant":      f.Claimant,
-		"at":            strconv.FormatInt(f.AtMs, 10),
 		"key_primary":   f.KeyPrimary,
 		"key_secondary": f.KeySecondary,
 		"content":       string(f.Content),
@@ -120,14 +109,6 @@ func parseDocFields(vals map[string]string) (*docFields, error) {
 		return strconv.ParseInt(s, 10, 64)
 	}
 
-	version, err := parseInt(vals["version"])
-	if err != nil {
-		return nil, fmt.Errorf("parse doc version: %w", err)
-	}
-	at, err := parseInt(vals["at"])
-	if err != nil {
-		return nil, fmt.Errorf("parse doc at: %w", err)
-	}
 	created, err := parseInt(vals["created"])
 	if err != nil {
 		return nil, fmt.Errorf("parse doc created: %w", err)
@@ -145,9 +126,6 @@ func parseDocFields(vals map[string]string) (*docFields, error) {
 	return &docFields{
 		Namespace:    vals["namespace"],
 		ID:           vals["id"],
-		Version:      int32(version),
-		Claimant:     vals["claimant"],
-		AtMs:         at,
 		KeyPrimary:   vals["key_primary"],
 		KeySecondary: vals["key_secondary"],
 		Content:      content,

@@ -694,3 +694,67 @@ func WorkerDependencyMove(ctx context.Context, t *testing.T, client *entroq.Entr
 		t.Errorf("worker exit: %v", err)
 	}
 }
+
+// WorkerHoldsEmptyGroup verifies that a worker keeps a doc group it claimed
+// empty for as long as its handler runs. Renewing a group's docs renews the
+// group, but an empty group has none, so without its own renewal the claim
+// would lapse after one lease and another claimant could take the group
+// mid-work.
+func WorkerHoldsEmptyGroup(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	queue := path.Join(qPrefix, "worker_holds_empty_group")
+	ns := path.Join(qPrefix, "worker_holds_empty_group_docs")
+	const lease = 300 * time.Millisecond
+
+	if _, err := client.Modify(ctx, entroq.InsertingInto(queue)); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	inWork := make(chan int, 1)
+	letFinish := make(chan bool)
+	w := worker.New(client,
+		worker.WithTakeDocs(func(context.Context, *entroq.Task, json.RawMessage) ([]*entroq.DocClaim, error) {
+			return []*entroq.DocClaim{entroq.ClaimKey(ns, "empty")}, nil
+		}),
+		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, _ json.RawMessage, docs []*entroq.Doc) (*worker.Result, error) {
+			inWork <- len(docs)
+			<-letFinish
+			return worker.Modify(task.Delete()), nil
+		}),
+	)
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- w.Run(runCtx, worker.Watching(queue), worker.WithLease(lease))
+	}()
+
+	select {
+	case n := <-inWork:
+		if n != 0 {
+			t.Fatalf("Handler got %d docs from an empty group", n)
+		}
+	case err := <-errCh:
+		t.Fatalf("Worker exited before work started: %v", err)
+	case <-ctx.Done():
+		t.Fatal("Timeout waiting for work to start")
+	}
+
+	// Several leases pass while the handler works; nobody else may claim the
+	// group meanwhile.
+	for deadline := time.Now().Add(4 * lease); time.Now().Before(deadline); time.Sleep(lease / 4) {
+		_, err := client.ClaimDocs(ctx, &entroq.DocClaim{Namespace: ns, Key: "empty", Claimant: "intruder", Duration: lease})
+		if err == nil {
+			t.Fatal("Another claimant took the worker's empty group while its handler ran")
+		}
+		if !entroq.IsDependency(err) {
+			t.Fatalf("Intruder claim: %v", err)
+		}
+	}
+	letFinish <- true
+
+	runCancel()
+	if err := <-errCh; err != nil && !entroq.IsCanceled(err) {
+		t.Errorf("Worker exit: %v", err)
+	}
+}
