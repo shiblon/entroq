@@ -5,6 +5,7 @@ import (
 
 	"github.com/google/btree"
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/backend/internal/docgroup"
 )
 
 // docKeyEntry is the btree item type, ordered by (Key, Secondary, ID).
@@ -42,6 +43,20 @@ type docNamespace struct {
 	name  string
 	byID  map[string]*entroq.Doc
 	byKey *btree.BTreeG[docKeyEntry]
+	// locks holds each doc group's lock, by primary key. A group can have a
+	// lock and no docs (a claimed empty group), so locks is kept apart from
+	// the docs rather than on them.
+	locks *btree.BTreeG[lockEntry]
+}
+
+// lockEntry is a doc group's lock in a namespace.
+type lockEntry struct {
+	Key  string
+	Lock docgroup.Lock
+}
+
+func lockKeyLess(a, b lockEntry) bool {
+	return a.Key < b.Key
 }
 
 const btreeDegree = 32
@@ -51,6 +66,7 @@ func newDocNamespace(name string) *docNamespace {
 		name:  name,
 		byID:  make(map[string]*entroq.Doc),
 		byKey: btree.NewG(btreeDegree, docKeyLess),
+		locks: btree.NewG(btreeDegree, lockKeyLess),
 	}
 }
 
@@ -83,11 +99,52 @@ func (s *docNamespace) Update(id string, f func(*entroq.Doc) *entroq.Doc) error 
 	return nil
 }
 
+// Len counts the namespace's docs and locks, so a namespace holding only a
+// claimed empty group is kept.
 func (s *docNamespace) Len() int {
 	if s == nil {
 		return 0
 	}
-	return len(s.byID)
+	return len(s.byID) + s.locks.Len()
+}
+
+// Lock returns the lock of the group with the given primary key, or
+// docgroup.Absent.
+func (s *docNamespace) Lock(key string) docgroup.Lock {
+	return lockIn(s.locks, key)
+}
+
+// lockIn returns key's lock in locks, or docgroup.Absent. It works on a
+// snapshot as well as on the live tree.
+func lockIn(locks *btree.BTreeG[lockEntry], key string) docgroup.Lock {
+	if e, ok := locks.Get(lockEntry{Key: key}); ok {
+		return e.Lock
+	}
+	return docgroup.Absent
+}
+
+// SetLock records the lock of the group with the given primary key.
+func (s *docNamespace) SetLock(key string, l docgroup.Lock) {
+	s.locks.ReplaceOrInsert(lockEntry{Key: key, Lock: l})
+}
+
+// DeleteLock removes the lock of the group with the given primary key.
+func (s *docNamespace) DeleteLock(key string) {
+	s.locks.Delete(lockEntry{Key: key})
+}
+
+// Members returns the docs of the group with the given primary key, in
+// secondary key order.
+func (s *docNamespace) Members(key string) []*entroq.Doc {
+	var docs []*entroq.Doc
+	s.AscendFrom(docKeyEntry{Key: key}, func(d *entroq.Doc) bool {
+		if d.Key != key {
+			return false
+		}
+		docs = append(docs, d)
+		return true
+	})
+	return docs
 }
 
 func (s *docNamespace) Get(id string) (*entroq.Doc, bool) {
@@ -95,12 +152,12 @@ func (s *docNamespace) Get(id string) (*entroq.Doc, bool) {
 	return d, ok
 }
 
-// snapshot returns a clone of the btree for lock-free range scanning.
-// Must be called with the namespace lock held; the returned tree may be
-// iterated after the lock is released.
-func (s *docNamespace) snapshot() *btree.BTreeG[docKeyEntry] {
-	c := s.byKey.Clone()
-	return c
+// snapshot returns clones of the doc and lock trees for lock-free range
+// scanning. Must be called with the namespace lock held; the returned trees may
+// be iterated after the lock is released. Cloning is copy-on-write, so it is
+// cheap.
+func (s *docNamespace) snapshot() (*btree.BTreeG[docKeyEntry], *btree.BTreeG[lockEntry]) {
+	return s.byKey.Clone(), s.locks.Clone()
 }
 
 // AscendFrom iterates live docs whose entry is >= pivot, in (key, secondary, id) order.

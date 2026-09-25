@@ -11,8 +11,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Release note: the next release must be a minor (v1.13.0 or later), not a
 patch. It adds public API (`entroq.InvalidArgumentError`), moves the SQLite
-schema to version 2, adds `eqc work --max-claims`, and removes the
-`eqc mod --reset` flag. The PostgreSQL schema moves to 1.13.0: run
+schema to version 3, adds `eqc work --max-claims`, removes the
+`eqc mod --reset` flag, and changes how doc versions and claims work (see the
+doc groups entry). The PostgreSQL schema moves to 1.13.0: run
 `eqpg schema upgrade` (or serve with `--init_schema`) before starting the new
 service.
 
@@ -39,6 +40,32 @@ service.
 
 ### Changed
 
+- **Breaking: docs sharing a primary key are one unit.** A doc group, the docs
+  sharing a primary key in a namespace, now has a single version, claimant, and
+  arrival time, as a task does, and every member reports its group's. Claiming
+  the group, renewing it, and changing or deleting any member move that
+  version, so a read taken before any of them is stale, even for a member
+  nobody touched. Inserting into an unheld group does not move it: nothing
+  already read changes, and concurrent inserts into one group do not conflict.
+  Only a claim tells a reader that it has seen every member, so a group whose
+  membership decides what happens next (say, "all parts done") should be
+  written by one serialized party, not appended to by workers racing its
+  reader. While one claimant holds the group, nobody else may
+  insert, change, or delete in it; a depend still succeeds, since it only
+  reads. A writer acting as the holder (`entroq.ModifyAs`, as
+  `eqc mod --force` does) still may. The holder's commit releases the group
+  unless it carries a future arrival time, which renews it. A group can be
+  claimed before it has docs: `ClaimDocs` then succeeds and returns none, where
+  it used to return none and lock nothing. The Go worker therefore no longer
+  moves a task to its error queue for a "required doc missing"; a group held by
+  someone else still retries with backoff, and a handler decides what an empty
+  group means. Docs keep their keys: a change replaces content only.
+  Upgrading gives every existing group a lock one version past its highest
+  member and releases claims held at the time: PostgreSQL gains the
+  `entroq.doc_locks` table, SQLite moves to schema version 3, Redis migrates on
+  its first open, and the in-memory backend rebuilds locks when its journal
+  loads. PostgreSQL's doc operations now run in Go on the same rules as every
+  other backend, and the schema drops `_modify_docs` and `_claim_docs`.
 - **Breaking: PostgreSQL no longer uses LISTEN/NOTIFY.** The service is the
   database's only client, so the backend now runs the same readiness loop as
   the other backends: a batched, read-only count of available tasks on the
@@ -61,8 +88,43 @@ service.
   combined with `--queue_to`. `--reset` now fails with a pointer to the new
   flag.
 
+### Deprecated
+
+- **In-memory journal replay no longer checks doc versions.** Journals written
+  before doc groups had locks did not record doc claims, so their doc versions
+  can trail what later records name. Replay applies the recorded state anyway,
+  and logs one warning if it found any such record. The next minor release
+  checks doc versions on replay again: take a snapshot with this version first
+  (`eqmem serve --snapshot_and_quit`), which rewrites the journal with correct
+  versions.
+
 ### Fixed
 
+- **In-memory snapshots keep docs.** A snapshot saved only tasks, and taking
+  one with cleanup removed the journals, so every doc was lost. Snapshots now
+  hold docs and doc group locks, and snapshots written before this still load.
+- **In-memory doc claims survive a restart.** `ClaimDocs` changed doc versions
+  without journaling them, so replay could fail on a later change or delete of
+  a claimed doc. Claims are now journaled with the rest.
+- **PostgreSQL enforces task claims.** A change or delete of a task another
+  claimant held succeeded on PostgreSQL if it named the current version; the
+  other backends refused it. It now fails with the claim reported in
+  `DependencyError.Claims`, as everywhere else. Depends are not claim-checked.
+- **Redis `Tasks` by ID stays in the queried queue.** A `Tasks` query naming a
+  queue and task IDs returned tasks from any queue on Redis, and the service
+  authorizes only the queried queue, so a caller could read queues it had no
+  access to. Redis now filters by queue like the other backends, and the
+  service also drops any returned task outside the queried queue.
+- **PostgreSQL rolls back a failed modification.** Since 1.0, a modification
+  that failed in Go rather than in the database, such as `eqpg.RunningInTx`
+  caller work returning an error, was committed anyway, and a failed commit
+  was reported as success. Both now roll back or report the error.
+  `RunningInTx` is now marked experimental; docs cover what it was for.
+- **Duplicate IDs in one modification are rejected.** Naming a task or doc in
+  more than one operation of a modification (two inserts, a change and a
+  delete, a delete and a re-insert) behaved differently on every backend and
+  could crash the in-memory one. Every backend now rejects it as an
+  `entroq.InvalidArgumentError` (HTTP 400) before touching storage.
 - **SQLite length limits count bytes.** The experimental SQLite backend
   checked id, claimant, namespace, and doc key lengths with `length()`, which
   counts characters and stops at the first NUL. Multibyte values up to twice

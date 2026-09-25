@@ -11,11 +11,12 @@ import (
 // NamespaceStats returns doc counts per namespace, optionally filtered by the
 // query's prefix/exact match criteria and capped by Limit.
 func (b *EQPG) NamespaceStats(ctx context.Context, qq *entroq.MatchQuery) (map[string]*entroq.NamespaceStat, error) {
+	// A doc is claimed while its group is held.
 	q := `SELECT
-			namespace,
+			d.namespace,
 			COUNT(*) AS size,
-			COUNT(*) FILTER(WHERE at > NOW() AND claimant != '') AS claimed
-		FROM entroq.docs`
+			COUNT(*) FILTER(WHERE l.at > NOW() AND l.claimant != '') AS claimed
+		FROM ` + docsWithLocks
 
 	var values []any
 
@@ -23,17 +24,17 @@ func (b *EQPG) NamespaceStats(ctx context.Context, qq *entroq.MatchQuery) (map[s
 		q += " WHERE"
 		var frags []string
 		for _, m := range qq.MatchPrefix {
-			frags = append(frags, fmt.Sprintf(" namespace LIKE $%d ESCAPE '\\'", len(values)+1))
+			frags = append(frags, fmt.Sprintf(" d.namespace LIKE $%d ESCAPE '\\'", len(values)+1))
 			values = append(values, likePrefix(m))
 		}
 		for _, m := range qq.MatchExact {
-			frags = append(frags, fmt.Sprintf(" namespace = $%d", len(values)+1))
+			frags = append(frags, fmt.Sprintf(" d.namespace = $%d", len(values)+1))
 			values = append(values, m)
 		}
 		q += strings.Join(frags, " OR ")
 	}
 
-	q += " GROUP BY namespace"
+	q += " GROUP BY d.namespace"
 
 	if qq.Limit > 0 {
 		q += fmt.Sprintf(" LIMIT $%d", len(values)+1)

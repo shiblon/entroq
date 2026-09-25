@@ -3,10 +3,13 @@ package eqredis
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"testing"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/backend/internal/docgroup"
 )
 
 func docContent(ctx context.Context, t *testing.T, client *entroq.EntroQ, ns, id string) string {
@@ -108,5 +111,63 @@ func TestMigrateDocKeys(t *testing.T) {
 	}
 	if got := docContent(ctx, t, reopened, kept, "d"); got != "kept" {
 		t.Errorf("doc in %q = %q, want %q", kept, got, "kept")
+	}
+}
+
+// TestMigrateDocLocks checks that opening a database written before doc groups
+// had locks gives each group a lock one version past its highest member, with
+// any claim released.
+func TestMigrateDocLocks(t *testing.T) {
+	ctx := context.Background()
+	client, err := redisClient(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
+	defer rdb.Close()
+
+	ns := "migrate-locks-" + entroq.GenHex16()
+	if _, err := client.Modify(ctx,
+		entroq.PuttingDocInto(ns, entroq.WithIDKeys("a", "k", "1")),
+		entroq.PuttingDocInto(ns, entroq.WithIDKeys("b", "k", "2")),
+		entroq.PuttingDocInto(ns, entroq.WithIDKeys("c", "other", "")),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// Put the namespace back the way an older server left it: per-doc versions
+	// and claims, and no locks.
+	future := strconv.FormatInt(time.Now().Add(time.Hour).UnixMilli(), 10)
+	for _, cmd := range []redis.Cmder{
+		rdb.HSet(ctx, docKey(ns, "a"), "version", "2"),
+		rdb.HSet(ctx, docKey(ns, "b"), "version", "7", "claimant", "holder", "at", future),
+		rdb.HSet(ctx, docKey(ns, "c"), "version", "0"),
+		rdb.Del(ctx, lockKey(docgroup.Group{Namespace: ns, Key: "k"}), lockKey(docgroup.Group{Namespace: ns, Key: "other"}),
+			lockIndexKey(ns), heldGroupsKey(ns), docLocksMigratedKey),
+	} {
+		if err := cmd.Err(); err != nil {
+			t.Fatalf("simulate legacy state: %v", err)
+		}
+	}
+
+	reopened, err := redisClient(ctx)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+
+	docs, err := reopened.Docs(ctx, &entroq.DocQuery{Namespace: ns})
+	if err != nil || len(docs) != 3 {
+		t.Fatalf("docs after migration: %v, %v", docs, err)
+	}
+	want := map[string]int32{"a": 8, "b": 8, "c": 1}
+	for _, d := range docs {
+		if d.Version != want[d.ID] || d.Claimant != "" {
+			t.Errorf("migrated doc %q: want version %d and no claimant, got version %d, claimant %q", d.ID, want[d.ID], d.Version, d.Claimant)
+		}
+	}
+	if _, err := reopened.Modify(ctx, docs[0].Change(entroq.WithContent("after"))); err != nil {
+		t.Errorf("change after migration: %v", err)
 	}
 }

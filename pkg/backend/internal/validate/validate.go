@@ -1,12 +1,12 @@
-// Package limits holds the byte-length bounds that the PostgreSQL and SQLite
-// schemas enforce with CHECK constraints, so backends without a schema can
-// enforce the same bounds in Go. The SQL backends check them too, so every
-// backend reports a violation as the same entroq.InvalidArgumentError rather
-// than a driver-specific constraint failure.
+// Package validate holds the checks every backend applies to a request before
+// touching storage, so all of them reject the same requests with the same
+// entroq.InvalidArgumentError rather than a driver-specific failure.
 //
-// Every bound counts bytes (Go's len), matching octet_length in SQL. Queue
-// names are deliberately unbounded.
-package limits
+// Byte-length bounds match the PostgreSQL and SQLite schemas' CHECK
+// constraints, which the SQL backends keep as a second line of defense. Every
+// bound counts bytes (Go's len), matching octet_length in SQL. Queue names are
+// deliberately unbounded.
+package validate
 
 import (
 	"github.com/shiblon/entroq"
@@ -53,10 +53,23 @@ func doc(ns, id, key, secondaryKey string) error {
 	return check("doc secondary key", secondaryKey, MaxDocKeyBytes)
 }
 
-// Modification checks every value mod would store. Deletes and depends only
+// Modification checks mod before a backend applies it: every write names its
+// queue or namespace, no task or doc appears in more than one operation, and
+// every value it would store is within its byte limit.
+func Modification(mod *entroq.Modification) error {
+	if err := mod.EnsureModifyKeys(); err != nil {
+		return err
+	}
+	if _, _, err := mod.AllDependencies(); err != nil {
+		return err
+	}
+	return lengths(mod)
+}
+
+// lengths checks every value mod would store. Deletes and depends only
 // reference existing rows, so they are not checked, and the claimant is
 // checked only when mod writes a row that records it.
-func Modification(mod *entroq.Modification) error {
+func lengths(mod *entroq.Modification) error {
 	writes := len(mod.Inserts) + len(mod.Changes) + len(mod.DocInserts) + len(mod.DocChanges)
 	if writes > 0 {
 		if err := Claimant(mod.Claimant); err != nil {

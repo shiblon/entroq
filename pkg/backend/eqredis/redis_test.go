@@ -125,6 +125,22 @@ func TestInsertKeepsAttemptAndErr(t *testing.T) {
 	RunQTest(t, eqtest.InsertKeepsAttemptAndErr)
 }
 
+func TestModifyRejectsDuplicateIDs(t *testing.T) {
+	RunQTest(t, eqtest.ModifyRejectsDuplicateIDs)
+}
+
+func TestModifyRespectsTaskClaims(t *testing.T) {
+	RunQTest(t, eqtest.ModifyRespectsTaskClaims)
+}
+
+func TestTasksWithIDStaysInQueue(t *testing.T) {
+	RunQTest(t, eqtest.TasksWithIDStaysInQueue)
+}
+
+func TestDocGroups(t *testing.T) {
+	RunQTest(t, eqtest.DocGroups)
+}
+
 func TestTaskChangeFarPastArrivalNormalized(t *testing.T) {
 	RunQTest(t, eqtest.TaskChangeFarPastArrivalNormalized)
 }

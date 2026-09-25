@@ -138,32 +138,33 @@ func (b *EQSQLite) Docs(ctx context.Context, q *entroq.DocQuery) ([]*entroq.Doc,
 	if q == nil {
 		return nil, fmt.Errorf("eqsqlite docs: nil query")
 	}
-	columns := docColumns
+	columns := groupDocColumns
 	if q.OmitValues {
-		columns = strings.Replace(columns, "content", "NULL", 1)
+		columns = strings.Replace(columns, "d.content", "NULL", 1)
 	}
-	where := []string{"namespace = ?"}
+	where := []string{"d.namespace = ?"}
 	args := []any{q.Namespace}
 	switch {
 	case len(q.IDs) > 0:
-		where = append(where, "id IN ("+placeholders(len(q.IDs))+")")
+		where = append(where, "d.id IN ("+placeholders(len(q.IDs))+")")
 		for _, id := range q.IDs {
 			args = append(args, id)
 		}
 	case q.KeyExact != "":
-		where = append(where, "key_primary = ?")
+		where = append(where, "d.key_primary = ?")
 		args = append(args, q.KeyExact)
 	default:
 		if q.KeyStart != "" {
-			where = append(where, "key_primary >= ?")
+			where = append(where, "d.key_primary >= ?")
 			args = append(args, q.KeyStart)
 		}
 		if q.KeyEnd != "" {
-			where = append(where, "key_primary < ?")
+			where = append(where, "d.key_primary < ?")
 			args = append(args, q.KeyEnd)
 		}
 	}
-	query := "SELECT " + columns + " FROM docs WHERE " + strings.Join(where, " AND ") + " ORDER BY key_primary, key_secondary, id"
+	query := "SELECT " + columns + " FROM " + docsWithLocks + " WHERE " + strings.Join(where, " AND ") +
+		" ORDER BY d.key_primary, d.key_secondary, d.id"
 	if q.Limit > 0 {
 		query += " LIMIT ?"
 		args = append(args, q.Limit)
@@ -187,15 +188,16 @@ func (b *EQSQLite) Docs(ctx context.Context, q *entroq.DocQuery) ([]*entroq.Doc,
 // NamespaceStats returns document statistics for each matching namespace.
 func (b *EQSQLite) NamespaceStats(ctx context.Context, q *entroq.MatchQuery) (map[string]*entroq.NamespaceStat, error) {
 	now := nowUTC().UnixMilli()
-	where, args := appendMatch(nil, nil, "namespace", q)
-	query := `SELECT namespace, count(*),
-        coalesce(sum(CASE WHEN claimant <> '' AND at_ms > ? THEN 1 ELSE 0 END), 0)
-        FROM docs`
+	// A doc is claimed while its group is held.
+	where, args := appendMatch(nil, nil, "d.namespace", q)
+	query := `SELECT d.namespace, count(*),
+        coalesce(sum(CASE WHEN l.claimant <> '' AND l.at_ms > ? THEN 1 ELSE 0 END), 0)
+        FROM ` + docsWithLocks
 	args = append([]any{now}, args...)
 	if len(where) > 0 {
 		query += " WHERE " + strings.Join(where, " AND ")
 	}
-	query += " GROUP BY namespace ORDER BY namespace"
+	query += " GROUP BY d.namespace ORDER BY d.namespace"
 	if q != nil && q.Limit > 0 {
 		query += " LIMIT ?"
 		args = append(args, q.Limit)

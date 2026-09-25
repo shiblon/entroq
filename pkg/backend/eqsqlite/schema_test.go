@@ -3,6 +3,7 @@ package eqsqlite
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -173,7 +174,9 @@ func TestMigrateV1ToV2(t *testing.T) {
 	if err != nil || len(docs) != 1 {
 		t.Fatalf("docs after migration: %v, %v", docs, err)
 	}
-	if got := docs[0]; got.ID != "doc-1" || got.Version != 4 || got.Key != "k" || got.SecondaryKey != "s" {
+	// Migrating on to version 3 gives the doc's group a lock one version past
+	// its highest member.
+	if got := docs[0]; got.ID != "doc-1" || got.Version != 5 || got.Key != "k" || got.SecondaryKey != "s" {
 		t.Fatalf("migrated doc = %#v", got)
 	}
 	if err := client.Close(); err != nil {
@@ -202,4 +205,51 @@ func TestMigrateV1ToV2RollsBackOversizedRows(t *testing.T) {
 		t.Fatalf("schema version after failed migration = %d, want 1", v)
 	}
 	execRaw(ctx, t, path, "SELECT id FROM tasks WHERE id = '"+wide+"'")
+}
+
+// TestMigrateV2ToV3 checks that a version 2 database, where each doc carried
+// its own version and claim, gains one lock per doc group, one version past
+// the group's highest member, with any claim released.
+func TestMigrateV2ToV3(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "entroq.sqlite")
+	b, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(time.Hour).UnixMilli()
+	execRaw(ctx, t, path,
+		"DROP TABLE doc_locks",
+		"UPDATE entroq_meta SET schema_version = 2 WHERE id = 1",
+		`INSERT INTO docs VALUES ('ns', 'a', 2, '', 0, 'k', '1', '"a"', 1, 1)`,
+		fmt.Sprintf(`INSERT INTO docs VALUES ('ns', 'b', 7, 'holder', %d, 'k', '2', '"b"', 1, 1)`, future),
+		`INSERT INTO docs VALUES ('ns', 'c', 0, '', 0, 'other', '', '"c"', 1, 1)`,
+	)
+
+	client, err := entroq.New(ctx, Opener(path))
+	if err != nil {
+		t.Fatalf("open version 2 database: %v", err)
+	}
+	defer client.Close()
+	if v := rawSchemaVersion(ctx, t, path); v != SchemaVersion {
+		t.Fatalf("schema version after migration = %d, want %d", v, SchemaVersion)
+	}
+
+	docs, err := client.Docs(ctx, &entroq.DocQuery{Namespace: "ns"})
+	if err != nil || len(docs) != 3 {
+		t.Fatalf("docs after migration: %v, %v", docs, err)
+	}
+	want := map[string]int32{"a": 8, "b": 8, "c": 1}
+	for _, d := range docs {
+		if d.Version != want[d.ID] || d.Claimant != "" {
+			t.Errorf("migrated doc %q: want version %d and no claimant, got version %d, claimant %q", d.ID, want[d.ID], d.Version, d.Claimant)
+		}
+	}
+	// The migrated group is writable at its lock's version.
+	if _, err := client.Modify(ctx, docs[0].Change(entroq.WithContent("after"))); err != nil {
+		t.Errorf("change after migration: %v", err)
+	}
 }

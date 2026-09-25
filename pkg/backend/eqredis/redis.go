@@ -77,6 +77,8 @@ func qsclaimedKey(name string) string {
 	return keyPrefix + "qsclaimed:" + name
 }
 
+// nsclaimedKey is the per-doc claim set from before doc groups had locks. Only
+// migrateDocLocks uses it, to remove it.
 func nsclaimedKey(ns string) string {
 	return keyPrefix + "nsclaimed:" + ns
 }
@@ -195,6 +197,10 @@ func Open(ctx context.Context, opts ...RedisOpt) (*EQRedis, error) {
 	if err := migrateDocKeys(ctx, client); err != nil {
 		client.Close()
 		return nil, fmt.Errorf("eqredis open: migrate doc keys: %w", err)
+	}
+	if err := migrateDocLocks(ctx, client); err != nil {
+		client.Close()
+		return nil, fmt.Errorf("eqredis open: migrate doc locks: %w", err)
 	}
 
 	nw := o.nw

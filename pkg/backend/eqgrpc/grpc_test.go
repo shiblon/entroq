@@ -115,6 +115,22 @@ func TestGRPCInsertKeepsAttemptAndErr(t *testing.T) {
 	RunQTest(t, eqtest.InsertKeepsAttemptAndErr)
 }
 
+func TestGRPCModifyRejectsDuplicateIDs(t *testing.T) {
+	RunQTest(t, eqtest.ModifyRejectsDuplicateIDs)
+}
+
+func TestGRPCModifyRespectsTaskClaims(t *testing.T) {
+	RunQTest(t, eqtest.ModifyRespectsTaskClaims)
+}
+
+func TestGRPCTasksWithIDStaysInQueue(t *testing.T) {
+	RunQTest(t, eqtest.TasksWithIDStaysInQueue)
+}
+
+func TestGRPCDocGroups(t *testing.T) {
+	RunQTest(t, eqtest.DocGroups)
+}
+
 func TestGRPCTaskChangeFutureArrival(t *testing.T) {
 	RunQTest(t, eqtest.TaskChangeFutureArrival)
 }

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/shiblon/entroq"
 	pb "github.com/shiblon/entroq/api"
 	"github.com/shiblon/entroq/pkg/authn"
 	"github.com/shiblon/entroq/pkg/authz"
@@ -365,5 +366,51 @@ func TestBearerTokenStopsAtAuthenticator(t *testing.T) {
 	}
 	if bytes.Contains(encoded, []byte("secret-token")) || bytes.Contains(encoded, []byte("authz")) {
 		t.Fatalf("authorization request leaked credentials: %s", encoded)
+	}
+}
+
+// queueBlindBackend is a backend with the bug the service must not trust:
+// its Tasks ignores the queue when task IDs are given.
+type queueBlindBackend struct{ entroq.Backend }
+
+func (b queueBlindBackend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Task, error) {
+	if len(tq.IDs) > 0 {
+		q := *tq
+		q.Queue = ""
+		tq = &q
+	}
+	return b.Backend.Tasks(ctx, tq)
+}
+
+// TestTasksDropsTasksOutsideQueriedQueue checks that the service itself keeps
+// a Tasks query inside the queue it authorized, even over a backend that
+// returns tasks from other queues.
+func TestTasksDropsTasksOutsideQueriedQueue(t *testing.T) {
+	ctx := context.Background()
+	opener := func(ctx context.Context) (entroq.Backend, error) {
+		b, err := eqmem.Opener()(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return queueBlindBackend{b}, nil
+	}
+	svc, err := New(ctx, opener)
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	defer svc.Close()
+
+	ins, err := svc.Modify(ctx, &pb.ModifyRequest{Inserts: []*pb.TaskData{{Queue: "readable"}, {Queue: "secret"}}})
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	secretID := ins.Inserted[1].Id
+
+	resp, err := svc.Tasks(ctx, &pb.TasksRequest{Queue: "readable", TaskId: []string{secretID}})
+	if err != nil {
+		t.Fatalf("tasks: %v", err)
+	}
+	if len(resp.Tasks) != 0 {
+		t.Errorf("tasks in %q by the ID of a task in %q: want none, got %v", "readable", "secret", resp.Tasks)
 	}
 }

@@ -14,13 +14,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/pkg/backend/internal/limits"
+	"github.com/shiblon/entroq/pkg/backend/internal/docgroup"
+	"github.com/shiblon/entroq/pkg/backend/internal/validate"
 )
 
 // docIndexSep is the separator used between fields in a namespace index member.
@@ -216,6 +218,7 @@ func (e *EQRedis) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc,
 	}
 
 	var docs []*entroq.Doc
+	var groups []docgroup.Group
 	for i, cmd := range cmds {
 		vals, err := cmd.Result()
 		if errors.Is(err, redis.Nil) || len(vals) == 0 {
@@ -233,134 +236,83 @@ func (e *EQRedis) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc,
 			d.Content = nil
 		}
 		docs = append(docs, d)
+		if g := (docgroup.Group{Namespace: d.Namespace, Key: d.Key}); !slices.Contains(groups, g) {
+			groups = append(groups, g)
+		}
+	}
+
+	// Each doc carries its group's version and claim, the only ones it has.
+	locks, err := readLocks(ctx, e.client, groups)
+	if err != nil {
+		return nil, fmt.Errorf("eqredis docs: %w", err)
+	}
+	for i, d := range docs {
+		if l := locks[docgroup.Group{Namespace: d.Namespace, Key: d.Key}]; l != docgroup.Absent {
+			docs[i] = docgroup.Overlay(d, l)
+		}
 	}
 	return docs, nil
 }
 
-// ClaimDocs claims all docs sharing a primary key in a namespace.
-// Returns a DependencyError if any doc with that key is already claimed
-// by a different claimant.
+// ClaimDocs claims the group of docs sharing a primary key in a namespace and
+// returns its members, which may be none: a group can be claimed before it has
+// docs. It returns a DependencyError listing the members while someone else
+// holds the group.
+//
+// The claim is written before the members are read. Inserts into an unheld
+// group leave its lock alone, so a claim watching the lock could not see one
+// land between reading the members and claiming. Every insert watches the
+// lock instead: one that commits before the claim is in the members read
+// after it, and one that has not committed yet fails its watch when the claim
+// writes the lock, then retries and finds the group held.
 func (e *EQRedis) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.Doc, error) {
-	if err := limits.DocClaim(cq); err != nil {
+	if err := validate.DocClaim(cq); err != nil {
 		return nil, fmt.Errorf("eqredis claim docs: %w", err)
 	}
-	now := time.Now().UTC()
-	nowMs := now.UnixMilli()
-	newAtMs := now.Add(cq.Duration).UnixMilli()
-	idxKey := docNSIndexKey(cq.Namespace)
-
-	for range maxClaimRetries {
-		// Find all doc IDs with this primary key using the namespace index.
-		min := "[" + cq.Key + docIndexSep
-		// The key immediately after all entries with this prefix:
-		// increment the last byte of Key to get the exclusive upper bound.
-		maxKey := cq.Key + "\x01"
-		max := "(" + maxKey
-
-		members, err := e.client.ZRangeArgs(ctx, redis.ZRangeArgs{
-			Key:   idxKey,
-			Start: min,
-			Stop:  max,
-			ByLex: true,
-		}).Result()
-		if err != nil {
-			return nil, fmt.Errorf("claim docs index scan: %w", err)
-		}
-		if len(members) == 0 {
-			return nil, nil
-		}
-
-		var docIDs []string
-		for _, m := range members {
-			_, _, id := parseDocIndexMember(m)
-			docIDs = append(docIDs, id)
-		}
-
-		watchKeys := make([]string, len(docIDs))
-		for i, id := range docIDs {
-			watchKeys[i] = docKey(cq.Namespace, id)
-		}
-
-		var claimed []*entroq.Doc
-
-		err = e.client.Watch(ctx, func(tx *redis.Tx) error {
-			// Read current state of all docs.
-			pipe := tx.Pipeline()
-			cmds := make([]*redis.MapStringStringCmd, len(docIDs))
-			for i, id := range docIDs {
-				cmds[i] = pipe.HGetAll(ctx, docKey(cq.Namespace, id))
+	g := docgroup.Group{Namespace: cq.Namespace, Key: cq.Key}
+	for attempt := range maxClaimRetries {
+		var current, next docgroup.Lock
+		var ok bool
+		err := e.client.Watch(ctx, func(tx *redis.Tx) error {
+			now := time.Now().UTC()
+			locks, err := readLocks(ctx, tx, []docgroup.Group{g})
+			if err != nil {
+				return err
 			}
-			if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
-				return fmt.Errorf("claim docs read: %w", err)
+			current = locks[g]
+			if next, ok = docgroup.Claim(current, cq.Claimant, now, cq.Duration); !ok {
+				return nil
 			}
-
-			var fields []*docFields
-			for _, cmd := range cmds {
-				vals, err := cmd.Result()
-				if errors.Is(err, redis.Nil) || len(vals) == 0 {
-					continue
-				}
-				if err != nil {
-					return fmt.Errorf("claim docs hgetall: %w", err)
-				}
-				f, err := parseDocFields(vals)
-				if err != nil {
-					return fmt.Errorf("claim docs parse: %w", err)
-				}
-				fields = append(fields, f)
-			}
-
-			// Check for docs already claimed by a different claimant.
-			depErr := &entroq.DependencyError{}
-			for _, f := range fields {
-				alreadyClaimed := f.Claimant != "" && f.Claimant != cq.Claimant && f.AtMs > nowMs
-				if alreadyClaimed {
-					depErr.DocClaims = append(depErr.DocClaims, &entroq.DocID{
-						Namespace: f.Namespace,
-						ID:        f.ID,
-						Version:   f.Version,
-					})
-				}
-			}
-			if depErr.HasAny() {
-				return depErr
-			}
-
-			// Atomically claim all docs.
-			claimed = nil
-			_, err := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-				for _, f := range fields {
-					updated := &docFields{
-						Namespace:    f.Namespace,
-						ID:           f.ID,
-						Version:      f.Version + 1,
-						Claimant:     cq.Claimant,
-						AtMs:         newAtMs,
-						KeyPrimary:   f.KeyPrimary,
-						KeySecondary: f.KeySecondary,
-						Content:      f.Content,
-						Created:      f.Created,
-						Modified:     nowMs,
-					}
-					pipe.HSet(ctx, docKey(f.Namespace, f.ID), updated.toMap())
-					pipe.ZAdd(ctx, nsclaimedKey(f.Namespace), redis.Z{Score: float64(newAtMs), Member: f.ID})
-					claimed = append(claimed, updated.toDoc())
-				}
+			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+				writeLock(ctx, pipe, g, next, now)
 				return nil
 			})
 			return err
-		}, watchKeys...)
-
+		}, lockKey(g))
 		if errors.Is(err, redis.TxFailedErr) {
+			if err := waitToRetry(ctx, attempt); err != nil {
+				return nil, fmt.Errorf("eqredis claim docs: %w", err)
+			}
 			continue
 		}
-		if depErr, ok := err.(*entroq.DependencyError); ok {
+		if err != nil {
+			return nil, fmt.Errorf("eqredis claim docs: %w", err)
+		}
+		members, err := groupMembers(ctx, e.client, g)
+		if err != nil {
+			return nil, fmt.Errorf("eqredis claim docs: %w", err)
+		}
+		if !ok {
+			depErr := &entroq.DependencyError{}
+			for _, d := range members {
+				depErr.DocClaims = append(depErr.DocClaims, entroq.NewDocID(d.Namespace, d.ID, current.Version))
+			}
 			return nil, depErr
 		}
-		if err != nil {
-			return nil, fmt.Errorf("claim docs watch: %w", err)
+		for i, d := range members {
+			members[i] = docgroup.Overlay(d, next)
 		}
-		return claimed, nil
+		return members, nil
 	}
-	return nil, fmt.Errorf("claimdocs max retries (%d) reached", maxClaimRetries)
+	return nil, fmt.Errorf("eqredis claim docs: too much contention on %q in %q", cq.Key, cq.Namespace)
 }

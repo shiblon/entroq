@@ -9,7 +9,8 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/pkg/backend/internal/limits"
+	"github.com/shiblon/entroq/pkg/backend/internal/docgroup"
+	"github.com/shiblon/entroq/pkg/backend/internal/validate"
 )
 
 // Modify atomically applies insertions, changes, deletions, and dependency
@@ -28,18 +29,17 @@ import (
 func (e *EQRedis) Modify(ctx context.Context, mod *entroq.Modification) (*entroq.ModifyResponse, error) {
 	// Reject writes to an empty queue/namespace once, before the WATCH/retry
 	// loop, so an empty queue is never written.
-	if err := mod.EnsureModifyKeys(); err != nil {
+	if err := validate.Modification(mod); err != nil {
 		return nil, fmt.Errorf("eqredis modify: %w", err)
 	}
-	if err := limits.Modification(mod); err != nil {
-		return nil, fmt.Errorf("eqredis modify: %w", err)
-	}
-	for {
+	for attempt := 0; ; attempt++ {
 		resp, err := e.modifyOnce(ctx, mod)
-		if errors.Is(err, redis.TxFailedErr) {
-			continue
+		if !errors.Is(err, redis.TxFailedErr) {
+			return resp, err
 		}
-		return resp, err
+		if err := waitToRetry(ctx, attempt); err != nil {
+			return nil, fmt.Errorf("eqredis modify: %w", err)
+		}
 	}
 }
 
@@ -96,6 +96,17 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 	for _, d := range mod.DocInserts {
 		if d.ID != "" {
 			watchKeys = append(watchKeys, docKey(d.Namespace, d.ID))
+		}
+	}
+	// Every write to a doc group writes its lock, so watching the lock
+	// serializes writers of a group. An insert's group is known now; the other
+	// operations' groups come from their stored docs, watched once read.
+	insertGroups := make(map[docgroup.Group]bool)
+	for _, d := range mod.DocInserts {
+		g := docgroup.Group{Namespace: d.Namespace, Key: d.Key}
+		if !insertGroups[g] {
+			insertGroups[g] = true
+			watchKeys = append(watchKeys, lockKey(g))
 		}
 	}
 
@@ -247,35 +258,44 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 				depErr.Inserts = append(depErr.Inserts, &entroq.TaskID{ID: t.ID, Version: st.fields.Version})
 			}
 		}
-		for _, d := range mod.DocDepends {
-			k := d.Namespace + "/" + d.ID
-			st := docStates[k]
-			if !st.found || st.fields.Version != d.Version {
-				depErr.DocDepends = append(depErr.DocDepends, &entroq.DocID{Namespace: d.Namespace, ID: d.ID, Version: d.Version})
+		// Doc groups follow the rules in docgroup, against each group's lock.
+		member := func(ns, id string) *entroq.Doc {
+			if st := docStates[ns+"/"+id]; st != nil && st.found {
+				return st.fields.toDoc()
+			}
+			return nil
+		}
+		groups := docgroup.Groups(mod, member)
+		var storedLockKeys []string
+		for _, g := range groups {
+			if !insertGroups[g] {
+				storedLockKeys = append(storedLockKeys, lockKey(g))
 			}
 		}
-		for _, d := range mod.DocDeletes {
-			k := d.Namespace + "/" + d.ID
-			st := docStates[k]
-			if !st.found || st.fields.Version != d.Version {
-				depErr.DocDeletes = append(depErr.DocDeletes, &entroq.DocID{Namespace: d.Namespace, ID: d.ID, Version: d.Version})
+		if len(storedLockKeys) > 0 {
+			if err := tx.Watch(ctx, storedLockKeys...).Err(); err != nil {
+				return fmt.Errorf("watch doc locks: %w", err)
 			}
 		}
-		for _, d := range mod.DocChanges {
-			k := d.Namespace + "/" + d.ID
-			st := docStates[k]
-			if !st.found || st.fields.Version != d.Version {
-				depErr.DocChanges = append(depErr.DocChanges, &entroq.DocID{Namespace: d.Namespace, ID: d.ID, Version: d.Version})
-			}
+		locks, err := readLocks(ctx, tx, groups)
+		if err != nil {
+			return err
 		}
-		for _, d := range mod.DocInserts {
-			if d.ID == "" {
-				continue
+		docPlan := docgroup.Evaluate(mod, now, member,
+			func(g docgroup.Group) docgroup.Lock { return locks[g] },
+		)
+		if merged := depErr.Merge(docPlan.Err); merged != nil {
+			depErr = merged
+		}
+		// withLock gives a written member its group's new lock, the only
+		// version and claim a member has.
+		withLock := func(f *docFields) {
+			g := docgroup.Group{Namespace: f.Namespace, Key: f.KeyPrimary}
+			l, ok := docPlan.Locks[g]
+			if !ok {
+				l = locks[g]
 			}
-			k := d.Namespace + "/" + d.ID
-			if st, ok := docStates[k]; ok && st.found {
-				depErr.DocInserts = append(depErr.DocInserts, &entroq.DocID{Namespace: d.Namespace, ID: d.ID, Version: st.fields.Version})
-			}
+			f.Version, f.Claimant, f.AtMs = l.Version, l.Claimant, l.At.UnixMilli()
 		}
 		if depErr.HasAny() {
 			return depErr
@@ -284,7 +304,7 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 		// Step 3: build and execute the MULTI block.
 		resp = entroq.ModifyResponse{}
 
-		_, err := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 			// Deletes: remove task hash, queue ZSET entry, and claimed ZSET entry.
 			for _, t := range dels {
 				st := states[t.id]
@@ -377,7 +397,6 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 				k := d.Namespace + "/" + d.ID
 				st := docStates[k]
 				pipe.Del(ctx, docKey(d.Namespace, d.ID))
-				pipe.ZRem(ctx, nsclaimedKey(d.Namespace), d.ID)
 				if st.found {
 					pipe.ZRem(ctx, docNSIndexKey(d.Namespace),
 						docIndexMember(st.fields.KeyPrimary, st.fields.KeySecondary, d.ID))
@@ -393,83 +412,45 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 				if id == "" {
 					id = entroq.GenHex16()
 				}
-				atMs := entroq.NormalizeArrival(dd.At, now).UnixMilli()
-				docClaimant := ""
-				if atMs > nowMs {
-					docClaimant = claimant
-				}
 				f := &docFields{
 					Namespace:    dd.Namespace,
 					ID:           id,
-					Version:      0,
-					Claimant:     docClaimant,
-					AtMs:         atMs,
 					KeyPrimary:   dd.Key,
 					KeySecondary: dd.SecondaryKey,
 					Content:      []byte(dd.Content),
 					Created:      nowMs,
 					Modified:     nowMs,
 				}
+				withLock(f)
 				pipe.HSet(ctx, docKey(dd.Namespace, id), f.toMap())
 				pipe.ZAdd(ctx, docNSIndexKey(dd.Namespace), redis.Z{
 					Score:  0,
 					Member: docIndexMember(dd.Key, dd.SecondaryKey, id),
 				})
 				pipe.SAdd(ctx, namespacesKey, dd.Namespace)
-				if atMs > nowMs {
-					pipe.ZAdd(ctx, nsclaimedKey(dd.Namespace), redis.Z{Score: float64(atMs), Member: id})
-				}
 				resp.InsertedDocs = append(resp.InsertedDocs, f.toDoc())
 			}
 
-			// Doc changes.
+			// Doc changes replace content; keys and Created belong to the stored
+			// doc, so its index entry does not move.
 			for _, d := range mod.DocChanges {
-				if err := validateDocKeys(d.Key, d.SecondaryKey); err != nil {
-					return err
-				}
-				k := d.Namespace + "/" + d.ID
-				st := docStates[k]
-				// Cap a far-past arrival to now (backend Modify contract), same as tasks.
-				newAtMs := entroq.NormalizeArrival(d.At, now).UnixMilli()
-				newClaimant := ""
-				if newAtMs > nowMs {
-					newClaimant = claimant
-				}
-				createdMs := nowMs
-				if st.found {
-					createdMs = st.fields.Created
-				}
+				st := docStates[d.Namespace+"/"+d.ID]
 				f := &docFields{
 					Namespace:    d.Namespace,
 					ID:           d.ID,
-					Version:      d.Version + 1,
-					Claimant:     newClaimant,
-					AtMs:         newAtMs,
-					KeyPrimary:   d.Key,
-					KeySecondary: d.SecondaryKey,
+					KeyPrimary:   st.fields.KeyPrimary,
+					KeySecondary: st.fields.KeySecondary,
 					Content:      []byte(d.Content),
-					Created:      createdMs,
+					Created:      st.fields.Created,
 					Modified:     nowMs,
 				}
+				withLock(f)
 				pipe.HSet(ctx, docKey(d.Namespace, d.ID), f.toMap())
-				// Update namespace index: remove old member if key changed, add new.
-				if st.found {
-					oldMember := docIndexMember(st.fields.KeyPrimary, st.fields.KeySecondary, d.ID)
-					newMember := docIndexMember(d.Key, d.SecondaryKey, d.ID)
-					if oldMember != newMember {
-						pipe.ZRem(ctx, docNSIndexKey(d.Namespace), oldMember)
-					}
-				}
-				pipe.ZAdd(ctx, docNSIndexKey(d.Namespace), redis.Z{
-					Score:  0,
-					Member: docIndexMember(d.Key, d.SecondaryKey, d.ID),
-				})
-				if newAtMs > nowMs {
-					pipe.ZAdd(ctx, nsclaimedKey(d.Namespace), redis.Z{Score: float64(newAtMs), Member: d.ID})
-				} else {
-					pipe.ZRem(ctx, nsclaimedKey(d.Namespace), d.ID)
-				}
 				resp.ChangedDocs = append(resp.ChangedDocs, f.toDoc())
+			}
+
+			for g, l := range docPlan.Locks {
+				writeLock(ctx, pipe, g, l, now)
 			}
 
 			return nil

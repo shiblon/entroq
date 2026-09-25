@@ -41,6 +41,9 @@ func (e *EQRedis) runGCLoop(ctx context.Context, interval time.Duration, batch i
 			if _, err := e.collectDocsOnce(ctx, batch); err != nil && ctx.Err() == nil {
 				log.Printf("eqredis gc collect docs: %v", err)
 			}
+			if _, err := e.collectLocksOnce(ctx, batch); err != nil && ctx.Err() == nil {
+				log.Printf("eqredis gc collect doc locks: %v", err)
+			}
 			if err := e.gc(ctx); err != nil {
 				if ctx.Err() == nil {
 					log.Printf("eqredis gc cleanup: %v", err)
@@ -87,7 +90,13 @@ func (e *EQRedis) gc(ctx context.Context) error {
 		if err != nil {
 			continue
 		}
-		if size == 0 {
+		// A namespace with doc group locks but no docs stays listed, so lock
+		// collection can still find it.
+		locks, err := e.client.SCard(ctx, lockIndexKey(ns)).Result()
+		if err != nil {
+			continue
+		}
+		if size == 0 && locks == 0 {
 			e.client.SRem(ctx, namespacesKey, ns)
 		}
 	}

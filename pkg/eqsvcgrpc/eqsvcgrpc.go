@@ -705,6 +705,11 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 	}
 	resp := new(pb.TasksResponse)
 	for _, task := range tasks {
+		// Backends already bind task IDs to their queue, but the service must
+		// not depend on that to keep a caller out of queues it cannot read.
+		if req.Queue != "" && task.Queue != req.Queue {
+			continue
+		}
 		pt, err := pbconv.TaskToProto(task)
 		if err != nil {
 			return nil, autoCodeErrorf("tasks task proto: %w", err)

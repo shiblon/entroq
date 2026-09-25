@@ -277,6 +277,12 @@ func (e *EQRedis) hydrate(ctx context.Context, ids []string, tq *entroq.TasksQue
 		if err != nil {
 			return nil, fmt.Errorf("tasks parse %q: %w", ids[i], err)
 		}
+		// A task named by ID belongs to the query only if it is in the queried
+		// queue. The service authorizes the query's queue, not each task's, so
+		// this check keeps a caller from reading other queues by ID.
+		if tq.Queue != "" && f.Queue != tq.Queue {
+			continue
+		}
 		if keep != nil && !keep(f) {
 			continue
 		}

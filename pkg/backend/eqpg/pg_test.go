@@ -189,6 +189,63 @@ func TestUpgradeDropsRetiredReadiness(t *testing.T) {
 	}
 }
 
+// TestUpgradeCreatesDocLocks puts a namespace back the way a schema before doc
+// group locks left it, per-doc versions and claims with no locks, then
+// reapplies the schema and checks that each group has a lock one version past
+// its highest member, with any claim released.
+func TestUpgradeCreatesDocLocks(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	client, err := pgClient(ctx)
+	if err != nil {
+		t.Fatalf("Open client: %v", err)
+	}
+	defer client.Close()
+	backend, err := Open(ctx, pgHostPort, WithDB("postgres"), WithUsername("postgres"), WithPassword("password"), WithConnectAttempts(10))
+	if err != nil {
+		t.Fatalf("Open backend: %v", err)
+	}
+	defer backend.Close()
+	db := backend.DB
+
+	ns := fmt.Sprintf("/test/upgrade-locks/%d", time.Now().UnixNano())
+	if _, err := client.Modify(ctx,
+		entroq.PuttingDocInto(ns, entroq.WithIDKeys("a", "k", "1")),
+		entroq.PuttingDocInto(ns, entroq.WithIDKeys("b", "k", "2")),
+		entroq.PuttingDocInto(ns, entroq.WithIDKeys("c", "other", "")),
+	); err != nil {
+		t.Fatalf("Insert docs: %v", err)
+	}
+	for _, stmt := range []string{
+		"DELETE FROM entroq.doc_locks WHERE namespace = $1",
+		"UPDATE entroq.docs SET version = 2 WHERE namespace = $1 AND id = 'a'",
+		"UPDATE entroq.docs SET version = 7, claimant = 'holder', at = now() + interval '1 hour' WHERE namespace = $1 AND id = 'b'",
+	} {
+		if _, err := db.ExecContext(ctx, stmt, ns); err != nil {
+			t.Fatalf("Simulate legacy state: %v\n%s", err, stmt)
+		}
+	}
+
+	if err := InitSchema(ctx, db); err != nil {
+		t.Fatalf("Reapply schema: %v", err)
+	}
+
+	docs, err := client.Docs(ctx, &entroq.DocQuery{Namespace: ns})
+	if err != nil || len(docs) != 3 {
+		t.Fatalf("Docs after upgrade: %v, %v", docs, err)
+	}
+	want := map[string]int32{"a": 8, "b": 8, "c": 1}
+	for _, d := range docs {
+		if d.Version != want[d.ID] || d.Claimant != "" {
+			t.Errorf("Upgraded doc %q: want version %d and no claimant, got version %d, claimant %q", d.ID, want[d.ID], d.Version, d.Claimant)
+		}
+	}
+	if _, err := client.Modify(ctx, docs[0].Change(entroq.WithContent("after"))); err != nil {
+		t.Errorf("Change after upgrade: %v", err)
+	}
+}
+
 func pgClient(ctx context.Context) (client *entroq.EntroQ, err error) {
 	return entroq.New(ctx, Opener(pgHostPort,
 		WithDB("postgres"),
@@ -381,6 +438,22 @@ func TestChangeKeepsStoredFields(t *testing.T) {
 
 func TestInsertKeepsAttemptAndErr(t *testing.T) {
 	RunQTest(t, eqtest.InsertKeepsAttemptAndErr)
+}
+
+func TestModifyRejectsDuplicateIDs(t *testing.T) {
+	RunQTest(t, eqtest.ModifyRejectsDuplicateIDs)
+}
+
+func TestModifyRespectsTaskClaims(t *testing.T) {
+	RunQTest(t, eqtest.ModifyRespectsTaskClaims)
+}
+
+func TestTasksWithIDStaysInQueue(t *testing.T) {
+	RunQTest(t, eqtest.TasksWithIDStaysInQueue)
+}
+
+func TestDocGroups(t *testing.T) {
+	RunQTest(t, eqtest.DocGroups)
 }
 
 func TestTaskChangeFarPastArrivalNormalized(t *testing.T) {
@@ -667,4 +740,64 @@ func TestModifyReportsAllFailureClasses(t *testing.T) {
 
 func TestModifyRejectsWrongNamespace(t *testing.T) {
 	RunQTest(t, eqtest.ModifyRejectsWrongNamespace)
+}
+
+// TestRunningInTxCommitsWithModify checks that caller work done through
+// RunningInTx commits or rolls back with the modification, including when the
+// modification fails in Go rather than in the database, which leaves the
+// transaction healthy enough to commit.
+func TestRunningInTxCommitsWithModify(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	b, err := Open(ctx, pgHostPort, WithDB("postgres"), WithUsername("postgres"), WithPassword("password"), WithConnectAttempts(10))
+	if err != nil {
+		t.Fatalf("Open backend: %v", err)
+	}
+	defer b.Close()
+	if _, err := b.DB.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS public.running_in_tx_test (id text PRIMARY KEY)`); err != nil {
+		t.Fatalf("Create table: %v", err)
+	}
+
+	prefix := entroq.GenHex16()
+	queue := "/test/running-in-tx/" + prefix
+	written := func(id string) bool {
+		t.Helper()
+		var n int
+		if err := b.DB.QueryRowContext(ctx, `SELECT count(*) FROM public.running_in_tx_test WHERE id = $1`, id).Scan(&n); err != nil {
+			t.Fatalf("Read caller row: %v", err)
+		}
+		return n == 1
+	}
+	modify := func(id string, fail error, args ...entroq.ModifyArg) error {
+		args = append(args, entroq.WithModifyOption(RunningInTx(func(ctx context.Context, tx *sql.Tx) error {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO public.running_in_tx_test (id) VALUES ($1)`, id); err != nil {
+				return err
+			}
+			return fail
+		})))
+		_, err := b.Modify(ctx, entroq.NewModification("me", args...))
+		return err
+	}
+
+	if err := modify(prefix+"-fails", errors.New("caller failed"), entroq.InsertingInto(queue)); err == nil {
+		t.Error("Modify with failing caller work: want an error")
+	}
+	if written(prefix + "-fails") {
+		t.Error("Caller work committed although the caller failed")
+	}
+
+	missing := entroq.NewDocID(queue, "missing", 0)
+	if err := modify(prefix+"-dep", nil, entroq.InsertingInto(queue), missing.Depend()); !entroq.IsDependency(err) {
+		t.Errorf("Modify depending on a missing doc: want a dependency error, got %v", err)
+	}
+	if written(prefix + "-dep") {
+		t.Error("Caller work committed although the modification failed a doc dependency")
+	}
+
+	if err := modify(prefix+"-ok", nil, entroq.InsertingInto(queue)); err != nil {
+		t.Fatalf("Modify: %v", err)
+	}
+	if !written(prefix + "-ok") {
+		t.Error("Caller work did not commit with a successful modification")
+	}
 }

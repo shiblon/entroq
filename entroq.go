@@ -1083,39 +1083,56 @@ func (m *Modification) EnsureModifyKeys() error {
 func (m *Modification) modDependencies() (tasks map[string]int32, docs map[string]int32, err error) {
 	tasks = make(map[string]int32)
 	for _, t := range m.Changes {
-		if _, ok := tasks[t.ID]; ok {
-			return nil, nil, fmt.Errorf("duplicates found in task dependencies")
+		if err := addTaskDep(tasks, t.ID, t.Version); err != nil {
+			return nil, nil, fmt.Errorf("modify task: %w", err)
 		}
-		tasks[t.ID] = t.Version
 	}
 	for _, t := range m.Deletes {
-		if _, ok := tasks[t.ID]; ok {
-			return nil, nil, fmt.Errorf("duplicates found in task dependencies")
+		if err := addTaskDep(tasks, t.ID, t.Version); err != nil {
+			return nil, nil, fmt.Errorf("modify task: %w", err)
 		}
-		tasks[t.ID] = t.Version
 	}
 	docs = make(map[string]int32)
 	for _, d := range m.DocChanges {
-		k := DocKey(d.Namespace, d.ID)
-		if _, ok := docs[k]; ok {
-			return nil, nil, fmt.Errorf("duplicates found in doc dependencies")
+		if err := addDocDep(docs, d.Namespace, d.ID, d.Version); err != nil {
+			return nil, nil, fmt.Errorf("modify doc: %w", err)
 		}
-		docs[k] = d.Version
 	}
 	for _, d := range m.DocDeletes {
-		k := DocKey(d.Namespace, d.ID)
-		if _, ok := docs[k]; ok {
-			return nil, nil, fmt.Errorf("duplicates found in doc dependencies")
+		if err := addDocDep(docs, d.Namespace, d.ID, d.Version); err != nil {
+			return nil, nil, fmt.Errorf("modify doc: %w", err)
 		}
-		docs[k] = d.Version
 	}
 	return tasks, docs, nil
 }
 
+// addTaskDep records a task ID's version, rejecting an ID already present:
+// one modification may name a task in only one operation.
+func addTaskDep(deps map[string]int32, id string, version int32) error {
+	if _, ok := deps[id]; ok {
+		return InvalidArgumentf("task %q appears in more than one operation of the modification", id)
+	}
+	deps[id] = version
+	return nil
+}
+
+// addDocDep is addTaskDep for docs, which are unique within a namespace.
+func addDocDep(deps map[string]int32, ns, id string, version int32) error {
+	k := DocKey(ns, id)
+	if _, ok := deps[k]; ok {
+		return InvalidArgumentf("doc %q in namespace %q appears in more than one operation of the modification", id, ns)
+	}
+	deps[k] = version
+	return nil
+}
+
 // AllDependencies returns dependency maps from ID to version for tasks and docs
-// that must exist and match version numbers. It returns an error if there are
-// duplicates. Changes, Deletions, Dependencies, and Insertions with IDs must be
-// disjoint sets within their respective types.
+// that must exist and match version numbers. It returns an InvalidArgumentError
+// if an ID appears in more than one operation: changes, deletions, depends,
+// and inserts with explicit IDs must be disjoint sets within their respective
+// types. That also rules out deleting and re-inserting an ID in one
+// modification, which would restart its version and let a stale holder of the
+// old one match the new one.
 //
 // When using this to query backend storage for presence, it is safe to ignore
 // the version if you use the DependencyError method to determine whether a
@@ -1124,39 +1141,33 @@ func (m *Modification) modDependencies() (tasks map[string]int32, docs map[strin
 func (m *Modification) AllDependencies() (tasks map[string]int32, docs map[string]int32, err error) {
 	tasks, docs, err = m.modDependencies()
 	if err != nil {
-		return nil, nil, fmt.Errorf("get dependencies: %w", err)
+		return nil, nil, fmt.Errorf("all dependencies: %w", err)
 	}
 	for _, t := range m.Depends {
-		if _, ok := tasks[t.ID]; ok {
-			return nil, nil, fmt.Errorf("duplicates found in task dependencies")
+		if err := addTaskDep(tasks, t.ID, t.Version); err != nil {
+			return nil, nil, fmt.Errorf("all dependencies: %w", err)
 		}
-		tasks[t.ID] = t.Version
 	}
 	for _, t := range m.Inserts {
 		if t.ID == "" {
 			continue
 		}
-		if _, ok := tasks[t.ID]; ok {
-			return nil, nil, fmt.Errorf("duplicates found in task dependencies")
+		if err := addTaskDep(tasks, t.ID, -1); err != nil {
+			return nil, nil, fmt.Errorf("all dependencies: %w", err)
 		}
-		tasks[t.ID] = -1
 	}
 	for _, d := range m.DocDepends {
-		k := DocKey(d.Namespace, d.ID)
-		if _, ok := docs[k]; ok {
-			return nil, nil, fmt.Errorf("duplicates found in doc dependencies")
+		if err := addDocDep(docs, d.Namespace, d.ID, d.Version); err != nil {
+			return nil, nil, fmt.Errorf("all dependencies: %w", err)
 		}
-		docs[k] = d.Version
 	}
 	for _, d := range m.DocInserts {
 		if d.ID == "" {
 			continue
 		}
-		k := DocKey(d.Namespace, d.ID)
-		if _, ok := docs[k]; ok {
-			return nil, nil, fmt.Errorf("duplicates found in doc dependencies")
+		if err := addDocDep(docs, d.Namespace, d.ID, -1); err != nil {
+			return nil, nil, fmt.Errorf("all dependencies: %w", err)
 		}
-		docs[k] = -1
 	}
 	return tasks, docs, nil
 }
@@ -1369,9 +1380,8 @@ func (m *DependencyError) HasMissing() bool {
 	return len(m.Depends) > 0 || len(m.Deletes) > 0 || len(m.Changes) > 0
 }
 
-// HasMissingDocs indicates whether any docs were missing (not claimed
-// by another, but actually absent). Used by workers to detect poison-pill tasks
-// whose required docs no longer exist.
+// HasMissingDocs indicates whether any docs a modification named were absent
+// or not at their group's version.
 func (m *DependencyError) HasMissingDocs() bool {
 	return len(m.DocDepends) > 0 || len(m.DocDeletes) > 0 || len(m.DocChanges) > 0
 }

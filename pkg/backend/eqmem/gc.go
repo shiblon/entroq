@@ -40,6 +40,9 @@ func (m *EQMem) runGCLoop(ctx context.Context, interval time.Duration, batch int
 			if _, err := m.collectDocsOnce(ctx, batch); err != nil && ctx.Err() == nil {
 				log.Printf("eqmem doc gc: %v", err)
 			}
+			if _, err := m.collectLocksOnce(ctx, batch); err != nil && ctx.Err() == nil {
+				log.Printf("eqmem doc lock gc: %v", err)
+			}
 			m.gcMetrics.Sweep(ctx, time.Since(start))
 		}
 	}

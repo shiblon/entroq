@@ -15,8 +15,9 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/backend/internal/docgroup"
 	"github.com/shiblon/entroq/pkg/backend/internal/gcmetrics"
-	"github.com/shiblon/entroq/pkg/backend/internal/limits"
+	"github.com/shiblon/entroq/pkg/backend/internal/validate"
 	"github.com/shiblon/entroq/pkg/subq"
 	"github.com/shiblon/stuffedio/wal"
 	"go.opentelemetry.io/otel/metric"
@@ -59,6 +60,11 @@ type EQMem struct {
 	journalDir      string
 	maxJournalBytes int64
 	maxJournalItems int
+
+	// staleDocReplays counts doc operations replay applied at a version other
+	// than the stored doc's; staleDocExamples names a few of them.
+	staleDocReplays  int
+	staleDocExamples []string
 
 	// outputSnapshot, if true, indicates tha the system should start up, read
 	// journals, and dump a snapshot before closing itself down.
@@ -210,45 +216,14 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 			wal.WithMaxJournalIndices(m.maxJournalItems),
 			wal.WithAllowWrite(!m.outputSnapshot),
 			wal.WithExcludeLiveJournal(m.outputSnapshot),
-			wal.WithSnapshotLoaderFunc(func(ctx context.Context, b []byte) error {
-				task := new(entroq.Task)
-				if err := json.Unmarshal(b, task); err != nil {
-					return fmt.Errorf("eqmem load task: %w", err)
-				}
-
-				qls, unlock := m.lockQueues([]string{task.Queue})
-				defer unlock()
-
-				m.queueUnsafeInsertTask(qls[0], task)
-
-				return nil
-			}),
-			wal.WithJournalPlayerFunc(func(ctx context.Context, b []byte) error {
-				mod := new(entroq.Modification)
-				if err := json.Unmarshal(b, mod); err != nil {
-					return fmt.Errorf("eqmem play mod: %w", err)
-				}
-
-				// Since changes represent the *final state* in the journal, we
-				// decrement the version number before attempting to apply the
-				// modification so the version-check in DependencyError passes.
-				for _, chg := range mod.Changes {
-					chg.Version--
-				}
-				for _, chg := range mod.DocChanges {
-					chg.Version--
-				}
-
-				if _, err := m.modifyImpl(ctx, mod, true); err != nil {
-					return fmt.Errorf("eqmem play mod: %w", err)
-				}
-				return nil
-			}),
+			wal.WithSnapshotLoaderFunc(m.loadSnapshotValue),
+			wal.WithJournalPlayerFunc(m.playJournalEntry),
 		}
 		var err error
 		if m.journal, err = wal.Open(ctx, m.journalDir, walOpts...); err != nil {
 			return nil, fmt.Errorf("open WAL: %w", err)
 		}
+		m.finishDocReplay()
 
 		// Now it's loaded. If we are to output a snapshot, then we create it
 		// here and close the whole system down.
@@ -292,6 +267,12 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 // TakeSnapshot brings the system up empty, loads a snapshot + journals,
 // then outputs a new snapshot and exits. Cleans up old files after
 // snapshotting if requested. Otherwise they are just moved out of the way.
+//
+// The snapshot covers every journal file except the live one, the file a
+// running server may still be appending to, which is left in place and
+// replayed after the snapshot on the next start. So a snapshot is safe to take
+// while a server is running, and the directory still needs that last journal
+// file: the snapshot alone does not hold the most recent changes.
 func TakeSnapshot(ctx context.Context, journalDir string, cleanup bool) error {
 	m, err := New(ctx, WithJournal(journalDir), withOutputSnapshot())
 	if err != nil {
@@ -306,23 +287,82 @@ func TakeSnapshot(ctx context.Context, journalDir string, cleanup bool) error {
 	return nil
 }
 
+// snapshotEntry marks a doc or a doc group lock in a snapshot. Tasks are
+// stored bare, as they were before snapshots held anything else, so an entry
+// with neither field is a task.
+type snapshotEntry struct {
+	Doc     *entroq.Doc  `json:"doc,omitempty"`
+	DocLock *journalLock `json:"doc_lock,omitempty"`
+}
+
+// loadSnapshotValue restores one snapshot entry: a task, a doc, or a lock.
+func (m *EQMem) loadSnapshotValue(_ context.Context, b []byte) error {
+	var se snapshotEntry
+	if err := json.Unmarshal(b, &se); err != nil {
+		return fmt.Errorf("eqmem load snapshot entry: %w", err)
+	}
+	if d := se.Doc; d != nil {
+		nls, unlock := m.lockNamespaces([]string{d.Namespace})
+		defer unlock()
+		nls[0].docs.Set(d.ID, d)
+		return nil
+	}
+	if se.DocLock != nil {
+		m.restoreLocks([]journalLock{*se.DocLock})
+		return nil
+	}
+
+	task := new(entroq.Task)
+	if err := json.Unmarshal(b, task); err != nil {
+		return fmt.Errorf("eqmem load task: %w", err)
+	}
+	qls, unlock := m.lockQueues([]string{task.Queue})
+	defer unlock()
+	m.queueUnsafeInsertTask(qls[0], task)
+	return nil
+}
+
+// makeSnapshot writes every task and doc. It runs during startup, after
+// journal replay and before any client can reach the backend, so it reads
+// without locks.
 func (m *EQMem) makeSnapshot(a wal.ValueAdder) error {
+	add := func(v any) error {
+		b, err := json.Marshal(v)
+		if err != nil {
+			return fmt.Errorf("marshal for snapshot: %w", err)
+		}
+		if err := a.AddValue(b); err != nil {
+			return fmt.Errorf("add value: %w", err)
+		}
+		return nil
+	}
+
 	var err error
 	for _, ts := range m.queues {
 		ts.Range(func(_ string, t *entroq.Task) bool {
-			var b []byte
-			if b, err = json.Marshal(t); err != nil {
-				err = fmt.Errorf("marshal for snapshot: %w", err)
-				return false
-			}
-			if err = a.AddValue(b); err != nil {
-				err = fmt.Errorf("add value: %w", err)
-				return false
-			}
-			return true
+			err = add(t)
+			return err == nil
 		})
+		if err != nil {
+			return err
+		}
 	}
-	return err
+	for name, ns := range m.namespaces {
+		for _, d := range ns.byID {
+			if err := add(snapshotEntry{Doc: d}); err != nil {
+				return err
+			}
+		}
+		ns.locks.Ascend(func(e lockEntry) bool {
+			jl := newJournalLock(docgroup.Group{Namespace: name, Key: e.Key}, e.Lock)
+			err = add(snapshotEntry{DocLock: &jl})
+			return err == nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (m *EQMem) queueLen(q string) int {
@@ -407,7 +447,7 @@ func (m *EQMem) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task,
 // TryClaim attempts to claim a task from the given queue query. If no task is
 // available, returns nil (not an error).
 func (m *EQMem) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
-	if err := limits.Claimant(cq.Claimant); err != nil {
+	if err := validate.Claimant(cq.Claimant); err != nil {
 		return nil, fmt.Errorf("eqmem claim: %w", err)
 	}
 	start := time.Now()
@@ -625,13 +665,10 @@ func (m *EQMem) queueUnsafeUpdateTask(ql *qLock, t *entroq.Task) func() {
 }
 
 func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (*entroq.ModifyResponse, error) {
-	// Reject writes to an empty queue/namespace on the live path. Journal replay
-	// goes straight to modifyImpl and skips this: it is trusted and its ops
-	// already carry valid keys.
-	if err := mod.EnsureModifyKeys(); err != nil {
-		return nil, fmt.Errorf("eqmem modify: %w", err)
-	}
-	if err := limits.Modification(mod); err != nil {
+	// Validate on the live path only. Journal replay goes straight to
+	// modifyImpl and skips this: it is trusted, and a journal written before a
+	// check existed must still load.
+	if err := validate.Modification(mod); err != nil {
 		return nil, fmt.Errorf("eqmem modify: %w", err)
 	}
 	start := time.Now()
@@ -759,27 +796,33 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 		addFoundDoc(t.Namespace, t.ID)
 	}
 
+	now, err := m.Time(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("modify get time: %w", err)
+	}
+
+	// Tasks are checked by the modification with its doc operations removed;
+	// doc groups follow their own rules, in docgroup. Replay applies recorded
+	// doc state without checking it: journals written before doc groups had
+	// locks carry per-doc versions that no longer match.
+	taskMod := *mod
+	taskMod.DocInserts, taskMod.DocChanges, taskMod.DocDeletes, taskMod.DocDepends = nil, nil, nil, nil
 	var foundDeps *entroq.DependencyError
-	if err := mod.DependencyError(found, foundDocs); err != nil {
+	if err := taskMod.DependencyError(found, nil); err != nil {
 		fd, ok := entroq.AsDependency(err)
 		if !ok {
 			return nil, fmt.Errorf("eqmem modify: %w", err)
 		}
 		foundDeps = fd
 	}
-	// Documents inserted by eqmem before v1.12.1 began at v1. Their journaled
-	// first change therefore carries final version v2, which the player above
-	// presents here as predecessor v1. New replay reconstructs that versionless
-	// insert at v0. Accept exactly that one-version ambiguity on trusted replay;
-	// applying the recorded change still restores its historical final version
-	// v2, after which later changes use ordinary exact version matching.
-	if replay && foundDeps != nil {
-		foundDeps.DocChanges = slices.DeleteFunc(foundDeps.DocChanges, func(failed *entroq.DocID) bool {
-			foundDoc, ok := foundDocs[entroq.DocKey(failed.Namespace, failed.ID)]
-			return ok && foundDoc.Version == 0 && failed.Version == 1
-		})
-		if !foundDeps.HasAny() {
-			foundDeps = nil
+	var docPlan docgroup.Plan
+	if !replay {
+		docPlan = docgroup.Evaluate(mod, now,
+			func(ns, id string) *entroq.Doc { return foundDocs[entroq.DocKey(ns, id)] },
+			func(g docgroup.Group) docgroup.Lock { return byNS[g.Namespace].docs.Lock(g.Key) },
+		)
+		if docPlan.Err != nil {
+			foundDeps = foundDeps.Merge(docPlan.Err)
 		}
 	}
 	// Merge the queue-integrity failures (computed under the global lock in
@@ -824,11 +867,6 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 	}
 	deleteResID := func(ns, id string) {
 		byNS[ns].docs.Delete(id)
-	}
-
-	now, err := m.Time(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("modify get time: %w", err)
 	}
 
 	for _, d := range mod.Deletes {
@@ -890,37 +928,40 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 		resp.InsertedTasks = append(resp.InsertedTasks, newTask)
 	}
 
+	// Each written member carries its group's new lock, the only version and
+	// claim a member has. Replay restores stored docs as journaled and restores
+	// locks separately, from the same journal entry.
+	withLock := func(d *entroq.Doc) {
+		if replay {
+			return
+		}
+		l, ok := docPlan.Locks[docgroup.Group{Namespace: d.Namespace, Key: d.Key}]
+		if !ok {
+			l = byNS[d.Namespace].docs.Lock(d.Key)
+		}
+		d.Version, d.Claimant, d.At = l.Version, l.Claimant, l.At
+	}
 	for _, d := range mod.DocDeletes {
 		deleteResID(d.Namespace, d.ID)
 	}
 	for _, c := range mod.DocChanges {
 		newRes := c.Copy()
-		newRes.Version++
-		// Created belongs to the backend, as for tasks above.
-		if !replay {
-			newRes.Created = foundDocs[entroq.DocKey(c.Namespace, c.ID)].Created
+		// Keys and Created belong to the stored doc: a change replaces content.
+		if stored := foundDocs[entroq.DocKey(c.Namespace, c.ID)]; stored != nil {
+			newRes.Key, newRes.SecondaryKey, newRes.Created = stored.Key, stored.SecondaryKey, stored.Created
 		}
-		// Cap a far-past arrival to now (backend Modify contract), same as tasks.
-		newRes.At = entroq.NormalizeArrival(newRes.At, now)
-		// Claim/renew if requested.At is in the future; release otherwise.
-		if newRes.At.After(now) {
-			newRes.Claimant = mod.Claimant
-		} else {
-			newRes.Claimant = ""
+		if replay {
+			// The journal player presented the change at its predecessor version.
+			newRes.Version++
 		}
 		if !replay || newRes.Modified.IsZero() {
 			newRes.Modified = now
 		}
+		withLock(newRes)
 		setRes(newRes)
 		resp.ChangedDocs = append(resp.ChangedDocs, newRes)
 	}
 	for _, rd := range mod.DocInserts {
-		id := rd.ID
-		at := entroq.NormalizeArrival(rd.At, now)
-		claimant := ""
-		if at.After(now) {
-			claimant = mod.Claimant
-		}
 		created := rd.Created
 		if created.IsZero() {
 			created = now
@@ -931,18 +972,20 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 		}
 		newRes := &entroq.Doc{
 			Namespace:    rd.Namespace,
-			ID:           id,
-			Version:      0,
-			At:           at,
+			ID:           rd.ID,
+			At:           rd.At,
 			Content:      rd.Content,
 			Key:          rd.Key,
 			SecondaryKey: rd.SecondaryKey,
-			Claimant:     claimant,
 			Created:      created,
 			Modified:     modified,
 		}
+		withLock(newRes)
 		setRes(newRes)
 		resp.InsertedDocs = append(resp.InsertedDocs, newRes)
+	}
+	for g, l := range docPlan.Locks {
+		byNS[g.Namespace].docs.SetLock(g.Key, l)
 	}
 
 	func() {
@@ -975,12 +1018,8 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 		for _, ins := range resp.InsertedDocs {
 			jMod.DocInserts = append(jMod.DocInserts, ins.Data())
 		}
-		b, err := json.Marshal(jMod)
-		if err != nil {
-			log.Fatalf("Inconsistent internal state: modification succeeded but could not marshal JSON: %v", err)
-		}
-		if err := m.journal.Append(b); err != nil {
-			log.Fatalf("Inconsistent internal state: modification succeeded but could not append to journal: %v", err)
+		if err := m.appendJournal(journalEntry{Modification: jMod, DocLocks: journalLocksOf(docPlan.Locks)}); err != nil {
+			log.Fatalf("Inconsistent internal state: modification succeeded but could not be journaled: %v", err)
 		}
 	}
 

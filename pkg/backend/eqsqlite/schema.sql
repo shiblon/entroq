@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS entroq_meta (
     schema_version INTEGER NOT NULL
 );
 
-INSERT OR IGNORE INTO entroq_meta (id, schema_version) VALUES (1, 2);
+INSERT OR IGNORE INTO entroq_meta (id, schema_version) VALUES (1, 3);
 
 -- Length limits count bytes (octet_length), matching the PostgreSQL schema.
 -- SQLite's length() counts characters and stops at the first NUL, so it both
@@ -53,3 +53,19 @@ CREATE INDEX IF NOT EXISTS docs_namespace_keys
 
 CREATE INDEX IF NOT EXISTS docs_namespace_at
     ON docs (namespace, at_ms, id);
+
+-- Each doc group (the docs sharing a primary key in a namespace) has one lock
+-- holding the only version, claimant, and arrival time its members have. A
+-- group can be claimed before it has docs, so locks are kept apart from docs;
+-- the docs table's version, claimant, and at_ms columns are no longer read.
+CREATE TABLE IF NOT EXISTS doc_locks (
+    namespace   TEXT NOT NULL COLLATE BINARY,
+    key_primary TEXT NOT NULL COLLATE BINARY,
+    version     INTEGER NOT NULL,
+    claimant    TEXT NOT NULL COLLATE BINARY,
+    at_ms       INTEGER NOT NULL,
+    PRIMARY KEY (namespace, key_primary),
+    CHECK (octet_length(namespace) <= 1024),
+    CHECK (octet_length(key_primary) <= 256),
+    CHECK (octet_length(claimant) <= 64)
+);

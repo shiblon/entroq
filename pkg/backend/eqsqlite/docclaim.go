@@ -6,11 +6,14 @@ import (
 	"fmt"
 
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/pkg/backend/internal/limits"
+	"github.com/shiblon/entroq/pkg/backend/internal/docgroup"
+	"github.com/shiblon/entroq/pkg/backend/internal/validate"
 )
 
-// ClaimDocs claims all docs with the requested primary key in a namespace.
-// It returns a DependencyError if another claimant holds any matching doc.
+// ClaimDocs claims the group of docs sharing the requested primary key in a
+// namespace and returns its members, which may be none: a group can be claimed
+// before it has docs. It returns a DependencyError listing the members while
+// someone else holds the group.
 func (b *EQSQLite) ClaimDocs(ctx context.Context, q *entroq.DocClaim) ([]*entroq.Doc, error) {
 	if q == nil {
 		return nil, fmt.Errorf("eqsqlite claim docs: nil query")
@@ -18,7 +21,7 @@ func (b *EQSQLite) ClaimDocs(ctx context.Context, q *entroq.DocClaim) ([]*entroq
 	if err := q.Validate(); err != nil {
 		return nil, fmt.Errorf("eqsqlite claim docs: %w", err)
 	}
-	if err := limits.DocClaim(q); err != nil {
+	if err := validate.DocClaim(q); err != nil {
 		return nil, fmt.Errorf("eqsqlite claim docs: %w", err)
 	}
 	value, err := b.write(ctx, func(ctx context.Context, tx *sql.Tx) (any, error) {
@@ -43,29 +46,26 @@ func (b *EQSQLite) ClaimDocs(ctx context.Context, q *entroq.DocClaim) ([]*entroq
 		if err != nil {
 			return nil, err
 		}
-		depErr := &entroq.DependencyError{}
-		for _, doc := range docs {
-			if heldDoc(doc, q.Claimant, now) {
-				depErr.DocClaims = append(depErr.DocClaims, doc.IDVersion())
-			}
+
+		g := docgroup.Group{Namespace: q.Namespace, Key: q.Key}
+		locks, err := loadDocLocks(ctx, tx, []docgroup.Group{g})
+		if err != nil {
+			return nil, err
 		}
-		if depErr.HasAny() {
+		current := lockOf(locks, g)
+		claimed, ok := docgroup.Claim(current, q.Claimant, now, q.Duration)
+		if !ok {
+			depErr := &entroq.DependencyError{}
+			for _, doc := range docs {
+				depErr.DocClaims = append(depErr.DocClaims, entroq.NewDocID(doc.Namespace, doc.ID, current.Version))
+			}
 			return nil, depErr
 		}
-		at := now.Add(q.Duration)
-		for _, doc := range docs {
-			doc.Version++
-			doc.Claimant = q.Claimant
-			doc.At = at
-			doc.Modified = now
+		if err := saveDocLocks(ctx, tx, map[docgroup.Group]docgroup.Lock{g: claimed}); err != nil {
+			return nil, err
 		}
-		if len(docs) > 0 {
-			if _, err := tx.ExecContext(ctx, `UPDATE docs
-					SET version = version + 1, claimant = ?, at_ms = ?, modified_ms = ?
-					WHERE namespace = ? AND key_primary = ?`,
-				q.Claimant, at.UnixMilli(), now.UnixMilli(), q.Namespace, q.Key); err != nil {
-				return nil, err
-			}
+		for i, doc := range docs {
+			docs[i] = docgroup.Overlay(doc, claimed)
 		}
 		return docs, nil
 	})

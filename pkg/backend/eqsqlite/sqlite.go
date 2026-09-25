@@ -23,7 +23,7 @@ import (
 )
 
 // SchemaVersion is the current database schema version.
-const SchemaVersion = 2
+const SchemaVersion = 3
 
 //go:embed schema.sql
 var schemaSQL string
@@ -214,6 +214,12 @@ func openWriteDB(ctx context.Context, path string, timeout time.Duration) (_ *sq
 		}
 		schemaVersion = 2
 	}
+	if schemaVersion == 2 {
+		if err := migrateV2ToV3(ctx, conn); err != nil {
+			return nil, fmt.Errorf("migrate schema 2 to 3: %w", err)
+		}
+		schemaVersion = 3
+	}
 	if schemaVersion != SchemaVersion {
 		return nil, fmt.Errorf("schema version %d, backend requires %d", schemaVersion, SchemaVersion)
 	}
@@ -250,6 +256,32 @@ func migrateV1ToV2(ctx context.Context, conn *sql.Conn) (err error) {
 		if _, err := tx.ExecContext(ctx, step.sql); err != nil {
 			return fmt.Errorf("%s: %w", step.name, err)
 		}
+	}
+	return tx.Commit()
+}
+
+// migrateV2ToV3 gives every existing doc group a lock. Before version 3 each
+// doc carried its own version and claim; a group's lock starts one version past
+// its highest member, so any version read before the migration is stale.
+// Claims held at migration time are released.
+func migrateV2ToV3(ctx context.Context, conn *sql.Conn) (err error) {
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, tx.Rollback())
+		}
+	}()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO doc_locks (namespace, key_primary, version, claimant, at_ms)
+		SELECT namespace, key_primary, max(version) + 1, '', ? FROM docs
+		GROUP BY namespace, key_primary
+		ON CONFLICT (namespace, key_primary) DO NOTHING`, nowUTC().UnixMilli()); err != nil {
+		return fmt.Errorf("create doc group locks: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE entroq_meta SET schema_version = 3 WHERE id = 1"); err != nil {
+		return fmt.Errorf("stamp version: %w", err)
 	}
 	return tx.Commit()
 }

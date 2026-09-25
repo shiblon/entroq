@@ -541,10 +541,10 @@ func WithDoModify[T any](f DoModifyRun[T]) Option[T] {
 }
 
 // WithTakeDocs sets the doc acquisition function. Before work begins, this
-// function is called with the claimed task to declare which docs are needed.
-// Required docs that are missing cause the task to be treated as a poison pill
-// (moved to the error queue). Required docs claimed by another worker cause a
-// backoff-and-retry
+// function is called with the claimed task to declare which doc groups are
+// needed. A group claimed by another worker causes a backoff-and-retry. A
+// group may have no docs yet; the handler decides what an empty group means,
+// and can return a MoveError if it should have had some.
 //
 // When used with WithMakeHandler, the handler's TakeDocs method takes
 // precedence and WithTakeDocs has no effect.
@@ -640,9 +640,8 @@ func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, ta
 // It calls the provided take function to learn what is needed, then claims
 // ownership of those documents.
 //
-// Returns a *entroq.DependencyError if claiming failed; the caller inspects
-// HasMissingDocs vs HasClaimedDocs to decide whether to retry or move the
-// task to the error queue.
+// Returns a *entroq.DependencyError while another claimant holds a group; the
+// caller retries the task with backoff.
 func acquireDocs[T any](ctx context.Context, eqc *entroq.EntroQ, task *entroq.Task, value T, lease time.Duration, take TakeRun[T]) ([]*entroq.Doc, error) {
 	if take == nil {
 		return nil, nil
@@ -727,17 +726,12 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt, slot *workerSlot) 
 	// doc groups are acquired.
 	docs, err := acquireDocs(rCtx, w.eqc, task, value, opts.lease, handler.TakeDocs)
 	if err != nil {
-		if de, ok := entroq.AsDependency(err); ok {
-			var sentinelErr error
-			if de.HasMissingDocs() {
-				sentinelErr = MoveErrorf("required doc missing")
-				outcome = outcomeMoved
-			} else {
-				sentinelErr = RetryErrorf("doc contention")
-				outcome = outcomeRetried
-			}
+		// A claim fails only while someone else holds the group, which is
+		// transient: retry with backoff.
+		if _, ok := entroq.AsDependency(err); ok {
+			outcome = outcomeRetried
 			errQ := w.ErrorQueueFor(task.Queue)
-			if _, herr := w.handleSentinelErrors(ctx, sentinelErr, task, errQ, opts); herr != nil {
+			if _, herr := w.handleSentinelErrors(ctx, RetryErrorf("doc contention"), task, errQ, opts); herr != nil {
 				return fmt.Errorf("handle sentinel error: %w", herr)
 			}
 			return nil

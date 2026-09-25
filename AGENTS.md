@@ -40,9 +40,9 @@ Read these before changing any client worker:
 - `worker.DefaultErrQMap` — the default error queue is `<inbox>/err`, and
   `WithErrQMap` computes it per inbox. A move with no destination falls back to
   it; it never becomes a no-op.
-- `acquireDocs` — a missing doc is a poison pill (move); a doc claimed by
-  someone else is transient (retry with backoff). Both are recorded on the task,
-  not just logged.
+- `acquireDocs` — a doc group held by someone else is transient (retry with
+  backoff), recorded on the task, not just logged. A group with no docs claims
+  normally and returns none; the handler decides what an empty group means.
 - `DependencyError` (`entroq.go`) — task and doc failures are separate fields.
   A `ModifyDep` carries either `id` or `doc_id`; a decoder that reads only `id`
   silently discards every doc dependency.

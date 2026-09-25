@@ -37,14 +37,14 @@ func (m *EQMem) NamespaceStats(ctx context.Context, qq *entroq.MatchQuery) (map[
 		}
 		// Clone under the namespace lock, then iterate the snapshot lock-free.
 		e.nl.Lock()
-		snap := e.nl.docs.snapshot()
+		snap, locks := e.nl.docs.snapshot()
 		e.nl.Unlock()
 
+		// A doc is claimed while its group is held.
 		stat := &entroq.NamespaceStat{Name: e.name}
 		snap.Ascend(func(entry docKeyEntry) bool {
-			d := entry.Doc
 			stat.Size++
-			if d.At.After(now) && d.Claimant != "" {
+			if lockIn(locks, entry.Key).Held(now) {
 				stat.Claimed++
 			}
 			return true

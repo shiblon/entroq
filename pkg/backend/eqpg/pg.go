@@ -28,7 +28,7 @@ import (
 	"github.com/lib/pq"
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/backend/internal/gcmetrics"
-	"github.com/shiblon/entroq/pkg/backend/internal/limits"
+	"github.com/shiblon/entroq/pkg/backend/internal/validate"
 	"github.com/shiblon/entroq/pkg/subq"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
@@ -600,7 +600,7 @@ func (b *EQPG) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 	if cq.Duration == 0 {
 		return nil, fmt.Errorf("no duration set for claim %q", cq.Queues)
 	}
-	if err := limits.Claimant(cq.Claimant); err != nil {
+	if err := validate.Claimant(cq.Claimant); err != nil {
 		return nil, fmt.Errorf("eqpg claim: %w", err)
 	}
 	start := time.Now()
@@ -662,6 +662,10 @@ func (modOpt) IsModifyBackend(b entroq.Backend) error {
 // RunningInTx returns an entroq.ModifyOption that signals to this backend
 // to run f inside the Modify transaction.
 //
+// Experimental: it may change or be removed. It predates docs, which now keep
+// state that must change atomically with tasks on every backend, including
+// through the service; prefer them.
+//
 // Important: the callback is responsible for managing any rows returned,
 // including closing them before the callback completes.
 func RunningInTx(f func(context.Context, *sql.Tx) error) entroq.ModifyOption {
@@ -675,10 +679,7 @@ func RunningInTx(f func(context.Context, *sql.Tx) error) entroq.ModifyOption {
 func (b *EQPG) Modify(ctx context.Context, mod *entroq.Modification) (*entroq.ModifyResponse, error) {
 	// Reject writes to an empty queue/namespace before touching the database, so
 	// an empty queue is never written.
-	if err := mod.EnsureModifyKeys(); err != nil {
-		return nil, fmt.Errorf("eqpg modify: %w", err)
-	}
-	if err := limits.Modification(mod); err != nil {
+	if err := validate.Modification(mod); err != nil {
 		return nil, fmt.Errorf("eqpg modify: %w", err)
 	}
 	start := time.Now()
@@ -738,18 +739,12 @@ func (b *EQPG) modifyHandlingRetriable(ctx context.Context, doModify func() (*en
 // dependencies, checks versions, and performs all inserts/changes/deletes in
 // one round trip. Returns a DependencyError (SQLSTATE EQ001) if any
 // dependency constraint is violated.
-func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *modifyConfig) (*entroq.ModifyResponse, error) {
+func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *modifyConfig) (resp *entroq.ModifyResponse, err error) {
 	// Build parallel arrays for task operation set.
 	depIDs, depVers, depQueues := taskIDArrays(mod.Depends)
 	delIDs, delVers, delQueues := taskIDArrays(mod.Deletes)
 	insIDs, insQueues, insAts, insValues, insAttempts, insErrs := insertArrays(mod.Inserts)
 	chgIDs, chgVers, chgFromQueues, chgQueues, chgAts, chgValues, chgAttempts, chgErrs := changeArrays(mod.Changes)
-
-	// Build parallel arrays for resource operation set.
-	rDepNS, rDepIDs, rDepVers := resourceIDArrays(mod.DocDepends)
-	rDelNS, rDelIDs, rDelVers := resourceIDArrays(mod.DocDeletes)
-	rInsNS, rInsIDs, rInsPKeys, rInsSKeys, rInsValues, rInsAts := resourceInsertArrays(mod.DocInserts)
-	rChgNS, rChgIDs, rChgVers, rChgPKeys, rChgSKeys, rChgValues, rChgAts := resourceChangeArrays(mod.DocChanges)
 
 	if options == nil {
 		options = &modifyConfig{}
@@ -766,7 +761,7 @@ func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *mo
 			}
 		} else {
 			if cmErr := tx.Commit(); cmErr != nil {
-				err = fmt.Errorf("pg modify commit failed: %w", cmErr)
+				resp, err = nil, fmt.Errorf("pg modify commit failed: %w", cmErr)
 			}
 		}
 	}()
@@ -778,45 +773,11 @@ func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *mo
 		}
 	}
 
-	resp := new(entroq.ModifyResponse)
+	resp = new(entroq.ModifyResponse)
 
-	// Resource modifications.
-	if len(rDepIDs)+len(rDelIDs)+len(rInsIDs)+len(rChgIDs) > 0 {
-		rRows, err := tx.QueryContext(ctx, `
-			SELECT kind, namespace, id, version, claimant, at, key_primary, key_secondary, value, created, modified
-			FROM _modify_docs(
-				$1,
-				$2::text[], $3::text[], $4::integer[],
-				$5::text[], $6::text[], $7::integer[],
-				$8::text[], $9::text[], $10::text[], $11::text[], $12::text[], $13::timestamptz[],
-				$14::text[], $15::text[], $16::integer[], $17::text[], $18::text[], $19::text[], $20::timestamptz[]
-			)`,
-			mod.Claimant,
-			pq.Array(rDepNS), pq.Array(rDepIDs), pq.Array(rDepVers),
-			pq.Array(rDelNS), pq.Array(rDelIDs), pq.Array(rDelVers),
-			pq.Array(rInsNS), pq.Array(rInsIDs), pq.Array(rInsPKeys), pq.Array(rInsSKeys), pq.Array(rInsValues), pq.Array(rInsAts),
-			pq.Array(rChgNS), pq.Array(rChgIDs), pq.Array(rChgVers), pq.Array(rChgPKeys), pq.Array(rChgSKeys), pq.Array(rChgValues), pq.Array(rChgAts),
-		)
-		if err != nil {
-			return nil, parseModifyDocsError(err, mod)
-		}
-		defer rRows.Close()
-
-		for rRows.Next() {
-			r := new(entroq.Doc)
-			var kind string
-			var val []byte
-			if err := rRows.Scan(&kind, &r.Namespace, &r.ID, &r.Version, &r.Claimant, &r.At, &r.Key, &r.SecondaryKey, &val, &r.Created, &r.Modified); err != nil {
-				return nil, fmt.Errorf("pg modify resource scan: %w", err)
-			}
-			r.Content = val
-			switch kind {
-			case "inserted":
-				resp.InsertedDocs = append(resp.InsertedDocs, r)
-			case "changed":
-				resp.ChangedDocs = append(resp.ChangedDocs, r)
-			}
-		}
+	// Doc modifications, by the rules in docgroup.
+	if err := modifyDocs(ctx, tx, mod, resp); err != nil {
+		return nil, err
 	}
 
 	// Task modifications.
@@ -882,6 +843,10 @@ func parseModifyError(err error, mod *entroq.Modification) error {
 			ID      string `json:"id"`
 			Version int32  `json:"version"`
 		} `json:"mismatched"`
+		Claimed []struct {
+			ID      string `json:"id"`
+			Version int32  `json:"version"`
+		} `json:"claimed"`
 		Collisions []struct {
 			ID      string `json:"id"`
 			Version int32  `json:"version"`
@@ -921,79 +886,11 @@ func parseModifyError(err error, mod *entroq.Modification) error {
 	for _, m := range detail.Mismatched {
 		categorize(m.ID, m.Version)
 	}
+	for _, c := range detail.Claimed {
+		depErr.Claims = append(depErr.Claims, &entroq.TaskID{ID: c.ID, Version: c.Version})
+	}
 	for _, c := range detail.Collisions {
 		depErr.Inserts = append(depErr.Inserts, &entroq.TaskID{ID: c.ID, Version: c.Version})
-	}
-
-	return depErr
-}
-
-// parseModifyDocsError converts an EQ001 PostgreSQL error from _modify_docs
-// into a DependencyError with doc fields populated. The doc error JSON uses
-// {ns, id, version} for missing/mismatched and {ns, id} for collisions,
-// unlike the task error which uses {id, version}. Other errors are returned unchanged.
-func parseModifyDocsError(err error, mod *entroq.Modification) error {
-	if err == nil {
-		return nil
-	}
-	pgerr := new(pq.Error)
-	if !errors.As(err, &pgerr) || string(pgerr.Code) != "EQ001" {
-		return err
-	}
-
-	var detail struct {
-		Missing []struct {
-			NS      string `json:"ns"`
-			ID      string `json:"id"`
-			Version int32  `json:"version"`
-		} `json:"missing"`
-		Mismatched []struct {
-			NS      string `json:"ns"`
-			ID      string `json:"id"`
-			Version int32  `json:"version"`
-		} `json:"mismatched"`
-		Collisions []struct {
-			NS string `json:"ns"`
-			ID string `json:"id"`
-		} `json:"collisions"`
-	}
-	if jsonErr := json.Unmarshal([]byte(pgerr.Detail), &detail); jsonErr != nil {
-		return fmt.Errorf("pg modify docs EQ001 with unparseable detail %q: %w", pgerr.Detail, err)
-	}
-
-	// Build lookup sets to categorize (namespace, id) pairs by operation.
-	dependKeys := make(map[string]bool, len(mod.DocDepends))
-	for _, d := range mod.DocDepends {
-		dependKeys[entroq.DocKey(d.Namespace, d.ID)] = true
-	}
-	deleteKeys := make(map[string]bool, len(mod.DocDeletes))
-	for _, d := range mod.DocDeletes {
-		deleteKeys[entroq.DocKey(d.Namespace, d.ID)] = true
-	}
-
-	depErr := new(entroq.DependencyError)
-
-	categorize := func(ns, id string, version int32) {
-		did := &entroq.DocID{Namespace: ns, ID: id, Version: version}
-		k := entroq.DocKey(ns, id)
-		switch {
-		case dependKeys[k]:
-			depErr.DocDepends = append(depErr.DocDepends, did)
-		case deleteKeys[k]:
-			depErr.DocDeletes = append(depErr.DocDeletes, did)
-		default:
-			depErr.DocChanges = append(depErr.DocChanges, did)
-		}
-	}
-
-	for _, m := range detail.Missing {
-		categorize(m.NS, m.ID, m.Version)
-	}
-	for _, m := range detail.Mismatched {
-		categorize(m.NS, m.ID, m.Version)
-	}
-	for _, c := range detail.Collisions {
-		depErr.DocInserts = append(depErr.DocInserts, &entroq.DocID{Namespace: c.NS, ID: c.ID})
 	}
 
 	return depErr
@@ -1080,46 +977,6 @@ func resourceIDArrays(rids []*entroq.DocID) (ns, ids []string, versions []int32)
 	return
 }
 
-// resourceInsertArrays splits a slice of ResourceData into parallel arrays.
-func resourceInsertArrays(inserts []*entroq.DocData) (ns, ids, pkeys, skeys []string, values []*string, ats []time.Time) {
-	ns = make([]string, len(inserts))
-	ids = make([]string, len(inserts))
-	pkeys = make([]string, len(inserts))
-	skeys = make([]string, len(inserts))
-	values = make([]*string, len(inserts))
-	ats = make([]time.Time, len(inserts))
-	for i, ins := range inserts {
-		ns[i] = ins.Namespace
-		ids[i] = ins.ID
-		pkeys[i] = ins.Key
-		skeys[i] = ins.SecondaryKey
-		values[i] = jsonTextVal(ins.Content)
-		ats[i] = ins.At
-	}
-	return
-}
-
-// resourceChangeArrays splits a slice of Resource changes into parallel arrays.
-func resourceChangeArrays(changes []*entroq.Doc) (ns, ids []string, versions []int32, pkeys, skeys []string, values []*string, ats []time.Time) {
-	ns = make([]string, len(changes))
-	ids = make([]string, len(changes))
-	versions = make([]int32, len(changes))
-	pkeys = make([]string, len(changes))
-	skeys = make([]string, len(changes))
-	values = make([]*string, len(changes))
-	ats = make([]time.Time, len(changes))
-	for i, chg := range changes {
-		ns[i] = chg.Namespace
-		ids[i] = chg.ID
-		versions[i] = chg.Version
-		pkeys[i] = chg.Key
-		skeys[i] = chg.SecondaryKey
-		values[i] = jsonTextVal(chg.Content)
-		ats[i] = chg.At
-	}
-	return
-}
-
 // Time returns the time used in all calculations in this process.
 func (b *EQPG) Time(ctx context.Context) (time.Time, error) {
 	row := b.DB.QueryRowContext(ctx, "SELECT now()")
@@ -1147,40 +1004,40 @@ func scanDocRows(rows *sql.Rows) ([]*entroq.Doc, error) {
 
 // Docs returns docs in a namespace. If IDs are specified, only those docs are
 // returned (key range and limit are ignored). Otherwise, docs are filtered by
-// optional key range and subject to limit.
+// optional key range and subject to limit. Each doc carries its group's
+// version and claim.
 func (b *EQPG) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, error) {
 	var (
 		rows *sql.Rows
 		err  error
 	)
+	columns := docColumns
+	if rq.OmitValues {
+		columns = strings.Replace(columns, "d.value", "NULL::jsonb", 1)
+	}
 	if len(rq.IDs) > 0 {
 		rows, err = b.DB.QueryContext(ctx,
-			`SELECT namespace, id, version, claimant, at, key_primary, key_secondary, value, created, modified
-			 FROM entroq.docs
-			 WHERE (namespace = $1 OR $1 = '') AND id = ANY($2)
-			 ORDER BY namespace, key_primary, key_secondary`,
+			`SELECT `+columns+` FROM `+docsWithLocks+`
+			 WHERE (d.namespace = $1 OR $1 = '') AND d.id = ANY($2)
+			 ORDER BY d.namespace, d.key_primary, d.key_secondary`,
 			rq.Namespace, pq.StringArray(rq.IDs),
 		)
 	} else if rq.KeyExact != "" {
 		rows, err = b.DB.QueryContext(ctx,
-			`SELECT namespace, id, version, claimant, at, key_primary, key_secondary, value, created, modified
-			 FROM entroq.docs
-			 WHERE (namespace = $1 OR $1 = '') AND key_primary = $2
-			 ORDER BY key_primary, key_secondary`,
+			`SELECT `+columns+` FROM `+docsWithLocks+`
+			 WHERE (d.namespace = $1 OR $1 = '') AND d.key_primary = $2
+			 ORDER BY d.key_primary, d.key_secondary`,
 			rq.Namespace, rq.KeyExact,
 		)
 	} else {
 		rows, err = b.DB.QueryContext(ctx,
-			`SELECT namespace, id, version, claimant, at, key_primary, key_secondary,
-			        CASE WHEN $5 THEN NULL::jsonb ELSE value END AS value,
-			        created, modified
-			 FROM entroq.docs
-			 WHERE ($1 = '' OR namespace = $1)
-			   AND ($2 = '' OR key_primary >= $2)
-			   AND ($3 = '' OR key_primary < $3)
-			 ORDER BY namespace, key_primary, key_secondary
+			`SELECT `+columns+` FROM `+docsWithLocks+`
+			 WHERE ($1 = '' OR d.namespace = $1)
+			   AND ($2 = '' OR d.key_primary >= $2)
+			   AND ($3 = '' OR d.key_primary < $3)
+			 ORDER BY d.namespace, d.key_primary, d.key_secondary
 			 LIMIT NULLIF($4, 0)`,
-			rq.Namespace, rq.KeyStart, rq.KeyEnd, rq.Limit, rq.OmitValues,
+			rq.Namespace, rq.KeyStart, rq.KeyEnd, rq.Limit,
 		)
 	}
 	if err != nil {
@@ -1190,76 +1047,29 @@ func (b *EQPG) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, er
 	return scanDocRows(rows)
 }
 
-// ClaimDocs claims all docs with the given primary key in the namespace.
-// Returns a DependencyError if any doc with that key is already claimed by
-// another claimant. Returns an empty slice (not an error) if none exist.
-func (b *EQPG) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.Doc, error) {
+// ClaimDocs claims the group of docs sharing the given primary key in the
+// namespace and returns its members, which may be none: a group can be claimed
+// before it has docs. It returns a DependencyError listing the members while
+// someone else holds the group.
+func (b *EQPG) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) (docs []*entroq.Doc, err error) {
 	if err := cq.Validate(); err != nil {
 		return nil, fmt.Errorf("claim docs: %w", err)
 	}
-	if err := limits.DocClaim(cq); err != nil {
+	if err := validate.DocClaim(cq); err != nil {
 		return nil, fmt.Errorf("claim docs: %w", err)
 	}
-
-	dur := pgInterval(cq.Duration)
-	rows, err := b.DB.QueryContext(ctx,
-		`SELECT namespace, id, version, claimant, at, key_primary, key_secondary, value, created, modified
-		 FROM entroq._claim_docs($1, $2, $3::interval, $4)`,
-		cq.Namespace, cq.Claimant, dur, cq.Key,
-	)
+	tx, err := b.DB.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, parseClaimDocsError(err)
+		return nil, fmt.Errorf("pg claim docs begin tx: %w", err)
 	}
-	defer rows.Close()
-	results, err := scanDocRows(rows)
-	if err != nil {
-		return nil, parseClaimDocsError(err)
-	}
-	return results, nil
-}
-
-// parseClaimDocsError converts an EQ001 from _claim_docs into a DependencyError
-// with DocDeletes (missing docs) and DocClaims (already-claimed docs) populated.
-// Other errors are returned unchanged.
-func parseClaimDocsError(err error) error {
-	if err == nil {
-		return nil
-	}
-	pgerr := new(pq.Error)
-	if !errors.As(err, &pgerr) || string(pgerr.Code) != "EQ001" {
-		return fmt.Errorf("pg claim docs: %w", err)
-	}
-
-	var detail struct {
-		MissingDocs []struct {
-			Namespace string `json:"namespace"`
-			ID        string `json:"id"`
-			Version   int32  `json:"version"`
-		} `json:"missing_docs"`
-		ClaimedDocs []struct {
-			Namespace string `json:"namespace"`
-			ID        string `json:"id"`
-			Version   int32  `json:"version"`
-		} `json:"claimed_docs"`
-	}
-	if jsonErr := json.Unmarshal([]byte(pgerr.Detail), &detail); jsonErr != nil {
-		return fmt.Errorf("pg claim docs EQ001 with unparseable detail %q: %w", pgerr.Detail, err)
-	}
-
-	depErr := new(entroq.DependencyError)
-	for _, d := range detail.MissingDocs {
-		depErr.DocDeletes = append(depErr.DocDeletes, &entroq.DocID{
-			Namespace: d.Namespace,
-			ID:        d.ID,
-			Version:   d.Version,
-		})
-	}
-	for _, d := range detail.ClaimedDocs {
-		depErr.DocClaims = append(depErr.DocClaims, &entroq.DocID{
-			Namespace: d.Namespace,
-			ID:        d.ID,
-			Version:   d.Version,
-		})
-	}
-	return depErr
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+			return
+		}
+		if cmErr := tx.Commit(); cmErr != nil {
+			docs, err = nil, fmt.Errorf("pg claim docs commit: %w", cmErr)
+		}
+	}()
+	return claimDocs(ctx, tx, cq)
 }

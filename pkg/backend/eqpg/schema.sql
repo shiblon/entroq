@@ -5,10 +5,8 @@
 -- Backend functions used by the Go eqpg implementation:
 --   entroq.try_claim       -- claim a task from one of several queues
 --   entroq._modify_arrays   -- parallel-array form of modify, called by Go backend
---   entroq._modify_docs     -- atomically update storage resources
 --   entroq._try_claim_one   -- claim from a single queue with bucket randomization
 --   entroq._try_claim_bucket -- claim from a specific hash bucket range
---   entroq._claim_docs      -- atomically claim specific storage resources
 
 CREATE SCHEMA IF NOT EXISTS entroq;
 
@@ -56,6 +54,29 @@ CREATE TABLE IF NOT EXISTS entroq.docs (
     modified      TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
     PRIMARY KEY (namespace, id)
 );
+
+-- Each doc group (the docs sharing a primary key in a namespace) has one lock
+-- holding the only version, claimant, and arrival time its members have. A
+-- group can be claimed before it has docs, so locks are kept apart from docs;
+-- the docs table's version, claimant, and at columns are no longer read.
+CREATE TABLE IF NOT EXISTS entroq.doc_locks (
+    namespace   TEXT COLLATE "C"         NOT NULL CHECK (octet_length(namespace) <= 1024),
+    key_primary TEXT COLLATE "C"         NOT NULL CHECK (octet_length(key_primary) <= 256),
+    version     INTEGER                  NOT NULL,
+    claimant    TEXT                     NOT NULL DEFAULT '' CHECK (octet_length(claimant) <= 64),
+    at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    PRIMARY KEY (namespace, key_primary)
+);
+
+-- Give every doc group written before doc groups had locks a lock one version
+-- past its highest member, so any version read before the upgrade is stale.
+-- Claims held at upgrade time are released. Groups that already have a lock
+-- are untouched, so re-applying the schema changes nothing.
+INSERT INTO entroq.doc_locks (namespace, key_primary, version, claimant, at)
+SELECT namespace, key_primary, max(version) + 1, '', now()
+FROM entroq.docs
+GROUP BY namespace, key_primary
+ON CONFLICT (namespace, key_primary) DO NOTHING;
 
 -- Indexes.
 CREATE INDEX IF NOT EXISTS byID        ON entroq.tasks (id);
@@ -344,6 +365,7 @@ DECLARE
     v_now          timestamptz := now();
     v_missing      jsonb;
     v_mismatched   jsonb;
+    v_claimed      jsonb;
     v_collisions   jsonb;
     v_qset         text[];
 BEGIN
@@ -351,7 +373,9 @@ BEGIN
     -- all_deps covers depends, deletes, and changes.
     -- locked acquires FOR UPDATE on matching rows.
     -- The LEFT JOIN finds missing rows (l.lck_id IS NULL) and version
-    -- mismatches (l.lck_ver != d.dep_ver).
+    -- mismatches (l.lck_ver != d.dep_ver). Deletes and changes, but not
+    -- depends, also fail on a task someone else holds: an unexpired claim by a
+    -- claimant other than p_claimant.
     --
     -- All CTE column aliases use prefixed names (dep_*, lck_*, etc.) to avoid
     -- ambiguity with the RETURNS TABLE OUT parameters (id, version, queue, ...)
@@ -360,15 +384,17 @@ BEGIN
     -- depends/deletes, the source (from) queue for changes. The queue is part of
     -- the key, so the LEFT JOIN matches on (id, queue); a queue mismatch fails to
     -- join and surfaces as missing, indistinguishable from an absent task.
-    WITH all_deps(dep_id, dep_ver, dep_queue) AS (
-        SELECT * FROM unnest(coalesce(p_dep_ids, '{}'::text[]), coalesce(p_dep_vers, '{}'::integer[]), coalesce(p_dep_queues, '{}'::text[]))
+    WITH all_deps(dep_id, dep_ver, dep_queue, dep_writes) AS (
+        SELECT *, false FROM unnest(coalesce(p_dep_ids, '{}'::text[]), coalesce(p_dep_vers, '{}'::integer[]), coalesce(p_dep_queues, '{}'::text[]))
         UNION ALL
-        SELECT * FROM unnest(coalesce(p_del_ids, '{}'::text[]), coalesce(p_del_vers, '{}'::integer[]), coalesce(p_del_queues, '{}'::text[]))
+        SELECT *, true FROM unnest(coalesce(p_del_ids, '{}'::text[]), coalesce(p_del_vers, '{}'::integer[]), coalesce(p_del_queues, '{}'::text[]))
         UNION ALL
-        SELECT * FROM unnest(coalesce(p_chg_ids, '{}'::text[]), coalesce(p_chg_vers, '{}'::integer[]), coalesce(p_chg_from_queues, '{}'::text[]))
+        SELECT *, true FROM unnest(coalesce(p_chg_ids, '{}'::text[]), coalesce(p_chg_vers, '{}'::integer[]), coalesce(p_chg_from_queues, '{}'::text[]))
     ),
     locked AS (
-        SELECT t.id AS lck_id, t.version AS lck_ver, t.queue AS lck_queue FROM entroq.tasks t
+        SELECT t.id AS lck_id, t.version AS lck_ver, t.queue AS lck_queue,
+               t.claimant AS lck_claimant, t.at AS lck_at
+        FROM entroq.tasks t
         WHERE t.id = ANY(ARRAY(SELECT dep_id FROM all_deps))
         FOR UPDATE
     )
@@ -382,8 +408,14 @@ BEGIN
             jsonb_agg(jsonb_build_object('id', d.dep_id, 'version', d.dep_ver))
                 FILTER (WHERE l.lck_id IS NOT NULL AND l.lck_ver != d.dep_ver),
             '[]'::jsonb
+        ),
+        coalesce(
+            jsonb_agg(jsonb_build_object('id', d.dep_id, 'version', d.dep_ver))
+                FILTER (WHERE l.lck_id IS NOT NULL AND l.lck_ver = d.dep_ver AND d.dep_writes
+                        AND l.lck_claimant != '' AND l.lck_claimant != p_claimant AND l.lck_at > v_now),
+            '[]'::jsonb
         )
-    INTO v_missing, v_mismatched
+    INTO v_missing, v_mismatched, v_claimed
     FROM all_deps d
     LEFT JOIN locked l ON l.lck_id = d.dep_id AND l.lck_queue = d.dep_queue;
 
@@ -399,12 +431,13 @@ BEGIN
     WHERE i.chk_id != '';
 
     -- Report all problems at once.
-    IF v_missing != '[]'::jsonb OR v_mismatched != '[]'::jsonb OR v_collisions != '[]'::jsonb THEN
+    IF v_missing != '[]'::jsonb OR v_mismatched != '[]'::jsonb OR v_claimed != '[]'::jsonb OR v_collisions != '[]'::jsonb THEN
         RAISE EXCEPTION 'entroq dependency error'
             USING ERRCODE = 'EQ001',
                   DETAIL  = jsonb_build_object(
                       'missing',    v_missing,
                       'mismatched', v_mismatched,
+                      'claimed',    v_claimed,
                       'collisions', v_collisions
                   )::text;
     END IF;
@@ -501,121 +534,13 @@ DROP FUNCTION IF EXISTS entroq._modify_docs(
     text[], text[], text[], text[], text[],
     text[], text[], integer[], text[], text[], text[], timestamptz[]
 );
-CREATE OR REPLACE FUNCTION entroq._modify_docs(
-    p_claimant     text,
-    p_dep_ns       text[],
-    p_dep_ids      text[],
-    p_dep_vers     integer[],
-    p_del_ns       text[],
-    p_del_ids      text[],
-    p_del_vers     integer[],
-    p_ins_ns       text[],
-    p_ins_ids      text[],
-    p_ins_pkeys    text[],
-    p_ins_skeys    text[],
-    p_ins_values   text[],
-    p_ins_ats      timestamptz[],
-    p_chg_ns       text[],
-    p_chg_ids      text[],
-    p_chg_vers     integer[],
-    p_chg_pkeys    text[],
-    p_chg_skeys    text[],
-    p_chg_values   text[],
-    p_chg_ats      timestamptz[]
-) RETURNS TABLE(
-    kind          text,
-    namespace     text,
-    id            text,
-    version       integer,
-    claimant      text,
-    at            timestamptz,
-    key_primary   text,
-    key_secondary text,
-    value         jsonb,
-    created       timestamptz,
-    modified      timestamptz
-) LANGUAGE plpgsql AS $$
-DECLARE
-    v_now          timestamptz := now();
-    v_missing      jsonb;
-    v_mismatched   jsonb;
-    v_collisions   jsonb;
-BEGIN
-    -- Dependency Checks
-    WITH all_deps(dep_ns, dep_id, dep_ver) AS (
-        SELECT * FROM unnest(coalesce(p_dep_ns, '{}'::text[]), coalesce(p_dep_ids, '{}'::text[]), coalesce(p_dep_vers, '{}'::integer[]))
-        UNION ALL
-        SELECT * FROM unnest(coalesce(p_del_ns, '{}'::text[]), coalesce(p_del_ids, '{}'::text[]), coalesce(p_del_vers, '{}'::integer[]))
-        UNION ALL
-        SELECT * FROM unnest(coalesce(p_chg_ns, '{}'::text[]), coalesce(p_chg_ids, '{}'::text[]), coalesce(p_chg_vers, '{}'::integer[]))
-    ),
-    locked AS (
-        SELECT s.namespace AS lck_ns, s.id AS lck_id, s.version AS lck_ver, s.claimant AS lck_claimant, s.at AS lck_at
-        FROM entroq.docs s
-        JOIN all_deps d ON s.namespace = d.dep_ns AND s.id = d.dep_id
-        FOR UPDATE
-    )
-    SELECT
-        coalesce(jsonb_agg(jsonb_build_object('ns', d.dep_ns, 'id', d.dep_id, 'version', d.dep_ver)) FILTER (WHERE l.lck_id IS NULL), '[]'::jsonb),
-        coalesce(jsonb_agg(jsonb_build_object('ns', d.dep_ns, 'id', d.dep_id, 'version', d.dep_ver))
-                 FILTER (WHERE l.lck_id IS NOT NULL AND (l.lck_ver != d.dep_ver OR (l.lck_claimant != '' AND l.lck_claimant != p_claimant AND l.lck_at > v_now))),
-                 '[]'::jsonb)
-    INTO v_missing, v_mismatched
-    FROM all_deps d
-    LEFT JOIN locked l ON l.lck_ns = d.dep_ns AND l.lck_id = d.dep_id;
-
-    -- Collision Checks
-    SELECT coalesce(jsonb_agg(jsonb_build_object('ns', i.ins_ns, 'id', i.ins_id)), '[]'::jsonb)
-    INTO v_collisions
-    FROM unnest(coalesce(p_ins_ns, '{}'::text[]), coalesce(p_ins_ids, '{}'::text[])) AS i(ins_ns, ins_id)
-    JOIN entroq.docs s ON s.namespace = i.ins_ns AND s.id = i.ins_id;
-
-    IF v_missing != '[]'::jsonb OR v_mismatched != '[]'::jsonb OR v_collisions != '[]'::jsonb THEN
-        RAISE EXCEPTION 'entroq storage dependency error'
-            USING ERRCODE = 'EQ001',
-                  DETAIL  = jsonb_build_object('missing', v_missing, 'mismatched', v_mismatched, 'collisions', v_collisions)::text;
-    END IF;
-
-    -- Deletes
-    DELETE FROM entroq.docs
-    USING unnest(coalesce(p_del_ns, '{}'::text[]), coalesce(p_del_ids, '{}'::text[])) AS d(del_ns, del_id)
-    WHERE entroq.docs.namespace = d.del_ns AND entroq.docs.id = d.del_id;
-
-    -- Inserts
-    RETURN QUERY
-    WITH r AS (
-        INSERT INTO entroq.docs (namespace, id, version, claimant, at, key_primary, key_secondary, value, created, modified)
-        SELECT ins_ns, ins_id, 0,
-               CASE WHEN ins_at > v_now THEN p_claimant ELSE '' END,
-               CASE WHEN ins_at IS NULL OR ins_at < v_now - interval '1 year' THEN v_now ELSE ins_at END,
-               ins_pk, ins_sk, ins_val::jsonb, v_now, v_now
-        FROM unnest(p_ins_ns, p_ins_ids, p_ins_pkeys, p_ins_skeys, p_ins_values, p_ins_ats)
-        AS i(ins_ns, ins_id, ins_pk, ins_sk, ins_val, ins_at)
-        RETURNING *
-    )
-    SELECT 'inserted', r.namespace, r.id, r.version, r.claimant, r.at, r.key_primary, r.key_secondary, r.value, r.created, r.modified FROM r;
-
-    -- Changes: future chg_at means claim/renew; past/zero means release.
-    RETURN QUERY
-    WITH r AS (
-        UPDATE entroq.docs
-        SET
-            version = entroq.docs.version + 1,
-            key_primary = c.chg_pk,
-            key_secondary = c.chg_sk,
-            value = c.chg_val::jsonb,
-            -- at: >1 year old snaps to v_now (covers Go's zero time); otherwise preserved.
-            at = CASE WHEN c.chg_at < v_now - interval '1 year' THEN v_now ELSE c.chg_at END,
-            claimant = CASE WHEN c.chg_at > v_now THEN p_claimant ELSE '' END,
-            modified = v_now
-        FROM unnest(p_chg_ns, p_chg_ids, p_chg_vers, p_chg_pkeys, p_chg_skeys, p_chg_values, p_chg_ats)
-        AS c(chg_ns, chg_id, chg_ver, chg_pk, chg_sk, chg_val, chg_at)
-        WHERE entroq.docs.namespace = c.chg_ns AND entroq.docs.id = c.chg_id
-        RETURNING *
-    )
-    SELECT 'changed', r.namespace, r.id, r.version, r.claimant, r.at, r.key_primary, r.key_secondary, r.value, r.created, r.modified FROM r;
-END;
-$$;
+-- Doc operations run in Go, by the doc group rules every backend shares, inside
+-- the same transaction as the task operations.
+DROP FUNCTION IF EXISTS entroq._modify_docs(
+    text, text[], text[], integer[], text[], text[], integer[],
+    text[], text[], text[], text[], text[], timestamptz[],
+    text[], text[], integer[], text[], text[], text[], timestamptz[]
+);
 
 -- Remove read-only wrappers from the retired raw-SQL API. The Go backend
 -- issues these parameterized queries directly.
@@ -627,73 +552,8 @@ DROP FUNCTION IF EXISTS entroq.like_prefix(text);
 -- queries entroq.docs directly.
 DROP FUNCTION IF EXISTS entroq.docs(text, text, text, integer, boolean);
 
--- entroq._claim_docs claims all docs sharing a primary key in a namespace.
--- Raises EQ001 if any doc with that key is already claimed by another claimant,
--- with JSON detail {"missing_docs":[], "claimed_docs":[...]}.
--- Returns 0 rows (not an error) if no docs with the key exist.
-CREATE OR REPLACE FUNCTION entroq._claim_docs(
-    p_namespace text,
-    p_claimant  text,
-    p_duration  interval,
-    p_key       text
-) RETURNS TABLE(
-    namespace     text,
-    id            text,
-    version       integer,
-    claimant      text,
-    at            timestamptz,
-    key_primary   text,
-    key_secondary text,
-    value         jsonb,
-    created       timestamptz,
-    modified      timestamptz
-) LANGUAGE plpgsql AS $$
-DECLARE
-    v_now     timestamptz := now();
-    v_claimed jsonb;
-BEGIN
-    -- Lock all rows with this primary key to serialize concurrent claims.
-    -- Use alias d to avoid ambiguity with RETURNS TABLE output column names.
-    PERFORM d.id FROM entroq.docs AS d
-    WHERE d.namespace = p_namespace AND d.key_primary = p_key
-    FOR UPDATE;
-
-    -- Detect any already-claimed docs.
-    SELECT coalesce(
-        jsonb_agg(jsonb_build_object('namespace', d.namespace, 'id', d.id, 'version', d.version))
-        FILTER (WHERE d.claimant != '' AND d.at > v_now AND d.claimant <> p_claimant),
-        '[]'::jsonb
-    )
-    INTO v_claimed
-    FROM entroq.docs AS d
-    WHERE d.namespace = p_namespace AND d.key_primary = p_key;
-
-    IF v_claimed != '[]'::jsonb THEN
-        RAISE EXCEPTION 'entroq doc claim dependency error'
-            USING ERRCODE = 'EQ001',
-                  DETAIL  = jsonb_build_object(
-                      'missing_docs', '[]'::jsonb,
-                      'claimed_docs', v_claimed
-                  )::text;
-    END IF;
-
-    -- plpgsql only allows DML in WITH clauses, not as subquery expressions.
-    RETURN QUERY
-        WITH updated AS (
-            UPDATE entroq.docs
-            SET
-                version  = entroq.docs.version + 1,
-                at       = v_now + p_duration,
-                claimant = p_claimant,
-                modified = v_now
-            WHERE entroq.docs.namespace = p_namespace
-              AND entroq.docs.key_primary = p_key
-            RETURNING *
-        )
-        SELECT * FROM updated
-        ORDER BY key_primary, key_secondary;
-END;
-$$;
+-- Doc claims run in Go, on the group's lock in entroq.doc_locks.
+DROP FUNCTION IF EXISTS entroq._claim_docs(text, text, interval, text);
 
 -- Remove the retired raw-SQL claim wrapper. The locking implementation
 -- remains in _claim_docs for the Go backend.
