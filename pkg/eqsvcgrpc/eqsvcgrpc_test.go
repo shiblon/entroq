@@ -414,3 +414,117 @@ func TestTasksDropsTasksOutsideQueriedQueue(t *testing.T) {
 		t.Errorf("tasks in %q by the ID of a task in %q: want none, got %v", "readable", "secret", resp.Tasks)
 	}
 }
+
+// TestMalformedRequestsFailBeforeAuthorization checks that a request the
+// service can never carry out is an invalid argument, found before the
+// authorizer is asked, so the code does not depend on whether authorization
+// is configured. A doc claim with no claimant must not become a claim by the
+// service itself.
+func TestMalformedRequestsFailBeforeAuthorization(t *testing.T) {
+	ctx := context.Background()
+	calls := map[string]func(s *QSvc) error{
+		"insert into no queue": func(s *QSvc) error {
+			_, err := s.Modify(ctx, &pb.ModifyRequest{ClaimantId: "c", Inserts: []*pb.TaskData{{Queue: ""}}})
+			return err
+		},
+		"doc insert into no namespace": func(s *QSvc) error {
+			_, err := s.Modify(ctx, &pb.ModifyRequest{ClaimantId: "c", DocInserts: []*pb.DocData{{Namespace: ""}}})
+			return err
+		},
+		"tasks with no queue or IDs": func(s *QSvc) error {
+			_, err := s.Tasks(ctx, &pb.TasksRequest{})
+			return err
+		},
+		"docs with no namespace": func(s *QSvc) error {
+			_, err := s.Docs(ctx, &pb.DocsRequest{Query: &pb.DocQuery{Ids: []string{"a"}}})
+			return err
+		},
+		"doc claim with no claimant": func(s *QSvc) error {
+			_, err := s.ClaimDocs(ctx, &pb.ClaimDocsRequest{ClaimQuery: &pb.DocClaim{Namespace: "ns", Key: "k"}})
+			return err
+		},
+		"claim from no queues": func(s *QSvc) error {
+			_, err := s.TryClaim(ctx, &pb.ClaimRequest{ClaimantId: "c"})
+			return err
+		},
+		"claim with no claimant": func(s *QSvc) error {
+			_, err := s.TryClaim(ctx, &pb.ClaimRequest{Queues: []string{"q"}})
+			return err
+		},
+	}
+	for name, call := range calls {
+		t.Run(name, func(t *testing.T) {
+			az := new(stubAuthorizer)
+			svc, err := New(ctx, eqmem.Opener(), WithAuthenticator(allowingAuthenticator()), WithAuthorizer(az))
+			if err != nil {
+				t.Fatalf("new service: %v", err)
+			}
+			defer svc.Close()
+			if err := call(svc); status.Code(err) != codes.InvalidArgument {
+				t.Errorf("want InvalidArgument, got %v", err)
+			}
+			if az.called {
+				t.Error("authorizer was consulted for a malformed request")
+			}
+		})
+	}
+}
+
+// failingBackend fails every task listing with an error no caller could fix.
+type failingBackend struct{ entroq.Backend }
+
+func (failingBackend) Tasks(context.Context, *entroq.TasksQuery) ([]*entroq.Task, error) {
+	return nil, errors.New("storage unavailable")
+}
+
+func TestServerFailureIsInternal(t *testing.T) {
+	ctx := context.Background()
+	opener := func(ctx context.Context) (entroq.Backend, error) {
+		b, err := eqmem.Opener()(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return failingBackend{b}, nil
+	}
+	svc, err := New(ctx, opener)
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	defer svc.Close()
+	if _, err := svc.Tasks(ctx, &pb.TasksRequest{Queue: "q"}); status.Code(err) != codes.Internal {
+		t.Errorf("Tasks on a failing backend: want Internal, got %v", err)
+	}
+}
+
+// fakeTaskStream is a StreamTasks server stream that records what is sent.
+type fakeTaskStream struct {
+	pb.EntroQ_StreamTasksServer
+	ctx  context.Context
+	sent []*pb.TasksResponse
+}
+
+func (s *fakeTaskStream) Context() context.Context { return s.ctx }
+func (s *fakeTaskStream) Send(r *pb.TasksResponse) error {
+	s.sent = append(s.sent, r)
+	return nil
+}
+
+// TestStreamTasksKeepsStatusCode checks that StreamTasks, which wraps the
+// errors of Tasks, keeps their codes rather than reporting every failure as a
+// server error.
+func TestStreamTasksKeepsStatusCode(t *testing.T) {
+	ctx := context.Background()
+	az := &stubAuthorizer{err: &authz.AuthzError{Failed: []*authz.Queue{{Exact: "q", Actions: []authz.Action{authz.Read}}}}}
+	svc, err := New(ctx, eqmem.Opener(), WithAuthenticator(allowingAuthenticator()), WithAuthorizer(az))
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	defer svc.Close()
+	stream := &fakeTaskStream{ctx: ctx}
+	if err := svc.StreamTasks(&pb.TasksRequest{Queue: "q"}, stream); status.Code(err) != codes.PermissionDenied {
+		t.Errorf("StreamTasks denied: want PermissionDenied, got %v", err)
+	}
+	if err := svc.StreamTasks(&pb.TasksRequest{}, stream); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("StreamTasks with no queue or IDs: want InvalidArgument, got %v", err)
+	}
+}

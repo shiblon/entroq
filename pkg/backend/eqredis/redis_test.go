@@ -285,3 +285,18 @@ func TestModifyReportsAllFailureClasses(t *testing.T) {
 func TestModifyRejectsWrongNamespace(t *testing.T) {
 	RunQTest(t, eqtest.ModifyRejectsWrongNamespace)
 }
+
+func TestInvalidRequests(t *testing.T) {
+	RunQTest(t, eqtest.InvalidRequests)
+}
+
+func TestBackendRejectsInvalidRequests(t *testing.T) {
+	ctx := context.Background()
+	b, err := Open(ctx, WithAddr(redisAddr))
+	if err != nil {
+		t.Fatalf("open backend: %v", err)
+	}
+	defer b.Close()
+	eqtest.BackendRejectsInvalidRequests(ctx, t, b, "/redistest/"+entroq.GenHex16())
+	eqtest.StorageRejectsZeroDurations(ctx, t, b, "/redistest/"+entroq.GenHex16())
+}

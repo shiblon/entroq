@@ -16,6 +16,9 @@ import (
 // Results are returned sorted by (key_primary, key_secondary). Each doc carries
 // its group's version and claim.
 func (m *EQMem) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, error) {
+	if err := rq.Validate(); err != nil {
+		return nil, fmt.Errorf("eqmem docs: %w", err)
+	}
 	nls, unlock := m.lockNamespaces([]string{rq.Namespace})
 
 	if len(nls) == 0 {

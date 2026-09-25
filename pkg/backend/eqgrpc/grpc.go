@@ -41,6 +41,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"time"
 
@@ -115,7 +116,7 @@ func WithNiladicDialer(f func() (net.Conn, error)) Option {
 
 // WithMaxSize is a convenience method for setting
 // WithDialOptions(grpc.WithDefaultCallOptions(grpc.MaxCallRecvSize(...), grpc.MaxCallSendSize(...))).
-// Default is 4MB.
+// By default the client limits neither, leaving the server's limits to govern.
 func WithMaxSize(maxMB int) Option {
 	return WithDialOpts(grpc.WithDefaultCallOptions(
 		grpc.MaxCallRecvMsgSize(maxMB*MB),
@@ -177,11 +178,17 @@ func Opener(addr string, opts ...Option) entroq.BackendOpener {
 		// stays false, so pings go only while an RPC such as Claim is active. Servers
 		// must accept DefaultKeepaliveTime; the official server does. Prepended so a
 		// caller's WithDialOpts can override it.
+		//
+		// Responses are not size-limited by default: the server's send limit
+		// (--max_size_mb) already bounds them, and gRPC's 4MB client default
+		// would reject responses the server is configured to send. WithMaxSize
+		// sets a limit.
 		dialOpts := append([]grpc.DialOption{
 			grpc.WithKeepaliveParams(keepalive.ClientParameters{
 				Time:    DefaultKeepaliveTime,
 				Timeout: DefaultKeepaliveTimeout,
 			}),
+			grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(math.MaxInt32)),
 		}, options.dialOpts...)
 		conn, err := grpc.DialContext(ctx, addr, dialOpts...)
 		if err != nil {

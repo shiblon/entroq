@@ -246,3 +246,26 @@ func TestGRPCModifyReportsAllFailureClasses(t *testing.T) {
 func TestGRPCModifyRejectsWrongNamespace(t *testing.T) {
 	RunQTest(t, eqtest.ModifyRejectsWrongNamespace)
 }
+
+func TestGRPCInvalidRequests(t *testing.T) {
+	RunQTest(t, eqtest.InvalidRequests)
+}
+
+// TestGRPCBackendRejectsInvalidRequests sends requests the client would have
+// rejected straight through the gRPC backend, so the service's own checks
+// must refuse them, and the codes must come back as invalid arguments.
+func TestGRPCBackendRejectsInvalidRequests(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stop, dial, err := eqtest.StartService(ctx, eqmem.Opener())
+	if err != nil {
+		t.Fatalf("start service: %v", err)
+	}
+	defer stop()
+	b, err := eqgrpc.Opener("bufnet", eqgrpc.WithNiladicDialer(dial), eqgrpc.WithInsecure())(ctx)
+	if err != nil {
+		t.Fatalf("open backend: %v", err)
+	}
+	defer b.Close()
+	eqtest.BackendRejectsInvalidRequests(ctx, t, b, "/grpctest")
+}

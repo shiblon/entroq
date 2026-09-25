@@ -447,7 +447,7 @@ func (m *EQMem) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task,
 // TryClaim attempts to claim a task from the given queue query. If no task is
 // available, returns nil (not an error).
 func (m *EQMem) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
-	if err := validate.Claimant(cq.Claimant); err != nil {
+	if err := validate.Claim(cq); err != nil {
 		return nil, fmt.Errorf("eqmem claim: %w", err)
 	}
 	start := time.Now()
@@ -1067,9 +1067,8 @@ func (m *EQMem) snapshotQueueLocks() []*qLock {
 // Tasks lists tasks according to the given query. If specific IDs are given,
 // it will block for brief periods to look up corresponding queues for them.
 func (m *EQMem) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Task, error) {
-	// Short circuit if there's nothing specified.
-	if tq.Queue == "" && len(tq.IDs) == 0 {
-		return nil, nil
+	if err := tq.Validate(); err != nil {
+		return nil, fmt.Errorf("eqmem tasks: %w", err)
 	}
 
 	now, err := m.Time(ctx)

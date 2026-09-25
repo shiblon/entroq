@@ -31,6 +31,15 @@ type TasksQuery struct {
 	OmitValues bool
 }
 
+// Validate checks that the query names a queue, task IDs, or both. Task IDs
+// are unique across queues, so IDs alone identify tasks.
+func (q *TasksQuery) Validate() error {
+	if q.Queue == "" && len(q.IDs) == 0 {
+		return InvalidArgumentf("tasks query must name a queue or task IDs")
+	}
+	return nil
+}
+
 // MatchQuery modifies a listing request by name, for queues or namespaces.
 type MatchQuery struct {
 	// MatchPrefix specifies allowable prefix matches. If empty, limitations
@@ -150,6 +159,9 @@ func (c *EntroQ) Tasks(ctx context.Context, queue string, opts ...TasksOpt) ([]*
 	query := &TasksQuery{Queue: queue}
 	for _, opt := range opts {
 		opt(c, query)
+	}
+	if err := query.Validate(); err != nil {
+		return nil, fmt.Errorf("tasks: %w", err)
 	}
 	return c.backend.Tasks(ctx, query)
 }

@@ -53,6 +53,7 @@ func TestBackendContract(t *testing.T) {
 		{"WorkerCompactDependencyHandler", eqtest.WorkerCompactDependencyHandler},
 		{"WorkerDependencyMove", eqtest.WorkerDependencyMove},
 		{"WorkerHoldsEmptyGroup", eqtest.WorkerHoldsEmptyGroup},
+		{"InvalidRequests", eqtest.InvalidRequests},
 		{"InitialVersions", eqtest.InitialVersions},
 		{"SimpleDocLifecycle", eqtest.SimpleDocLifecycle},
 		{"DocMultiOp", eqtest.DocMultiOp},
@@ -356,4 +357,15 @@ func TestGCDocGroups(t *testing.T) {
 	}
 	defer b.Close()
 	eqtest.GCDocGroups(ctx, t, b, b.collectDocsOnce, "sqlitetest")
+}
+
+func TestBackendRejectsInvalidRequests(t *testing.T) {
+	ctx := context.Background()
+	b, err := Open(ctx, filepath.Join(t.TempDir(), "entroq.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	eqtest.BackendRejectsInvalidRequests(ctx, t, b, "sqlitetest")
+	eqtest.StorageRejectsZeroDurations(ctx, t, b, "sqlitetest")
 }

@@ -416,7 +416,12 @@ func autoCodeErrorf(format string, vals ...any) error {
 	if entroq.IsInvalidArgument(err) {
 		return status.New(codes.InvalidArgument, err.Error()).Err()
 	}
-	return err
+	// An error that already carries a status, such as one passed through from
+	// a remote backend, keeps its code; anything else is the server's failure.
+	if _, ok := status.FromError(err); ok {
+		return err
+	}
+	return status.New(codes.Internal, err.Error()).Err()
 }
 
 func codeErrorf(code codes.Code, format string, vals ...any) error {
@@ -546,14 +551,16 @@ func (s *QSvc) modifyAuthz(ctx context.Context, req *pb.ModifyRequest) (*authz.R
 
 // Claim is the blocking version of TryClaim.
 func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
-	if err := s.Authorize(ctx, s.claimAuthz(ctx, req)); err != nil {
-		return nil, err // don't wrap, has status codes
-	}
-
-	duration := time.Duration(req.DurationMs) * time.Millisecond
 	pollTime := time.Duration(0)
 	if req.PollMs > 0 {
 		pollTime = time.Duration(req.PollMs) * time.Millisecond
+	}
+	opts := append(claimOpts(req), entroq.ClaimPollTime(pollTime))
+	if err := entroq.NewClaimQuery(opts...).Validate(); err != nil {
+		return nil, autoCodeErrorf("claim: %w", err)
+	}
+	if err := s.Authorize(ctx, s.claimAuthz(ctx, req)); err != nil {
+		return nil, err // don't wrap, has status codes
 	}
 
 	// Block until a task is available or the caller's context ends, re-checking
@@ -561,11 +568,7 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 	// client holds this open on a single RPC with no per-attempt deadline; a dead
 	// connection is surfaced by client keepalive, not by racing claim delivery
 	// with a cancel. See pkg/backend/eqgrpc backend.Claim.
-	task, err := s.impl.Claim(ctx,
-		entroq.From(req.Queues...),
-		entroq.ClaimFor(duration),
-		entroq.WithClaimant(req.ClaimantId),
-		entroq.ClaimPollTime(pollTime))
+	task, err := s.impl.Claim(ctx, opts...)
 	if err != nil {
 		return nil, autoCodeErrorf("eqsvcgrpc claim: %w", err)
 	}
@@ -587,15 +590,15 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 // available to claim. Callers can check for context cancelation codes to know
 // that this has happened, and may opt to immediately re-send the request.
 func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
+	opts := claimOpts(req)
+	if err := entroq.NewClaimQuery(opts...).Validate(); err != nil {
+		return nil, autoCodeErrorf("try claim: %w", err)
+	}
 	if err := s.Authorize(ctx, s.claimAuthz(ctx, req)); err != nil {
 		return nil, err // don't wrap, has status codes
 	}
 
-	duration := time.Duration(req.DurationMs) * time.Millisecond
-	task, err := s.impl.TryClaim(ctx,
-		entroq.From(req.Queues...),
-		entroq.ClaimFor(duration),
-		entroq.WithClaimant(req.ClaimantId))
+	task, err := s.impl.TryClaim(ctx, opts...)
 	if err != nil {
 		return nil, autoCodeErrorf("try claim: %w", err)
 	}
@@ -609,6 +612,16 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 	return &pb.ClaimResponse{Task: pt}, nil
 }
 
+// claimOpts are the claim options a request asks for. The claimant is the
+// request's, never the service's own: an empty one fails the claim's check.
+func claimOpts(req *pb.ClaimRequest) []entroq.ClaimOpt {
+	return []entroq.ClaimOpt{
+		entroq.From(req.Queues...),
+		entroq.ClaimFor(time.Duration(req.DurationMs) * time.Millisecond),
+		entroq.WithClaimant(req.ClaimantId),
+	}
+}
+
 // Modify attempts to make the specified modification from the given
 // ModifyRequest. If all goes well, it returns a ModifyResponse. If the
 // modification fails due to a dependency error (one of the specified tasks was
@@ -617,9 +630,24 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 // reconstruct an entroq.DependencyError, or directly to find out which IDs
 // caused the dependency failure. Code UNKNOWN is returned on other errors.
 func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyResponse, error) {
+	// Check the modification's shape before authorizing it, with the same
+	// check every backend runs, so a malformed request is InvalidArgument
+	// whether or not an authorizer is configured.
+	modArgs, err := pbconv.ModifyArgsFromProto(req)
+	if err != nil {
+		var inv *pbconv.InvalidRequestError
+		if errors.As(err, &inv) {
+			return nil, codeErrorf(codes.InvalidArgument, "%v", err)
+		}
+		return nil, autoCodeErrorf("modify: %w", err)
+	}
+	if err := entroq.NewModification(req.ClaimantId, modArgs...).EnsureModifyKeys(); err != nil {
+		return nil, autoCodeErrorf("modify: %w", err)
+	}
+
 	// Authorization is enforced only when an authorizer is configured (admins may
-	// run open). When it is, a modification naming an empty queue/namespace fails
-	// closed here before reaching the backend.
+	// run open). A modification naming an empty queue or namespace fails the
+	// check above; modifyAuthz still refuses one, as a backstop.
 	if s.az != nil {
 		authReq, err := s.modifyAuthz(ctx, req)
 		if err != nil {
@@ -628,15 +656,6 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 		if err := s.Authorize(ctx, authReq); err != nil {
 			return nil, err // don't wrap, has status codes
 		}
-	}
-
-	modArgs, err := pbconv.ModifyArgsFromProto(req)
-	if err != nil {
-		var inv *pbconv.InvalidRequestError
-		if errors.As(err, &inv) {
-			return nil, codeErrorf(codes.InvalidArgument, "%v", err)
-		}
-		return nil, autoCodeErrorf("modify: %w", err)
 	}
 
 	resp, err := s.impl.Modify(ctx, modArgs...)
@@ -685,6 +704,9 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 }
 
 func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksResponse, error) {
+	if err := (&entroq.TasksQuery{Queue: req.Queue, IDs: req.TaskId}).Validate(); err != nil {
+		return nil, autoCodeErrorf("tasks: %w", err)
+	}
 	if err := s.Authorize(ctx, s.tasksAuthz(ctx, req)); err != nil {
 		return nil, err // don't wrap, has status codes
 	}
@@ -811,12 +833,21 @@ func depDetails(depErr *entroq.DependencyError) []proto.Message {
 // Docs returns a listing of docs matching the given query.
 func (s *QSvc) Docs(ctx context.Context, req *pb.DocsRequest) (*pb.DocsResponse, error) {
 	q := req.GetQuery()
+	dq := &entroq.DocQuery{
+		Namespace:  q.GetNamespace(),
+		IDs:        q.GetIds(),
+		KeyExact:   q.GetKeyExact(),
+		KeyStart:   q.GetKeyStart(),
+		KeyEnd:     q.GetKeyEnd(),
+		Limit:      int(q.GetLimit()),
+		OmitValues: q.GetOmitValues(),
+	}
+	if err := dq.Validate(); err != nil {
+		return nil, autoCodeErrorf("docs: %w", err)
+	}
 	// Reading doc content is gated on Read for the namespace (unlike queue/
 	// namespace metadata, which is open). Enforced only when an authorizer is set.
 	if s.az != nil {
-		if q.GetNamespace() == "" {
-			return nil, codeErrorf(codes.PermissionDenied, "docs: a namespace is required")
-		}
 		authReq := s.newAuthzRequest(ctx)
 		authReq.Namespaces = append(authReq.Namespaces, &authz.Namespace{
 			Exact:   q.GetNamespace(),
@@ -826,15 +857,7 @@ func (s *QSvc) Docs(ctx context.Context, req *pb.DocsRequest) (*pb.DocsResponse,
 			return nil, err // don't wrap, has status codes
 		}
 	}
-	docs, err := s.impl.Docs(ctx, &entroq.DocQuery{
-		Namespace:  q.GetNamespace(),
-		IDs:        q.GetIds(),
-		KeyExact:   q.GetKeyExact(),
-		KeyStart:   q.GetKeyStart(),
-		KeyEnd:     q.GetKeyEnd(),
-		Limit:      int(q.GetLimit()),
-		OmitValues: q.GetOmitValues(),
-	})
+	docs, err := s.impl.Docs(ctx, dq)
 	if err != nil {
 		return nil, autoCodeErrorf("docs: %w", err)
 	}
@@ -879,12 +902,20 @@ func (s *QSvc) NamespaceStats(ctx context.Context, req *pb.NamespacesRequest) (*
 // already claimed.
 func (s *QSvc) ClaimDocs(ctx context.Context, req *pb.ClaimDocsRequest) (*pb.ClaimDocsResponse, error) {
 	cq := req.GetClaimQuery()
+	// The claimant is the request's: the service's client would otherwise fill
+	// in its own for an empty one, so check the claim as received.
+	dc := &entroq.DocClaim{
+		Namespace: cq.GetNamespace(),
+		Claimant:  cq.GetClaimant(),
+		Key:       cq.GetKey(),
+		Duration:  time.Duration(cq.GetDurationMs()) * time.Millisecond,
+	}
+	if err := dc.Validate(); err != nil {
+		return nil, autoCodeErrorf("claim docs: %w", err)
+	}
 	// Claiming a doc is gated on Claim for the namespace. Enforced only when an
 	// authorizer is set.
 	if s.az != nil {
-		if cq.GetNamespace() == "" {
-			return nil, codeErrorf(codes.PermissionDenied, "claim docs: a namespace is required")
-		}
 		authReq := s.newAuthzRequest(ctx)
 		authReq.ClaimantId = cq.GetClaimant()
 		authReq.Namespaces = append(authReq.Namespaces, &authz.Namespace{
@@ -895,12 +926,7 @@ func (s *QSvc) ClaimDocs(ctx context.Context, req *pb.ClaimDocsRequest) (*pb.Cla
 			return nil, err // don't wrap, has status codes
 		}
 	}
-	claimed, err := s.impl.ClaimDocs(ctx, &entroq.DocClaim{
-		Namespace: cq.GetNamespace(),
-		Claimant:  cq.GetClaimant(),
-		Key:       cq.GetKey(),
-		Duration:  time.Duration(cq.GetDurationMs()) * time.Millisecond,
-	})
+	claimed, err := s.impl.ClaimDocs(ctx, dc)
 	if err != nil {
 		if depErr, ok := entroq.AsDependency(err); ok {
 			details := depDetails(depErr)

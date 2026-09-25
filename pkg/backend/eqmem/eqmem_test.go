@@ -954,3 +954,18 @@ func TestEQMemModifyReportsAllFailureClasses(t *testing.T) {
 func TestEQMemModifyRejectsWrongNamespace(t *testing.T) {
 	RunQTest(t, eqtest.ModifyRejectsWrongNamespace)
 }
+
+func TestEQMemInvalidRequests(t *testing.T) {
+	RunQTest(t, eqtest.InvalidRequests)
+}
+
+func TestEQMemBackendRejectsInvalidRequests(t *testing.T) {
+	ctx := context.Background()
+	b, err := New(ctx)
+	if err != nil {
+		t.Fatalf("new backend: %v", err)
+	}
+	defer b.Close()
+	eqtest.BackendRejectsInvalidRequests(ctx, t, b, "/memtest")
+	eqtest.StorageRejectsZeroDurations(ctx, t, b, "/memtest")
+}

@@ -861,3 +861,18 @@ func TestRunningInTxCommitsWithModify(t *testing.T) {
 		t.Error("Caller work did not commit with a successful modification")
 	}
 }
+
+func TestInvalidRequests(t *testing.T) {
+	RunQTest(t, eqtest.InvalidRequests)
+}
+
+func TestBackendRejectsInvalidRequests(t *testing.T) {
+	ctx := context.Background()
+	b, err := Open(ctx, pgHostPort, WithDB("postgres"), WithUsername("postgres"), WithPassword("password"), WithConnectAttempts(10))
+	if err != nil {
+		t.Fatalf("open backend: %v", err)
+	}
+	defer b.Close()
+	eqtest.BackendRejectsInvalidRequests(ctx, t, b, "/pgtest/"+entroq.GenHex16())
+	eqtest.StorageRejectsZeroDurations(ctx, t, b, "/pgtest/"+entroq.GenHex16())
+}

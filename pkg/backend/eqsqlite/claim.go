@@ -19,10 +19,7 @@ const claimWindow = 64
 func (b *EQSQLite) TryClaim(ctx context.Context, q *entroq.ClaimQuery) (*entroq.Task, error) {
 	start := time.Now()
 	defer func() { b.claimDur.Record(ctx, time.Since(start).Seconds()) }()
-	if err := validateClaim(q); err != nil {
-		return nil, fmt.Errorf("eqsqlite try claim: %w", err)
-	}
-	if err := validate.Claimant(q.Claimant); err != nil {
+	if err := validate.Claim(q); err != nil {
 		return nil, fmt.Errorf("eqsqlite try claim: %w", err)
 	}
 	queues := slices.Clone(q.Queues)
@@ -67,7 +64,7 @@ func (b *EQSQLite) TryClaim(ctx context.Context, q *entroq.ClaimQuery) (*entroq.
 
 // Claim waits for an arrived task to become available, then claims it.
 func (b *EQSQLite) Claim(ctx context.Context, q *entroq.ClaimQuery) (*entroq.Task, error) {
-	if err := validateClaim(q); err != nil {
+	if err := validate.Claim(q); err != nil {
 		return nil, fmt.Errorf("eqsqlite claim: %w", err)
 	}
 	task, err := b.TryClaim(ctx, q)
@@ -75,16 +72,6 @@ func (b *EQSQLite) Claim(ctx context.Context, q *entroq.ClaimQuery) (*entroq.Tas
 		return task, err
 	}
 	return entroq.WaitTryClaim(ctx, q, b.tryClaimWhenReady, b.nw)
-}
-
-func validateClaim(q *entroq.ClaimQuery) error {
-	if q == nil || len(q.Queues) == 0 {
-		return fmt.Errorf("no queues")
-	}
-	if q.Duration == 0 {
-		return fmt.Errorf("zero duration")
-	}
-	return nil
 }
 
 // tryClaimWhenReady keeps empty blocking-claim polls out of the write pool.

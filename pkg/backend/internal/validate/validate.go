@@ -35,8 +35,24 @@ func Claimant(claimant string) error {
 	return check("claimant", claimant, MaxClaimantBytes)
 }
 
-// DocClaim checks the claimant a doc claim would store.
+// Claim checks a task claim (see ClaimQuery.Validate) and its claimant's
+// length. The client checks the same, so a claim failing here bypassed it.
+func Claim(cq *entroq.ClaimQuery) error {
+	if err := cq.Validate(); err != nil {
+		return err
+	}
+	return Claimant(cq.Claimant)
+}
+
+// DocClaim checks a doc claim (see DocClaim.Validate), its claimant's length,
+// and its duration, which the client has already defaulted.
 func DocClaim(cq *entroq.DocClaim) error {
+	if err := cq.Validate(); err != nil {
+		return err
+	}
+	if cq.Duration == 0 {
+		return entroq.InvalidArgumentf("doc claim duration must be positive")
+	}
 	return Claimant(cq.Claimant)
 }
 

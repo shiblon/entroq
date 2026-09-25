@@ -941,16 +941,16 @@ func ClaimRandomHead(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 // "no move", so the behavior is path-dependent rather than a uniform invariant.)
 func EmptyWriteTargetRejected(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	// A task insert with no queue is rejected.
-	if _, err := client.Modify(ctx, entroq.InsertingInto("", entroq.WithValue("v"))); err == nil {
-		t.Errorf("insert into empty queue: got nil error, want rejection")
+	if _, err := client.Modify(ctx, entroq.InsertingInto("", entroq.WithValue("v"))); !entroq.IsInvalidArgument(err) {
+		t.Errorf("insert into empty queue: want an invalid argument, got %v", err)
 	}
 
 	// A doc insert with no namespace is rejected.
 	if _, err := client.Modify(ctx, entroq.PuttingDocInto("",
 		entroq.WithIDKeys("empty-ns-doc", "", ""),
 		entroq.WithContent(json.RawMessage(`"v"`)),
-	)); err == nil {
-		t.Errorf("doc insert into empty namespace: got nil error, want rejection")
+	)); !entroq.IsInvalidArgument(err) {
+		t.Errorf("doc insert into empty namespace: want an invalid argument, got %v", err)
 	}
 
 	// A well-formed insert into a real queue still works: the guard is not

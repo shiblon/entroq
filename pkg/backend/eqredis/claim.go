@@ -17,7 +17,7 @@ const maxClaimRetries = 50
 // TryClaim attempts to claim a task from one of the queues in cq.
 // Returns nil, nil if no claimable task is found.
 func (e *EQRedis) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
-	if err := validate.Claimant(cq.Claimant); err != nil {
+	if err := validate.Claim(cq); err != nil {
 		return nil, fmt.Errorf("eqredis claim: %w", err)
 	}
 	now := time.Now().UTC()

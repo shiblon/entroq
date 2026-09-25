@@ -79,6 +79,9 @@ func (b *EQSQLite) Tasks(ctx context.Context, q *entroq.TasksQuery) ([]*entroq.T
 	if q == nil {
 		return nil, fmt.Errorf("eqsqlite tasks: nil query")
 	}
+	if err := q.Validate(); err != nil {
+		return nil, fmt.Errorf("eqsqlite tasks: %w", err)
+	}
 	columns := taskColumns
 	if q.OmitValues {
 		columns = strings.Replace(columns, "value", "NULL", 1)
@@ -137,6 +140,9 @@ func (b *EQSQLite) Tasks(ctx context.Context, q *entroq.TasksQuery) ([]*entroq.T
 func (b *EQSQLite) Docs(ctx context.Context, q *entroq.DocQuery) ([]*entroq.Doc, error) {
 	if q == nil {
 		return nil, fmt.Errorf("eqsqlite docs: nil query")
+	}
+	if err := q.Validate(); err != nil {
+		return nil, fmt.Errorf("eqsqlite docs: %w", err)
 	}
 	columns := docColumns
 	if q.OmitValues {

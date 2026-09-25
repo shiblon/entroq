@@ -18,9 +18,6 @@ func (b *EQSQLite) ClaimDocs(ctx context.Context, q *entroq.DocClaim) ([]*entroq
 	if q == nil {
 		return nil, fmt.Errorf("eqsqlite claim docs: nil query")
 	}
-	if err := q.Validate(); err != nil {
-		return nil, fmt.Errorf("eqsqlite claim docs: %w", err)
-	}
 	if err := validate.DocClaim(q); err != nil {
 		return nil, fmt.Errorf("eqsqlite claim docs: %w", err)
 	}

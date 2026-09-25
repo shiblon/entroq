@@ -136,6 +136,9 @@ func parseDocFields(vals map[string]string) (*docFields, error) {
 
 // Docs returns docs in a namespace, optionally filtered by key range or IDs.
 func (e *EQRedis) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, error) {
+	if err := rq.Validate(); err != nil {
+		return nil, fmt.Errorf("eqredis docs: %w", err)
+	}
 	var ids []string
 
 	if len(rq.IDs) > 0 {

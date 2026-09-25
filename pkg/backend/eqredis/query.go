@@ -127,6 +127,9 @@ const claimListPage = 128
 // filter could return fewer than Limit, even zero, while matches remain, so we
 // never do that.
 func (e *EQRedis) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Task, error) {
+	if err := tq.Validate(); err != nil {
+		return nil, fmt.Errorf("eqredis tasks: %w", err)
+	}
 	now := time.Now().UTC()
 
 	// Explicit IDs: fetch exactly those hashes, filter, then cap results.

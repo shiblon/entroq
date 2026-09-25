@@ -121,6 +121,21 @@ type ClaimQuery struct {
 	PollTime time.Duration // Length of time between (possibly interruptible) sleep and polling.
 }
 
+// Validate checks that the claim names at least one queue, a claimant, and a
+// positive duration, returning an InvalidArgumentError otherwise.
+func (q *ClaimQuery) Validate() error {
+	if len(q.Queues) == 0 {
+		return InvalidArgumentf("claim must name at least one queue")
+	}
+	if q.Claimant == "" {
+		return InvalidArgumentf("claim must name a claimant")
+	}
+	if q.Duration <= 0 {
+		return InvalidArgumentf("claim duration must be positive, got %v", q.Duration)
+	}
+	return nil
+}
+
 // BackendClaimFunc is a function that can make claims based on a ClaimQuery.
 // It is a convenience type for backends to use.
 type BackendClaimFunc func(ctx context.Context, eq *ClaimQuery) (*Task, error)
@@ -599,7 +614,15 @@ func IsInvalidArgument(err error) bool {
 	return errors.As(err, &e)
 }
 
-// claimQueryFromOpts processes ClaimOpt values and produces a claim query.
+// NewClaimQuery builds the claim query that Claim and TryClaim would send for
+// opts, with no default claimant. The service uses it to check a claim's shape
+// before authorizing it.
+func NewClaimQuery(opts ...ClaimOpt) *ClaimQuery {
+	return claimQueryFromOpts("", opts...)
+}
+
+// claimQueryFromOpts processes ClaimOpt values and produces a claim query. A
+// zero duration, as from ClaimFor(0), means the default.
 func claimQueryFromOpts(claimant string, opts ...ClaimOpt) *ClaimQuery {
 	query := &ClaimQuery{
 		Claimant: claimant,
@@ -608,6 +631,9 @@ func claimQueryFromOpts(claimant string, opts ...ClaimOpt) *ClaimQuery {
 	}
 	for _, opt := range opts {
 		opt(query)
+	}
+	if query.Duration == 0 {
+		query.Duration = DefaultClaimDuration
 	}
 	return query
 }
@@ -619,8 +645,8 @@ func claimQueryFromOpts(claimant string, opts ...ClaimOpt) *ClaimQuery {
 // default duration if none is given is DefaultClaimDuration.
 func (c *EntroQ) Claim(ctx context.Context, opts ...ClaimOpt) (*Task, error) {
 	query := claimQueryFromOpts(c.ClientID, opts...)
-	if len(query.Queues) == 0 {
-		return nil, fmt.Errorf("no queues specified for claim")
+	if err := query.Validate(); err != nil {
+		return nil, fmt.Errorf("claim: %w", err)
 	}
 	return c.backend.Claim(ctx, query)
 }
@@ -632,8 +658,8 @@ func (c *EntroQ) Claim(ctx context.Context, opts ...ClaimOpt) (*Task, error) {
 // that configuration tasks haven't changed.
 func (c *EntroQ) TryClaim(ctx context.Context, opts ...ClaimOpt) (*Task, error) {
 	query := claimQueryFromOpts(c.ClientID, opts...)
-	if len(query.Queues) == 0 {
-		return nil, fmt.Errorf("no queues specified for try claim")
+	if err := query.Validate(); err != nil {
+		return nil, fmt.Errorf("try claim: %w", err)
 	}
 	return c.backend.TryClaim(ctx, query)
 }
@@ -916,6 +942,9 @@ func (c *EntroQ) TryClaimDocByID(ctx context.Context, ns, id string, duration ti
 
 // Docs returns a list of docs matching the given query.
 func (c *EntroQ) Docs(ctx context.Context, rq *DocQuery) ([]*Doc, error) {
+	if err := rq.Validate(); err != nil {
+		return nil, fmt.Errorf("docs: %w", err)
+	}
 	return c.backend.Docs(ctx, rq)
 }
 
@@ -923,6 +952,12 @@ func (c *EntroQ) Docs(ctx context.Context, rq *DocQuery) ([]*Doc, error) {
 func (c *EntroQ) ClaimDocs(ctx context.Context, cq *DocClaim) ([]*Doc, error) {
 	if cq.Claimant == "" {
 		cq.Claimant = c.ClientID
+	}
+	if cq.Duration == 0 {
+		cq.Duration = DefaultClaimDuration
+	}
+	if err := cq.Validate(); err != nil {
+		return nil, fmt.Errorf("claim docs: %w", err)
 	}
 	return c.backend.ClaimDocs(ctx, cq)
 }
@@ -1068,17 +1103,17 @@ func (m *Modification) Options() []ModifyOption {
 func (m *Modification) EnsureModifyKeys() error {
 	for _, ins := range m.Inserts {
 		if ins.Queue == "" {
-			return fmt.Errorf("modify: insert of task %q must name a queue", ins.ID)
+			return InvalidArgumentf("modify: insert of task %q must name a queue", ins.ID)
 		}
 	}
 	for _, c := range m.Changes {
 		if c.Queue == "" {
-			return fmt.Errorf("modify: change of task %q must name a destination queue", c.ID)
+			return InvalidArgumentf("modify: change of task %q must name a destination queue", c.ID)
 		}
 	}
 	for _, ins := range m.DocInserts {
 		if ins.Namespace == "" {
-			return fmt.Errorf("modify: doc insert %q must name a namespace", ins.ID)
+			return InvalidArgumentf("modify: doc insert %q must name a namespace", ins.ID)
 		}
 	}
 	return nil

@@ -75,6 +75,26 @@ runs, so plan a short maintenance window on large doc tables.
   count claimed docs from the held locks instead of reading every doc.
   PostgreSQL's doc operations now run in Go on the same rules as every other
   backend, and the schema drops `_modify_docs` and `_claim_docs`.
+- **Malformed requests are invalid arguments, found before authorization.**
+  A request the backend can never carry out now fails as
+  `entroq.InvalidArgumentError` (gRPC `InvalidArgument`, HTTP 400) on every
+  backend, where some returned an unclassified error (HTTP 500), a
+  permission error, or silently nothing: a claim with no queues or no
+  claimant, a task listing with no queue and no task IDs, a doc listing or
+  doc claim with no namespace (doc IDs are unique only within a namespace, so
+  even a lookup by ID needs one), a doc claim with no key, a negative claim
+  duration, and a modification that inserts into no queue or namespace or
+  moves a task to no queue. The client checks first, the service checks
+  before authorizing, so the code no longer depends on whether authorization
+  is on, and every backend checks again. A task lookup by ID alone stays
+  valid. A zero claim duration, for tasks or docs, now means the default
+  (`entroq.DefaultClaimDuration`) instead of a claim that expires at once;
+  `entroq.NewClaimQuery` builds the query Claim would send. Errors the server
+  cannot classify are now gRPC `Internal` instead of `Unknown`.
+- **The Go gRPC client does not limit response size.** It kept gRPC's 4MB
+  receive default, so a response the server was configured to send (up to
+  `--max_size_mb`, default 10MB), such as a large task listing, failed on the
+  client. The server's limit now governs; `eqgrpc.WithMaxSize` still sets one.
 - **Schemas carry a digest, and unreleased ones a `-dev` version.**
   `eqpg.InitSchema` records `eqpg.SchemaDigest`, the SHA-256 of the schema it
   applies, and `eqpg.Open` refuses a database at the right version whose
@@ -123,6 +143,9 @@ runs, so plan a short maintenance window on large doc tables.
 
 ### Fixed
 
+- **A doc claim with no claimant is refused.** The service passed it to its
+  own client, which filled in the service's claimant, so the claim succeeded
+  as the service itself. It is now an invalid argument.
 - **The Go worker keeps an empty doc group it claimed.** Renewing a group's
   docs renewed the group, but a group claimed with no docs had none to renew,
   so its claim lapsed after one lease while the handler still ran, and another

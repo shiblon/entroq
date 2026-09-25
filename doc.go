@@ -314,6 +314,15 @@ type DocQuery struct {
 	OmitValues bool     `json:"omit_values"`
 }
 
+// Validate checks that the query names a namespace. Doc IDs are unique only
+// within a namespace, unlike task IDs, so even a lookup by ID needs one.
+func (q *DocQuery) Validate() error {
+	if q.Namespace == "" {
+		return InvalidArgumentf("docs query must name a namespace")
+	}
+	return nil
+}
+
 // DocClaim is used to claim all docs that share a primary key in a namespace.
 //
 // Construct with ClaimKey for a fluent interface:
@@ -343,10 +352,20 @@ func (c *DocClaim) For(d time.Duration) *DocClaim {
 	return c
 }
 
-// Validate checks that the claim query specifies exactly one valid strategy.
+// Validate checks that the claim names a namespace, a key, and a claimant. A
+// zero duration means the default, which ClaimDocs fills in.
 func (q *DocClaim) Validate() error {
+	if q.Namespace == "" {
+		return InvalidArgumentf("doc claim must name a namespace")
+	}
 	if q.Key == "" {
-		return fmt.Errorf("can't claim on a blank key")
+		return InvalidArgumentf("doc claim must name a key")
+	}
+	if q.Claimant == "" {
+		return InvalidArgumentf("doc claim must name a claimant")
+	}
+	if q.Duration < 0 {
+		return InvalidArgumentf("doc claim duration must not be negative, got %v", q.Duration)
 	}
 	return nil
 }

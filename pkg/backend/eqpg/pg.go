@@ -535,6 +535,9 @@ func (b *EQPG) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[stri
 
 // Tasks returns a slice of all tasks in the given queue.
 func (b *EQPG) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Task, error) {
+	if err := tq.Validate(); err != nil {
+		return nil, fmt.Errorf("eqpg tasks: %w", err)
+	}
 	q := "SELECT id, version, queue, at, created, modified, claimant, value, claims, attempt, err FROM tasks WHERE true"
 	var values []any
 
@@ -603,10 +606,7 @@ func (b *EQPG) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, 
 // queues, attempting to do so fairly across queues. Returns a nil task (no
 // error) if all queues are empty.
 func (b *EQPG) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
-	if cq.Duration == 0 {
-		return nil, fmt.Errorf("no duration set for claim %q", cq.Queues)
-	}
-	if err := validate.Claimant(cq.Claimant); err != nil {
+	if err := validate.Claim(cq); err != nil {
 		return nil, fmt.Errorf("eqpg claim: %w", err)
 	}
 	start := time.Now()
@@ -1013,6 +1013,9 @@ func scanDocRows(rows *sql.Rows) ([]*entroq.Doc, error) {
 // optional key range and subject to limit. Each doc carries its group's
 // version and claim.
 func (b *EQPG) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, error) {
+	if err := rq.Validate(); err != nil {
+		return nil, fmt.Errorf("eqpg docs: %w", err)
+	}
 	var (
 		rows *sql.Rows
 		err  error
@@ -1024,21 +1027,21 @@ func (b *EQPG) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, er
 	if len(rq.IDs) > 0 {
 		rows, err = b.DB.QueryContext(ctx,
 			`SELECT `+columns+` FROM `+docsWithLocks+`
-			 WHERE (d.namespace = $1 OR $1 = '') AND d.id = ANY($2)
+			 WHERE d.namespace = $1 AND d.id = ANY($2)
 			 ORDER BY d.namespace, d.key_primary, d.key_secondary`,
 			rq.Namespace, pq.StringArray(rq.IDs),
 		)
 	} else if rq.KeyExact != "" {
 		rows, err = b.DB.QueryContext(ctx,
 			`SELECT `+columns+` FROM `+docsWithLocks+`
-			 WHERE (d.namespace = $1 OR $1 = '') AND d.key_primary = $2
+			 WHERE d.namespace = $1 AND d.key_primary = $2
 			 ORDER BY d.key_primary, d.key_secondary`,
 			rq.Namespace, rq.KeyExact,
 		)
 	} else {
 		rows, err = b.DB.QueryContext(ctx,
 			`SELECT `+columns+` FROM `+docsWithLocks+`
-			 WHERE ($1 = '' OR d.namespace = $1)
+			 WHERE d.namespace = $1
 			   AND ($2 = '' OR d.key_primary >= $2)
 			   AND ($3 = '' OR d.key_primary < $3)
 			 ORDER BY d.namespace, d.key_primary, d.key_secondary
@@ -1058,9 +1061,6 @@ func (b *EQPG) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, er
 // before it has docs. It returns a DependencyError listing the members while
 // someone else holds the group.
 func (b *EQPG) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) (docs []*entroq.Doc, err error) {
-	if err := cq.Validate(); err != nil {
-		return nil, fmt.Errorf("claim docs: %w", err)
-	}
 	if err := validate.DocClaim(cq); err != nil {
 		return nil, fmt.Errorf("claim docs: %w", err)
 	}
