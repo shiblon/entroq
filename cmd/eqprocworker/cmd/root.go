@@ -23,24 +23,26 @@ import (
 	"strings"
 
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/cmd/internal/eqflags"
 	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
 	"github.com/shiblon/entroq/pkg/version"
 	"github.com/shiblon/entroq/pkg/workers/procworker"
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
 )
 
 var (
-	cfgFile string
-	eqaddr  string
-	inbox   string
+	cfgFile  string
+	settings = eqflags.NewEnvironment("EQPROCWORKER")
+	eqaddr   string
+	inbox    string
 )
 
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
-	Use:     "eqprocworker [options]",
-	Version: version.Version,
-	Short:   "EntroQ Worker CLI that reads a subprocess task and runs the specified command",
+	Use:               "eqprocworker [options]",
+	Version:           version.Version,
+	Short:             "EntroQ Worker CLI that reads a subprocess task and runs the specified command",
+	PersistentPreRunE: eqflags.Apply(settings),
 	Long: `The eqprocworker processes EntroQ tasks and runs subprocess commands.
 
 	It starts an EntroQ worker that accepts a subprocess definition and tries
@@ -84,6 +86,9 @@ var rootCmd = &cobra.Command{
 		}
 	`,
 	Run: func(cmd *cobra.Command, args []string) {
+		if !strings.Contains(eqaddr, ":") {
+			eqaddr += ":37706"
+		}
 		if inbox == "" {
 			log.Fatal("No inbox specified.")
 		}
@@ -117,15 +122,16 @@ func init() {
 
 	pflags.StringVar(&inbox, "inbox", "/subprocworker/inbox", "Queue to listen to")
 	pflags.StringVar(&eqaddr, "eqaddr", ":37706", "address of service, uses port 37706 if none is specified")
-
-	viper.BindPFlag("eqaddr", pflags.Lookup("eqaddr"))
 }
 
 // initConfig reads in config file and ENV variables if set.
 func initConfig() {
+	if cfgFile == "" {
+		cfgFile = settings.GetString("config")
+	}
 	if cfgFile != "" {
 		// Use config file from the flag.
-		viper.SetConfigFile(cfgFile)
+		settings.SetConfigFile(cfgFile)
 	} else {
 		// Find home directory.
 		home, err := os.UserHomeDir()
@@ -135,18 +141,12 @@ func initConfig() {
 		}
 
 		// Search config in home directory with name ".config".
-		viper.AddConfigPath(filepath.Join(home, ".config"))
-		viper.SetConfigName("eqprocworker")
+		settings.AddConfigPath(filepath.Join(home, ".config"))
+		settings.SetConfigName("eqprocworker")
 	}
-
-	if !strings.Contains(eqaddr, ":") {
-		eqaddr += ":37706"
-	}
-
-	viper.AutomaticEnv() // read in environment variables that match
 
 	// If a config file is found, read it in.
-	if err := viper.ReadInConfig(); err == nil {
-		fmt.Println("Using config file:", viper.ConfigFileUsed())
+	if err := settings.ReadInConfig(); err == nil {
+		fmt.Println("Using config file:", settings.ConfigFileUsed())
 	}
 }

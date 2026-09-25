@@ -9,8 +9,6 @@
 --   entroq._try_claim_one   -- claim from a single queue with bucket randomization
 --   entroq._try_claim_bucket -- claim from a specific hash bucket range
 --   entroq._claim_docs      -- atomically claim specific storage resources
---   entroq.channel_name     -- map queue names to LISTEN/NOTIFY channels
---   entroq.notify_ready_queues -- trigger notifications for tasks that reached their 'at' time
 
 CREATE SCHEMA IF NOT EXISTS entroq;
 
@@ -89,8 +87,10 @@ CREATE INDEX IF NOT EXISTS idx_docs_ns_stats ON entroq.docs (namespace, at, clai
 -- avoiding a full-queue scan while preserving dynamic bucket count selection.
 CREATE INDEX IF NOT EXISTS byQueueAtBucket ON entroq.tasks (queue, at, (hashtext(id) & 255));
 
--- Readiness index: supports global range scans for future-bound tasks becoming ready.
-CREATE INDEX IF NOT EXISTS byAt ON entroq.tasks (at, queue);
+-- The retired global readiness scan used byAt. The Go backend now counts ready
+-- tasks per waited queue through byQueueAtClaims, and byAt only added an index
+-- update to every task write.
+DROP INDEX IF EXISTS entroq.byAt;
 
 -- entroq._try_claim_bucket claims one available task whose ID hashes into the
 -- given bucket range. The bucket is selected by:
@@ -346,7 +346,6 @@ DECLARE
     v_mismatched   jsonb;
     v_collisions   jsonb;
     v_qset         text[];
-    v_queue        text;
 BEGIN
     -- Lock all must-exist dependency rows and check their versions.
     -- all_deps covers depends, deletes, and changes.
@@ -482,22 +481,6 @@ BEGIN
             r.created, r.modified, r.claimant, r.value,
             r.claims, r.attempt, r.err
         FROM r;
-
-    -- Batch Notifications.
-    -- Fires once per unique queue in the transaction, instead of once per row.
-    -- This deduplicates notifications and eliminates row-trigger overhead.
-    FOR v_queue IN
-        SELECT DISTINCT q FROM (
-            SELECT unnest(coalesce(p_ins_queues, '{}'::text[])) as q, 
-                   unnest(coalesce(p_ins_ats,    '{}'::timestamptz[])) as a
-            UNION ALL
-            SELECT unnest(coalesce(p_chg_queues, '{}'::text[])) as q,
-                   unnest(coalesce(p_chg_ats,    '{}'::timestamptz[])) as a
-        ) sub
-        WHERE sub.a <= v_now
-    LOOP
-        PERFORM pg_notify(entroq.channel_name(v_queue), '');
-    END LOOP;
 END;
 $$;
 
@@ -640,29 +623,6 @@ DROP FUNCTION IF EXISTS entroq.queues(text, text[], integer);
 DROP FUNCTION IF EXISTS entroq.tasks(text, integer, boolean);
 DROP FUNCTION IF EXISTS entroq.like_prefix(text);
 
--- entroq.channel_name converts a queue name into a valid PostgreSQL
--- LISTEN/NOTIFY channel identifier within the 63-byte limit.
--- Uses the full sanitized name when it fits; otherwise sandwiches an
--- 8-hex-char MD5 of the original name between a prefix and suffix.
--- Prefix length 25, suffix length 26: 2+25+1+8+1+26 = 63 bytes exactly.
---
--- md5() is used instead of CRC32 because it is a built-in PostgreSQL
--- function requiring no extension.
---
--- SQL notification paths use this channel name; the Go listener mirrors the
--- same algorithm in pgnotify.go.
-CREATE OR REPLACE FUNCTION entroq.channel_name(p_queue text)
-RETURNS text LANGUAGE sql IMMUTABLE STRICT AS $$
-    SELECT CASE
-        WHEN length(regexp_replace(p_queue, '[^a-zA-Z0-9]', '_', 'g')) + 2 <= 63
-        THEN 'q_' || regexp_replace(p_queue, '[^a-zA-Z0-9]', '_', 'g')
-        ELSE 'q_'
-            || left(regexp_replace(p_queue, '[^a-zA-Z0-9]', '_', 'g'), 25)
-            || '_' || left(md5(p_queue), 8)
-            || '_' || right(regexp_replace(p_queue, '[^a-zA-Z0-9]', '_', 'g'), 26)
-    END
-$$;
-
 -- Remove the retired raw-SQL document listing wrapper. The Go backend
 -- queries entroq.docs directly.
 DROP FUNCTION IF EXISTS entroq.docs(text, text, text, integer, boolean);
@@ -746,58 +706,13 @@ DROP TYPE IF EXISTS entroq.doc_arg;
 DROP TYPE IF EXISTS entroq.task_id;
 DROP TYPE IF EXISTS entroq.doc_id;
 
--- Global state for readiness notifications. last_at tracks the watermark of
--- tasks that have already been processed for "silent readiness."
-CREATE TABLE IF NOT EXISTS entroq.notification_state (
-    id      INTEGER     PRIMARY KEY CHECK (id = 1),
-    last_at TIMESTAMPTZ NOT NULL
-);
-
--- Initialize the watermark if it doesn't exist.
-INSERT INTO entroq.notification_state (id, last_at)
-VALUES (1, now())
-ON CONFLICT (id) DO NOTHING;
-
--- entroq.notify_ready_queues atomizes the "Check and Notify" logic by maintaining
--- a high-watermark of processed 'at' times. This makes the notification system
--- immune to ticker jitter, overlapping runs, or service restarts.
---
--- If p_min_interval is specified, the function only proceeds if the
--- watermark has stagnated for at least that long. This prevents distributed
--- tickers from flooding the database with redundant updates and signals.
---
--- The minimum interval lets multiple eqpg backend instances call this safely;
--- the watermark and interval guard ensure only one does real work per interval.
-CREATE OR REPLACE FUNCTION entroq.notify_ready_queues(p_min_interval interval DEFAULT '0 seconds')
-RETURNS SETOF text LANGUAGE plpgsql AS $$
-DECLARE
-    v_old_last_at timestamptz;
-    v_new_last_at timestamptz := now();
-    v_queue       text;
-BEGIN
-    -- Lock the row and read the current watermark atomically.
-    -- FOR UPDATE ensures concurrent callers serialize here; the second caller
-    -- will see the updated last_at and bail out via the interval check below.
-    SELECT last_at INTO v_old_last_at FROM entroq.notification_state WHERE id = 1 FOR UPDATE;
-
-    -- Rate limit: skip if the watermark moved recently enough.
-    -- This prevents distributed tickers from flooding notifications.
-    IF now() - v_old_last_at < p_min_interval THEN
-        RETURN;
-    END IF;
-
-    UPDATE entroq.notification_state SET last_at = v_new_last_at WHERE id = 1;
-    
-    FOR v_queue IN
-        SELECT DISTINCT queue 
-        FROM entroq.tasks 
-        WHERE at > v_old_last_at AND at <= v_new_last_at
-    LOOP
-        PERFORM pg_notify(entroq.channel_name(v_queue), '');
-        RETURN NEXT v_queue;
-    END LOOP;
-END;
-$$;
+-- Retired LISTEN/NOTIFY readiness: the watermark table, the function that
+-- scanned and broadcast from it, and the channel-name helper. Each Go backend
+-- now runs its own readiness loop over the queues its claims wait on, and
+-- modifications no longer send NOTIFY.
+DROP FUNCTION IF EXISTS entroq.notify_ready_queues(interval);
+DROP TABLE IF EXISTS entroq.notification_state;
+DROP FUNCTION IF EXISTS entroq.channel_name(text);
 
 -- GC is an ordinary Go backend queue worker. Remove the retired
 -- PostgreSQL-specific policy and collection API so existing schemas converge on
@@ -849,9 +764,9 @@ DROP FUNCTION IF EXISTS entroq.gc_due(text);
 --   (1) Text length CHECKs count bytes, not characters: length() becomes
 --       octet_length() on tasks.id/claimant and
 --       docs.namespace/id/claimant/key_primary/key_secondary. These bounds
---       budget btree index entries, which are measured in bytes, and every
---       client validates in bytes (Go's len()), so a multi-byte key could pass
---       the old check while consuming up to 4x the intended index space.
+--       budget btree index entries, which are measured in bytes, so a
+--       multi-byte key could pass the old check while consuming up to 4x the
+--       intended index space.
 --       Collation is not involved: COLLATE "C" governs comparison, while
 --       length() counts characters per the server encoding, so the columns
 --       were byte-ordered but character-bounded. The new constraints are added
@@ -1023,5 +938,5 @@ CREATE TABLE IF NOT EXISTS entroq.meta (
     value TEXT NOT NULL
 );
 
-INSERT INTO entroq.meta (key, value) VALUES ('schema_version', '1.11.0')
-    ON CONFLICT (key) DO UPDATE SET value = '1.11.0' WHERE entroq.meta.key = 'schema_version';
+INSERT INTO entroq.meta (key, value) VALUES ('schema_version', '1.13.0')
+    ON CONFLICT (key) DO UPDATE SET value = '1.13.0' WHERE entroq.meta.key = 'schema_version';

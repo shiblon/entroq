@@ -14,6 +14,59 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// InitialVersions verifies that newly inserted tasks and docs both begin at
+// version zero. Their first changes must therefore advance them to version one.
+func InitialVersions(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	queue := path.Join(qPrefix, "initial_versions", "tasks")
+	namespace := path.Join(qPrefix, "initial_versions", "docs")
+
+	resp, err := client.Modify(ctx,
+		entroq.InsertingInto(queue,
+			entroq.WithID(uniqueTaskID("task-1")),
+			entroq.WithValue("task"),
+		),
+		entroq.PuttingDocInto(namespace,
+			entroq.WithIDKeys("doc-1", "", ""),
+			entroq.WithContent("doc"),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Insert task and doc: %v", err)
+	}
+	if len(resp.InsertedTasks) != 1 {
+		t.Fatalf("InsertedTasks length: want 1, got %d", len(resp.InsertedTasks))
+	}
+	if len(resp.InsertedDocs) != 1 {
+		t.Fatalf("InsertedDocs length: want 1, got %d", len(resp.InsertedDocs))
+	}
+	if got := resp.InsertedTasks[0].Version; got != 0 {
+		t.Errorf("Initial task version: want 0, got %d", got)
+	}
+	if got := resp.InsertedDocs[0].Version; got != 0 {
+		t.Errorf("Initial doc version: want 0, got %d", got)
+	}
+
+	resp, err = client.Modify(ctx,
+		resp.InsertedTasks[0].Change(entroq.ValueTo("changed task")),
+		resp.InsertedDocs[0].Change(entroq.WithContent("changed doc")),
+	)
+	if err != nil {
+		t.Fatalf("Change task and doc: %v", err)
+	}
+	if len(resp.ChangedTasks) != 1 {
+		t.Fatalf("ChangedTasks length: want 1, got %d", len(resp.ChangedTasks))
+	}
+	if len(resp.ChangedDocs) != 1 {
+		t.Fatalf("ChangedDocs length: want 1, got %d", len(resp.ChangedDocs))
+	}
+	if got := resp.ChangedTasks[0].Version; got != 1 {
+		t.Errorf("First changed task version: want 1, got %d", got)
+	}
+	if got := resp.ChangedDocs[0].Version; got != 1 {
+		t.Errorf("First changed doc version: want 1, got %d", got)
+	}
+}
+
 // SimpleDocLifecycle tests basic insertion, change, and deletion of a doc.
 func SimpleDocLifecycle(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	ns := path.Join(qPrefix, "simple_doc")
@@ -769,5 +822,48 @@ func ModifyRejectsWrongNamespace(ctx context.Context, t *testing.T, client *entr
 	}
 	if len(docs) != 1 || docs[0].Version != doc.Version {
 		t.Errorf("doc should be untouched in %q at v%d: got %+v", realNS, doc.Version, docs)
+	}
+}
+
+// DocTimestamps checks that a backend owns a doc's timestamps: an insert that
+// does not supply them gets the current time, and a change keeps the stored
+// creation time rather than taking it from the caller. Over the gRPC service
+// an unset timestamp must not arrive as a real far-past date.
+func DocTimestamps(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	ns := path.Join(qPrefix, "doc_timestamps")
+
+	before, err := client.Time(ctx)
+	if err != nil {
+		t.Fatalf("Time: %v", err)
+	}
+	// Allow for millisecond truncation on the wire.
+	before = before.Add(-time.Second)
+
+	resp, err := client.Modify(ctx, entroq.PuttingDocInto(ns, entroq.WithContent("v0")))
+	if err != nil {
+		t.Fatalf("Insert doc: %v", err)
+	}
+	inserted := resp.InsertedDocs[0]
+	if inserted.Created.Before(before) || inserted.Modified.Before(before) {
+		t.Fatalf("Inserted: want created and modified after %v, got created %v, modified %v", before, inserted.Created, inserted.Modified)
+	}
+
+	resp, err = client.Modify(ctx, inserted.Change(entroq.WithContent("v1")))
+	if err != nil {
+		t.Fatalf("Change doc: %v", err)
+	}
+	if got := resp.ChangedDocs[0].Created; !got.Equal(inserted.Created) {
+		t.Errorf("Changed: want created %v, got %v", inserted.Created, got)
+	}
+
+	docs, err := client.Docs(ctx, &entroq.DocQuery{Namespace: ns, IDs: []string{inserted.ID}})
+	if err != nil {
+		t.Fatalf("Read doc: %v", err)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("Want 1 stored doc, got %d", len(docs))
+	}
+	if got := docs[0].Created; !got.Equal(inserted.Created) {
+		t.Errorf("Stored: want created %v, got %v", inserted.Created, got)
 	}
 }

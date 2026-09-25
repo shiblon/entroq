@@ -22,7 +22,7 @@
 //			log.Fatalf("Failed to listen: %v", err)
 //		}
 //
-//		svc, err := eqsvcgrpc.New(ctx, eqpg.Opener("localhost:5432", "postgres", "postgres", false))
+//		svc, err := eqsvcgrpc.New(ctx, eqpg.Opener("localhost:5432", eqpg.WithUsername("postgres"), eqpg.WithPassword("postgres")))
 //		if err != nil {
 //			log.Fatalf("Failed to open service backends: %v", err)
 //		}
@@ -412,6 +412,9 @@ func autoCodeErrorf(format string, vals ...any) error {
 	}
 	if entroq.IsCanceled(err) {
 		return status.New(codes.Canceled, err.Error()).Err()
+	}
+	if entroq.IsInvalidArgument(err) {
+		return status.New(codes.InvalidArgument, err.Error()).Err()
 	}
 	return err
 }

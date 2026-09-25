@@ -7,6 +7,149 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [Unreleased]
+
+Release note: the next release must be a minor (v1.13.0 or later), not a
+patch. It adds public API (`entroq.InvalidArgumentError`), moves the SQLite
+schema to version 2, adds `eqc work --max-claims`, and removes the
+`eqc mod --reset` flag. The PostgreSQL schema moves to 1.13.0: run
+`eqpg schema upgrade` (or serve with `--init_schema`) before starting the new
+service.
+
+### Added
+
+- **Readiness loops for SQLite and Redis.** Both backends now wake claims for
+  tasks that become available with time, every `WithReadinessInterval`
+  (default 5s; `--readiness_interval` on `eqsqlite serve` and `eqredis serve`),
+  instead of waiting for the 30-second claim poll. Each tick asks the notifier
+  which queues have waiters and checks only those, so an idle backend does no
+  work. Redis's loop also finds tasks made available by another process sharing
+  the same Redis.
+- **Readiness wakes one waiter per ready task.** When several tasks in a queue
+  become available together, every backend now wakes up to that many waiting
+  claims in one tick, instead of one waiter per tick. This uses the new
+  optional `entroq.ListenerCounter` interface, which `subq.SubQ` implements
+  through the new `SubQ.Listeners`; a custom `NotifyWaiter` without it keeps
+  claim polling (SQLite, Redis, PostgreSQL) or one wakeup per queue (in-memory).
+- **`eqc work --max-claims`.** Passes the worker's claim ceiling through, as
+  `eqlink work` already does: claim `N` may run, and a later claim moves the
+  task to the error queue without running the command. The default 0 means no
+  maximum, matching `worker.WithMaxClaims`. Tasks the worker moves itself now
+  honor `--error-queue` too.
+
+### Changed
+
+- **Breaking: PostgreSQL no longer uses LISTEN/NOTIFY.** The service is the
+  database's only client, so the backend now runs the same readiness loop as
+  the other backends: a batched, read-only count of available tasks on the
+  queues its claims wait on (`eqpg.WithReadinessInterval`, default 5s,
+  `eqpg serve --readiness_interval`). Modifications no longer send NOTIFY, and
+  the schema drops `notify_ready_queues`, the `notification_state` watermark
+  table, `channel_name`, and the `byAt` index, which was updated on every task
+  write only to serve the old heartbeat. `eqpg.PGNotifyWaiter` is removed.
+  `eqpg.WithHeartbeat` and `eqpg serve --heartbeat` still set the readiness
+  interval but are deprecated; `eqpg.WithNoListen` and `--no_listen` are
+  deprecated and do nothing. `eqc --pg_url` gets the readiness loop too:
+  `--pg_heartbeat` sets its interval and now defaults to 5s instead of off.
+- **`eqc mod --reset_to_queue` replaces `--reset`.** `eqc mod -Q <queue> -r`
+  reset a task's attempt and error but kept its claim count, which the backend
+  owns and every change preserves. A task quarantined by `worker.WithMaxClaims`
+  went straight back to its error queue on the first claim. `--reset_to_queue`
+  (`-R`) deletes the task and inserts its value, or `--val`, into the named
+  queue as a fresh task in one atomic modification: new ID, zero claims and
+  attempts, no error, available now. It prints the new task. It cannot be
+  combined with `--queue_to`. `--reset` now fails with a pointer to the new
+  flag.
+
+### Fixed
+
+- **SQLite length limits count bytes.** The experimental SQLite backend
+  checked id, claimant, namespace, and doc key lengths with `length()`, which
+  counts characters and stops at the first NUL. Multibyte values up to twice
+  the limit, and anything after a NUL, got through. The checks now use
+  `octet_length()`, matching PostgreSQL, and the doc namespace limit rises from
+  64 to PostgreSQL's 1024 bytes. The SQLite schema moves to version 2; opening
+  a version 1 database rebuilds its tables in one transaction. If any stored
+  row exceeds the byte limits, the migration rolls back and the file stays at
+  version 1.
+- **Length limits on every backend, reported as 400.** The in-memory and
+  Redis backends enforced no length limits at all, and PostgreSQL and SQLite
+  enforced them only through schema CHECKs, whose failures reached callers as
+  an unclassified error: the service returned gRPC `Unknown`, which HTTP/JSON
+  clients saw as a 500. Every backend now checks the limits in Go before
+  touching storage (task and doc IDs and claimants 64 bytes, doc namespaces
+  1024 bytes, doc keys 256 bytes) and returns the new
+  `entroq.InvalidArgumentError`, which the service reports as
+  `InvalidArgument` (HTTP 400) and the gRPC backend turns back into the same
+  error (`entroq.IsInvalidArgument`). Claims, doc claims, and modifications
+  that insert or change rows are checked; deletes and depends are not, since
+  they store nothing. In-memory journal replay is not checked, so an existing
+  journal still loads. The schema CHECKs remain as a backstop, and a shared
+  contract test runs the limits against every backend.
+- **Redis doc keys no longer collide.** The Redis backend escaped `/` in a
+  namespace as `%2F` but left `%` alone, so namespaces such as `a/b` and
+  `a%2Fb` shared doc keys and a doc in one overwrote the doc with the same ID
+  in the other. `%` is now escaped too. Opening the backend moves docs in
+  namespaces containing `%` to their new keys; a doc already lost to a
+  collision cannot be recovered. The move reruns on every open, but a server
+  running the previous version against the same Redis keeps writing old keys,
+  so upgrade all servers sharing a database together.
+
+## [1.12.3] - 2026-09-24
+
+Go module `v1.12.3`. A bug-fix release for the in-memory backend and the gRPC
+service. No proto or schema change (schema version stays 1.11.0) and no client
+changes.
+
+### Fixed
+
+- **Doc timestamps over gRPC.** A doc inserted through the gRPC service without
+  explicit timestamps was stored with a 1754 (Go client) or 1970 (Python, JS)
+  creation and modification time on every backend. The service now reads a
+  non-positive `created_ms` or `modified_ms` as unset, so the backend assigns
+  the current time; the Go client sends 0 for an unset time.
+- **In-memory stored fields.** The in-memory backend took a changed task's
+  claim count and creation time, and a changed doc's creation time, from the
+  caller. Through the gRPC service these arrived empty, so every renewal, retry,
+  or move reset claims to 0 (disabling `worker.WithMaxClaims`) and cleared the
+  creation time. Changes now keep the stored values. Inserted tasks also keep
+  their `Attempt` and `Err`, and journal replay restores the recorded
+  modification time instead of the replay time. Values already journaled replay
+  as recorded.
+
+## [1.12.2] - 2026-09-23
+
+### Added
+
+- **Service environment overrides.** Every flag on `eqmem`, `eqpg`, `eqredis`,
+  `eqsqlite`, `eqlink`, `eqk8s`, and `eqprocworker` accepts a service-prefixed
+  environment variable, such as
+  `EQMEM_READINESS_INTERVAL=2s`, `EQPG_PORT=37707`, or
+  `EQLINK_ENTROQ_STARTUP_TIMEOUT=1m`. Explicit command-line flags take
+  precedence. The `PG*`, `EQ_REDIS_*`, and `EQ_SQLITE_PATH` aliases are also
+  accepted.
+
+## [1.12.1] - 2026-09-23
+
+### Fixed
+
+- **In-memory document versions.** Newly inserted documents now begin at v0,
+  matching tasks and every other backend. Journal replay accepts the former v1
+  predecessor for a historical first change ending at v2; insert-only documents
+  from older journals reopen at v0.
+
+## [1.12.0] - 2026-09-23
+
+### Changed
+
+- **In-memory claim readiness.** The in-memory backend checks queue heap heads
+  every five seconds and wakes blocked claims when scheduled or expired tasks
+  become available, instead of relying on the 30-second claim poll fallback.
+  `eqmem.WithReadinessInterval` and `eqmem serve --readiness_interval` control
+  or disable the check.
+- **In-memory queue-stat contention.** Queue stats snapshot queue pointers once
+  instead of reacquiring the global queue-registry lock for every queue.
+
 ## [1.11.0] - 2026-09-22
 
 ### Fixed

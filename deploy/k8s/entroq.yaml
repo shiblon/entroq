@@ -46,8 +46,7 @@ spec:
             - "--dbaddr=postgres:5432"
             - "--dbuser=entroq"
             - "--dbname=entroq"
-            - "--heartbeat=5s"
-            - "--no_listen=false"
+            - "--readiness_interval=5s"
           ports:
             - containerPort: 37706
               name: grpc

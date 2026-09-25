@@ -2,8 +2,10 @@ package eqmem
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/backend/internal/limits"
 )
 
 // Docs returns a slice of docs in a namespace. If IDs are specified, only
@@ -87,6 +89,9 @@ func (m *EQMem) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, e
 // another claimant, a DependencyError is returned. Returns an empty slice (not
 // an error) if no docs with the key exist.
 func (m *EQMem) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.Doc, error) {
+	if err := limits.DocClaim(cq); err != nil {
+		return nil, fmt.Errorf("eqmem claim docs: %w", err)
+	}
 	nls, unlock := m.lockNamespaces([]string{cq.Namespace})
 	defer unlock()
 

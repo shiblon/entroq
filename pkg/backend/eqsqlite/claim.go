@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/backend/internal/limits"
 )
 
 const claimWindow = 64
@@ -19,6 +20,9 @@ func (b *EQSQLite) TryClaim(ctx context.Context, q *entroq.ClaimQuery) (*entroq.
 	start := time.Now()
 	defer func() { b.claimDur.Record(ctx, time.Since(start).Seconds()) }()
 	if err := validateClaim(q); err != nil {
+		return nil, fmt.Errorf("eqsqlite try claim: %w", err)
+	}
+	if err := limits.Claimant(q.Claimant); err != nil {
 		return nil, fmt.Errorf("eqsqlite try claim: %w", err)
 	}
 	queues := slices.Clone(q.Queues)

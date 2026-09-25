@@ -52,6 +52,28 @@ func (h *claimHeap) Top() *claimItem {
 	return h.items[0]
 }
 
+// CountAvailable returns how many items are available at now, counting no
+// more than limit. The heap orders items by arrival time, so a subtree whose
+// root is not yet available holds nothing available and is skipped; the walk
+// visits about twice as many items as it counts.
+func (h *claimHeap) CountAvailable(now time.Time, limit int) int {
+	if h == nil {
+		return 0
+	}
+	count := 0
+	var walk func(index int)
+	walk = func(index int) {
+		if count >= limit || index >= len(h.items) || now.Before(h.items[index].at) {
+			return
+		}
+		count++
+		walk(index*2 + 1)
+		walk(index*2 + 2)
+	}
+	walk(0)
+	return count
+}
+
 func (h *claimHeap) RandomAvailable(now time.Time) *claimItem {
 	return h.randAvail(now, 0)
 }

@@ -324,9 +324,9 @@ func Example_docBasics() {
 	fmt.Printf("listed %d doc(s) after delete\n", len(docs))
 
 	// Output:
-	// created doc key=server version 1
+	// created doc key=server version 0
 	// listed 1 doc(s)
-	// updated doc key=server to version 2
+	// updated doc key=server to version 1
 	// listed 0 doc(s) after delete
 }
 
@@ -548,8 +548,8 @@ func Example_docVersionPin() {
 	fmt.Println("current pin: ok")
 
 	// Output:
-	// created at version 1
-	// updated to version 2
+	// created at version 0
+	// updated to version 1
 	// stale pin: IsDependency=true, HasMissingDocs=true
 	// current pin: ok
 }

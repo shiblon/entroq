@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/backend/internal/limits"
 )
 
 // Modify atomically applies a modification to the task and document store.
@@ -18,6 +19,9 @@ func (b *EQSQLite) Modify(ctx context.Context, mod *entroq.Modification) (*entro
 		return nil, fmt.Errorf("eqsqlite modify: nil modification")
 	}
 	if err := mod.EnsureModifyKeys(); err != nil {
+		return nil, fmt.Errorf("eqsqlite modify: %w", err)
+	}
+	if err := limits.Modification(mod); err != nil {
 		return nil, fmt.Errorf("eqsqlite modify: %w", err)
 	}
 	if _, _, err := mod.AllDependencies(); err != nil {

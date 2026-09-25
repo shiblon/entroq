@@ -107,6 +107,14 @@ func TestGRPCSimpleChange(t *testing.T) {
 	RunQTest(t, eqtest.SimpleChange)
 }
 
+func TestGRPCChangeKeepsStoredFields(t *testing.T) {
+	RunQTest(t, eqtest.ChangeKeepsStoredFields)
+}
+
+func TestGRPCInsertKeepsAttemptAndErr(t *testing.T) {
+	RunQTest(t, eqtest.InsertKeepsAttemptAndErr)
+}
+
 func TestGRPCTaskChangeFutureArrival(t *testing.T) {
 	RunQTest(t, eqtest.TaskChangeFutureArrival)
 }
@@ -167,8 +175,16 @@ func TestGRPCSimpleDocLifecycle(t *testing.T) {
 	RunQTest(t, eqtest.SimpleDocLifecycle)
 }
 
+func TestGRPCInitialVersions(t *testing.T) {
+	RunQTest(t, eqtest.InitialVersions)
+}
+
 func TestGRPCDocMultiOp(t *testing.T) {
 	RunQTest(t, eqtest.DocMultiOp)
+}
+
+func TestGRPCDocTimestamps(t *testing.T) {
+	RunQTest(t, eqtest.DocTimestamps)
 }
 
 func TestGRPCDocListing(t *testing.T) {

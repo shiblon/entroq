@@ -11,7 +11,10 @@ import (
 	"go.opentelemetry.io/otel/metric"
 )
 
-var serve eqserve.Config
+var (
+	serve             eqserve.Config
+	readinessInterval time.Duration
+)
 
 var serveCmd = &cobra.Command{
 	Use:   "serve",
@@ -28,6 +31,7 @@ HTTP/JSON + Connect API (--http_port, default 9100, which also serves /metrics).
 					eqredis.WithPassword(redisPwd),
 					eqredis.WithRedisDB(redisDB),
 					eqredis.WithMeterProvider(mp),
+					eqredis.WithReadinessInterval(readinessInterval),
 				)
 			},
 			fmt.Sprintf("redis(%s db=%d)", redisAddr, redisDB),
@@ -39,6 +43,8 @@ func init() {
 	f := serveCmd.Flags()
 	serve.MetricInterval = 5 * time.Second
 	serve.BindFlags(f)
+	f.DurationVar(&readinessInterval, "readiness_interval", eqredis.DefaultReadinessInterval,
+		"Interval for notifying claims when tasks become ready through time; non-positive disables.")
 
 	rootCmd.AddCommand(serveCmd)
 }

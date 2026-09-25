@@ -37,7 +37,6 @@ func TestClaimContentionOverGRPCPostgres(t *testing.T) {
 		WithUsername("postgres"),
 		WithPassword("password"),
 		WithConnectAttempts(10),
-		WithHeartbeat(5*time.Second),
 	))
 	if err != nil {
 		t.Fatalf("start gRPC service over postgres: %v", err)

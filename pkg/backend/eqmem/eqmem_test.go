@@ -59,6 +59,14 @@ func TestEQMemSimpleChange(t *testing.T) {
 	RunQTest(t, eqtest.SimpleChange)
 }
 
+func TestEQMemChangeKeepsStoredFields(t *testing.T) {
+	RunQTest(t, eqtest.ChangeKeepsStoredFields)
+}
+
+func TestEQMemInsertKeepsAttemptAndErr(t *testing.T) {
+	RunQTest(t, eqtest.InsertKeepsAttemptAndErr)
+}
+
 func TestEQMemTaskChangeFutureArrival(t *testing.T) {
 	RunQTest(t, eqtest.TaskChangeFutureArrival)
 }
@@ -125,6 +133,10 @@ func TestEQMemClaimRandomHead(t *testing.T) {
 
 func TestEQMemTasksClaimantLimit(t *testing.T) {
 	RunQTest(t, eqtest.TasksClaimantLimit)
+}
+
+func TestEQMemLengthLimits(t *testing.T) {
+	RunQTest(t, eqtest.LengthLimits)
 }
 
 func TestEQMemClaimLongDuration(t *testing.T) {
@@ -543,8 +555,16 @@ func TestEQMemSimpleDocLifecycle(t *testing.T) {
 	RunQTest(t, eqtest.SimpleDocLifecycle)
 }
 
+func TestEQMemInitialVersions(t *testing.T) {
+	RunQTest(t, eqtest.InitialVersions)
+}
+
 func TestEQMemDocMultiOp(t *testing.T) {
 	RunQTest(t, eqtest.DocMultiOp)
+}
+
+func TestEQMemDocTimestamps(t *testing.T) {
+	RunQTest(t, eqtest.DocTimestamps)
 }
 
 func TestEQMemDocListing(t *testing.T) {
@@ -573,6 +593,190 @@ func TestEQMemQueueStatsAccuracy(t *testing.T) {
 
 func TestEQMemNamespaceStats(t *testing.T) {
 	RunQTest(t, eqtest.NamespaceStats)
+}
+
+func TestEQMemJournalDocVersions(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	opener := Opener(WithJournal(t.TempDir()))
+	eq, err := entroq.New(ctx, opener)
+	if err != nil {
+		t.Fatalf("Open journaled client: %v", err)
+	}
+
+	const namespace = "/journal/doc_versions"
+	resp, err := eq.Modify(ctx, entroq.PuttingDocInto(namespace,
+		entroq.WithIDKeys("doc-1", "", ""),
+		entroq.WithContent("initial"),
+	))
+	if err != nil {
+		t.Fatalf("Insert doc: %v", err)
+	}
+	inserted := resp.InsertedDocs[0]
+	if inserted.Version != 0 {
+		t.Fatalf("Inserted doc version: want 0, got %d", inserted.Version)
+	}
+
+	resp, err = eq.Modify(ctx, inserted.Change(entroq.WithContent("changed")))
+	if err != nil {
+		t.Fatalf("Change doc: %v", err)
+	}
+	if got := resp.ChangedDocs[0].Version; got != 1 {
+		t.Fatalf("Changed doc version: want 1, got %d", got)
+	}
+	if err := eq.Close(); err != nil {
+		t.Fatalf("Close journaled client: %v", err)
+	}
+
+	eq, err = entroq.New(ctx, opener)
+	if err != nil {
+		t.Fatalf("Reopen journaled client: %v", err)
+	}
+	defer eq.Close()
+
+	docs, err := eq.Docs(ctx, &entroq.DocQuery{Namespace: namespace, IDs: []string{"doc-1"}})
+	if err != nil {
+		t.Fatalf("Read replayed doc: %v", err)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("Replayed docs length: want 1, got %d", len(docs))
+	}
+	if got := docs[0].Version; got != 1 {
+		t.Errorf("Replayed doc version: want 1, got %d", got)
+	}
+}
+
+func TestEQMemJournalReplayKeepsStoredFields(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	opener := Opener(WithJournal(t.TempDir()))
+	eq, err := entroq.New(ctx, opener)
+	if err != nil {
+		t.Fatalf("Open journaled client: %v", err)
+	}
+
+	const queue = "/journal/stored_fields"
+	if _, err := eq.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue("v0"))); err != nil {
+		t.Fatalf("Insert task: %v", err)
+	}
+	task, err := eq.Claim(ctx, entroq.From(queue), entroq.ClaimFor(time.Minute))
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	resp, err := eq.Modify(ctx, task.Change(entroq.ValueTo("v1")))
+	if err != nil {
+		t.Fatalf("Change task: %v", err)
+	}
+	wantTask := resp.ChangedTasks[0]
+
+	const namespace = "/journal/stored_fields"
+	resp, err = eq.Modify(ctx, entroq.PuttingDocInto(namespace, entroq.WithContent("v0")))
+	if err != nil {
+		t.Fatalf("Insert doc: %v", err)
+	}
+	resp, err = eq.Modify(ctx, resp.InsertedDocs[0].Change(entroq.WithContent("v1")))
+	if err != nil {
+		t.Fatalf("Change doc: %v", err)
+	}
+	wantDoc := resp.ChangedDocs[0]
+
+	if err := eq.Close(); err != nil {
+		t.Fatalf("Close journaled client: %v", err)
+	}
+	eq, err = entroq.New(ctx, opener)
+	if err != nil {
+		t.Fatalf("Reopen journaled client: %v", err)
+	}
+	defer eq.Close()
+
+	tasks, err := eq.Tasks(ctx, queue, entroq.WithTaskID(wantTask.ID))
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("Read replayed task: %v (%d tasks)", err, len(tasks))
+	}
+	got := tasks[0]
+	if got.Claims != 1 {
+		t.Errorf("Replayed claims: want 1, got %d", got.Claims)
+	}
+	if !got.Created.Equal(wantTask.Created) || !got.Modified.Equal(wantTask.Modified) {
+		t.Errorf("Replayed task times: want created %v, modified %v; got created %v, modified %v",
+			wantTask.Created, wantTask.Modified, got.Created, got.Modified)
+	}
+
+	docs, err := eq.Docs(ctx, &entroq.DocQuery{Namespace: namespace, IDs: []string{wantDoc.ID}})
+	if err != nil || len(docs) != 1 {
+		t.Fatalf("Read replayed doc: %v (%d docs)", err, len(docs))
+	}
+	if !docs[0].Created.Equal(wantDoc.Created) || !docs[0].Modified.Equal(wantDoc.Modified) {
+		t.Errorf("Replayed doc times: want created %v, modified %v; got created %v, modified %v",
+			wantDoc.Created, wantDoc.Modified, docs[0].Created, docs[0].Modified)
+	}
+}
+
+func TestEQMemReplaysLegacyInitialDocVersion(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	opener := WithJournal(t.TempDir())
+	m, err := New(ctx, opener)
+	if err != nil {
+		t.Fatalf("Open journaled backend: %v", err)
+	}
+
+	const namespace = "/journal/legacy_doc_version"
+	resp, err := m.Modify(ctx, entroq.NewModification("",
+		entroq.PuttingDocInto(namespace,
+			entroq.WithIDKeys("doc-1", "", ""),
+			entroq.WithContent("initial"),
+		),
+	))
+	if err != nil {
+		t.Fatalf("Insert doc: %v", err)
+	}
+
+	// Before v1.12.1 this insert would have produced v1, making its first
+	// changed state v2. Append that historical final-state record directly so
+	// reopening exercises the real journal player and its version decrement.
+	legacyChange := resp.InsertedDocs[0].Copy()
+	legacyChange.Version = 1
+	legacyChange.Content = json.RawMessage(`"changed"`)
+	if _, err := m.Modify(ctx, &entroq.Modification{DocChanges: []*entroq.Doc{legacyChange}}); err == nil {
+		t.Fatal("Live modification accepted legacy predecessor version")
+	} else if !entroq.IsDependency(err) {
+		t.Fatalf("Live legacy-version change: want dependency error, got %v", err)
+	}
+	legacyChange.Version = 2
+	journalRecord, err := json.Marshal(&entroq.Modification{DocChanges: []*entroq.Doc{legacyChange}})
+	if err != nil {
+		t.Fatalf("Marshal legacy journal change: %v", err)
+	}
+	if err := m.journal.Append(journalRecord); err != nil {
+		t.Fatalf("Append legacy journal change: %v", err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatalf("Close journaled backend: %v", err)
+	}
+
+	m, err = New(ctx, opener)
+	if err != nil {
+		t.Fatalf("Replay legacy journal: %v", err)
+	}
+	defer m.Close()
+
+	docs, err := m.Docs(ctx, &entroq.DocQuery{Namespace: namespace, IDs: []string{"doc-1"}})
+	if err != nil {
+		t.Fatalf("Read replayed doc: %v", err)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("Replayed docs length: want 1, got %d", len(docs))
+	}
+	if got := docs[0].Version; got != 2 {
+		t.Errorf("Replayed legacy doc version: want 2, got %d", got)
+	}
+	if got := string(docs[0].Content); got != `"changed"` {
+		t.Errorf("Replayed legacy doc content: want %q, got %q", `"changed"`, got)
+	}
 }
 
 // TestEQMemReplayBackfillsMissingQueue covers the journal read path for older

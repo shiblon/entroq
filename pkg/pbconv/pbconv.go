@@ -26,9 +26,25 @@ func FromMS(ms int64) time.Time {
 	return time.Unix(0, ms*int64(time.Millisecond))
 }
 
+// fromMSOrUnset is FromMS for optional timestamps: a non-positive value means
+// the field was not set and yields Go's zero time, so a backend's IsZero
+// default applies. Go's zero time has no exact wire form (it encodes as a
+// large negative value), and clients that omit the field send 0, which would
+// otherwise decode as a real 1970 timestamp.
+func fromMSOrUnset(ms int64) time.Time {
+	if ms <= 0 {
+		return time.Time{}
+	}
+	return FromMS(ms)
+}
+
 // ToMS converts a Go time.Time to epoch milliseconds (the proto time
-// representation), truncating sub-millisecond precision.
+// representation), truncating sub-millisecond precision. Zero time encodes as
+// 0, the wire's "unset" value.
 func ToMS(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
 	return t.Truncate(time.Millisecond).UnixNano() / 1000000
 }
 
@@ -154,8 +170,8 @@ func ModifyArgsFromProto(req *pb.ModifyRequest) ([]entroq.ModifyArg, error) {
 			Key:          di.Key,
 			SecondaryKey: di.SecondaryKey,
 			Content:      val,
-			Created:      FromMS(di.CreatedMs),
-			Modified:     FromMS(di.ModifiedMs),
+			Created:      fromMSOrUnset(di.CreatedMs),
+			Modified:     fromMSOrUnset(di.ModifiedMs),
 		}))
 	}
 	for _, dc := range req.DocChanges {

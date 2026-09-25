@@ -7,6 +7,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/shiblon/entroq/cmd/internal/eqflags"
 	"github.com/shiblon/entroq/pkg/version"
 	"github.com/shiblon/entroq/pkg/workgateway"
 	"github.com/spf13/cobra"
@@ -20,12 +21,15 @@ var (
 	certFile string
 	keyFile  string
 	caFile   string
+
+	settings = eqflags.NewEnvironment("EQLINK")
 )
 
 var rootCmd = &cobra.Command{
-	Use:     "eqlink",
-	Version: version.Version,
-	Short:   "Experimental HTTP networking sidecar over EntroQ task queues.",
+	Use:               "eqlink",
+	Version:           version.Version,
+	Short:             "Experimental HTTP networking sidecar over EntroQ task queues.",
+	PersistentPreRunE: eqflags.Apply(settings),
 	Long: `EXPERIMENTAL: eqlink's protocol and command surface may change without compatibility.
 
 eqlink translates HTTP calls into EntroQ task queue operations, giving services

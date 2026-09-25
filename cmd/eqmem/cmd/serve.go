@@ -18,13 +18,14 @@ const minSnapshotPeriod = time.Minute
 var serve struct {
 	eqserve.Config
 
-	journal          string
-	createJournalDir bool
-	snapshotAndQuit  bool
-	periodicSnapshot string
-	journalMaxItems  int
-	journalMaxBytes  int
-	cleanup          bool
+	journal           string
+	readinessInterval time.Duration
+	createJournalDir  bool
+	snapshotAndQuit   bool
+	periodicSnapshot  string
+	journalMaxItems   int
+	journalMaxBytes   int
+	cleanup           bool
 }
 
 var serveCmd = &cobra.Command{
@@ -35,7 +36,11 @@ HTTP/JSON + Connect API (--http_port, default 9100, which also serves /metrics).
 
 State is held in memory. Pass --journal to persist it to a write-ahead journal
 that replays quickly on restart; without one, a restart starts empty. Best for
-tests, development, and light-duty singleton services.`,
+tests, development, and light-duty singleton services.
+
+Each flag also has an EQMEM_-prefixed environment variable; for example,
+EQMEM_READINESS_INTERVAL=2s sets --readiness_interval. Explicit command-line
+flags take precedence.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
@@ -93,6 +98,7 @@ tests, development, and light-duty singleton services.`,
 			func(mp metric.MeterProvider) entroq.BackendOpener {
 				return eqmem.Opener(
 					eqmem.WithJournal(serve.journal),
+					eqmem.WithReadinessInterval(serve.readinessInterval),
 					eqmem.WithMaxJournalBytes(int64(serve.journalMaxBytes)),
 					eqmem.WithMaxJournalItems(serve.journalMaxItems),
 					eqmem.WithMeterProvider(mp),
@@ -107,6 +113,8 @@ func init() {
 	f := serveCmd.Flags()
 	serve.Config.BindFlags(f)
 	f.StringVar(&serve.journal, "journal", "", "Journal directory for persistence. Default is ephemeral.")
+	f.DurationVar(&serve.readinessInterval, "readiness_interval", eqmem.DefaultReadinessInterval,
+		"Interval for notifying claims when tasks become ready through time; non-positive disables.")
 	f.BoolVar(&serve.createJournalDir, "mkdir", false, "Create the journal directory if it does not exist.")
 	f.BoolVar(&serve.snapshotAndQuit, "snapshot_and_quit", false, "Read the journal, write a snapshot, then exit. Requires --journal.")
 	f.StringVar(&serve.periodicSnapshot, "periodic_snapshot", "", "Snapshot interval (e.g. 1h). Minimum 1m. Requires --journal.")

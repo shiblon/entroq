@@ -16,6 +16,7 @@ import (
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/backend/internal/gcmetrics"
+	"github.com/shiblon/entroq/pkg/backend/internal/limits"
 	"github.com/shiblon/entroq/pkg/subq"
 	"github.com/shiblon/stuffedio/wal"
 	"go.opentelemetry.io/otel/metric"
@@ -66,6 +67,10 @@ type EQMem struct {
 	claimDuration  metric.Float64Histogram
 	modifyDuration metric.Float64Histogram
 	gcMetrics      *gcmetrics.Metrics
+
+	readinessInterval time.Duration
+	stopReadiness     func()
+	readinessDone     chan struct{}
 
 	gcInterval  time.Duration
 	gcBatchSize int
@@ -190,6 +195,7 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 		claimDuration:      claimDuration,
 		modifyDuration:     modifyDuration,
 		gcMetrics:          gcMetrics,
+		readinessInterval:  DefaultReadinessInterval,
 		gcInterval:         defaultGCInterval,
 		gcBatchSize:        defaultGCBatchSize,
 	}
@@ -257,13 +263,20 @@ func New(ctx context.Context, opts ...Option) (*EQMem, error) {
 		}
 	}
 
-	// Garbage collection is a first-class, always-on backend behavior. It is not
-	// started in snapshot-and-quit mode (a load-dump-exit tool). Its context is
-	// rooted at context.Background(), NOT the constructor's ctx: the loop's
-	// lifetime is the backend's, ended by Close, whereas the constructor ctx
-	// scopes only construction (a caller may bound New with a timeout and defer
-	// cancel()). Close cancels it and waits for it to exit.
+	// Background loops are not started in snapshot-and-quit mode. Their contexts
+	// are rooted at context.Background(), not the constructor's ctx: their
+	// lifetime is the backend's and is ended by Close.
 	if !m.outputSnapshot {
+		if m.readinessInterval > 0 {
+			readinessCtx, cancel := context.WithCancel(context.Background())
+			m.stopReadiness = cancel
+			m.readinessDone = make(chan struct{})
+			go func() {
+				defer close(m.readinessDone)
+				m.runReadinessLoop(readinessCtx, m.readinessInterval)
+			}()
+		}
+
 		gcCtx, cancel := context.WithCancel(context.Background())
 		m.stopGC = cancel
 		m.gcDone = make(chan struct{})
@@ -394,6 +407,9 @@ func (m *EQMem) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task,
 // TryClaim attempts to claim a task from the given queue query. If no task is
 // available, returns nil (not an error).
 func (m *EQMem) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
+	if err := limits.Claimant(cq.Claimant); err != nil {
+		return nil, fmt.Errorf("eqmem claim: %w", err)
+	}
 	start := time.Now()
 	defer func() {
 		m.claimDuration.Record(ctx, time.Since(start).Seconds())
@@ -615,6 +631,9 @@ func (m *EQMem) Modify(ctx context.Context, mod *entroq.Modification) (*entroq.M
 	if err := mod.EnsureModifyKeys(); err != nil {
 		return nil, fmt.Errorf("eqmem modify: %w", err)
 	}
+	if err := limits.Modification(mod); err != nil {
+		return nil, fmt.Errorf("eqmem modify: %w", err)
+	}
 	start := time.Now()
 	defer func() {
 		m.modifyDuration.Record(ctx, time.Since(start).Seconds())
@@ -748,6 +767,21 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 		}
 		foundDeps = fd
 	}
+	// Documents inserted by eqmem before v1.12.1 began at v1. Their journaled
+	// first change therefore carries final version v2, which the player above
+	// presents here as predecessor v1. New replay reconstructs that versionless
+	// insert at v0. Accept exactly that one-version ambiguity on trusted replay;
+	// applying the recorded change still restores its historical final version
+	// v2, after which later changes use ordinary exact version matching.
+	if replay && foundDeps != nil {
+		foundDeps.DocChanges = slices.DeleteFunc(foundDeps.DocChanges, func(failed *entroq.DocID) bool {
+			foundDoc, ok := foundDocs[entroq.DocKey(failed.Namespace, failed.ID)]
+			return ok && foundDoc.Version == 0 && failed.Version == 1
+		})
+		if !foundDeps.HasAny() {
+			foundDeps = nil
+		}
+	}
 	// Merge the queue-integrity failures (computed under the global lock in
 	// modPrep) with the found-based failures so a single DependencyError reports
 	// every failure class -- notably, insert collisions are still reported even
@@ -803,6 +837,14 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 	for _, c := range mod.Changes {
 		newTask := c.Copy()
 		newTask.Version++
+		// Claims and Created belong to the backend, not the caller (who cannot
+		// send them over the wire). Replay applies the journaled final state
+		// as-is: claims are journaled as changes carrying the new count.
+		if !replay {
+			old := found[c.ID]
+			newTask.Claims = old.Claims
+			newTask.Created = old.Created
+		}
 		// Cap a far-past arrival to now (backend Modify contract): an omitted At
 		// arrives now and is ordered at now, not in the distant past.
 		newTask.At = entroq.NormalizeArrival(newTask.At, now)
@@ -810,7 +852,9 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 		if !newTask.At.After(now) {
 			newTask.Claimant = ""
 		}
-		newTask.Modified = now
+		if !replay || newTask.Modified.IsZero() {
+			newTask.Modified = now
+		}
 		if c.FromQueue != c.Queue {
 			deleteID(c.FromQueue, c.ID)
 			insertTask(newTask)
@@ -839,6 +883,8 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 			Claimant: mod.Claimant,
 			Created:  created,
 			Modified: modified,
+			Attempt:  td.Attempt,
+			Err:      td.Err,
 		}
 		insertTask(newTask)
 		resp.InsertedTasks = append(resp.InsertedTasks, newTask)
@@ -850,6 +896,10 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 	for _, c := range mod.DocChanges {
 		newRes := c.Copy()
 		newRes.Version++
+		// Created belongs to the backend, as for tasks above.
+		if !replay {
+			newRes.Created = foundDocs[entroq.DocKey(c.Namespace, c.ID)].Created
+		}
 		// Cap a far-past arrival to now (backend Modify contract), same as tasks.
 		newRes.At = entroq.NormalizeArrival(newRes.At, now)
 		// Claim/renew if requested.At is in the future; release otherwise.
@@ -858,7 +908,9 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 		} else {
 			newRes.Claimant = ""
 		}
-		newRes.Modified = now
+		if !replay || newRes.Modified.IsZero() {
+			newRes.Modified = now
+		}
 		setRes(newRes)
 		resp.ChangedDocs = append(resp.ChangedDocs, newRes)
 	}
@@ -880,6 +932,7 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 		newRes := &entroq.Doc{
 			Namespace:    rd.Namespace,
 			ID:           id,
+			Version:      0,
 			At:           at,
 			Content:      rd.Content,
 			Key:          rd.Key,
@@ -887,7 +940,6 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 			Claimant:     claimant,
 			Created:      created,
 			Modified:     modified,
-			Version:      1,
 		}
 		setRes(newRes)
 		resp.InsertedDocs = append(resp.InsertedDocs, newRes)
@@ -953,6 +1005,24 @@ func (m *EQMem) queueTasks(queue string) (*taskQueue, bool) {
 	defer un(lock(m))
 	q, ok := m.queues[queue]
 	return q, ok
+}
+
+// snapshotQueueLocks returns the queue lock structures present while the
+// global registry lock is held. It does not acquire the individual queue
+// locks.
+//
+// A returned pointer remains valid if its queue is subsequently removed from
+// the registry. Callers may read the immutable queue name and concurrency-safe
+// task store directly, but must acquire the queue lock before inspecting the
+// heap.
+func (m *EQMem) snapshotQueueLocks() []*qLock {
+	defer un(lock(m))
+
+	qls := make([]*qLock, 0, len(m.locksSuperUnsafe))
+	for _, ql := range m.locksSuperUnsafe {
+		qls = append(qls, ql)
+	}
+	return qls
 }
 
 // Tasks lists tasks according to the given query. If specific IDs are given,
@@ -1048,31 +1118,21 @@ func (m *EQMem) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[str
 	if err != nil {
 		return nil, fmt.Errorf("queue stats time: %w", err)
 	}
-	var qnames []string
-	func() {
-		defer un(lock(m))
-		for q := range m.queues {
-			qnames = append(qnames, q)
-		}
-	}()
 
 	qs := make(map[string]*entroq.QueueStat)
-	for _, q := range qnames {
+	for _, ql := range m.snapshotQueueLocks() {
+		q := ql.queue
 		if !matchesQuery(q, qq) {
 			continue
 		}
 		if qq.Limit > 0 && len(qs) >= qq.Limit {
 			break
 		}
-		qts, ok := m.queueTasks(q)
-		if !ok {
-			continue
-		}
 
 		stats := &entroq.QueueStat{
 			Name: q,
 		}
-		qts.Range(func(_ string, t *entroq.Task) bool {
+		ql.tasks.Range(func(_ string, t *entroq.Task) bool {
 			stats.Size++
 			if t.At.After(now) {
 				if t.Claims > 0 {
@@ -1097,6 +1157,10 @@ func (m *EQMem) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[str
 
 // Close cleans up this implementation.
 func (m *EQMem) Close() error {
+	if m.stopReadiness != nil {
+		m.stopReadiness()
+		<-m.readinessDone
+	}
 	if m.stopGC != nil {
 		m.stopGC()
 		<-m.gcDone // wait for the GC loop to exit before tearing down

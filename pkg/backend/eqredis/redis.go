@@ -29,8 +29,11 @@
 //
 // Notifications:
 //
-//	SubQ is used for "something changed" signals. A background ticker handles
-//	passage-of-time wakeups by scanning queue ZSETs for tasks that became ready.
+//	SubQ is used for in-process "something changed" signals. A readiness loop
+//	(WithReadinessInterval) periodically counts available tasks in queues that
+//	have waiters and wakes them, which covers tasks that become ready with the
+//	passage of time and changes made by other processes sharing the Redis.
+//	Without it, those are found only by the claim poll (ClaimQuery.PollTime).
 package eqredis
 
 import (
@@ -78,10 +81,18 @@ func nsclaimedKey(ns string) string {
 	return keyPrefix + "nsclaimed:" + ns
 }
 
+// docKeyEscaper percent-escapes "%" and "/" in a namespace, so the first "/"
+// in a doc key always ends the namespace and no two namespaces share an
+// encoding. The id follows unescaped and may contain "/".
+var docKeyEscaper = strings.NewReplacer("%", "%25", "/", "%2F")
+
 func docKey(namespace, id string) string {
-	// Encode namespace and id with a separator that cannot appear in either.
-	// Namespace and id are limited to 64 chars, so "/" is safe as a separator
-	// as long as we escape any "/" in the namespace itself.
+	return keyPrefix + "d:" + docKeyEscaper.Replace(namespace) + "/" + id
+}
+
+// legacyDocKey is the doc key encoding before "%" was escaped, under which
+// namespaces "a/b" and "a%2Fb" shared keys. Only migrateDocKeys uses it.
+func legacyDocKey(namespace, id string) string {
 	return keyPrefix + "d:" + strings.ReplaceAll(namespace, "/", "%2F") + "/" + id
 }
 
@@ -95,6 +106,9 @@ type EQRedis struct {
 	stopGC    context.CancelFunc
 	gcDone    chan struct{}
 	gcMetrics *gcmetrics.Metrics
+
+	stopReadiness context.CancelFunc
+	readinessDone chan struct{}
 }
 
 type redisOptions struct {
@@ -105,6 +119,8 @@ type redisOptions struct {
 	gcInterval  time.Duration
 	gcBatchSize int
 	mp          metric.MeterProvider
+
+	readinessInterval time.Duration
 }
 
 // RedisOpt configures the Redis backend.
@@ -160,6 +176,8 @@ func Open(ctx context.Context, opts ...RedisOpt) (*EQRedis, error) {
 		addr:        "localhost:6379",
 		gcInterval:  defaultGCInterval,
 		gcBatchSize: defaultGCBatchSize,
+
+		readinessInterval: DefaultReadinessInterval,
 	}
 	for _, opt := range opts {
 		opt(o)
@@ -173,6 +191,10 @@ func Open(ctx context.Context, opts ...RedisOpt) (*EQRedis, error) {
 
 	if err := client.Ping(ctx).Err(); err != nil {
 		return nil, fmt.Errorf("eqredis open: ping redis: %w", err)
+	}
+	if err := migrateDocKeys(ctx, client); err != nil {
+		client.Close()
+		return nil, fmt.Errorf("eqredis open: migrate doc keys: %w", err)
 	}
 
 	nw := o.nw
@@ -208,6 +230,18 @@ func Open(ctx context.Context, opts ...RedisOpt) (*EQRedis, error) {
 		defer close(b.gcDone)
 		b.runGCLoop(gcCtx, o.gcInterval, o.gcBatchSize)
 	}()
+	// The readiness loop shares GC's lifetime. It needs to know who is
+	// waiting; a custom NotifyWaiter that cannot say leaves claim polling as the
+	// only wakeup for tasks that become ready over time.
+	if lc, ok := nw.(entroq.ListenerCounter); ok && o.readinessInterval > 0 {
+		readinessCtx, stop := context.WithCancel(context.Background())
+		b.stopReadiness = stop
+		b.readinessDone = make(chan struct{})
+		go func() {
+			defer close(b.readinessDone)
+			b.runReadinessLoop(readinessCtx, lc, o.readinessInterval)
+		}()
+	}
 	return b, nil
 }
 
@@ -216,6 +250,10 @@ func Open(ctx context.Context, opts ...RedisOpt) (*EQRedis, error) {
 func (e *EQRedis) Close() error {
 	e.stopGC()
 	<-e.gcDone
+	if e.stopReadiness != nil {
+		e.stopReadiness()
+		<-e.readinessDone
+	}
 	return e.client.Close()
 }
 

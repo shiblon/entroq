@@ -99,13 +99,15 @@ queue listings, individual task information, etc.`,
 
 		var err error
 		if rootFlags.pgURL != "" {
-			var hb time.Duration
+			var pgOpts []eqpg.PGOpt
 			if rootFlags.pgHeartbeat != "" {
-				if hb, err = time.ParseDuration(rootFlags.pgHeartbeat); err != nil {
+				interval, err := time.ParseDuration(rootFlags.pgHeartbeat)
+				if err != nil {
 					return fmt.Errorf("pg heartbeat duration Parse: %w", err)
 				}
+				pgOpts = append(pgOpts, eqpg.WithReadinessInterval(interval))
 			}
-			eq, err = entroq.New(context.Background(), eqpg.Opener(rootFlags.pgURL, eqpg.WithHeartbeat(hb)), clientOpts...)
+			eq, err = entroq.New(context.Background(), eqpg.Opener(rootFlags.pgURL, pgOpts...), clientOpts...)
 		} else {
 			eq, err = entroq.New(context.Background(), eqgrpc.Opener(rootFlags.svcAddr, opts...), clientOpts...)
 		}
@@ -147,7 +149,7 @@ func init() {
 	rootCmd.PersistentFlags().BoolVarP(&rootFlags.secure, "secure", "S", false, "Use secure connection.")
 	rootCmd.PersistentFlags().StringVar(&rootFlags.authzToken, "authz_token", "", "Pass an Authorization token.")
 	rootCmd.PersistentFlags().StringVar(&rootFlags.pgURL, "pg_url", "", "PostgreSQL URL for direct backend connection.")
-	rootCmd.PersistentFlags().StringVar(&rootFlags.pgHeartbeat, "pg_heartbeat", "", "Heartbeat interval for direct PG connection (e.g. 5s).")
+	rootCmd.PersistentFlags().StringVar(&rootFlags.pgHeartbeat, "pg_heartbeat", "", "How often a direct PG connection checks for tasks that became ready through time or other clients (e.g. 5s; default 5s, 0 disables).")
 	rootCmd.PersistentFlags().StringVar(&rootFlags.claimant, "claimant", "", "Claimant ID for this process. Defaults to a random ID if not set. Also read from EQC_CLAIMANT.")
 
 	viper.BindPFlag("svcaddr", rootCmd.PersistentFlags().Lookup("svcaddr"))

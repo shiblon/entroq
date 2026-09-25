@@ -24,6 +24,8 @@ func TestBackendContract(t *testing.T) {
 		{"InsertWithID", eqtest.InsertWithID},
 		{"SimpleSequence", eqtest.SimpleSequence},
 		{"SimpleChange", eqtest.SimpleChange},
+		{"ChangeKeepsStoredFields", eqtest.ChangeKeepsStoredFields},
+		{"InsertKeepsAttemptAndErr", eqtest.InsertKeepsAttemptAndErr},
 		{"TaskChangeFutureArrival", eqtest.TaskChangeFutureArrival},
 		{"TaskChangeFarPastArrivalNormalized", eqtest.TaskChangeFarPastArrivalNormalized},
 		{"ModifyRejectsWrongQueue", eqtest.ModifyRejectsWrongQueue},
@@ -41,12 +43,15 @@ func TestBackendContract(t *testing.T) {
 		{"DeleteMissingTask", eqtest.DeleteMissingTask},
 		{"ClaimRandomHead", eqtest.ClaimRandomHead},
 		{"TasksClaimantLimit", eqtest.TasksClaimantLimit},
+		{"LengthLimits", eqtest.LengthLimits},
 		{"ClaimLongDuration", eqtest.ClaimLongDuration},
 		{"MapReduce", eqtest.MapReduce},
 		{"WorkerCompactDependencyHandler", eqtest.WorkerCompactDependencyHandler},
 		{"WorkerDependencyMove", eqtest.WorkerDependencyMove},
+		{"InitialVersions", eqtest.InitialVersions},
 		{"SimpleDocLifecycle", eqtest.SimpleDocLifecycle},
 		{"DocMultiOp", eqtest.DocMultiOp},
+		{"DocTimestamps", eqtest.DocTimestamps},
 		{"DocListing", eqtest.DocListing},
 		{"DocKeyRangeByteOrder", eqtest.DocKeyRangeByteOrder},
 		{"DocClaimLocking", eqtest.DocClaimLocking},
@@ -71,6 +76,18 @@ func TestBackendContract(t *testing.T) {
 			test.run(ctx, t, client, "sqlitetest")
 		})
 	}
+}
+
+func TestReadinessFanout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	const interval = 500 * time.Millisecond
+	client, err := entroq.New(ctx, Opener(filepath.Join(t.TempDir(), "entroq.sqlite"), WithReadinessInterval(interval)))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer client.Close()
+	eqtest.ReadinessFanout(interval)(ctx, t, client, "sqlitetest")
 }
 
 func TestPersistenceAcrossReopen(t *testing.T) {

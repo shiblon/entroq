@@ -18,3 +18,13 @@ func TestUnpackUnavailable(t *testing.T) {
 		t.Fatalf("unpackGRPCError(Unavailable) = %v, want an entroq.IsUnavailable error", err)
 	}
 }
+
+// TestUnpackInvalidArgument checks that a gRPC InvalidArgument status comes
+// back as entroq's invalid-argument error, so a Go client behind the service
+// sees the same error type as one talking to a backend directly.
+func TestUnpackInvalidArgument(t *testing.T) {
+	err := unpackGRPCError(status.Error(codes.InvalidArgument, "claimant is 65 bytes, limit is 64"))
+	if !entroq.IsInvalidArgument(err) {
+		t.Fatalf("unpackGRPCError(InvalidArgument) = %v, want an entroq.IsInvalidArgument error", err)
+	}
+}

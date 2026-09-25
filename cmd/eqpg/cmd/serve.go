@@ -17,10 +17,11 @@ import (
 var (
 	serve eqserve.Config
 
-	attempts   int
-	heartbeat  time.Duration
-	noListen   bool
-	initSchema bool
+	attempts          int
+	readinessInterval time.Duration
+	heartbeat         time.Duration
+	noListen          bool
+	initSchema        bool
 )
 
 var serveCmd = &cobra.Command{
@@ -37,6 +38,11 @@ mismatch rather than migrating a live database silently.`,
 		ctx := cmd.Context()
 
 		dbTarget, connectionOptions := databaseConnection()
+
+		// --heartbeat is the deprecated name for --readiness_interval.
+		if cmd.Flags().Changed("heartbeat") && !cmd.Flags().Changed("readiness_interval") {
+			readinessInterval = heartbeat
+		}
 
 		if initSchema {
 			db, err := eqpg.OpenDB(dbTarget, connectionOptions...)
@@ -55,12 +61,9 @@ mismatch rather than migrating a live database silently.`,
 			func(mp metric.MeterProvider) entroq.BackendOpener {
 				openerOptions := append(connectionOptions,
 					eqpg.WithConnectAttempts(attempts),
-					eqpg.WithHeartbeat(heartbeat),
+					eqpg.WithReadinessInterval(readinessInterval),
 					eqpg.WithMeterProvider(mp),
 				)
-				if noListen {
-					openerOptions = append(openerOptions, eqpg.WithNoListen())
-				}
 				return eqpg.Opener(dbTarget, openerOptions...)
 			},
 			databaseDescription(dbTarget),
@@ -73,8 +76,12 @@ func init() {
 	serve.MetricInterval = 5 * time.Second
 	serve.BindFlags(flags)
 	flags.IntVar(&attempts, "attempts", 10, "Connection attempts before dying (5-second pauses between tries).")
-	flags.DurationVar(&heartbeat, "heartbeat", 5*time.Second, "Interval at which this node triggers notifications for tasks that have become available (via NOTIFY).")
-	flags.BoolVar(&noListen, "no_listen", false, "Disable the persistent PostgreSQL LISTEN connection; claims then fall back to polling. LISTEN is on by default for prompt claim wakeups via NOTIFY.")
+	flags.DurationVar(&readinessInterval, "readiness_interval", eqpg.DefaultReadinessInterval,
+		"Interval for notifying claims when tasks become ready through time, or through other database clients; non-positive disables.")
+	flags.DurationVar(&heartbeat, "heartbeat", eqpg.DefaultReadinessInterval, "Deprecated name for --readiness_interval.")
+	flags.MarkDeprecated("heartbeat", "use --readiness_interval")
+	flags.BoolVar(&noListen, "no_listen", false, "Deprecated: the service no longer uses LISTEN/NOTIFY.")
+	flags.MarkDeprecated("no_listen", "the service no longer uses LISTEN/NOTIFY; this flag does nothing")
 	flags.BoolVar(&initSchema, "init_schema", false, "Initialize the EntroQ schema before serving (idempotent; safe to always set).")
 
 	rootCmd.AddCommand(serveCmd)

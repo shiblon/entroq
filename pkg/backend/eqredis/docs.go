@@ -20,6 +20,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/backend/internal/limits"
 )
 
 // docIndexSep is the separator used between fields in a namespace index member.
@@ -240,6 +241,9 @@ func (e *EQRedis) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc,
 // Returns a DependencyError if any doc with that key is already claimed
 // by a different claimant.
 func (e *EQRedis) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.Doc, error) {
+	if err := limits.DocClaim(cq); err != nil {
+		return nil, fmt.Errorf("eqredis claim docs: %w", err)
+	}
 	now := time.Now().UTC()
 	nowMs := now.UnixMilli()
 	newAtMs := now.Add(cq.Duration).UnixMilli()

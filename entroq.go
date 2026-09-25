@@ -17,12 +17,9 @@
 // crash-looping; then with power restored and no other intervention,
 // everything just started moving again with no work lost or repeated.
 //
-// The PostgreSQL implementation is pure stored procedures and LISTEN/NOTIFY, so
-// if you want, you don't even need all of this. You can do everything with the
-// schema file and some scripting. No additional server protocols, just use
-// PostgreSQL native privileges and connections. Or you can use the nicer
-// client approaches here, with workers, etc. In any case, see the Python pg
-// client implementation for a thin wrapper around Postgres for inspiration.
+// The PostgreSQL implementation keeps its task and document logic in stored
+// procedures, served through the Go eqpg service, which owns the schema and is
+// the database's only client.
 //
 // Using the Go implementation opens up possibilities of, among other things, an
 // in-memory backend served via gRPC with queue-level authorization. To use
@@ -188,6 +185,16 @@ type Notifier interface {
 type NotifyWaiter interface {
 	Notifier
 	Waiter
+}
+
+// ListenerCounter is an optional capability of a NotifyWaiter: it reports
+// how many callers are currently waiting on each queue. A backend's readiness
+// loop uses it to check only queues someone is waiting on, and to notify once
+// per ready task up to the number waiting. subq.SubQ implements it; a backend
+// given a NotifyWaiter without it skips its readiness loop and relies on claim
+// polling.
+type ListenerCounter interface {
+	Listeners() map[string]int
 }
 
 // NotifyModified takes inserted and changed tasks and notifies once per unique queue/ID pair.
@@ -373,8 +380,8 @@ type Backend interface {
 // IDGenerator is a function that can generate IDs. Used for generating task IDs
 // and claimant IDs when they are not specified. By default, this is
 // GenHex16
-// NOTE: any ID generated must be <= 64 characters in length to
-// maintain compatibility with some backends.
+// NOTE: any ID generated must be <= 64 bytes long; every backend rejects
+// longer task IDs and claimants.
 type IDGenerator func() string
 
 // GenHex16 is an ID generator that produces 16-character random
@@ -569,6 +576,27 @@ func Unavailablef(format string, args ...any) *UnavailableError {
 func IsUnavailable(err error) bool {
 	var u *UnavailableError
 	return errors.As(err, &u)
+}
+
+// InvalidArgumentError indicates a request the backend will never accept as
+// given, such as an ID or claimant over its length limit. Retrying it unchanged
+// cannot succeed. The service reports it as codes.InvalidArgument (HTTP 400),
+// and the gRPC backend translates that code back to it.
+type InvalidArgumentError struct{ msg string }
+
+// Error implements the error interface.
+func (e *InvalidArgumentError) Error() string { return e.msg }
+
+// InvalidArgumentf builds an InvalidArgumentError with a formatted message.
+func InvalidArgumentf(format string, args ...any) *InvalidArgumentError {
+	return &InvalidArgumentError{msg: fmt.Sprintf(format, args...)}
+}
+
+// IsInvalidArgument reports whether err indicates a request the backend
+// rejects as malformed (see InvalidArgumentError).
+func IsInvalidArgument(err error) bool {
+	var e *InvalidArgumentError
+	return errors.As(err, &e)
 }
 
 // claimQueryFromOpts processes ClaimOpt values and produces a claim query.

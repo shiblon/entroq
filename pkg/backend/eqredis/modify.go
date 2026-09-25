@@ -9,6 +9,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/backend/internal/limits"
 )
 
 // Modify atomically applies insertions, changes, deletions, and dependency
@@ -28,6 +29,9 @@ func (e *EQRedis) Modify(ctx context.Context, mod *entroq.Modification) (*entroq
 	// Reject writes to an empty queue/namespace once, before the WATCH/retry
 	// loop, so an empty queue is never written.
 	if err := mod.EnsureModifyKeys(); err != nil {
+		return nil, fmt.Errorf("eqredis modify: %w", err)
+	}
+	if err := limits.Modification(mod); err != nil {
 		return nil, fmt.Errorf("eqredis modify: %w", err)
 	}
 	for {
