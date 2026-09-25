@@ -88,6 +88,12 @@ dimension in the storage format for a later source or mapper API that exposes
 secondary sort. EntroQ document secondary keys organize pointer documents and
 do not carry record secondary keys.
 
+An object-backed shuffle path is under development; controllers still use the
+document store by default today. Its versioned byte format and language-neutral
+subprocess contract are specified in the
+[object-store HTTP protocol](../../docs/storage-http.md). Drivers store opaque
+streams and never implement MapReduce record semantics.
+
 That makes reduce work proportional to the partition count, not to the number of
 distinct keys.
 
