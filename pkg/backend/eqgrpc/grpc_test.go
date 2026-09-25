@@ -269,3 +269,23 @@ func TestGRPCBackendRejectsInvalidRequests(t *testing.T) {
 	defer b.Close()
 	eqtest.BackendRejectsInvalidRequests(ctx, t, b, "/grpctest")
 }
+
+func TestGRPCTasksClaimantFilter(t *testing.T) {
+	RunQTest(t, eqtest.TasksClaimantFilter)
+}
+
+func TestGRPCQueueStatsCounts(t *testing.T) {
+	RunQTest(t, eqtest.QueueStatsCounts)
+}
+
+func TestGRPCQueueStatsMatching(t *testing.T) {
+	RunQTest(t, eqtest.QueueStatsMatching)
+}
+
+func TestGRPCDocsOrderAndLimits(t *testing.T) {
+	RunQTest(t, eqtest.DocsOrderAndLimits)
+}
+
+func TestGRPCTaskClaimantIsHolder(t *testing.T) {
+	RunQTest(t, eqtest.TaskClaimantIsHolder)
+}

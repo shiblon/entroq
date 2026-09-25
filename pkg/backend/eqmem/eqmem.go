@@ -886,9 +886,11 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 		// Cap a far-past arrival to now (backend Modify contract): an omitted At
 		// arrives now and is ordered at now, not in the distant past.
 		newTask.At = entroq.NormalizeArrival(newTask.At, now)
-		// Preserve claimant on renewal (At pushed to future); clear otherwise.
-		if !newTask.At.After(now) {
-			newTask.Claimant = ""
+		// The claimant is the task's holder: the modifier while the task is
+		// not yet available, no one once it is. Replay restores the recorded
+		// claimant.
+		if !replay {
+			newTask.Claimant = holder(mod.Claimant, newTask.At, now)
 		}
 		if !replay || newTask.Modified.IsZero() {
 			newTask.Modified = now
@@ -918,7 +920,7 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 			Queue:    td.Queue,
 			At:       entroq.NormalizeArrival(td.At, now),
 			Value:    td.Value,
-			Claimant: mod.Claimant,
+			Claimant: holder(mod.Claimant, entroq.NormalizeArrival(td.At, now), now),
 			Created:  created,
 			Modified: modified,
 			Attempt:  td.Attempt,
@@ -1359,4 +1361,15 @@ func (m *EQMem) lockNamespaces(ns []string) ([]*nsLock, func()) {
 			}
 		}
 	}
+}
+
+// holder is the claimant a task written by claimant records: the writer holds
+// a task that is not yet available, and no one holds an available one, so an
+// empty claimant marks a task made available on purpose, while an available
+// task with a claimant is one whose claim ran out.
+func holder(claimant string, at, now time.Time) string {
+	if at.After(now) {
+		return claimant
+	}
+	return ""
 }

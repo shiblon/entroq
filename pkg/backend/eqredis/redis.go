@@ -5,11 +5,14 @@
 //	{eq}:q:{name}           -- ZSET: member=taskID, score=atUnixMilli (task index per queue)
 //	{eq}:t:{id}             -- Hash: task fields (id, queue, value, at, created, modified, claimant, version, claims, attempt, err)
 //	{eq}:qs                 -- Set: active queue names (maintained lazily; GC removes empties)
-//	{eq}:qsclaimed:{name}   -- ZSET: claimed task IDs, score=atUnixMilli; ZCOUNT >now gives exact claimed count
-//	{eq}:d:{ns}/{id}        -- Hash: doc fields (namespace, id, version, claimant, at, key_primary, key_secondary, content, created, modified)
+//	{eq}:qsclaimed:{name}   -- ZSET: task IDs claimed at least once, score=atUnixMilli; ZCOUNT >now counts claimed tasks
+//	{eq}:qsclaims:{name}    -- ZSET: task IDs claimed at least once, score=claims; the top score is MaxClaims
+//	{eq}:d:{ns}/{id}        -- Hash: doc fields (namespace, id, key_primary, key_secondary, content, created, modified)
 //	{eq}:dnsidx:{ns}        -- ZSET: doc namespace index, member=keyPrimary\x00keySecondary\x00id, score=0
+//	{eq}:dl:{ns}/{key}      -- Hash: doc group lock (version, claimant, at)
+//	{eq}:dlidx:{ns}         -- Set: primary keys in a namespace that have a lock
+//	{eq}:dlheld:{ns}        -- ZSET: held primary keys, score=atUnixMilli
 //	{eq}:ns                 -- Set: active namespace names (maintained lazily; GC removes empties)
-//	{eq}:nsclaimed:{ns}     -- ZSET: claimed doc IDs, score=atUnixMilli; ZCOUNT >now gives exact claimed count
 //
 // Key hash tags:
 //
@@ -75,6 +78,12 @@ func queueKey(name string) string {
 
 func qsclaimedKey(name string) string {
 	return keyPrefix + "qsclaimed:" + name
+}
+
+// qsclaimsKey is the ZSET of a queue's tasks that have been claimed, scored by
+// their claim count, so the most-claimed task still in the queue is its top.
+func qsclaimsKey(name string) string {
+	return keyPrefix + "qsclaims:" + name
 }
 
 // nsclaimedKey is the per-doc claim set from before doc groups had locks. Only
@@ -205,6 +214,10 @@ func Open(ctx context.Context, opts ...RedisOpt) (*EQRedis, error) {
 	if err := migrateDocFields(ctx, client); err != nil {
 		client.Close()
 		return nil, fmt.Errorf("eqredis open: migrate doc fields: %w", err)
+	}
+	if err := migrateClaimsIndex(ctx, client); err != nil {
+		client.Close()
+		return nil, fmt.Errorf("eqredis open: migrate claims index: %w", err)
 	}
 
 	nw := o.nw

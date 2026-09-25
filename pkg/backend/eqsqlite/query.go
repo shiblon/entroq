@@ -34,6 +34,18 @@ func appendMatch(where []string, args []any, column string, q *entroq.MatchQuery
 	return where, args
 }
 
+// requestedOrder is an ORDER BY expression, and its arguments, that sorts rows
+// by where their column's value appears in ids.
+func requestedOrder(column string, ids []string) (string, []any) {
+	whens := make([]string, 0, len(ids))
+	args := make([]any, 0, len(ids))
+	for i, id := range ids {
+		whens = append(whens, fmt.Sprintf("WHEN ? THEN %d", i))
+		args = append(args, id)
+	}
+	return "CASE " + column + " " + strings.Join(whens, " ") + " ELSE " + fmt.Sprint(len(ids)) + " END", args
+}
+
 // Queues returns matching queue names and their task counts.
 func (b *EQSQLite) Queues(ctx context.Context, q *entroq.QueuesQuery) (map[string]int, error) {
 	return entroq.QueuesFromStats(b.QueueStats(ctx, q))
@@ -107,12 +119,9 @@ func (b *EQSQLite) Tasks(ctx context.Context, q *entroq.TasksQuery) ([]*entroq.T
 	}
 	query := "SELECT " + columns + " FROM tasks WHERE " + strings.Join(where, " AND ")
 	if len(q.IDs) > 0 {
-		order := make([]string, 0, len(q.IDs))
-		for i, id := range q.IDs {
-			order = append(order, fmt.Sprintf("WHEN ? THEN %d", i))
-			args = append(args, id)
-		}
-		query += " ORDER BY CASE id " + strings.Join(order, " ") + " ELSE " + fmt.Sprint(len(q.IDs)) + " END"
+		order, orderArgs := requestedOrder("id", q.IDs)
+		query += " ORDER BY " + order
+		args = append(args, orderArgs...)
 	} else {
 		query += " ORDER BY at_ms, id"
 	}
@@ -169,11 +178,19 @@ func (b *EQSQLite) Docs(ctx context.Context, q *entroq.DocQuery) ([]*entroq.Doc,
 			args = append(args, q.KeyEnd)
 		}
 	}
-	query := "SELECT " + columns + " FROM " + docsWithLocks + " WHERE " + strings.Join(where, " AND ") +
-		" ORDER BY d.key_primary, d.key_secondary, d.id"
-	if q.Limit > 0 {
-		query += " LIMIT ?"
-		args = append(args, q.Limit)
+	// Docs looked up by ID come in the order asked for, ignoring any limit;
+	// other docs come in key order, which a limit cuts.
+	query := "SELECT " + columns + " FROM " + docsWithLocks + " WHERE " + strings.Join(where, " AND ")
+	if len(q.IDs) > 0 {
+		order, orderArgs := requestedOrder("d.id", q.IDs)
+		query += " ORDER BY " + order
+		args = append(args, orderArgs...)
+	} else {
+		query += " ORDER BY d.key_primary, d.key_secondary, d.id"
+		if q.Limit > 0 {
+			query += " LIMIT ?"
+			args = append(args, q.Limit)
+		}
 	}
 	rows, err := b.readDB.QueryContext(ctx, query, args...)
 	if err != nil {

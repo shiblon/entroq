@@ -876,3 +876,23 @@ func TestBackendRejectsInvalidRequests(t *testing.T) {
 	eqtest.BackendRejectsInvalidRequests(ctx, t, b, "/pgtest/"+entroq.GenHex16())
 	eqtest.StorageRejectsZeroDurations(ctx, t, b, "/pgtest/"+entroq.GenHex16())
 }
+
+func TestTasksClaimantFilter(t *testing.T) {
+	RunQTest(t, eqtest.TasksClaimantFilter)
+}
+
+func TestQueueStatsCounts(t *testing.T) {
+	RunQTest(t, eqtest.QueueStatsCounts)
+}
+
+func TestQueueStatsMatching(t *testing.T) {
+	RunQTest(t, eqtest.QueueStatsMatching)
+}
+
+func TestDocsOrderAndLimits(t *testing.T) {
+	RunQTest(t, eqtest.DocsOrderAndLimits)
+}
+
+func TestTaskClaimantIsHolder(t *testing.T) {
+	RunQTest(t, eqtest.TaskClaimantIsHolder)
+}

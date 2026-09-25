@@ -770,6 +770,9 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	if claimed.Claims != 1 {
 		t.Fatalf("Expected claim to increment task claims to %d, got %d", 1, claimed.Claims)
 	}
+	if claimed.Claimant != client.ClientID {
+		t.Fatalf("Claimed task's claimant is %q, want the claiming client %q", claimed.Claimant, client.ClientID)
+	}
 
 	// TryClaim not ready task.
 	tryclaimed, err := client.TryClaim(ctx, entroq.From(queue), entroq.ClaimFor(10*time.Second))

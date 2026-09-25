@@ -969,3 +969,23 @@ func TestEQMemBackendRejectsInvalidRequests(t *testing.T) {
 	eqtest.BackendRejectsInvalidRequests(ctx, t, b, "/memtest")
 	eqtest.StorageRejectsZeroDurations(ctx, t, b, "/memtest")
 }
+
+func TestEQMemTasksClaimantFilter(t *testing.T) {
+	RunQTest(t, eqtest.TasksClaimantFilter)
+}
+
+func TestEQMemQueueStatsCounts(t *testing.T) {
+	RunQTest(t, eqtest.QueueStatsCounts)
+}
+
+func TestEQMemQueueStatsMatching(t *testing.T) {
+	RunQTest(t, eqtest.QueueStatsMatching)
+}
+
+func TestEQMemDocsOrderAndLimits(t *testing.T) {
+	RunQTest(t, eqtest.DocsOrderAndLimits)
+}
+
+func TestEQMemTaskClaimantIsHolder(t *testing.T) {
+	RunQTest(t, eqtest.TaskClaimantIsHolder)
+}

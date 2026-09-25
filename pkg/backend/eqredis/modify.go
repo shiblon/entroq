@@ -312,6 +312,7 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 				pipe.Del(ctx, taskKey(t.id))
 				pipe.ZRem(ctx, queueKey(q), t.id)
 				pipe.ZRem(ctx, qsclaimedKey(q), t.id)
+				pipe.ZRem(ctx, qsclaimsKey(q), t.id)
 				// Queue cleanup is handled by the GC goroutine.
 			}
 
@@ -353,8 +354,14 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 				if newQueue != oldQueue {
 					pipe.ZRem(ctx, queueKey(oldQueue), t.ID)
 					pipe.ZRem(ctx, qsclaimedKey(oldQueue), t.ID)
+					pipe.ZRem(ctx, qsclaimsKey(oldQueue), t.ID)
+					if f.Claims > 0 {
+						pipe.ZAdd(ctx, qsclaimsKey(newQueue), redis.Z{Score: float64(f.Claims), Member: t.ID})
+					}
 				}
-				if newAtMs > nowMs {
+				// Claimed means not yet available and claimed at least once; a
+				// task that was never claimed is future, however it got there.
+				if newAtMs > nowMs && f.Claims > 0 {
 					pipe.ZAdd(ctx, qsclaimedKey(newQueue), redis.Z{Score: float64(newAtMs), Member: t.ID})
 				} else {
 					pipe.ZRem(ctx, qsclaimedKey(newQueue), t.ID)
@@ -370,6 +377,12 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 					id = entroq.GenHex16()
 				}
 				atMs := entroq.NormalizeArrival(td.At, now).UnixMilli()
+				// As for a change, the writer holds a task that is not yet
+				// available.
+				insClaimant := ""
+				if atMs > nowMs {
+					insClaimant = claimant
+				}
 
 				f := &taskFields{
 					ID:       id,
@@ -378,7 +391,7 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 					AtMs:     atMs,
 					Created:  nowMs,
 					Modified: nowMs,
-					Claimant: claimant,
+					Claimant: insClaimant,
 					Version:  0,
 					Claims:   0,
 					Attempt:  td.Attempt,

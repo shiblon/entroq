@@ -185,13 +185,8 @@ func TestNamespacePrefixMatchLiteral(t *testing.T) {
 	RunQTest(t, eqtest.NamespacePrefixMatchLiteral)
 }
 
-// TestQueueStats is skipped for eqredis because QueueStats intentionally
-// returns MaxClaims=0. Computing it requires a full linear scan of task hashes
-// per queue (O(tasks), not O(queues)), which is inappropriate for a stats call.
-// Postgres avoids this via an index-only scan; Redis has no equivalent.
-// TODO: consider a eq:maxclaims:{name} sorted set to restore O(1) MaxClaims.
 func TestQueueStats(t *testing.T) {
-	t.Skip("eqredis returns MaxClaims=0; see QueueStats comment in query.go")
+	RunQTest(t, eqtest.QueueStats)
 }
 
 func TestQueueStatsLimit(t *testing.T) {
@@ -299,4 +294,24 @@ func TestBackendRejectsInvalidRequests(t *testing.T) {
 	defer b.Close()
 	eqtest.BackendRejectsInvalidRequests(ctx, t, b, "/redistest/"+entroq.GenHex16())
 	eqtest.StorageRejectsZeroDurations(ctx, t, b, "/redistest/"+entroq.GenHex16())
+}
+
+func TestTasksClaimantFilter(t *testing.T) {
+	RunQTest(t, eqtest.TasksClaimantFilter)
+}
+
+func TestQueueStatsCounts(t *testing.T) {
+	RunQTest(t, eqtest.QueueStatsCounts)
+}
+
+func TestQueueStatsMatching(t *testing.T) {
+	RunQTest(t, eqtest.QueueStatsMatching)
+}
+
+func TestDocsOrderAndLimits(t *testing.T) {
+	RunQTest(t, eqtest.DocsOrderAndLimits)
+}
+
+func TestTaskClaimantIsHolder(t *testing.T) {
+	RunQTest(t, eqtest.TaskClaimantIsHolder)
 }

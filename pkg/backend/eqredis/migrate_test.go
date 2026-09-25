@@ -225,3 +225,58 @@ func TestMigrateDocFieldsAfterLocks(t *testing.T) {
 		t.Errorf("doc after field migration: want version %d from its lock, got %v, %v", version, docs, err)
 	}
 }
+
+// TestMigrateClaimsIndex puts a queue back the way an earlier version left it,
+// with no claims index and a never-claimed task in the claimed set, and checks
+// that opening builds the index and corrects the counts.
+func TestMigrateClaimsIndex(t *testing.T) {
+	ctx := context.Background()
+	client, err := redisClient(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
+	defer rdb.Close()
+
+	queue := "migrate-claims-" + entroq.GenHex16()
+	resp, err := client.Modify(ctx, entroq.InsertingInto(queue), entroq.InsertingInto(queue))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := client.TryClaim(ctx, entroq.From(queue), entroq.ClaimFor(time.Hour))
+	if err != nil || claimed == nil {
+		t.Fatalf("claim: %v, %v", claimed, err)
+	}
+	var never *entroq.Task
+	for _, task := range resp.InsertedTasks {
+		if task.ID != claimed.ID {
+			never = task
+		}
+	}
+	later := strconv.FormatInt(time.Now().Add(time.Hour).UnixMilli(), 10)
+	for _, cmd := range []redis.Cmder{
+		rdb.HSet(ctx, taskKey(never.ID), "at", later),
+		rdb.ZAdd(ctx, queueKey(queue), redis.Z{Score: float64(time.Now().Add(time.Hour).UnixMilli()), Member: never.ID}),
+		rdb.ZAdd(ctx, qsclaimedKey(queue), redis.Z{Score: float64(time.Now().Add(time.Hour).UnixMilli()), Member: never.ID}),
+		rdb.Del(ctx, qsclaimsKey(queue), claimsIndexMigratedKey),
+	} {
+		if err := cmd.Err(); err != nil {
+			t.Fatalf("simulate legacy state: %v", err)
+		}
+	}
+
+	reopened, err := redisClient(ctx)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	stats, err := reopened.QueueStats(ctx, entroq.MatchExact(queue))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := stats[queue]
+	if s == nil || s.Claimed != 1 || s.Future != 1 || s.MaxClaims != 1 {
+		t.Errorf("stats after migration: want 1 claimed, 1 future, max claims 1; got %+v", s)
+	}
+}

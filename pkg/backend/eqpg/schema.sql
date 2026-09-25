@@ -85,7 +85,10 @@ DROP INDEX IF EXISTS entroq.byGCQueueAt;
 DROP INDEX IF EXISTS entroq.byCompoundGCQueueAt;
 
 -- Storage Indexes.
-CREATE INDEX IF NOT EXISTS idx_docs_keys     ON entroq.docs (namespace, key_primary, key_secondary);
+-- Docs are listed in (key, secondary key, id) order within a namespace; the
+-- id makes the order total, so a limit cuts it in the same place every time.
+DROP INDEX IF EXISTS entroq.idx_docs_keys;
+CREATE INDEX IF NOT EXISTS idx_docs_order ON entroq.docs (namespace, key_primary, key_secondary, id);
 -- Covers NamespaceStats: GROUP BY namespace with FILTER on at/claimant, index-only.
 DROP INDEX IF EXISTS entroq.idx_docs_ns_stats;
 -- Held groups, for counting claimed docs without reading every doc.
@@ -451,7 +454,8 @@ BEGIN
                 0,
                 ins_queue,
                 CASE WHEN ins_at < v_now - interval '1 year' THEN v_now ELSE ins_at END,
-                p_claimant,
+                -- As for a change, the writer holds a task not yet available.
+                CASE WHEN ins_at > v_now THEN p_claimant ELSE '' END,
                 ins_value::jsonb,
                 v_now, v_now,
                 ins_attempt, ins_err
@@ -634,7 +638,8 @@ DROP FUNCTION IF EXISTS entroq.gc_due(text);
 --       existing rows, so this constraint is added VALID.
 --
 --       NOTE: namespace, key_primary and key_secondary share one budget. They
---       are the columns of idx_docs_keys, and a btree index row cannot exceed
+--       are the columns of idx_docs_keys (since 1.13.0 idx_docs_order, which
+--       adds the 64-byte id: 1600 bytes), and a btree index row cannot exceed
 --       2704 bytes (1/3 of an 8kB page). Measured with both key columns at their
 --       256 maximum and incompressible values, a namespace of 2048 bytes still
 --       indexes and 2176 does not. The current allocation is
@@ -658,6 +663,8 @@ DROP FUNCTION IF EXISTS entroq.gc_due(text);
 --       dropped, with their stats index; docs_group_fk ties each doc to its
 --       group's lock. _modify_docs and _claim_docs are dropped: doc rules run
 --       in the Go backend inside the modify transaction.
+--   (4) idx_docs_keys becomes idx_docs_order, adding id, so doc listings have
+--       a total order.
 -- Each block checks pg_attribute to skip on fresh installs where the column
 -- is already correct, avoiding unnecessary table scans on re-runs.
 

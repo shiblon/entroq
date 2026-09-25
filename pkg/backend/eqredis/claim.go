@@ -60,6 +60,7 @@ func (e *EQRedis) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 // skips any stale ZSET member whose hash was already removed, cleaning it up.
 //
 //	KEYS[1]=queue ZSET  KEYS[2]=qsclaimed ZSET  KEYS[3]=queues set
+//	KEYS[4]=qsclaims ZSET
 //	ARGV[1]=nowMs  ARGV[2]=newAtMs  ARGV[3]=claimant  ARGV[4]=window
 //	ARGV[5]=queue name  ARGV[6]=task-key prefix  ARGV[7]=random offset
 //	returns HGETALL of the claimed task, or nil if none claimable.
@@ -77,14 +78,16 @@ for off = 0, n - 1 do
   else
     local h = {}
     for i = 1, #vals, 2 do h[vals[i]] = vals[i+1] end
+    local claims = (tonumber(h['claims']) or 0) + 1
     redis.call('HSET', tkey,
       'claimant', ARGV[3],
       'at', ARGV[2],
       'version', tostring((tonumber(h['version']) or 0) + 1),
-      'claims', tostring((tonumber(h['claims']) or 0) + 1),
+      'claims', tostring(claims),
       'modified', ARGV[1])
     redis.call('ZADD', KEYS[1], ARGV[2], id)
     redis.call('ZADD', KEYS[2], ARGV[2], id)
+    redis.call('ZADD', KEYS[4], claims, id)
     redis.call('SADD', KEYS[3], ARGV[5])
     return redis.call('HGETALL', tkey)
   end
@@ -102,7 +105,7 @@ func (e *EQRedis) tryClaimOne(ctx context.Context, queue string, claimant string
 	offset := rand.Intn(1 << 30)
 
 	res, err := claimScript.Run(ctx, e.client,
-		[]string{queueKey(queue), qsclaimedKey(queue), queuesKey},
+		[]string{queueKey(queue), qsclaimedKey(queue), queuesKey, qsclaimsKey(queue)},
 		nowMs, newAtMs, claimant, claimWindow, queue, keyPrefix+"t:", offset).Result()
 	if errors.Is(err, redis.Nil) {
 		return nil, nil // nothing claimable

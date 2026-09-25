@@ -12,7 +12,11 @@ type TasksQuery struct {
 
 	// Claimant, when non-empty, filters results to tasks that are available or
 	// expired (arrival time at or before now) OR currently claimed by this
-	// claimant. Empty means no claimant filter: every task is eligible.
+	// claimant: what that claimant can act on now. A task's claimant is
+	// whoever last wrote it, so it names a holder only while the arrival time
+	// is in the future; a not-yet-available task another claimant, or no
+	// claimant, wrote is excluded. Empty means no claimant filter: every task
+	// is eligible.
 	Claimant string
 
 	// Limit, when positive, caps the number of MATCHING tasks returned -- that
@@ -70,14 +74,23 @@ func newMatchQuery(opts ...QueuesOpt) *MatchQuery {
 // QueueStat holds high-level information about a queue.
 // Note that available + claimed may not add up to size. This is because a task
 // can be unavailable (AT in the future) without being claimed by anyone.
+//
+// Available is exact: tasks whose arrival time has come. The others are split
+// by whether they were ever claimed. A task's claimant is whoever last wrote
+// it, so no backend can tell a task a worker holds from one a worker delayed
+// for a retry: both were claimed and are not yet available, and both count as
+// Claimed. Future counts not-yet-available tasks that were never claimed.
 type QueueStat struct {
 	Name      string `json:"name"`      // The queue name.
 	Size      int    `json:"size"`      // The total number of tasks.
-	Claimed   int    `json:"claimed"`   // The number of currently claimed tasks.
-	Available int    `json:"available"` // The number of available tasks.
-	Future    int    `json:"future"`    // The number of tasks with a future arrival time and 0 claims.
+	Claimed   int    `json:"claimed"`   // Tasks not yet available that were claimed at least once.
+	Available int    `json:"available"` // Tasks whose arrival time has come.
+	Future    int    `json:"future"`    // Tasks not yet available that were never claimed.
 
-	MaxClaims int `json:"maxClaims"` // The maximum number of claims for a task in the queue.
+	// MaxClaims is the most claims any task still in the queue has had. A
+	// high value points at a task that keeps failing, or at a task used as
+	// a recurring job; it falls when that task leaves the queue.
+	MaxClaims int `json:"maxClaims"`
 }
 
 // NamespaceStat holds high-level information about a doc namespace.

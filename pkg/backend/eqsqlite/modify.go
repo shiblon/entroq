@@ -66,7 +66,7 @@ func modifyTx(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (*entro
 	}
 	for _, change := range mod.Changes {
 		old := foundTasks[change.ID]
-		at := entroq.NormalizeArrival(change.At, now)
+		at := storedAt(change.At, now)
 		claimant := ""
 		if at.After(now) {
 			claimant = mod.Claimant
@@ -86,12 +86,17 @@ func modifyTx(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (*entro
 		if id == "" {
 			id = entroq.GenHex16()
 		}
-		at := entroq.NormalizeArrival(insert.At, now)
+		at := storedAt(insert.At, now)
 		created := time.UnixMilli(storedTime(insert.Created, now)).UTC()
 		modified := time.UnixMilli(storedTime(insert.Modified, now)).UTC()
+		// As for a change, the writer holds a task that is not yet available.
+		claimant := ""
+		if at.After(now) {
+			claimant = mod.Claimant
+		}
 		task := &entroq.Task{
 			ID: id, Queue: insert.Queue, Version: 0, At: at,
-			Claimant: mod.Claimant, Value: insert.Value, Created: created,
+			Claimant: claimant, Value: insert.Value, Created: created,
 			Modified: modified, Attempt: insert.Attempt, Err: insert.Err,
 		}
 		resp.InsertedTasks = append(resp.InsertedTasks, task)
@@ -467,4 +472,12 @@ func saveDocLocks(ctx context.Context, tx *sql.Tx, locks map[docgroup.Group]docg
 		}
 		return nil
 	})
+}
+
+// storedAt is the arrival time a write stores: normalized, then cut to the
+// millisecond the database keeps, so comparing it with now, which is kept the
+// same way, gives the answer a later read will, and the response carries what
+// was stored.
+func storedAt(at, now time.Time) time.Time {
+	return time.UnixMilli(entroq.NormalizeArrival(at, now).UnixMilli()).UTC()
 }

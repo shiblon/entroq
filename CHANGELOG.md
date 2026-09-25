@@ -75,6 +75,18 @@ runs, so plan a short maintenance window on large doc tables.
   count claimed docs from the held locks instead of reading every doc.
   PostgreSQL's doc operations now run in Go on the same rules as every other
   backend, and the schema drops `_modify_docs` and `_claim_docs`.
+- **A task's claimant names its holder.** A write that leaves a task not yet
+  available records the writer as its claimant, and a write that leaves it
+  available records none, on every backend, as doc group locks already do.
+  Changes already worked this way except on the in-memory backend, which kept
+  the claimant the caller's copy of the task carried when a change delayed
+  it; inserts recorded the writer even for a task available at once. So an
+  empty claimant now marks a task released or inserted to be worked, and an
+  available task that still has one is a claim that ran out: its worker never
+  came back. Tasks stored before this keep their old claimant until their next
+  write. SQLite also compares arrival times at the millisecond it stores, so a
+  release in the same millisecond no longer keeps its claimant, and responses
+  carry the stored time.
 - **Malformed requests are invalid arguments, found before authorization.**
   A request the backend can never carry out now fails as
   `entroq.InvalidArgumentError` (gRPC `InvalidArgument`, HTTP 400) on every
@@ -143,6 +155,27 @@ runs, so plan a short maintenance window on large doc tables.
 
 ### Fixed
 
+- **PostgreSQL's claimant filter on `Tasks` matches the other backends.**
+  `entroq.ClaimedBy` and `ClaimedBySelf` keep what that claimant can act on
+  now: available tasks and the ones it holds. PostgreSQL also returned
+  not-yet-available tasks with an empty claimant, which no one holds and no
+  one can claim yet.
+- **Redis queue stats match the other backends.** Exact and prefix matches
+  are alternatives, where Redis ignored the prefixes whenever an exact name
+  was given; a limit counts only the queues reported, so emptied queues no
+  longer use it up; a task that was never claimed counts as future rather
+  than claimed when a change delays it; and `MaxClaims` is reported, from a
+  per-queue index of claim counts that Redis builds on its first open, where
+  it was always 0.
+- **Doc listings have one order everywhere.** Docs listed by key come in
+  (key, secondary key, ID) order on every backend, where PostgreSQL left ties
+  unordered, so a limit cuts the same docs every time; PostgreSQL now applies
+  a limit to an exact-key listing too. Docs looked up by ID come in the order
+  asked for, with no limit, where PostgreSQL and SQLite sorted them by key and
+  SQLite applied the limit. The PostgreSQL index behind this, `idx_docs_keys`,
+  becomes `idx_docs_order` and includes the ID. Tasks still come in no
+  guaranteed order, but PostgreSQL now returns them as SQLite does: by
+  arrival time, or in the order their IDs were asked for.
 - **A doc claim with no claimant is refused.** The service passed it to its
   own client, which filled in the service's claimant, so the claim succeeded
   as the service itself. It is now an invalid argument.

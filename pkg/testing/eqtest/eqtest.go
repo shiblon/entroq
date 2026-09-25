@@ -97,21 +97,22 @@ func newTaskQueueVersionValue(t *entroq.Task) *taskQueueVersionValue {
 	}
 }
 
+// taskIDQueueVersionValue is what a comparison of a task before and after an
+// operation checks. The claimant is left out: it names the task's holder, which
+// claiming and releasing change by design (see TaskClaimantIsHolder).
 type taskIDQueueVersionValue struct {
-	Queue    string
-	ID       string
-	Version  int32
-	Value    json.RawMessage
-	Claimant string
+	Queue   string
+	ID      string
+	Version int32
+	Value   json.RawMessage
 }
 
 func newTaskIDQueueVersionValue(t *entroq.Task) *taskIDQueueVersionValue {
 	return &taskIDQueueVersionValue{
-		ID:       t.ID,
-		Queue:    t.Queue,
-		Version:  t.Version,
-		Claimant: t.Claimant,
-		Value:    append(json.RawMessage(nil), t.Value...),
+		ID:      t.ID,
+		Queue:   t.Queue,
+		Version: t.Version,
+		Value:   append(json.RawMessage(nil), t.Value...),
 	}
 }
 

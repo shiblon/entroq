@@ -15,95 +15,91 @@ import (
 
 // matchesQueuesQuery returns true if the queue name passes the filter in qq.
 func matchesQueuesQuery(name string, qq *entroq.QueuesQuery) bool {
-	if len(qq.MatchExact) > 0 {
-		return slices.Contains(qq.MatchExact, name)
+	if len(qq.MatchExact) == 0 && len(qq.MatchPrefix) == 0 {
+		return true
 	}
-	if len(qq.MatchPrefix) > 0 {
-		for _, p := range qq.MatchPrefix {
-			if strings.HasPrefix(name, p) {
-				return true
-			}
-		}
-		return false
+	if slices.Contains(qq.MatchExact, name) {
+		return true
 	}
-	return true
+	return slices.ContainsFunc(qq.MatchPrefix, func(p string) bool {
+		return strings.HasPrefix(name, p)
+	})
 }
 
 // QueueStats returns per-queue statistics.
 //
-// Stats are computed from the ZSET and inflight Set without reading task
-// hashes, so they are O(Q) in the number of matching queues:
+// Stats come from each queue's sorted sets, without reading task hashes, so
+// they cost O(Q) in the number of matching queues:
 //
-//	Size      = ZCARD eq:q:{name}
-//	Claimed   = SCARD eq:inflight:{name}
-//	Available = ZCOUNT eq:q:{name} 0 now_ms
-//	            (claimed tasks have score > now by definition, so this is exact)
+//	Size      = ZCARD q:{name}
+//	Available = ZCOUNT q:{name} 0 now_ms
+//	Claimed   = ZCOUNT qsclaimed:{name} (now_ms +inf)
 //	Future    = Size - Available - Claimed
-//	            (approximation: includes expired-but-rescheduled tasks with claims>0)
-//	MaxClaims = 0 (always; see TestQueueStats in redis_test.go)
+//	MaxClaims = top score of qsclaims:{name}
 //
-// MaxClaims requires reading every task hash in each queue -- O(tasks), not
-// O(queues). Postgres computes this via an index-only scan and does not block
-// writers; Redis has no equivalent. Accepting the weaker contract here rather
-// than introducing a hot-path linear scan on a stats call.
+// As in every backend, a task not yet available counts as claimed if it was
+// ever claimed, and as future otherwise. Queues are matched by exact name or
+// prefix, and a limit counts only non-empty queues, in name order.
 func (e *EQRedis) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[string]*entroq.QueueStat, error) {
 	now := time.Now().UTC()
 	nowMs := now.UnixMilli()
 
-	// Get all known queue names.
 	allQueues, err := e.client.SMembers(ctx, queuesKey).Result()
 	if err != nil {
 		return nil, fmt.Errorf("queue stats smembers: %w", err)
 	}
-
-	// Filter by query.
 	var names []string
 	for _, q := range allQueues {
 		if matchesQueuesQuery(q, qq) {
 			names = append(names, q)
 		}
 	}
-	if qq.Limit > 0 && len(names) > qq.Limit {
-		names = names[:qq.Limit]
-	}
+	slices.Sort(names)
 
-	if len(names) == 0 {
-		return map[string]*entroq.QueueStat{}, nil
+	type queueCmds struct {
+		size, available, claimed *redis.IntCmd
+		maxClaims                *redis.ZSliceCmd
 	}
-
-	// Pipeline ZCARD, ZCOUNT (available), and ZCOUNT >now (claimed) for all queues.
 	pipe := e.client.Pipeline()
-	zcardCmds := make(map[string]*redis.IntCmd, len(names))
-	zcountCmds := make(map[string]*redis.IntCmd, len(names))
-	claimedCmds := make(map[string]*redis.IntCmd, len(names))
-	nowStr := fmt.Sprintf("%d", nowMs)
-
-	for _, name := range names {
-		zcardCmds[name] = pipe.ZCard(ctx, queueKey(name))
-		zcountCmds[name] = pipe.ZCount(ctx, queueKey(name), "0", nowStr)
-		claimedCmds[name] = pipe.ZCount(ctx, qsclaimedKey(name), fmt.Sprintf("(%d", nowMs), "+inf")
+	cmds := make([]queueCmds, len(names))
+	nowStr := strconv.FormatInt(nowMs, 10)
+	for i, name := range names {
+		cmds[i] = queueCmds{
+			size:      pipe.ZCard(ctx, queueKey(name)),
+			available: pipe.ZCount(ctx, queueKey(name), "0", nowStr),
+			claimed:   pipe.ZCount(ctx, qsclaimedKey(name), "("+nowStr, "+inf"),
+			maxClaims: pipe.ZRevRangeWithScores(ctx, qsclaimsKey(name), 0, 0),
+		}
 	}
-	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
-		return nil, fmt.Errorf("queue stats pipeline: %w", err)
+	if len(names) > 0 {
+		if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+			return nil, fmt.Errorf("queue stats pipeline: %w", err)
+		}
 	}
 
-	result := make(map[string]*entroq.QueueStat, len(names))
-	for _, name := range names {
-		size := int(zcardCmds[name].Val())
+	result := make(map[string]*entroq.QueueStat)
+	for i, name := range names {
+		if qq.Limit > 0 && len(result) >= qq.Limit {
+			break
+		}
+		size := int(cmds[i].size.Val())
 		if size == 0 {
 			// Queue is empty; skip and let GC clean it up.
 			continue
 		}
-		available := int(zcountCmds[name].Val())
-		claimed := int(claimedCmds[name].Val())
-		future := max(size-available-claimed, 0)
+		available := int(cmds[i].available.Val())
+		claimed := int(cmds[i].claimed.Val())
+		maxClaims := 0
+		if top := cmds[i].maxClaims.Val(); len(top) > 0 {
+			maxClaims = int(top[0].Score)
+		}
 		result[name] = &entroq.QueueStat{
 			Name:      name,
 			Size:      size,
 			Claimed:   claimed,
 			Available: available,
-			Future:    future,
-			MaxClaims: 0,
+			Future:    max(size-available-claimed, 0),
+			MaxClaims: maxClaims,
 		}
 	}
 	return result, nil

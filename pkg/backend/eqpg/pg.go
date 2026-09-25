@@ -546,19 +546,21 @@ func (b *EQPG) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Task
 		values = append(values, tq.Queue)
 	}
 
+	// A claimant filter keeps what that claimant can act on now: tasks anyone
+	// could claim, and tasks it holds. A task's claimant is whoever last wrote
+	// it, so the claimant alone does not mean it is held.
 	if tq.Claimant != "" {
-		q += fmt.Sprintf(" AND (claimant = $%d OR claimant = $%d OR at < NOW())", len(values)+1, len(values)+2)
-		values = append(values, "", tq.Claimant)
+		q += fmt.Sprintf(" AND (at <= NOW() OR claimant = $%d)", len(values)+1)
+		values = append(values, tq.Claimant)
 	}
 
-	// Add IDs if a set of limiting IDs has been requested.
-	strIDs := make([]string, 0, len(tq.IDs))
-	for _, id := range tq.IDs {
-		strIDs = append(strIDs, id)
-	}
-	if len(strIDs) != 0 {
-		q += fmt.Sprintf(" AND id = any($%d)", len(values)+1)
-		values = append(values, pq.StringArray(strIDs))
+	// No order is promised, but tasks come in arrival order, or in the order
+	// their IDs were asked for, as the indexes make that cheap.
+	if len(tq.IDs) != 0 {
+		q += fmt.Sprintf(" AND id = any($%d) ORDER BY array_position($%[1]d, id)", len(values)+1)
+		values = append(values, pq.StringArray(tq.IDs))
+	} else {
+		q += " ORDER BY at, id"
 	}
 
 	if tq.Limit > 0 {
@@ -1028,15 +1030,16 @@ func (b *EQPG) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, er
 		rows, err = b.DB.QueryContext(ctx,
 			`SELECT `+columns+` FROM `+docsWithLocks+`
 			 WHERE d.namespace = $1 AND d.id = ANY($2)
-			 ORDER BY d.namespace, d.key_primary, d.key_secondary`,
+			 ORDER BY array_position($2, d.id)`,
 			rq.Namespace, pq.StringArray(rq.IDs),
 		)
 	} else if rq.KeyExact != "" {
 		rows, err = b.DB.QueryContext(ctx,
 			`SELECT `+columns+` FROM `+docsWithLocks+`
 			 WHERE d.namespace = $1 AND d.key_primary = $2
-			 ORDER BY d.key_primary, d.key_secondary`,
-			rq.Namespace, rq.KeyExact,
+			 ORDER BY d.key_primary, d.key_secondary, d.id
+			 LIMIT NULLIF($3, 0)`,
+			rq.Namespace, rq.KeyExact, rq.Limit,
 		)
 	} else {
 		rows, err = b.DB.QueryContext(ctx,
@@ -1044,7 +1047,7 @@ func (b *EQPG) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, er
 			 WHERE d.namespace = $1
 			   AND ($2 = '' OR d.key_primary >= $2)
 			   AND ($3 = '' OR d.key_primary < $3)
-			 ORDER BY d.namespace, d.key_primary, d.key_secondary
+			 ORDER BY d.key_primary, d.key_secondary, d.id
 			 LIMIT NULLIF($4, 0)`,
 			rq.Namespace, rq.KeyStart, rq.KeyEnd, rq.Limit,
 		)
