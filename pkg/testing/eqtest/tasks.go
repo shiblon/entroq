@@ -969,11 +969,13 @@ func ModifyReportsAllFailureClasses(ctx context.Context, t *testing.T, client *e
 	q := path.Join(qPrefix, "all_failures")
 	wrongQ := path.Join(qPrefix, "all_failures_wrong")
 
-	// Seed three real tasks to fail against, with explicit IDs so we can name them.
+	// Seed three real tasks to fail against, with explicit IDs so we can name
+	// them. Task IDs are unique across queues, so each run gets its own.
+	chgID, delID, collideID := uniqueTaskID("f-chg"), uniqueTaskID("f-del"), uniqueTaskID("f-collide")
 	ins, err := client.Modify(ctx,
-		entroq.InsertingInto(q, entroq.WithValue("chg"), entroq.WithID("f-chg")),
-		entroq.InsertingInto(q, entroq.WithValue("del"), entroq.WithID("f-del")),
-		entroq.InsertingInto(q, entroq.WithValue("collide"), entroq.WithID("f-collide")),
+		entroq.InsertingInto(q, entroq.WithValue("chg"), entroq.WithID(chgID)),
+		entroq.InsertingInto(q, entroq.WithValue("del"), entroq.WithID(delID)),
+		entroq.InsertingInto(q, entroq.WithValue("collide"), entroq.WithID(collideID)),
 	)
 	if err != nil {
 		t.Fatalf("seed insert: %v", err)
@@ -990,11 +992,11 @@ func ModifyReportsAllFailureClasses(ctx context.Context, t *testing.T, client *e
 	//   - a delete of a task that does not exist.
 	// The queue-mismatch delete is what historically short-circuited eqmem before
 	// it computed the collision and the wrong-version change.
-	chgWrongVer := &entroq.Task{ID: "f-chg", Version: byID["f-chg"].Version + 7, Queue: q, Value: json.RawMessage(`"x"`)}
+	chgWrongVer := &entroq.Task{ID: chgID, Version: byID[chgID].Version + 7, Queue: q, Value: json.RawMessage(`"x"`)}
 	_, err = client.Modify(ctx,
-		entroq.InsertingInto(q, entroq.WithValue("y"), entroq.WithID("f-collide")),
+		entroq.InsertingInto(q, entroq.WithValue("y"), entroq.WithID(collideID)),
 		chgWrongVer.Change(),
-		entroq.NewTaskID("f-del", byID["f-del"].Version, wrongQ).Delete(),
+		entroq.NewTaskID(delID, byID[delID].Version, wrongQ).Delete(),
 		entroq.NewTaskID("ghost", 0, q).Delete(),
 	)
 	depErr, ok := entroq.AsDependency(err)

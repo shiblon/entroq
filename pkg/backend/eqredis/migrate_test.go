@@ -36,7 +36,9 @@ func TestDocKeysDistinguishEscapedNamespaces(t *testing.T) {
 	}
 	defer client.Close()
 
-	slash, escaped := "keycollide/a/b", "keycollide/a%2Fb"
+	// A fresh root per run keeps repeated runs against the shared Redis apart.
+	root := "keycollide-" + entroq.GenHex16()
+	slash, escaped := root+"/a/b", root+"/a%2Fb"
 	if _, err := client.Modify(ctx,
 		entroq.PuttingDocInto(slash, entroq.WithIDKeys("d", "k", ""), entroq.WithContent("slash")),
 		entroq.PuttingDocInto(escaped, entroq.WithIDKeys("d", "k", ""), entroq.WithContent("escaped")),
@@ -66,7 +68,8 @@ func TestMigrateDocKeys(t *testing.T) {
 
 	// "pct%" is the only namespace whose encoding changes. "col/x" and
 	// "col%2Fx" collided under the legacy encoding; "col/x" keeps its key.
-	moved, kept, lost := "migrate/pct%", "migrate/col/x", "migrate/col%2Fx"
+	root := "migrate-" + entroq.GenHex16()
+	moved, kept, lost := root+"/pct%", root+"/col/x", root+"/col%2Fx"
 	if _, err := client.Modify(ctx,
 		entroq.PuttingDocInto(moved, entroq.WithIDKeys("d", "k", ""), entroq.WithContent("moved")),
 		entroq.PuttingDocInto(kept, entroq.WithIDKeys("d", "k", ""), entroq.WithContent("kept")),

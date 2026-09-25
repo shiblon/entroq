@@ -12,10 +12,25 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Release note: the next release must be a minor (v1.13.0 or later), not a
 patch. It adds public API (`entroq.InvalidArgumentError`), moves the SQLite
 schema to version 2, adds `eqc work --max-claims`, and removes the
-`eqc mod --reset` flag. The PostgreSQL schema is unchanged (stays 1.11.0).
+`eqc mod --reset` flag. The PostgreSQL schema moves to 1.13.0: run
+`eqpg schema upgrade` (or serve with `--init_schema`) before starting the new
+service.
 
 ### Added
 
+- **Readiness loops for SQLite and Redis.** Both backends now wake claims for
+  tasks that become available with time, every `WithReadinessInterval`
+  (default 5s; `--readiness_interval` on `eqsqlite serve` and `eqredis serve`),
+  instead of waiting for the 30-second claim poll. Each tick asks the notifier
+  which queues have waiters and checks only those, so an idle backend does no
+  work. Redis's loop also finds tasks made available by another process sharing
+  the same Redis.
+- **Readiness wakes one waiter per ready task.** When several tasks in a queue
+  become available together, every backend now wakes up to that many waiting
+  claims in one tick, instead of one waiter per tick. This uses the new
+  optional `entroq.ListenerCounter` interface, which `subq.SubQ` implements
+  through the new `SubQ.Listeners`; a custom `NotifyWaiter` without it keeps
+  claim polling (SQLite, Redis, PostgreSQL) or one wakeup per queue (in-memory).
 - **`eqc work --max-claims`.** Passes the worker's claim ceiling through, as
   `eqlink work` already does: claim `N` may run, and a later claim moves the
   task to the error queue without running the command. The default 0 means no
@@ -24,6 +39,18 @@ schema to version 2, adds `eqc work --max-claims`, and removes the
 
 ### Changed
 
+- **Breaking: PostgreSQL no longer uses LISTEN/NOTIFY.** The service is the
+  database's only client, so the backend now runs the same readiness loop as
+  the other backends: a batched, read-only count of available tasks on the
+  queues its claims wait on (`eqpg.WithReadinessInterval`, default 5s,
+  `eqpg serve --readiness_interval`). Modifications no longer send NOTIFY, and
+  the schema drops `notify_ready_queues`, the `notification_state` watermark
+  table, `channel_name`, and the `byAt` index, which was updated on every task
+  write only to serve the old heartbeat. `eqpg.PGNotifyWaiter` is removed.
+  `eqpg.WithHeartbeat` and `eqpg serve --heartbeat` still set the readiness
+  interval but are deprecated; `eqpg.WithNoListen` and `--no_listen` are
+  deprecated and do nothing. `eqc --pg_url` gets the readiness loop too:
+  `--pg_heartbeat` sets its interval and now defaults to 5s instead of off.
 - **`eqc mod --reset_to_queue` replaces `--reset`.** `eqc mod -Q <queue> -r`
   reset a task's attempt and error but kept its claim count, which the backend
   owns and every change preserves. A task quarantined by `worker.WithMaxClaims`

@@ -30,7 +30,7 @@ services:
       - "--dbaddr=postgres:5432"
       - "--dbname=entroq"
       - "--dbuser=entroq"
-      - "--heartbeat=5s"
+      - "--readiness_interval=5s"
       - "--init_schema"
       - "--authn=jwt"
       - "--auth_jwks_file=/etc/entroq/jwks.json"

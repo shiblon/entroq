@@ -11,7 +11,10 @@ import (
 	"go.opentelemetry.io/otel/metric"
 )
 
-var serve eqserve.Config
+var (
+	serve             eqserve.Config
+	readinessInterval time.Duration
+)
 
 var serveCmd = &cobra.Command{
 	Use:   "serve",
@@ -31,7 +34,10 @@ path while the backend remains experimental.`,
 
 		return eqserve.Run(cmd.Context(), serve,
 			func(mp metric.MeterProvider) entroq.BackendOpener {
-				return eqsqlite.Opener(dbPath, eqsqlite.WithMeterProvider(mp))
+				return eqsqlite.Opener(dbPath,
+					eqsqlite.WithMeterProvider(mp),
+					eqsqlite.WithReadinessInterval(readinessInterval),
+				)
 			},
 			fmt.Sprintf("sqlite(%q)", dbPath),
 		)
@@ -41,5 +47,7 @@ path while the backend remains experimental.`,
 func init() {
 	serve.MetricInterval = 5 * time.Second
 	serve.BindFlags(serveCmd.Flags())
+	serveCmd.Flags().DurationVar(&readinessInterval, "readiness_interval", eqsqlite.DefaultReadinessInterval,
+		"Interval for notifying claims when tasks become ready through time; non-positive disables.")
 	rootCmd.AddCommand(serveCmd)
 }

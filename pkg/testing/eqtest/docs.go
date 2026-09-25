@@ -22,7 +22,7 @@ func InitialVersions(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 
 	resp, err := client.Modify(ctx,
 		entroq.InsertingInto(queue,
-			entroq.WithID("task-1"),
+			entroq.WithID(uniqueTaskID("task-1")),
 			entroq.WithValue("task"),
 		),
 		entroq.PuttingDocInto(namespace,

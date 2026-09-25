@@ -78,6 +78,18 @@ func TestBackendContract(t *testing.T) {
 	}
 }
 
+func TestReadinessFanout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	const interval = 500 * time.Millisecond
+	client, err := entroq.New(ctx, Opener(filepath.Join(t.TempDir(), "entroq.sqlite"), WithReadinessInterval(interval)))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer client.Close()
+	eqtest.ReadinessFanout(interval)(ctx, t, client, "sqlitetest")
+}
+
 func TestPersistenceAcrossReopen(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "entroq.sqlite")

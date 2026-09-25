@@ -81,6 +81,18 @@ func RunQTest(t *testing.T, tester eqtest.Tester) {
 	tester(ctx, t, client, fmt.Sprintf("redistest/%s", client.GenID()))
 }
 
+func TestReadinessFanout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	const interval = 500 * time.Millisecond
+	client, err := entroq.New(ctx, Opener(WithAddr(redisAddr), WithReadinessInterval(interval)))
+	if err != nil {
+		t.Fatalf("Get client: %v", err)
+	}
+	defer client.Close()
+	eqtest.ReadinessFanout(interval)(ctx, t, client, fmt.Sprintf("redistest/%s", client.GenID()))
+}
+
 func TestTasksWithID(t *testing.T) {
 	RunQTest(t, eqtest.TasksWithID)
 }

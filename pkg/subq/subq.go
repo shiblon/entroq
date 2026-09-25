@@ -47,6 +47,15 @@ func (s *sub) Done() {
 	s.listeners--
 }
 
+// Listeners returns the number of goroutines waiting on this queue.
+func (s *sub) Listeners() int {
+	if s == nil {
+		return 0
+	}
+	defer un(lock(s))
+	return s.listeners
+}
+
 func (s *sub) Reserved() bool {
 	if s == nil {
 		return false
@@ -106,6 +115,20 @@ func (s *SubQ) Notify(q string) {
 			}
 		}
 	}()
+}
+
+// Listeners returns the number of goroutines currently waiting on each queue.
+// Queues with no waiters are omitted. It is a snapshot: waiters may arrive or
+// leave as soon as it returns.
+func (s *SubQ) Listeners() map[string]int {
+	defer un(lock(s))
+	listeners := make(map[string]int, len(s.qs))
+	for q, qi := range s.qs {
+		if n := qi.Listeners(); n > 0 {
+			listeners[q] = n
+		}
+	}
+	return listeners
 }
 
 // makeDefaultCondition creates a condition function that returns false once,

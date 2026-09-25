@@ -37,7 +37,10 @@ func TestMain(m *testing.M) {
 	}
 	svcAddr = fmt.Sprintf("localhost:%d", lis.Addr().(*net.TCPAddr).Port)
 
-	svc, err := eqsvcgrpc.New(ctx, eqmem.Opener())
+	// A short readiness interval wakes claims promptly when a task becomes
+	// available only through time, such as an expired claim, so tests that
+	// wait on that do not race the default 5-second tick.
+	svc, err := eqsvcgrpc.New(ctx, eqmem.Opener(eqmem.WithReadinessInterval(100*time.Millisecond)))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eqsvcgrpc: %v\n", err)
 		os.Exit(1)
@@ -83,7 +86,7 @@ func mustRun(t *testing.T, args ...string) []byte {
 }
 
 func TestInsAndTs(t *testing.T) {
-	queue := "test/ins-ts"
+	queue := uniqueQueue(t, "ins-ts")
 
 	out := mustRun(t, "ins", "-q", queue, "-v", `{"hello":"world"}`)
 
@@ -115,7 +118,7 @@ func TestInsAndTs(t *testing.T) {
 }
 
 func TestDocPutAndDocs(t *testing.T) {
-	ns := "test-docput-and-docs"
+	ns := uniqueNamespace(t, "docs")
 
 	out := mustRun(t, "doc-put", "-n", ns, "-k", "mykey", "-v", `{"x":42}`)
 
@@ -150,7 +153,7 @@ func TestDocPutAndDocs(t *testing.T) {
 }
 
 func TestDocsByID(t *testing.T) {
-	ns := "test-docs-by-id"
+	ns := uniqueNamespace(t, "docs")
 
 	out := mustRun(t, "doc-put", "-n", ns, "-k", "a", "-v", `"one"`)
 	var inserted []*entroq.Doc
@@ -178,7 +181,7 @@ func TestDocsByID(t *testing.T) {
 }
 
 func TestDocRm(t *testing.T) {
-	ns := "test-doc-rm"
+	ns := uniqueNamespace(t, "docs")
 
 	out := mustRun(t, "doc-put", "-n", ns, "-k", "gone", "-v", `null`)
 	var inserted []*entroq.Doc
@@ -196,7 +199,7 @@ func TestDocRm(t *testing.T) {
 }
 
 func TestDocKeyRange(t *testing.T) {
-	ns := "test-doc-key-range"
+	ns := uniqueNamespace(t, "docs")
 
 	for _, k := range []string{"a", "b", "c", "d"} {
 		mustRun(t, "doc-put", "-n", ns, "-k", k)
@@ -601,6 +604,14 @@ func uniqueQueue(t *testing.T, leaf string) string {
 	t.Helper()
 
 	return fmt.Sprintf("test/%s/%d/%s", t.Name(), time.Now().UnixNano(), leaf)
+}
+
+// uniqueNamespace is uniqueQueue for doc namespaces: each run of a test gets
+// its own, so repeated runs against the shared service start empty.
+func uniqueNamespace(t *testing.T, leaf string) string {
+	t.Helper()
+
+	return uniqueQueue(t, leaf)
 }
 
 type runningCmd struct {

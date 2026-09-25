@@ -22,7 +22,7 @@
 //			log.Fatalf("Failed to listen: %v", err)
 //		}
 //
-//		svc, err := eqsvcgrpc.New(ctx, eqpg.Opener("localhost:5432", "postgres", "postgres", false))
+//		svc, err := eqsvcgrpc.New(ctx, eqpg.Opener("localhost:5432", eqpg.WithUsername("postgres"), eqpg.WithPassword("postgres")))
 //		if err != nil {
 //			log.Fatalf("Failed to open service backends: %v", err)
 //		}

@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -217,3 +218,15 @@ func EqualTasksVersionIncr(want, got *entroq.Task, versionBump int) string {
 
 // DeleteMissingTask tests that deleting non-existent tasks or versions results
 // in the right dependency errors.
+
+// uniqueTaskID returns base with a random suffix. Task IDs are unique across
+// every queue, unlike doc IDs, so a test that names its tasks must not reuse
+// an ID from an earlier run against the same database (as with go test -count).
+func uniqueTaskID(base string) string {
+	return base + "-" + entroq.GenHex16()
+}
+
+// uniqueTaskIDOfLen returns a random task ID exactly n bytes long, n >= 16.
+func uniqueTaskIDOfLen(n int) string {
+	return strings.Repeat("a", n-16) + entroq.GenHex16()
+}

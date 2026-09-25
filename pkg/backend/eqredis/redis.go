@@ -29,10 +29,11 @@
 //
 // Notifications:
 //
-//	SubQ is used for in-process "something changed" signals only: a change
-//	made through another process sharing the same Redis does not wake local
-//	waiters. Tasks that become ready with the passage of time, and changes
-//	from other processes, are found by the claim poll (ClaimQuery.PollTime).
+//	SubQ is used for in-process "something changed" signals. A readiness loop
+//	(WithReadinessInterval) periodically counts available tasks in queues that
+//	have waiters and wakes them, which covers tasks that become ready with the
+//	passage of time and changes made by other processes sharing the Redis.
+//	Without it, those are found only by the claim poll (ClaimQuery.PollTime).
 package eqredis
 
 import (
@@ -105,6 +106,9 @@ type EQRedis struct {
 	stopGC    context.CancelFunc
 	gcDone    chan struct{}
 	gcMetrics *gcmetrics.Metrics
+
+	stopReadiness context.CancelFunc
+	readinessDone chan struct{}
 }
 
 type redisOptions struct {
@@ -115,6 +119,8 @@ type redisOptions struct {
 	gcInterval  time.Duration
 	gcBatchSize int
 	mp          metric.MeterProvider
+
+	readinessInterval time.Duration
 }
 
 // RedisOpt configures the Redis backend.
@@ -170,6 +176,8 @@ func Open(ctx context.Context, opts ...RedisOpt) (*EQRedis, error) {
 		addr:        "localhost:6379",
 		gcInterval:  defaultGCInterval,
 		gcBatchSize: defaultGCBatchSize,
+
+		readinessInterval: DefaultReadinessInterval,
 	}
 	for _, opt := range opts {
 		opt(o)
@@ -222,6 +230,18 @@ func Open(ctx context.Context, opts ...RedisOpt) (*EQRedis, error) {
 		defer close(b.gcDone)
 		b.runGCLoop(gcCtx, o.gcInterval, o.gcBatchSize)
 	}()
+	// The readiness loop shares GC's lifetime. It needs to know who is
+	// waiting; a custom NotifyWaiter that cannot say leaves claim polling as the
+	// only wakeup for tasks that become ready over time.
+	if lc, ok := nw.(entroq.ListenerCounter); ok && o.readinessInterval > 0 {
+		readinessCtx, stop := context.WithCancel(context.Background())
+		b.stopReadiness = stop
+		b.readinessDone = make(chan struct{})
+		go func() {
+			defer close(b.readinessDone)
+			b.runReadinessLoop(readinessCtx, lc, o.readinessInterval)
+		}()
+	}
 	return b, nil
 }
 
@@ -230,6 +250,10 @@ func Open(ctx context.Context, opts ...RedisOpt) (*EQRedis, error) {
 func (e *EQRedis) Close() error {
 	e.stopGC()
 	<-e.gcDone
+	if e.stopReadiness != nil {
+		e.stopReadiness()
+		<-e.readinessDone
+	}
 	return e.client.Close()
 }
 

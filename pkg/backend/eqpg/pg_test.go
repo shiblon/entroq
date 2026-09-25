@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"slices"
 	"testing"
 	"time"
 
@@ -87,63 +86,9 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// TestNotifyReadyQueues directly invokes notify_ready_queues() and asserts
-// that it returns the expected queue when a task's arrival time has passed.
-// This pins the watermark logic in SQL independently of any polling fallback.
-func TestNotifyReadyQueues(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	backend, err := Open(ctx, pgHostPort,
-		WithDB("postgres"),
-		WithUsername("postgres"),
-		WithPassword("password"),
-		WithConnectAttempts(10))
-	if err != nil {
-		t.Fatalf("Open backend: %v", err)
-	}
-	defer backend.Close()
-
-	client, err := entroq.New(ctx, nil, entroq.WithBackend(backend))
-	if err != nil {
-		t.Fatalf("New client: %v", err)
-	}
-	defer client.Close()
-
-	queue := fmt.Sprintf("/test/notify-ready/%d", time.Now().UnixNano())
-	if _, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithArrivalTimeIn(500*time.Millisecond))); err != nil {
-		t.Fatalf("Insert delayed task: %v", err)
-	}
-
-	// Wait for the task to become ready.
-	time.Sleep(600 * time.Millisecond)
-
-	// Directly call notify_ready_queues with no minimum interval.
-	rows, err := backend.DB.QueryContext(ctx, "SELECT entroq.notify_ready_queues('0 seconds'::interval)")
-	if err != nil {
-		t.Fatalf("notify_ready_queues: %v", err)
-	}
-	defer rows.Close()
-
-	var notified []string
-	for rows.Next() {
-		var q string
-		if err := rows.Scan(&q); err != nil {
-			t.Fatalf("scan: %v", err)
-		}
-		notified = append(notified, q)
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("rows: %v", err)
-	}
-
-	if slices.Contains(notified, queue) {
-		return
-	}
-	t.Fatalf("notify_ready_queues did not return %q; got %v", queue, notified)
-}
-
-func TestReadinessTicker(t *testing.T) {
+// TestReadinessLoop checks that a claim blocked on a future task is woken by
+// the backend's readiness loop, well before the 30-second claim poll.
+func TestReadinessLoop(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -155,15 +100,14 @@ func TestReadinessTicker(t *testing.T) {
 
 	queue := fmt.Sprintf("/test/readiness/%d", time.Now().UnixNano())
 
-	// Insert a task that becomes ready in 2 seconds.
-	// The immediate trigger won't fire for this one.
+	// Arrive in the future so the insert itself wakes no one.
 	at := time.Now().Add(2 * time.Second)
 	if _, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithArrivalTime(at))); err != nil {
 		t.Fatalf("Failed to insert delayed task: %v", err)
 	}
 
-	// Claim should block until notified or timeout.
-	// We expect the ticker to fire around the 5s mark.
+	// The default readiness interval is 5s, so the claim should return within
+	// about 7s; the poll would take 30s.
 	claimCtx, claimCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer claimCancel()
 
@@ -175,40 +119,74 @@ func TestReadinessTicker(t *testing.T) {
 	t.Logf("Successfully claimed delayed task: %v", task.ID)
 }
 
-func TestReadinessTicker_LocalOnly(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+func TestReadinessFanout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-
-	// Create a client with Local-Only notifications. No LISTEN/NOTIFY.
+	const interval = 500 * time.Millisecond
 	client, err := entroq.New(ctx, Opener(pgHostPort,
 		WithDB("postgres"),
 		WithUsername("postgres"),
 		WithPassword("password"),
 		WithConnectAttempts(10),
-		WithHeartbeat(5*time.Second),
-		WithNoListen()))
+		WithReadinessInterval(interval)))
 	if err != nil {
-		t.Fatalf("Failed to create local-only client: %v", err)
+		t.Fatalf("Open client: %v", err)
 	}
 	defer client.Close()
+	eqtest.ReadinessFanout(interval)(ctx, t, client, fmt.Sprintf("/test/fanout/%d", time.Now().UnixNano()))
+}
 
-	queue := fmt.Sprintf("/test/readiness-local/%d", time.Now().UnixNano())
+// TestUpgradeDropsRetiredReadiness recreates the LISTEN/NOTIFY readiness
+// objects a 1.11.0 schema has, then reapplies the schema and checks that each
+// one is gone.
+func TestUpgradeDropsRetiredReadiness(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
-	// Insert a delayed task.
-	if _, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithArrivalTimeIn(2*time.Second))); err != nil {
-		t.Fatalf("Failed to insert delayed task: %v", err)
-	}
-
-	// Claim should block until notified by the ticker (since no PG notify is being listened to).
-	claimCtx, claimCancel := context.WithTimeout(ctx, 10*time.Second)
-	defer claimCancel()
-
-	task, err := client.Claim(claimCtx, entroq.From(queue), entroq.ClaimFor(time.Second))
+	backend, err := Open(ctx, pgHostPort,
+		WithDB("postgres"),
+		WithUsername("postgres"),
+		WithPassword("password"),
+		WithConnectAttempts(10))
 	if err != nil {
-		t.Fatalf("Failed to claim task: %v", err)
+		t.Fatalf("Open backend: %v", err)
+	}
+	defer backend.Close()
+	db := backend.DB
+
+	for _, stmt := range []string{
+		"CREATE INDEX IF NOT EXISTS byAt ON entroq.tasks (at, queue)",
+		"CREATE TABLE IF NOT EXISTS entroq.notification_state (id INTEGER PRIMARY KEY CHECK (id = 1), last_at TIMESTAMPTZ NOT NULL)",
+		"CREATE OR REPLACE FUNCTION entroq.channel_name(p_queue text) RETURNS text LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT 'q_' || p_queue $$",
+		"CREATE OR REPLACE FUNCTION entroq.notify_ready_queues(p_min_interval interval DEFAULT '0 seconds') RETURNS SETOF text LANGUAGE sql AS $$ SELECT ''::text WHERE false $$",
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("Recreate retired object: %v\n%s", err, stmt)
+		}
 	}
 
-	t.Logf("Successfully claimed delayed task: %v", task.ID)
+	if err := InitSchema(ctx, db); err != nil {
+		t.Fatalf("Reapply schema: %v", err)
+	}
+
+	checks := []struct {
+		name  string
+		query string
+	}{
+		{"byAt index", "SELECT count(*) FROM pg_indexes WHERE schemaname = 'entroq' AND indexname = 'byat'"},
+		{"notification_state table", "SELECT count(*) FROM pg_tables WHERE schemaname = 'entroq' AND tablename = 'notification_state'"},
+		{"channel_name function", "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'entroq' AND p.proname = 'channel_name'"},
+		{"notify_ready_queues function", "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'entroq' AND p.proname = 'notify_ready_queues'"},
+	}
+	for _, c := range checks {
+		var n int
+		if err := db.QueryRowContext(ctx, c.query).Scan(&n); err != nil {
+			t.Fatalf("Check %s: %v", c.name, err)
+		}
+		if n != 0 {
+			t.Errorf("%s still present after schema upgrade", c.name)
+		}
+	}
 }
 
 func pgClient(ctx context.Context) (client *entroq.EntroQ, err error) {
@@ -216,8 +194,7 @@ func pgClient(ctx context.Context) (client *entroq.EntroQ, err error) {
 		WithDB("postgres"),
 		WithUsername("postgres"),
 		WithPassword("password"),
-		WithConnectAttempts(10),
-		WithHeartbeat(5*time.Second)))
+		WithConnectAttempts(10)))
 }
 
 func Example() {
@@ -227,8 +204,7 @@ func Example() {
 		WithDB("postgres"),
 		WithUsername("postgres"),
 		WithPassword("password"),
-		WithConnectAttempts(2),
-		WithHeartbeat(5*time.Second)))
+		WithConnectAttempts(2)))
 	if err != nil {
 		log.Fatalf("Entroq init error: %v", err)
 	}

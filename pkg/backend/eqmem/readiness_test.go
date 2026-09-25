@@ -2,10 +2,12 @@ package eqmem
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/testing/eqtest"
 )
 
 func TestClaimUnblocksAtFutureArrival(t *testing.T) {
@@ -44,5 +46,51 @@ func TestClaimUnblocksAtFutureArrival(t *testing.T) {
 	}
 	if now := time.Now(); now.Before(arrival) {
 		t.Fatalf("claimed future task at %v before arrival %v", now, arrival)
+	}
+}
+
+func TestReadinessFanout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	const interval = 500 * time.Millisecond
+	client, err := entroq.New(ctx, Opener(WithReadinessInterval(interval)))
+	if err != nil {
+		t.Fatalf("open client: %v", err)
+	}
+	defer client.Close()
+	eqtest.ReadinessFanout(interval)(ctx, t, client, "/test/fanout")
+}
+
+func TestClaimHeapCountAvailable(t *testing.T) {
+	now := time.Now()
+	h := newClaimHeap()
+	// Interleave available (even) and future (odd) items so both kinds end up
+	// scattered through the heap.
+	for i := range 12 {
+		at := now.Add(-time.Duration(i) * time.Second)
+		if i%2 == 1 {
+			at = now.Add(time.Duration(i) * time.Second)
+		}
+		h.PushItem(newItem("q", fmt.Sprint(i), at))
+	}
+	var want int
+	for _, item := range h.Items() {
+		if !now.Before(item.at) {
+			want++
+		}
+	}
+
+	if got := h.CountAvailable(now, 100); got != want {
+		t.Errorf("CountAvailable(no cap): got %d, want %d", got, want)
+	}
+	if got := h.CountAvailable(now, 3); got != 3 {
+		t.Errorf("CountAvailable(cap 3): got %d, want 3", got)
+	}
+	if got := h.CountAvailable(now.Add(-time.Hour), 100); got != 0 {
+		t.Errorf("CountAvailable(before everything): got %d, want 0", got)
+	}
+	var empty *claimHeap
+	if got := empty.CountAvailable(now, 10); got != 0 {
+		t.Errorf("CountAvailable(nil heap): got %d, want 0", got)
 	}
 }

@@ -34,6 +34,8 @@ type options struct {
 	gcInterval  time.Duration
 	gcBatchSize int
 	busyTimeout time.Duration
+
+	readinessInterval time.Duration
 }
 
 // Option configures the SQLite backend.
@@ -58,8 +60,11 @@ type EQSQLite struct {
 	stopGC    context.CancelFunc
 	gcDone    chan struct{}
 	gcMetrics *gcmetrics.Metrics
-	claimDur  metric.Float64Histogram
-	modifyDur metric.Float64Histogram
+
+	stopReadiness context.CancelFunc
+	readinessDone chan struct{}
+	claimDur      metric.Float64Histogram
+	modifyDur     metric.Float64Histogram
 
 	closeOnce sync.Once
 	closeErr  error
@@ -83,6 +88,8 @@ func Open(ctx context.Context, path string, opts ...Option) (*EQSQLite, error) {
 		gcInterval:  defaultGCInterval,
 		gcBatchSize: defaultGCBatchSize,
 		busyTimeout: 5 * time.Second,
+
+		readinessInterval: DefaultReadinessInterval,
 	}
 	for _, opt := range opts {
 		opt(&o)
@@ -134,6 +141,18 @@ func Open(ctx context.Context, path string, opts ...Option) (*EQSQLite, error) {
 		defer close(b.gcDone)
 		b.runGCLoop(gcCtx, o.gcInterval, o.gcBatchSize)
 	}()
+	// Like GC, the readiness loop lives as long as the backend. It needs to
+	// know who is waiting; a custom NotifyWaiter that cannot say leaves claim
+	// polling as the only wakeup for tasks that become ready over time.
+	if lc, ok := nw.(entroq.ListenerCounter); ok && o.readinessInterval > 0 {
+		readinessCtx, stop := context.WithCancel(context.Background())
+		b.stopReadiness = stop
+		b.readinessDone = make(chan struct{})
+		go func() {
+			defer close(b.readinessDone)
+			b.runReadinessLoop(readinessCtx, lc, o.readinessInterval)
+		}()
+	}
 
 	return b, nil
 }
@@ -287,6 +306,10 @@ func (b *EQSQLite) Close() error {
 	b.closeOnce.Do(func() {
 		b.stopGC()
 		<-b.gcDone
+		if b.stopReadiness != nil {
+			b.stopReadiness()
+			<-b.readinessDone
+		}
 		if err := b.writeDB.Close(); err != nil {
 			b.closeErr = err
 		}

@@ -45,7 +45,7 @@ var SchemaSQL string
 //     1.7.0 is skipped because it named a queue-array-only schema on develop
 //     that lacked the 1.7.1 collation change.
 //   - Schemas predating 1.0 cannot be migrated; see UpgradeSchema.
-const SchemaVersion = "1.11.0"
+const SchemaVersion = "1.13.0"
 
 // InitSchema applies the full idempotent EntroQ DDL to db. Safe to run on an
 // already-initialized database.

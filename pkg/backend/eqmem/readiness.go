@@ -36,14 +36,31 @@ func (m *EQMem) runReadinessLoop(ctx context.Context, interval time.Duration) {
 }
 
 func (m *EQMem) notifyReadyQueues(now time.Time) {
+	// With waiter counts, check only waited queues and wake one waiter per
+	// available task. A notifier that cannot count waiters gets one wakeup per
+	// queue whose earliest task is available.
+	var listeners map[string]int
+	lc, counting := m.nw.(entroq.ListenerCounter)
+	if counting {
+		if listeners = lc.Listeners(); len(listeners) == 0 {
+			return
+		}
+	}
+
 	for _, ql := range m.snapshotQueueLocks() {
+		limit := 1
+		if counting {
+			if limit = listeners[ql.queue]; limit == 0 {
+				continue
+			}
+		}
 		ql.Lock()
-		ready := ql.heap.Len() > 0 && !now.Before(ql.heap.Top().at)
+		ready := ql.heap.CountAvailable(now, limit)
 		ql.Unlock()
 
 		// Notify after releasing the queue lock so a woken claimant can acquire
 		// it immediately.
-		if ready {
+		for range ready {
 			m.nw.Notify(ql.queue)
 		}
 	}

@@ -17,12 +17,9 @@
 // crash-looping; then with power restored and no other intervention,
 // everything just started moving again with no work lost or repeated.
 //
-// The PostgreSQL implementation is pure stored procedures and LISTEN/NOTIFY, so
-// if you want, you don't even need all of this. You can do everything with the
-// schema file and some scripting. No additional server protocols, just use
-// PostgreSQL native privileges and connections. Or you can use the nicer
-// client approaches here, with workers, etc. In any case, see the Python pg
-// client implementation for a thin wrapper around Postgres for inspiration.
+// The PostgreSQL implementation keeps its task and document logic in stored
+// procedures, served through the Go eqpg service, which owns the schema and is
+// the database's only client.
 //
 // Using the Go implementation opens up possibilities of, among other things, an
 // in-memory backend served via gRPC with queue-level authorization. To use
@@ -188,6 +185,16 @@ type Notifier interface {
 type NotifyWaiter interface {
 	Notifier
 	Waiter
+}
+
+// ListenerCounter is an optional capability of a NotifyWaiter: it reports
+// how many callers are currently waiting on each queue. A backend's readiness
+// loop uses it to check only queues someone is waiting on, and to notify once
+// per ready task up to the number waiting. subq.SubQ implements it; a backend
+// given a NotifyWaiter without it skips its readiness loop and relies on claim
+// polling.
+type ListenerCounter interface {
+	Listeners() map[string]int
 }
 
 // NotifyModified takes inserted and changed tasks and notifies once per unique queue/ID pair.

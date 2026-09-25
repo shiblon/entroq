@@ -144,7 +144,7 @@ func TestGCCollectOnce(t *testing.T) {
 	}
 	defer b.Close()
 
-	const p = "/test/collectonce"
+	p := "/test/collectonce/" + entroq.GenHex16()
 	past := time.Now().Add(-time.Hour)
 	future := time.Now().Add(time.Hour)
 	futureGC := fmt.Sprintf("%s/c/gc=%d", p, future.Unix())
@@ -159,6 +159,10 @@ func TestGCCollectOnce(t *testing.T) {
 		{"co_future", futureGC, past, false},         // activation in the future => not due
 		{"co_claimed", p + "/a/gc=0", future, false}, // arrival in the future => claimed-equivalent
 		{"co_plain", p + "/plain", past, false},      // not a gc= queue
+	}
+	// Task IDs are unique across queues; give this run's cases their own.
+	for i := range cases {
+		cases[i].id += "-" + entroq.GenHex16()
 	}
 	for _, c := range cases {
 		if _, err := client.Modify(ctx, entroq.InsertingInto(c.queue,

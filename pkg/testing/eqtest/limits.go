@@ -30,7 +30,7 @@ func LengthLimits(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 		claimant string // Modifying claimant, or the client default if empty.
 		ok       bool
 	}{
-		{"task id at limit", entroq.InsertingInto(queue, entroq.WithID(strings.Repeat("a", 64))), "", true},
+		{"task id at limit", entroq.InsertingInto(queue, entroq.WithID(uniqueTaskIDOfLen(64))), "", true},
 		{"task id over limit", entroq.InsertingInto(queue, entroq.WithID(wide(33))), "", false},
 		{"doc id at limit", entroq.PuttingDocInto(ns, entroq.WithIDKeys(strings.Repeat("a", 64), "k", "")), "", true},
 		{"doc id over limit", entroq.PuttingDocInto(ns, entroq.WithIDKeys(wide(33), "k", "")), "", false},

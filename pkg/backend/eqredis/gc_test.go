@@ -129,6 +129,10 @@ func TestGCCollectOnce(t *testing.T) {
 		{"co_claimed", p + "/a/gc=0", future, false}, // arrival in the future => claimed-equivalent
 		{"co_plain", p + "/plain", past, false},      // not a gc= queue
 	}
+	// Task IDs are unique across queues; give this run's cases their own.
+	for i := range cases {
+		cases[i].id += "-" + entroq.GenHex16()
+	}
 	for _, c := range cases {
 		if _, err := client.Modify(ctx, entroq.InsertingInto(c.queue,
 			entroq.WithID(c.id), entroq.WithArrivalTime(c.at), entroq.WithRawValue([]byte("{}")))); err != nil {

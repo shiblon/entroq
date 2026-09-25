@@ -20,7 +20,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"math/rand"
 	"net/url"
 	"strings"
@@ -58,7 +57,6 @@ type pgOptions struct {
 	sslMode           string
 	attempts          int
 	readinessInterval time.Duration
-	noListen          bool
 	initSchema        bool
 	nw                entroq.NotifyWaiter
 	mp                metric.MeterProvider
@@ -155,41 +153,6 @@ func WithNotifyWaiter(nw entroq.NotifyWaiter) PGOpt {
 	}
 }
 
-// WithHeartbeat, when given a non-zero interval, pings a stored prcedure that
-// triggers a notification for any queues containing recently-available tasks
-// due to the passage of time. This can trigger some duplicate notifications,
-// particularly for task modification, but these are generally harmless.
-//
-// In large clusters where multiple workers connect directly to postgres, it
-// can be best to minimize the number of workers that emit heartbeats. Note that this
-// does not work at all with connection pool proxies, so should be disabled by
-// setting interval = 0.
-func WithHeartbeat(interval time.Duration) PGOpt {
-	return func(opts *pgOptions) {
-		opts.readinessInterval = interval
-	}
-}
-
-// WithNoListen disables the dedicated PostgreSQL LISTEN connection.
-// This means that the only notifications received will be in-process. This
-// works very well for a singleton service that is basically the only thing
-// talking to the Postgres backend. No need for a network round trip.
-//
-// If, however, there are multiple things talking to a postgres backend, the
-// NOTIFY/LISTEN approach in postgres can notify all of them. WithNoListen turns
-// that off, so multiple clients of postgres can't wake up if another client
-// does something to a queue they are watching.
-//
-// The gist is that in single-server scenarios, where PostgreSQL is an
-// implementation detail behind an RPC service, you can use this to turn off
-// the listener. In situations where this is one of several clients of
-// PostgreSQL, leave it on.
-func WithNoListen() PGOpt {
-	return func(opts *pgOptions) {
-		opts.noListen = true
-	}
-}
-
 // WithMeterProvider sets the OTel MeterProvider for claim and modify duration
 // histograms. Defaults to a noop provider.
 func WithMeterProvider(mp metric.MeterProvider) PGOpt {
@@ -274,8 +237,7 @@ func defaultOptions(opts []PGOpt) *pgOptions {
 		password:          "password",
 		attempts:          1,
 		sslMode:           string(SSLDisable),
-		readinessInterval: 0, // 0 == no heartbeat
-		noListen:          false,
+		readinessInterval: DefaultReadinessInterval,
 		gcInterval:        defaultGCInterval,
 		gcBatchSize:       defaultGCBatchSize,
 	}
@@ -310,10 +272,6 @@ func OpenDB(target string, opts ...PGOpt) (*sql.DB, error) {
 // version; run "eqpg schema init" or "eqpg schema upgrade" first.
 func Open(ctx context.Context, target string, opts ...PGOpt) (*EQPG, error) {
 	options := defaultOptions(opts)
-	connStr, err := buildConnStr(target, options)
-	if err != nil {
-		return nil, err
-	}
 
 	db, err := OpenDB(target, opts...)
 	if err != nil {
@@ -321,13 +279,7 @@ func Open(ctx context.Context, target string, opts ...PGOpt) (*EQPG, error) {
 	}
 
 	if options.nw == nil {
-		if options.noListen {
-			// Don't rely on database notify/listen, use internal one instead.
-			options.nw = subq.New()
-		} else {
-			// Otherwise use the PG-aware mechanism.
-			options.nw = NewPGNotifyWaiter(connStr)
-		}
+		options.nw = subq.New()
 	}
 
 	for i := 0; i < options.attempts; i++ {
@@ -363,8 +315,8 @@ type EQPG struct {
 	DB *sql.DB
 	nw entroq.NotifyWaiter
 
-	stopTicker     func()
-	tickerDone     chan struct{}
+	stopReadiness  func()
+	readinessDone  chan struct{}
 	stopGC         func()
 	gcDone         chan struct{}
 	claimDuration  metric.Float64Histogram
@@ -414,18 +366,20 @@ func New(ctx context.Context, db *sql.DB, nw entroq.NotifyWaiter, opts *pgOption
 	// ctx. Its lifetime is the backend's, ended by Close; the constructor ctx
 	// scopes only construction, and callers idiomatically bound New with a timeout
 	// and defer cancel(), so deriving from ctx would silently stop the loop the
-	// instant New returned while the backend kept serving. (The notify listener in
-	// pgnotify.go follows the same rule.) Close cancels each loop and waits for it
-	// to exit before closing the DB, so it never touches a closed connection and
-	// never outlives the backend -- a lingering readiness ticker would keep
-	// mutating shared notification state.
-	if opts.readinessInterval > 0 {
-		tickerCtx, stop := context.WithCancel(context.Background())
-		b.stopTicker = stop
-		b.tickerDone = make(chan struct{})
+	// instant New returned while the backend kept serving. Close cancels each
+	// loop and waits for it to exit before closing the DB, so it never touches a
+	// closed connection and never outlives the backend.
+	//
+	// The readiness loop needs to know who is waiting; a NotifyWaiter that cannot
+	// say leaves claim polling as the only wakeup for tasks that become ready
+	// over time.
+	if lc, ok := b.nw.(entroq.ListenerCounter); ok && opts.readinessInterval > 0 {
+		readinessCtx, stop := context.WithCancel(context.Background())
+		b.stopReadiness = stop
+		b.readinessDone = make(chan struct{})
 		go func() {
-			defer close(b.tickerDone)
-			b.runReadinessTicker(tickerCtx, opts.readinessInterval)
+			defer close(b.readinessDone)
+			b.runReadinessLoop(readinessCtx, lc, opts.readinessInterval)
 		}()
 	}
 
@@ -467,9 +421,9 @@ func (b *EQPG) initMetrics(mp metric.MeterProvider) error {
 
 // Close closes the underlying database connection.
 func (b *EQPG) Close() error {
-	if b.stopTicker != nil {
-		b.stopTicker()
-		<-b.tickerDone // wait for the readiness loop to exit before closing the DB
+	if b.stopReadiness != nil {
+		b.stopReadiness()
+		<-b.readinessDone // wait for the readiness loop to exit before closing the DB
 	}
 	if b.stopGC != nil {
 		b.stopGC()
@@ -481,8 +435,6 @@ func (b *EQPG) Close() error {
 	return nil
 }
 
-// runReadinessTicker examines the task table to see what queues had tasks
-// become recently available to notify on them for the passage of time.
 // pgInterval formats a duration as a Postgres interval literal, split into
 // seconds and microseconds so that no single interval field integer exceeds
 // int32, which Postgres rejects with SQLSTATE 22015. A bare microseconds field
@@ -493,40 +445,6 @@ func pgInterval(d time.Duration) string {
 	secs := d / time.Second
 	usec := (d % time.Second) / time.Microsecond
 	return fmt.Sprintf("%d seconds %d microseconds", secs, usec)
-}
-
-func (b *EQPG) runReadinessTicker(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			// notify_ready_queues atomically updates its own watermark state.
-			// We use a safety interval of half the ticker interval to prevent
-			// accidental double-flushing if tickers drift.
-			rows, err := b.DB.QueryContext(ctx, "SELECT entroq.notify_ready_queues($1)", pgInterval(interval/2))
-			if err != nil {
-				log.Printf("pg readiness ticker: %v", err)
-				continue
-			}
-
-			// Bridge: Forward global ready-event to the local waiter.
-			for rows.Next() {
-				var q string
-				if err := rows.Scan(&q); err != nil {
-					log.Printf("pg readiness scan: %v", err)
-					continue
-				}
-				if b.nw != nil {
-					b.nw.Notify(q)
-				}
-			}
-			rows.Close()
-		}
-	}
 }
 
 // Queues returns the queues and their sizes.
