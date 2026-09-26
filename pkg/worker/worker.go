@@ -418,7 +418,24 @@ type Worker[T any] struct {
 	// handler state is isolated by construction.
 	makeHandler MakeHandler[T]
 	metrics     *workerMetrics
+
+	// Shutdown state, like http.Server's tracked connections: each Run joins
+	// runs under mu, so Shutdown can reach it, and none joins once closed is
+	// set, so wg.Add never races wg.Wait.
+	mu     sync.Mutex
+	closed bool
+	runs   map[*activeRun]struct{}
+	wg     sync.WaitGroup
 }
+
+// activeRun holds what Shutdown needs to stop one Run.
+type activeRun struct {
+	cancel      context.CancelFunc // ends the Run, canceling its handler
+	cancelClaim context.CancelFunc // ends its claim; nil when not claiming
+}
+
+// ErrShutdown is returned by Run on a worker that Shutdown has been called on.
+var ErrShutdown = errors.New("worker: shut down")
 
 // workerOpts holds built-up worker options to be later checked against as a
 // new worker is created.
@@ -453,6 +470,7 @@ func New[T any](eq *entroq.EntroQ, opts ...Option[T]) *Worker[T] {
 		eqc:         eq,
 		errQMap:     wOpts.errQMap,
 		makeHandler: wOpts.makeHandler,
+		runs:        make(map[*activeRun]struct{}),
 	}
 	if wOpts.mp != nil {
 		metrics, err := newWorkerMetrics(wOpts.mp)
@@ -729,7 +747,7 @@ func withRenewed(groups []*entroq.DocGroup, renewed []*entroq.Doc) []*entroq.Doc
 
 // runOne claims one task, unmarshals its value into T, runs the work function
 // with renewal, and applies any resulting modification.
-func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt, slot *workerSlot) error {
+func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, slot *workerSlot) error {
 	// Note: do NOT cancel rCtx from inside the work function. If rCtx is
 	// canceled while a renewal Modify is in flight over gRPC, the client sees
 	// context.Canceled but the server may have already committed the renewal.
@@ -739,7 +757,12 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt, slot *workerSlot) 
 
 	// Phase 1: Claim task and unmarshal its value.
 	slot.set(workerIdle)
-	task, err := w.eqc.Claim(rCtx, entroq.From(opts.qs...), entroq.ClaimFor(opts.lease))
+	claimCtx, endClaim, err := w.startClaim(rCtx, run)
+	if err != nil {
+		return err
+	}
+	task, err := w.eqc.Claim(claimCtx, entroq.From(opts.qs...), entroq.ClaimFor(opts.lease))
+	endClaim()
 	if err != nil {
 		return fmt.Errorf("worker (%q) claim: %w", opts.qs, err)
 	}
@@ -941,7 +964,8 @@ func isSentinelError(err error) bool {
 //     moved, a dependency was lost), a known state, so the task is left to be
 //     re-claimed on lease expiry and the loop continues. See OnDependency to
 //     inspect and redirect this case.
-//   - Context cancellation or timeout: a clean stop; Run returns nil.
+//   - Context cancellation or timeout: a clean stop; Run returns nil. Shutdown
+//     stops Run the same way, after its task is done.
 //   - Anything else: the worker exits. An unclassified error leaves the loop in an
 //     unknown state, and crashing for an orchestrator to restart is safer, and
 //     louder and thus more fixable, than continuing from state neither the author
@@ -959,16 +983,106 @@ func (w *Worker[T]) Run(ctx context.Context, opts ...RunOption) error {
 	if len(ro.qs) == 0 {
 		return fmt.Errorf("no queues specified to work on")
 	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	run := &activeRun{cancel: cancel}
+	if err := w.join(run); err != nil {
+		return err
+	}
+	defer w.leave(run)
+
 	slot := w.metrics.add()
 	defer slot.remove()
 	for {
-		if err := w.runOne(ctx, ro, slot); err != nil {
+		if err := w.runOne(ctx, run, ro, slot); err != nil {
+			if errors.Is(err, ErrShutdown) {
+				return nil
+			}
 			if entroq.IsCanceled(err) || entroq.IsTimeout(err) {
-				log.Printf("worker was asked to quit: %v", ctx.Err())
+				log.Printf("worker (%q) was asked to quit: %v", ro.qs, err)
 				return nil
 			}
 			return fmt.Errorf("worker (%q): %w", ro.qs, err)
 		}
+	}
+}
+
+// join registers run for Shutdown, or refuses once Shutdown has been called.
+func (w *Worker[T]) join(run *activeRun) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return ErrShutdown
+	}
+	w.runs[run] = struct{}{}
+	w.wg.Add(1)
+	return nil
+}
+
+// leave unregisters a finished run.
+func (w *Worker[T]) leave(run *activeRun) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	delete(w.runs, run)
+	w.wg.Done()
+}
+
+// startClaim returns a context for run's next claim that Shutdown can cancel,
+// and a function to call when the claim returns. Checking closed here, under
+// mu, means a claim either starts before Shutdown and is canceled by it, or
+// does not start at all. Shutdown cancels only the claim: a task it has
+// already returned is worked, as part of draining.
+func (w *Worker[T]) startClaim(ctx context.Context, run *activeRun) (context.Context, func(), error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return nil, nil, ErrShutdown
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	run.cancelClaim = cancel
+	return ctx, func() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		run.cancelClaim = nil
+		cancel()
+	}, nil
+}
+
+// Shutdown stops the worker gracefully, like http.Server.Shutdown: every Run
+// stops claiming at once, finishes the task it holds (renewing and committing
+// it as usual), and returns nil. Shutdown waits for all of them. If ctx ends
+// first, it cancels the handlers still running and returns ctx.Err() without
+// waiting further; their tasks are reclaimed when their leases expire.
+//
+// A claim canceled by Shutdown that the server had already granted cannot be
+// returned, so that task waits out its lease too. After Shutdown, Run returns
+// ErrShutdown.
+func (w *Worker[T]) Shutdown(ctx context.Context) error {
+	w.mu.Lock()
+	w.closed = true
+	for run := range w.runs {
+		if run.cancelClaim != nil {
+			run.cancelClaim()
+		}
+	}
+	w.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		w.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		w.mu.Lock()
+		for run := range w.runs {
+			run.cancel()
+		}
+		w.mu.Unlock()
+		return ctx.Err()
 	}
 }
 

@@ -45,6 +45,11 @@ runs, so plan a short maintenance window on large doc tables.
   task to the error queue without running the command. The default 0 means no
   maximum, matching `worker.WithMaxClaims`. Tasks the worker moves itself now
   honor `--error-queue` too.
+- **`worker.Shutdown`.** Stops a worker gracefully, like
+  `http.Server.Shutdown`: every `Run` stops claiming at once, finishes and
+  commits the task it holds, and returns nil. If Shutdown's context ends first,
+  it cancels the handlers still running and returns the context's error. `Run`
+  on a shut-down worker returns `worker.ErrShutdown`.
 
 ### Changed
 
