@@ -182,14 +182,14 @@ func TestClaim(t *testing.T) {
 	}
 }
 
-func TestEvaluateInsertIntoUnheldGroupLeavesLock(t *testing.T) {
+func TestEvaluateInsertIntoUnheldGroupMovesVersion(t *testing.T) {
 	s := newStore(Lock{})
 	p := s.evaluate("me", entroq.PuttingDocInto("ns", entroq.WithKeys("k", "c")))
 	if p.Err != nil {
 		t.Fatalf("Insert: %v", p.Err)
 	}
-	if len(p.Locks) != 0 {
-		t.Errorf("Insert into an unheld group: want no lock change, got %v", p.Locks)
+	if got := p.Locks[group]; got.Version != 6 || got.Claimant != "" {
+		t.Errorf("Insert into an unheld group: want version 6, unheld, got %+v", got)
 	}
 	// A change in the same modification still moves the version, once.
 	p = s.evaluate("me",
@@ -233,8 +233,8 @@ func TestExclusive(t *testing.T) {
 		doc("a", 5).Depend(),
 	)
 	got := Exclusive(mod, s.member)
-	if len(got) != 1 || !got[Group{Namespace: "ns", Key: "claimed"}] {
-		t.Errorf("Inserts and depends: want only the claiming insert's group exclusive, got %v", got)
+	if len(got) != 2 || !got[Group{Namespace: "ns", Key: "appended"}] || !got[Group{Namespace: "ns", Key: "claimed"}] || got[group] {
+		t.Errorf("Inserts and depends: want every insert's group exclusive and the depended-on one shared, got %v", got)
 	}
 	mod = entroq.NewModification("me", doc("a", 5).Change(entroq.WithContent("x")))
 	if got := Exclusive(mod, s.member); !got[group] {

@@ -283,12 +283,10 @@ func (e *EQRedis) readDocsWithLocks(ctx context.Context, rq *entroq.DocQuery, id
 // docs. It returns a DependencyError listing the members while someone else
 // holds the group.
 //
-// The claim is written before the members are read. Inserts into an unheld
-// group leave its lock alone, so a claim watching the lock could not see one
-// land between reading the members and claiming. Every insert watches the
-// lock instead: one that commits before the claim is in the members read
-// after it, and one that has not committed yet fails its watch when the claim
-// writes the lock, then retries and finds the group held.
+// The claim is written before the members are read. Every insert writes and
+// watches its group's lock: one that commits before the claim is in the
+// members read after it, and one that has not committed yet fails its watch
+// when the claim writes the lock, then retries and finds the group held.
 func (e *EQRedis) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) (*entroq.DocGroup, error) {
 	if err := validate.DocClaim(cq); err != nil {
 		return nil, fmt.Errorf("eqredis claim docs: %w", err)

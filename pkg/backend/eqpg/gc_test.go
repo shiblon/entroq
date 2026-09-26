@@ -201,9 +201,9 @@ func TestGCCollectOnce(t *testing.T) {
 }
 
 // TestCollectLocksSkipsGroupBeingInserted holds an insert into an empty,
-// unheld group open while lock collection runs. The insert leaves the lock
-// row unchanged, so only its shared lock on the row keeps collection from
-// deleting the lock of a group that is about to have a member.
+// unheld group open while lock collection runs. The insert's lock on the row
+// keeps collection from deleting the lock of a group that is about to have a
+// member.
 func TestCollectLocksSkipsGroupBeingInserted(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

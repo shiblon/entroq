@@ -8,12 +8,10 @@
 // that version, and while one claimant holds the group nobody else may write
 // to it.
 //
-// The version moves for exactly the writes that can falsify something a
-// reader saw at it. Inserting into an unheld group adds a member without
-// changing any other, so it leaves the version alone and inserts do not
-// contend with each other. A delete does move it, or deleting a member and
-// inserting another with the same ID would change content at one version.
-// Only a claim tells a reader the group's membership is complete.
+// Every write to a group moves its version, inserts included, so a version a
+// reader saw means the group, members and all, is as the reader saw it.
+// Concurrent writers of one group therefore contend; a workload with many
+// writers is better spread over several primary keys.
 package docgroup
 
 import (
@@ -39,13 +37,6 @@ type Lock struct {
 // write or claim moves it to version 0, so a new doc starts at version 0 as a
 // new task does. Backends return it for a group they have no lock for.
 var Absent = Lock{Version: -1}
-
-// New reports whether l is a group nothing has written or claimed yet. Only
-// the version tells: a backend that creates a lock row before deciding what
-// to write gives it a time.
-func (l Lock) New() bool {
-	return l.Version == Absent.Version
-}
 
 // Held reports whether anyone holds the lock at now.
 func (l Lock) Held(now time.Time) bool {
@@ -111,12 +102,7 @@ type Plan struct {
 // member's stored key, not the one in the request, decides its group. A change
 // or delete also fails while someone else holds the group, and so does an
 // insert, which checks no version. A depend only reads, so it neither checks
-// the claim nor writes the group.
-//
-// An insert writes its group only to create it, at version 0, to claim it by
-// carrying a future arrival time, or when mod.Claimant already holds it, whose
-// commit releases or renews the claim. Otherwise the group's lock is left as
-// it is.
+// the claim nor writes the group. Changes, deletes, and inserts write it.
 //
 // Each written group's version moves once. If any of its changes or inserts
 // carries a future arrival time, the group ends held by mod.Claimant until the
@@ -154,13 +140,12 @@ func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string
 			continue
 		}
 		g := Group{Namespace: ins.Namespace, Key: ins.Key}
-		switch l := lock(g); {
-		case claimed(g):
-			id.Version = l.Version
+		if claimed(g) {
+			id.Version = lock(g).Version
 			depErr.DocClaims = append(depErr.DocClaims, id)
-		case l.New() || l.Held(now) || ins.At.After(now):
-			write(g, ins.At)
+			continue
 		}
+		write(g, ins.At)
 	}
 	for _, chg := range mod.DocChanges {
 		id := entroq.NewDocID(chg.Namespace, chg.ID, chg.Version)
@@ -242,18 +227,13 @@ func Groups(mod *entroq.Modification, member func(ns, id string) *entroq.Doc) []
 }
 
 // Exclusive reports which of mod's groups a backend must lock exclusively
-// before calling Evaluate: those mod changes or deletes a member of, and those
-// an insert may claim by carrying an arrival time. mod only inserts into or
-// depends on the rest, so they may be locked shared: concurrent inserts can
-// proceed together, while a claim or lock collection waits for them. Evaluate
-// still writes a shared group when mod.Claimant holds it or it is new, so the
-// backend must be able to take it exclusively then.
+// before calling Evaluate: those it writes, by inserting into them or changing
+// or deleting a member. mod only depends on the rest, so they may be locked
+// shared, and since a depend names a stored member, they already exist.
 func Exclusive(mod *entroq.Modification, member func(ns, id string) *entroq.Doc) map[Group]bool {
 	exclusive := make(map[Group]bool)
 	for _, ins := range mod.DocInserts {
-		if !ins.At.IsZero() {
-			exclusive[Group{Namespace: ins.Namespace, Key: ins.Key}] = true
-		}
+		exclusive[Group{Namespace: ins.Namespace, Key: ins.Key}] = true
 	}
 	stored := func(ns, id string) {
 		if d := member(ns, id); d != nil {

@@ -56,16 +56,13 @@ runs, so plan a short maintenance window on large doc tables.
 - **Breaking: docs sharing a primary key are one unit.** A doc group, the docs
   sharing a primary key in a namespace, now has a single version, claimant, and
   arrival time, as a task does, and every member reports its group's. Claiming
-  the group, renewing it, and changing or deleting any member move that
-  version, so a read taken before any of them is stale, even for a member
-  nobody touched. Inserting into an unheld group does not move it: nothing
-  already read changes, and concurrent inserts into one group do not conflict.
-  Only a claim tells a reader that it has seen every member, so a group whose
-  membership decides what happens next (say, "all parts done") should be
-  written by one serialized party, not appended to by workers racing its
-  reader. While one claimant holds the group, nobody else may
-  insert, change, or delete in it; a depend still succeeds, since it only
-  reads. A writer acting as the holder (`entroq.ModifyAs`, as
+  the group, renewing it, and inserting, changing, or deleting any member move
+  that version, so a read taken before any of them is stale, even for a member
+  nobody touched, and a version a reader saw means the group, membership
+  included, is as it saw it. Concurrent writers of one group therefore take
+  turns; spread many writers over several primary keys. While one claimant
+  holds the group, nobody else may insert, change, or delete in it; a depend
+  still succeeds, since it only reads. A writer acting as the holder (`entroq.ModifyAs`, as
   `eqc mod --force` does) still may. The holder's commit releases the group
   unless it carries a future arrival time, which renews it. When one
   modification gives docs of a group different future arrival times, the

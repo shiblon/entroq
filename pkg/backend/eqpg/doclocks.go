@@ -69,31 +69,17 @@ func lockMembers(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (map
 
 // lockGroups locks the lock rows of groups and returns them with the
 // database's time. The lock row is the group's mutex for the length of the
-// transaction, apart from any claim on it: groups in exclusive are locked FOR
-// UPDATE, and the rest, which the modification only inserts into or depends
-// on, FOR SHARE, so concurrent inserts into one group proceed together while a
-// claim or lock collection waits for them (see docgroup.Exclusive).
+// transaction, apart from any claim on it: groups in exclusive, which the
+// modification writes, are locked FOR UPDATE, and the rest, which it only
+// depends on, FOR SHARE, so concurrent depends proceed together while a
+// writer waits for them (see docgroup.Exclusive).
 //
 // Rows are locked in (namespace, key) order, a run of same-mode groups per
-// statement, so modifications locking the same groups cannot deadlock, with
-// two exceptions left to PostgreSQL's deadlock detector, which aborts one
-// transaction for modifyHandlingRetriable to retry:
+// statement, so modifications locking the same groups cannot deadlock.
 //
-//   - A shared group that turns out to be held by the modification's
-//     claimant is written when the holder commits, upgrading its lock. Two
-//     concurrent modifications by one holder inserting into its own group
-//     can each wait for the other's share. Modifications belong in a
-//     worker's finalization, not in concurrent goroutines, so this is rare;
-//     after the retry the group is released and the insert is a plain
-//     shared one. Choosing the mode from an unlocked read of the claim
-//     would avoid it, but only by acting on a check another transaction
-//     can invalidate.
-//   - A shared group that has no row yet is created after the existing ones
-//     are locked, out of order, and so can wait on another transaction
-//     creating it too.
-//
-// A group with no lock row gets one at docgroup.Absent's version; if the
-// modification fails, the row rolls back with it.
+// A written group with no lock row gets one at docgroup.Absent's version; if
+// the modification fails, the row rolls back with it. A shared group always
+// has one, as a depend names a stored member.
 func lockGroups(ctx context.Context, tx *sql.Tx, groups []docgroup.Group, exclusive map[docgroup.Group]bool) (map[docgroup.Group]docgroup.Lock, time.Time, error) {
 	locks := make(map[docgroup.Group]docgroup.Lock, len(groups))
 	if len(groups) == 0 {
@@ -138,51 +124,21 @@ func upsertGroups(ctx context.Context, tx *sql.Tx, groups []docgroup.Group, lock
 	return scanLocks(rows, locks)
 }
 
-// shareGroups locks the lock rows of groups FOR SHARE. A missing row is
-// created, which holds it exclusively, as creating a group is a write. A row
-// another transaction creates meanwhile is invisible to the first read and
-// skipped by the insert, so the next pass locks it.
+// shareGroups locks the lock rows of groups FOR SHARE. They exist, as each
+// holds a member the modification depends on; one that a concurrent delete
+// has emptied and collection removed is simply absent, and the depend on its
+// member then fails.
 func shareGroups(ctx context.Context, tx *sql.Tx, groups []docgroup.Group, locks map[docgroup.Group]docgroup.Lock) (time.Time, error) {
-	var now time.Time
-	for len(groups) > 0 {
-		ns, keys := groupArrays(groups)
-		rows, err := tx.QueryContext(ctx, `SELECT namespace, key_primary, version, claimant, at, now()
-			FROM entroq.doc_locks
-			WHERE (namespace, key_primary) IN (SELECT * FROM unnest($1::text[], $2::text[]))
-			ORDER BY namespace, key_primary
-			FOR SHARE`, pq.Array(ns), pq.Array(keys))
-		if err != nil {
-			return time.Time{}, fmt.Errorf("share doc groups: %w", err)
-		}
-		if now, err = scanLocks(rows, locks); err != nil {
-			return time.Time{}, err
-		}
-		if groups = missingGroups(groups, locks); len(groups) == 0 {
-			break
-		}
-		ns, keys = groupArrays(groups)
-		if rows, err = tx.QueryContext(ctx, `INSERT INTO entroq.doc_locks (namespace, key_primary, version, claimant, at)
-			SELECT n, k, $3, '', now() FROM unnest($1::text[], $2::text[]) AS g(n, k)
-			ORDER BY n, k
-			ON CONFLICT (namespace, key_primary) DO NOTHING
-			RETURNING namespace, key_primary, version, claimant, at, now()`,
-			pq.Array(ns), pq.Array(keys), docgroup.Absent.Version); err != nil {
-			return time.Time{}, fmt.Errorf("create doc groups: %w", err)
-		}
-		if now, err = scanLocks(rows, locks); err != nil {
-			return time.Time{}, err
-		}
-		groups = missingGroups(groups, locks)
+	ns, keys := groupArrays(groups)
+	rows, err := tx.QueryContext(ctx, `SELECT namespace, key_primary, version, claimant, at, now()
+		FROM entroq.doc_locks
+		WHERE (namespace, key_primary) IN (SELECT * FROM unnest($1::text[], $2::text[]))
+		ORDER BY namespace, key_primary
+		FOR SHARE`, pq.Array(ns), pq.Array(keys))
+	if err != nil {
+		return time.Time{}, fmt.Errorf("share doc groups: %w", err)
 	}
-	return now, nil
-}
-
-// missingGroups returns the groups not yet in locks.
-func missingGroups(groups []docgroup.Group, locks map[docgroup.Group]docgroup.Lock) []docgroup.Group {
-	return slices.DeleteFunc(groups, func(g docgroup.Group) bool {
-		_, ok := locks[g]
-		return ok
-	})
+	return scanLocks(rows, locks)
 }
 
 // groupArrays splits groups into parallel namespace and key arrays.
@@ -285,9 +241,9 @@ func modifyDocs(ctx context.Context, tx *sql.Tx, mod *entroq.Modification, resp 
 // conflict.
 //
 // An insert can still collide with a doc another transaction inserted after
-// lockMembers found none: inserts into a group share its lock, so nothing
-// orders them. The collision is a dependency error, as if lockMembers had seen
-// the doc, and the caller rolls back.
+// lockMembers found none, as members are read before their groups are locked.
+// The collision is a dependency error, as if lockMembers had seen the doc, and
+// the caller rolls back.
 func writeDocGroups(ctx context.Context, tx *sql.Tx, deletes []*entroq.DocID, inserts, changes []*entroq.Doc, locks map[docgroup.Group]docgroup.Lock, now time.Time) error {
 	delNS, delIDs, _ := resourceIDArrays(deletes)
 	args := []any{pq.Array(delNS), pq.Array(delIDs)}
@@ -429,12 +385,10 @@ func claimDocs(ctx context.Context, tx *sql.Tx, cq *entroq.DocClaim) (*entroq.Do
 // collectLocksOnce removes the locks of up to batch groups that have no docs
 // and are not held, so claimed-then-abandoned groups do not accumulate.
 //
-// Inserts into an unheld group leave its lock unchanged, so nothing on the
-// lock row shows a concurrent insert. Instead collection locks the rows FOR
-// UPDATE, skipping any an insert holds shared, and only then, in a statement
-// that sees every insert committed before the lock, checks the groups are
-// still empty. An insert that arrives later waits, then finds the row gone
-// and creates the group anew.
+// Collection locks the rows FOR UPDATE, skipping any a writer holds, and only
+// then, in a statement that sees every insert committed before the lock,
+// checks the groups are still empty. An insert that arrives later waits, then
+// finds the row gone and creates the group anew.
 func (b *EQPG) collectLocksOnce(ctx context.Context, batch int) (n int, err error) {
 	tx, err := b.DB.BeginTx(ctx, nil)
 	if err != nil {

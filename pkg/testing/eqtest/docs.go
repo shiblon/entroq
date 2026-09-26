@@ -1007,7 +1007,7 @@ func DocGroups(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix
 		}
 	})
 
-	t.Run("inserts into an unheld group leave its version", func(t *testing.T) {
+	t.Run("an insert into an unheld group moves its version", func(t *testing.T) {
 		before := readGroup("g")
 		if _, err := client.Modify(ctx, entroq.PuttingDocInto(ns, entroq.WithKeys("g", "appended")), entroq.ModifyAs(intruder)); err != nil {
 			t.Fatalf("Insert: %v", err)
@@ -1017,20 +1017,13 @@ func DocGroups(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix
 			t.Fatalf("Group has %d members after an insert, want %d", len(after), len(before)+1)
 		}
 		for _, d := range after {
-			if d.Version != before[0].Version {
-				t.Errorf("Member %q at version %d after an insert, want %d", d.ID, d.Version, before[0].Version)
+			if d.Version != before[0].Version+1 {
+				t.Errorf("Member %q at version %d after an insert, want %d", d.ID, d.Version, before[0].Version+1)
 			}
 		}
-		// Nothing read before the insert changed, so a depend on it holds.
-		if _, err := client.Modify(ctx, before[0].Depend()); err != nil {
-			t.Errorf("Depend on a read taken before an insert: %v", err)
-		}
-		// A delete can falsify what was read, so it moves the version.
-		if _, err := client.Modify(ctx, before[0].Delete()); err != nil {
-			t.Fatalf("Delete: %v", err)
-		}
-		if _, err := client.Modify(ctx, before[1].Depend()); !entroq.IsDependency(err) {
-			t.Errorf("Depend on a read taken before a delete: want a dependency error, got %v", err)
+		// The membership read before the insert is stale, so a depend on it fails.
+		if _, err := client.Modify(ctx, before[0].Depend()); !entroq.IsDependency(err) {
+			t.Errorf("Depend on a read taken before an insert: want a dependency error, got %v", err)
 		}
 	})
 
@@ -1093,8 +1086,8 @@ func DocGroups(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix
 		if got := resp.ChangedDocs[0]; got.Version != held[0].Version+1 || got.Claimant != "" {
 			t.Errorf("Held group after the holder's commit: want released at version %d, got %+v", held[0].Version+1, got)
 		}
-		if got := resp.InsertedDocs[0].Version; got != side.Version {
-			t.Errorf("Unheld group moved to version %d on an insert, want %d", got, side.Version)
+		if got := resp.InsertedDocs[0].Version; got != side.Version+1 {
+			t.Errorf("Unheld group at version %d after an insert, want %d", got, side.Version+1)
 		}
 	})
 
@@ -1165,4 +1158,5 @@ func DocGroups(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix
 			t.Errorf("Inserts of one ID: %d succeeded, want 1", won)
 		}
 	})
+
 }

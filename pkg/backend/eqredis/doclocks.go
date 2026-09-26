@@ -230,10 +230,8 @@ func migrateDocFields(ctx context.Context, client *redis.Client) error {
 }
 
 // collectLockScript deletes a doc group's lock if the group is unheld and has
-// no docs. Inserts into an unheld group leave its lock alone, so a WATCH on the
-// lock could not see one land between checking for docs and deleting; the
-// script does both atomically. An insert already watching the lock fails its
-// watch when the lock goes, and retries against a new group.
+// no docs, checking and deleting atomically. An insert already watching the
+// lock fails its watch when the lock goes, and retries against a new group.
 //
 //	KEYS[1]=lock hash  KEYS[2]=namespace doc index  KEYS[3]=lock index set
 //	KEYS[4]=held groups ZSET
