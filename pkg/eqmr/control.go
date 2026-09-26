@@ -137,7 +137,7 @@ func (c *Controller) pendingReduceTasks(parts int) []entroq.ModifyArg {
 	args := make([]entroq.ModifyArg, 0, parts)
 	for p := range parts {
 		args = append(args, entroq.InsertingInto(c.ReduceQ(), entroq.WithValue(reduceClaim{
-			Doc:       docRef{NS: c.DocNS(), Key: mapOutDocKey(p)},
+			Doc:       docRef{NS: c.DocNS(), Key: mapOutPartition(p)},
 			Partition: p,
 		})))
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/shiblon/entroq"
@@ -19,7 +20,8 @@ type keyValues struct {
 	Values []string `json:"values"`
 }
 
-// reduceClaim is the value of a reduce task: one partition of the shuffle.
+// reduceClaim is the value of a reduce task: one partition of the shuffle. Its
+// Doc names the key prefix the partition's map outputs are under.
 type reduceClaim struct {
 	Doc       docRef `json:"doc"`
 	Partition int    `json:"partition"`
@@ -255,11 +257,11 @@ func (c *Controller) MapperWorker(mapFn Mapper, opts ...MapperOption) *worker.Wo
 					continue
 				}
 				modArgs = append(modArgs, entroq.PuttingDocInto(c.DocNS(),
-					// No secondary key. A reducer takes a whole partition in
-					// one ClaimDocs, the merge is order-independent, and the
-					// reducer sorts values itself, so nothing here needs the
-					// intra-group ordering a secondary key provides.
-					entroq.WithKeys(mapOutDocKey(p), ""),
+					// No secondary key. The doc is alone in its group, the
+					// merge is order-independent, and the reducer sorts values
+					// itself, so nothing here needs the ordering a secondary
+					// key provides.
+					entroq.WithKeys(mapOutDocKey(p, ref.Key), ""),
 					entroq.WithContent(entries),
 				))
 			}
@@ -356,8 +358,8 @@ func sortValues(vals []string) { sort.Strings(vals) }
 
 // ReducerWorker returns a worker that consumes one reduce partition per task.
 //
-// It claims every map-output doc sharing the partition's primary key in a single
-// ClaimDocs, merges those sorted runs, runs reduceFn once per distinct key, and
+// It reads every map-output doc under the partition's key prefix, merges those
+// sorted runs, runs reduceFn once per distinct key, and
 // commits the map output deletions together with the partition's result doc. As in
 // the map phase, that atomicity is what makes "no map-output docs remain" a sound
 // barrier.
@@ -368,7 +370,17 @@ func (c *Controller) ReducerWorker(reduceFn Reducer) *worker.Worker[reduceClaim]
 			// Read the partition's map outputs WITHOUT claiming them, for the same
 			// reason the mapper does: a claim would block a duplicate worker
 			// rather than race it. Exclusion is at commit time.
-			docs, err := c.client.Docs(ctx, rc.Doc.asQuery())
+			if !strings.HasSuffix(rc.Doc.Key, "/") {
+				// A run started by an older eqmr keyed a partition's outputs
+				// exactly; reading them as a range would find none and record
+				// an empty result. Fail the run instead.
+				return nil, worker.MoveErrorf("reduce task names %q, not a partition prefix: finish runs before upgrading eqmr", rc.Doc.Key)
+			}
+			docs, err := c.client.Docs(ctx, &entroq.DocQuery{
+				Namespace: rc.Doc.NS,
+				KeyStart:  rc.Doc.Key,
+				KeyEnd:    prefixEnd(rc.Doc.Key),
+			})
 			if err != nil {
 				return nil, fmt.Errorf("read map outputs %q: %w", rc.Doc.Key, err)
 			}

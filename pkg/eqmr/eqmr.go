@@ -63,7 +63,7 @@
 // invalid UTF-8. ValidateText states the rule, and Setup and every emit apply
 // it, so a violation fails where it was produced. Encode binary keys in the job
 // that needs them. Document keys are readable text: "split/000007",
-// "mapout/000003", "result/000003".
+// "mapout/000003/000007", "result/000003".
 package eqmr
 
 import (
@@ -356,8 +356,18 @@ func (c *Controller) errQMap(string) string { return c.ErrQ() }
 // Doc key layout. These are readable on purpose: they are what shows up in psql
 // and in `eqc` output when a run needs debugging.
 func splitDocKey(n int) string  { return fmt.Sprintf("split/%06d", n) }
-func mapOutDocKey(p int) string { return fmt.Sprintf("mapout/%06d", p) }
 func resultDocKey(p int) string { return fmt.Sprintf("result/%06d", p) }
+
+// mapOutDocKey is the primary key of one split's output for partition p. Each
+// split's output has a key of its own, so concurrent mappers write distinct
+// doc groups and never contend; a reducer reads the partition as the range
+// under mapOutPartition.
+func mapOutDocKey(p int, split string) string {
+	return mapOutPartition(p) + strings.TrimPrefix(split, splitPrefix)
+}
+
+// mapOutPartition is the key prefix of partition p's map outputs.
+func mapOutPartition(p int) string { return fmt.Sprintf("mapout/%06d/", p) }
 
 // resultDocID is a deterministic document id for a partition's output.
 //

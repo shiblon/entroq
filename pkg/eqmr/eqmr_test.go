@@ -566,3 +566,40 @@ func TestMaxClaimsDefault(t *testing.T) {
 		t.Errorf("WithConfig did not compose: %+v", got)
 	}
 }
+
+// TestReducerRefusesExactPartitionKey: a reduce task from a run an older eqmr
+// started names its partition's outputs by an exact key. Reading that as a
+// range would find none and record an empty result, so the reducer
+// quarantines the task instead, failing the run.
+func TestReducerRefusesExactPartitionKey(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	eq := newClient(ctx, t)
+	ctrl, err := eqmr.New(eq, testPrefix(), testOpts(1, 1)...)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	old := fmt.Sprintf(`{"doc":{"ns":%q,"key":"mapout/000000"},"partition":0}`, ctrl.DocNS())
+	if _, err := eq.Modify(ctx, entroq.InsertingInto(ctrl.ReduceQ(), entroq.WithRawValue([]byte(old)))); err != nil {
+		t.Fatalf("insert reduce task: %v", err)
+	}
+
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go ctrl.ReducerWorker(eqmr.SumReducer).Run(runCtx, worker.Watching(ctrl.ReduceQ()))
+
+	for {
+		quarantined, err := eq.Tasks(ctx, ctrl.ErrQ())
+		if err != nil {
+			t.Fatalf("tasks: %v", err)
+		}
+		if len(quarantined) == 1 {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("the old-format reduce task was never quarantined")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}

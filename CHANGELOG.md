@@ -53,6 +53,15 @@ runs, so plan a short maintenance window on large doc tables.
 
 ### Changed
 
+- **eqmr map outputs have a primary key per split.** A mapper writes each
+  partition's output under `mapout/<partition>/<split>` instead of sharing
+  `mapout/<partition>` with every other mapper, so concurrent mappers write
+  distinct doc groups and do not contend now that every insert moves its
+  group's version. A reducer reads its partition as the range under
+  `mapout/<partition>/`. Finish runs before upgrading: a reducer given a task
+  from a run an older eqmr started quarantines it, failing the run, rather
+  than record an empty result.
+
 - **Breaking: docs sharing a primary key are one unit.** A doc group, the docs
   sharing a primary key in a namespace, now has a single version, claimant, and
   arrival time, as a task does, and every member reports its group's. Claiming

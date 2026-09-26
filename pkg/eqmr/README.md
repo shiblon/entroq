@@ -20,7 +20,7 @@ each role scales independently:
               |  (scale N)    |      | (scale to R)  |       | (scale 1..k)  |
               +---------------+      +---------------+       +---------------+
                       |                      |                       |
-   docs:  split/NNNNNN  ->  mapout/NNNNNN  ->  result/NNNNNN
+   docs:  split/NNNNNN  ->  mapout/PPPPPP/NNNNNN  ->  result/PPPPPP
 ```
 
 One process does `Setup` to write the splits and create the control task. After
@@ -73,16 +73,17 @@ and a worker that dies mid-task simply loses its claim.
 
 Mappers assign each intermediate key to one of the run's reduce partitions
 by `ShardForKey`, and write one map-output doc per non-empty partition, keyed
-`mapout/<partition>`. A reducer claims a whole partition in one `ClaimDocs`,
-merges the per-split sorted runs, and reduces each key once.
+`mapout/<partition>/<split>`. Every split's output has a primary key of its own,
+so concurrent mappers write distinct doc groups and never contend: every write
+to a group moves its version, so mappers sharing one group per partition would
+take turns on it. A reducer reads the whole partition, the key range under
+`mapout/<partition>/`, merges the per-split sorted runs, and reduces each key
+once.
 
-Map-output docs carry **no secondary key**, on purpose. A secondary key keeps subsets
-of a primary-key group located together; it does not define the group. Here the
-group is the whole partition, taken in one `ClaimDocs`, and it has no subset that
-needs co-locating: the merge is order-independent and the reducer sorts values
-itself. The field is left free rather than filled with something nothing reads,
-so a later job-specific use (MapReduce's classic one being secondary sort) still
-has it.
+Map-output docs carry **no secondary key**, on purpose. Each is alone in its
+group, the merge is order-independent, and the reducer sorts values itself. The
+field is left free rather than filled with something nothing reads, so a later
+job-specific use (MapReduce's classic one being secondary sort) still has it.
 
 That makes reduce work proportional to the partition count, not to the number of
 distinct keys.
@@ -226,14 +227,12 @@ wrong for intermediates.
   limit (10MB by default for the gRPC service).
 - A reducer holds an entire partition in memory. **`ReduceShards` is the knob
   for this**: more partitions means smaller ones. A merger worker would not
-  help, because `ClaimDocs` returns document content and `DocClaim` has no
-  `OmitValues`, so claiming a partition materializes all of it either way.
+  help, because the reducer reads every map-output doc's content either way.
 - The `Combiner` runs only within a split. Values for one key emitted by
   different splits accumulate untouched until the reducer. A merger worker that
   combined map-output documents across splits, concurrently with the map phase, would
   close that gap and cut intermediate volume; it is worth doing for throughput
-  and map output size, but not as a memory bound. Inserting a new map output into a
-  partition whose documents are claimed does work (doc inserts use generated
-  IDs, and only an explicit-ID collision is rejected), so such a merger can run
-  alongside mappers safely.
+  and map output size, but not as a memory bound. Each map output has its own
+  primary key, so a merger that claims the ones it combines never blocks a
+  mapper writing another, and can run alongside mappers safely.
 - `Setup` is not idempotent; use a fresh `Prefix` per run.
