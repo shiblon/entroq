@@ -939,8 +939,8 @@ func (s *QSvc) ClaimDocs(ctx context.Context, req *pb.ClaimDocsRequest) (*pb.Cla
 		}
 		return nil, autoCodeErrorf("claim docs: %w", err)
 	}
-	resp := new(pb.ClaimDocsResponse)
-	for _, d := range claimed {
+	resp := &pb.ClaimDocsResponse{Group: pbconv.DocGroupToProto(claimed)}
+	for _, d := range claimed.Docs {
 		pd, err := pbconv.DocToProto(d)
 		if err != nil {
 			return nil, autoCodeErrorf("claim docs doc proto: %w", err)

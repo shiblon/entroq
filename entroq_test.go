@@ -394,12 +394,12 @@ func Example_docAtomicTaskCommit() {
 		log.Fatalf("claim task: %v", err)
 	}
 
-	// Claim the state doc for exclusive modification.
+	// Claim the state doc's group for exclusive modification.
 	claimed, err := eq.ClaimDocs(ctx, entroq.ClaimKey("state", stateDoc.Key).For(5*time.Second))
 	if err != nil {
 		log.Fatalf("claim doc: %v", err)
 	}
-	counter := claimed[0]
+	counter := claimed.Docs[0]
 
 	var count int
 	if err := json.Unmarshal(counter.Content, &count); err != nil {
@@ -440,9 +440,10 @@ func Example_docAtomicTaskCommit() {
 }
 
 // Example_docClaimContention demonstrates the all-or-nothing locking behavior
-// of ClaimDocs. All docs sharing a primary key are claimed together; a second
-// claimant attempting the same key while the lock is held gets a DependencyError.
-// A key that does not exist returns an empty slice rather than an error.
+// of ClaimDocs. All docs sharing a primary key are claimed together, as one
+// group; a second claimant attempting the same key while the group is held
+// gets a DependencyError. A key with no docs is an empty group: claiming it
+// succeeds and holds it, with no docs.
 func Example_docClaimContention() {
 	ctx := context.Background()
 	eq, err := entroq.New(ctx, eqmem.Opener())
@@ -454,12 +455,12 @@ func Example_docClaimContention() {
 	const ns = "locks"
 	const key = "resource"
 
-	// A missing key returns an empty slice, not an error.
+	// A key with no docs is an empty group, claimed like any other.
 	empty, err := eq.ClaimDocs(ctx, entroq.ClaimKey(ns, "no-such-key").For(time.Second))
 	if err != nil {
-		log.Fatalf("missing-key claim: %v", err)
+		log.Fatalf("empty group claim: %v", err)
 	}
-	fmt.Printf("missing key: %d docs\n", len(empty))
+	fmt.Printf("empty group: %d docs\n", len(empty.Docs))
 
 	// Create two docs sharing the same primary key.
 	if _, err := eq.Modify(ctx,
@@ -470,11 +471,11 @@ func Example_docClaimContention() {
 	}
 
 	// First claimant acquires both docs atomically.
-	docs, err := eq.ClaimDocs(ctx, entroq.ClaimKey(ns, key))
+	group, err := eq.ClaimDocs(ctx, entroq.ClaimKey(ns, key))
 	if err != nil {
 		log.Fatalf("first claim: %v", err)
 	}
-	fmt.Printf("first claim: %d docs\n", len(docs))
+	fmt.Printf("first claim: %d docs\n", len(group.Docs))
 
 	// A second claimant is blocked while the first holds the lock.
 	// The lock expires automatically after Duration; use doc.Change() to
@@ -488,7 +489,7 @@ func Example_docClaimContention() {
 	fmt.Printf("contention: IsDependency=%v\n", entroq.IsDependency(err))
 
 	// Output:
-	// missing key: 0 docs
+	// empty group: 0 docs
 	// first claim: 2 docs
 	// contention: IsDependency=true
 }

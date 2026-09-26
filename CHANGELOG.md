@@ -113,6 +113,16 @@ runs, so plan a short maintenance window on large doc tables.
   receive default, so a response the server was configured to send (up to
   `--max_size_mb`, default 10MB), such as a large task listing, failed on the
   client. The server's limit now governs; `eqgrpc.WithMaxSize` still sets one.
+- **Breaking (Go): `ClaimDocs` returns the group it claimed.**
+  `EntroQ.ClaimDocs` and `Backend.ClaimDocs` return a `*entroq.DocGroup`: the
+  group's namespace, key, version, claimant, and arrival time, with its
+  members in `Docs`. A group claimed with no docs still reports its version
+  and claim, which a list of members could not. On the wire,
+  `ClaimDocsResponse` gains a `group` field beside its docs, so older clients
+  keep reading the members as before; the Go client rebuilds the group from
+  the members when a server older than this one sends none. Replace
+  `docs, err := eq.ClaimDocs(...)` with `group, err := ...` and read
+  `group.Docs`.
 - **Schemas carry a digest, and unreleased ones a `-dev` version.**
   `eqpg.InitSchema` records `eqpg.SchemaDigest`, the SHA-256 of the schema it
   applies, and `eqpg.Open` refuses a database at the right version whose

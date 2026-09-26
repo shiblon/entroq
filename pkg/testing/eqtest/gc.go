@@ -63,12 +63,12 @@ func GCDocGroups(ctx context.Context, t *testing.T, backend entroq.Backend, coll
 	)); err != nil {
 		t.Fatalf("GCDocGroups: insert: %v", err)
 	}
-	claimed, err := backend.ClaimDocs(ctx, &entroq.DocClaim{
+	claimed, err := docsOf(backend.ClaimDocs(ctx, &entroq.DocClaim{
 		Namespace: ns,
 		Key:       claimedKey,
 		Claimant:  "doc-gc-test",
 		Duration:  time.Hour,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("GCDocGroups: claim: %v", err)
 	}

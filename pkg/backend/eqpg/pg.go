@@ -1084,7 +1084,7 @@ func (b *EQPG) Docs(ctx context.Context, rq *entroq.DocQuery) (_ []*entroq.Doc, 
 // namespace and returns its members, which may be none: a group can be claimed
 // before it has docs. It returns a DependencyError listing the members while
 // someone else holds the group.
-func (b *EQPG) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) (docs []*entroq.Doc, err error) {
+func (b *EQPG) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) (group *entroq.DocGroup, err error) {
 	defer func() { err = interrupted(ctx, err) }()
 	if err := validate.DocClaim(cq); err != nil {
 		return nil, fmt.Errorf("claim docs: %w", err)
@@ -1099,7 +1099,7 @@ func (b *EQPG) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) (docs []*entr
 			return
 		}
 		if cmErr := tx.Commit(); cmErr != nil {
-			docs, err = nil, fmt.Errorf("pg claim docs commit: %w", cmErr)
+			group, err = nil, fmt.Errorf("pg claim docs commit: %w", cmErr)
 		}
 	}()
 	return claimDocs(ctx, tx, cq)

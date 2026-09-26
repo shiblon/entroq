@@ -668,14 +668,14 @@ func acquireDocs[T any](ctx context.Context, eqc *entroq.EntroQ, task *entroq.Ta
 
 	for _, cq := range req {
 		cq.Duration = lease
-		results, err := eqc.ClaimDocs(ctx, cq)
+		group, err := eqc.ClaimDocs(ctx, cq)
 		if err != nil {
 			return nil, nil, err // caller inspects DependencyError
 		}
-		if len(results) == 0 {
+		if len(group.Docs) == 0 {
 			empty = append(empty, cq)
 		}
-		docs = append(docs, results...)
+		docs = append(docs, group.Docs...)
 	}
 	return docs, empty, nil
 }

@@ -754,10 +754,11 @@ func TestEQMemJournalDocClaim(t *testing.T) {
 	); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
-	held, err := eq.ClaimDocs(ctx, entroq.ClaimKey(namespace, "g").For(time.Hour))
-	if err != nil || len(held) != 2 {
-		t.Fatalf("Claim: %v, %d docs", err, len(held))
+	group, err := eq.ClaimDocs(ctx, entroq.ClaimKey(namespace, "g").For(time.Hour))
+	if err != nil || len(group.Docs) != 2 {
+		t.Fatalf("Claim: %v, %v", err, group)
 	}
+	held := group.Docs
 	holder := eq.ClientID
 	if err := eq.Close(); err != nil {
 		t.Fatalf("Close: %v", err)

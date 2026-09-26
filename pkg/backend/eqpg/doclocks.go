@@ -393,7 +393,7 @@ func txNow(ctx context.Context, tx *sql.Tx) (time.Time, error) {
 }
 
 // claimDocs claims the group g inside tx and returns its members.
-func claimDocs(ctx context.Context, tx *sql.Tx, cq *entroq.DocClaim) ([]*entroq.Doc, error) {
+func claimDocs(ctx context.Context, tx *sql.Tx, cq *entroq.DocClaim) (*entroq.DocGroup, error) {
 	g := docgroup.Group{Namespace: cq.Namespace, Key: cq.Key}
 	locks, now, err := lockGroups(ctx, tx, []docgroup.Group{g}, map[docgroup.Group]bool{g: true})
 	if err != nil {
@@ -423,10 +423,7 @@ func claimDocs(ctx context.Context, tx *sql.Tx, cq *entroq.DocClaim) ([]*entroq.
 	if err := saveLocks(ctx, tx, map[docgroup.Group]docgroup.Lock{g: claimed}); err != nil {
 		return nil, err
 	}
-	for i, d := range members {
-		members[i] = docgroup.Overlay(d, claimed)
-	}
-	return members, nil
+	return docgroup.Claimed(g, claimed, members), nil
 }
 
 // collectLocksOnce removes the locks of up to batch groups that have no docs

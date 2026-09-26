@@ -94,7 +94,7 @@ func (m *EQMem) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, e
 // namespace and returns its members, which may be none: a group can be claimed
 // before it has docs. It fails with a DependencyError listing the members while
 // someone else holds the group.
-func (m *EQMem) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.Doc, error) {
+func (m *EQMem) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) (*entroq.DocGroup, error) {
 	if err := validate.DocClaim(cq); err != nil {
 		return nil, fmt.Errorf("eqmem claim docs: %w", err)
 	}
@@ -121,9 +121,5 @@ func (m *EQMem) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.D
 		log.Fatalf("Inconsistent internal state: doc claim succeeded but could not be journaled: %v", err)
 	}
 
-	results := make([]*entroq.Doc, 0, len(members))
-	for _, d := range members {
-		results = append(results, docgroup.Overlay(d, claimed))
-	}
-	return results, nil
+	return docgroup.Claimed(docgroup.Group{Namespace: cq.Namespace, Key: cq.Key}, claimed, members), nil
 }

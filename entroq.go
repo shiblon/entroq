@@ -379,7 +379,7 @@ type Backend interface {
 
 	// ClaimDocs attempts to claim a set of docs for modification (including
 	// deletion).
-	ClaimDocs(ctx context.Context, cq *DocClaim) ([]*Doc, error)
+	ClaimDocs(ctx context.Context, cq *DocClaim) (*DocGroup, error)
 
 	// NamespaceStats returns statistics for doc namespaces matching the query.
 	NamespaceStats(ctx context.Context, qq *MatchQuery) (map[string]*NamespaceStat, error)
@@ -948,8 +948,9 @@ func (c *EntroQ) Docs(ctx context.Context, rq *DocQuery) ([]*Doc, error) {
 	return c.backend.Docs(ctx, rq)
 }
 
-// ClaimDocs attempts to claim a set of docs.
-func (c *EntroQ) ClaimDocs(ctx context.Context, cq *DocClaim) ([]*Doc, error) {
+// ClaimDocs claims the doc group sharing a primary key in a namespace and
+// returns it, with its members, which may be none.
+func (c *EntroQ) ClaimDocs(ctx context.Context, cq *DocClaim) (*DocGroup, error) {
 	if cq.Claimant == "" {
 		cq.Claimant = c.ClientID
 	}

@@ -497,12 +497,12 @@ func DocClaimLocking(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 
 	// First claimant acquires the lock.
 	const claimDur = 500 * time.Millisecond
-	docs, err := client.ClaimDocs(ctx, &entroq.DocClaim{
+	docs, err := docsOf(client.ClaimDocs(ctx, &entroq.DocClaim{
 		Namespace: ns,
 		Claimant:  "claimant-A",
 		Key:       key,
 		Duration:  claimDur,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("first claim: %v", err)
 	}
@@ -526,12 +526,12 @@ func DocClaimLocking(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 
 	// After the claim duration expires, a third claimant can succeed.
 	time.Sleep(claimDur + 50*time.Millisecond)
-	docs2, err := client.ClaimDocs(ctx, &entroq.DocClaim{
+	docs2, err := docsOf(client.ClaimDocs(ctx, &entroq.DocClaim{
 		Namespace: ns,
 		Claimant:  "claimant-C",
 		Key:       key,
 		Duration:  claimDur,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("claim after expiry: %v", err)
 	}
@@ -674,7 +674,7 @@ func DocClaimantBehavior(ctx context.Context, t *testing.T, client *entroq.Entro
 	if time.Until(inserted.At) <= 0 {
 		t.Errorf("after future-at insert: at %v is not in the future", inserted.At)
 	}
-	reclaimed, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "claimed-on-insert").For(insertLease))
+	reclaimed, err := docsOf(client.ClaimDocs(ctx, entroq.ClaimKey(ns, "claimed-on-insert").For(insertLease)))
 	if err != nil {
 		t.Fatalf("same-client reclaim after future-at insert: %v", err)
 	}
@@ -921,9 +921,17 @@ func DocGroups(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix
 
 	t.Run("a claim makes earlier reads stale", func(t *testing.T) {
 		before := readGroup("g")
-		held, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "g").For(lease))
-		if err != nil || len(held) != 2 {
-			t.Fatalf("Claim: %v, %d docs", err, len(held))
+		group, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "g").For(lease))
+		if err != nil || len(group.Docs) != 2 {
+			t.Fatalf("Claim: %v, %v", err, group)
+		}
+		held := group.Docs
+		// Each member reports its group's version and claim.
+		for _, d := range held {
+			if d.Version != group.Version || d.Claimant != group.Claimant || !d.At.Equal(group.At) {
+				t.Errorf("Member %q reports version %d, claimant %q, at %v; its group has %d, %q, %v",
+					d.ID, d.Version, d.Claimant, d.At, group.Version, group.Claimant, group.At)
+			}
 		}
 		if held[0].Version == before[0].Version {
 			t.Errorf("Claim did not move the group version (%d)", held[0].Version)
@@ -938,7 +946,7 @@ func DocGroups(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix
 	})
 
 	t.Run("a held group refuses other writers", func(t *testing.T) {
-		held, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "g").For(lease))
+		held, err := docsOf(client.ClaimDocs(ctx, entroq.ClaimKey(ns, "g").For(lease)))
 		if err != nil {
 			t.Fatalf("Claim: %v", err)
 		}
@@ -977,12 +985,19 @@ func DocGroups(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix
 	})
 
 	t.Run("an empty group can be claimed", func(t *testing.T) {
-		held, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "empty").For(lease))
+		before := time.Now()
+		group, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "empty").For(lease))
 		if err != nil {
 			t.Fatalf("Claim of an empty group: %v", err)
 		}
-		if len(held) != 0 {
-			t.Fatalf("Claim of an empty group returned %d docs", len(held))
+		if len(group.Docs) != 0 {
+			t.Fatalf("Claim of an empty group returned %d docs", len(group.Docs))
+		}
+		// With no docs to carry them, the group itself reports its version
+		// and claim.
+		if group.Namespace != ns || group.Key != "empty" || group.Version < 0 ||
+			group.Claimant != client.ClientID || !group.At.After(before) {
+			t.Errorf("Claimed empty group: got %+v, want %s/empty held by %s past %v", group, ns, client.ClientID, before)
 		}
 		if _, err := client.Modify(ctx, entroq.PuttingDocInto(ns, entroq.WithKeys("empty", "x")), entroq.ModifyAs(intruder)); !entroq.IsDependency(err) {
 			t.Errorf("Intruder insert into a claimed empty group: want a claim error, got %v", err)
@@ -1043,7 +1058,7 @@ func DocGroups(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix
 	})
 
 	t.Run("a held group and an unheld one in one modification", func(t *testing.T) {
-		held, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "g").For(lease))
+		held, err := docsOf(client.ClaimDocs(ctx, entroq.ClaimKey(ns, "g").For(lease)))
 		if err != nil || len(held) == 0 {
 			t.Fatalf("Claim: %v, %d docs", err, len(held))
 		}

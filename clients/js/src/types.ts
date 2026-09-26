@@ -167,10 +167,25 @@ export interface ClaimDocsRequest {
 }
 
 /**
- * ClaimDocsResponse contains the claimed docs.
+ * DocGroup is a doc group's lock: the docs sharing a primary key in a
+ * namespace have one version, claimant, and arrival time between them, which
+ * each member reports. A group can be claimed before it has any docs.
+ */
+export interface DocGroup {
+  namespace: string;
+  key: string;
+  version?: number;
+  claimant?: string;
+  atMs?: string;
+}
+
+/**
+ * ClaimDocsResponse contains the claimed docs, and the group they belong to,
+ * present even when it has no docs. Servers before 1.13 omit the group.
  */
 export interface ClaimDocsResponse {
   docs: Doc[];
+  group?: DocGroup;
 }
 
 /**

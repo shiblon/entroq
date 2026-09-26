@@ -14,7 +14,7 @@ import (
 // namespace and returns its members, which may be none: a group can be claimed
 // before it has docs. It returns a DependencyError listing the members while
 // someone else holds the group.
-func (b *EQSQLite) ClaimDocs(ctx context.Context, q *entroq.DocClaim) ([]*entroq.Doc, error) {
+func (b *EQSQLite) ClaimDocs(ctx context.Context, q *entroq.DocClaim) (*entroq.DocGroup, error) {
 	if q == nil {
 		return nil, fmt.Errorf("eqsqlite claim docs: nil query")
 	}
@@ -61,13 +61,10 @@ func (b *EQSQLite) ClaimDocs(ctx context.Context, q *entroq.DocClaim) ([]*entroq
 		if err := saveDocLocks(ctx, tx, map[docgroup.Group]docgroup.Lock{g: claimed}); err != nil {
 			return nil, err
 		}
-		for i, doc := range docs {
-			docs[i] = docgroup.Overlay(doc, claimed)
-		}
-		return docs, nil
+		return docgroup.Claimed(g, claimed, docs), nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("eqsqlite claim docs: %w", err)
 	}
-	return value.([]*entroq.Doc), nil
+	return value.(*entroq.DocGroup), nil
 }

@@ -392,10 +392,13 @@ components:
                     type: array
                     items:
                         $ref: '#/components/schemas/Doc'
+                group:
+                    $ref: '#/components/schemas/DocGroup'
             description: |-
-                ClaimDocsResponse contains the docs claimed by a ClaimDocs call.
-                 A dependency error (missing or already-claimed docs) comes through as
-                 gRPC's NOT_FOUND code with ModifyDep details carrying doc_id fields.
+                ClaimDocsResponse contains the docs claimed by a ClaimDocs call, and the
+                 group they belong to, which is present even when the group has no docs.
+                 A dependency error (a group held by someone else) comes through as gRPC's
+                 NOT_FOUND code with ModifyDep details carrying doc_id fields.
         ClaimRequest:
             type: object
             properties:
@@ -505,6 +508,25 @@ components:
                 DocData holds the data portion of a doc, used for insertions. The created_ms
                  and modified_ms fields are used only for journal replay; leave them zero for
                  normal insertions.
+        DocGroup:
+            type: object
+            properties:
+                namespace:
+                    type: string
+                key:
+                    type: string
+                version:
+                    type: integer
+                    format: int32
+                claimant:
+                    type: string
+                atMs:
+                    type: string
+            description: |-
+                DocGroup is a doc group's lock: the docs sharing a primary key in a
+                 namespace have one version, claimant, and arrival time between them, held
+                 here, and each member reports them. A group can be claimed before it has
+                 any docs, so the lock stands on its own; its members travel separately.
         DocID:
             type: object
             properties:

@@ -53,7 +53,7 @@ func InvalidRequests(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 	if !task.At.After(before.Add(entroq.DefaultClaimDuration / 2)) {
 		t.Errorf("Claim for a zero duration: held until %v, want about %v from %v", task.At, entroq.DefaultClaimDuration, before)
 	}
-	docs, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "zero").For(0))
+	docs, err := docsOf(client.ClaimDocs(ctx, entroq.ClaimKey(ns, "zero").For(0)))
 	if err != nil {
 		t.Fatalf("Doc claim for a zero duration: %v", err)
 	}

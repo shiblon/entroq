@@ -78,6 +78,23 @@ func Claim(l Lock, claimant string, now time.Time, d time.Duration) (Lock, bool)
 	return Lock{Version: l.Version + 1, Claimant: claimant, At: now.Add(d)}, true
 }
 
+// Claimed returns the group g as its claim left it: holding lock l, with each
+// member carrying that lock.
+func Claimed(g Group, l Lock, members []*entroq.Doc) *entroq.DocGroup {
+	dg := &entroq.DocGroup{
+		Namespace: g.Namespace,
+		Key:       g.Key,
+		Version:   l.Version,
+		Claimant:  l.Claimant,
+		At:        l.At,
+		Docs:      make([]*entroq.Doc, 0, len(members)),
+	}
+	for _, d := range members {
+		dg.Docs = append(dg.Docs, Overlay(d, l))
+	}
+	return dg
+}
+
 // Plan is what a modification does to doc groups.
 type Plan struct {
 	// Err describes every doc operation that cannot proceed, or is nil.

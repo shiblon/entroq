@@ -259,12 +259,12 @@ func NamespaceStats(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	}
 
 	// Claim one doc in ns2.
-	claimed, err := client.ClaimDocs(ctx, &entroq.DocClaim{
+	claimed, err := docsOf(client.ClaimDocs(ctx, &entroq.DocClaim{
 		Namespace: ns2,
 		Claimant:  client.ClientID,
 		Key:       key,
 		Duration:  30 * time.Second,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("claim docs: %v", err)
 	}

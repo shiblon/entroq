@@ -87,7 +87,7 @@ func LengthLimits(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 		}
 		cq := entroq.ClaimKey(dns, "k").For(time.Minute)
 		entroq.WithDocClaimant(wide(33))(cq)
-		if docs, err := client.ClaimDocs(ctx, cq); err == nil {
+		if docs, err := docsOf(client.ClaimDocs(ctx, cq)); err == nil {
 			t.Fatalf("claimed docs with an over-limit claimant: %v", docs)
 		}
 	})

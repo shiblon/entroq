@@ -231,3 +231,11 @@ func uniqueTaskID(base string) string {
 func uniqueTaskIDOfLen(n int) string {
 	return strings.Repeat("a", n-16) + entroq.GenHex16()
 }
+
+// docsOf returns the members of a claimed doc group, or the claim's error.
+func docsOf(g *entroq.DocGroup, err error) ([]*entroq.Doc, error) {
+	if err != nil {
+		return nil, err
+	}
+	return g.Docs, nil
+}

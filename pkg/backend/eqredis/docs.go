@@ -289,7 +289,7 @@ func (e *EQRedis) readDocsWithLocks(ctx context.Context, rq *entroq.DocQuery, id
 // lock instead: one that commits before the claim is in the members read
 // after it, and one that has not committed yet fails its watch when the claim
 // writes the lock, then retries and finds the group held.
-func (e *EQRedis) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.Doc, error) {
+func (e *EQRedis) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) (*entroq.DocGroup, error) {
 	if err := validate.DocClaim(cq); err != nil {
 		return nil, fmt.Errorf("eqredis claim docs: %w", err)
 	}
@@ -333,10 +333,7 @@ func (e *EQRedis) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq
 			}
 			return nil, depErr
 		}
-		for i, d := range members {
-			members[i] = docgroup.Overlay(d, next)
-		}
-		return members, nil
+		return docgroup.Claimed(g, next, members), nil
 	}
 	return nil, fmt.Errorf("eqredis claim docs: too much contention on %q in %q", cq.Key, cq.Namespace)
 }

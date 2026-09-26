@@ -214,11 +214,25 @@ message ClaimDocsRequest {
   DocClaim claim_query = 1;
 }
 
-// ClaimDocsResponse contains the docs claimed by a ClaimDocs call.
-// A dependency error (missing or already-claimed docs) comes through as
-// gRPC's NOT_FOUND code with ModifyDep details carrying doc_id fields.
+// DocGroup is a doc group's lock: the docs sharing a primary key in a
+// namespace have one version, claimant, and arrival time between them, held
+// here, and each member reports them. A group can be claimed before it has
+// any docs, so the lock stands on its own; its members travel separately.
+message DocGroup {
+  string namespace = 1;
+  string key = 2;
+  int32 version = 3;
+  string claimant = 4;
+  int64 at_ms = 5;
+}
+
+// ClaimDocsResponse contains the docs claimed by a ClaimDocs call, and the
+// group they belong to, which is present even when the group has no docs.
+// A dependency error (a group held by someone else) comes through as gRPC's
+// NOT_FOUND code with ModifyDep details carrying doc_id fields.
 message ClaimDocsResponse {
   repeated Doc docs = 1;
+  DocGroup group = 2;
 }
 
 // NamespaceStat contains statistics for a single doc namespace.

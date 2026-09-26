@@ -141,6 +141,31 @@ func DocFromProto(d *pb.Doc) (*entroq.Doc, error) {
 	}, nil
 }
 
+// DocGroupToProto converts a doc group's lock to its wire form. Its members
+// travel separately, as the docs beside it.
+func DocGroupToProto(g *entroq.DocGroup) *pb.DocGroup {
+	return &pb.DocGroup{
+		Namespace: g.Namespace,
+		Key:       g.Key,
+		Version:   g.Version,
+		Claimant:  g.Claimant,
+		AtMs:      ToMS(g.At),
+	}
+}
+
+// DocGroupFromProto converts a wire doc group's lock and its members to an
+// entroq.DocGroup.
+func DocGroupFromProto(g *pb.DocGroup, docs []*entroq.Doc) *entroq.DocGroup {
+	return &entroq.DocGroup{
+		Namespace: g.Namespace,
+		Key:       g.Key,
+		Version:   g.Version,
+		Claimant:  g.Claimant,
+		At:        fromMSOrUnset(g.AtMs),
+		Docs:      docs,
+	}
+}
+
 // MustDocFromProto is DocFromProto for callers converting a Doc whose content
 // came off the wire already valid, where the re-marshal cannot realistically
 // fail. If that impossible error ever does occur it is fatal: better a loud exit

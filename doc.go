@@ -323,6 +323,19 @@ func (q *DocQuery) Validate() error {
 	return nil
 }
 
+// DocGroup is a doc group: the docs sharing a primary key in a namespace,
+// which have one version, claimant, and arrival time between them, as a task
+// does. ClaimDocs returns the group it claimed, which may have no docs yet;
+// each member carries the group's version and claim.
+type DocGroup struct {
+	Namespace string
+	Key       string
+	Version   int32
+	Claimant  string
+	At        time.Time
+	Docs      []*Doc
+}
+
 // DocClaim is used to claim all docs that share a primary key in a namespace.
 //
 // Construct with ClaimKey for a fluent interface:
