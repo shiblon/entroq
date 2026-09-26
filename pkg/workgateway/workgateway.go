@@ -20,6 +20,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"sync"
 	"time"
 
 	"github.com/shiblon/entroq"
@@ -60,7 +62,6 @@ type Config struct {
 	RetryDelay time.Duration
 }
 
-
 // defaultEntroQTimeout is how long a Bridge rides out an unreachable EntroQ
 // backend before giving up, unless WithEntroQTimeout overrides it.
 const defaultEntroQTimeout = 60 * time.Second
@@ -70,17 +71,44 @@ const defaultEntroQTimeout = 60 * time.Second
 // behavior, and supervises that loop: it reconnects across a transient EntroQ
 // outage (bounded by the fatal timeout) and classifies why it stops so the
 // transport can report an exit code or close code. One connection handles one
-// task at a time, so the Bridge needs no locking; its configuration is fixed at
-// construction and all per-task state lives in a fresh handler the worker builds
-// per task. connLost is the single bit of run-to-run state: once a Send or Recv
-// fails, the client is gone and there is nothing left to serve.
+// task at a time; its configuration is fixed at construction and all per-task
+// state lives in a fresh handler the worker builds per task.
+//
+// A background reader takes every message the worker sends, so the gateway
+// hears the worker hang up even while it is claiming or committing, not only
+// when it next waits for a reply. The reader accepts a message only as the
+// reply to the one request outstanding; anything else is a protocol violation.
+// Either way the session ends by draining the worker (worker.Shutdown), so a
+// commit already under way finishes and nothing more is claimed for a worker
+// that is gone.
 type Bridge struct {
 	conn          Conn
 	cfg           Config
 	lease         time.Duration
 	entroqTimeout time.Duration
-	connLost      bool
+
+	// eq and w are set by Run before the reader starts, and fixed after.
+	eq *entroq.EntroQ
+	w  *worker.Worker[json.RawMessage]
+
+	// wmu makes the connection's writes one at a time. mu guards the state
+	// below; it is never held across a write, so a slow write cannot stall
+	// the reader.
+	wmu       sync.Mutex
+	mu        sync.Mutex
+	connLost  bool  // a Send or Recv failed: the worker is gone
+	violation error // the worker sent a message no request asked for
+	awaiting  bool  // a request is outstanding; the next message is its reply
+	ending    bool  // gave up on a reply; discard whatever arrives
+
+	replies chan json.RawMessage // the outstanding request's reply
+	gone    chan struct{}        // closed when the reader stops
 }
+
+// errConnLost is what a request returns once the worker has hung up. The
+// phases that hold a task the worker never answered for release it rather than
+// leave it to its lease: the worker is gone, so no one is working on it.
+var errConnLost = errors.New("worker connection lost")
 
 // Option configures a Bridge at construction.
 type Option func(*Bridge)
@@ -115,30 +143,163 @@ func WithEntroQTimeout(d time.Duration) Option {
 // entroq.DefaultClaimDuration and the EntroQ timeout to defaultEntroQTimeout;
 // supply WithConfig to register the worker.
 func NewBridge(conn Conn, opts ...Option) *Bridge {
-	b := &Bridge{conn: conn, lease: entroq.DefaultClaimDuration, entroqTimeout: defaultEntroQTimeout}
+	b := &Bridge{
+		conn:          conn,
+		lease:         entroq.DefaultClaimDuration,
+		entroqTimeout: defaultEntroQTimeout,
+		replies:       make(chan json.RawMessage, 1),
+		gone:          make(chan struct{}),
+	}
 	for _, opt := range opts {
 		opt(b)
 	}
 	return b
 }
 
-// send and recv wrap the Conn and record a lost connection. Every phase goes
-// through them, so classify can tell "the client hung up" from any other stop by
-// inspecting one bit, no matter how the error was wrapped on the way out.
+// send writes one message the worker does not answer (hello, error, abort),
+// recording a lost connection so classify can tell "the client hung up" from
+// any other stop, no matter how the error was wrapped on the way out.
 func (b *Bridge) send(ctx context.Context, v any) error {
-	if err := b.conn.Send(ctx, v); err != nil {
+	b.wmu.Lock()
+	err := b.conn.Send(ctx, v)
+	b.wmu.Unlock()
+	if err != nil {
+		b.mu.Lock()
 		b.connLost = true
-		return err
+		b.mu.Unlock()
 	}
-	return nil
+	return err
 }
 
-func (b *Bridge) recv(ctx context.Context, v any) error {
-	if err := b.conn.Recv(ctx, v); err != nil {
-		b.connLost = true
-		return err
+// request sends a phase message and waits for its reply, decoding it into
+// reply. The reply is expected before the message is sent, so the reader can
+// never take a fast answer for an unsolicited message. If ctx ends first, the
+// gateway stops waiting; abort, if given, tells the worker (see awaitAbort).
+func (b *Bridge) request(ctx context.Context, msg, reply any, abort *abortMsg) error {
+	select {
+	case <-b.gone:
+		return b.goneErr()
+	default:
 	}
-	return nil
+	b.mu.Lock()
+	b.awaiting = true
+	b.mu.Unlock()
+	if err := b.send(ctx, msg); err != nil {
+		return fmt.Errorf("%w: %v", errConnLost, err)
+	}
+
+	select {
+	case raw := <-b.replies:
+		return json.Unmarshal(raw, reply)
+	case <-b.gone:
+		return b.goneErr()
+	case <-ctx.Done():
+	}
+	if abort != nil {
+		return b.awaitAbort(ctx, abort)
+	}
+	b.giveUp()
+	return ctx.Err()
+}
+
+// awaitAbort handles a doWork whose context ended while the worker was still
+// working. The gateway tells the worker to abort. If the claim was lost, the
+// session goes on, so the gateway waits one lease for the worker's reply, which
+// it discards: the task is no longer the gateway's to commit, and a reply left
+// on the stream would be read as the next task's. A worker that does not answer
+// in time is a caller fault and ends the session. Any other end of ctx is the
+// gateway stopping, so it does not wait.
+func (b *Bridge) awaitAbort(ctx context.Context, abort *abortMsg) error {
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), b.lease)
+	defer cancel()
+	if err := b.send(sctx, abort); err != nil {
+		return errConnLost
+	}
+	if _, ok := entroq.AsDependency(context.Cause(ctx)); !ok {
+		b.giveUp()
+		return ctx.Err()
+	}
+	select {
+	case <-b.replies:
+		return ctx.Err()
+	case <-b.gone:
+		return b.goneErr()
+	case <-sctx.Done():
+		b.giveUp()
+		return worker.FatalErrorf("worker did not answer within %s after abort of task %s", b.lease, abort.ID)
+	}
+}
+
+// giveUp stops waiting for the outstanding reply. The session is ending, so
+// anything the worker sends from now on is discarded rather than taken for a
+// protocol violation.
+func (b *Bridge) giveUp() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.awaiting, b.ending = false, true
+}
+
+// goneErr is why the reader stopped: a violation, or the worker hanging up.
+func (b *Bridge) goneErr() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.violation != nil {
+		return b.violation
+	}
+	return errConnLost
+}
+
+// read takes every message the worker sends until the connection fails or the
+// worker violates the protocol, then drains the worker: a commit under way
+// finishes, and nothing more is claimed. An undecodable message counts as the
+// connection failing, since the stream cannot be read past it.
+func (b *Bridge) read(ctx context.Context) {
+	defer b.drain() // after gone closes, so a request waiting on it fails first
+	defer close(b.gone)
+	for {
+		var raw json.RawMessage
+		if err := b.conn.Recv(ctx, &raw); err != nil {
+			b.mu.Lock()
+			b.connLost = true
+			b.mu.Unlock()
+			return
+		}
+		if !b.accept(raw) {
+			return
+		}
+	}
+}
+
+// accept delivers raw as the outstanding reply, discards it once the session
+// is ending, and otherwise records a violation and returns false.
+func (b *Bridge) accept(raw json.RawMessage) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	switch {
+	case b.awaiting:
+		b.awaiting = false
+		b.replies <- raw // never blocks: one reply per request, taken before the next
+		return true
+	case b.ending:
+		return true
+	default:
+		var probe struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(raw, &probe)
+		b.violation = worker.FatalErrorf("worker sent %q with no request outstanding", probe.Type)
+		return false
+	}
+}
+
+// drain stops the worker without interrupting a commit under way. Nothing it
+// might wait on needs the worker, so a lease is ample.
+func (b *Bridge) drain() {
+	ctx, cancel := context.WithTimeout(context.Background(), b.lease)
+	defer cancel()
+	if err := b.w.Shutdown(ctx); err != nil {
+		log.Printf("work gateway: drain after the worker stopped: %v", err)
+	}
 }
 
 // Run supervises the worker loop against eq until ctx is done or a terminal
@@ -164,6 +325,11 @@ func (b *Bridge) Run(ctx context.Context, eq *entroq.EntroQ) error {
 		return &ExitError{Class: ExitCaller, err: fmt.Errorf("gateway registration: a work handler is required (the gateway has nothing to do without one)")}
 	}
 
+	b.eq, b.w = eq, b.newWorker(eq)
+	rctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go b.read(rctx)
+
 	const (
 		minBackoff = 200 * time.Millisecond
 		maxBackoff = 5 * time.Second
@@ -174,8 +340,13 @@ func (b *Bridge) Run(ctx context.Context, eq *entroq.EntroQ) error {
 	)
 	for {
 		runStart := time.Now()
-		err := b.runWorker(ctx, eq)
+		err := b.runWorker(ctx)
 		class := b.classify(err)
+		if class == ExitCaller {
+			if verr := b.violationErr(); verr != nil {
+				err = verr
+			}
+		}
 
 		switch class {
 		case ExitOK:
@@ -189,7 +360,7 @@ func (b *Bridge) Run(ctx context.Context, eq *entroq.EntroQ) error {
 		// tell the client we are retrying, then ride the outage out with backoff,
 		// bounded by the fatal timeout.
 		b.notify(ctx, ExitTransient, err)
-		if b.connLost {
+		if b.lost() {
 			return nil // the client hung up while we were reporting; stop cleanly
 		}
 		if b.entroqTimeout <= 0 {
@@ -217,10 +388,8 @@ func (b *Bridge) Run(ctx context.Context, eq *entroq.EntroQ) error {
 	}
 }
 
-// runWorker builds a worker for exactly the registered phases and runs it once,
-// until ctx is done or it stops. The supervision loop in Run calls it repeatedly,
-// reusing this Bridge (and its connection) across restarts.
-func (b *Bridge) runWorker(ctx context.Context, eq *entroq.EntroQ) error {
+// newWorker builds a worker for exactly the registered phases.
+func (b *Bridge) newWorker(eq *entroq.EntroQ) *worker.Worker[json.RawMessage] {
 	opts := []worker.Option[json.RawMessage]{}
 	if b.cfg.TakeDocs {
 		opts = append(opts, worker.WithTakeDocs[json.RawMessage](b.takeDocs))
@@ -230,7 +399,13 @@ func (b *Bridge) runWorker(ctx context.Context, eq *entroq.EntroQ) error {
 		opts = append(opts, worker.WithErrQMap[json.RawMessage](worker.ErrQTemplate(b.cfg.ErrorQueue)))
 	}
 
-	w := worker.New(eq, opts...)
+	return worker.New(eq, opts...)
+}
+
+// runWorker runs the worker once, until ctx is done or it stops. The
+// supervision loop in Run calls it repeatedly, reusing this Bridge (and its
+// connection) across restarts.
+func (b *Bridge) runWorker(ctx context.Context) error {
 	runOpts := []worker.RunOption{
 		worker.Watching(b.cfg.Queues...),
 		worker.WithLease(b.lease),
@@ -240,19 +415,39 @@ func (b *Bridge) runWorker(ctx context.Context, eq *entroq.EntroQ) error {
 	if b.cfg.RetryDelay > 0 {
 		runOpts = append(runOpts, worker.WithBaseRetryDelay(b.cfg.RetryDelay))
 	}
-	return w.Run(ctx, runOpts...)
+	return b.w.Run(ctx, runOpts...)
 }
 
-// classify maps a worker run's exit into a class. The connLost bit is checked
-// before everything except a clean stop: a dropped client connection may also
-// surface wrapped as a fatal (the success phase escalates it to stop the worker
-// promptly), but it is still just the client hanging up, which is a clean end of
-// service, not a fault or a thing to retry.
+// violationErr is the protocol violation that ended the session, if any.
+func (b *Bridge) violationErr() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.violation
+}
+
+// lost reports whether the worker has hung up.
+func (b *Bridge) lost() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.connLost
+}
+
+// classify maps a worker run's exit into a class. A protocol violation comes
+// first, since the drain it causes stops the worker cleanly. The connLost bit
+// is checked before everything except a clean stop: a dropped client
+// connection may also surface wrapped as a fatal (the success phase escalates
+// it to stop the worker promptly), but it is still just the client hanging up,
+// which is a clean end of service, not a fault or a thing to retry.
 func (b *Bridge) classify(err error) ExitClass {
+	b.mu.Lock()
+	violation, connLost := b.violation, b.connLost
+	b.mu.Unlock()
 	switch {
-	case err == nil || entroq.IsCanceled(err):
+	case violation != nil:
+		return ExitCaller
+	case err == nil || entroq.IsCanceled(err) || errors.Is(err, worker.ErrShutdown):
 		return ExitOK
-	case b.connLost:
+	case connLost:
 		return ExitOK
 	case entroq.IsUnavailable(err):
 		return ExitTransient
@@ -271,7 +466,7 @@ func (b *Bridge) classify(err error) ExitClass {
 // rather than replying, and if the connection is already gone there is no one to
 // tell (the send fails, records the loss, and is ignored).
 func (b *Bridge) notify(ctx context.Context, class ExitClass, cause error) {
-	if b.connLost {
+	if b.lost() {
 		return
 	}
 	_ = b.send(ctx, errorMsg{Type: msgError, Class: class.String(), Message: cause.Error()})
@@ -285,12 +480,15 @@ func (b *Bridge) takeDocs(ctx context.Context, task *entroq.Task, _ json.RawMess
 	if err != nil {
 		return nil, fmt.Errorf("convert task for takeDocs: %w", err)
 	}
-	if err := b.send(ctx, takeDocsMsg{Type: msgTakeDocs, Task: wireTask{taskPB}}); err != nil {
-		return nil, fmt.Errorf("send takeDocs: %w", err)
-	}
 	var d docsMsg
-	if err := b.recv(ctx, &d); err != nil {
-		return nil, fmt.Errorf("read docs: %w", err)
+	if err := b.request(ctx, takeDocsMsg{Type: msgTakeDocs, Task: wireTask{taskPB}}, &d, nil); err != nil {
+		if errors.Is(err, errConnLost) {
+			// Renewal has not started, so the claimed version is current.
+			if _, rerr := b.eq.Modify(ctx, task.Change(entroq.ArrivalTimeBy(0))); rerr != nil {
+				log.Printf("work gateway: release task %s after hang-up: %v", task.ID, rerr)
+			}
+		}
+		return nil, fmt.Errorf("takeDocs: %w", err)
 	}
 	if d.Type != msgDocs {
 		return nil, fmt.Errorf("expected %q message, got %q", msgDocs, d.Type)
@@ -325,12 +523,15 @@ func (b *Bridge) doWork(ctx context.Context, task *entroq.Task, _ json.RawMessag
 		msg.Groups = append(msg.Groups, wg)
 		msg.Docs = append(msg.Docs, wg.Docs...)
 	}
-	if err := b.send(ctx, msg); err != nil {
-		return nil, fmt.Errorf("send doWork: %w", err)
-	}
 	var res result
-	if err := b.recv(ctx, &res); err != nil {
-		return nil, fmt.Errorf("read result: %w", err)
+	abort := &abortMsg{Type: msgAbort, ID: task.ID, Version: task.Version}
+	if err := b.request(ctx, msg, &res, abort); err != nil {
+		if errors.Is(err, errConnLost) {
+			// Commit the release like any result, so the worker fixes up the
+			// version renewal has moved it to.
+			return worker.Modify(task.Change(entroq.ArrivalTimeBy(0))), nil
+		}
+		return nil, fmt.Errorf("doWork: %w", err)
 	}
 	if res.Type != msgResult {
 		// A wrong message type is a client protocol bug, not a transient fault.
@@ -414,15 +615,12 @@ func (b *Bridge) report(ctx context.Context, depErr *entroq.DependencyError) err
 	for _, d := range pbconv.DependencyErrorDetails(depErr) {
 		msg.Deps = append(msg.Deps, wireDep{d})
 	}
-	if err := b.send(ctx, msg); err != nil {
+	var d done
+	if err := b.request(ctx, msg, &d, nil); err != nil {
 		// A transport failure here is a dead connection, not a task problem.
 		// Returning a plain (non-sentinel) error exits the worker, the right
 		// response to a broken pipe (see the worker's exit-on-unknown ladder).
-		return fmt.Errorf("send dependency: %w", err)
-	}
-	var d done
-	if err := b.recv(ctx, &d); err != nil {
-		return fmt.Errorf("read done: %w", err)
+		return fmt.Errorf("dependency: %w", err)
 	}
 	if d.Type != msgDone {
 		return worker.FatalErrorf("expected %q message, got %q", msgDone, d.Type)
@@ -446,12 +644,9 @@ func (b *Bridge) report(ctx context.Context, depErr *entroq.DependencyError) err
 // cannot deliver (needlessly starving that task for a lease period), a dropped
 // connection must escalate to a FatalError so the worker stops instead.
 func (b *Bridge) success(ctx context.Context) error {
-	if err := b.send(ctx, successMsg{Type: msgSuccess}); err != nil {
-		return worker.FatalErrorf("send success: %v", err)
-	}
 	var d done
-	if err := b.recv(ctx, &d); err != nil {
-		return worker.FatalErrorf("read done: %v", err)
+	if err := b.request(ctx, successMsg{Type: msgSuccess}, &d, nil); err != nil {
+		return worker.FatalErrorf("success: %v", err)
 	}
 	if d.Type != msgDone {
 		return worker.FatalErrorf("expected %q message, got %q", msgDone, d.Type)

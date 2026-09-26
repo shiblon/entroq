@@ -907,7 +907,7 @@ func TestBridge_RequiresWorkHandler(t *testing.T) {
 // TestBridge_ClientDropReclaims is the core resilience property: a worker that
 // receives a task then vanishes without replying leaves the bridge to stop
 // cleanly, the (uncommitted) task still in its queue, and the task reclaimable
-// once the lease lapses.
+// (at once, since the gateway releases it; see TestContract_HangUpReleasesTask).
 func TestBridge_ClientDropReclaims(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -925,7 +925,7 @@ func TestBridge_ClientDropReclaims(t *testing.T) {
 	if err := s.wait(); err != nil {
 		t.Fatalf("a client drop should be a clean stop, got: %v", err)
 	}
-	// The task was never committed, so it is still present, just leased.
+	// The task was never committed, so it is still present.
 	tasks, err := eq.Tasks(ctx, "in")
 	if err != nil {
 		t.Fatalf("tasks: %v", err)
@@ -933,7 +933,7 @@ func TestBridge_ClientDropReclaims(t *testing.T) {
 	if len(tasks) != 1 {
 		t.Fatalf("task lost after a drop: got %d tasks, want 1", len(tasks))
 	}
-	// Once the lease lapses it must be claimable again (at-least-once).
+	// It must be claimable again (at-least-once).
 	deadline := time.After(5 * time.Second)
 	for {
 		claimed, err := eq.TryClaim(ctx, entroq.From("in"), entroq.ClaimFor(time.Second))

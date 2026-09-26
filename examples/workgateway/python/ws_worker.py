@@ -58,6 +58,11 @@ async def run_once():
                     check_hello(msg)
                 elif kind == "doWork":
                     await ws.send(json.dumps(handle(msg["task"])))
+                elif kind == "abort":
+                    # The gateway lost the claim on the task it names. This worker handles
+                    # one task at a time without reading, so by now it has answered that
+                    # doWork, and the gateway discards the answer; nothing to stop.
+                    pass
                 elif kind == "error":
                     print(f"[worker] gateway error [{msg.get('class')}]: {msg.get('message')}", file=sys.stderr)
                 else:

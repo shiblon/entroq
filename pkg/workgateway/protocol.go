@@ -59,6 +59,7 @@ import (
 //	client  -> docs {claims: [...]}
 //	  (gateway claims the doc groups, sorted, and passes them along)
 //	gateway -> doWork {task, docs, groups}
+//	gateway -> abort {id, version}        # only if the claim is lost mid-task
 //	client  -> result {outcome, ack?, modification?, ...}
 //	  (gateway stops renewal, freezes the stable version, and commits atomically)
 //	  (then exactly ONE post-commit phase fires, and only if the worker registered it)
@@ -91,8 +92,8 @@ import (
 // hello. It advances when the protocol changes in a way a client must know
 // about; a gateway's release version is only for people to read.
 //
-// Protocol 1 added the hello itself, doc groups in doWork, and the "error"
-// outcome.
+// Protocol 1 added the hello itself, doc groups in doWork, the "error"
+// outcome, and abort.
 const Protocol = 1
 
 // Message type tags. Every protocol message is a JSON object with a "type".
@@ -106,6 +107,7 @@ const (
 	msgDependency = "dependency"
 	msgDone       = "done"
 	msgError      = "error"
+	msgAbort      = "abort"
 )
 
 // Outcomes a client reports for a task (result.Outcome, ack.Outcome) or for
@@ -482,6 +484,17 @@ func AsExit(err error) (*ExitError, bool) {
 		return e, true
 	}
 	return nil, false
+}
+
+// abortMsg tells the worker to stop working on the task it holds: the gateway
+// has lost the claim, or is stopping. It is one-way and names the task, so a
+// worker that has already finished that task ignores it. The worker still
+// sends its result for the doWork, which the gateway discards; that reply is
+// what keeps one request and one reply in step on the stream.
+type abortMsg struct {
+	Type    string `json:"type"`
+	ID      string `json:"id"`
+	Version int32  `json:"version"`
 }
 
 // errorMsg is the one-way error side channel: the gateway reports a worker error

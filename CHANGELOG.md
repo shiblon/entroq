@@ -141,6 +141,17 @@ runs, so plan a short maintenance window on large doc tables.
   --error-queue` takes the same `{inbox}` template (`worker.ErrQTemplate`), so a
   worker watching several queues can quarantine each task beside its inbox; a
   name without `{inbox}` still means one queue for all.
+- **The work gateway hears the worker at all times.** A background reader takes
+  every message the worker sends, so the gateway notices a worker that hangs up
+  while it is claiming or committing: it stops claiming at once, where it used
+  to claim one more task for a worker that was gone. Hanging up never interrupts
+  a commit already under way, so a worker may send its result and exit. A
+  message sent when no request is outstanding is a protocol violation (the
+  caller class). If the gateway loses its claim mid-task, it sends a one-way
+  `abort` naming the task; the worker still answers, the gateway discards the
+  answer, and a worker that does not answer within a lease ends the session as a
+  caller fault. A task whose `takeDocs` or `doWork` the worker never answered
+  is released when it hangs up, available at once instead of after its lease.
 - **Breaking (Go): worker handlers receive doc groups.** `DoWork`, `DoModify`,
   and `Finish` handlers, and the `Handler` interface, take
   `[]*entroq.DocGroup` where they took `[]*entroq.Doc`: one group per claim

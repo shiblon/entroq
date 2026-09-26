@@ -66,7 +66,8 @@ message, which a worker reads as protocol 0. The hello is sent even when the
 registration is then refused, so a worker can tell a registration it got wrong
 from a gateway it cannot talk to.
 
-Protocol 1 added the hello, doc groups in `doWork`, and the `error` outcome.
+Protocol 1 added the hello, doc groups in `doWork`, the `error` outcome, and
+`abort`.
 
 ## Phases
 
@@ -80,6 +81,7 @@ gateway -> hello {protocol, version}  # once, first
 gateway -> takeDocs {task}            # only if registered takeDocs
 client  -> docs {claims: [...]}
 gateway -> doWork {task, docs, groups}
+gateway -> abort {id, version}        # only if the claim is lost mid-task
 client  -> result {outcome, ack?, modification?}
   (gateway stops renewal, freezes the stable version, commits atomically)
   (then exactly ONE post-commit phase fires, and only if registered)
@@ -99,6 +101,27 @@ The commit is the exactly-once boundary. Everything before it is at-least-once (
 dropped connection reclaims the task on lease expiry); `success` after it is
 best-effort and at-most-once, so success-phase side effects must be idempotent or
 safe to skip.
+
+The worker answers only what it is asked. The gateway reads the worker's side of
+the connection all the time, so it notices a worker that hangs up even while it
+is claiming or committing, and it treats a message sent when no request is
+outstanding as a protocol violation (a `caller` fault). A worker that hangs up
+never interrupts a commit already under way: a worker may send its `result` and
+exit, and the result still commits.
+
+### Abort
+
+If the gateway loses its claim while the worker is working (the lease lapsed,
+say, and another worker claimed the task), it sends `abort`, naming the task by
+`id` and `version`. It is one-way. The worker should stop that task's work if it
+can, and it still sends its `result`, which the gateway discards: the task is no
+longer the gateway's to commit, and one reply per request is what keeps the
+stream in step. A worker that does not answer within a lease of the abort is a
+`caller` fault, and the session ends.
+
+A worker that handles one task at a time without reading meanwhile sees the
+`abort` only after it has answered, when it reads the next message. It ignores an
+`abort` that names a task it is not working on.
 
 ### Doc groups in `doWork`
 
