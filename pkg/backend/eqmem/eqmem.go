@@ -18,6 +18,7 @@ import (
 	"github.com/shiblon/entroq/pkg/backend/internal/docgroup"
 	"github.com/shiblon/entroq/pkg/backend/internal/gcmetrics"
 	"github.com/shiblon/entroq/pkg/backend/internal/validate"
+	"github.com/shiblon/entroq/pkg/internal/latency"
 	"github.com/shiblon/entroq/pkg/subq"
 	"github.com/shiblon/stuffedio/wal"
 	"go.opentelemetry.io/otel/metric"
@@ -175,10 +176,12 @@ func WithMeterProvider(mp metric.MeterProvider) Option {
 		m.claimDuration, _ = mp.Meter("entroq.mem").Float64Histogram("entroq.claim.duration",
 			metric.WithDescription("Duration of TryClaim calls in the in-memory backend."),
 			metric.WithUnit("s"),
+			latency.Buckets(),
 		)
 		m.modifyDuration, _ = mp.Meter("entroq.mem").Float64Histogram("entroq.modify.duration",
 			metric.WithDescription("Duration of Modify calls in the in-memory backend."),
 			metric.WithUnit("s"),
+			latency.Buckets(),
 		)
 		m.gcMetrics, _ = gcmetrics.New(mp.Meter("entroq.mem"))
 	}

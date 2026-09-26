@@ -5,13 +5,17 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/internal/latency"
 	"github.com/shiblon/entroq/pkg/testing/eqtest"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 var redisAddr string
@@ -332,4 +336,50 @@ func TestDocConcurrencyStress(t *testing.T) {
 func TestMixedAtomicStress(t *testing.T) {
 	t.Parallel()
 	RunQTest(t, eqtest.MixedAtomicStress)
+}
+
+// TestLatencyMetrics checks that Redis records claim and modify durations, as
+// the other backends do, with the shared latency buckets.
+func TestLatencyMetrics(t *testing.T) {
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	b, err := Open(ctx, WithAddr(redisAddr), WithMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))))
+	if err != nil {
+		t.Fatalf("open backend: %v", err)
+	}
+	defer b.Close()
+	client, err := entroq.New(ctx, func(context.Context) (entroq.Backend, error) { return b, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	queue := "latency-metrics/" + entroq.GenHex16()
+	if _, err := client.Modify(ctx, entroq.InsertingInto(queue)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.TryClaim(ctx, entroq.From(queue)); err != nil {
+		t.Fatal(err)
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &rm); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			h, ok := m.Data.(metricdata.Histogram[float64])
+			if !ok || (m.Name != "entroq.claim.duration" && m.Name != "entroq.modify.duration") {
+				continue
+			}
+			seen[m.Name] = true
+			if dp := h.DataPoints[0]; dp.Count == 0 || !slices.Equal(dp.Bounds, latency.Bounds) {
+				t.Errorf("%s: count %d, bounds %v; want recorded with %v", m.Name, dp.Count, dp.Bounds, latency.Bounds)
+			}
+		}
+	}
+	for _, name := range []string{"entroq.claim.duration", "entroq.modify.duration"} {
+		if !seen[name] {
+			t.Errorf("%s not recorded", name)
+		}
+	}
 }

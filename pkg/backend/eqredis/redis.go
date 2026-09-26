@@ -50,6 +50,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/backend/internal/gcmetrics"
+	"github.com/shiblon/entroq/pkg/internal/latency"
 	"github.com/shiblon/entroq/pkg/subq"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
@@ -118,6 +119,9 @@ type EQRedis struct {
 	gcDone    chan struct{}
 	gcMetrics *gcmetrics.Metrics
 
+	claimDuration  metric.Float64Histogram
+	modifyDuration metric.Float64Histogram
+
 	stopReadiness context.CancelFunc
 	readinessDone chan struct{}
 }
@@ -165,8 +169,9 @@ func WithNotifyWaiter(nw entroq.NotifyWaiter) RedisOpt {
 	}
 }
 
-// WithMeterProvider sets the OTel MeterProvider used for GC telemetry (metrics
-// are reported under the "entroq.redis" meter). Defaults to a noop provider.
+// WithMeterProvider sets the OTel MeterProvider used for claim, modify, and GC
+// telemetry (metrics are reported under the "entroq.redis" meter). Defaults to
+// a noop provider.
 func WithMeterProvider(mp metric.MeterProvider) RedisOpt {
 	return func(o *redisOptions) {
 		o.mp = mp
@@ -229,10 +234,29 @@ func Open(ctx context.Context, opts ...RedisOpt) (*EQRedis, error) {
 	if mp == nil {
 		mp = noop.NewMeterProvider()
 	}
-	gcMetrics, err := gcmetrics.New(mp.Meter("entroq.redis"))
+	meter := mp.Meter("entroq.redis")
+	gcMetrics, err := gcmetrics.New(meter)
 	if err != nil {
 		client.Close()
 		return nil, fmt.Errorf("eqredis open: gc metrics: %w", err)
+	}
+	claimDuration, err := meter.Float64Histogram("entroq.claim.duration",
+		metric.WithDescription("Duration of TryClaim calls against Redis."),
+		metric.WithUnit("s"),
+		latency.Buckets(),
+	)
+	if err != nil {
+		client.Close()
+		return nil, fmt.Errorf("eqredis open: claim metrics: %w", err)
+	}
+	modifyDuration, err := meter.Float64Histogram("entroq.modify.duration",
+		metric.WithDescription("Duration of Modify calls against Redis."),
+		metric.WithUnit("s"),
+		latency.Buckets(),
+	)
+	if err != nil {
+		client.Close()
+		return nil, fmt.Errorf("eqredis open: modify metrics: %w", err)
 	}
 
 	// GC's context is rooted at context.Background(), NOT the constructor's ctx:
@@ -247,6 +271,9 @@ func Open(ctx context.Context, opts ...RedisOpt) (*EQRedis, error) {
 		stopGC:    gcCancel,
 		gcDone:    make(chan struct{}),
 		gcMetrics: gcMetrics,
+
+		claimDuration:  claimDuration,
+		modifyDuration: modifyDuration,
 	}
 	// GC is a first-class, always-on backend behavior.
 	go func() {

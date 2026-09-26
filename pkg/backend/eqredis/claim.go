@@ -20,6 +20,8 @@ func (e *EQRedis) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.
 	if err := validate.Claim(cq); err != nil {
 		return nil, fmt.Errorf("eqredis claim: %w", err)
 	}
+	start := time.Now()
+	defer func() { e.claimDuration.Record(ctx, time.Since(start).Seconds()) }()
 	now := time.Now().UTC()
 
 	// Shuffle queues to avoid consistently favoring one; uniform selection probability.

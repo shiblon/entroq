@@ -161,6 +161,13 @@ runs, so plan a short maintenance window on large doc tables.
 
 ### Fixed
 
+- **Latency metrics resolve milliseconds.** Claim, modify, GC sweep, and
+  `pkg/async` durations are recorded in seconds, as OpenTelemetry recommends,
+  but used the SDK's default buckets (0, 5, 10, 25, ... 10000), which are
+  sized for milliseconds: every latency under five seconds fell in the first
+  bucket. They now share buckets from 100µs to five minutes. Redis also
+  records `entroq.claim.duration` and `entroq.modify.duration`, as the other
+  backends do.
 - **Redis doc reads no longer lose concurrent updates.** `Docs` read docs and
   their group locks in separate round trips, so a write landing between them
   paired old content with the new version. A read-modify-write of that content

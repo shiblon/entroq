@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/internal/latency"
 	"github.com/shiblon/entroq/pkg/worker"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
@@ -122,6 +123,7 @@ func NewReceiver(eq *entroq.EntroQ, upstream string, opts ...ReceiverOption) *Re
 	duration, _ := meter.Float64Histogram("receiver.duration_seconds",
 		metric.WithDescription("HTTP session duration in seconds."),
 		metric.WithUnit("s"),
+		latency.Buckets(),
 	)
 	return &Receiver{
 		eq:            eq,

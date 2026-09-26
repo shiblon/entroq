@@ -18,6 +18,7 @@ import (
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/backend/internal/gcmetrics"
+	"github.com/shiblon/entroq/pkg/internal/latency"
 	"github.com/shiblon/entroq/pkg/subq"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
@@ -112,13 +113,15 @@ func Open(ctx context.Context, path string, opts ...Option) (*EQSQLite, error) {
 	meter := mp.Meter("entroq.sqlite")
 	claimDur, err := meter.Float64Histogram("entroq.claim.duration",
 		metric.WithDescription("Duration of TryClaim calls against SQLite."),
-		metric.WithUnit("s"))
+		metric.WithUnit("s"),
+		latency.Buckets())
 	if err != nil {
 		return nil, fmt.Errorf("eqsqlite open: claim metrics: %w", err)
 	}
 	modifyDur, err := meter.Float64Histogram("entroq.modify.duration",
 		metric.WithDescription("Duration of Modify calls against SQLite."),
-		metric.WithUnit("s"))
+		metric.WithUnit("s"),
+		latency.Buckets())
 	if err != nil {
 		return nil, fmt.Errorf("eqsqlite open: modify metrics: %w", err)
 	}

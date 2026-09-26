@@ -20,6 +20,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 
+	"github.com/shiblon/entroq/pkg/internal/latency"
 	"github.com/shiblon/entroq/pkg/queues"
 )
 
@@ -49,6 +50,7 @@ func New(meter metric.Meter) (*Metrics, error) {
 	sweepDur, err := meter.Float64Histogram("entroq.gc.sweep_duration_seconds",
 		metric.WithDescription("Duration of a full GC scan pass in seconds."),
 		metric.WithUnit("s"),
+		latency.Buckets(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("gc sweep duration histogram: %w", err)

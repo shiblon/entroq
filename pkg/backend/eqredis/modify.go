@@ -32,6 +32,8 @@ func (e *EQRedis) Modify(ctx context.Context, mod *entroq.Modification) (*entroq
 	if err := validate.Modification(mod); err != nil {
 		return nil, fmt.Errorf("eqredis modify: %w", err)
 	}
+	start := time.Now()
+	defer func() { e.modifyDuration.Record(ctx, time.Since(start).Seconds()) }()
 	for attempt := 0; ; attempt++ {
 		resp, err := e.modifyOnce(ctx, mod)
 		if !errors.Is(err, redis.TxFailedErr) {

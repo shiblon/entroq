@@ -29,6 +29,7 @@ import (
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/backend/internal/gcmetrics"
 	"github.com/shiblon/entroq/pkg/backend/internal/validate"
+	"github.com/shiblon/entroq/pkg/internal/latency"
 	"github.com/shiblon/entroq/pkg/subq"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
@@ -408,6 +409,7 @@ func (b *EQPG) initMetrics(mp metric.MeterProvider) error {
 	b.claimDuration, err = meter.Float64Histogram("entroq.claim.duration",
 		metric.WithDescription("Duration of TryClaim calls against the database."),
 		metric.WithUnit("s"),
+		latency.Buckets(),
 	)
 	if err != nil {
 		return fmt.Errorf("claim duration histogram: %w", err)
@@ -415,6 +417,7 @@ func (b *EQPG) initMetrics(mp metric.MeterProvider) error {
 	b.modifyDuration, err = meter.Float64Histogram("entroq.modify.duration",
 		metric.WithDescription("Duration of Modify calls against the database."),
 		metric.WithUnit("s"),
+		latency.Buckets(),
 	)
 	if err != nil {
 		return fmt.Errorf("modify duration histogram: %w", err)

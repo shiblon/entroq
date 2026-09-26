@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/internal/latency"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
 	"golang.org/x/net/http2"
@@ -197,6 +198,7 @@ func (s *Sender) doInitMetrics() error {
 	if s.metricDuration, err = m.Float64Histogram("sender.duration_seconds",
 		metric.WithDescription("Request round-trip duration in seconds."),
 		metric.WithUnit("s"),
+		latency.Buckets(),
 	); err != nil {
 		return fmt.Errorf("sender duration histogram: %w", err)
 	}
