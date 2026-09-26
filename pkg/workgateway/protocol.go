@@ -1,6 +1,7 @@
 package workgateway
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -35,7 +36,7 @@ import (
 // # Registration is out-of-band
 //
 // The queues a worker serves, its max-attempts, and which phases it implements
-// (takeDocs, work, cleanup) are connection-scoped and fixed for the session, so
+// (takeDocs, work, success, dependency) are connection-scoped and fixed for the session, so
 // they are supplied at connection time out-of-band, not as a wire message: flags
 // or env when a client spawns the gateway over a pipe, URL params or headers when
 // a client opens a WebSocket. Those are the same idea (a connection preamble) in
@@ -44,15 +45,20 @@ import (
 // # Lifecycle
 //
 // A connection is one worker slot: exactly one task in flight, strict
-// request/response, no correlation ids (concurrency is more connections). Once
-// connected the gateway drives a loop that mirrors the Go worker lifecycle,
-// sending each phase message only if the worker registered for that phase:
+// request/response, no correlation ids (concurrency is more connections). The
+// gateway speaks first, with a hello naming the protocol version it speaks
+// (Protocol) and its own version, so a client checks compatibility before any
+// task arrives and names both versions if it cannot proceed. A gateway that
+// predates the hello starts with a phase message instead: protocol 0. Then the
+// gateway drives a loop that mirrors the Go worker lifecycle, sending each phase
+// message only if the worker registered for that phase:
 //
+//	gateway -> hello {protocol, version}  # once, first
 //	  (gateway claims a task and begins renewing it)
 //	gateway -> takeDocs {task}            # only if the worker registered takeDocs
 //	client  -> docs {claims: [...]}
-//	  (gateway claims the docs, sorted, and passes them along)
-//	gateway -> doWork {task, docs}
+//	  (gateway claims the doc groups, sorted, and passes them along)
+//	gateway -> doWork {task, docs, groups}
 //	client  -> result {outcome, ack?, modification?, ...}
 //	  (gateway stops renewal, freezes the stable version, and commits atomically)
 //	  (then exactly ONE post-commit phase fires, and only if the worker registered it)
@@ -81,8 +87,17 @@ import (
 // which dependencies failed and lets the worker pick the task's disposition, the
 // same choice the Go worker's OnDependency hook makes.
 
+// Protocol is the version of this protocol the gateway speaks, sent in its
+// hello. It advances when the protocol changes in a way a client must know
+// about; a gateway's release version is only for people to read.
+//
+// Protocol 1 added the hello itself, doc groups in doWork, and the "error"
+// outcome.
+const Protocol = 1
+
 // Message type tags. Every protocol message is a JSON object with a "type".
 const (
+	msgHello      = "hello"
 	msgTakeDocs   = "takeDocs"
 	msgDocs       = "docs"
 	msgDoWork     = "doWork"
@@ -101,6 +116,7 @@ const (
 	outcomeRetry = "retry" // re-queue with backoff, quarantining once attempts exhaust
 	outcomeMove  = "move"  // send straight to a destination (error) queue
 	outcomeFatal = "fatal" // stop the whole worker
+	outcomeError = "error" // the handler failed in a way it does not understand; stop
 )
 
 // The wireX types carry an api/entroq.proto message inside a JSON envelope as
@@ -169,6 +185,14 @@ func unmarshalPB(b []byte, m proto.Message) error {
 	return nil
 }
 
+// helloMsg opens every session: the protocol version the gateway speaks and
+// the gateway's release version, for a client to name when it refuses.
+type helloMsg struct {
+	Type     string `json:"type"`
+	Protocol int    `json:"protocol"`
+	Version  string `json:"version"`
+}
+
 // takeDocsMsg asks the client which docs the claimed task needs. The doc set is
 // a function of the task, so it cannot be static config; it has to be a
 // callback. Sent only when the client registered takeDocs.
@@ -193,14 +217,70 @@ type docClaim struct {
 	Key       string `json:"key"`
 }
 
-// doWorkMsg carries the task and any acquired docs to the client for the actual
-// work. Task is the identical task a native DoWork would receive, as protojson,
-// so a wire worker sees exactly what an in-process one does, down to fields like
-// attempt a reaper or authorizer might use.
+// doWorkMsg carries the task and any acquired doc groups to the client for the
+// actual work. Task is the identical task a native DoWork would receive, as
+// protojson, so a wire worker sees exactly what an in-process one does, down to
+// fields like attempt a reaper or authorizer might use. Groups are the claimed
+// doc groups in claim order, each with its docs, including groups with none;
+// Docs is every group's docs in one list, as before protocol 1.
 type doWorkMsg struct {
-	Type string    `json:"type"`
-	Task wireTask  `json:"task"`
-	Docs []wireDoc `json:"docs,omitempty"`
+	Type   string      `json:"type"`
+	Task   wireTask    `json:"task"`
+	Docs   []wireDoc   `json:"docs,omitempty"`
+	Groups []wireGroup `json:"groups,omitempty"`
+}
+
+// wireGroup is a claimed doc group on the wire: the protojson of its pb.DocGroup
+// lock, with its docs beside the lock's fields as "docs".
+type wireGroup struct {
+	*pb.DocGroup
+	Docs []wireDoc
+}
+
+// MarshalJSON renders the group's lock as protojson and adds its docs.
+func (w wireGroup) MarshalJSON() ([]byte, error) {
+	b, err := protojson.Marshal(w.DocGroup)
+	if err != nil {
+		return nil, err
+	}
+	fields := map[string]json.RawMessage{}
+	if err := json.Unmarshal(b, &fields); err != nil {
+		return nil, err
+	}
+	docs, err := json.Marshal(orEmpty(w.Docs))
+	if err != nil {
+		return nil, err
+	}
+	fields["docs"] = docs
+	return json.Marshal(fields)
+}
+
+// UnmarshalJSON reads a group's protojson lock and its docs.
+func (w *wireGroup) UnmarshalJSON(b []byte) error {
+	fields := map[string]json.RawMessage{}
+	if err := json.Unmarshal(b, &fields); err != nil {
+		return err
+	}
+	if docs, ok := fields["docs"]; ok {
+		if err := json.Unmarshal(docs, &w.Docs); err != nil {
+			return err
+		}
+		delete(fields, "docs")
+	}
+	lock, err := json.Marshal(fields)
+	if err != nil {
+		return err
+	}
+	w.DocGroup = &pb.DocGroup{}
+	return unmarshalPB(lock, w.DocGroup)
+}
+
+// orEmpty returns s, or an empty slice for nil, so it encodes as [] not null.
+func orEmpty[E any](s []E) []E {
+	if s == nil {
+		return []E{}
+	}
+	return s
 }
 
 // disposition is a worker's choice of what happens to the task, shared by every
@@ -246,10 +326,26 @@ func (d disposition) sentinel() (error, bool) {
 		return me, true
 	case outcomeFatal:
 		return worker.FatalErrorf("%s", orDefault(d.Message, "worker requested fatal")), true
+	case outcomeError:
+		// Not a worker sentinel: the Go worker treats it as a handler's unknown
+		// error, leaving the task for its lease to release and stopping.
+		return &HandlerError{Message: orDefault(d.Message, "worker handler failed")}, true
 	default:
 		return worker.FatalErrorf("unknown outcome %q", d.Outcome), true
 	}
 }
+
+// HandlerError is a worker's report that its handler failed with an error it
+// does not understand (the "error" outcome): an exception it did not expect,
+// rather than a retry, move, or fatal it chose. The gateway stops as the Go
+// worker does for an unknown handler error and exits with the caller class; the
+// client, which holds the actual exception, raises it.
+type HandlerError struct {
+	Message string
+}
+
+// Error implements the error interface.
+func (e *HandlerError) Error() string { return "worker handler failed: " + e.Message }
 
 // result is the client's reply to doWork: exactly one disposition. On "ok" the
 // gateway commits Modification; an absent modification commits nothing and leaves
@@ -323,8 +419,9 @@ const (
 	// relocated). Retry or reconnect; it will likely recover.
 	ExitTransient
 	// ExitCaller is a caller fault: a bad registration, a protocol violation, or
-	// a worker-requested fatal. Retrying replays the same problem, so stop and
-	// surface it for a human to fix.
+	// a worker-requested fatal, or a handler error the worker reported.
+	// Retrying replays the same problem, so stop and surface it for a human to
+	// fix.
 	ExitCaller
 	// ExitGateway is an unexpected gateway-internal error. Stop and surface; it is
 	// likely a bug to report rather than something a retry will fix.

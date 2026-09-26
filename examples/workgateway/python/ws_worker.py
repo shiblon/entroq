@@ -28,6 +28,19 @@ import websockets  # pip install websockets
 
 from handler import handle
 
+# The gateway protocol this worker speaks. The gateway opens every session with
+# a hello naming its protocol; a worker that does not speak it stops, naming the
+# gateway's version so a person can see what is installed.
+PROTOCOL = 1
+
+
+def check_hello(msg):
+    if msg.get("protocol") != PROTOCOL:
+        sys.exit(
+            f"[worker] gateway {msg.get('version')} speaks protocol "
+            f"{msg.get('protocol')}; this worker speaks {PROTOCOL}"
+        )
+
 WS_URL = os.environ.get("GATEWAY_WS_URL", "ws://localhost:8080/work?queue=in&work=1")
 
 # WebSocket close codes the gateway uses (see ws.go); the one we branch on:
@@ -41,7 +54,9 @@ async def run_once():
             async for raw in ws:
                 msg = json.loads(raw)
                 kind = msg.get("type")
-                if kind == "doWork":
+                if kind == "hello":
+                    check_hello(msg)
+                elif kind == "doWork":
                     await ws.send(json.dumps(handle(msg["task"])))
                 elif kind == "error":
                     print(f"[worker] gateway error [{msg.get('class')}]: {msg.get('message')}", file=sys.stderr)

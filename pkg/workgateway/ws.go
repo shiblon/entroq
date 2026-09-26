@@ -33,7 +33,7 @@ func (w *WSConn) Recv(ctx context.Context, v any) error { return wsjson.Read(ctx
 // Handler returns the work gateway's HTTP handler. A worker connects to /work
 // and declares its registration in the URL query string (?queue=... repeated,
 // plus optional maxAttempts=N, maxClaims=N, takeDocs=1, work=1, success=1,
-// dependency=1), the
+// dependency=1, errorQueue=Q, retryDelay=D as a Go duration), the
 // same connection preamble a pipe worker supplies via flags. The handler upgrades
 // to WebSocket and runs one Bridge over it. Canceling ctx stops every connection.
 //
@@ -54,8 +54,17 @@ func Handler(ctx context.Context, eq *entroq.EntroQ, lease, entroqTimeout time.D
 			http.Error(rw, err.Error(), http.StatusBadRequest)
 			return
 		}
+		var retryDelay time.Duration
+		if d := r.URL.Query().Get("retryDelay"); d != "" {
+			if retryDelay, err = time.ParseDuration(d); err != nil {
+				http.Error(rw, fmt.Sprintf("work gateway: bad retryDelay %q: %v", d, err), http.StatusBadRequest)
+				return
+			}
+		}
 		cfg := Config{
 			Queues:      r.URL.Query()["queue"],
+			ErrorQueue:  r.URL.Query().Get("errorQueue"),
+			RetryDelay:  retryDelay,
 			MaxAttempts: maxAttempts,
 			MaxClaims:   maxClaims,
 			TakeDocs:    queryBool(r, "takeDocs"),

@@ -22,6 +22,8 @@ var (
 	workWork          bool
 	workSuccess       bool
 	workDependency    bool
+	workErrorQueue    string
+	workRetryDelay    time.Duration
 	workEntroQTimeout time.Duration
 )
 
@@ -112,6 +114,8 @@ WebSocket close codes (1013 transient, 1008 caller, 1011 gateway).`,
 			Work:        workWork,
 			Success:     workSuccess,
 			Dependency:  workDependency,
+			ErrorQueue:  workErrorQueue,
+			RetryDelay:  workRetryDelay,
 		}
 		bridge := workgateway.NewBridge(workgateway.NewPipeConn(os.Stdin, os.Stdout),
 			workgateway.WithConfig(cfg), workgateway.WithLease(workLease),
@@ -131,6 +135,8 @@ func init() {
 	flags.BoolVar(&workWork, "work", false, "The worker implements the work phase (required).")
 	flags.BoolVar(&workSuccess, "success", false, "The worker implements the success phase (post-commit).")
 	flags.BoolVar(&workDependency, "dependency", false, "The worker implements the dependency phase (commit lost a dependency).")
+	flags.StringVar(&workErrorQueue, "error-queue", "", `Queue a quarantined task, or one moved with no destination, goes to; "{inbox}" stands for the task's queue. Default "{inbox}/err".`)
+	flags.DurationVar(&workRetryDelay, "retry-delay", 0, "Base delay before a retried task is available again; 0 keeps the worker default.")
 	flags.DurationVar(&workEntroQTimeout, "entroq-timeout", 60*time.Second, "How long to ride out an unreachable EntroQ backend (restart or relocation) before exiting; 0 disables the ride-out.")
 
 	rootCmd.AddCommand(workCmd)

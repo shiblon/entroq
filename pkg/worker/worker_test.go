@@ -286,3 +286,17 @@ func TestWithRenewed(t *testing.T) {
 		t.Error("withRenewed changed the group it was given")
 	}
 }
+
+func TestErrQTemplate(t *testing.T) {
+	for template, want := range map[string]string{
+		"":                  "jobs/err",
+		"{inbox}/err":       "jobs/err",
+		"{inbox}/dead":      "jobs/dead",
+		"quarantine":        "quarantine",
+		"x/{inbox}/{inbox}": "x/jobs/jobs",
+	} {
+		if got := ErrQTemplate(template)("jobs"); got != want {
+			t.Errorf("ErrQTemplate(%q)(jobs) = %q, want %q", template, got, want)
+		}
+	}
+}

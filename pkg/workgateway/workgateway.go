@@ -17,12 +17,14 @@ package workgateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"time"
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/pbconv"
+	"github.com/shiblon/entroq/pkg/version"
 	"github.com/shiblon/entroq/pkg/worker"
 )
 
@@ -48,7 +50,16 @@ type Config struct {
 	Work        bool     // worker implements the work phase (required)
 	Success     bool     // worker implements the success phase (post-commit)
 	Dependency  bool     // worker implements the dependency phase (commit lost a dependency)
+
+	// ErrorQueue names the queue a task moves to when it is quarantined or
+	// moved with no destination, as a worker.ErrQTemplate: "{inbox}" stands
+	// for the task's own queue, so "{inbox}/err" is the default.
+	ErrorQueue string
+	// RetryDelay is the base delay before a retried task is available again;
+	// 0 keeps the worker's default.
+	RetryDelay time.Duration
 }
+
 
 // defaultEntroQTimeout is how long a Bridge rides out an unreachable EntroQ
 // backend before giving up, unless WithEntroQTimeout overrides it.
@@ -140,6 +151,12 @@ func (b *Bridge) recv(ctx context.Context, v any) error {
 // (graceful shutdown, or the client hanging up) and an *ExitError otherwise, so
 // the transport can map the class onto an exit or close code.
 func (b *Bridge) Run(ctx context.Context, eq *entroq.EntroQ) error {
+	// The hello comes first, before anything can fail, so a client can always
+	// check the protocol, and can tell a registration it got wrong from a
+	// gateway it cannot talk to.
+	if err := b.send(ctx, helloMsg{Type: msgHello, Protocol: Protocol, Version: version.Version}); err != nil {
+		return nil // the client is already gone
+	}
 	if len(b.cfg.Queues) == 0 {
 		return &ExitError{Class: ExitCaller, err: fmt.Errorf("gateway registration: at least one queue is required")}
 	}
@@ -209,14 +226,21 @@ func (b *Bridge) runWorker(ctx context.Context, eq *entroq.EntroQ) error {
 		opts = append(opts, worker.WithTakeDocs[json.RawMessage](b.takeDocs))
 	}
 	opts = append(opts, worker.WithDoModify[json.RawMessage](b.doWork))
+	if b.cfg.ErrorQueue != "" {
+		opts = append(opts, worker.WithErrQMap[json.RawMessage](worker.ErrQTemplate(b.cfg.ErrorQueue)))
+	}
 
 	w := worker.New(eq, opts...)
-	return w.Run(ctx,
+	runOpts := []worker.RunOption{
 		worker.Watching(b.cfg.Queues...),
 		worker.WithLease(b.lease),
 		worker.WithMaxAttempts(b.cfg.MaxAttempts),
 		worker.WithMaxClaims(b.cfg.MaxClaims),
-	)
+	}
+	if b.cfg.RetryDelay > 0 {
+		runOpts = append(runOpts, worker.WithBaseRetryDelay(b.cfg.RetryDelay))
+	}
+	return w.Run(ctx, runOpts...)
 }
 
 // classify maps a worker run's exit into a class. The connLost bit is checked
@@ -233,7 +257,8 @@ func (b *Bridge) classify(err error) ExitClass {
 	case entroq.IsUnavailable(err):
 		return ExitTransient
 	default:
-		if _, ok := worker.AsFatal(err); ok {
+		var he *HandlerError
+		if _, ok := worker.AsFatal(err); ok || errors.As(err, &he) {
 			return ExitCaller
 		}
 		return ExitGateway
@@ -288,12 +313,17 @@ func (b *Bridge) doWork(ctx context.Context, task *entroq.Task, _ json.RawMessag
 		return nil, fmt.Errorf("convert task for doWork: %w", err)
 	}
 	msg := doWorkMsg{Type: msgDoWork, Task: wireTask{taskPB}}
-	for _, d := range entroq.GroupDocs(groups) {
-		docPB, err := pbconv.DocToProto(d)
-		if err != nil {
-			return nil, fmt.Errorf("convert doc for doWork: %w", err)
+	for _, g := range groups {
+		wg := wireGroup{DocGroup: pbconv.DocGroupToProto(g)}
+		for _, d := range g.Docs {
+			docPB, err := pbconv.DocToProto(d)
+			if err != nil {
+				return nil, fmt.Errorf("convert doc for doWork: %w", err)
+			}
+			wg.Docs = append(wg.Docs, wireDoc{docPB})
 		}
-		msg.Docs = append(msg.Docs, wireDoc{docPB})
+		msg.Groups = append(msg.Groups, wg)
+		msg.Docs = append(msg.Docs, wg.Docs...)
 	}
 	if err := b.send(ctx, msg); err != nil {
 		return nil, fmt.Errorf("send doWork: %w", err)

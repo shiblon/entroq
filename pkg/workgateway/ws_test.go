@@ -33,6 +33,7 @@ func TestWS_OK(t *testing.T) {
 		t.Fatalf("dial: %v", err)
 	}
 	defer c.CloseNow()
+	readHello(t, ctx, c)
 
 	var dw doWorkMsg
 	if err := wsjson.Read(ctx, c, &dw); err != nil {
@@ -80,10 +81,14 @@ func TestWS_ClientDropReclaims(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
+	readHello(t, ctx, c)
 
 	var dw doWorkMsg
 	if err := wsjson.Read(ctx, c, &dw); err != nil {
 		t.Fatalf("read doWork: %v", err)
+	}
+	if dw.Type != msgDoWork {
+		t.Fatalf("got %q, want %q", dw.Type, msgDoWork)
 	}
 	c.CloseNow() // abruptly drop without replying
 
@@ -102,5 +107,18 @@ func TestWS_ClientDropReclaims(t *testing.T) {
 			t.Fatal("task never reclaimable after a WS drop + lease expiry")
 		case <-time.After(20 * time.Millisecond):
 		}
+	}
+}
+
+// readHello reads the gateway's opening hello on a WebSocket, as every client
+// does before the first phase message.
+func readHello(t *testing.T, ctx context.Context, c *websocket.Conn) {
+	t.Helper()
+	var h helloMsg
+	if err := wsjson.Read(ctx, c, &h); err != nil {
+		t.Fatalf("read hello: %v", err)
+	}
+	if h.Type != msgHello || h.Protocol != Protocol {
+		t.Fatalf("hello: got %+v, want protocol %d", h, Protocol)
 	}
 }

@@ -453,6 +453,22 @@ func TestWorkMaxClaimsMovesInputAndResetRevivesIt(t *testing.T) {
 	})
 }
 
+// TestWorkErrorQueueTemplate checks that "{inbox}" in --error-queue stands for
+// each input queue, so a worker watching several queues quarantines each
+// task beside its own inbox.
+func TestWorkErrorQueueTemplate(t *testing.T) {
+	a, b := uniqueQueue(t, "a"), uniqueQueue(t, "b")
+	mustRun(t, "ins", "-q", a, "-v", `{"x":1}`)
+	mustRun(t, "ins", "-q", b, "-v", `{"x":2}`)
+
+	work := startRun(t, "work", "-q", a, "-q", b, "--max-attempts", "1", "--error-queue", "{inbox}/quarantine", "--", "false")
+	defer work.stop(t)
+
+	waitFor(t, "each failed task quarantined beside its inbox", work, func() bool {
+		return len(tasksInQueue(t, a+"/quarantine")) == 1 && len(tasksInQueue(t, b+"/quarantine")) == 1
+	})
+}
+
 func TestWorkMaxOutputBytesMovesInputToErrorQueue(t *testing.T) {
 	in := uniqueQueue(t, "in")
 	outQ := uniqueQueue(t, "out")

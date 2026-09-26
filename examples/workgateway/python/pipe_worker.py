@@ -38,6 +38,19 @@ QUEUE = os.environ.get("QUEUE", "in")
 # 78 (caller fault), and 70 (gateway fault) are all terminal -- stop and surface.
 EXIT_TRANSIENT = 75
 
+# The gateway protocol this worker speaks. The gateway opens every session with
+# a hello naming its protocol; a worker that does not speak it stops, naming the
+# gateway's version so a person can see what is installed.
+PROTOCOL = 1
+
+
+def check_hello(msg):
+    if msg.get("protocol") != PROTOCOL:
+        sys.exit(
+            f"[worker] gateway {msg.get('version')} speaks protocol "
+            f"{msg.get('protocol')}; this worker speaks {PROTOCOL}"
+        )
+
 
 def serve(proc):
     """Answer phase messages from one gateway child until it exits.
@@ -49,7 +62,9 @@ def serve(proc):
     for line in proc.stdout:
         msg = json.loads(line)
         kind = msg.get("type")
-        if kind == "doWork":
+        if kind == "hello":
+            check_hello(msg)
+        elif kind == "doWork":
             reply = handle(msg["task"])
             proc.stdin.write((json.dumps(reply) + "\n").encode())
             proc.stdin.flush()

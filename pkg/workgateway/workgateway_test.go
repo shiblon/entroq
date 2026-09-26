@@ -73,6 +73,7 @@ type session struct {
 	errc    chan error
 	clientR *io.PipeReader // client's read end; closing it breaks the bridge's Send
 	clientW *io.PipeWriter // client's write end; closing it gives the bridge's Recv EOF
+	hello   helloMsg       // the gateway's opening message
 }
 
 func newSession(t *testing.T, ctx context.Context, eq *entroq.EntroQ, cfg Config, lease time.Duration, opts ...Option) *session {
@@ -86,7 +87,7 @@ func newSession(t *testing.T, ctx context.Context, eq *entroq.EntroQ, cfg Config
 	errc := make(chan error, 1)
 	go func() { errc <- bridge.Run(rctx, eq) }()
 
-	return &session{
+	s := &session{
 		t:       t,
 		c:       &codec{t: t, enc: json.NewEncoder(clientW), dec: json.NewDecoder(clientR)},
 		cancel:  cancel,
@@ -94,6 +95,13 @@ func newSession(t *testing.T, ctx context.Context, eq *entroq.EntroQ, cfg Config
 		clientR: clientR,
 		clientW: clientW,
 	}
+	// Every session opens with the gateway's hello; keep it for the tests
+	// that check it, and start the rest at the first phase message.
+	s.c.recv(&s.hello)
+	if s.hello.Type != msgHello {
+		t.Fatalf("first message: got type %q, want %q", s.hello.Type, msgHello)
+	}
+	return s
 }
 
 // closeClient simulates the worker vanishing: it closes both client pipe ends,

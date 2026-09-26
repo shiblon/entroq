@@ -123,6 +123,19 @@ runs, so plan a short maintenance window on large doc tables.
   the members when a server older than this one sends none. Replace
   `docs, err := eq.ClaimDocs(...)` with `group, err := ...` and read
   `group.Docs`.
+- **Work gateway protocol 1.** `eqlink work` opens every session with a
+  `hello` naming the protocol version it speaks (`workgateway.Protocol`) and
+  its release, so a worker checks compatibility before any task and names both
+  versions when it cannot proceed; a gateway without the hello is protocol 0.
+  `doWork` carries the claimed doc groups, each with its docs and its version
+  and claim, including groups with no docs. A worker can report an `error`
+  outcome for a handler failure it does not understand. `--error-queue` (with
+  `{inbox}` standing for the task's queue) and `--retry-delay`, or the
+  `errorQueue` and `retryDelay` URL params, pass through the Go worker's error
+  queue and base retry delay. The example workers check the hello. `eqc work
+  --error-queue` takes the same `{inbox}` template (`worker.ErrQTemplate`), so a
+  worker watching several queues can quarantine each task beside its inbox; a
+  name without `{inbox}` still means one queue for all.
 - **Breaking (Go): worker handlers receive doc groups.** `DoWork`, `DoModify`,
   and `Finish` handlers, and the `Handler` interface, take
   `[]*entroq.DocGroup` where they took `[]*entroq.Doc`: one group per claim

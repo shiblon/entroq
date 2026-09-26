@@ -66,7 +66,7 @@ func init() {
 	flags.DurationVar(&flagWork.retryIn, "retry-in", worker.DefaultRetryDelay, "Relative delay before retrying a failed input task.")
 	flags.Int32Var(&flagWork.maxAttempts, "max-attempts", 0, "Maximum attempts before moving the input task to the error queue. The default 0 means unlimited retries.")
 	flags.Int32Var(&flagWork.maxClaims, "max-claims", 0, "Maximum claims before moving the input task to the error queue without running the command. Claim N may run; a later claim is moved. Catches tasks whose runs never finish, such as a command that crashes the worker. The default 0 means no maximum.")
-	flags.StringVar(&flagWork.errorQueue, "error-queue", "", "Queue for exhausted or non-retriable failed tasks. Defaults to <input>/err.")
+	flags.StringVar(&flagWork.errorQueue, "error-queue", "", `Queue for exhausted or non-retriable failed tasks; "{inbox}" stands for the input queue. Defaults to "{inbox}/err".`)
 	flags.DurationVar(&flagWork.lease, "lease", entroq.DefaultClaimDuration, "Claim lease and renewal interval.")
 	flags.Int64Var(&flagWork.maxOutputBytes, "max-output-bytes", defaultMaxWorkOutputSize, "Maximum stdout bytes to capture from the command. Use 0 for unlimited.")
 }
@@ -255,10 +255,7 @@ func (cfg *workConfig) doWork(ctx context.Context, task *entroq.Task, value json
 // errorQueueFor is also the worker's error queue map, so tasks the worker moves
 // itself, such as for --max-claims, land where command failures do.
 func (cfg *workConfig) errorQueueFor(inbox string) string {
-	if cfg.errorQueue != "" {
-		return cfg.errorQueue
-	}
-	return worker.DefaultErrQMap(inbox)
+	return worker.ErrQTemplate(cfg.errorQueue)(inbox)
 }
 
 func (cfg *workConfig) retryArg(task *entroq.Task, msg string) entroq.ModifyArg {

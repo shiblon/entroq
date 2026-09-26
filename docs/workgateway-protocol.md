@@ -39,10 +39,34 @@ worker using `WithDocArrivalTime`.
 
 ## Registration is out of band
 
-The queues a worker serves, its max-attempts, and which phases it implements are
-fixed for the session and supplied at connection time, never as a wire message:
-flags for a spawned pipe gateway, URL query params for a WebSocket. A work handler
-is required; the others are opt-in.
+The queues a worker serves, its max-attempts and max-claims, which phases it
+implements, its error queue, and its base retry delay are fixed for the session
+and supplied at connection time, never as a wire message: flags for a spawned
+pipe gateway (`--queue`, `--max-attempts`, `--max-claims`, `--take-docs`,
+`--work`, `--success`, `--dependency`, `--error-queue`, `--retry-delay`), URL
+query params for a WebSocket (`queue`, `maxAttempts`, `maxClaims`, `takeDocs`,
+`work`, `success`, `dependency`, `errorQueue`, `retryDelay`). A work handler is
+required; the others are opt-in. In the error queue, `{inbox}` stands for the
+task's own queue, so `{inbox}/err` is the default; a name without it is one
+error queue for every inbox.
+
+## Hello and protocol versions
+
+The gateway speaks first, before any task arrives, with a hello:
+
+```
+gateway -> hello {protocol: 1, version: "v1.13.0"}
+```
+
+`protocol` is the version of this protocol the gateway speaks, and it alone
+decides compatibility: a worker checks it and stops if it does not speak it,
+naming `version` (the gateway's release, for a person to read) in its error. A
+gateway older than protocol 1 sends no hello; its first message is a phase
+message, which a worker reads as protocol 0. The hello is sent even when the
+registration is then refused, so a worker can tell a registration it got wrong
+from a gateway it cannot talk to.
+
+Protocol 1 added the hello, doc groups in `doWork`, and the `error` outcome.
 
 ## Phases
 
@@ -51,10 +75,11 @@ request/response, no correlation IDs. Concurrency is more connections. Per task,
 the gateway sends only the phases the worker registered:
 
 ```
+gateway -> hello {protocol, version}  # once, first
   (gateway claims a task and begins renewing it)
 gateway -> takeDocs {task}            # only if registered takeDocs
 client  -> docs {claims: [...]}
-gateway -> doWork {task, docs}
+gateway -> doWork {task, docs, groups}
 client  -> result {outcome, ack?, modification?}
   (gateway stops renewal, freezes the stable version, commits atomically)
   (then exactly ONE post-commit phase fires, and only if registered)
@@ -75,10 +100,32 @@ dropped connection reclaims the task on lease expiry); `success` after it is
 best-effort and at-most-once, so success-phase side effects must be idempotent or
 safe to skip.
 
+### Doc groups in `doWork`
+
+Each claim in `docs` takes a doc group: the docs sharing a primary key in a
+namespace, which have one version, claimant, and arrival time between them.
+`groups` carries each claimed group, in the order the gateway claimed them
+(sorted by namespace, then key), as the protojson of its `DocGroup` with its
+docs beside the lock's fields:
+
+```json
+{"namespace": "ns", "key": "k", "version": 3, "claimant": "...", "atMs": "...",
+ "docs": [{"namespace": "ns", "id": "a", "key": "k", ...}]}
+```
+
+A group claimed with no docs appears with `"docs": []`, still reporting its
+version and claim. `docs` is every group's docs in one list, as before protocol
+1. As protojson, a zero version is omitted, so read a missing `version` as 0.
+
 ### Outcomes and the `ack` shorthand
 
 A `result` (and a post-commit `done`) carries an outcome: `ok`, `retry`, `move`,
-or `fatal` — the same vocabulary a native Go worker has. `ok` commits the
+`fatal`, or `error` — the vocabulary a native Go worker has. `error` reports
+that the handler failed in a way it does not understand, such as an exception
+it did not expect, as opposed to a retry, move, or fatal it chose: the gateway
+stops as the Go worker does for an unknown handler error, leaving the task for
+its lease to release, and exits with the caller class; the worker, which holds
+the actual exception, raises it. `ok` commits the
 modification; `ok` **alone does not delete the task**. Deleting the input is the
 overwhelmingly common case, so set `"ack": true` and the gateway deletes the
 claimed task for you (from its own authoritative copy — you never echo id/version

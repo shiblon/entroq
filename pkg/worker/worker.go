@@ -37,6 +37,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -511,6 +512,19 @@ func (w *Worker[T]) ErrorQueueFor(inbox string) string {
 // "/err" to the inbox name.
 func DefaultErrQMap(inbox string) string {
 	return inbox + "/err"
+}
+
+// ErrQTemplate returns the error queue mapping a template names: "{inbox}" in
+// it stands for the inbox, so "{inbox}/err" is DefaultErrQMap, and a template
+// without it is one error queue for every inbox. An empty template is
+// DefaultErrQMap. Command-line workers take their error queue flag this way.
+func ErrQTemplate(template string) ErrQMap {
+	if template == "" {
+		return DefaultErrQMap
+	}
+	return func(inbox string) string {
+		return strings.ReplaceAll(template, "{inbox}", inbox)
+	}
 }
 
 // WithDoWork sets the primary work function for a worker. It runs under
