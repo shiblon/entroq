@@ -27,7 +27,8 @@
 //			log.Fatalf("Failed to open service backends: %v", err)
 //		}
 //
-//		s := grpc.NewServer()
+//		// ServerKeepalive accepts the client's pings during a long Claim.
+//		s := grpc.NewServer(eqgrpc.ServerKeepalive())
 //		pb.RegisterEntroQServer(s, svc)
 //		s.Serve(listener)
 //	}

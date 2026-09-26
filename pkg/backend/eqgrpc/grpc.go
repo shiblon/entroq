@@ -10,9 +10,9 @@
 // You can start, for example, a postgres-backed QSvc like this (or just use pg/svc):
 //
 //	ctx := context.Background()
-//	svc, err := eqsvcgrpc.New(ctx, pg.Opener(dbHostPort)) // Other options available, too.
+//	svc, err := eqsvcgrpc.New(ctx, eqpg.Opener(dbHostPort)) // Other options available, too.
 //	if err != nil {
-//		log.Fatalf("Can't open PG backend: %v",e rr)
+//		log.Fatalf("Can't open PG backend: %v", err)
 //	}
 //	defer svc.Close()
 //
@@ -21,7 +21,7 @@
 //		log.Fatalf("Can't start this service")
 //	}
 //
-//	s := eqgrpc.NewServer()
+//	s := grpc.NewServer(eqgrpc.ServerKeepalive())
 //	pb.RegisterEntroQServer(s, svc)
 //	s.Serve(lis)
 //
@@ -112,6 +112,23 @@ func WithNiladicDialer(f func() (net.Conn, error)) Option {
 	return WithDialOpts(grpc.WithDialer(func(string, time.Duration) (net.Conn, error) {
 		return f()
 	}))
+}
+
+// ServerKeepalive is the server option that accepts this client's keepalive
+// pings while an RPC such as Claim is open. The grpc-go server default refuses
+// pings more often than every five minutes and closes the connection on the
+// third, failing any claim that waits longer than a few pings. Every server
+// for EntroQ clients needs it:
+//
+//	s := grpc.NewServer(eqgrpc.ServerKeepalive())
+func ServerKeepalive() grpc.ServerOption {
+	return grpc.KeepaliveEnforcementPolicy(serverKeepalivePolicy())
+}
+
+// serverKeepalivePolicy accepts pings as often as DefaultKeepaliveTime, but
+// only while an RPC is open, as the client only sends them then.
+func serverKeepalivePolicy() keepalive.EnforcementPolicy {
+	return keepalive.EnforcementPolicy{MinTime: DefaultKeepaliveTime}
 }
 
 // WithMaxSize is a convenience method for setting

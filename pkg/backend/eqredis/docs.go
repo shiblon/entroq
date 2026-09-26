@@ -139,10 +139,27 @@ func (e *EQRedis) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc,
 	if err := rq.Validate(); err != nil {
 		return nil, fmt.Errorf("eqredis docs: %w", err)
 	}
+	// ids are the docs to read, and keys their primary keys where known.
 	var ids []string
+	keys := make(map[string]string)
 
 	if len(rq.IDs) > 0 {
 		ids = rq.IDs
+		// Look up the primary keys, which never change, so the docs and their
+		// group locks can be read together below.
+		pipe := e.client.Pipeline()
+		cmds := make([]*redis.StringCmd, len(ids))
+		for i, id := range ids {
+			cmds[i] = pipe.HGet(ctx, docKey(rq.Namespace, id), "key_primary")
+		}
+		if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+			return nil, fmt.Errorf("docs key lookup: %w", err)
+		}
+		for i, cmd := range cmds {
+			if key, err := cmd.Result(); err == nil {
+				keys[ids[i]] = key
+			}
+		}
 	} else {
 		// Use namespace index for key-range scan.
 		idxKey := docNSIndexKey(rq.Namespace)
@@ -179,60 +196,86 @@ func (e *EQRedis) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc,
 		}
 
 		for _, m := range members {
-			_, _, id := parseDocIndexMember(m)
+			key, _, id := parseDocIndexMember(m)
 			ids = append(ids, id)
+			keys[id] = key
 		}
 	}
 
 	if len(ids) == 0 {
 		return nil, nil
 	}
-
-	// Pipeline HGETALL for each doc.
-	pipe := e.client.Pipeline()
-	cmds := make([]*redis.MapStringStringCmd, len(ids))
-	for i, id := range ids {
-		cmds[i] = pipe.HGetAll(ctx, docKey(rq.Namespace, id))
+	for {
+		docs, ok, err := e.readDocsWithLocks(ctx, rq, ids, keys)
+		if err != nil || ok {
+			return docs, err
+		}
 	}
-	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
-		return nil, fmt.Errorf("docs pipeline hgetall: %w", err)
+}
+
+// readDocsWithLocks reads docs and their groups' locks in one transaction, so
+// each doc's content and its group's version come from the same moment. Read
+// apart, a write landing between them would pair old content with the new
+// version, and a read-modify-write of that content would pass its version
+// check and overwrite the newer content. keys gives each doc's primary key,
+// read beforehand; it returns false if a doc turned out to belong to another
+// group, deleted and inserted again meanwhile, and the caller reads again.
+func (e *EQRedis) readDocsWithLocks(ctx context.Context, rq *entroq.DocQuery, ids []string, keys map[string]string) ([]*entroq.Doc, bool, error) {
+	var groups []docgroup.Group
+	for _, id := range ids {
+		if key, ok := keys[id]; ok {
+			if g := (docgroup.Group{Namespace: rq.Namespace, Key: key}); !slices.Contains(groups, g) {
+				groups = append(groups, g)
+			}
+		}
+	}
+	docCmds := make([]*redis.MapStringStringCmd, len(ids))
+	lockCmds := make([]*redis.MapStringStringCmd, len(groups))
+	if _, err := e.client.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		for i, id := range ids {
+			docCmds[i] = pipe.HGetAll(ctx, docKey(rq.Namespace, id))
+		}
+		for i, g := range groups {
+			lockCmds[i] = pipe.HGetAll(ctx, lockKey(g))
+		}
+		return nil
+	}); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, false, fmt.Errorf("eqredis docs: %w", err)
+	}
+	locks := make(map[docgroup.Group]docgroup.Lock, len(groups))
+	for i, g := range groups {
+		l, err := parseLock(lockCmds[i].Val())
+		if err != nil {
+			return nil, false, fmt.Errorf("eqredis docs: %w", err)
+		}
+		locks[g] = l
 	}
 
 	var docs []*entroq.Doc
-	var groups []docgroup.Group
-	for i, cmd := range cmds {
-		vals, err := cmd.Result()
-		if errors.Is(err, redis.Nil) || len(vals) == 0 {
+	for i, cmd := range docCmds {
+		vals := cmd.Val()
+		if len(vals) == 0 {
 			continue
-		}
-		if err != nil {
-			return nil, fmt.Errorf("docs hgetall %q: %w", ids[i], err)
 		}
 		f, err := parseDocFields(vals)
 		if err != nil {
-			return nil, fmt.Errorf("docs parse %q: %w", ids[i], err)
+			return nil, false, fmt.Errorf("docs parse %q: %w", ids[i], err)
 		}
 		d := f.toDoc()
 		if rq.OmitValues {
 			d.Content = nil
 		}
+		l, ok := locks[docgroup.Group{Namespace: d.Namespace, Key: d.Key}]
+		if !ok {
+			return nil, false, nil
+		}
+		// Each doc carries its group's version and claim, the only ones it has.
+		if l != docgroup.Absent {
+			d = docgroup.Overlay(d, l)
+		}
 		docs = append(docs, d)
-		if g := (docgroup.Group{Namespace: d.Namespace, Key: d.Key}); !slices.Contains(groups, g) {
-			groups = append(groups, g)
-		}
 	}
-
-	// Each doc carries its group's version and claim, the only ones it has.
-	locks, err := readLocks(ctx, e.client, groups)
-	if err != nil {
-		return nil, fmt.Errorf("eqredis docs: %w", err)
-	}
-	for i, d := range docs {
-		if l := locks[docgroup.Group{Namespace: d.Namespace, Key: d.Key}]; l != docgroup.Absent {
-			docs[i] = docgroup.Overlay(d, l)
-		}
-	}
-	return docs, nil
+	return docs, true, nil
 }
 
 // ClaimDocs claims the group of docs sharing a primary key in a namespace and

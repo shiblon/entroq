@@ -75,7 +75,7 @@ func StartService(ctx context.Context, opener entroq.BackendOpener) (stop func()
 	if err != nil {
 		return nil, nil, fmt.Errorf("start service: %w", err)
 	}
-	s := grpc.NewServer()
+	s := grpc.NewServer(eqgrpc.ServerKeepalive())
 	hpb.RegisterHealthServer(s, health.NewServer())
 	pb.RegisterEntroQServer(s, svc)
 	go s.Serve(lis)

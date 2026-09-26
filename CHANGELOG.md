@@ -21,6 +21,12 @@ runs, so plan a short maintenance window on large doc tables.
 
 ### Added
 
+- **`eqgrpc.ServerKeepalive`.** The server option every server for EntroQ
+  clients needs: it accepts the client's keepalive pings while a claim is
+  open. A server built without it, as the package documentation's examples
+  showed, keeps the grpc-go default, refuses pings more often than every five
+  minutes, and closes the connection on the third, failing any claim that
+  waits more than about a minute and a half. The examples now use it.
 - **Readiness loops for SQLite and Redis.** Both backends now wake claims for
   tasks that become available with time, every `WithReadinessInterval`
   (default 5s; `--readiness_interval` on `eqsqlite serve` and `eqredis serve`),
@@ -155,6 +161,12 @@ runs, so plan a short maintenance window on large doc tables.
 
 ### Fixed
 
+- **Redis doc reads no longer lose concurrent updates.** `Docs` read docs and
+  their group locks in separate round trips, so a write landing between them
+  paired old content with the new version. A read-modify-write of that content
+  then passed its version check and overwrote the newer content: under
+  contention, increments were lost. Docs and their locks are now read in one
+  transaction, so a doc's version is never newer than its content.
 - **PostgreSQL's claimant filter on `Tasks` matches the other backends.**
   `entroq.ClaimedBy` and `ClaimedBySelf` keep what that claimant can act on
   now: available tasks and the ones it holds. PostgreSQL also returned

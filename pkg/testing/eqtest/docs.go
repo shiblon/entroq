@@ -250,6 +250,9 @@ func DocListing(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefi
 // goroutines attempt to read-modify-write the same docs simultaneously,
 // relying on version-based dependency checks for optimistic concurrency.
 func DocConcurrencyStress(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	if testing.Short() {
+		t.Skip("stress test; skipped with -short")
+	}
 	ns := path.Join(qPrefix, "stress_ns")
 	const (
 		numDocs    = 10
@@ -348,6 +351,9 @@ func DocConcurrencyStress(ctx context.Context, t *testing.T, client *entroq.Entr
 // under high contention, verifying that combined queue+namespace locking
 // remains atomic and deadlock-free.
 func MixedAtomicStress(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	if testing.Short() {
+		t.Skip("stress test; skipped with -short")
+	}
 	ns := path.Join(qPrefix, "mixed_ns")
 	q := path.Join(qPrefix, "mixed_q")
 	const (
@@ -357,8 +363,9 @@ func MixedAtomicStress(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 	)
 
 	// Setup: each 'item' has a task and a corresponding doc, both starting at 0.
+	// Task IDs are unique across queues, so each run names its own.
 	for i := range numItems {
-		id := fmt.Sprintf("item-%d", i)
+		id := uniqueTaskID(fmt.Sprintf("item-%d", i))
 		if _, err := client.Modify(ctx,
 			entroq.InsertingInto(q, entroq.WithID(id), entroq.WithValue(0)),
 			entroq.PuttingDocInto(ns,

@@ -30,7 +30,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	hpb "google.golang.org/grpc/health/grpc_health_v1"
-	"google.golang.org/grpc/keepalive"
 )
 
 const bytesPerMB = 1024 * 1024
@@ -147,7 +146,7 @@ func Run(ctx context.Context, cfg Config, open OpenFunc, backendDescription stri
 	grpcServer := grpc.NewServer(
 		grpc.MaxRecvMsgSize(cfg.MaxSize*bytesPerMB),
 		grpc.MaxSendMsgSize(cfg.MaxSize*bytesPerMB),
-		grpc.KeepaliveEnforcementPolicy(serverKeepalivePolicy()),
+		eqgrpc.ServerKeepalive(),
 	)
 	pb.RegisterEntroQServer(grpcServer, svc)
 	hpb.RegisterHealthServer(grpcServer, health.NewServer())
@@ -181,12 +180,6 @@ func Run(ctx context.Context, cfg Config, open OpenFunc, backendDescription stri
 			return fmt.Errorf("shut down HTTP server: %w", err)
 		}
 		return nil
-	}
-}
-
-func serverKeepalivePolicy() keepalive.EnforcementPolicy {
-	return keepalive.EnforcementPolicy{
-		MinTime: eqgrpc.DefaultKeepaliveTime,
 	}
 }
 

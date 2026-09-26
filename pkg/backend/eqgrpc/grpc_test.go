@@ -289,3 +289,39 @@ func TestGRPCDocsOrderAndLimits(t *testing.T) {
 func TestGRPCTaskClaimantIsHolder(t *testing.T) {
 	RunQTest(t, eqtest.TaskClaimantIsHolder)
 }
+
+func TestGRPCClaimLongDuration(t *testing.T) {
+	RunQTest(t, eqtest.ClaimLongDuration)
+}
+
+func TestGRPCClaimRandomHead(t *testing.T) {
+	RunQTest(t, eqtest.ClaimRandomHead)
+}
+
+func TestGRPCDocKeyRangeByteOrder(t *testing.T) {
+	RunQTest(t, eqtest.DocKeyRangeByteOrder)
+}
+
+func TestGRPCLengthLimits(t *testing.T) {
+	RunQTest(t, eqtest.LengthLimits)
+}
+
+func TestGRPCNamespacePrefixMatchLiteral(t *testing.T) {
+	RunQTest(t, eqtest.NamespacePrefixMatchLiteral)
+}
+
+func TestGRPCQueuePrefixMatchLiteral(t *testing.T) {
+	RunQTest(t, eqtest.QueuePrefixMatchLiteral)
+}
+
+func TestGRPCQueueStatsLimit(t *testing.T) {
+	RunQTest(t, eqtest.QueueStatsLimit)
+}
+
+func TestGRPCTasksClaimantLimit(t *testing.T) {
+	RunQTest(t, eqtest.TasksClaimantLimit)
+}
+
+// GCCollectsInLoop is not run over gRPC: garbage collection belongs to the
+// storage backend behind the service, and each storage backend runs it with
+// its own test-only GC interval.

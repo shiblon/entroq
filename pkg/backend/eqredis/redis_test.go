@@ -315,3 +315,21 @@ func TestDocsOrderAndLimits(t *testing.T) {
 func TestTaskClaimantIsHolder(t *testing.T) {
 	RunQTest(t, eqtest.TaskClaimantIsHolder)
 }
+
+func TestTaskChangeFutureArrival(t *testing.T) {
+	RunQTest(t, eqtest.TaskChangeFutureArrival)
+}
+
+// TestDocConcurrencyStress is slow, so it runs in parallel with the other parallel tests
+// once the sequential ones finish; it uses its own namespace and queue.
+func TestDocConcurrencyStress(t *testing.T) {
+	t.Parallel()
+	RunQTest(t, eqtest.DocConcurrencyStress)
+}
+
+// TestMixedAtomicStress is slow, so it runs in parallel with the other parallel tests
+// once the sequential ones finish; it uses its own namespace and queue.
+func TestMixedAtomicStress(t *testing.T) {
+	t.Parallel()
+	RunQTest(t, eqtest.MixedAtomicStress)
+}
