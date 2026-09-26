@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
+	pb "github.com/shiblon/entroq/api"
 )
 
 // These tests cover the failure contract: what the gateway does when the
@@ -247,5 +248,35 @@ func TestContract_ShutdownIdle(t *testing.T) {
 	}
 	if err := s.wait(); err != nil {
 		t.Fatalf("a drained session should be a clean stop, got: %v", err)
+	}
+}
+
+// TestContract_HangUpInDependency: a worker that hangs up instead of answering
+// the dependency phase stops the session cleanly. The commit had failed, so
+// the task is still there, left to its lease.
+func TestContract_HangUpInDependency(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	eq := newEQ(t, ctx)
+	insertTask(t, ctx, eq, "in", "hello")
+	cfg := workCfg()
+	cfg.Dependency = true
+	s := newSession(t, ctx, eq, cfg, time.Minute)
+
+	var dw doWorkMsg
+	s.c.recv(&dw)
+	mr := deleteTask(dw.Task.Task)
+	mr.Depends = []*pb.TaskID{{Id: "00000000-0000-0000-0000-000000000000", Queue: "in"}}
+	s.c.send(okResult(mr))
+
+	var dep dependencyMsg
+	s.c.recv(&dep)
+	s.closeClient()
+	if err := s.wait(); err != nil {
+		t.Fatalf("a hang-up in the dependency phase should be a clean stop, got: %v", err)
+	}
+	tasks, err := eq.Tasks(ctx, "in")
+	if err != nil || len(tasks) != 1 || !tasks[0].At.After(time.Now()) {
+		t.Fatalf("want the task still held for its lease, got %v, %v", tasks, err)
 	}
 }

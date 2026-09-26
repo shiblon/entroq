@@ -102,12 +102,24 @@ dropped connection reclaims the task on lease expiry); `success` after it is
 best-effort and at-most-once, so success-phase side effects must be idempotent or
 safe to skip.
 
-The worker answers only what it is asked. The gateway reads the worker's side of
-the connection all the time, so it notices a worker that hangs up even while it
-is claiming or committing, and it treats a message sent when no request is
-outstanding as a protocol violation (a `caller` fault). A worker that hangs up
-never interrupts a commit already under way: a worker may send its `result` and
-exit, and the result still commits.
+The worker answers only what it is asked: exactly one reply to each request,
+and nothing else.
+
+| Gateway sends | Worker replies |
+|---|---|
+| `takeDocs` | `docs` |
+| `doWork` | `result`, even after an `abort` |
+| `success` | `done` |
+| `dependency` | `done` |
+| `hello`, `abort`, `error` | nothing |
+
+The gateway reads the worker's side of the connection all the time, so it
+notices a worker that hangs up even while it is claiming or committing, and it
+treats a message sent when no request is outstanding as a protocol violation (a
+`caller` fault). A second reply to one request, a reply to `abort`, and a
+message sent unprompted are all violations. A worker that hangs up never
+interrupts a commit already under way: a worker may send its `result` and exit,
+and the result still commits.
 
 ### Abort
 
@@ -203,6 +215,34 @@ Point the gateway at a **stable** target (a DNS or Kubernetes Service name, not 
 pinned IP) so gRPC re-resolves and reconnects underneath during a relocation.
 
 ---
+
+## The failure contract
+
+What the gateway does when something goes wrong, and what becomes of the task.
+"Released" means available to another worker at once; "its lease" means held
+until the lease lapses, then claimable again. Each row but the last has a test
+in `pkg/workgateway` (`contract_test.go` unless noted).
+
+| Situation | Gateway | Task | Class |
+|---|---|---|---|
+| Worker hangs up while the gateway waits for a task | stops claiming at once | none claimed | `ok` |
+| Worker hangs up with `takeDocs` or `doWork` unanswered | releases the task | released | `ok` |
+| Worker sends its `result`, then hangs up | commits the result | committed | `ok` |
+| Worker hangs up during `success` | stops (`workgateway_test.go`) | committed | `ok` |
+| Worker hangs up during `dependency` (the commit failed) | stops | its lease, as after any failed commit: the lease is the backoff | `ok` |
+| Worker sends a message with no request outstanding | drains: a commit under way finishes, nothing more is claimed | committed, if a commit was under way | `caller` |
+| Worker replies with the wrong message type | stops (`workgateway_test.go`) | its lease | `caller` |
+| Worker sends a message that does not decode | treats it as a hang-up (`workgateway_test.go`) | released | `ok` |
+| Worker reports the `error` outcome | stops (`protocol1_test.go`) | its lease | `caller` |
+| The claim is lost while the worker works | sends `abort`, discards the `result` | the new holder's | `gateway`, for now[^w5] |
+| No `result` within a lease of an `abort` | ends the session | the new holder's | `caller` |
+| EntroQ is unreachable | reports `transient`, rides it out for `--entroq-timeout` (`reconnect_test.go`) | its lease | `transient` if it gives up |
+| Operator's first `SIGTERM`/`SIGINT` | drains, closing WebSocket connections normally (also `ws_test.go`) | committed as usual | `ok` |
+| Operator's second signal | stops at once (`cmd/eqlink/cmd/drain_test.go`) | its lease | `ok` |
+| The gateway itself crashes | nothing: the worker sees the connection end | its lease | none |
+
+[^w5]: Once the Go worker keeps running after a lost claim, the session will
+continue instead.
 
 ## Handling disconnects: two recipes
 

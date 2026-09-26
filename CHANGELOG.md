@@ -152,6 +152,9 @@ runs, so plan a short maintenance window on large doc tables.
   answer, and a worker that does not answer within a lease ends the session as a
   caller fault. A task whose `takeDocs` or `doWork` the worker never answered
   is released when it hangs up, available at once instead of after its lease.
+  `docs/workgateway-protocol.md` now lists which messages a worker answers and
+  the full failure contract: each failure, what the gateway does, and what
+  becomes of the task.
 - **`eqlink work` drains on the first signal.** The first SIGINT or SIGTERM
   stops claiming, finishes the task in hand, and exits 0, waiting up to
   `--lease` for it; a second stops at once, leaving the task to its lease, as

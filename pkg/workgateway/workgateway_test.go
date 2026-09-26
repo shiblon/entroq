@@ -1040,7 +1040,7 @@ func TestBridge_WrongMessageType(t *testing.T) {
 
 // TestBridge_MalformedInput treats undecodable input as a lost connection: the
 // gateway cannot parse the stream, so it stops cleanly rather than hanging or
-// panicking. (A decodable-but-wrong message is a caller fault; see
+// panicking, and releases the task the worker never answered. (A decodable-but-wrong message is a caller fault; see
 // TestBridge_WrongMessageType.)
 func TestBridge_MalformedInput(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1059,6 +1059,7 @@ func TestBridge_MalformedInput(t *testing.T) {
 	if err := s.wait(); err != nil {
 		t.Fatalf("malformed input should be a clean stop, got: %v", err)
 	}
+	wantReleased(t, ctx, eq, "in")
 }
 
 // TestClassify checks the exit classification in isolation, over the errors a
