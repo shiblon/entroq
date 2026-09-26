@@ -462,7 +462,8 @@ func (b *EQPG) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[string]i
 }
 
 // QueueStats returns a mapping from queue names to their statistics.
-func (b *EQPG) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[string]*entroq.QueueStat, error) {
+func (b *EQPG) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (_ map[string]*entroq.QueueStat, err error) {
+	defer func() { err = interrupted(ctx, err) }()
 	// All metrics come from one index-only grouped scan: a single pass grouped by
 	// queue over a covering index on (queue, at, claims), with FILTERs deriving
 	// the claimed/future/available counts and MAX(claims) folded into the same
@@ -537,7 +538,8 @@ func (b *EQPG) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[stri
 }
 
 // Tasks returns a slice of all tasks in the given queue.
-func (b *EQPG) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Task, error) {
+func (b *EQPG) Tasks(ctx context.Context, tq *entroq.TasksQuery) (_ []*entroq.Task, err error) {
+	defer func() { err = interrupted(ctx, err) }()
 	if err := tq.Validate(); err != nil {
 		return nil, fmt.Errorf("eqpg tasks: %w", err)
 	}
@@ -610,7 +612,8 @@ func (b *EQPG) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, 
 // TryClaim attempts to claim an "arrived" task from any of the specified
 // queues, attempting to do so fairly across queues. Returns a nil task (no
 // error) if all queues are empty.
-func (b *EQPG) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
+func (b *EQPG) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (_ *entroq.Task, err error) {
+	defer func() { err = interrupted(ctx, err) }()
 	if err := validate.Claim(cq); err != nil {
 		return nil, fmt.Errorf("eqpg claim: %w", err)
 	}
@@ -620,7 +623,7 @@ func (b *EQPG) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 	}()
 	task := new(entroq.Task)
 	var val []byte
-	err := b.DB.QueryRowContext(ctx,
+	err = b.DB.QueryRowContext(ctx,
 		`SELECT id, version, queue, at, created, modified, claimant, value, claims, attempt, err
 		 FROM try_claim($1, $2, $3)`,
 		pq.Array(cq.Queues), cq.Claimant, pgInterval(cq.Duration),
@@ -637,6 +640,20 @@ func (b *EQPG) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 		return nil, fmt.Errorf("try claim one: %w", err)
 	}
 	return task, nil
+}
+
+// interrupted reports err as the caller's cancellation or deadline when ctx is
+// done. lib/pq stops a query the context interrupts by asking the server to
+// cancel it, and returns the server's "canceling statement due to user
+// request" (57014), which does not wrap the context's error: a caller
+// checking entroq.IsCanceled or IsTimeout would see a server failure instead.
+// Whether the query was running decides which error pq returns, so a caller
+// canceling while a claim waits could get either. Both are kept.
+func interrupted(ctx context.Context, err error) error {
+	if err == nil || ctx.Err() == nil || errors.Is(err, ctx.Err()) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", ctx.Err(), err)
 }
 
 // isRetryable returns true for PostgreSQL errors that indicate a transaction
@@ -687,7 +704,8 @@ func RunningInTx(f func(context.Context, *sql.Tx) error) entroq.ModifyOption {
 
 // Modify attempts to apply an atomic modification to the task store. Either
 // all succeeds or all fails.
-func (b *EQPG) Modify(ctx context.Context, mod *entroq.Modification) (*entroq.ModifyResponse, error) {
+func (b *EQPG) Modify(ctx context.Context, mod *entroq.Modification) (_ *entroq.ModifyResponse, err error) {
+	defer func() { err = interrupted(ctx, err) }()
 	// Reject writes to an empty queue/namespace before touching the database, so
 	// an empty queue is never written.
 	if err := validate.Modification(mod); err != nil {
@@ -767,7 +785,8 @@ func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *mo
 	}
 	defer func() {
 		if err != nil {
-			if rbErr := tx.Rollback(); rbErr != nil {
+			// A canceled context rolls the transaction back on its own.
+			if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
 				err = fmt.Errorf("pg modify rollback failed: %v (original error: %w)", rbErr, err)
 			}
 		} else {
@@ -989,7 +1008,8 @@ func resourceIDArrays(rids []*entroq.DocID) (ns, ids []string, versions []int32)
 }
 
 // Time returns the time used in all calculations in this process.
-func (b *EQPG) Time(ctx context.Context) (time.Time, error) {
+func (b *EQPG) Time(ctx context.Context) (_ time.Time, err error) {
+	defer func() { err = interrupted(ctx, err) }()
 	row := b.DB.QueryRowContext(ctx, "SELECT now()")
 	var t time.Time
 	if err := row.Scan(&t); err != nil {
@@ -1017,14 +1037,12 @@ func scanDocRows(rows *sql.Rows) ([]*entroq.Doc, error) {
 // returned (key range and limit are ignored). Otherwise, docs are filtered by
 // optional key range and subject to limit. Each doc carries its group's
 // version and claim.
-func (b *EQPG) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, error) {
+func (b *EQPG) Docs(ctx context.Context, rq *entroq.DocQuery) (_ []*entroq.Doc, err error) {
+	defer func() { err = interrupted(ctx, err) }()
 	if err := rq.Validate(); err != nil {
 		return nil, fmt.Errorf("eqpg docs: %w", err)
 	}
-	var (
-		rows *sql.Rows
-		err  error
-	)
+	var rows *sql.Rows
 	columns := docColumns
 	if rq.OmitValues {
 		columns = strings.Replace(columns, "d.value", "NULL::jsonb", 1)
@@ -1067,6 +1085,7 @@ func (b *EQPG) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, er
 // before it has docs. It returns a DependencyError listing the members while
 // someone else holds the group.
 func (b *EQPG) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) (docs []*entroq.Doc, err error) {
+	defer func() { err = interrupted(ctx, err) }()
 	if err := validate.DocClaim(cq); err != nil {
 		return nil, fmt.Errorf("claim docs: %w", err)
 	}

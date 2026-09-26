@@ -914,3 +914,34 @@ func TestMixedAtomicStress(t *testing.T) {
 	t.Parallel()
 	RunQTest(t, eqtest.MixedAtomicStress)
 }
+
+// TestCanceledQueryIsCanceled cancels a modification while its transaction is
+// running a query. lib/pq then reports the server's "canceling statement due
+// to user request", which must still read as the caller's cancellation.
+func TestCanceledQueryIsCanceled(t *testing.T) {
+	ctx := context.Background()
+	b, err := Open(ctx, pgHostPort, WithDB("postgres"), WithUsername("postgres"), WithPassword("password"), WithConnectAttempts(10))
+	if err != nil {
+		t.Fatalf("Open backend: %v", err)
+	}
+	defer b.Close()
+
+	cctx, cancel := context.WithCancel(ctx)
+	running := make(chan struct{})
+	go func() {
+		<-running
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+	_, err = b.Modify(cctx, entroq.NewModification("me",
+		entroq.InsertingInto("/test/canceled-query"),
+		entroq.WithModifyOption(RunningInTx(func(ctx context.Context, tx *sql.Tx) error {
+			close(running)
+			_, err := tx.ExecContext(ctx, "SELECT pg_sleep(10)")
+			return err
+		})),
+	))
+	if !entroq.IsCanceled(err) {
+		t.Errorf("Modify canceled mid-query: want a cancellation, got %v", err)
+	}
+}

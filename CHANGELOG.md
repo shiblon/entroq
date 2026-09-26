@@ -161,6 +161,14 @@ runs, so plan a short maintenance window on large doc tables.
 
 ### Fixed
 
+- **A canceled PostgreSQL call reports the cancellation.** When a caller's
+  context ended while its query was running, lib/pq returned the server's
+  "canceling statement due to user request", which does not wrap the
+  context's error, so `entroq.IsCanceled` and `IsTimeout` saw a server
+  failure; a worker shutting down while its claim was querying reported an
+  error. Every PostgreSQL call now reports the context's error, keeping the
+  server's. Since the readiness loop replaced LISTEN/NOTIFY, a waiting claim
+  runs its query each time it wakes, which made this much more likely.
 - **Latency metrics resolve milliseconds.** Claim, modify, GC sweep, and
   `pkg/async` durations are recorded in seconds, as OpenTelemetry recommends,
   but used the SDK's default buckets (0, 5, 10, 25, ... 10000), which are

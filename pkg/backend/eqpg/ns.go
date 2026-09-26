@@ -10,7 +10,8 @@ import (
 
 // NamespaceStats returns doc counts per namespace, optionally filtered by the
 // query's prefix/exact match criteria and capped by Limit.
-func (b *EQPG) NamespaceStats(ctx context.Context, qq *entroq.MatchQuery) (map[string]*entroq.NamespaceStat, error) {
+func (b *EQPG) NamespaceStats(ctx context.Context, qq *entroq.MatchQuery) (_ map[string]*entroq.NamespaceStat, err error) {
+	defer func() { err = interrupted(ctx, err) }()
 	// A doc is claimed while its group is held. Counting docs needs only the
 	// docs table; counting claimed ones starts from the held locks, which are
 	// few, and counts their members.
