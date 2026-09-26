@@ -177,6 +177,7 @@ export interface DocGroup {
   version?: number;
   claimant?: string;
   atMs?: string;
+  numDocs?: number;
 }
 
 /**

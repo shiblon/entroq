@@ -224,6 +224,8 @@ message DocGroup {
   int32 version = 3;
   string claimant = 4;
   int64 at_ms = 5;
+  // How many docs the group has, whichever of them travel with it.
+  int32 num_docs = 6;
 }
 
 // ClaimDocsResponse contains the docs claimed by a ClaimDocs call, and the

@@ -29,7 +29,7 @@ func (s store) evaluate(claimant string, args ...entroq.ModifyArg) Plan {
 
 // newStore holds one group, ns/k, with members a and b at version 5.
 func newStore(l Lock) store {
-	l.Version = 5
+	l.Version, l.NumDocs = 5, 2
 	return store{
 		members: map[string]*entroq.Doc{
 			entroq.DocKey("ns", "a"): {Namespace: "ns", ID: "a", Key: "k"},
@@ -239,5 +239,24 @@ func TestExclusive(t *testing.T) {
 	mod = entroq.NewModification("me", doc("a", 5).Change(entroq.WithContent("x")))
 	if got := Exclusive(mod, s.member); !got[group] {
 		t.Errorf("Change: want its group exclusive, got %v", got)
+	}
+}
+
+func TestEvaluateCountsDocs(t *testing.T) {
+	s := newStore(Lock{})
+	p := s.evaluate("me",
+		entroq.PuttingDocInto("ns", entroq.WithKeys("k", "c")),
+		entroq.PuttingDocInto("ns", entroq.WithKeys("k", "d")),
+		doc("a", 5).Delete(),
+		doc("b", 5).Change(entroq.WithContent("x")),
+	)
+	if p.Err != nil {
+		t.Fatalf("Evaluate: %v", p.Err)
+	}
+	if got := p.Locks[group].NumDocs; got != 3 {
+		t.Errorf("Two inserts, a delete, and a change in a group of 2: want 3 docs, got %d", got)
+	}
+	if l, ok := Claim(s.lock(group), "me", now, time.Minute); !ok || l.NumDocs != 2 {
+		t.Errorf("Claim: want the count kept at 2, got %+v, %v", l, ok)
 	}
 }

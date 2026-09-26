@@ -1159,4 +1159,43 @@ func DocGroups(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix
 		}
 	})
 
+	t.Run("a group counts its docs", func(t *testing.T) {
+		claim := func(want int) *entroq.DocGroup {
+			t.Helper()
+			group, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "count").For(lease))
+			if err != nil {
+				t.Fatalf("Claim: %v", err)
+			}
+			if group.NumDocs != want || len(group.Docs) != want {
+				t.Errorf("Claimed group counts %d docs and returns %d, want %d", group.NumDocs, len(group.Docs), want)
+			}
+			return group
+		}
+		claim(0)
+		if _, err := client.Modify(ctx,
+			entroq.PuttingDocInto(ns, entroq.WithKeys("count", "a")),
+			entroq.PuttingDocInto(ns, entroq.WithKeys("count", "b")),
+			entroq.PuttingDocInto(ns, entroq.WithKeys("count", "c")),
+		); err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+		group := claim(3)
+		if _, err := client.Modify(ctx,
+			group.Docs[0].Delete(),
+			group.Docs[1].Change(entroq.WithContent("changed")),
+			entroq.PuttingDocInto(ns, entroq.WithKeys("count", "d")),
+			entroq.PuttingDocInto(ns, entroq.WithKeys("count", "e")),
+		); err != nil {
+			t.Fatalf("Holder commit: %v", err)
+		}
+		group = claim(4)
+		var dels []entroq.ModifyArg
+		for _, d := range group.Docs {
+			dels = append(dels, d.Delete())
+		}
+		if _, err := client.Modify(ctx, dels...); err != nil {
+			t.Fatalf("Delete all: %v", err)
+		}
+		claim(0)
+	})
 }

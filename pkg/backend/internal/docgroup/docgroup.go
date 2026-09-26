@@ -26,11 +26,12 @@ type Group struct {
 	Key       string
 }
 
-// Lock is a group's version and claim.
+// Lock is a group's version and claim, and how many docs it has.
 type Lock struct {
 	Version  int32
 	Claimant string
 	At       time.Time
+	NumDocs  int
 }
 
 // Absent is the lock of a group nothing has written or claimed yet. Its first
@@ -66,7 +67,7 @@ func Claim(l Lock, claimant string, now time.Time, d time.Duration) (Lock, bool)
 	if l.HeldByOther(claimant, now) {
 		return l, false
 	}
-	return Lock{Version: l.Version + 1, Claimant: claimant, At: now.Add(d)}, true
+	return Lock{Version: l.Version + 1, Claimant: claimant, At: now.Add(d), NumDocs: l.NumDocs}, true
 }
 
 // Claimed returns the group g as its claim left it: holding lock l, with each
@@ -78,6 +79,7 @@ func Claimed(g Group, l Lock, members []*entroq.Doc) *entroq.DocGroup {
 		Version:   l.Version,
 		Claimant:  l.Claimant,
 		At:        l.At,
+		NumDocs:   l.NumDocs,
 		Docs:      make([]*entroq.Doc, 0, len(members)),
 	}
 	for _, d := range members {
@@ -95,8 +97,9 @@ type Plan struct {
 }
 
 // Evaluate checks mod's doc operations and computes the lock each written
-// group ends with. member returns the stored doc with the given namespace and
-// ID, or nil; lock returns a group's current lock, or Absent.
+// group ends with, its doc count moved by the docs the modification inserts
+// and deletes. member returns the stored doc with the given namespace and ID,
+// or nil; lock returns a group's current lock, or Absent.
 //
 // A change, delete, or depend names a member at its group's version; the
 // member's stored key, not the one in the request, decides its group. A change
@@ -111,6 +114,7 @@ type Plan struct {
 func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string) *entroq.Doc, lock func(Group) Lock) Plan {
 	depErr := new(entroq.DependencyError)
 	held := make(map[Group]time.Time) // written groups, with the latest future arrival
+	added := make(map[Group]int)      // docs inserted less docs deleted, per group
 
 	write := func(g Group, at time.Time) {
 		latest := held[g]
@@ -146,6 +150,7 @@ func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string
 			continue
 		}
 		write(g, ins.At)
+		added[g]++
 	}
 	for _, chg := range mod.DocChanges {
 		id := entroq.NewDocID(chg.Namespace, chg.ID, chg.Version)
@@ -168,6 +173,7 @@ func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string
 			depErr.DocClaims = append(depErr.DocClaims, del)
 		default:
 			write(g, time.Time{})
+			added[g]--
 		}
 	}
 	for _, dep := range mod.DocDepends {
@@ -182,7 +188,7 @@ func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string
 		return plan
 	}
 	for g, at := range held {
-		next := Lock{Version: lock(g).Version + 1, At: now}
+		next := Lock{Version: lock(g).Version + 1, At: now, NumDocs: lock(g).NumDocs + added[g]}
 		if !at.IsZero() {
 			next.Claimant = mod.Claimant
 			next.At = at

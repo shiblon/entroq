@@ -172,6 +172,14 @@ runs, so plan a short maintenance window on large doc tables.
   `workgateway.Serve` takes it in place of the handler's arguments. A context no
   longer stops the connections: call `Close`. `Bridge.Shutdown` drains one
   session.
+- **A doc group counts its docs.** `entroq.DocGroup.NumDocs`, and `num_docs`
+  on the `DocGroup` message and in the work gateway's `doWork` groups, is how
+  many docs the group has. PostgreSQL and SQLite keep it on the group's lock
+  row, which every write already updates, and lock collection now checks it
+  instead of looking for docs; Redis counts it from its doc index when it reads
+  a lock; the in-memory backend keeps it on the lock and recounts after
+  replaying a journal. Upgrading from 1.12 counts each group's docs as it gives
+  the group its lock.
 - **Breaking (Go): worker handlers receive doc groups.** `DoWork`, `DoModify`,
   and `Finish` handlers, and the `Handler` interface, take
   `[]*entroq.DocGroup` where they took `[]*entroq.Doc`: one group per claim

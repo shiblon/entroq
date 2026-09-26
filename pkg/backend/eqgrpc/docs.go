@@ -65,7 +65,7 @@ func claimedGroup(cq *entroq.DocClaim, resp *pb.ClaimDocsResponse) *entroq.DocGr
 	if resp.Group != nil {
 		return pbconv.DocGroupFromProto(resp.Group, docs)
 	}
-	g := &entroq.DocGroup{Namespace: cq.Namespace, Key: cq.Key, Docs: docs}
+	g := &entroq.DocGroup{Namespace: cq.Namespace, Key: cq.Key, NumDocs: len(docs), Docs: docs}
 	if len(docs) > 0 {
 		g.Version, g.Claimant, g.At = docs[0].Version, docs[0].Claimant, docs[0].At
 	}

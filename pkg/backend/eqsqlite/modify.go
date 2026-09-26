@@ -422,7 +422,7 @@ func loadDocLocks(ctx context.Context, q queryer, groups []docgroup.Group) (map[
 		for _, g := range groups[start:end] {
 			args = append(args, g.Namespace, g.Key)
 		}
-		rows, err := q.QueryContext(ctx, `SELECT namespace, key_primary, version, claimant, at_ms FROM doc_locks
+		rows, err := q.QueryContext(ctx, `SELECT namespace, key_primary, version, claimant, at_ms, num_docs FROM doc_locks
 			WHERE (namespace, key_primary) IN (VALUES `+rowPlaceholders(end-start, columns)+")", args...)
 		if err != nil {
 			return fmt.Errorf("load doc locks: %w", err)
@@ -432,7 +432,7 @@ func loadDocLocks(ctx context.Context, q queryer, groups []docgroup.Group) (map[
 			var g docgroup.Group
 			var l docgroup.Lock
 			var at int64
-			if err := rows.Scan(&g.Namespace, &g.Key, &l.Version, &l.Claimant, &at); err != nil {
+			if err := rows.Scan(&g.Namespace, &g.Key, &l.Version, &l.Claimant, &at, &l.NumDocs); err != nil {
 				return fmt.Errorf("scan doc lock: %w", err)
 			}
 			l.At = time.UnixMilli(at).UTC()
@@ -457,17 +457,18 @@ func saveDocLocks(ctx context.Context, tx *sql.Tx, locks map[docgroup.Group]docg
 	for g := range locks {
 		groups = append(groups, g)
 	}
-	const columns = 5
+	const columns = 6
 	return batchRanges(len(groups), columns, func(start, end int) error {
 		args := make([]any, 0, columns*(end-start))
 		for _, g := range groups[start:end] {
 			l := locks[g]
-			args = append(args, g.Namespace, g.Key, l.Version, l.Claimant, l.At.UnixMilli())
+			args = append(args, g.Namespace, g.Key, l.Version, l.Claimant, l.At.UnixMilli(), l.NumDocs)
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO doc_locks (namespace, key_primary, version, claimant, at_ms)
+		if _, err := tx.ExecContext(ctx, `INSERT INTO doc_locks (namespace, key_primary, version, claimant, at_ms, num_docs)
 			VALUES `+rowPlaceholders(end-start, columns)+`
 			ON CONFLICT (namespace, key_primary) DO UPDATE SET
-				version = excluded.version, claimant = excluded.claimant, at_ms = excluded.at_ms`, args...); err != nil {
+				version = excluded.version, claimant = excluded.claimant, at_ms = excluded.at_ms,
+				num_docs = excluded.num_docs`, args...); err != nil {
 			return fmt.Errorf("save doc locks: %w", err)
 		}
 		return nil

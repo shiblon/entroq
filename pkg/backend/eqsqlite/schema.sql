@@ -57,14 +57,16 @@ CREATE INDEX IF NOT EXISTS docs_namespace_keys
     ON docs (namespace, key_primary, key_secondary, id);
 
 -- Each doc group (the docs sharing a primary key in a namespace) has one lock
--- holding the only version, claimant, and arrival time its members have. A
--- group can be claimed before it has docs, so locks are kept apart from docs.
+-- holding the only version, claimant, and arrival time its members have, and
+-- how many there are. A group can be claimed before it has docs, so locks are
+-- kept apart from docs.
 CREATE TABLE IF NOT EXISTS doc_locks (
     namespace   TEXT NOT NULL COLLATE BINARY,
     key_primary TEXT NOT NULL COLLATE BINARY,
     version     INTEGER NOT NULL,
     claimant    TEXT NOT NULL COLLATE BINARY,
     at_ms       INTEGER NOT NULL,
+    num_docs    INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (namespace, key_primary),
     CHECK (octet_length(namespace) <= 1024),
     CHECK (octet_length(key_primary) <= 256),
@@ -74,3 +76,7 @@ CREATE TABLE IF NOT EXISTS doc_locks (
 -- Held groups, for counting claimed docs without reading every doc.
 CREATE INDEX IF NOT EXISTS doc_locks_held
     ON doc_locks (namespace, at_ms) WHERE claimant <> '';
+
+-- Empty groups, the only ones lock collection considers.
+CREATE INDEX IF NOT EXISTS doc_locks_empty
+    ON doc_locks (namespace, key_primary) WHERE num_docs = 0;

@@ -116,7 +116,7 @@ func upsertGroups(ctx context.Context, tx *sql.Tx, groups []docgroup.Group, lock
 		SELECT n, k, $3, '', now() FROM unnest($1::text[], $2::text[]) AS g(n, k)
 		ORDER BY n, k
 		ON CONFLICT (namespace, key_primary) DO UPDATE SET namespace = l.namespace
-		RETURNING l.namespace, l.key_primary, l.version, l.claimant, l.at, now()`,
+		RETURNING l.namespace, l.key_primary, l.version, l.claimant, l.at, l.num_docs, now()`,
 		pq.Array(ns), pq.Array(keys), docgroup.Absent.Version)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("lock doc groups: %w", err)
@@ -130,7 +130,7 @@ func upsertGroups(ctx context.Context, tx *sql.Tx, groups []docgroup.Group, lock
 // member then fails.
 func shareGroups(ctx context.Context, tx *sql.Tx, groups []docgroup.Group, locks map[docgroup.Group]docgroup.Lock) (time.Time, error) {
 	ns, keys := groupArrays(groups)
-	rows, err := tx.QueryContext(ctx, `SELECT namespace, key_primary, version, claimant, at, now()
+	rows, err := tx.QueryContext(ctx, `SELECT namespace, key_primary, version, claimant, at, num_docs, now()
 		FROM entroq.doc_locks
 		WHERE (namespace, key_primary) IN (SELECT * FROM unnest($1::text[], $2::text[]))
 		ORDER BY namespace, key_primary
@@ -150,16 +150,16 @@ func groupArrays(groups []docgroup.Group) (ns, keys []string) {
 	return ns, keys
 }
 
-// scanLocks reads lock rows (namespace, key, version, claimant, at, now) into
-// locks, closing rows, and returns the database's time. The time is zero if
-// there were no rows.
+// scanLocks reads lock rows (namespace, key, version, claimant, at, num_docs,
+// now) into locks, closing rows, and returns the database's time. The time is
+// zero if there were no rows.
 func scanLocks(rows *sql.Rows, locks map[docgroup.Group]docgroup.Lock) (time.Time, error) {
 	defer rows.Close()
 	var now time.Time
 	for rows.Next() {
 		var g docgroup.Group
 		var l docgroup.Lock
-		if err := rows.Scan(&g.Namespace, &g.Key, &l.Version, &l.Claimant, &l.At, &now); err != nil {
+		if err := rows.Scan(&g.Namespace, &g.Key, &l.Version, &l.Claimant, &l.At, &l.NumDocs, &now); err != nil {
 			return time.Time{}, fmt.Errorf("scan doc lock: %w", err)
 		}
 		locks[g] = l
@@ -173,8 +173,8 @@ func saveLocks(ctx context.Context, tx *sql.Tx, locks map[docgroup.Group]docgrou
 		return nil
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE entroq.doc_locks l
-		SET version = u.version, claimant = u.claimant, at = u.at
-		FROM unnest($1::text[], $2::text[], $3::integer[], $4::text[], $5::timestamptz[]) AS u(namespace, key_primary, version, claimant, at)
+		SET version = u.version, claimant = u.claimant, at = u.at, num_docs = u.num_docs
+		FROM unnest($1::text[], $2::text[], $3::integer[], $4::text[], $5::timestamptz[], $6::integer[]) AS u(namespace, key_primary, version, claimant, at, num_docs)
 		WHERE l.namespace = u.namespace AND l.key_primary = u.key_primary`, lockArrays(locks)...); err != nil {
 		return fmt.Errorf("save doc locks: %w", err)
 	}
@@ -259,7 +259,7 @@ func writeDocGroups(ctx context.Context, tx *sql.Tx, deletes []*entroq.DocID, in
 		),
 		ins AS (
 			INSERT INTO entroq.docs (namespace, id, key_primary, key_secondary, value, created, modified)
-			SELECT namespace, id, key_primary, key_secondary, value::jsonb, $18, $18
+			SELECT namespace, id, key_primary, key_secondary, value::jsonb, $19, $19
 			FROM unnest($3::text[], $4::text[], $5::text[], $6::text[], $7::text[])
 				AS r(namespace, id, key_primary, key_secondary, value)
 			ON CONFLICT (namespace, id) DO NOTHING
@@ -267,16 +267,16 @@ func writeDocGroups(ctx context.Context, tx *sql.Tx, deletes []*entroq.DocID, in
 		),
 		upd AS (
 			UPDATE entroq.docs d
-			SET value = c.value::jsonb, modified = $18
+			SET value = c.value::jsonb, modified = $19
 			FROM unnest($8::text[], $9::text[], $10::text[], $11::text[], $12::text[])
 				AS c(namespace, id, key_primary, key_secondary, value)
 			WHERE d.namespace = c.namespace AND d.id = c.id
 		),
 		lck AS (
 			UPDATE entroq.doc_locks l
-			SET version = u.version, claimant = u.claimant, at = u.at
-			FROM unnest($13::text[], $14::text[], $15::integer[], $16::text[], $17::timestamptz[])
-				AS u(namespace, key_primary, version, claimant, at)
+			SET version = u.version, claimant = u.claimant, at = u.at, num_docs = u.num_docs
+			FROM unnest($13::text[], $14::text[], $15::integer[], $16::text[], $17::timestamptz[], $18::integer[])
+				AS u(namespace, key_primary, version, claimant, at, num_docs)
 			WHERE l.namespace = u.namespace AND l.key_primary = u.key_primary
 		)
 		SELECT namespace, id FROM ins`, args...)
@@ -324,19 +324,21 @@ func docArrays(docs []*entroq.Doc) []any {
 }
 
 // lockArrays splits locks into parallel arrays: namespace, key, version,
-// claimant, and at.
+// claimant, at, and doc count.
 func lockArrays(locks map[docgroup.Group]docgroup.Lock) []any {
 	var ns, keys, claimants []string
 	var versions []int32
 	var ats []time.Time
+	var numDocs []int64
 	for g, l := range locks {
 		ns = append(ns, g.Namespace)
 		keys = append(keys, g.Key)
 		versions = append(versions, l.Version)
 		claimants = append(claimants, l.Claimant)
 		ats = append(ats, l.At)
+		numDocs = append(numDocs, int64(l.NumDocs))
 	}
-	return []any{pq.Array(ns), pq.Array(keys), pq.Array(versions), pq.Array(claimants), pq.Array(ats)}
+	return []any{pq.Array(ns), pq.Array(keys), pq.Array(versions), pq.Array(claimants), pq.Array(ats), pq.Array(numDocs)}
 }
 
 // txNow is the database's time for tx, the clock every lock is compared to.
@@ -385,10 +387,10 @@ func claimDocs(ctx context.Context, tx *sql.Tx, cq *entroq.DocClaim) (*entroq.Do
 // collectLocksOnce removes the locks of up to batch groups that have no docs
 // and are not held, so claimed-then-abandoned groups do not accumulate.
 //
-// Collection locks the rows FOR UPDATE, skipping any a writer holds, and only
-// then, in a statement that sees every insert committed before the lock,
-// checks the groups are still empty. An insert that arrives later waits, then
-// finds the row gone and creates the group anew.
+// A lock row counts its group's docs, and every write updates that count
+// under the row lock, so collection only locks the rows FOR UPDATE, skipping
+// any a writer holds, and checks the count again as it deletes. An insert that
+// arrives later waits, then finds the row gone and creates the group anew.
 func (b *EQPG) collectLocksOnce(ctx context.Context, batch int) (n int, err error) {
 	tx, err := b.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -403,8 +405,7 @@ func (b *EQPG) collectLocksOnce(ctx context.Context, batch int) (n int, err erro
 			n, err = 0, fmt.Errorf("eqpg collect doc locks commit: %w", cmErr)
 		}
 	}()
-	const idle = `(l.claimant = '' OR l.at <= now())
-		AND NOT EXISTS (SELECT 1 FROM entroq.docs d WHERE d.namespace = l.namespace AND d.key_primary = l.key_primary)`
+	const idle = `(l.claimant = '' OR l.at <= now()) AND l.num_docs = 0`
 	rows, err := tx.QueryContext(ctx, `SELECT l.namespace, l.key_primary FROM entroq.doc_locks l
 		WHERE `+idle+`
 		LIMIT $1

@@ -153,9 +153,10 @@ func (m *EQMem) countStaleDocReplays(mod *entroq.Modification) {
 }
 
 // finishDocReplay runs once the journal has loaded. It reports stale doc
-// versions replay applied, and gives every group written before groups had
-// locks a lock one version past its highest member, so any version read
-// before then is stale.
+// versions replay applied, gives every group written before groups had locks a
+// lock one version past its highest member, so any version read before then
+// is stale, and sets every group's doc count from its members, as the journal
+// does not record counts.
 func (m *EQMem) finishDocReplay() {
 	if m.staleDocReplays > 0 {
 		log.Printf("eqmem journal replay: %d doc operations named a version other than the stored doc's (for example %v), "+
@@ -166,15 +167,20 @@ func (m *EQMem) finishDocReplay() {
 	}
 	for _, ns := range m.namespaces {
 		highest := make(map[string]int32)
+		count := make(map[string]int)
 		for _, d := range ns.byID {
 			if v, ok := highest[d.Key]; !ok || d.Version > v {
 				highest[d.Key] = d.Version
 			}
+			count[d.Key]++
 		}
 		for key, v := range highest {
-			if ns.Lock(key) == docgroup.Absent {
-				ns.SetLock(key, docgroup.Lock{Version: v + 1})
+			l := ns.Lock(key)
+			if l == docgroup.Absent {
+				l = docgroup.Lock{Version: v + 1}
 			}
+			l.NumDocs = count[key]
+			ns.SetLock(key, l)
 		}
 	}
 }

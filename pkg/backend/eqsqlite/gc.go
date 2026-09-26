@@ -58,8 +58,7 @@ func (b *EQSQLite) collectLocksOnce(ctx context.Context, batch int) (int, error)
 	value, err := b.write(ctx, func(ctx context.Context, tx *sql.Tx) (any, error) {
 		res, err := tx.ExecContext(ctx, `DELETE FROM doc_locks WHERE rowid IN (
 			SELECT l.rowid FROM doc_locks l
-			WHERE (l.claimant = '' OR l.at_ms <= ?)
-			  AND NOT EXISTS (SELECT 1 FROM docs d WHERE d.namespace = l.namespace AND d.key_primary = l.key_primary)
+			WHERE (l.claimant = '' OR l.at_ms <= ?) AND l.num_docs = 0
 			LIMIT ?)`, nowUTC().UnixMilli(), batch)
 		if err != nil {
 			return 0, err

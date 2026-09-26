@@ -62,7 +62,9 @@ func parseLock(vals map[string]string) (docgroup.Lock, error) {
 }
 
 // readLocks reads the locks of groups; a group with none maps to
-// docgroup.Absent.
+// docgroup.Absent. A lock's doc count is not stored but counted from the
+// namespace doc index, which costs a logarithmic lookup and cannot drift from
+// the docs.
 func readLocks(ctx context.Context, c redis.Cmdable, groups []docgroup.Group) (map[docgroup.Group]docgroup.Lock, error) {
 	locks := make(map[docgroup.Group]docgroup.Lock, len(groups))
 	if len(groups) == 0 {
@@ -70,8 +72,11 @@ func readLocks(ctx context.Context, c redis.Cmdable, groups []docgroup.Group) (m
 	}
 	pipe := c.Pipeline()
 	cmds := make([]*redis.MapStringStringCmd, len(groups))
+	counts := make([]*redis.IntCmd, len(groups))
 	for i, g := range groups {
 		cmds[i] = pipe.HGetAll(ctx, lockKey(g))
+		min, max := groupMembersRange(g.Key)
+		counts[i] = pipe.ZLexCount(ctx, docNSIndexKey(g.Namespace), min, max)
 	}
 	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
 		return nil, fmt.Errorf("read doc locks: %w", err)
@@ -81,6 +86,7 @@ func readLocks(ctx context.Context, c redis.Cmdable, groups []docgroup.Group) (m
 		if err != nil {
 			return nil, err
 		}
+		l.NumDocs = int(counts[i].Val())
 		locks[g] = l
 	}
 	return locks, nil

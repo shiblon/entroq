@@ -333,7 +333,8 @@ type DocGroup struct {
 	Version   int32
 	Claimant  string
 	At        time.Time
-	Docs      []*Doc
+	NumDocs   int    // how many docs the group has
+	Docs      []*Doc // its docs
 }
 
 // GroupDocs returns the docs of groups, in order: every member of the first

@@ -53,15 +53,17 @@ CREATE TABLE IF NOT EXISTS entroq.docs (
 );
 
 -- Each doc group (the docs sharing a primary key in a namespace) has one lock
--- holding the only version, claimant, and arrival time its members have. A
--- group can be claimed before it has docs, so locks are kept apart from docs,
--- and every doc's group has a lock (docs_group_fk, added below).
+-- holding the only version, claimant, and arrival time its members have, and
+-- how many there are. A group can be claimed before it has docs, so locks are
+-- kept apart from docs, and every doc's group has a lock (docs_group_fk, added
+-- below).
 CREATE TABLE IF NOT EXISTS entroq.doc_locks (
     namespace   TEXT COLLATE "C"         NOT NULL CHECK (octet_length(namespace) <= 1024),
     key_primary TEXT COLLATE "C"         NOT NULL CHECK (octet_length(key_primary) <= 256),
     version     INTEGER                  NOT NULL,
     claimant    TEXT                     NOT NULL DEFAULT '' CHECK (octet_length(claimant) <= 64),
     at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    num_docs    INTEGER                  NOT NULL DEFAULT 0,
     PRIMARY KEY (namespace, key_primary)
 );
 
@@ -93,6 +95,8 @@ CREATE INDEX IF NOT EXISTS idx_docs_order ON entroq.docs (namespace, key_primary
 DROP INDEX IF EXISTS entroq.idx_docs_ns_stats;
 -- Held groups, for counting claimed docs without reading every doc.
 CREATE INDEX IF NOT EXISTS idx_doc_locks_held ON entroq.doc_locks (namespace, at) WHERE claimant <> '';
+-- Empty groups, the only ones lock collection considers.
+CREATE INDEX IF NOT EXISTS idx_doc_locks_empty ON entroq.doc_locks (namespace, key_primary) WHERE num_docs = 0;
 
 -- Bucket index: supports range-based bucket selection in _try_claim_bucket.
 -- hashtext(id) & 255 gives a stable value in [0, 255] for any text ID.
@@ -802,18 +806,19 @@ BEGIN
 END $$;
 
 -- Migration: docs move their version, claimant, and arrival time to their
--- group's lock (1.13.0). Every group gets a lock one version past its highest
--- member, so no version read before the upgrade can match one written after
--- it, even once the group has moved on: resetting to 0 would let a read held
--- across the upgrade, such as a config doc's depend, succeed again after a few
--- changes. Claims held at upgrade time are released. Then the docs columns go.
+-- group's lock (1.13.0), which also counts them. Every group gets a lock one
+-- version past its highest member, so no version read before the upgrade can
+-- match one written after it, even once the group has moved on: resetting to 0
+-- would let a read held across the upgrade, such as a config doc's depend,
+-- succeed again after a few changes. Claims held at upgrade time are released.
+-- Then the docs columns go.
 -- Guarded on docs.version, which the block drops, so a re-run does nothing.
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_attribute
                 WHERE attrelid = 'entroq.docs'::regclass AND attname = 'version' AND NOT attisdropped) THEN
-        INSERT INTO entroq.doc_locks (namespace, key_primary, version, claimant, at)
-        SELECT namespace, key_primary, max(version) + 1, '', now()
+        INSERT INTO entroq.doc_locks (namespace, key_primary, version, claimant, at, num_docs)
+        SELECT namespace, key_primary, max(version) + 1, '', now(), count(*)
           FROM entroq.docs
          GROUP BY namespace, key_primary
         ON CONFLICT (namespace, key_primary) DO NOTHING;

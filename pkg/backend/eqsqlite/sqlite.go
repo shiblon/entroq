@@ -305,8 +305,8 @@ func migrateToV3(ctx context.Context, conn *sql.Conn, from int) (err error) {
 			step{"drop old tasks", "DROP TABLE tasks_old"})
 	}
 	steps = append(steps,
-		step{"create doc group locks", fmt.Sprintf(`INSERT INTO doc_locks (namespace, key_primary, version, claimant, at_ms)
-			SELECT namespace, key_primary, max(version) + 1, '', %d FROM docs_old
+		step{"create doc group locks", fmt.Sprintf(`INSERT INTO doc_locks (namespace, key_primary, version, claimant, at_ms, num_docs)
+			SELECT namespace, key_primary, max(version) + 1, '', %d, count(*) FROM docs_old
 			GROUP BY namespace, key_primary`, nowUTC().UnixMilli())},
 		step{"copy docs (an id or key may exceed its byte limit)", `INSERT INTO docs
 			(namespace, id, key_primary, key_secondary, content, created_ms, modified_ms)

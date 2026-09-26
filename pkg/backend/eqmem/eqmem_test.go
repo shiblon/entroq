@@ -775,6 +775,10 @@ func TestEQMemJournalDocClaim(t *testing.T) {
 	if _, err := eq.Modify(ctx, held[0].Delete(), entroq.ModifyAs(holder)); err != nil {
 		t.Errorf("Holder delete at the claimed version after replay: %v", err)
 	}
+	// The journal records no doc counts; replay sets them from the docs.
+	if group, err := eq.ClaimDocs(ctx, entroq.ClaimKey(namespace, "g").For(time.Minute)); err != nil || group.NumDocs != 1 {
+		t.Errorf("Claim after replay and a delete: want 1 doc counted, got %v, %v", group, err)
+	}
 }
 
 // TestEQMemSnapshotKeepsDocs takes a snapshot with cleanup and checks that

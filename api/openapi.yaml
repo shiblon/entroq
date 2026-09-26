@@ -522,6 +522,10 @@ components:
                     type: string
                 atMs:
                     type: string
+                numDocs:
+                    type: integer
+                    description: How many docs the group has, whichever of them travel with it.
+                    format: int32
             description: |-
                 DocGroup is a doc group's lock: the docs sharing a primary key in a
                  namespace have one version, claimant, and arrival time between them, held

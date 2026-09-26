@@ -145,12 +145,13 @@ docs beside the lock's fields:
 
 ```json
 {"namespace": "ns", "key": "k", "version": 3, "claimant": "...", "atMs": "...",
- "docs": [{"namespace": "ns", "id": "a", "key": "k", ...}]}
+ "numDocs": 1, "docs": [{"namespace": "ns", "id": "a", "key": "k", ...}]}
 ```
 
-A group claimed with no docs appears with `"docs": []`, still reporting its
-version and claim. `docs` is every group's docs in one list, as before protocol
-1. As protojson, a zero version is omitted, so read a missing `version` as 0.
+`numDocs` counts the group's docs. A group claimed with no docs appears with
+`"docs": []`, still reporting its version and claim. `docs` is every group's
+docs in one list, as before protocol 1. As protojson, a zero is omitted, so
+read a missing `version` or `numDocs` as 0.
 
 ### Outcomes and the `ack` shorthand
 

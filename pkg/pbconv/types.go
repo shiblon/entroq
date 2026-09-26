@@ -150,6 +150,7 @@ func DocGroupToProto(g *entroq.DocGroup) *pb.DocGroup {
 		Version:   g.Version,
 		Claimant:  g.Claimant,
 		AtMs:      ToMS(g.At),
+		NumDocs:   int32(g.NumDocs),
 	}
 }
 
@@ -162,6 +163,7 @@ func DocGroupFromProto(g *pb.DocGroup, docs []*entroq.Doc) *entroq.DocGroup {
 		Version:   g.Version,
 		Claimant:  g.Claimant,
 		At:        fromMSOrUnset(g.AtMs),
+		NumDocs:   int(g.NumDocs),
 		Docs:      docs,
 	}
 }
