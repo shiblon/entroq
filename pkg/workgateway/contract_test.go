@@ -203,3 +203,49 @@ func TestContract_HangUpInTakeDocsReleasesTask(t *testing.T) {
 	}
 	wantReleased(t, ctx, eq, "in")
 }
+
+// TestContract_ShutdownDrains: Shutdown lets the task in hand finish and
+// commit, claims nothing more, and ends the session as a clean stop.
+func TestContract_ShutdownDrains(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	eq := newEQ(t, ctx)
+	insertTask(t, ctx, eq, "in", "first")
+	s := newSession(t, ctx, eq, workCfg(), time.Minute)
+
+	var dw doWorkMsg
+	s.c.recv(&dw)
+	insertTask(t, ctx, eq, "in", "second")
+
+	shutErr := make(chan error, 1)
+	go func() { shutErr <- s.bridge.Shutdown(ctx) }()
+	time.Sleep(20 * time.Millisecond) // let the drain begin before the result
+	s.c.send(okResult(deleteTask(dw.Task.Task)))
+
+	if err := <-shutErr; err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if err := s.wait(); err != nil {
+		t.Fatalf("a drained session should be a clean stop, got: %v", err)
+	}
+	tasks, err := eq.Tasks(ctx, "in")
+	if err != nil || len(tasks) != 1 || tasks[0].Claims != 0 {
+		t.Fatalf("want only the unclaimed second task, got %v, %v", tasks, err)
+	}
+}
+
+// TestContract_ShutdownIdle: a session waiting for a task drains at once.
+func TestContract_ShutdownIdle(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	eq := newEQ(t, ctx)
+	s := newSession(t, ctx, eq, workCfg(), time.Minute)
+
+	time.Sleep(20 * time.Millisecond) // let the gateway block in its claim
+	if err := s.bridge.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if err := s.wait(); err != nil {
+		t.Fatalf("a drained session should be a clean stop, got: %v", err)
+	}
+}

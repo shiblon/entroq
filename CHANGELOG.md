@@ -152,6 +152,17 @@ runs, so plan a short maintenance window on large doc tables.
   answer, and a worker that does not answer within a lease ends the session as a
   caller fault. A task whose `takeDocs` or `doWork` the worker never answered
   is released when it hangs up, available at once instead of after its lease.
+- **`eqlink work` drains on the first signal.** The first SIGINT or SIGTERM
+  stops claiming, finishes the task in hand, and exits 0, waiting up to
+  `--lease` for it; a second stops at once, leaving the task to its lease, as
+  the first did before. `eqlink work --addr` closes each connection normally
+  once its task is done and refuses new connections meanwhile.
+- **Breaking (Go): `workgateway.Server` replaces `workgateway.Handler`.**
+  `NewServer(eq, lease, entroqTimeout)` is the `http.Handler`, with `Shutdown`
+  to drain every connection and `Close` to stop them, like `http.Server`;
+  `workgateway.Serve` takes it in place of the handler's arguments. A context no
+  longer stops the connections: call `Close`. `Bridge.Shutdown` drains one
+  session.
 - **Breaking (Go): worker handlers receive doc groups.** `DoWork`, `DoModify`,
   and `Finish` handlers, and the `Handler` interface, take
   `[]*entroq.DocGroup` where they took `[]*entroq.Doc`: one group per claim

@@ -1059,14 +1059,11 @@ func (w *Worker[T]) startClaim(ctx context.Context, run *activeRun) (context.Con
 // returned, so that task waits out its lease too. After Shutdown, Run returns
 // ErrShutdown.
 func (w *Worker[T]) Shutdown(ctx context.Context) error {
-	w.mu.Lock()
-	w.closed = true
-	for run := range w.runs {
+	w.closeRuns(func(run *activeRun) {
 		if run.cancelClaim != nil {
 			run.cancelClaim()
 		}
-	}
-	w.mu.Unlock()
+	})
 
 	done := make(chan struct{})
 	go func() {
@@ -1077,12 +1074,19 @@ func (w *Worker[T]) Shutdown(ctx context.Context) error {
 	case <-done:
 		return nil
 	case <-ctx.Done():
-		w.mu.Lock()
-		for run := range w.runs {
-			run.cancel()
-		}
-		w.mu.Unlock()
+		w.closeRuns(func(run *activeRun) { run.cancel() })
 		return ctx.Err()
+	}
+}
+
+// closeRuns marks the worker closed, so no Run joins or claims again, and
+// calls stop on each active Run while no Run can leave.
+func (w *Worker[T]) closeRuns(stop func(*activeRun)) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.closed = true
+	for run := range w.runs {
+		stop(run)
 	}
 }
 

@@ -245,6 +245,14 @@ stateless per connection, so it just claims the next task.
   go to stderr. A spawning client must inherit it (Go's `os/exec` sends a child's
   stderr to `/dev/null` unless you set `cmd.Stderr`; Python/shell inherit by
   default) or lose all diagnostics.
-- **To stop cleanly**, signal the gateway (`SIGTERM`/`SIGINT`) or close the
-  WebSocket normally, rather than killing the pipe mid-task — it winds the current
-  claim down instead of orphaning it for a lease period.
+- **To stop cleanly**, finish the exchange in progress (send the `result`, or
+  the `done` of a post-commit phase), then hang up: close the gateway's stdin
+  or the WebSocket, and wait for the gateway to exit (0) or close (1000). A
+  result already sent always commits. The gateway may have claimed another task
+  in the meantime; it releases a task the worker never answered at once, so
+  nothing waits out a lease.
+- **An operator stopping the gateway** signals it: the first `SIGTERM`/`SIGINT`
+  drains, finishing the task in hand before exiting 0 (a WebSocket gateway
+  closes every connection normally and refuses new ones meanwhile); a second
+  stops at once. A library that spawned the gateway and is itself signaled
+  should not forward the signal: it drains as above, and the gateway follows.

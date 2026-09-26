@@ -74,6 +74,7 @@ type session struct {
 	clientR *io.PipeReader // client's read end; closing it breaks the bridge's Send
 	clientW *io.PipeWriter // client's write end; closing it gives the bridge's Recv EOF
 	hello   helloMsg       // the gateway's opening message
+	bridge  *Bridge
 }
 
 func newSession(t *testing.T, ctx context.Context, eq *entroq.EntroQ, cfg Config, lease time.Duration, opts ...Option) *session {
@@ -94,6 +95,7 @@ func newSession(t *testing.T, ctx context.Context, eq *entroq.EntroQ, cfg Config
 		errc:    errc,
 		clientR: clientR,
 		clientW: clientW,
+		bridge:  bridge,
 	}
 	// Every session opens with the gateway's hello; keep it for the tests
 	// that check it, and start the rest at the first phase message.

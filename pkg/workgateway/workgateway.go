@@ -87,7 +87,8 @@ type Bridge struct {
 	lease         time.Duration
 	entroqTimeout time.Duration
 
-	// eq and w are set by Run before the reader starts, and fixed after.
+	// eq and w are set by Run, under mu, before the reader starts, and fixed
+	// after.
 	eq *entroq.EntroQ
 	w  *worker.Worker[json.RawMessage]
 
@@ -96,6 +97,7 @@ type Bridge struct {
 	// the reader.
 	wmu       sync.Mutex
 	mu        sync.Mutex
+	closed    bool  // Shutdown was called
 	connLost  bool  // a Send or Recv failed: the worker is gone
 	violation error // the worker sent a message no request asked for
 	awaiting  bool  // a request is outstanding; the next message is its reply
@@ -160,15 +162,30 @@ func NewBridge(conn Conn, opts ...Option) *Bridge {
 // recording a lost connection so classify can tell "the client hung up" from
 // any other stop, no matter how the error was wrapped on the way out.
 func (b *Bridge) send(ctx context.Context, v any) error {
-	b.wmu.Lock()
-	err := b.conn.Send(ctx, v)
-	b.wmu.Unlock()
+	err := func() error {
+		b.wmu.Lock()
+		defer b.wmu.Unlock()
+		return b.conn.Send(ctx, v)
+	}()
 	if err != nil {
-		b.mu.Lock()
-		b.connLost = true
-		b.mu.Unlock()
+		b.markLost()
 	}
 	return err
+}
+
+// markLost records that the worker is gone.
+func (b *Bridge) markLost() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.connLost = true
+}
+
+// expectReply marks a request outstanding, so the reader takes the next
+// message as its reply.
+func (b *Bridge) expectReply() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.awaiting = true
 }
 
 // request sends a phase message and waits for its reply, decoding it into
@@ -181,9 +198,7 @@ func (b *Bridge) request(ctx context.Context, msg, reply any, abort *abortMsg) e
 		return b.goneErr()
 	default:
 	}
-	b.mu.Lock()
-	b.awaiting = true
-	b.mu.Unlock()
+	b.expectReply()
 	if err := b.send(ctx, msg); err != nil {
 		return fmt.Errorf("%w: %v", errConnLost, err)
 	}
@@ -259,9 +274,7 @@ func (b *Bridge) read(ctx context.Context) {
 	for {
 		var raw json.RawMessage
 		if err := b.conn.Recv(ctx, &raw); err != nil {
-			b.mu.Lock()
-			b.connLost = true
-			b.mu.Unlock()
+			b.markLost()
 			return
 		}
 		if !b.accept(raw) {
@@ -325,7 +338,9 @@ func (b *Bridge) Run(ctx context.Context, eq *entroq.EntroQ) error {
 		return &ExitError{Class: ExitCaller, err: fmt.Errorf("gateway registration: a work handler is required (the gateway has nothing to do without one)")}
 	}
 
-	b.eq, b.w = eq, b.newWorker(eq)
+	if !b.start(eq) {
+		return nil
+	}
 	rctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go b.read(rctx)
@@ -402,6 +417,37 @@ func (b *Bridge) newWorker(eq *entroq.EntroQ) *worker.Worker[json.RawMessage] {
 	return worker.New(eq, opts...)
 }
 
+// Shutdown drains the session, as worker.Shutdown does: the gateway stops
+// claiming at once, finishes the task in hand (its remaining phases and its
+// commit), and Run returns nil, ending the session as a clean stop. If ctx ends
+// first, the task's handler context is canceled and Shutdown returns ctx.Err().
+func (b *Bridge) Shutdown(ctx context.Context) error {
+	if w := b.close(); w != nil {
+		return w.Shutdown(ctx)
+	}
+	return nil // Run has not started the worker, and now will not
+}
+
+// start builds the session's worker, unless Shutdown came first.
+func (b *Bridge) start(eq *entroq.EntroQ) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return false
+	}
+	b.eq, b.w = eq, b.newWorker(eq)
+	return true
+}
+
+// close marks the session shut down and returns its worker, nil if start has
+// not run.
+func (b *Bridge) close() *worker.Worker[json.RawMessage] {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.closed = true
+	return b.w
+}
+
 // runWorker runs the worker once, until ctx is done or it stops. The
 // supervision loop in Run calls it repeatedly, reusing this Bridge (and its
 // connection) across restarts.
@@ -439,15 +485,12 @@ func (b *Bridge) lost() bool {
 // it to stop the worker promptly), but it is still just the client hanging up,
 // which is a clean end of service, not a fault or a thing to retry.
 func (b *Bridge) classify(err error) ExitClass {
-	b.mu.Lock()
-	violation, connLost := b.violation, b.connLost
-	b.mu.Unlock()
 	switch {
-	case violation != nil:
+	case b.violationErr() != nil:
 		return ExitCaller
 	case err == nil || entroq.IsCanceled(err) || errors.Is(err, worker.ErrShutdown):
 		return ExitOK
-	case connLost:
+	case b.lost():
 		return ExitOK
 	case entroq.IsUnavailable(err):
 		return ExitTransient

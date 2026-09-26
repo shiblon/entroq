@@ -2,8 +2,6 @@ package cmd
 
 import (
 	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"github.com/shiblon/entroq"
@@ -79,18 +77,23 @@ relocated) for --entroq-timeout, reconnecting transparently, before giving up.
 On stop it exits with a class code a supervisor can key on: 0 clean, 75
 transient (retryable), 78 caller fault, 70 gateway fault.
 
+The first SIGINT or SIGTERM drains: the gateway stops claiming, finishes the
+task in hand (waiting up to --lease for it), and exits 0. A second stops at
+once, leaving the task to its lease.
+
 With --addr the gateway serves WebSocket instead, and each connecting worker
 declares the same registration via URL query params (?queue=..&work=1&...).
-Concurrency is more connections; a dropped connection is a clean stop and the
-in-flight task is reclaimed on lease expiry. The same classes surface as
+Concurrency is more connections; a dropped connection is a clean stop, and a
+task the worker never answered is released for another worker at once. A
+drain finishes every connection's task and closes it normally, refusing new
+connections meanwhile. The same classes surface as
 WebSocket close codes (1013 transient, 1008 caller, 1011 gateway).`,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
-		defer stop()
-
-		g, gctx := errgroup.WithContext(ctx)
+		// The first SIGINT or SIGTERM drains (see onSignal), so the
+		// connection to EntroQ outlives it: only the run's context ends early.
+		g, gctx := errgroup.WithContext(cmd.Context())
 
 		eq, err := localEQ(gctx, g)
 		if err != nil {
@@ -101,7 +104,10 @@ WebSocket close codes (1013 transient, 1008 caller, 1011 gateway).`,
 		// WebSocket serve mode: many workers connect, each declaring its own
 		// registration via URL query params.
 		if workAddr != "" {
-			return workgateway.Serve(gctx, workAddr, eq, workLease, workEntroQTimeout)
+			srv := workgateway.NewServer(eq, workLease, workEntroQTimeout)
+			ctx, cancel := onSignal(gctx, workLease, srv.Shutdown)
+			defer cancel()
+			return workgateway.Serve(ctx, workAddr, srv)
 		}
 
 		// stdio mode: one worker over this process's stdin/stdout, registered by
@@ -120,7 +126,9 @@ WebSocket close codes (1013 transient, 1008 caller, 1011 gateway).`,
 		bridge := workgateway.NewBridge(workgateway.NewPipeConn(os.Stdin, os.Stdout),
 			workgateway.WithConfig(cfg), workgateway.WithLease(workLease),
 			workgateway.WithEntroQTimeout(workEntroQTimeout))
-		return bridge.Run(gctx, eq)
+		ctx, cancel := onSignal(gctx, workLease, bridge.Shutdown)
+		defer cancel()
+		return bridge.Run(ctx, eq)
 	},
 }
 

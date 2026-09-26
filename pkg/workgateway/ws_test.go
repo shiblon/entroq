@@ -2,6 +2,8 @@ package workgateway
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -22,9 +24,9 @@ func TestWS_OK(t *testing.T) {
 	eq := newEQ(t, ctx)
 	insertTask(t, ctx, eq, "in", "hello")
 
-	srvCtx, srvCancel := context.WithCancel(ctx)
-	defer srvCancel()
-	srv := httptest.NewServer(Handler(srvCtx, eq, 30*time.Second, defaultEntroQTimeout))
+	gw := NewServer(eq, 30*time.Second, defaultEntroQTimeout)
+	defer gw.Close()
+	srv := httptest.NewServer(gw)
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/work?queue=in&work=1"
@@ -58,7 +60,6 @@ func TestWS_OK(t *testing.T) {
 		t.Fatalf("wait queue empty: %v", err)
 	}
 	c.Close(websocket.StatusNormalClosure, "")
-	srvCancel()
 }
 
 // TestWS_ClientDropReclaims is the WebSocket analog of TestBridge_ClientDropReclaims:
@@ -71,9 +72,9 @@ func TestWS_ClientDropReclaims(t *testing.T) {
 	insertTask(t, ctx, eq, "in", "hello")
 
 	lease := 200 * time.Millisecond
-	srvCtx, srvCancel := context.WithCancel(ctx)
-	defer srvCancel()
-	srv := httptest.NewServer(Handler(srvCtx, eq, lease, defaultEntroQTimeout))
+	gw := NewServer(eq, lease, defaultEntroQTimeout)
+	defer gw.Close()
+	srv := httptest.NewServer(gw)
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/work?queue=in&work=1"
@@ -120,5 +121,54 @@ func readHello(t *testing.T, ctx context.Context, c *websocket.Conn) {
 	}
 	if h.Type != msgHello || h.Protocol != Protocol {
 		t.Fatalf("hello: got %+v, want protocol %d", h, Protocol)
+	}
+}
+
+// TestWS_ShutdownDrains: Server.Shutdown lets each connection finish its task
+// and closes it normally, and refuses new connections meanwhile.
+func TestWS_ShutdownDrains(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	eq := newEQ(t, ctx)
+	insertTask(t, ctx, eq, "in", "hello")
+
+	gw := NewServer(eq, time.Minute, defaultEntroQTimeout)
+	defer gw.Close()
+	srv := httptest.NewServer(gw)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/work?queue=in&work=1"
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.CloseNow()
+	readHello(t, ctx, c)
+	var dw doWorkMsg
+	if err := wsjson.Read(ctx, c, &dw); err != nil {
+		t.Fatalf("read doWork: %v", err)
+	}
+
+	shutErr := make(chan error, 1)
+	go func() { shutErr <- gw.Shutdown(ctx) }()
+	time.Sleep(20 * time.Millisecond) // let the drain begin
+
+	if _, resp, err := websocket.Dial(ctx, wsURL, nil); err == nil || resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("dial while draining: got %v (resp %v), want a 503 refusal", err, resp)
+	}
+
+	del := &pb.ModifyRequest{Deletes: []*pb.TaskID{{Id: dw.Task.Id, Version: dw.Task.Version, Queue: dw.Task.Queue}}}
+	if err := wsjson.Write(ctx, c, result{Type: msgResult, disposition: disposition{Outcome: outcomeOK}, Modification: &wireModReq{del}}); err != nil {
+		t.Fatalf("write result: %v", err)
+	}
+	if err := <-shutErr; err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	var msg json.RawMessage
+	if err := wsjson.Read(ctx, c, &msg); websocket.CloseStatus(err) != websocket.StatusNormalClosure {
+		t.Errorf("after the drain: got %v, want a normal close", err)
+	}
+	if err := eq.WaitQueuesEmpty(ctx, entroq.MatchExact("in")); err != nil {
+		t.Fatalf("the drained task must commit: %v", err)
 	}
 }
