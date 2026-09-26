@@ -282,13 +282,13 @@ func (b *Bridge) takeDocs(ctx context.Context, task *entroq.Task, _ json.RawMess
 // error. It chains the post-commit phases the worker registered: OnSuccess runs
 // the success phase after a good commit, OnDependency the dependency phase when
 // the commit loses a dependency race.
-func (b *Bridge) doWork(ctx context.Context, task *entroq.Task, _ json.RawMessage, docs []*entroq.Doc) (*worker.Result, error) {
+func (b *Bridge) doWork(ctx context.Context, task *entroq.Task, _ json.RawMessage, groups []*entroq.DocGroup) (*worker.Result, error) {
 	taskPB, err := pbconv.TaskToProto(task)
 	if err != nil {
 		return nil, fmt.Errorf("convert task for doWork: %w", err)
 	}
 	msg := doWorkMsg{Type: msgDoWork, Task: wireTask{taskPB}}
-	for _, d := range docs {
+	for _, d := range entroq.GroupDocs(groups) {
 		docPB, err := pbconv.DocToProto(d)
 		if err != nil {
 			return nil, fmt.Errorf("convert doc for doWork: %w", err)

@@ -123,6 +123,13 @@ runs, so plan a short maintenance window on large doc tables.
   the members when a server older than this one sends none. Replace
   `docs, err := eq.ClaimDocs(...)` with `group, err := ...` and read
   `group.Docs`.
+- **Breaking (Go): worker handlers receive doc groups.** `DoWork`, `DoModify`,
+  and `Finish` handlers, and the `Handler` interface, take
+  `[]*entroq.DocGroup` where they took `[]*entroq.Doc`: one group per claim
+  from `TakeDocs`, in claim order, each with its docs and its version and
+  claim, including a group claimed with no docs. `entroq.GroupDocs(groups)`
+  flattens them to the docs handlers received before. A handler that ignored
+  its docs only changes the parameter type.
 - **Schemas carry a digest, and unreleased ones a `-dev` version.**
   `eqpg.InitSchema` records `eqpg.SchemaDigest`, the SHA-256 of the schema it
   applies, and `eqpg.Open` refuses a database at the right version whose

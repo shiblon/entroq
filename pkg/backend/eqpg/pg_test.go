@@ -339,12 +339,12 @@ func Example() {
 	go func() { time.Sleep(2 * time.Second); cancel() }()
 
 	w := worker.New(client,
-		worker.WithDoWork(func(ctx context.Context, claimed *entroq.Task, s string, _ []*entroq.Doc) error {
+		worker.WithDoWork(func(ctx context.Context, claimed *entroq.Task, s string, _ []*entroq.DocGroup) error {
 			// Do work with the task.
 			fmt.Println(s)
 			return nil
 		}),
-		worker.WithFinish(func(ctx context.Context, mod worker.Modifier, final *entroq.Task, _ string, _ []*entroq.Doc) error {
+		worker.WithFinish(func(ctx context.Context, mod worker.Modifier, final *entroq.Task, _ string, _ []*entroq.DocGroup) error {
 			// Delete the task to "commit" the work.
 			// At this point, you can also call directly into eqpg.ModifyOpts and
 			// hand it a function to call that has a transaction. That transaction
@@ -414,12 +414,12 @@ func Example_inTransaction() {
 	// when the task version is finalized (background renewal is stopped),
 	// updates the counter table.
 	w := worker.New(client,
-		worker.WithDoWork(func(ctx context.Context, claimed *entroq.Task, s string, _ []*entroq.Doc) error {
+		worker.WithDoWork(func(ctx context.Context, claimed *entroq.Task, s string, _ []*entroq.DocGroup) error {
 			// Do work with the task.
 			fmt.Println(s)
 			return nil
 		}),
-		worker.WithFinish(func(ctx context.Context, mod worker.Modifier, final *entroq.Task, _ string, _ []*entroq.Doc) error {
+		worker.WithFinish(func(ctx context.Context, mod worker.Modifier, final *entroq.Task, _ string, _ []*entroq.DocGroup) error {
 			// Delete the task to "commit" the work.
 
 			// The counter is updated in the same transaction as the entroq modification.

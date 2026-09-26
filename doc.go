@@ -336,6 +336,16 @@ type DocGroup struct {
 	Docs      []*Doc
 }
 
+// GroupDocs returns the docs of groups, in order: every member of the first
+// group, then of the next.
+func GroupDocs(groups []*DocGroup) []*Doc {
+	var docs []*Doc
+	for _, g := range groups {
+		docs = append(docs, g.Docs...)
+	}
+	return docs
+}
+
 // DocClaim is used to claim all docs that share a primary key in a namespace.
 //
 // Construct with ClaimKey for a fluent interface:

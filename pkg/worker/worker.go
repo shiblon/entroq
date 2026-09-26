@@ -21,7 +21,7 @@
 //
 //	client, _ := entroq.New(ctx, mem.Opener()) // Open an in-memory EntroQ backend.
 //	w := worker.New[json.RawMessage](client,
-//		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, value json.RawMessage, docs []*entroq.Doc) (*worker.Result, error) {
+//		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, value json.RawMessage, _ []*entroq.DocGroup) (*worker.Result, error) {
 //			log.Printf("Working on task %v", task.ID)
 //			return worker.Modify(task.Delete()), nil
 //		}),
@@ -74,9 +74,9 @@ type Modifier interface {
 //   - Finish: commit phase, runs after renewal stops with stable task version
 type Handler[T any] interface {
 	// TakeDocs is called after a task is claimed and before DoWork. It declares which
-	// docs the worker needs to claim ownership of before doing work. Return
-	// nil to skip doc acquisition. A missing doc moves the task to the error
-	// queue. A claimed (contended) required doc causes a retry.
+	// doc groups the worker needs to claim ownership of before doing work. Return
+	// nil to skip doc acquisition. Each claim takes a whole group, which may have
+	// no docs yet. A group someone else holds causes a retry.
 	//
 	// Note: task renewal begins as soon as the task is claimed, before TakeDocs
 	// is called. Doc renewal (alongside the task) starts only once TakeDocs
@@ -88,8 +88,10 @@ type Handler[T any] interface {
 
 	// DoWork is called by Worker.Run for each claimed task. The task is renewed in
 	// the background while this function runs. value holds the result of
-	// unmarshaling task.Value into T. Docs holds any docs acquired by TakeDocs; it
-	// is non-nil but empty when no docs were acquired.
+	// unmarshaling task.Value into T. The groups are those TakeDocs claimed, in
+	// the order they were claimed (by namespace, then key), each with its docs;
+	// the slice is non-nil but empty when none were claimed, and a group may have
+	// no docs.
 	//
 	// On nil return, renewal is stopped and Finish (if set) is called with
 	// the stable task version.
@@ -103,12 +105,12 @@ type Handler[T any] interface {
 	// restart are the responsibility of the process orchestrator (e.g.
 	// Kubernetes, systemd). To retry or quarantine the task instead, return a
 	// RetryError or MoveError (see RetryErrorf and MoveErrorf).
-	DoWork(context.Context, *entroq.Task, T, []*entroq.Doc) error
+	DoWork(context.Context, *entroq.Task, T, []*entroq.DocGroup) error
 
 	// Finish is called after DoWork returns nil and renewal has stopped. It
 	// receives a Modifier (the worker's client, narrowed to modification), the
 	// stable (final renewed) task version, the same value passed to DoWork, and
-	// the same docs. Use it to apply task modifications -- deletion, requeueing,
+	// the same doc groups, at their final versions. Use it to apply task modifications -- deletion, requeueing,
 	// doc changes, etc. Finish is skipped when DoWork returns a non-nil error of
 	// any kind.
 	//
@@ -119,7 +121,7 @@ type Handler[T any] interface {
 	// so they are given no client. A handler that needs more than a commit here
 	// (or a client in the earlier phases) implements Handler via WithMakeHandler
 	// and captures a full client in a closure.
-	Finish(context.Context, Modifier, *entroq.Task, T, []*entroq.Doc) error
+	Finish(context.Context, Modifier, *entroq.Task, T, []*entroq.DocGroup) error
 }
 
 // MakeHandler defines a function that can be called to make a new handler.
@@ -133,14 +135,15 @@ type MakeHandler[T any] func() (Handler[T], error)
 // run once it succeeds) rather than committing them yourself in a Finish
 // function. It is not handed a client: it runs under renewal, and its output is
 // the returned Result, which the worker commits in Finish at the stable version.
-// The docs parameter carries any docs claimed by WithTakeDocs, and can be empty.
+// The groups parameter carries any doc groups claimed by WithTakeDocs, and can
+// be empty.
 //
 // Return the Result (built with Modify) and a nil error on success; a nil Result
 // is a valid no-op. To retry the task return a RetryError (RetryErrorf); to move
 // it return a MoveError (MoveErrorf). Any other non-nil error causes the worker
 // to exit -- backoff and restart are the responsibility of the process
 // orchestrator.
-type DoModifyRun[T any] func(context.Context, *entroq.Task, T, []*entroq.Doc) (*Result, error)
+type DoModifyRun[T any] func(context.Context, *entroq.Task, T, []*entroq.DocGroup) (*Result, error)
 
 // Result is what a DoModifyRun returns: the modifications the worker applies
 // after work completes, plus optional work to run when the task is handled
@@ -218,15 +221,15 @@ func (r *Result) OnDependency(fn func(context.Context, *entroq.DependencyError) 
 type TakeRun[T any] func(context.Context, *entroq.Task, T) ([]*entroq.DocClaim, error)
 
 // DoRun[T] is the WithDoWork function shape: the work phase. It is given the
-// task, its typed value, and any claimed docs, but no client -- it runs under
+// task, its typed value, and any claimed doc groups, but no client -- it runs under
 // renewal, so it must not modify the claimed task (see Handler.Finish). Return a
 // RetryError/MoveError to retry/move, or any other error to exit.
-type DoRun[T any] func(context.Context, *entroq.Task, T, []*entroq.Doc) error
+type DoRun[T any] func(context.Context, *entroq.Task, T, []*entroq.DocGroup) error
 
 // FinishRun[T] is the WithFinish function shape: the commit phase. It runs after
 // renewal has stopped and is handed a Modifier, so committing the (now stable)
-// task is safe. It receives the same value and docs as DoRun.
-type FinishRun[T any] func(context.Context, Modifier, *entroq.Task, T, []*entroq.Doc) error
+// task is safe. It receives the same value and doc groups as DoRun.
+type FinishRun[T any] func(context.Context, Modifier, *entroq.Task, T, []*entroq.DocGroup) error
 
 // funcHandler[T] is a Handler[T] backed by plain functions.
 type funcHandler[T any] struct {
@@ -244,19 +247,19 @@ func (h *funcHandler[T]) TakeDocs(ctx context.Context, task *entroq.Task, value 
 }
 
 // DoWork runs the specified "do" function.
-func (h *funcHandler[T]) DoWork(ctx context.Context, task *entroq.Task, value T, docs []*entroq.Doc) error {
+func (h *funcHandler[T]) DoWork(ctx context.Context, task *entroq.Task, value T, groups []*entroq.DocGroup) error {
 	if h.do == nil {
 		return FatalErrorf("no work function specified")
 	}
-	return h.do(ctx, task, value, docs)
+	return h.do(ctx, task, value, groups)
 }
 
 // Finish runs the specified "finish" function if it has been defined.
-func (h *funcHandler[T]) Finish(ctx context.Context, mod Modifier, task *entroq.Task, value T, docs []*entroq.Doc) error {
+func (h *funcHandler[T]) Finish(ctx context.Context, mod Modifier, task *entroq.Task, value T, groups []*entroq.DocGroup) error {
 	if h.finish == nil {
 		return nil
 	}
-	return h.finish(ctx, mod, task, value, docs)
+	return h.finish(ctx, mod, task, value, groups)
 }
 
 // doModifyhandler is a special handler that keeps track of "desired
@@ -283,11 +286,11 @@ func (h *doModifyHandler[T]) TakeDocs(ctx context.Context, task *entroq.Task, va
 	return h.take(ctx, task, val)
 }
 
-func (h *doModifyHandler[T]) DoWork(ctx context.Context, task *entroq.Task, val T, docs []*entroq.Doc) error {
+func (h *doModifyHandler[T]) DoWork(ctx context.Context, task *entroq.Task, val T, groups []*entroq.DocGroup) error {
 	if h.doModify == nil {
 		return FatalErrorf("no work function specified")
 	}
-	result, err := h.doModify(ctx, task, val, docs)
+	result, err := h.doModify(ctx, task, val, groups)
 	if err != nil {
 		return err
 	}
@@ -295,7 +298,7 @@ func (h *doModifyHandler[T]) DoWork(ctx context.Context, task *entroq.Task, val 
 	return nil
 }
 
-func (h *doModifyHandler[T]) Finish(ctx context.Context, mod Modifier, finalTask *entroq.Task, val T, finalDocs []*entroq.Doc) error {
+func (h *doModifyHandler[T]) Finish(ctx context.Context, mod Modifier, finalTask *entroq.Task, val T, finalGroups []*entroq.DocGroup) error {
 	// initialTask is set unconditionally by TakeDocs, which always runs before
 	// Finish, so it is non-nil here by construction.
 	if h.result == nil {
@@ -333,6 +336,7 @@ func (h *doModifyHandler[T]) Finish(ctx context.Context, mod Modifier, finalTask
 
 		// Fix up doc modification versions to reflect the final renewed state.
 		type nsID = [2]string
+		finalDocs := entroq.GroupDocs(finalGroups)
 		docVers := make(map[nsID]int32, len(finalDocs))
 		for _, d := range finalDocs {
 			docVers[nsID{d.Namespace, d.ID}] = d.Version
@@ -640,22 +644,23 @@ func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, ta
 // It calls the provided take function to learn what is needed, then claims
 // ownership of those documents.
 //
-// It also returns the claims of groups that had no docs. Renewing the docs
-// renews their groups, but nothing renews an empty group, so the caller
-// re-claims those as it renews.
+// It returns the claimed groups in claim order, and the claims of those that
+// had no docs: renewing the docs renews their groups, but nothing renews an
+// empty group, so the caller re-claims those as it renews.
 //
 // Returns a *entroq.DependencyError while another claimant holds a group; the
 // caller retries the task with backoff.
-func acquireDocs[T any](ctx context.Context, eqc *entroq.EntroQ, task *entroq.Task, value T, lease time.Duration, take TakeRun[T]) (docs []*entroq.Doc, empty []*entroq.DocClaim, err error) {
+func acquireDocs[T any](ctx context.Context, eqc *entroq.EntroQ, task *entroq.Task, value T, lease time.Duration, take TakeRun[T]) (groups []*entroq.DocGroup, empty []*entroq.DocClaim, err error) {
+	groups = []*entroq.DocGroup{}
 	if take == nil {
-		return nil, nil, nil
+		return groups, nil, nil
 	}
 	req, err := take(ctx, task, value)
 	if err != nil {
 		return nil, nil, fmt.Errorf("take docs: %w", err)
 	}
 	if req == nil {
-		return nil, nil, nil
+		return groups, nil, nil
 	}
 
 	// Sort to avoid livelock from dining philosophers.
@@ -675,9 +680,37 @@ func acquireDocs[T any](ctx context.Context, eqc *entroq.EntroQ, task *entroq.Ta
 		if len(group.Docs) == 0 {
 			empty = append(empty, cq)
 		}
-		docs = append(docs, group.Docs...)
+		groups = append(groups, group)
 	}
-	return docs, empty, nil
+	return groups, empty, nil
+}
+
+// withRenewed returns groups with their members replaced by the renewed copies
+// in renewed, and each group's version and claim taken from them, as renewal
+// moves every member of a group together. A group with no docs is returned as
+// it was.
+func withRenewed(groups []*entroq.DocGroup, renewed []*entroq.Doc) []*entroq.DocGroup {
+	type nsID struct{ ns, id string }
+	byID := make(map[nsID]*entroq.Doc, len(renewed))
+	for _, d := range renewed {
+		byID[nsID{d.Namespace, d.ID}] = d
+	}
+	out := make([]*entroq.DocGroup, 0, len(groups))
+	for _, g := range groups {
+		ng := *g
+		ng.Docs = make([]*entroq.Doc, 0, len(g.Docs))
+		for _, d := range g.Docs {
+			if r, ok := byID[nsID{d.Namespace, d.ID}]; ok {
+				d = r
+			}
+			ng.Docs = append(ng.Docs, d)
+		}
+		if len(ng.Docs) > 0 {
+			ng.Version, ng.Claimant, ng.At = ng.Docs[0].Version, ng.Docs[0].Claimant, ng.Docs[0].At
+		}
+		out = append(out, &ng)
+	}
+	return out
 }
 
 // runOne claims one task, unmarshals its value into T, runs the work function
@@ -728,7 +761,7 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt, slot *workerSlot) 
 	// Phase 2: Acquire docs before renewal starts. Doc claims are sorted by
 	// (namespace, key) to prevent dining-philosopher livelock when multiple
 	// doc groups are acquired.
-	docs, emptyGroups, err := acquireDocs(rCtx, w.eqc, task, value, opts.lease, handler.TakeDocs)
+	groups, emptyGroups, err := acquireDocs(rCtx, w.eqc, task, value, opts.lease, handler.TakeDocs)
 	if err != nil {
 		// A claim fails only while someone else holds the group, which is
 		// transient: retry with backoff.
@@ -747,7 +780,7 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt, slot *workerSlot) 
 	var (
 		sentinelErr error
 		finalTask   *entroq.Task
-		finalDocs   []*entroq.Doc
+		finalGroups []*entroq.DocGroup
 	)
 
 	handleErr := doWhileRenewing(rCtx, w.eqc, emptyGroups,
@@ -757,9 +790,9 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt, slot *workerSlot) 
 				if len(stable.Tasks) > 0 {
 					finalTask = stable.Tasks[0]
 				}
-				finalDocs = stable.Docs
+				finalGroups = withRenewed(groups, stable.Docs)
 			}()
-			if err := handler.DoWork(ctx, task, value, docs); err != nil {
+			if err := handler.DoWork(ctx, task, value, groups); err != nil {
 				if !isSentinelError(err) {
 					return fmt.Errorf("task do: %w", err)
 				}
@@ -768,7 +801,7 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt, slot *workerSlot) 
 			return nil
 		},
 		entroq.RenewingTask(task),
-		entroq.RenewingDocs(docs),
+		entroq.RenewingDocs(entroq.GroupDocs(groups)),
 		entroq.WithRenewInterval(opts.lease),
 	)
 
@@ -786,7 +819,7 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt, slot *workerSlot) 
 	}
 
 	// Phase 4: Finish with stable versions — renewal has stopped.
-	if err := handler.Finish(ctx, w.eqc, finalTask, value, finalDocs); err != nil {
+	if err := handler.Finish(ctx, w.eqc, finalTask, value, finalGroups); err != nil {
 		// A post-commit hook (OnDependency) may return a Retry/Move/Fatal
 		// sentinel; route it through the same machinery as a work-phase sentinel
 		// before falling back to the default dependency reclaim.

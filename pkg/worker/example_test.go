@@ -34,7 +34,7 @@ func Example_simpleWorker() {
 	done := make(chan struct{})
 
 	w := worker.New[json.RawMessage](eq,
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, value json.RawMessage, _ []*entroq.Doc) (*worker.Result, error) {
+		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, value json.RawMessage, _ []*entroq.DocGroup) (*worker.Result, error) {
 			fmt.Printf("processing task with value %s\n", value)
 			// Return the modifications to apply atomically after work completes.
 			return worker.Modify(task.Delete()), nil
@@ -113,8 +113,9 @@ func Example_workerWithDocs() {
 				Key:       val.Key,
 			}}, nil
 		}),
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, val jobValue, docs []*entroq.Doc) (*worker.Result, error) {
-			// docs are sorted by (primary key, secondary key).
+		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, val jobValue, groups []*entroq.DocGroup) (*worker.Result, error) {
+			// One claim, one group; its docs are sorted by secondary key.
+			docs := groups[0].Docs
 			for _, d := range docs {
 				fmt.Printf("doc key=%s secondary=%s\n", d.Key, d.SecondaryKey)
 			}
