@@ -172,9 +172,9 @@ func DocFromProto(d *pb.Doc) (*entroq.Doc, error) {
 	}, nil
 }
 
-// DocGroupToProto converts a doc set's lock to its wire form: a Doc with no
+// DocSetToProto converts a doc set's lock to its wire form: a Doc with no
 // ID, secondary key, or content. Its members travel separately.
-func DocGroupToProto(g *entroq.DocGroup) *pb.Doc {
+func DocSetToProto(g *entroq.DocSet) *pb.Doc {
 	return &pb.Doc{
 		Namespace: g.Namespace,
 		Key:       g.Key,
@@ -185,10 +185,10 @@ func DocGroupToProto(g *entroq.DocGroup) *pb.Doc {
 	}
 }
 
-// DocGroupFromProto converts a wire doc set, a Doc with no ID, and its members
-// to an entroq.DocGroup.
-func DocGroupFromProto(d *pb.Doc, docs []*entroq.Doc) *entroq.DocGroup {
-	return &entroq.DocGroup{
+// DocSetFromProto converts a wire doc set, a Doc with no ID, and its members
+// to an entroq.DocSet.
+func DocSetFromProto(d *pb.Doc, docs []*entroq.Doc) *entroq.DocSet {
+	return &entroq.DocSet{
 		Namespace: d.Namespace,
 		Key:       d.Key,
 		Version:   d.Version,

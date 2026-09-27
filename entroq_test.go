@@ -51,7 +51,7 @@ func Example() {
 	w := worker.New(eq,
 		// Workers claim a task and pass it to your handler functions. In the
 		// background, the task's lease is renewed while the first function runs.
-		worker.WithDoWork(func(ctx context.Context, initial *entroq.Task, v string, _ []*entroq.DocGroup) error {
+		worker.WithDoWork(func(ctx context.Context, initial *entroq.Task, v string, _ []*entroq.DocSet) error {
 			fmt.Printf("Worker handling task %q\n", v)
 			// Do work with it here.
 			return nil
@@ -59,7 +59,7 @@ func Example() {
 		// When ready to commit changes to the task (including deletion), the second
 		// function passes the version-stable task after the renewer is stopped,
 		// making it safe to use it in modification transactions.
-		worker.WithFinish(func(ctx context.Context, mod worker.Modifier, final *entroq.Task, v string, _ []*entroq.DocGroup) error {
+		worker.WithFinish(func(ctx context.Context, mod worker.Modifier, final *entroq.Task, v string, _ []*entroq.DocSet) error {
 			fmt.Printf("Deleting task %q\n", v)
 			_, err := mod.Modify(ctx, final.Delete())
 			if err != nil {
@@ -107,7 +107,7 @@ func Example_dependencies() {
 	var config *entroq.Task
 
 	w := worker.New(eq,
-		worker.WithDoWork(func(ctx context.Context, initial *entroq.Task, _ json.RawMessage, _ []*entroq.DocGroup) error {
+		worker.WithDoWork(func(ctx context.Context, initial *entroq.Task, _ json.RawMessage, _ []*entroq.DocSet) error {
 			if config == nil {
 				tasks, err := eq.Tasks(ctx, "config")
 				if err != nil || len(tasks) == 0 {
@@ -118,7 +118,7 @@ func Example_dependencies() {
 			// ... do work with initial and config ...
 			return nil
 		}),
-		worker.WithFinish(func(ctx context.Context, mod worker.Modifier, final *entroq.Task, _ json.RawMessage, _ []*entroq.DocGroup) error {
+		worker.WithFinish(func(ctx context.Context, mod worker.Modifier, final *entroq.Task, _ json.RawMessage, _ []*entroq.DocSet) error {
 			if config == nil {
 				return fmt.Errorf("config missing during finalize")
 			}
@@ -394,7 +394,7 @@ func Example_docAtomicTaskCommit() {
 		log.Fatalf("claim task: %v", err)
 	}
 
-	// Claim the state doc's group for exclusive modification.
+	// Claim the state doc's set for exclusive modification.
 	claimed, err := eq.ClaimDocs(ctx, entroq.ClaimKey("state", stateDoc.Key).For(5*time.Second))
 	if err != nil {
 		log.Fatalf("claim doc: %v", err)
@@ -441,8 +441,8 @@ func Example_docAtomicTaskCommit() {
 
 // Example_docClaimContention demonstrates the all-or-nothing locking behavior
 // of ClaimDocs. All docs sharing a primary key are claimed together, as one
-// group; a second claimant attempting the same key while the group is held
-// gets a DependencyError. A key with no docs is an empty group: claiming it
+// set; a second claimant attempting the same key while the set is held
+// gets a DependencyError. A key with no docs is an empty set: claiming it
 // succeeds and holds it, with no docs.
 func Example_docClaimContention() {
 	ctx := context.Background()
@@ -455,12 +455,12 @@ func Example_docClaimContention() {
 	const ns = "locks"
 	const key = "resource"
 
-	// A key with no docs is an empty group, claimed like any other.
+	// A key with no docs is an empty set, claimed like any other.
 	empty, err := eq.ClaimDocs(ctx, entroq.ClaimKey(ns, "no-such-key").For(time.Second))
 	if err != nil {
-		log.Fatalf("empty group claim: %v", err)
+		log.Fatalf("empty set claim: %v", err)
 	}
-	fmt.Printf("empty group: %d docs\n", len(empty.Docs))
+	fmt.Printf("empty set: %d docs\n", len(empty.Docs))
 
 	// Create two docs sharing the same primary key.
 	if _, err := eq.Modify(ctx,
@@ -471,11 +471,11 @@ func Example_docClaimContention() {
 	}
 
 	// First claimant acquires both docs atomically.
-	group, err := eq.ClaimDocs(ctx, entroq.ClaimKey(ns, key))
+	set, err := eq.ClaimDocs(ctx, entroq.ClaimKey(ns, key))
 	if err != nil {
 		log.Fatalf("first claim: %v", err)
 	}
-	fmt.Printf("first claim: %d docs\n", len(group.Docs))
+	fmt.Printf("first claim: %d docs\n", len(set.Docs))
 
 	// A second claimant is blocked while the first holds the lock.
 	// The lock expires automatically after Duration; use doc.Change() to
@@ -489,7 +489,7 @@ func Example_docClaimContention() {
 	fmt.Printf("contention: IsDependency=%v\n", entroq.IsDependency(err))
 
 	// Output:
-	// empty group: 0 docs
+	// empty set: 0 docs
 	// first claim: 2 docs
 	// contention: IsDependency=true
 }

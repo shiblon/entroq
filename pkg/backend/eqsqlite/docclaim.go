@@ -6,15 +6,15 @@ import (
 	"fmt"
 
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/pkg/backend/internal/docgroup"
+	"github.com/shiblon/entroq/pkg/backend/internal/docset"
 	"github.com/shiblon/entroq/pkg/backend/internal/validate"
 )
 
-// ClaimDocs claims the group of docs sharing the requested primary key in a
-// namespace and returns its members, which may be none: a group can be claimed
+// ClaimDocs claims the set of docs sharing the requested primary key in a
+// namespace and returns its members, which may be none: a set can be claimed
 // before it has docs. It returns a DependencyError listing the members while
-// someone else holds the group.
-func (b *EQSQLite) ClaimDocs(ctx context.Context, q *entroq.DocClaim) (*entroq.DocGroup, error) {
+// someone else holds the set.
+func (b *EQSQLite) ClaimDocs(ctx context.Context, q *entroq.DocClaim) (*entroq.DocSet, error) {
 	if q == nil {
 		return nil, fmt.Errorf("eqsqlite claim docs: nil query")
 	}
@@ -44,23 +44,23 @@ func (b *EQSQLite) ClaimDocs(ctx context.Context, q *entroq.DocClaim) (*entroq.D
 			return nil, err
 		}
 
-		g := docgroup.Group{Namespace: q.Namespace, Key: q.Key}
-		locks, err := loadDocLocks(ctx, tx, []docgroup.Group{g})
+		g := docset.Set{Namespace: q.Namespace, Key: q.Key}
+		locks, err := loadDocLocks(ctx, tx, []docset.Set{g})
 		if err != nil {
 			return nil, err
 		}
 		current := lockOf(locks, g)
-		claimed, ok := docgroup.Claim(current, q.Claimant, now, q.Duration)
+		claimed, ok := docset.Claim(current, q.Claimant, now, q.Duration)
 		if !ok {
-			return nil, docgroup.HeldError(g, current, docs)
+			return nil, docset.HeldError(g, current, docs)
 		}
-		if err := saveDocLocks(ctx, tx, map[docgroup.Group]docgroup.Lock{g: claimed}); err != nil {
+		if err := saveDocLocks(ctx, tx, map[docset.Set]docset.Lock{g: claimed}); err != nil {
 			return nil, err
 		}
-		return docgroup.Claimed(g, claimed, docs), nil
+		return docset.Claimed(g, claimed, docs), nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("eqsqlite claim docs: %w", err)
 	}
-	return value.(*entroq.DocGroup), nil
+	return value.(*entroq.DocSet), nil
 }

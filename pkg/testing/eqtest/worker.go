@@ -60,14 +60,14 @@ func simpleWorkerOnce(ctx context.Context, t *testing.T, client *entroq.EntroQ, 
 	var consumed []*entroq.Task
 	g.Go(func() error {
 		return worker.New(client,
-			worker.WithDoWork(func(ctx context.Context, task *entroq.Task, _ json.RawMessage, _ []*entroq.DocGroup) error {
+			worker.WithDoWork(func(ctx context.Context, task *entroq.Task, _ json.RawMessage, _ []*entroq.DocSet) error {
 				if task.Claims != 1 {
 					return fmt.Errorf("worker claim expected claims to be 1, got %d", task.Claims)
 				}
 				consumed = append(consumed, task)
 				return nil
 			}),
-			worker.WithFinish(func(ctx context.Context, mod worker.Modifier, task *entroq.Task, _ json.RawMessage, _ []*entroq.DocGroup) error {
+			worker.WithFinish(func(ctx context.Context, mod worker.Modifier, task *entroq.Task, _ json.RawMessage, _ []*entroq.DocSet) error {
 				_, err := mod.Modify(ctx, task.Delete())
 				return err
 			}),
@@ -163,7 +163,7 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 		g.Go(func() error {
 			ti := 0
 			w := worker.New(client,
-				worker.WithDoWork(func(ctx context.Context, task *entroq.Task, _ json.RawMessage, _ []*entroq.DocGroup) error {
+				worker.WithDoWork(func(ctx context.Context, task *entroq.Task, _ json.RawMessage, _ []*entroq.DocSet) error {
 					ti++
 					if task.Claims != 1 {
 						return fmt.Errorf("worker claim expected to be 1, was %d", task.Claims)
@@ -171,7 +171,7 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 					consumedCh <- task
 					return nil
 				}),
-				worker.WithFinish(func(ctx context.Context, mod worker.Modifier, task *entroq.Task, _ json.RawMessage, _ []*entroq.DocGroup) error {
+				worker.WithFinish(func(ctx context.Context, mod worker.Modifier, task *entroq.Task, _ json.RawMessage, _ []*entroq.DocSet) error {
 					_, err := mod.Modify(ctx, task.Delete())
 					return err
 				}),
@@ -311,7 +311,7 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 		retriedTaskCh := make(chan *entroq.Task, 1)
 
 		w := worker.New(client,
-			worker.WithDoWork(func(ctx context.Context, task *entroq.Task, s string, _ []*entroq.DocGroup) error {
+			worker.WithDoWork(func(ctx context.Context, task *entroq.Task, s string, _ []*entroq.DocSet) error {
 				// Only attempt this again if it's the first time.
 				if task.Attempt == 0 {
 					return worker.RetryErrorf("worker error (%q)", s)
@@ -320,7 +320,7 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 				retriedTaskCh <- task
 				return nil
 			}),
-			worker.WithFinish(func(ctx context.Context, mod worker.Modifier, task *entroq.Task, _ string, _ []*entroq.DocGroup) error {
+			worker.WithFinish(func(ctx context.Context, mod worker.Modifier, task *entroq.Task, _ string, _ []*entroq.DocSet) error {
 				_, err := mod.Modify(ctx, task.Delete())
 				return err
 			}),
@@ -437,7 +437,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		const leaseTime = 2 * time.Second
 
 		w := worker.New(client,
-			worker.WithDoWork(func(ctx context.Context, task *entroq.Task, cmd string, _ []*entroq.DocGroup) error {
+			worker.WithDoWork(func(ctx context.Context, task *entroq.Task, cmd string, _ []*entroq.DocSet) error {
 				switch cmd {
 				case "die":
 					return worker.FatalErrorf("task asked to die")
@@ -453,7 +453,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 				}
 				return nil
 			}),
-			worker.WithFinish(func(ctx context.Context, mod worker.Modifier, task *entroq.Task, _ string, _ []*entroq.DocGroup) error {
+			worker.WithFinish(func(ctx context.Context, mod worker.Modifier, task *entroq.Task, _ string, _ []*entroq.DocSet) error {
 				if _, err := mod.Modify(ctx, task.Delete()); err != nil {
 					return fmt.Errorf("task deletion failed: %w", err)
 				}
@@ -565,7 +565,7 @@ func WorkerCompactDependencyHandler(ctx context.Context, t *testing.T, client *e
 	handlerCalled := make(chan bool, 1)
 
 	w := worker.New(client,
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, val string, _ []*entroq.DocGroup) (*worker.Result, error) {
+		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, val string, _ []*entroq.DocSet) (*worker.Result, error) {
 			inWork <- true
 			<-letFinish
 			return worker.
@@ -636,7 +636,7 @@ func WorkerDependencyMove(ctx context.Context, t *testing.T, client *entroq.Entr
 	letFinish := make(chan bool)
 
 	w := worker.New(client,
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, val string, _ []*entroq.DocGroup) (*worker.Result, error) {
+		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, val string, _ []*entroq.DocSet) (*worker.Result, error) {
 			inWork <- true
 			<-letFinish
 			return worker.
@@ -695,10 +695,10 @@ func WorkerDependencyMove(ctx context.Context, t *testing.T, client *entroq.Entr
 	}
 }
 
-// WorkerHoldsEmptyGroup verifies that a worker keeps a doc group it claimed
-// empty for as long as its handler runs. Renewing a group's docs renews the
-// group, but an empty group has none, so without its own renewal the claim
-// would lapse after one lease and another claimant could take the group
+// WorkerHoldsEmptyGroup verifies that a worker keeps a doc set it claimed
+// empty for as long as its handler runs. Renewing a set's docs renews the
+// set, but an empty set has none, so without its own renewal the claim
+// would lapse after one lease and another claimant could take the set
 // mid-work.
 func WorkerHoldsEmptyGroup(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	queue := path.Join(qPrefix, "worker_holds_empty_group")
@@ -715,8 +715,8 @@ func WorkerHoldsEmptyGroup(ctx context.Context, t *testing.T, client *entroq.Ent
 		worker.WithTakeDocs(func(context.Context, *entroq.Task, json.RawMessage) ([]*entroq.DocClaim, error) {
 			return []*entroq.DocClaim{entroq.ClaimKey(ns, "empty")}, nil
 		}),
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, _ json.RawMessage, groups []*entroq.DocGroup) (*worker.Result, error) {
-			inWork <- len(groups[0].Docs)
+		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, _ json.RawMessage, sets []*entroq.DocSet) (*worker.Result, error) {
+			inWork <- len(sets[0].Docs)
 			<-letFinish
 			return worker.Modify(task.Delete()), nil
 		}),
@@ -732,7 +732,7 @@ func WorkerHoldsEmptyGroup(ctx context.Context, t *testing.T, client *entroq.Ent
 	select {
 	case n := <-inWork:
 		if n != 0 {
-			t.Fatalf("Handler got %d docs from an empty group", n)
+			t.Fatalf("Handler got %d docs from an empty set", n)
 		}
 	case err := <-errCh:
 		t.Fatalf("Worker exited before work started: %v", err)
@@ -741,11 +741,11 @@ func WorkerHoldsEmptyGroup(ctx context.Context, t *testing.T, client *entroq.Ent
 	}
 
 	// Several leases pass while the handler works; nobody else may claim the
-	// group meanwhile.
+	// set meanwhile.
 	for deadline := time.Now().Add(4 * lease); time.Now().Before(deadline); time.Sleep(lease / 4) {
 		_, err := client.ClaimDocs(ctx, &entroq.DocClaim{Namespace: ns, Key: "empty", Claimant: "intruder", Duration: lease})
 		if err == nil {
-			t.Fatal("Another claimant took the worker's empty group while its handler ran")
+			t.Fatal("Another claimant took the worker's empty set while its handler ran")
 		}
 		if !entroq.IsDependency(err) {
 			t.Fatalf("Intruder claim: %v", err)

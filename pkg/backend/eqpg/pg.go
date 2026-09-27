@@ -5,7 +5,7 @@
 //
 // This backend garbage-collects on its own. Queues and doc namespaces that opt
 // in by name (a /gc= component) have their arrived tasks or complete unclaimed
-// doc groups reaped by an always-on background loop started when the backend is
+// doc sets reaped by an always-on background loop started when the backend is
 // opened. It is a first-class backend behavior, not a separate process, so a
 // client talking directly to PostgreSQL with this package (the many-clients,
 // one-database model, with no "eqpg serve" in front) collects gc=-marked queues
@@ -840,7 +840,7 @@ func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *mo
 		mod = arrival.Changes(mod, now, func(id string) *entroq.Task { return stored[id] })
 	}
 
-	// Doc modifications, by the rules in docgroup.
+	// Doc modifications, by the rules in docset.
 	if err := modifyDocs(ctx, tx, mod, resp); err != nil {
 		return nil, err
 	}
@@ -1074,7 +1074,7 @@ func scanDocRows(rows *sql.Rows) ([]*entroq.Doc, error) {
 
 // Docs returns docs in a namespace. If IDs are specified, only those docs are
 // returned (key range and limit are ignored). Otherwise, docs are filtered by
-// optional key range and subject to limit. Each doc carries its group's
+// optional key range and subject to limit. Each doc carries its set's
 // version and claim.
 func (b *EQPG) Docs(ctx context.Context, rq *entroq.DocQuery) (_ []*entroq.Doc, err error) {
 	defer func() { err = interrupted(ctx, err) }()
@@ -1119,11 +1119,11 @@ func (b *EQPG) Docs(ctx context.Context, rq *entroq.DocQuery) (_ []*entroq.Doc, 
 	return scanDocRows(rows)
 }
 
-// ClaimDocs claims the group of docs sharing the given primary key in the
-// namespace and returns its members, which may be none: a group can be claimed
+// ClaimDocs claims the set of docs sharing the given primary key in the
+// namespace and returns its members, which may be none: a set can be claimed
 // before it has docs. It returns a DependencyError listing the members while
-// someone else holds the group.
-func (b *EQPG) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) (group *entroq.DocGroup, err error) {
+// someone else holds the set.
+func (b *EQPG) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) (set *entroq.DocSet, err error) {
 	defer func() { err = interrupted(ctx, err) }()
 	if err := validate.DocClaim(cq); err != nil {
 		return nil, fmt.Errorf("claim docs: %w", err)
@@ -1138,7 +1138,7 @@ func (b *EQPG) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) (group *entro
 			return
 		}
 		if cmErr := tx.Commit(); cmErr != nil {
-			group, err = nil, fmt.Errorf("pg claim docs commit: %w", cmErr)
+			set, err = nil, fmt.Errorf("pg claim docs commit: %w", cmErr)
 		}
 	}()
 	return claimDocs(ctx, tx, cq)

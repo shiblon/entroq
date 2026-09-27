@@ -242,7 +242,7 @@ func TestGCLoopCollects(t *testing.T) {
 	eqtest.GCCollectsInLoop(ctx, t, client, "/test/gcloop")
 }
 
-func TestGCDocGroups(t *testing.T) {
+func TestGCDocSets(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	b, err := New(ctx, withGCInterval(time.Hour))
@@ -250,7 +250,7 @@ func TestGCDocGroups(t *testing.T) {
 		t.Fatalf("new backend: %v", err)
 	}
 	defer b.Close()
-	eqtest.GCDocGroups(ctx, t, b, b.collectDocsOnce, "/memtest")
+	eqtest.GCDocSets(ctx, t, b, b.collectDocsOnce, "/memtest")
 }
 
 // TestGCCollectOnce drives collectOnce directly (white-box) to pin the semantics:

@@ -79,8 +79,8 @@ func TestEQMemTasksWithIDStaysInQueue(t *testing.T) {
 	RunQTest(t, eqtest.TasksWithIDStaysInQueue)
 }
 
-func TestEQMemDocGroups(t *testing.T) {
-	RunQTest(t, eqtest.DocGroups)
+func TestEQMemDocSets(t *testing.T) {
+	RunQTest(t, eqtest.DocSets)
 }
 
 func TestEQMemUpdateArrival(t *testing.T) {
@@ -740,7 +740,7 @@ func TestEQMemJournalReplayKeepsStoredFields(t *testing.T) {
 
 // TestEQMemJournalDocClaim checks that a doc claim is journaled. The claim is
 // the last thing written before a restart, so only its own journal entry can
-// restore it: afterward the group is still held, and the holder can delete a
+// restore it: afterward the set is still held, and the holder can delete a
 // member at the version the claim returned.
 func TestEQMemJournalDocClaim(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -758,11 +758,11 @@ func TestEQMemJournalDocClaim(t *testing.T) {
 	); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
-	group, err := eq.ClaimDocs(ctx, entroq.ClaimKey(namespace, "g").For(time.Hour))
-	if err != nil || len(group.Docs) != 2 {
-		t.Fatalf("Claim: %v, %v", err, group)
+	set, err := eq.ClaimDocs(ctx, entroq.ClaimKey(namespace, "g").For(time.Hour))
+	if err != nil || len(set.Docs) != 2 {
+		t.Fatalf("Claim: %v, %v", err, set)
 	}
-	held := group.Docs
+	held := set.Docs
 	holder := eq.ClientID
 	if err := eq.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -780,8 +780,8 @@ func TestEQMemJournalDocClaim(t *testing.T) {
 		t.Errorf("Holder delete at the claimed version after replay: %v", err)
 	}
 	// The journal records no doc counts; replay sets them from the docs.
-	if group, err := eq.ClaimDocs(ctx, entroq.ClaimKey(namespace, "g").For(time.Minute)); err != nil || group.NumDocs != 1 {
-		t.Errorf("Claim after replay and a delete: want 1 doc counted, got %v, %v", group, err)
+	if set, err := eq.ClaimDocs(ctx, entroq.ClaimKey(namespace, "g").For(time.Minute)); err != nil || set.NumDocs != 1 {
+		t.Errorf("Claim after replay and a delete: want 1 doc counted, got %v, %v", set, err)
 	}
 }
 
@@ -802,8 +802,8 @@ func TestEQMemSnapshotKeepsDocs(t *testing.T) {
 	const queue, namespace = "/snapshot/tasks", "/snapshot/docs"
 	resp, err := eq.Modify(ctx,
 		entroq.InsertingInto(queue, entroq.WithValue("task")),
-		entroq.PuttingDocInto(namespace, entroq.WithIDKeys("doc-a", "group", "1"), entroq.WithContent("a")),
-		entroq.PuttingDocInto(namespace, entroq.WithIDKeys("doc-b", "group", "2"), entroq.WithContent("b")),
+		entroq.PuttingDocInto(namespace, entroq.WithIDKeys("doc-a", "set", "1"), entroq.WithContent("a")),
+		entroq.PuttingDocInto(namespace, entroq.WithIDKeys("doc-b", "set", "2"), entroq.WithContent("b")),
 	)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
@@ -850,9 +850,9 @@ func TestEQMemSnapshotKeepsDocs(t *testing.T) {
 }
 
 // TestEQMemReplaysLegacyDocJournal replays doc records written before doc
-// groups had locks: an insert, then a change recorded at v2, the final version
+// sets had locks: an insert, then a change recorded at v2, the final version
 // eqmem gave a doc's first change before v1.12.1 started docs at v0. Replay
-// applies the recorded state without checking versions, and gives the group a
+// applies the recorded state without checking versions, and gives the set a
 // lock one version past its highest member, so any version read from the old
 // journal is stale.
 func TestEQMemReplaysLegacyDocJournal(t *testing.T) {
@@ -901,10 +901,10 @@ func TestEQMemReplaysLegacyDocJournal(t *testing.T) {
 		t.Errorf("Replayed legacy doc content: want %q, got %q", `"changed"`, got)
 	}
 	if got := docs[0].Version; got != 3 {
-		t.Errorf("Replayed legacy group version: want 3 (one past the highest member), got %d", got)
+		t.Errorf("Replayed legacy set version: want 3 (one past the highest member), got %d", got)
 	}
 
-	// The group is writable at its new version.
+	// The set is writable at its new version.
 	if _, err := m.Modify(ctx, entroq.NewModification("", docs[0].Change(entroq.WithContent("after")))); err != nil {
 		t.Errorf("Change after replay: %v", err)
 	}
@@ -999,7 +999,7 @@ func TestEQMemTaskClaimantIsHolder(t *testing.T) {
 	RunQTest(t, eqtest.TaskClaimantIsHolder)
 }
 
-// TestEQMemJournalUpdateArrival renews a task and a group, reopens, and checks
+// TestEQMemJournalUpdateArrival renews a task and a set, reopens, and checks
 // that replay restores both at their renewed versions and claims.
 func TestEQMemJournalUpdateArrival(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -1021,11 +1021,11 @@ func TestEQMemJournalUpdateArrival(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Claim task: %v", err)
 	}
-	group, err := eq.ClaimDocs(ctx, entroq.ClaimKey(namespace, "g").For(time.Minute))
+	set, err := eq.ClaimDocs(ctx, entroq.ClaimKey(namespace, "g").For(time.Minute))
 	if err != nil {
-		t.Fatalf("Claim group: %v", err)
+		t.Fatalf("Claim set: %v", err)
 	}
-	resp, err := eq.UpdateArrival(ctx, entroq.ReadyIn(time.Hour).Tasks(task).Docs(group))
+	resp, err := eq.UpdateArrival(ctx, entroq.ReadyIn(time.Hour).Tasks(task).Docs(set))
 	if err != nil {
 		t.Fatalf("Renew: %v", err)
 	}
@@ -1045,8 +1045,8 @@ func TestEQMemJournalUpdateArrival(t *testing.T) {
 	if got, want := tasks[0], resp.ChangedTasks[0]; got.Version != want.Version || got.Claimant != holder || !got.At.Equal(want.At) {
 		t.Errorf("Task after replay: want version %d held by %s until %v, got %+v", want.Version, holder, want.At, got)
 	}
-	renewed := resp.ChangedGroups[0]
+	renewed := resp.ChangedSets[0]
 	if _, err := eq.Modify(ctx, entroq.Arriving(entroq.ReadyNow().Docs(renewed)), entroq.ModifyAs(holder)); err != nil {
-		t.Errorf("Release of the group at its renewed version after replay: %v", err)
+		t.Errorf("Release of the set at its renewed version after replay: %v", err)
 	}
 }

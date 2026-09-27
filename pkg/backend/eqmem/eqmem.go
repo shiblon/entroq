@@ -16,7 +16,7 @@ import (
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/backend/internal/arrival"
-	"github.com/shiblon/entroq/pkg/backend/internal/docgroup"
+	"github.com/shiblon/entroq/pkg/backend/internal/docset"
 	"github.com/shiblon/entroq/pkg/backend/internal/gcmetrics"
 	"github.com/shiblon/entroq/pkg/backend/internal/validate"
 	"github.com/shiblon/entroq/pkg/internal/latency"
@@ -291,7 +291,7 @@ func TakeSnapshot(ctx context.Context, journalDir string, cleanup bool) error {
 	return nil
 }
 
-// snapshotEntry marks a doc or a doc group lock in a snapshot. Tasks are
+// snapshotEntry marks a doc or a doc set lock in a snapshot. Tasks are
 // stored bare, as they were before snapshots held anything else, so an entry
 // with neither field is a task.
 type snapshotEntry struct {
@@ -358,7 +358,7 @@ func (m *EQMem) makeSnapshot(a wal.ValueAdder) error {
 			}
 		}
 		ns.locks.Ascend(func(e lockEntry) bool {
-			jl := newJournalLock(docgroup.Group{Namespace: name, Key: e.Key}, e.Lock)
+			jl := newJournalLock(docset.Set{Namespace: name, Key: e.Key}, e.Lock)
 			err = add(snapshotEntry{DocLock: &jl})
 			return err == nil
 		})
@@ -817,8 +817,8 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 	mod = arrival.Changes(mod, now, func(id string) *entroq.Task { return found[id] })
 
 	// Tasks are checked by the modification with its doc operations removed;
-	// doc groups follow their own rules, in docgroup. Replay applies recorded
-	// doc state without checking it: journals written before doc groups had
+	// doc sets follow their own rules, in docset. Replay applies recorded
+	// doc state without checking it: journals written before doc sets had
 	// locks carry per-doc versions that no longer match.
 	taskMod := *mod
 	taskMod.DocInserts, taskMod.DocChanges, taskMod.DocDeletes, taskMod.DocDepends = nil, nil, nil, nil
@@ -830,11 +830,11 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 		}
 		foundDeps = fd
 	}
-	var docPlan docgroup.Plan
+	var docPlan docset.Plan
 	if !replay {
-		docPlan = docgroup.Evaluate(mod, now,
+		docPlan = docset.Evaluate(mod, now,
 			func(ns, id string) *entroq.Doc { return foundDocs[entroq.DocKey(ns, id)] },
-			func(g docgroup.Group) docgroup.Lock { return byNS[g.Namespace].docs.Lock(g.Key) },
+			func(g docset.Set) docset.Lock { return byNS[g.Namespace].docs.Lock(g.Key) },
 		)
 		if docPlan.Err != nil {
 			foundDeps = foundDeps.Merge(docPlan.Err)
@@ -945,14 +945,14 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 		resp.InsertedTasks = append(resp.InsertedTasks, newTask)
 	}
 
-	// Each written member carries its group's new lock, the only version and
+	// Each written member carries its set's new lock, the only version and
 	// claim a member has. Replay restores stored docs as journaled and restores
 	// locks separately, from the same journal entry.
 	withLock := func(d *entroq.Doc) {
 		if replay {
 			return
 		}
-		l, ok := docPlan.Locks[docgroup.Group{Namespace: d.Namespace, Key: d.Key}]
+		l, ok := docPlan.Locks[docset.Set{Namespace: d.Namespace, Key: d.Key}]
 		if !ok {
 			l = byNS[d.Namespace].docs.Lock(d.Key)
 		}
@@ -1004,7 +1004,7 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 	for g, l := range docPlan.Locks {
 		byNS[g.Namespace].docs.SetLock(g.Key, l)
 	}
-	resp.ChangedGroups = docPlan.Arrived
+	resp.ChangedSets = docPlan.Arrived
 
 	func() {
 		defer un(lock(m))

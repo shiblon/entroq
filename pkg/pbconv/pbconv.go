@@ -156,7 +156,7 @@ func docLease(old *pb.DocID, lease *pb.DocData) (entroq.ModifyArg, error) {
 		return nil, invalidf("doc lease of set %q may set only its arrival time", key.Key)
 	}
 	return entroq.Arriving(entroq.ReadyAt(FromMS(lease.GetAtMs())).Docs(
-		&entroq.DocGroup{Namespace: old.GetNamespace(), Key: key.Key, Version: old.GetVersion()},
+		&entroq.DocSet{Namespace: old.GetNamespace(), Key: key.Key, Version: old.GetVersion()},
 	)), nil
 }
 
@@ -365,12 +365,12 @@ func DependencyErrorDetails(depErr *entroq.DependencyError) []*pb.ModifyDep {
 			details = append(details, &pb.ModifyDep{Type: dtype, DocId: DocIDToProto(did.Namespace, did.ID, did.Version)})
 		}
 	}
-	groupMap := map[pb.ActionType][]*entroq.DocGroup{
+	groupMap := map[pb.ActionType][]*entroq.DocSet{
 		pb.ActionType_CHANGE: depErr.DocArrives,
-		pb.ActionType_CLAIM:  depErr.GroupClaims,
+		pb.ActionType_CLAIM:  depErr.SetClaims,
 	}
-	for dtype, groups := range groupMap {
-		for _, g := range groups {
+	for dtype, sets := range groupMap {
+		for _, g := range sets {
 			details = append(details, &pb.ModifyDep{Type: dtype, DocId: DocSetIDToProto(g.Namespace, g.Key, g.Version)})
 		}
 	}

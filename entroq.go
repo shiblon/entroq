@@ -49,14 +49,14 @@
 //
 // # Doc Keys and Ordering
 //
-// The primary key groups related docs together. ClaimDocs acquires an
+// The primary key sets related docs together. ClaimDocs acquires an
 // exclusive lease on all docs sharing a primary key in one atomic operation,
 // making the primary key the natural unit of exclusive ownership. The
-// secondary key provides a sort dimension within that group.
+// secondary key provides a sort dimension within that set.
 //
 // Both Docs and ClaimDocs return results ordered by (primary key, secondary
 // key). This is guaranteed by both the PostgreSQL and eqmem backends. A
-// worker that claims a primary-key group receives docs in stable secondary-key
+// worker that claims a primary-key set receives docs in stable secondary-key
 // order, making reduce-shaped strategies simple.
 //
 // # Doc Storage Considerations
@@ -288,11 +288,11 @@ func NormalizeArrival(at, now time.Time) time.Time {
 // convention for garbage-collected task queues and doc namespaces. Each
 // backend starts its own GC loop that pays attention to any queue or namespace
 // whose /gc=<ts> activation has fired (ts <= now). It deletes available tasks
-// (At <= now), and atomically deletes complete primary-key groups from opted-in
-// namespaces only when every member of that group is available.
+// (At <= now), and atomically deletes complete primary-key sets from opted-in
+// namespaces only when every member of that set is available.
 //
 // Backends MAY implement GC loops more efficiently so long as the behavior is
-// equivalent to those task and doc-group semantics.
+// equivalent to those task and doc-set semantics.
 //
 // See pkg/queues for details on how /gc= parameter sections are parsed.
 //
@@ -379,7 +379,7 @@ type Backend interface {
 
 	// ClaimDocs attempts to claim a set of docs for modification (including
 	// deletion).
-	ClaimDocs(ctx context.Context, cq *DocClaim) (*DocGroup, error)
+	ClaimDocs(ctx context.Context, cq *DocClaim) (*DocSet, error)
 
 	// NamespaceStats returns statistics for doc namespaces matching the query.
 	NamespaceStats(ctx context.Context, qq *MatchQuery) (map[string]*NamespaceStat, error)
@@ -921,11 +921,11 @@ func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (*ModifyRespo
 // may retry. If the doc is currently claimed by another claimant, a
 // DependencyError with DocClaims set is returned.
 //
-// A doc has no claim of its own: this claims the doc's whole group, the docs
+// A doc has no claim of its own: this claims the doc's whole set, the docs
 // sharing its primary key, and returns only the named doc.
 //
-// Deprecated: claim the group with ClaimDocs(ctx, ClaimKey(ns, doc.Key)),
-// which also works for a group with no docs.
+// Deprecated: claim the set with ClaimDocs(ctx, ClaimKey(ns, doc.Key)),
+// which also works for a set with no docs.
 func (c *EntroQ) TryClaimDocByID(ctx context.Context, ns, id string, duration time.Duration) (*Doc, error) {
 	docs, err := c.Docs(ctx, &DocQuery{Namespace: ns, IDs: []string{id}})
 	if err != nil {
@@ -949,9 +949,9 @@ func (c *EntroQ) Docs(ctx context.Context, rq *DocQuery) ([]*Doc, error) {
 	return c.backend.Docs(ctx, rq)
 }
 
-// ClaimDocs claims the doc group sharing a primary key in a namespace and
+// ClaimDocs claims the doc set sharing a primary key in a namespace and
 // returns it, with its members, which may be none.
-func (c *EntroQ) ClaimDocs(ctx context.Context, cq *DocClaim) (*DocGroup, error) {
+func (c *EntroQ) ClaimDocs(ctx context.Context, cq *DocClaim) (*DocSet, error) {
 	if cq.Claimant == "" {
 		cq.Claimant = c.ClientID
 	}
@@ -971,9 +971,9 @@ type ModifyResponse struct {
 	InsertedDocs  []*Doc
 	ChangedDocs   []*Doc
 
-	// ChangedGroups holds each doc group named in DocArrives at its new lock
-	// and doc count, without its docs: they are at the group's new version.
-	ChangedGroups []*DocGroup
+	// ChangedSets holds each doc set named in DocArrives at its new lock
+	// and doc count, without its docs: they are at the set's new version.
+	ChangedSets []*DocSet
 }
 
 // ModifyArg is an argument to the Modify function, which does batch modifications to the task store.
@@ -1135,16 +1135,16 @@ func (m *Modification) EnsureModifyKeys() error {
 			return InvalidArgumentf("modify: doc insert %q must name a namespace", ins.ID)
 		}
 	}
-	groups := make(map[[2]string]bool, len(m.DocArrives))
+	sets := make(map[[2]string]bool, len(m.DocArrives))
 	for _, a := range m.DocArrives {
 		if a.Namespace == "" {
-			return InvalidArgumentf("modify: arrival of doc group %q must name a namespace", a.Key)
+			return InvalidArgumentf("modify: arrival of doc set %q must name a namespace", a.Key)
 		}
 		k := [2]string{a.Namespace, a.Key}
-		if groups[k] {
-			return InvalidArgumentf("modify: doc group %q in %q arrives more than once", a.Key, a.Namespace)
+		if sets[k] {
+			return InvalidArgumentf("modify: doc set %q in %q arrives more than once", a.Key, a.Namespace)
 		}
-		groups[k] = true
+		sets[k] = true
 	}
 	return nil
 }
@@ -1419,13 +1419,13 @@ type DependencyError struct {
 
 	DocClaims []*DocID
 
-	// Doc groups that failed as a whole, each with its current lock:
-	// GroupClaims those held by someone else, whatever the operation, and
-	// DocArrives arriving groups that were missing or not at the version
-	// named. Over gRPC a failed group carries only its namespace, key, and
+	// Doc sets that failed as a whole, each with its current lock:
+	// SetClaims those held by someone else, whatever the operation, and
+	// DocArrives arriving sets that were missing or not at the version
+	// named. Over gRPC a failed set carries only its namespace, key, and
 	// version, not who holds it.
-	GroupClaims []*DocGroup
-	DocArrives  []*DocGroup
+	SetClaims  []*DocSet
+	DocArrives []*DocSet
 
 	Message string
 }
@@ -1451,7 +1451,7 @@ func (m *DependencyError) Copy() *DependencyError {
 		Message:    m.Message,
 	}
 	e.Arrives = append(e.Arrives, m.Arrives...)
-	e.GroupClaims = append(e.GroupClaims, m.GroupClaims...)
+	e.SetClaims = append(e.SetClaims, m.SetClaims...)
 	e.DocArrives = append(e.DocArrives, m.DocArrives...)
 	copy(e.Inserts, m.Inserts)
 	copy(e.Depends, m.Depends)
@@ -1471,16 +1471,16 @@ func (m *DependencyError) HasMissing() bool {
 	return len(m.Depends) > 0 || len(m.Deletes) > 0 || len(m.Changes) > 0 || len(m.Arrives) > 0
 }
 
-// HasMissingDocs indicates whether any docs or doc groups the operation named
-// were absent or not at their group's version.
+// HasMissingDocs indicates whether any docs or doc sets the operation named
+// were absent or not at their set's version.
 func (m *DependencyError) HasMissingDocs() bool {
 	return len(m.DocDepends) > 0 || len(m.DocDeletes) > 0 || len(m.DocChanges) > 0 || len(m.DocArrives) > 0
 }
 
-// HasClaimedDocs indicates whether any docs or doc groups were blocked by
+// HasClaimedDocs indicates whether any docs or doc sets were blocked by
 // another claimant. This is transient contention -- retry with backoff.
 func (m *DependencyError) HasClaimedDocs() bool {
-	return len(m.DocClaims) > 0 || len(m.GroupClaims) > 0
+	return len(m.DocClaims) > 0 || len(m.SetClaims) > 0
 }
 
 // HasClaims indicates whether any of the tasks were claimed by another claimant and unexpired.
@@ -1543,20 +1543,20 @@ func (m *DependencyError) Merge(other *DependencyError) *DependencyError {
 	cat := func(a, b []*TaskID) []*TaskID { return append(append([]*TaskID{}, a...), b...) }
 	catDoc := func(a, b []*DocID) []*DocID { return append(append([]*DocID{}, a...), b...) }
 	merged := &DependencyError{
-		Inserts:     dedupTaskIDs(cat(m.Inserts, other.Inserts)),
-		Depends:     dedupTaskIDs(cat(m.Depends, other.Depends)),
-		Deletes:     dedupTaskIDs(cat(m.Deletes, other.Deletes)),
-		Changes:     dedupTaskIDs(cat(m.Changes, other.Changes)),
-		Claims:      dedupTaskIDs(cat(m.Claims, other.Claims)),
-		Arrives:     dedupTaskIDs(cat(m.Arrives, other.Arrives)),
-		DocInserts:  dedupDocIDs(catDoc(m.DocInserts, other.DocInserts)),
-		DocDepends:  dedupDocIDs(catDoc(m.DocDepends, other.DocDepends)),
-		DocDeletes:  dedupDocIDs(catDoc(m.DocDeletes, other.DocDeletes)),
-		DocChanges:  dedupDocIDs(catDoc(m.DocChanges, other.DocChanges)),
-		DocClaims:   dedupDocIDs(catDoc(m.DocClaims, other.DocClaims)),
-		GroupClaims: dedupGroups(append(append([]*DocGroup{}, m.GroupClaims...), other.GroupClaims...)),
-		DocArrives:  dedupGroups(append(append([]*DocGroup{}, m.DocArrives...), other.DocArrives...)),
-		Message:     m.Message,
+		Inserts:    dedupTaskIDs(cat(m.Inserts, other.Inserts)),
+		Depends:    dedupTaskIDs(cat(m.Depends, other.Depends)),
+		Deletes:    dedupTaskIDs(cat(m.Deletes, other.Deletes)),
+		Changes:    dedupTaskIDs(cat(m.Changes, other.Changes)),
+		Claims:     dedupTaskIDs(cat(m.Claims, other.Claims)),
+		Arrives:    dedupTaskIDs(cat(m.Arrives, other.Arrives)),
+		DocInserts: dedupDocIDs(catDoc(m.DocInserts, other.DocInserts)),
+		DocDepends: dedupDocIDs(catDoc(m.DocDepends, other.DocDepends)),
+		DocDeletes: dedupDocIDs(catDoc(m.DocDeletes, other.DocDeletes)),
+		DocChanges: dedupDocIDs(catDoc(m.DocChanges, other.DocChanges)),
+		DocClaims:  dedupDocIDs(catDoc(m.DocClaims, other.DocClaims)),
+		SetClaims:  dedupGroups(append(append([]*DocSet{}, m.SetClaims...), other.SetClaims...)),
+		DocArrives: dedupGroups(append(append([]*DocSet{}, m.DocArrives...), other.DocArrives...)),
+		Message:    m.Message,
 	}
 	if merged.Message == "" {
 		merged.Message = other.Message
@@ -1620,11 +1620,11 @@ func (m *DependencyError) nameArrivals(mod *Modification) {
 	m.Changes = changes
 }
 
-// dedupGroups keeps the first entry seen for each doc group.
-func dedupGroups(groups []*DocGroup) []*DocGroup {
-	seen := make(map[[2]string]bool, len(groups))
-	var out []*DocGroup
-	for _, g := range groups {
+// dedupGroups keeps the first entry seen for each doc set.
+func dedupGroups(sets []*DocSet) []*DocSet {
+	seen := make(map[[2]string]bool, len(sets))
+	var out []*DocSet
+	for _, g := range sets {
 		if g == nil {
 			continue
 		}
@@ -1710,14 +1710,14 @@ func (m *DependencyError) Error() string {
 		}
 	}
 	if len(m.DocArrives) > 0 {
-		lines = append(lines, "\tmissing doc group arrivals:")
+		lines = append(lines, "\tmissing doc set arrivals:")
 		for _, g := range m.DocArrives {
 			lines = append(lines, fmt.Sprintf("\t\t%s", g.ID()))
 		}
 	}
-	if len(m.GroupClaims) > 0 {
-		lines = append(lines, "\tdoc groups held by another claimant:")
-		for _, g := range m.GroupClaims {
+	if len(m.SetClaims) > 0 {
+		lines = append(lines, "\tdoc sets held by another claimant:")
+		for _, g := range m.SetClaims {
 			lines = append(lines, fmt.Sprintf("\t\t%s held by %q until %v", g.ID(), g.Claimant, g.At))
 		}
 	}

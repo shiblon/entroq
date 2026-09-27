@@ -274,7 +274,7 @@ func storedDigest(ctx context.Context, conn *sql.Conn) (string, error) {
 //
 // Version 2 made the length CHECKs count bytes, which SQLite cannot alter in
 // place, so a version 1 database rebuilds tasks too. Version 3 moves each
-// doc's version, claimant, and arrival time to its group's lock: every group
+// doc's version, claimant, and arrival time to its set's lock: every set
 // gets a lock one version past its highest member, so no version read before
 // the migration can match one written after it, and claims held at migration
 // time are released. The old tables are renamed aside, schemaSQL creates the
@@ -305,7 +305,7 @@ func migrateToV3(ctx context.Context, conn *sql.Conn, from int) (err error) {
 			step{"drop old tasks", "DROP TABLE tasks_old"})
 	}
 	steps = append(steps,
-		step{"create doc group locks", fmt.Sprintf(`INSERT INTO doc_locks (namespace, key_primary, version, claimant, at_ms, num_docs)
+		step{"create doc set locks", fmt.Sprintf(`INSERT INTO doc_locks (namespace, key_primary, version, claimant, at_ms, num_docs)
 			SELECT namespace, key_primary, max(version) + 1, '', %d, count(*) FROM docs_old
 			GROUP BY namespace, key_primary`, nowUTC().UnixMilli())},
 		step{"copy docs (an id or key may exceed its byte limit)", `INSERT INTO docs

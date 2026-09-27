@@ -10,19 +10,19 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/pkg/backend/internal/docgroup"
+	"github.com/shiblon/entroq/pkg/backend/internal/docset"
 )
 
 // journalEntry is one journal record: a committed modification and the doc
-// group locks it leaves. Claims and lock collection record locks alone.
-// Entries written before doc groups had locks carry no DocLocks and parse
+// set locks it leaves. Claims and lock collection record locks alone.
+// Entries written before doc sets had locks carry no DocLocks and parse
 // unchanged.
 type journalEntry struct {
 	*entroq.Modification
 	DocLocks []journalLock `json:"doc_locks,omitempty"`
 }
 
-// journalLock is a doc group's lock as journaled or snapshotted. Deleted
+// journalLock is a doc set's lock as journaled or snapshotted. Deleted
 // records that the lock was collected.
 type journalLock struct {
 	Namespace string    `json:"namespace"`
@@ -33,17 +33,17 @@ type journalLock struct {
 	Deleted   bool      `json:"deleted,omitempty"`
 }
 
-func (l journalLock) lock() docgroup.Lock {
-	return docgroup.Lock{Version: l.Version, Claimant: l.Claimant, At: l.At}
+func (l journalLock) lock() docset.Lock {
+	return docset.Lock{Version: l.Version, Claimant: l.Claimant, At: l.At}
 }
 
-func newJournalLock(g docgroup.Group, l docgroup.Lock) journalLock {
+func newJournalLock(g docset.Set, l docset.Lock) journalLock {
 	return journalLock{Namespace: g.Namespace, Key: g.Key, Version: l.Version, Claimant: l.Claimant, At: l.At}
 }
 
 // journalLocksOf lists locks in a stable order, so a journal records the same
 // entry for the same change.
-func journalLocksOf(locks map[docgroup.Group]docgroup.Lock) []journalLock {
+func journalLocksOf(locks map[docset.Set]docset.Lock) []journalLock {
 	jls := make([]journalLock, 0, len(locks))
 	for g, l := range locks {
 		jls = append(jls, newJournalLock(g, l))
@@ -73,7 +73,7 @@ func (m *EQMem) appendJournal(entry journalEntry) error {
 }
 
 // journalLocks records lock changes made without a modification.
-func (m *EQMem) journalLocks(locks map[docgroup.Group]docgroup.Lock) error {
+func (m *EQMem) journalLocks(locks map[docset.Set]docset.Lock) error {
 	return m.appendJournal(journalEntry{DocLocks: journalLocksOf(locks)})
 }
 
@@ -113,7 +113,7 @@ func (m *EQMem) playJournalEntry(ctx context.Context, b []byte) error {
 		chg.Version--
 	}
 
-	// Entries without locks were written before doc groups had them, when a
+	// Entries without locks were written before doc sets had them, when a
 	// doc claim was not journaled, so their doc versions can trail what the
 	// modification names. Replay applies them anyway; count them for one
 	// warning at the end.
@@ -153,9 +153,9 @@ func (m *EQMem) countStaleDocReplays(mod *entroq.Modification) {
 }
 
 // finishDocReplay runs once the journal has loaded. It reports stale doc
-// versions replay applied, gives every group written before groups had locks a
+// versions replay applied, gives every set written before sets had locks a
 // lock one version past its highest member, so any version read before then
-// is stale, and sets every group's doc count from its members, as the journal
+// is stale, and sets every set's doc count from its members, as the journal
 // does not record counts.
 func (m *EQMem) finishDocReplay() {
 	if m.staleDocReplays > 0 {
@@ -176,8 +176,8 @@ func (m *EQMem) finishDocReplay() {
 		}
 		for key, v := range highest {
 			l := ns.Lock(key)
-			if l == docgroup.Absent {
-				l = docgroup.Lock{Version: v + 1}
+			if l == docset.Absent {
+				l = docset.Lock{Version: v + 1}
 			}
 			l.NumDocs = count[key]
 			ns.SetLock(key, l)
@@ -185,10 +185,10 @@ func (m *EQMem) finishDocReplay() {
 	}
 }
 
-// collectLocksOnce removes the locks of up to batch groups that have no docs
-// and are not held, so claimed-then-abandoned groups do not accumulate. Each
+// collectLocksOnce removes the locks of up to batch sets that have no docs
+// and are not held, so claimed-then-abandoned sets do not accumulate. Each
 // namespace is checked under its own lock, so a concurrent insert either comes
-// first, leaving the group non-empty, or after, starting a new lock.
+// first, leaving the set non-empty, or after, starting a new lock.
 func (m *EQMem) collectLocksOnce(ctx context.Context, batch int) (int, error) {
 	now, err := m.Time(ctx)
 	if err != nil {
@@ -202,7 +202,7 @@ func (m *EQMem) collectLocksOnce(ctx context.Context, batch int) (int, error) {
 		}
 	}()
 
-	collected := make(map[docgroup.Group]docgroup.Lock)
+	collected := make(map[docset.Set]docset.Lock)
 	for _, name := range names {
 		if len(collected) >= batch || ctx.Err() != nil {
 			break
@@ -223,7 +223,7 @@ func (m *EQMem) collectLocksOnce(ctx context.Context, batch int) (int, error) {
 			})
 			for _, e := range empty {
 				nss.DeleteLock(e.Key)
-				collected[docgroup.Group{Namespace: name, Key: e.Key}] = e.Lock
+				collected[docset.Set{Namespace: name, Key: e.Key}] = e.Lock
 			}
 		}()
 	}

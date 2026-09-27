@@ -187,8 +187,8 @@ func TestModifyArgsFromProtoNotYetSupported(t *testing.T) {
 
 func TestDependencyErrorDetailsNameSets(t *testing.T) {
 	deps := DependencyErrorDetails(&entroq.DependencyError{
-		GroupClaims: []*entroq.DocGroup{{Namespace: "ns", Key: "held", Version: 2}},
-		DocArrives:  []*entroq.DocGroup{{Namespace: "ns", Key: "stale", Version: 4}},
+		SetClaims:  []*entroq.DocSet{{Namespace: "ns", Key: "held", Version: 2}},
+		DocArrives: []*entroq.DocSet{{Namespace: "ns", Key: "stale", Version: 4}},
 	})
 	found := make(map[string]pb.ActionType)
 	for _, d := range deps[1:] {

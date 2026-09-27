@@ -46,7 +46,7 @@ func TestShutdown_Idle(t *testing.T) {
 	defer cancel()
 	client := newShutdownEQ(ctx, t)
 
-	w := New(client, WithDoModify(func(_ context.Context, task *entroq.Task, _ string, _ []*entroq.DocGroup) (*Result, error) {
+	w := New(client, WithDoModify(func(_ context.Context, task *entroq.Task, _ string, _ []*entroq.DocSet) (*Result, error) {
 		return Modify(task.Delete()), nil
 	}))
 	var errcs []<-chan error
@@ -74,7 +74,7 @@ func TestShutdown_DrainsInFlight(t *testing.T) {
 		t.Fatalf("Insert: %v", err)
 	}
 	started, release := make(chan struct{}), make(chan struct{})
-	w := New(client, WithDoModify(func(_ context.Context, task *entroq.Task, _ string, _ []*entroq.DocGroup) (*Result, error) {
+	w := New(client, WithDoModify(func(_ context.Context, task *entroq.Task, _ string, _ []*entroq.DocSet) (*Result, error) {
 		close(started)
 		<-release
 		return Modify(task.Delete()), nil
@@ -119,7 +119,7 @@ func TestShutdown_DeadlineCancelsHandlers(t *testing.T) {
 		t.Fatalf("Insert: %v", err)
 	}
 	started := make(chan struct{})
-	w := New(client, WithDoModify(func(ctx context.Context, _ *entroq.Task, _ string, _ []*entroq.DocGroup) (*Result, error) {
+	w := New(client, WithDoModify(func(ctx context.Context, _ *entroq.Task, _ string, _ []*entroq.DocSet) (*Result, error) {
 		close(started)
 		<-ctx.Done()
 		return nil, ctx.Err()
@@ -142,7 +142,7 @@ func TestShutdown_RunAfter(t *testing.T) {
 	defer cancel()
 	client := newShutdownEQ(ctx, t)
 
-	w := New(client, WithDoModify(func(_ context.Context, task *entroq.Task, _ string, _ []*entroq.DocGroup) (*Result, error) {
+	w := New(client, WithDoModify(func(_ context.Context, task *entroq.Task, _ string, _ []*entroq.DocSet) (*Result, error) {
 		return Modify(task.Delete()), nil
 	}))
 	if err := w.Shutdown(ctx); err != nil {
@@ -160,7 +160,7 @@ func TestShutdown_ConcurrentRuns(t *testing.T) {
 	defer cancel()
 	client := newShutdownEQ(ctx, t)
 
-	w := New(client, WithDoModify(func(_ context.Context, task *entroq.Task, _ string, _ []*entroq.DocGroup) (*Result, error) {
+	w := New(client, WithDoModify(func(_ context.Context, task *entroq.Task, _ string, _ []*entroq.DocSet) (*Result, error) {
 		return Modify(task.Delete()), nil
 	}))
 	var wg sync.WaitGroup

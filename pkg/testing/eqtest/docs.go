@@ -876,9 +876,9 @@ func DocTimestamps(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPr
 	}
 }
 
-// DocGroups checks that the docs sharing a primary key behave as one unit: a
-// single version and claim cover the whole group, as a task's cover the task.
-func DocGroups(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+// DocSets checks that the docs sharing a primary key behave as one unit: a
+// single version and claim cover the whole set, as a task's cover the task.
+func DocSets(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	ns := path.Join(qPrefix, "doc_groups")
 	const intruder = "intruder"
 	lease := time.Minute
@@ -887,7 +887,7 @@ func DocGroups(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix
 		t.Helper()
 		docs, err := client.Docs(ctx, &entroq.DocQuery{Namespace: ns, KeyExact: key})
 		if err != nil {
-			t.Fatalf("Read group %q: %v", key, err)
+			t.Fatalf("Read set %q: %v", key, err)
 		}
 		return docs
 	}
@@ -897,11 +897,11 @@ func DocGroups(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix
 		entroq.PuttingDocInto(ns, entroq.WithKeys("g", "b"), entroq.WithContent("b")),
 	)
 	if err != nil {
-		t.Fatalf("Insert group: %v", err)
+		t.Fatalf("Insert set: %v", err)
 	}
 	a, b := resp.InsertedDocs[0], resp.InsertedDocs[1]
 
-	t.Run("one version per group", func(t *testing.T) {
+	t.Run("one version per set", func(t *testing.T) {
 		if a.Version != b.Version {
 			t.Fatalf("Members inserted together: versions %d and %d differ", a.Version, b.Version)
 		}
@@ -913,28 +913,28 @@ func DocGroups(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix
 				t.Errorf("Member %q still at version %d after another member changed", d.ID, d.Version)
 			}
 		}
-		// b was not touched, but the group moved, so the old version is stale.
+		// b was not touched, but the set moved, so the old version is stale.
 		if _, err := client.Modify(ctx, b.Delete()); !entroq.IsDependency(err) {
-			t.Errorf("Delete at the group's old version: want a dependency error, got %v", err)
+			t.Errorf("Delete at the set's old version: want a dependency error, got %v", err)
 		}
 	})
 
 	t.Run("a claim makes earlier reads stale", func(t *testing.T) {
 		before := readGroup("g")
-		group, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "g").For(lease))
-		if err != nil || len(group.Docs) != 2 {
-			t.Fatalf("Claim: %v, %v", err, group)
+		set, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "g").For(lease))
+		if err != nil || len(set.Docs) != 2 {
+			t.Fatalf("Claim: %v, %v", err, set)
 		}
-		held := group.Docs
-		// Each member reports its group's version and claim.
+		held := set.Docs
+		// Each member reports its set's version and claim.
 		for _, d := range held {
-			if d.Version != group.Version || d.Claimant != group.Claimant || !d.At.Equal(group.At) {
-				t.Errorf("Member %q reports version %d, claimant %q, at %v; its group has %d, %q, %v",
-					d.ID, d.Version, d.Claimant, d.At, group.Version, group.Claimant, group.At)
+			if d.Version != set.Version || d.Claimant != set.Claimant || !d.At.Equal(set.At) {
+				t.Errorf("Member %q reports version %d, claimant %q, at %v; its set has %d, %q, %v",
+					d.ID, d.Version, d.Claimant, d.At, set.Version, set.Claimant, set.At)
 			}
 		}
 		if held[0].Version == before[0].Version {
-			t.Errorf("Claim did not move the group version (%d)", held[0].Version)
+			t.Errorf("Claim did not move the set version (%d)", held[0].Version)
 		}
 		// Release without touching before[0]: commit a change to the other member.
 		if _, err := client.Modify(ctx, held[1].Change(entroq.WithContent("released"))); err != nil {
@@ -945,7 +945,7 @@ func DocGroups(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix
 		}
 	})
 
-	t.Run("a held group refuses other writers", func(t *testing.T) {
+	t.Run("a held set refuses other writers", func(t *testing.T) {
 		held, err := docsOf(client.ClaimDocs(ctx, entroq.ClaimKey(ns, "g").For(lease)))
 		if err != nil {
 			t.Fatalf("Claim: %v", err)
@@ -957,17 +957,17 @@ func DocGroups(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix
 		} {
 			_, err := client.Modify(ctx, arg, entroq.ModifyAs(intruder))
 			if depErr, ok := entroq.AsDependency(err); !ok || !depErr.HasClaimedDocs() {
-				t.Errorf("Intruder %s in a held group: want a claim error, got %v", name, err)
+				t.Errorf("Intruder %s in a held set: want a claim error, got %v", name, err)
 			}
 		}
 		if _, err := client.Modify(ctx, held[0].Depend(), entroq.ModifyAs(intruder)); err != nil {
-			t.Errorf("Intruder depend on a held group: %v", err)
+			t.Errorf("Intruder depend on a held set: %v", err)
 		}
 		if _, err := client.ClaimDocs(ctx, &entroq.DocClaim{Namespace: ns, Key: "g", Claimant: intruder, Duration: lease}); !entroq.IsDependency(err) {
-			t.Errorf("Intruder claim of a held group: want a dependency error, got %v", err)
+			t.Errorf("Intruder claim of a held set: want a dependency error, got %v", err)
 		}
 
-		// Renewing keeps the group held; committing without renewing releases it.
+		// Renewing keeps the set held; committing without renewing releases it.
 		resp, err := client.Modify(ctx, held[0].Change(entroq.WithDocArrivalTimeBy(lease)))
 		if err != nil {
 			t.Fatalf("Holder renew: %v", err)
@@ -984,37 +984,37 @@ func DocGroups(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix
 		}
 	})
 
-	t.Run("an empty group can be claimed", func(t *testing.T) {
+	t.Run("an empty set can be claimed", func(t *testing.T) {
 		before := time.Now()
-		group, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "empty").For(lease))
+		set, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "empty").For(lease))
 		if err != nil {
-			t.Fatalf("Claim of an empty group: %v", err)
+			t.Fatalf("Claim of an empty set: %v", err)
 		}
-		if len(group.Docs) != 0 {
-			t.Fatalf("Claim of an empty group returned %d docs", len(group.Docs))
+		if len(set.Docs) != 0 {
+			t.Fatalf("Claim of an empty set returned %d docs", len(set.Docs))
 		}
-		// With no docs to carry them, the group itself reports its version
+		// With no docs to carry them, the set itself reports its version
 		// and claim.
-		if group.Namespace != ns || group.Key != "empty" || group.Version < 0 ||
-			group.Claimant != client.ClientID || !group.At.After(before) {
-			t.Errorf("Claimed empty group: got %+v, want %s/empty held by %s past %v", group, ns, client.ClientID, before)
+		if set.Namespace != ns || set.Key != "empty" || set.Version < 0 ||
+			set.Claimant != client.ClientID || !set.At.After(before) {
+			t.Errorf("Claimed empty set: got %+v, want %s/empty held by %s past %v", set, ns, client.ClientID, before)
 		}
 		if _, err := client.Modify(ctx, entroq.PuttingDocInto(ns, entroq.WithKeys("empty", "x")), entroq.ModifyAs(intruder)); !entroq.IsDependency(err) {
-			t.Errorf("Intruder insert into a claimed empty group: want a claim error, got %v", err)
+			t.Errorf("Intruder insert into a claimed empty set: want a claim error, got %v", err)
 		}
 		if _, err := client.Modify(ctx, entroq.PuttingDocInto(ns, entroq.WithKeys("empty", "x"))); err != nil {
-			t.Errorf("Holder insert into its claimed empty group: %v", err)
+			t.Errorf("Holder insert into its claimed empty set: %v", err)
 		}
 	})
 
-	t.Run("an insert into an unheld group moves its version", func(t *testing.T) {
+	t.Run("an insert into an unheld set moves its version", func(t *testing.T) {
 		before := readGroup("g")
 		if _, err := client.Modify(ctx, entroq.PuttingDocInto(ns, entroq.WithKeys("g", "appended")), entroq.ModifyAs(intruder)); err != nil {
 			t.Fatalf("Insert: %v", err)
 		}
 		after := readGroup("g")
 		if len(after) != len(before)+1 {
-			t.Fatalf("Group has %d members after an insert, want %d", len(after), len(before)+1)
+			t.Fatalf("Set has %d members after an insert, want %d", len(after), len(before)+1)
 		}
 		for _, d := range after {
 			if d.Version != before[0].Version+1 {
@@ -1027,7 +1027,7 @@ func DocGroups(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix
 		}
 	})
 
-	t.Run("an insert and a change move an unheld group once", func(t *testing.T) {
+	t.Run("an insert and a change move an unheld set once", func(t *testing.T) {
 		before := readGroup("g")
 		resp, err := client.Modify(ctx,
 			entroq.PuttingDocInto(ns, entroq.WithKeys("g", "with-change")),
@@ -1050,19 +1050,19 @@ func DocGroups(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix
 		}
 	})
 
-	t.Run("a held group and an unheld one in one modification", func(t *testing.T) {
+	t.Run("a held set and an unheld one in one modification", func(t *testing.T) {
 		held, err := docsOf(client.ClaimDocs(ctx, entroq.ClaimKey(ns, "g").For(lease)))
 		if err != nil || len(held) == 0 {
 			t.Fatalf("Claim: %v, %d docs", err, len(held))
 		}
 		sideResp, err := client.Modify(ctx, entroq.PuttingDocInto(ns, entroq.WithKeys("side", "a")))
 		if err != nil {
-			t.Fatalf("Insert into side group: %v", err)
+			t.Fatalf("Insert into side set: %v", err)
 		}
 		side := sideResp.InsertedDocs[0]
 
-		// A group someone else holds fails the whole modification, so the
-		// caller keeps the group it holds.
+		// A set someone else holds fails the whole modification, so the
+		// caller keeps the set it holds.
 		if _, err := client.ClaimDocs(ctx, &entroq.DocClaim{Namespace: ns, Key: "blocked", Claimant: intruder, Duration: lease}); err != nil {
 			t.Fatalf("Intruder claim: %v", err)
 		}
@@ -1070,10 +1070,10 @@ func DocGroups(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix
 			held[0].Change(entroq.WithContent("mixed")),
 			entroq.PuttingDocInto(ns, entroq.WithKeys("blocked", "x")),
 		); !entroq.IsDependency(err) {
-			t.Fatalf("Modify touching a group held by someone else: want a dependency error, got %v", err)
+			t.Fatalf("Modify touching a set held by someone else: want a dependency error, got %v", err)
 		}
 		if _, err := client.Modify(ctx, entroq.PuttingDocInto(ns, entroq.WithKeys("g", "sneak")), entroq.ModifyAs(intruder)); !entroq.IsDependency(err) {
-			t.Errorf("Held group released by a failed modification: intruder insert got %v", err)
+			t.Errorf("Held set released by a failed modification: intruder insert got %v", err)
 		}
 
 		resp, err := client.Modify(ctx,
@@ -1084,10 +1084,10 @@ func DocGroups(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix
 			t.Fatalf("Holder commit with an insert elsewhere: %v", err)
 		}
 		if got := resp.ChangedDocs[0]; got.Version != held[0].Version+1 || got.Claimant != "" {
-			t.Errorf("Held group after the holder's commit: want released at version %d, got %+v", held[0].Version+1, got)
+			t.Errorf("Held set after the holder's commit: want released at version %d, got %+v", held[0].Version+1, got)
 		}
 		if got := resp.InsertedDocs[0].Version; got != side.Version+1 {
-			t.Errorf("Unheld group at version %d after an insert, want %d", got, side.Version+1)
+			t.Errorf("Unheld set at version %d after an insert, want %d", got, side.Version+1)
 		}
 	})
 
@@ -1113,7 +1113,7 @@ func DocGroups(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix
 		}
 	})
 
-	t.Run("concurrent inserts into one group", func(t *testing.T) {
+	t.Run("concurrent inserts into one set", func(t *testing.T) {
 		const writers = 8
 		insertAll := func(opts func(i int) []entroq.DocOpt) []error {
 			errs := make([]error, writers)
@@ -1137,10 +1137,10 @@ func DocGroups(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix
 			}
 		}
 		if n := len(readGroup("fan")); n != writers {
-			t.Errorf("Group has %d members after %d inserts", n, writers)
+			t.Errorf("Set has %d members after %d inserts", n, writers)
 		}
 
-		// Inserts of one ID share the group but collide on the doc: one wins,
+		// Inserts of one ID share the set but collide on the doc: one wins,
 		// and the rest learn the ID is taken.
 		won := 0
 		for i, err := range insertAll(func(int) []entroq.DocOpt {
@@ -1159,17 +1159,17 @@ func DocGroups(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix
 		}
 	})
 
-	t.Run("a group counts its docs", func(t *testing.T) {
-		claim := func(want int) *entroq.DocGroup {
+	t.Run("a set counts its docs", func(t *testing.T) {
+		claim := func(want int) *entroq.DocSet {
 			t.Helper()
-			group, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "count").For(lease))
+			set, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "count").For(lease))
 			if err != nil {
 				t.Fatalf("Claim: %v", err)
 			}
-			if group.NumDocs != want || len(group.Docs) != want {
-				t.Errorf("Claimed group counts %d docs and returns %d, want %d", group.NumDocs, len(group.Docs), want)
+			if set.NumDocs != want || len(set.Docs) != want {
+				t.Errorf("Claimed set counts %d docs and returns %d, want %d", set.NumDocs, len(set.Docs), want)
 			}
-			return group
+			return set
 		}
 		claim(0)
 		if _, err := client.Modify(ctx,
@@ -1179,18 +1179,18 @@ func DocGroups(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix
 		); err != nil {
 			t.Fatalf("Insert: %v", err)
 		}
-		group := claim(3)
+		set := claim(3)
 		if _, err := client.Modify(ctx,
-			group.Docs[0].Delete(),
-			group.Docs[1].Change(entroq.WithContent("changed")),
+			set.Docs[0].Delete(),
+			set.Docs[1].Change(entroq.WithContent("changed")),
 			entroq.PuttingDocInto(ns, entroq.WithKeys("count", "d")),
 			entroq.PuttingDocInto(ns, entroq.WithKeys("count", "e")),
 		); err != nil {
 			t.Fatalf("Holder commit: %v", err)
 		}
-		group = claim(4)
+		set = claim(4)
 		var dels []entroq.ModifyArg
-		for _, d := range group.Docs {
+		for _, d := range set.Docs {
 			dels = append(dels, d.Delete())
 		}
 		if _, err := client.Modify(ctx, dels...); err != nil {

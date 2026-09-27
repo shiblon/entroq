@@ -33,8 +33,8 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE INDEX IF NOT EXISTS tasks_queue_at
     ON tasks (queue, at_ms, id);
 
--- A doc's version, claimant, and arrival time are its group's, in doc_locks.
--- The reference is checked at commit, so a modification may write a group's
+-- A doc's version, claimant, and arrival time are its set's, in doc_locks.
+-- The reference is checked at commit, so a modification may write a set's
 -- docs before its lock.
 CREATE TABLE IF NOT EXISTS docs (
     namespace     TEXT NOT NULL COLLATE BINARY CHECK (namespace <> ''),
@@ -56,9 +56,9 @@ CREATE TABLE IF NOT EXISTS docs (
 CREATE INDEX IF NOT EXISTS docs_namespace_keys
     ON docs (namespace, key_primary, key_secondary, id);
 
--- Each doc group (the docs sharing a primary key in a namespace) has one lock
+-- Each doc set (the docs sharing a primary key in a namespace) has one lock
 -- holding the only version, claimant, and arrival time its members have, and
--- how many there are. A group can be claimed before it has docs, so locks are
+-- how many there are. A set can be claimed before it has docs, so locks are
 -- kept apart from docs.
 CREATE TABLE IF NOT EXISTS doc_locks (
     namespace   TEXT NOT NULL COLLATE BINARY,
@@ -73,10 +73,10 @@ CREATE TABLE IF NOT EXISTS doc_locks (
     CHECK (octet_length(claimant) <= 64)
 );
 
--- Held groups, for counting claimed docs without reading every doc.
+-- Held sets, for counting claimed docs without reading every doc.
 CREATE INDEX IF NOT EXISTS doc_locks_held
     ON doc_locks (namespace, at_ms) WHERE claimant <> '';
 
--- Empty groups, the only ones lock collection considers.
+-- Empty sets, the only ones lock collection considers.
 CREATE INDEX IF NOT EXISTS doc_locks_empty
     ON doc_locks (namespace, key_primary) WHERE num_docs = 0;

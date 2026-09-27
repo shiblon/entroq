@@ -1,18 +1,18 @@
-// Package docgroup holds the claim and version rules for doc groups, which
+// Package docset holds the claim and version rules for doc sets, which
 // every backend applies the same way.
 //
-// A doc group is the set of docs sharing a primary key in a namespace. It
-// behaves like a task whose members share one lifecycle: the group has a
+// A doc set is the set of docs sharing a primary key in a namespace. It
+// behaves like a task whose members share one lifecycle: the set has a
 // single lock carrying the only version, claimant, and arrival time its
 // members have. Claiming, renewing, and changing or deleting a member move
-// that version, and while one claimant holds the group nobody else may write
+// that version, and while one claimant holds the set nobody else may write
 // to it.
 //
-// Every write to a group moves its version, inserts included, so a version a
-// reader saw means the group, members and all, is as the reader saw it.
-// Concurrent writers of one group therefore contend; a workload with many
+// Every write to a set moves its version, inserts included, so a version a
+// reader saw means the set, members and all, is as the reader saw it.
+// Concurrent writers of one set therefore contend; a workload with many
 // writers is better spread over several primary keys.
-package docgroup
+package docset
 
 import (
 	"fmt"
@@ -21,13 +21,13 @@ import (
 	"github.com/shiblon/entroq"
 )
 
-// Group names a doc group.
-type Group struct {
+// Set names a doc set.
+type Set struct {
 	Namespace string
 	Key       string
 }
 
-// Lock is a group's version and claim, and how many docs it has.
+// Lock is a set's version and claim, and how many docs it has.
 type Lock struct {
 	Version  int32
 	Claimant string
@@ -35,9 +35,9 @@ type Lock struct {
 	NumDocs  int
 }
 
-// Absent is the lock of a group nothing has written or claimed yet. Its first
+// Absent is the lock of a set nothing has written or claimed yet. Its first
 // write or claim moves it to version 0, so a new doc starts at version 0 as a
-// new task does. Backends return it for a group they have no lock for.
+// new task does. Backends return it for a set they have no lock for.
 var Absent = Lock{Version: -1}
 
 // Held reports whether anyone holds the lock at now.
@@ -51,7 +51,7 @@ func (l Lock) HeldByOther(claimant string, now time.Time) bool {
 	return l.Held(now) && l.Claimant != claimant
 }
 
-// Overlay returns a copy of member carrying its group's version and claim, the
+// Overlay returns a copy of member carrying its set's version and claim, the
 // only ones a member has.
 func Overlay(member *entroq.Doc, l Lock) *entroq.Doc {
 	d := member.Copy()
@@ -62,7 +62,7 @@ func Overlay(member *entroq.Doc, l Lock) *entroq.Doc {
 }
 
 // Claim returns l claimed by claimant until now+d, or false if someone else
-// holds it. Claiming moves the version, so any earlier read of the group is
+// holds it. Claiming moves the version, so any earlier read of the set is
 // stale; the holder claiming again extends its claim the same way.
 func Claim(l Lock, claimant string, now time.Time, d time.Duration) (Lock, bool) {
 	if l.HeldByOther(claimant, now) {
@@ -71,10 +71,10 @@ func Claim(l Lock, claimant string, now time.Time, d time.Duration) (Lock, bool)
 	return Lock{Version: l.Version + 1, Claimant: claimant, At: now.Add(d), NumDocs: l.NumDocs}, true
 }
 
-// Claimed returns the group g as its claim left it: holding lock l, with each
+// Claimed returns the set g as its claim left it: holding lock l, with each
 // member carrying that lock.
-func Claimed(g Group, l Lock, members []*entroq.Doc) *entroq.DocGroup {
-	dg := &entroq.DocGroup{
+func Claimed(g Set, l Lock, members []*entroq.Doc) *entroq.DocSet {
+	dg := &entroq.DocSet{
 		Namespace: g.Namespace,
 		Key:       g.Key,
 		Version:   l.Version,
@@ -89,10 +89,10 @@ func Claimed(g Group, l Lock, members []*entroq.Doc) *entroq.DocGroup {
 	return dg
 }
 
-// Current returns the group g as its lock l stands, without its docs: what a
+// Current returns the set g as its lock l stands, without its docs: what a
 // dependency error or an arrival update reports.
-func Current(g Group, l Lock) *entroq.DocGroup {
-	return &entroq.DocGroup{
+func Current(g Set, l Lock) *entroq.DocSet {
+	return &entroq.DocSet{
 		Namespace: g.Namespace,
 		Key:       g.Key,
 		Version:   l.Version,
@@ -103,12 +103,12 @@ func Current(g Group, l Lock) *entroq.DocGroup {
 }
 
 // HeldError is the error for a claim of g, holding lock l, by someone else:
-// it names the group, with its lock, and its members, for clients that know
+// it names the set, with its lock, and its members, for clients that know
 // only doc failures.
-func HeldError(g Group, l Lock, members []*entroq.Doc) *entroq.DependencyError {
+func HeldError(g Set, l Lock, members []*entroq.Doc) *entroq.DependencyError {
 	depErr := &entroq.DependencyError{
-		Message:     fmt.Sprintf("doc group %q in namespace %q is claimed by %s until %v", g.Key, g.Namespace, l.Claimant, l.At),
-		GroupClaims: []*entroq.DocGroup{Current(g, l)},
+		Message:   fmt.Sprintf("doc set %q in namespace %q is claimed by %s until %v", g.Key, g.Namespace, l.Claimant, l.At),
+		SetClaims: []*entroq.DocSet{Current(g, l)},
 	}
 	for _, d := range members {
 		depErr.DocClaims = append(depErr.DocClaims, entroq.NewDocID(d.Namespace, d.ID, l.Version))
@@ -116,67 +116,67 @@ func HeldError(g Group, l Lock, members []*entroq.Doc) *entroq.DependencyError {
 	return depErr
 }
 
-// Plan is what a modification does to doc groups.
+// Plan is what a modification does to doc sets.
 type Plan struct {
 	// Err describes every doc operation that cannot proceed, or is nil.
 	Err *entroq.DependencyError
-	// Locks holds the new lock of every group the modification writes.
-	Locks map[Group]Lock
-	// Arrived holds each group mod.DocArrives names at its new lock, in the
-	// order named: a modify response's changed groups.
-	Arrived []*entroq.DocGroup
+	// Locks holds the new lock of every set the modification writes.
+	Locks map[Set]Lock
+	// Arrived holds each set mod.DocArrives names at its new lock, in the
+	// order named: a modify response's changed sets.
+	Arrived []*entroq.DocSet
 }
 
 // Evaluate checks mod's doc operations and computes the lock each written
-// group ends with, its doc count moved by the docs the modification inserts
+// set ends with, its doc count moved by the docs the modification inserts
 // and deletes. member returns the stored doc with the given namespace and ID,
-// or nil; lock returns a group's current lock, or Absent.
+// or nil; lock returns a set's current lock, or Absent.
 //
-// A change, delete, or depend names a member at its group's version; the
-// member's stored key, not the one in the request, decides its group. A change
-// or delete also fails while someone else holds the group, and so does an
+// A change, delete, or depend names a member at its set's version; the
+// member's stored key, not the one in the request, decides its set. A change
+// or delete also fails while someone else holds the set, and so does an
 // insert, which checks no version. A depend only reads, so it neither checks
-// the claim nor writes the group. Changes, deletes, and inserts write it.
+// the claim nor writes the set. Changes, deletes, and inserts write it.
 //
-// Each written group's version moves once. If any of its changes or inserts
-// carries a future arrival time, the group ends held by mod.Claimant until the
+// Each written set's version moves once. If any of its changes or inserts
+// carries a future arrival time, the set ends held by mod.Claimant until the
 // latest one; otherwise the write releases it, as committing a task releases
 // its claim.
-func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string) *entroq.Doc, lock func(Group) Lock) Plan {
+func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string) *entroq.Doc, lock func(Set) Lock) Plan {
 	depErr := new(entroq.DependencyError)
-	held := make(map[Group]time.Time) // written groups, with the latest future arrival
-	added := make(map[Group]int)      // docs inserted less docs deleted, per group
+	held := make(map[Set]time.Time) // written sets, with the latest future arrival
+	added := make(map[Set]int)      // docs inserted less docs deleted, per set
 
-	write := func(g Group, at time.Time) {
+	write := func(g Set, at time.Time) {
 		latest := held[g]
 		if at.After(now) && at.After(latest) {
 			latest = at
 		}
 		held[g] = latest
 	}
-	// claimed reports whether someone else holds g, naming the group in the
+	// claimed reports whether someone else holds g, naming the set in the
 	// error the first time. The members are named too, for clients that
 	// know only doc failures.
-	reported := make(map[Group]bool)
-	claimed := func(g Group) bool {
+	reported := make(map[Set]bool)
+	claimed := func(g Set) bool {
 		l := lock(g)
 		if !l.HeldByOther(mod.Claimant, now) {
 			return false
 		}
 		if !reported[g] {
 			reported[g] = true
-			depErr.GroupClaims = append(depErr.GroupClaims, Current(g, l))
+			depErr.SetClaims = append(depErr.SetClaims, Current(g, l))
 		}
 		return true
 	}
-	// stored returns the member's group and lock, or false if it does not
+	// stored returns the member's set and lock, or false if it does not
 	// exist at version.
-	stored := func(ns, id string, version int32) (Group, bool) {
+	stored := func(ns, id string, version int32) (Set, bool) {
 		d := member(ns, id)
 		if d == nil {
-			return Group{}, false
+			return Set{}, false
 		}
-		g := Group{Namespace: d.Namespace, Key: d.Key}
+		g := Set{Namespace: d.Namespace, Key: d.Key}
 		return g, lock(g).Version == version
 	}
 
@@ -186,7 +186,7 @@ func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string
 			depErr.DocInserts = append(depErr.DocInserts, id)
 			continue
 		}
-		g := Group{Namespace: ins.Namespace, Key: ins.Key}
+		g := Set{Namespace: ins.Namespace, Key: ins.Key}
 		if claimed(g) {
 			id.Version = lock(g).Version
 			depErr.DocClaims = append(depErr.DocClaims, id)
@@ -224,10 +224,10 @@ func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string
 			depErr.DocDepends = append(depErr.DocDepends, dep)
 		}
 	}
-	// An arrival names the group itself, at its version, and writes only when
+	// An arrival names the set itself, at its version, and writes only when
 	// it is ready again.
 	for _, a := range mod.DocArrives {
-		g := Group{Namespace: a.Namespace, Key: a.Key}
+		g := Set{Namespace: a.Namespace, Key: a.Key}
 		l := lock(g)
 		switch {
 		case l.Version < 0 || l.Version != a.Version:
@@ -238,7 +238,7 @@ func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string
 		}
 	}
 
-	plan := Plan{Locks: make(map[Group]Lock, len(held))}
+	plan := Plan{Locks: make(map[Set]Lock, len(held))}
 	if depErr.HasAny() {
 		plan.Err = depErr
 		return plan
@@ -252,32 +252,32 @@ func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string
 		plan.Locks[g] = next
 	}
 	for _, a := range mod.DocArrives {
-		g := Group{Namespace: a.Namespace, Key: a.Key}
+		g := Set{Namespace: a.Namespace, Key: a.Key}
 		plan.Arrived = append(plan.Arrived, Current(g, plan.Locks[g]))
 	}
 	return plan
 }
 
-// Groups lists the doc groups mod's doc operations name, each once: an
+// Sets lists the doc sets mod's doc operations name, each once: an
 // insert's and an arrival's by its key, and every other operation's by its
 // stored member's key. member returns the stored doc with the given namespace and ID, or nil.
-// A backend locks or reads these groups before calling Evaluate; see
+// A backend locks or reads these sets before calling Evaluate; see
 // Exclusive for which need an exclusive lock.
-func Groups(mod *entroq.Modification, member func(ns, id string) *entroq.Doc) []Group {
-	seen := make(map[Group]bool)
-	var groups []Group
-	add := func(g Group) {
+func Sets(mod *entroq.Modification, member func(ns, id string) *entroq.Doc) []Set {
+	seen := make(map[Set]bool)
+	var sets []Set
+	add := func(g Set) {
 		if !seen[g] {
 			seen[g] = true
-			groups = append(groups, g)
+			sets = append(sets, g)
 		}
 	}
 	for _, ins := range mod.DocInserts {
-		add(Group{Namespace: ins.Namespace, Key: ins.Key})
+		add(Set{Namespace: ins.Namespace, Key: ins.Key})
 	}
 	stored := func(ns, id string) {
 		if d := member(ns, id); d != nil {
-			add(Group{Namespace: d.Namespace, Key: d.Key})
+			add(Set{Namespace: d.Namespace, Key: d.Key})
 		}
 	}
 	for _, chg := range mod.DocChanges {
@@ -290,24 +290,24 @@ func Groups(mod *entroq.Modification, member func(ns, id string) *entroq.Doc) []
 		stored(dep.Namespace, dep.ID)
 	}
 	for _, a := range mod.DocArrives {
-		add(Group{Namespace: a.Namespace, Key: a.Key})
+		add(Set{Namespace: a.Namespace, Key: a.Key})
 	}
-	return groups
+	return sets
 }
 
-// Exclusive reports which of mod's groups a backend must lock exclusively
+// Exclusive reports which of mod's sets a backend must lock exclusively
 // before calling Evaluate: those it writes, by inserting into them, changing
 // or deleting a member, or changing their arrival. mod only depends on the
 // rest, so they may be locked
 // shared, and since a depend names a stored member, they already exist.
-func Exclusive(mod *entroq.Modification, member func(ns, id string) *entroq.Doc) map[Group]bool {
-	exclusive := make(map[Group]bool)
+func Exclusive(mod *entroq.Modification, member func(ns, id string) *entroq.Doc) map[Set]bool {
+	exclusive := make(map[Set]bool)
 	for _, ins := range mod.DocInserts {
-		exclusive[Group{Namespace: ins.Namespace, Key: ins.Key}] = true
+		exclusive[Set{Namespace: ins.Namespace, Key: ins.Key}] = true
 	}
 	stored := func(ns, id string) {
 		if d := member(ns, id); d != nil {
-			exclusive[Group{Namespace: d.Namespace, Key: d.Key}] = true
+			exclusive[Set{Namespace: d.Namespace, Key: d.Key}] = true
 		}
 	}
 	for _, chg := range mod.DocChanges {
@@ -317,7 +317,7 @@ func Exclusive(mod *entroq.Modification, member func(ns, id string) *entroq.Doc)
 		stored(del.Namespace, del.ID)
 	}
 	for _, a := range mod.DocArrives {
-		exclusive[Group{Namespace: a.Namespace, Key: a.Key}] = true
+		exclusive[Set{Namespace: a.Namespace, Key: a.Key}] = true
 	}
 	return exclusive
 }

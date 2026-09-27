@@ -9,7 +9,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/pkg/backend/internal/docgroup"
+	"github.com/shiblon/entroq/pkg/backend/internal/docset"
 )
 
 func docContent(ctx context.Context, t *testing.T, client *entroq.EntroQ, ns, id string) string {
@@ -114,8 +114,8 @@ func TestMigrateDocKeys(t *testing.T) {
 	}
 }
 
-// TestMigrateDocLocks checks that opening a database written before doc groups
-// had locks gives each group a lock one version past its highest member, with
+// TestMigrateDocLocks checks that opening a database written before doc sets
+// had locks gives each set a lock one version past its highest member, with
 // any claim released.
 func TestMigrateDocLocks(t *testing.T) {
 	ctx := context.Background()
@@ -143,7 +143,7 @@ func TestMigrateDocLocks(t *testing.T) {
 		rdb.HSet(ctx, docKey(ns, "a"), "version", "2"),
 		rdb.HSet(ctx, docKey(ns, "b"), "version", "7", "claimant", "holder", "at", future),
 		rdb.HSet(ctx, docKey(ns, "c"), "version", "0"),
-		rdb.Del(ctx, lockKey(docgroup.Group{Namespace: ns, Key: "k"}), lockKey(docgroup.Group{Namespace: ns, Key: "other"}),
+		rdb.Del(ctx, lockKey(docset.Set{Namespace: ns, Key: "k"}), lockKey(docset.Set{Namespace: ns, Key: "other"}),
 			lockIndexKey(ns), heldGroupsKey(ns), docLocksMigratedKey, docFieldsMigratedKey),
 	} {
 		if err := cmd.Err(); err != nil {
@@ -187,7 +187,7 @@ func checkNoDocFields(ctx context.Context, t *testing.T, rdb *redis.Client, ns s
 }
 
 // TestMigrateDocFieldsAfterLocks covers a database a development build left
-// with group locks, and the lock migration marked done, but with doc hashes
+// with set locks, and the lock migration marked done, but with doc hashes
 // still holding their own versions and claims. The fields go; the locks stay.
 func TestMigrateDocFieldsAfterLocks(t *testing.T) {
 	ctx := context.Background()

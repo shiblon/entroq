@@ -13,7 +13,7 @@ Release note: the next release must be a minor (v1.13.0 or later), not a
 patch. It adds public API (`entroq.InvalidArgumentError`), moves the SQLite
 schema to version 3, adds `eqc work --max-claims`, removes the
 `eqc mod --reset` flag, and changes how doc versions and claims work (see the
-doc groups entry). The PostgreSQL schema moves to 1.13.0: stop 1.12 services
+doc sets entry). The PostgreSQL schema moves to 1.13.0: stop 1.12 services
 first, since the upgrade drops the doc functions they call, then run
 `eqpg schema upgrade` (or serve with `--init_schema`) before starting the new
 service. The upgrade moves data and holds a lock on the docs table while it
@@ -56,37 +56,37 @@ runs, so plan a short maintenance window on large doc tables.
 - **eqmr map outputs have a primary key per split.** A mapper writes each
   partition's output under `mapout/<partition>/<split>` instead of sharing
   `mapout/<partition>` with every other mapper, so concurrent mappers write
-  distinct doc groups and do not contend now that every insert moves its
-  group's version. A reducer reads its partition as the range under
+  distinct doc sets and do not contend now that every insert moves its
+  set's version. A reducer reads its partition as the range under
   `mapout/<partition>/`. Finish runs before upgrading: a reducer given a task
   from a run an older eqmr started quarantines it, failing the run, rather
   than record an empty result.
 
-- **Breaking: docs sharing a primary key are one unit.** A doc group, the docs
+- **Breaking: docs sharing a primary key are one unit.** A doc set, the docs
   sharing a primary key in a namespace, now has a single version, claimant, and
-  arrival time, as a task does, and every member reports its group's. Claiming
-  the group, renewing it, and inserting, changing, or deleting any member move
+  arrival time, as a task does, and every member reports its set's. Claiming
+  the set, renewing it, and inserting, changing, or deleting any member move
   that version, so a read taken before any of them is stale, even for a member
-  nobody touched, and a version a reader saw means the group, membership
-  included, is as it saw it. Concurrent writers of one group therefore take
+  nobody touched, and a version a reader saw means the set, membership
+  included, is as it saw it. Concurrent writers of one set therefore take
   turns; spread many writers over several primary keys. While one claimant
-  holds the group, nobody else may insert, change, or delete in it; a depend
+  holds the set, nobody else may insert, change, or delete in it; a depend
   still succeeds, since it only reads. A writer acting as the holder (`entroq.ModifyAs`, as
-  `eqc mod --force` does) still may. The holder's commit releases the group
+  `eqc mod --force` does) still may. The holder's commit releases the set
   unless it carries a future arrival time, which renews it. When one
-  modification gives docs of a group different future arrival times, the
-  latest wins. A group can be
+  modification gives docs of a set different future arrival times, the
+  latest wins. A set can be
   claimed before it has docs: `ClaimDocs` then succeeds and returns none, where
   it used to return none and lock nothing. The Go worker therefore no longer
-  moves a task to its error queue for a "required doc missing"; a group held by
+  moves a task to its error queue for a "required doc missing"; a set held by
   someone else still retries with backoff, and a handler decides what an empty
-  group means. Docs keep their keys: a change replaces content only.
-  Upgrading gives every existing group a lock one version past its highest
+  set means. Docs keep their keys: a change replaces content only.
+  Upgrading gives every existing set a lock one version past its highest
   member, so no version read before the upgrade can match one written after,
   and releases claims held at the time. The version, claimant, and arrival
   time then live only in the lock: PostgreSQL gains the `entroq.doc_locks`
   table, drops those columns from `entroq.docs`, and ties every doc to its
-  group's lock with a foreign key; SQLite does the same in schema version 3;
+  set's lock with a foreign key; SQLite does the same in schema version 3;
   Redis migrates on its first open and removes the fields from doc hashes; and
   the in-memory backend rebuilds locks when its journal loads. Namespace stats
   count claimed docs from the held locks instead of reading every doc.
@@ -94,7 +94,7 @@ runs, so plan a short maintenance window on large doc tables.
   backend, and the schema drops `_modify_docs` and `_claim_docs`.
 - **A task's claimant names its holder.** A write that leaves a task not yet
   available records the writer as its claimant, and a write that leaves it
-  available records none, on every backend, as doc group locks already do.
+  available records none, on every backend, as doc set locks already do.
   Changes already worked this way except on the in-memory backend, which kept
   the claimant the caller's copy of the task carried when a change delayed
   it; inserts recorded the writer even for a task available at once. So an
@@ -124,22 +124,22 @@ runs, so plan a short maintenance window on large doc tables.
   receive default, so a response the server was configured to send (up to
   `--max_size_mb`, default 10MB), such as a large task listing, failed on the
   client. The server's limit now governs; `eqgrpc.WithMaxSize` still sets one.
-- **Breaking (Go): `ClaimDocs` returns the group it claimed.**
-  `EntroQ.ClaimDocs` and `Backend.ClaimDocs` return a `*entroq.DocGroup`: the
-  group's namespace, key, version, claimant, and arrival time, with its
-  members in `Docs`. A group claimed with no docs still reports its version
+- **Breaking (Go): `ClaimDocs` returns the set it claimed.**
+  `EntroQ.ClaimDocs` and `Backend.ClaimDocs` return a `*entroq.DocSet`: the
+  set's namespace, key, version, claimant, and arrival time, with its
+  members in `Docs`. A set claimed with no docs still reports its version
   and claim, which a list of members could not. On the wire,
-  `ClaimDocsResponse` gains a `group` field beside its docs, so older clients
-  keep reading the members as before; the Go client rebuilds the group from
+  `ClaimDocsResponse` gains a `set` field beside its docs, so older clients
+  keep reading the members as before; the Go client rebuilds the set from
   the members when a server older than this one sends none. Replace
-  `docs, err := eq.ClaimDocs(...)` with `group, err := ...` and read
-  `group.Docs`.
+  `docs, err := eq.ClaimDocs(...)` with `set, err := ...` and read
+  `set.Docs`.
 - **Work gateway protocol 1.** `eqlink work` opens every session with a
   `hello` naming the protocol version it speaks (`workgateway.Protocol`) and
   its release, so a worker checks compatibility before any task and names both
   versions when it cannot proceed; a gateway without the hello is protocol 0.
-  `doWork` carries the claimed doc groups, each with its docs and its version
-  and claim, including groups with no docs. A worker can report an `error`
+  `doWork` carries the claimed doc sets, each with its docs and its version
+  and claim, including sets with no docs. A worker can report an `error`
   outcome for a handler failure it does not understand. `--error-queue` (with
   `{inbox}` standing for the task's queue) and `--retry-delay`, or the
   `errorQueue` and `retryDelay` URL params, pass through the Go worker's error
@@ -172,17 +172,17 @@ runs, so plan a short maintenance window on large doc tables.
   `workgateway.Serve` takes it in place of the handler's arguments. A context no
   longer stops the connections: call `Close`. `Bridge.Shutdown` drains one
   session.
-- **Modify can change only when tasks and doc groups are ready again.**
-  `Modification` gains `Arrives` and `DocArrives`: a task or doc group at a
+- **Modify can change only when tasks and doc sets are ready again.**
+  `Modification` gains `Arrives` and `DocArrives`: a task or doc set at a
   version, ready again at a given time, or now, which releases it. Each moves
   one version and keeps everything else, its value, attempts, and claim count,
-  or its docs, and a doc group with no docs works like any other. Build them
+  or its docs, and a doc set with no docs works like any other. Build them
   with `entroq.Arriving`, or call `eq.UpdateArrival`:
-  `eq.UpdateArrival(ctx, entroq.ReadyIn(lease).Tasks(task).Docs(groups...))`
+  `eq.UpdateArrival(ctx, entroq.ReadyIn(lease).Tasks(task).Docs(sets...))`
   renews them for the lease, and `entroq.ReadyNow()` releases them. The claim
   rules are Modify's: an item someone else holds fails the whole modification.
-  `ModifyResponse.ChangedGroups` returns the groups at their new locks and doc
-  counts; their docs are at the group's new version. Over gRPC they travel as
+  `ModifyResponse.ChangedSets` returns the sets at their new locks and doc
+  counts; their docs are at the set's new version. Over gRPC they travel as
   the protocol 2 lease changes below, and the client refuses to send them to a
   server at protocol 1.
 - **The service reports its protocol.** Every gRPC and JSON response carries
@@ -213,27 +213,27 @@ runs, so plan a short maintenance window on large doc tables.
   with no identifier or no data, a delete or depend naming no doc, and a lease
   carrying anything but its arrival time are invalid arguments. A 1.12 server
   applied a change with no data as one clearing every field.
-- **Dependency errors can name doc groups.** `entroq.DependencyError` gains
-  `GroupClaims` (held by someone else) and `DocArrives` (arriving groups not at
-  the version named), each carrying the group's current lock, and `Arrives`,
-  task arrivals that failed. Over the wire a group is a `ModifyDep` whose
+- **Dependency errors can name doc sets.** `entroq.DependencyError` gains
+  `SetClaims` (held by someone else) and `DocArrives` (arriving sets not at
+  the version named), each carrying the set's current lock, and `Arrives`,
+  task arrivals that failed. Over the wire a set is a `ModifyDep` whose
   `doc_id` names it by key, with its version but not who holds it. A claim or
-  modification refused because someone else holds a group names the group as
+  modification refused because someone else holds a set names the set as
   well as its members, so clients that read only doc failures see what they did
   before.
-- **A doc group counts its docs.** `entroq.DocGroup.NumDocs`, and `len` on the
+- **A doc set counts its docs.** `entroq.DocSet.NumDocs`, and `len` on the
   `Doc` standing for a set in claim responses and in the work gateway's
-  `doWork` groups, is how many docs the group has. PostgreSQL and SQLite keep it
-  on the group's lock row, which every write already updates, and lock
+  `doWork` sets, is how many docs the set has. PostgreSQL and SQLite keep it
+  on the set's lock row, which every write already updates, and lock
   collection now checks it instead of looking for docs; Redis counts it from its
   doc index when it reads a lock; the in-memory backend keeps it on the lock and
-  recounts after replaying a journal. Upgrading from 1.12 counts each group's
-  docs as it gives the group its lock.
-- **Breaking (Go): worker handlers receive doc groups.** `DoWork`, `DoModify`,
+  recounts after replaying a journal. Upgrading from 1.12 counts each set's
+  docs as it gives the set its lock.
+- **Breaking (Go): worker handlers receive doc sets.** `DoWork`, `DoModify`,
   and `Finish` handlers, and the `Handler` interface, take
-  `[]*entroq.DocGroup` where they took `[]*entroq.Doc`: one group per claim
+  `[]*entroq.DocSet` where they took `[]*entroq.Doc`: one set per claim
   from `TakeDocs`, in claim order, each with its docs and its version and
-  claim, including a group claimed with no docs. `entroq.GroupDocs(groups)`
+  claim, including a set claimed with no docs. `entroq.DocsIn(sets)`
   flattens them to the docs handlers received before. A handler that ignored
   its docs only changes the parameter type.
 - **Schemas carry a digest, and unreleased ones a `-dev` version.**
@@ -271,11 +271,11 @@ runs, so plan a short maintenance window on large doc tables.
 ### Deprecated
 
 - **`EntroQ.TryClaimDocByID`.** A doc has no claim of its own: it claimed the
-  doc's whole group and returned only the named doc. Claim the group with
-  `ClaimDocs(ctx, entroq.ClaimKey(ns, doc.Key))`, which also works for a group
+  doc's whole set and returned only the named doc. Claim the set with
+  `ClaimDocs(ctx, entroq.ClaimKey(ns, doc.Key))`, which also works for a set
   with no docs.
 - **In-memory journal replay no longer checks doc versions.** Journals written
-  before doc groups had locks did not record doc claims, so their doc versions
+  before doc sets had locks did not record doc claims, so their doc versions
   can trail what later records name. Replay applies the recorded state anyway,
   and logs one warning if it found any such record. The next minor release
   checks doc versions on replay again: take a snapshot with this version first
@@ -300,7 +300,7 @@ runs, so plan a short maintenance window on large doc tables.
   records `entroq.claim.duration` and `entroq.modify.duration`, as the other
   backends do.
 - **Redis doc reads no longer lose concurrent updates.** `Docs` read docs and
-  their group locks in separate round trips, so a write landing between them
+  their set locks in separate round trips, so a write landing between them
   paired old content with the new version. A read-modify-write of that content
   then passed its version check and overwrote the newer content: under
   contention, increments were lost. Docs and their locks are now read in one
@@ -329,17 +329,17 @@ runs, so plan a short maintenance window on large doc tables.
 - **A doc claim with no claimant is refused.** The service passed it to its
   own client, which filled in the service's claimant, so the claim succeeded
   as the service itself. It is now an invalid argument.
-- **The Go worker keeps an empty doc group it claimed.** Renewing a group's
-  docs renewed the group, but a group claimed with no docs had none to renew,
+- **The Go worker keeps an empty doc set it claimed.** Renewing a set's
+  docs renewed the set, but a set claimed with no docs had none to renew,
   so its claim lapsed after one lease while the handler still ran, and another
-  claimant could take it. The worker now claims such groups again each time it
-  renews. A group the handler does not write is still released only when its
+  claimant could take it. The worker now claims such sets again each time it
+  renews. A set the handler does not write is still released only when its
   lease runs out.
 - **`eqpg.Open` closes its connections when it fails.** A failed open, such as
   one refused for a schema mismatch, left its connection pool open.
 - **In-memory snapshots keep docs.** A snapshot saved only tasks, and taking
   one with cleanup removed the journals, so every doc was lost. Snapshots now
-  hold docs and doc group locks, and snapshots written before this still load.
+  hold docs and doc set locks, and snapshots written before this still load.
 - **In-memory doc claims survive a restart.** `ClaimDocs` changed doc versions
   without journaling them, so replay could fail on a later change or delete of
   a claimed doc. Claims are now journaled with the rest.

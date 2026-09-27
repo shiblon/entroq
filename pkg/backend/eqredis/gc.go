@@ -90,7 +90,7 @@ func (e *EQRedis) gc(ctx context.Context) error {
 		if err != nil {
 			continue
 		}
-		// A namespace with doc group locks but no docs stays listed, so lock
+		// A namespace with doc set locks but no docs stays listed, so lock
 		// collection can still find it.
 		locks, err := e.client.SCard(ctx, lockIndexKey(ns)).Result()
 		if err != nil {

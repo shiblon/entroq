@@ -127,8 +127,8 @@ func TestGRPCTasksWithIDStaysInQueue(t *testing.T) {
 	RunQTest(t, eqtest.TasksWithIDStaysInQueue)
 }
 
-func TestGRPCDocGroups(t *testing.T) {
-	RunQTest(t, eqtest.DocGroups)
+func TestGRPCDocSets(t *testing.T) {
+	RunQTest(t, eqtest.DocSets)
 }
 
 func TestGRPCUpdateArrival(t *testing.T) {

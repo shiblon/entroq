@@ -31,13 +31,13 @@ func TestWorker_Basic(t *testing.T) {
 
 	go func() {
 		w := New(client,
-			WithDoWork(func(ctx context.Context, task *entroq.Task, s string, _ []*entroq.DocGroup) error {
+			WithDoWork(func(ctx context.Context, task *entroq.Task, s string, _ []*entroq.DocSet) error {
 				if s != "hi" {
 					return errors.New("wrong value")
 				}
 				return nil
 			}),
-			WithFinish(func(ctx context.Context, mod Modifier, task *entroq.Task, _ string, _ []*entroq.DocGroup) error {
+			WithFinish(func(ctx context.Context, mod Modifier, task *entroq.Task, _ string, _ []*entroq.DocSet) error {
 				if _, err := mod.Modify(ctx, task.Delete()); err != nil {
 					return err
 				}
@@ -227,8 +227,8 @@ func TestDoModify_DocVersionFixedAfterRenewal(t *testing.T) {
 			WithTakeDocs(func(_ context.Context, _ *entroq.Task, _ string) ([]*entroq.DocClaim, error) {
 				return []*entroq.DocClaim{entroq.ClaimKey("ns", "k")}, nil
 			}),
-			WithDoModify(func(_ context.Context, task *entroq.Task, _ string, groups []*entroq.DocGroup) (*Result, error) {
-				docs := entroq.GroupDocs(groups)
+			WithDoModify(func(_ context.Context, task *entroq.Task, _ string, sets []*entroq.DocSet) (*Result, error) {
+				docs := entroq.DocsIn(sets)
 				if len(docs) == 0 {
 					return nil, FatalErrorf("expected claimed doc")
 				}
@@ -261,29 +261,29 @@ func TestDoModify_DocVersionFixedAfterRenewal(t *testing.T) {
 	}
 }
 
-// TestWithRenewed checks that renewal's copies replace a group's members and
-// carry the group's new version and claim, and that an empty group, which
+// TestWithRenewed checks that renewal's copies replace a set's members and
+// carry the set's new version and claim, and that an empty set, which
 // renewal of docs cannot reach, comes back as it was.
 func TestWithRenewed(t *testing.T) {
 	later := time.Now().Add(time.Minute)
-	full := &entroq.DocGroup{Namespace: "ns", Key: "k", Version: 1, Docs: []*entroq.Doc{
+	full := &entroq.DocSet{Namespace: "ns", Key: "k", Version: 1, Docs: []*entroq.Doc{
 		{Namespace: "ns", ID: "a", Key: "k", Version: 1},
 		{Namespace: "ns", ID: "b", Key: "k", Version: 1},
 	}}
-	empty := &entroq.DocGroup{Namespace: "ns", Key: "e", Version: 4}
+	empty := &entroq.DocSet{Namespace: "ns", Key: "e", Version: 4}
 	renewed := []*entroq.Doc{
 		{Namespace: "ns", ID: "a", Key: "k", Version: 2, Claimant: "me", At: later},
 		{Namespace: "ns", ID: "b", Key: "k", Version: 2, Claimant: "me", At: later},
 	}
-	got := withRenewed([]*entroq.DocGroup{full, empty}, renewed)
+	got := withRenewed([]*entroq.DocSet{full, empty}, renewed)
 	if g := got[0]; g.Version != 2 || g.Claimant != "me" || !g.At.Equal(later) || g.Docs[0] != renewed[0] || g.Docs[1] != renewed[1] {
-		t.Errorf("Renewed group: got %+v", g)
+		t.Errorf("Renewed set: got %+v", g)
 	}
 	if e := got[1]; e == empty || e.Key != "e" || e.Version != 4 || len(e.Docs) != 0 {
-		t.Errorf("Empty group: want an unchanged copy, got %+v", e)
+		t.Errorf("Empty set: want an unchanged copy, got %+v", e)
 	}
 	if full.Version != 1 {
-		t.Error("withRenewed changed the group it was given")
+		t.Error("withRenewed changed the set it was given")
 	}
 }
 

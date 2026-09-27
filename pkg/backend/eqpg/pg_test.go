@@ -220,9 +220,9 @@ func freshDB(ctx context.Context, t *testing.T, name string) *sql.DB {
 
 // TestUpgradeFrom1_11 upgrades a database initialized with the last released
 // schema (1.11.0, shipped through 1.12.x), whose docs carried their own
-// versions and claims. Each group must get a lock one version past its
+// versions and claims. Each set must get a lock one version past its
 // highest member, with claims released; the per-doc columns must be gone and
-// every doc tied to its group's lock; and the digest must let the backend
+// every doc tied to its set's lock; and the digest must let the backend
 // open, and stop it opening once it no longer matches.
 func TestUpgradeFrom1_11(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -259,7 +259,7 @@ func TestUpgradeFrom1_11(t *testing.T) {
 		t.Errorf("Docs keep %d of their per-doc version, claimant, and at columns", dropped)
 	}
 	if _, err := db.ExecContext(ctx, `INSERT INTO entroq.docs (namespace, id, key_primary) VALUES ('ns', 'orphan', 'nolock')`); err == nil {
-		t.Error("Inserted a doc whose group has no lock")
+		t.Error("Inserted a doc whose set has no lock")
 	}
 
 	b, err := Open(ctx, pgHostPort, WithDB(name), WithUsername("postgres"), WithPassword("password"), WithConnectAttempts(10))
@@ -339,12 +339,12 @@ func Example() {
 	go func() { time.Sleep(2 * time.Second); cancel() }()
 
 	w := worker.New(client,
-		worker.WithDoWork(func(ctx context.Context, claimed *entroq.Task, s string, _ []*entroq.DocGroup) error {
+		worker.WithDoWork(func(ctx context.Context, claimed *entroq.Task, s string, _ []*entroq.DocSet) error {
 			// Do work with the task.
 			fmt.Println(s)
 			return nil
 		}),
-		worker.WithFinish(func(ctx context.Context, mod worker.Modifier, final *entroq.Task, _ string, _ []*entroq.DocGroup) error {
+		worker.WithFinish(func(ctx context.Context, mod worker.Modifier, final *entroq.Task, _ string, _ []*entroq.DocSet) error {
 			// Delete the task to "commit" the work.
 			// At this point, you can also call directly into eqpg.ModifyOpts and
 			// hand it a function to call that has a transaction. That transaction
@@ -414,12 +414,12 @@ func Example_inTransaction() {
 	// when the task version is finalized (background renewal is stopped),
 	// updates the counter table.
 	w := worker.New(client,
-		worker.WithDoWork(func(ctx context.Context, claimed *entroq.Task, s string, _ []*entroq.DocGroup) error {
+		worker.WithDoWork(func(ctx context.Context, claimed *entroq.Task, s string, _ []*entroq.DocSet) error {
 			// Do work with the task.
 			fmt.Println(s)
 			return nil
 		}),
-		worker.WithFinish(func(ctx context.Context, mod worker.Modifier, final *entroq.Task, _ string, _ []*entroq.DocGroup) error {
+		worker.WithFinish(func(ctx context.Context, mod worker.Modifier, final *entroq.Task, _ string, _ []*entroq.DocSet) error {
 			// Delete the task to "commit" the work.
 
 			// The counter is updated in the same transaction as the entroq modification.
@@ -508,8 +508,8 @@ func TestTasksWithIDStaysInQueue(t *testing.T) {
 	RunQTest(t, eqtest.TasksWithIDStaysInQueue)
 }
 
-func TestDocGroups(t *testing.T) {
-	RunQTest(t, eqtest.DocGroups)
+func TestDocSets(t *testing.T) {
+	RunQTest(t, eqtest.DocSets)
 }
 
 func TestUpdateArrival(t *testing.T) {

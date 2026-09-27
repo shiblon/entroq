@@ -42,7 +42,7 @@ func TestResponseAcknowledgementRejectsApplicationData(t *testing.T) {
 			ReplyQueue: "/service/response-data",
 		},
 		Body: []byte("not an acknowledgement"),
-	}, []*entroq.DocGroup{{Docs: []*entroq.Doc{{}}}})
+	}, []*entroq.DocSet{{Docs: []*entroq.Doc{{}}}})
 	if err == nil || !strings.Contains(err.Error(), "where an ACK was expected") {
 		t.Fatalf("error: got %v, want ACK-shape protocol error", err)
 	}

@@ -9,7 +9,7 @@ import (
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/backend/internal/arrival"
-	"github.com/shiblon/entroq/pkg/backend/internal/docgroup"
+	"github.com/shiblon/entroq/pkg/backend/internal/docset"
 	"github.com/shiblon/entroq/pkg/backend/internal/validate"
 )
 
@@ -43,22 +43,22 @@ func modifyTx(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (*entro
 	// Task arrivals are changes of the stored tasks' arrival times alone.
 	mod = arrival.Changes(mod, now, func(id string) *entroq.Task { return foundTasks[id] })
 	member := func(ns, id string) *entroq.Doc { return foundDocs[entroq.DocKey(ns, id)] }
-	locks, err := loadDocLocks(ctx, tx, docgroup.Groups(mod, member))
+	locks, err := loadDocLocks(ctx, tx, docset.Sets(mod, member))
 	if err != nil {
 		return nil, err
 	}
-	docPlan := docgroup.Evaluate(mod, now, member,
-		func(g docgroup.Group) docgroup.Lock { return lockOf(locks, g) },
+	docPlan := docset.Evaluate(mod, now, member,
+		func(g docset.Set) docset.Lock { return lockOf(locks, g) },
 	)
 	if depErr := checkDependencies(mod, foundTasks, now).Merge(docPlan.Err); depErr != nil {
 		return nil, depErr
 	}
-	// Each written member carries its group's new lock, the only version and
+	// Each written member carries its set's new lock, the only version and
 	// claim a member has.
 	withLock := func(d *entroq.Doc) {
-		l, ok := docPlan.Locks[docgroup.Group{Namespace: d.Namespace, Key: d.Key}]
+		l, ok := docPlan.Locks[docset.Set{Namespace: d.Namespace, Key: d.Key}]
 		if !ok {
-			l = lockOf(locks, docgroup.Group{Namespace: d.Namespace, Key: d.Key})
+			l = lockOf(locks, docset.Set{Namespace: d.Namespace, Key: d.Key})
 		}
 		d.Version, d.Claimant, d.At = l.Version, l.Claimant, l.At
 	}
@@ -146,7 +146,7 @@ func modifyTx(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (*entro
 	if err := saveDocLocks(ctx, tx, docPlan.Locks); err != nil {
 		return nil, err
 	}
-	resp.ChangedGroups = docPlan.Arrived
+	resp.ChangedSets = docPlan.Arrived
 	return resp, nil
 }
 
@@ -250,7 +250,7 @@ func deleteDocs(ctx context.Context, tx *sql.Tx, deletes []*entroq.DocID) error 
 	})
 }
 
-// insertDocs writes new docs. A doc's version and claim are its group's,
+// insertDocs writes new docs. A doc's version and claim are its set's,
 // written to doc_locks.
 func insertDocs(ctx context.Context, tx *sql.Tx, docs []*entroq.Doc) error {
 	const columns = 7
@@ -271,7 +271,7 @@ func insertDocs(ctx context.Context, tx *sql.Tx, docs []*entroq.Doc) error {
 }
 
 // changeDocs replaces docs' content; keys belong to the stored doc, and the
-// version and claim to its group's lock.
+// version and claim to its set's lock.
 func changeDocs(ctx context.Context, tx *sql.Tx, docs []*entroq.Doc) error {
 	const columns = 4
 	return batchRanges(len(docs), columns, func(start, end int) error {
@@ -379,7 +379,7 @@ func loadDependencies(ctx context.Context, tx *sql.Tx, mod *entroq.Modification)
 }
 
 // checkDependencies checks mod's task operations against the stored tasks;
-// docgroup checks its doc operations.
+// docset checks its doc operations.
 func checkDependencies(mod *entroq.Modification, tasks map[string]*entroq.Task, now time.Time) *entroq.DependencyError {
 	depErr := &entroq.DependencyError{}
 	for _, dep := range mod.Depends {
@@ -416,14 +416,14 @@ func heldTask(task *entroq.Task, claimant string, now time.Time) bool {
 	return task.Claimant != "" && task.Claimant != claimant && task.At.After(now)
 }
 
-// loadDocLocks reads the locks of groups; a group with none is absent from the
+// loadDocLocks reads the locks of sets; a set with none is absent from the
 // result.
-func loadDocLocks(ctx context.Context, q queryer, groups []docgroup.Group) (map[docgroup.Group]docgroup.Lock, error) {
-	locks := make(map[docgroup.Group]docgroup.Lock, len(groups))
+func loadDocLocks(ctx context.Context, q queryer, sets []docset.Set) (map[docset.Set]docset.Lock, error) {
+	locks := make(map[docset.Set]docset.Lock, len(sets))
 	const columns = 2
-	err := batchRanges(len(groups), columns, func(start, end int) error {
+	err := batchRanges(len(sets), columns, func(start, end int) error {
 		args := make([]any, 0, columns*(end-start))
-		for _, g := range groups[start:end] {
+		for _, g := range sets[start:end] {
 			args = append(args, g.Namespace, g.Key)
 		}
 		rows, err := q.QueryContext(ctx, `SELECT namespace, key_primary, version, claimant, at_ms, num_docs FROM doc_locks
@@ -433,8 +433,8 @@ func loadDocLocks(ctx context.Context, q queryer, groups []docgroup.Group) (map[
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var g docgroup.Group
-			var l docgroup.Lock
+			var g docset.Set
+			var l docset.Lock
 			var at int64
 			if err := rows.Scan(&g.Namespace, &g.Key, &l.Version, &l.Claimant, &at, &l.NumDocs); err != nil {
 				return fmt.Errorf("scan doc lock: %w", err)
@@ -447,24 +447,24 @@ func loadDocLocks(ctx context.Context, q queryer, groups []docgroup.Group) (map[
 	return locks, err
 }
 
-// lockOf returns g's lock from locks, or docgroup.Absent.
-func lockOf(locks map[docgroup.Group]docgroup.Lock, g docgroup.Group) docgroup.Lock {
+// lockOf returns g's lock from locks, or docset.Absent.
+func lockOf(locks map[docset.Set]docset.Lock, g docset.Set) docset.Lock {
 	if l, ok := locks[g]; ok {
 		return l
 	}
-	return docgroup.Absent
+	return docset.Absent
 }
 
-// saveDocLocks writes locks, creating or replacing each group's.
-func saveDocLocks(ctx context.Context, tx *sql.Tx, locks map[docgroup.Group]docgroup.Lock) error {
-	groups := make([]docgroup.Group, 0, len(locks))
+// saveDocLocks writes locks, creating or replacing each set's.
+func saveDocLocks(ctx context.Context, tx *sql.Tx, locks map[docset.Set]docset.Lock) error {
+	sets := make([]docset.Set, 0, len(locks))
 	for g := range locks {
-		groups = append(groups, g)
+		sets = append(sets, g)
 	}
 	const columns = 6
-	return batchRanges(len(groups), columns, func(start, end int) error {
+	return batchRanges(len(sets), columns, func(start, end int) error {
 		args := make([]any, 0, columns*(end-start))
-		for _, g := range groups[start:end] {
+		for _, g := range sets[start:end] {
 			l := locks[g]
 			args = append(args, g.Namespace, g.Key, l.Version, l.Claimant, l.At.UnixMilli(), l.NumDocs)
 		}

@@ -18,8 +18,8 @@ func (g *DocSetID) String() string {
 	return fmt.Sprintf("%s:%s:v%d", g.Namespace, g.Key, g.Version)
 }
 
-// ID returns the group's name and version.
-func (g *DocGroup) ID() *DocSetID {
+// ID returns the set's name and version.
+func (g *DocSet) ID() *DocSetID {
 	return &DocSetID{Namespace: g.Namespace, Key: g.Key, Version: g.Version}
 }
 
@@ -31,14 +31,14 @@ type TaskArrival struct {
 	At time.Time `json:"at"`
 }
 
-// DocArrival changes only when a doc group is ready again, as TaskArrival does
-// for a task. The group may have no docs.
+// DocArrival changes only when a doc set is ready again, as TaskArrival does
+// for a task. The set may have no docs.
 type DocArrival struct {
 	DocSetID
 	At time.Time `json:"at"`
 }
 
-// ArrivalEntry makes tasks and doc groups ready again after a duration. Build
+// ArrivalEntry makes tasks and doc sets ready again after a duration. Build
 // one with ReadyIn or ReadyNow, name what it covers with Tasks and Docs, and
 // apply it with Arriving or UpdateArrival:
 //
@@ -47,10 +47,10 @@ type DocArrival struct {
 //		entroq.ReadyNow().Docs(finished...),
 //	)
 type ArrivalEntry struct {
-	in     time.Duration
-	at     time.Time
-	tasks  []*Task
-	groups []*DocGroup
+	in    time.Duration
+	at    time.Time
+	tasks []*Task
+	sets  []*DocSet
 }
 
 // ReadyIn returns an entry making its items ready again d from when the
@@ -84,16 +84,16 @@ func (e *ArrivalEntry) Tasks(tasks ...*Task) *ArrivalEntry {
 	return e
 }
 
-// Docs adds doc groups to the entry, each at the version given. Only a
-// group's name and version matter here.
-func (e *ArrivalEntry) Docs(groups ...*DocGroup) *ArrivalEntry {
-	e.groups = append(e.groups, groups...)
+// Docs adds doc sets to the entry, each at the version given. Only a
+// set's name and version matter here.
+func (e *ArrivalEntry) Docs(sets ...*DocSet) *ArrivalEntry {
+	e.sets = append(e.sets, sets...)
 	return e
 }
 
 // Arriving adds the entries' arrival changes to a modification. Its tasks come
-// back among the response's changed tasks, and its doc groups among its
-// changed groups.
+// back among the response's changed tasks, and its doc sets among its
+// changed sets.
 func Arriving(entries ...*ArrivalEntry) ModifyArg {
 	return func(m *Modification) {
 		now := ProcessTime()
@@ -102,14 +102,14 @@ func Arriving(entries ...*ArrivalEntry) ModifyArg {
 			for _, t := range e.tasks {
 				m.Arrives = append(m.Arrives, &TaskArrival{TaskID: *t.IDVersion(), At: at})
 			}
-			for _, g := range e.groups {
+			for _, g := range e.sets {
 				m.DocArrives = append(m.DocArrives, &DocArrival{DocSetID: *g.ID(), At: at})
 			}
 		}
 	}
 }
 
-// UpdateArrival changes when tasks and doc groups this client holds are ready
+// UpdateArrival changes when tasks and doc sets this client holds are ready
 // again, renewing or releasing them, in one atomic modification. It is Modify
 // with Arriving: every item must be at the version named and not held by
 // anyone else, or nothing changes, and each moves one version and nothing
@@ -118,7 +118,7 @@ func (c *EntroQ) UpdateArrival(ctx context.Context, entries ...*ArrivalEntry) (*
 	var mod Modification
 	Arriving(entries...)(&mod)
 	if len(mod.Arrives) == 0 && len(mod.DocArrives) == 0 {
-		return nil, InvalidArgumentf("update arrival: no tasks or doc groups")
+		return nil, InvalidArgumentf("update arrival: no tasks or doc sets")
 	}
 	return c.Modify(ctx, Arriving(entries...))
 }

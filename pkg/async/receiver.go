@@ -188,7 +188,7 @@ func (r *Receiver) Run(ctx context.Context, inbox string) error {
 }
 
 func (r *Receiver) bootstrapHandler(runCtx context.Context, starts chan<- sessionStart) worker.DoModifyRun[Envelope] {
-	return func(_ context.Context, task *entroq.Task, env Envelope, _ []*entroq.DocGroup) (*worker.Result, error) {
+	return func(_ context.Context, task *entroq.Task, env Envelope, _ []*entroq.DocSet) (*worker.Result, error) {
 		if env.Session == "" {
 			return nil, worker.MoveErrorf("eqlink frame has no session")
 		}
@@ -340,7 +340,7 @@ func (r *Receiver) runRequestWorkers(ctx context.Context, state *receiverSession
 }
 
 func (r *Receiver) requestHandler(state *receiverSessionState, socket *responseSocket) worker.DoModifyRun[Envelope] {
-	return func(ctx context.Context, task *entroq.Task, env Envelope, _ []*entroq.DocGroup) (*worker.Result, error) {
+	return func(ctx context.Context, task *entroq.Task, env Envelope, _ []*entroq.DocSet) (*worker.Result, error) {
 		if env.Session != state.session {
 			return nil, worker.FatalErrorf("request session mismatch: got %q, want %q", env.Session, state.session)
 		}
@@ -491,11 +491,11 @@ func (r *Receiver) runResponseWorkers(ctx context.Context, start sessionStart, s
 }
 
 func (r *Receiver) responseHandler(start sessionStart, state *receiverSessionState, socket *responseSocket, complete func()) worker.DoModifyRun[Response] {
-	return func(ctx context.Context, task *entroq.Task, ack Response, groups []*entroq.DocGroup) (*worker.Result, error) {
-		if len(groups) != 1 || len(groups[0].Docs) != 1 {
-			return nil, worker.FatalErrorf("session %q claimed %d receiver session doc groups, want one holding one doc", ack.Session, len(groups))
+	return func(ctx context.Context, task *entroq.Task, ack Response, sets []*entroq.DocSet) (*worker.Result, error) {
+		if len(sets) != 1 || len(sets[0].Docs) != 1 {
+			return nil, worker.FatalErrorf("session %q claimed %d receiver session doc sets, want one holding one doc", ack.Session, len(sets))
 		}
-		docs := groups[0].Docs
+		docs := sets[0].Docs
 		if !responseDataEmpty(ack) {
 			return nil, worker.FatalErrorf("session %q received response data where an ACK was expected", ack.Session)
 		}

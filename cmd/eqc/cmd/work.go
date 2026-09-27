@@ -215,7 +215,7 @@ func newWorkConfig(cmd *cobra.Command, args []string) (*workConfig, error) {
 	}, nil
 }
 
-func (cfg *workConfig) doWork(ctx context.Context, task *entroq.Task, value json.RawMessage, _ []*entroq.DocGroup) (*worker.Result, error) {
+func (cfg *workConfig) doWork(ctx context.Context, task *entroq.Task, value json.RawMessage, _ []*entroq.DocSet) (*worker.Result, error) {
 	result := cfg.runCommand(ctx, task, value)
 	if result.err != nil {
 		if ctx.Err() != nil {

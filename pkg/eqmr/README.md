@@ -74,14 +74,14 @@ and a worker that dies mid-task simply loses its claim.
 Mappers assign each intermediate key to one of the run's reduce partitions
 by `ShardForKey`, and write one map-output doc per non-empty partition, keyed
 `mapout/<partition>/<split>`. Every split's output has a primary key of its own,
-so concurrent mappers write distinct doc groups and never contend: every write
-to a group moves its version, so mappers sharing one group per partition would
+so concurrent mappers write distinct doc sets and never contend: every write
+to a set moves its version, so mappers sharing one set per partition would
 take turns on it. A reducer reads the whole partition, the key range under
 `mapout/<partition>/`, merges the per-split sorted runs, and reduces each key
 once.
 
 Map-output docs carry **no secondary key**, on purpose. Each is alone in its
-group, the merge is order-independent, and the reducer sorts values itself. The
+set, the merge is order-independent, and the reducer sorts values itself. The
 field is left free rather than filled with something nothing reads, so a later
 job-specific use (MapReduce's classic one being secondary sort) still has it.
 
@@ -216,7 +216,7 @@ tear down a live run, because a claimed doc or task cannot be deleted.
 
 A run whose output should simply expire can instead put its namespace under
 EntroQ's `/gc=` convention. Note the activation timestamp is baked into the
-namespace string at insert time and collects any unclaimed doc group once it
+namespace string at insert time and collects any unclaimed doc set once it
 fires, which is right for output a consumer has a bounded window to read and
 wrong for intermediates.
 

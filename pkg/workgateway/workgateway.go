@@ -548,14 +548,14 @@ func (b *Bridge) takeDocs(ctx context.Context, task *entroq.Task, _ json.RawMess
 // error. It chains the post-commit phases the worker registered: OnSuccess runs
 // the success phase after a good commit, OnDependency the dependency phase when
 // the commit loses a dependency race.
-func (b *Bridge) doWork(ctx context.Context, task *entroq.Task, _ json.RawMessage, groups []*entroq.DocGroup) (*worker.Result, error) {
+func (b *Bridge) doWork(ctx context.Context, task *entroq.Task, _ json.RawMessage, sets []*entroq.DocSet) (*worker.Result, error) {
 	taskPB, err := pbconv.TaskToProto(task)
 	if err != nil {
 		return nil, fmt.Errorf("convert task for doWork: %w", err)
 	}
 	msg := doWorkMsg{Type: msgDoWork, Task: wireTask{taskPB}}
-	for _, g := range groups {
-		wg := wireGroup{Doc: pbconv.DocGroupToProto(g)}
+	for _, g := range sets {
+		wg := wireSet{Doc: pbconv.DocSetToProto(g)}
 		for _, d := range g.Docs {
 			docPB, err := pbconv.DocToProto(d)
 			if err != nil {
@@ -563,7 +563,7 @@ func (b *Bridge) doWork(ctx context.Context, task *entroq.Task, _ json.RawMessag
 			}
 			wg.Docs = append(wg.Docs, wireDoc{docPB})
 		}
-		msg.Groups = append(msg.Groups, wg)
+		msg.Sets = append(msg.Sets, wg)
 		msg.Docs = append(msg.Docs, wg.Docs...)
 	}
 	var res result

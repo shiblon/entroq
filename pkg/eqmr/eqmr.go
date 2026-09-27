@@ -360,7 +360,7 @@ func resultDocKey(p int) string { return fmt.Sprintf("result/%06d", p) }
 
 // mapOutDocKey is the primary key of one split's output for partition p. Each
 // split's output has a key of its own, so concurrent mappers write distinct
-// doc groups and never contend; a reducer reads the partition as the range
+// doc sets and never contend; a reducer reads the partition as the range
 // under mapOutPartition.
 func mapOutDocKey(p int, split string) string {
 	return mapOutPartition(p) + strings.TrimPrefix(split, splitPrefix)
@@ -409,7 +409,7 @@ type docRef struct {
 	ReduceShards int `json:"reduce_shards"`
 }
 
-// asQuery reads the doc group by primary key without claiming it. Reading
+// asQuery reads the doc set by primary key without claiming it. Reading
 // rather than claiming is what allows two workers to process the same unit
 // concurrently; exclusion happens when they commit.
 func (r docRef) asQuery() *entroq.DocQuery {

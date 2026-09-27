@@ -733,8 +733,8 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 		pbResp.ChangedDocs = append(pbResp.ChangedDocs, pd)
 	}
 	// A doc set whose lease changed comes back as a Doc with no ID.
-	for _, g := range resp.ChangedGroups {
-		pbResp.ChangedDocs = append(pbResp.ChangedDocs, pbconv.DocGroupToProto(g))
+	for _, g := range resp.ChangedSets {
+		pbResp.ChangedDocs = append(pbResp.ChangedDocs, pbconv.DocSetToProto(g))
 	}
 	return pbResp, nil
 }
@@ -995,7 +995,7 @@ func (s *QSvc) ClaimDocs(ctx context.Context, req *pb.ClaimDocsRequest) (*pb.Cla
 		}
 		return nil, autoCodeErrorf("claim docs: %w", err)
 	}
-	resp := &pb.ClaimDocsResponse{Sets: []*pb.Doc{pbconv.DocGroupToProto(claimed)}}
+	resp := &pb.ClaimDocsResponse{Sets: []*pb.Doc{pbconv.DocSetToProto(claimed)}}
 	for _, d := range claimed.Docs {
 		pd, err := pbconv.DocToProto(d)
 		if err != nil {

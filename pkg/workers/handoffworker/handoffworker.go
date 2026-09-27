@@ -216,7 +216,7 @@ func Run(ctx context.Context, src *entroq.EntroQ, opts ...Option) error {
 	}
 
 	return worker.New(src,
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, value json.RawMessage, _ []*entroq.DocGroup) (*worker.Result, error) {
+		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, value json.RawMessage, _ []*entroq.DocSet) (*worker.Result, error) {
 			// Deliver to the destination: insert the inbox task and a dedup
 			// tombstone in one atomic Modify. tombstone is a per-invocation local,
 			// so the after-commit closure below is fresh for every task.

@@ -9,7 +9,7 @@
 //	{eq}:qsclaims:{name}    -- ZSET: task IDs claimed at least once, score=claims; the top score is MaxClaims
 //	{eq}:d:{ns}/{id}        -- Hash: doc fields (namespace, id, key_primary, key_secondary, content, created, modified)
 //	{eq}:dnsidx:{ns}        -- ZSET: doc namespace index, member=keyPrimary\x00keySecondary\x00id, score=0
-//	{eq}:dl:{ns}/{key}      -- Hash: doc group lock (version, claimant, at)
+//	{eq}:dl:{ns}/{key}      -- Hash: doc set lock (version, claimant, at)
 //	{eq}:dlidx:{ns}         -- Set: primary keys in a namespace that have a lock
 //	{eq}:dlheld:{ns}        -- ZSET: held primary keys, score=atUnixMilli
 //	{eq}:ns                 -- Set: active namespace names (maintained lazily; GC removes empties)
@@ -87,7 +87,7 @@ func qsclaimsKey(name string) string {
 	return keyPrefix + "qsclaims:" + name
 }
 
-// nsclaimedKey is the per-doc claim set from before doc groups had locks. Only
+// nsclaimedKey is the per-doc claim set from before doc sets had locks. Only
 // migrateDocLocks uses it, to remove it.
 func nsclaimedKey(ns string) string {
 	return keyPrefix + "nsclaimed:" + ns

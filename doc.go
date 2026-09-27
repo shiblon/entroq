@@ -69,10 +69,10 @@ func WithContent(v any) DocOpt {
 // non-zero and in the future, the backend also records the caller as the
 // claimant so the doc can be renewed or released.
 //
-// The arrival time belongs to the doc's group, not the doc: setting it claims
-// or renews the whole group. When one modification sets different future
-// arrival times on docs of one group, the latest wins; if none is in the
-// future, the modification releases the group.
+// The arrival time belongs to the doc's set, not the doc: setting it claims
+// or renews the whole set. When one modification sets different future
+// arrival times on docs of one set, the latest wins; if none is in the
+// future, the modification releases the set.
 func WithDocArrivalTime(t time.Time) DocOpt {
 	return func(o *docOpts) {
 		o.at = t
@@ -323,25 +323,25 @@ func (q *DocQuery) Validate() error {
 	return nil
 }
 
-// DocGroup is a doc group: the docs sharing a primary key in a namespace,
+// DocSet is a doc set: the docs sharing a primary key in a namespace,
 // which have one version, claimant, and arrival time between them, as a task
-// does. ClaimDocs returns the group it claimed, which may have no docs yet;
-// each member carries the group's version and claim.
-type DocGroup struct {
+// does. ClaimDocs returns the set it claimed, which may have no docs yet;
+// each member carries the set's version and claim.
+type DocSet struct {
 	Namespace string
 	Key       string
 	Version   int32
 	Claimant  string
 	At        time.Time
-	NumDocs   int    // how many docs the group has
+	NumDocs   int    // how many docs the set has
 	Docs      []*Doc // its docs
 }
 
-// GroupDocs returns the docs of groups, in order: every member of the first
-// group, then of the next.
-func GroupDocs(groups []*DocGroup) []*Doc {
+// DocsIn returns the docs of sets, in order: every member of the first
+// set, then of the next.
+func DocsIn(sets []*DocSet) []*Doc {
 	var docs []*Doc
-	for _, g := range groups {
+	for _, g := range sets {
 		docs = append(docs, g.Docs...)
 	}
 	return docs

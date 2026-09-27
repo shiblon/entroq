@@ -10,7 +10,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/backend/internal/arrival"
-	"github.com/shiblon/entroq/pkg/backend/internal/docgroup"
+	"github.com/shiblon/entroq/pkg/backend/internal/docset"
 	"github.com/shiblon/entroq/pkg/backend/internal/validate"
 )
 
@@ -104,12 +104,12 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 			watchKeys = append(watchKeys, docKey(d.Namespace, d.ID))
 		}
 	}
-	// Every write to a doc group writes its lock, so watching the lock
-	// serializes writers of a group. An insert's group is known now; the other
-	// operations' groups come from their stored docs, watched once read.
-	insertGroups := make(map[docgroup.Group]bool)
+	// Every write to a doc set writes its lock, so watching the lock
+	// serializes writers of a set. An insert's set is known now; the other
+	// operations' sets come from their stored docs, watched once read.
+	insertGroups := make(map[docset.Set]bool)
 	for _, d := range mod.DocInserts {
-		g := docgroup.Group{Namespace: d.Namespace, Key: d.Key}
+		g := docset.Set{Namespace: d.Namespace, Key: d.Key}
 		if !insertGroups[g] {
 			insertGroups[g] = true
 			watchKeys = append(watchKeys, lockKey(g))
@@ -275,16 +275,16 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 				depErr.Inserts = append(depErr.Inserts, &entroq.TaskID{ID: t.ID, Version: st.fields.Version})
 			}
 		}
-		// Doc groups follow the rules in docgroup, against each group's lock.
+		// Doc sets follow the rules in docset, against each set's lock.
 		member := func(ns, id string) *entroq.Doc {
 			if st := docStates[ns+"/"+id]; st != nil && st.found {
 				return st.fields.toDoc()
 			}
 			return nil
 		}
-		groups := docgroup.Groups(mod, member)
+		sets := docset.Sets(mod, member)
 		var storedLockKeys []string
-		for _, g := range groups {
+		for _, g := range sets {
 			if !insertGroups[g] {
 				storedLockKeys = append(storedLockKeys, lockKey(g))
 			}
@@ -294,25 +294,25 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 				return fmt.Errorf("watch doc locks: %w", err)
 			}
 		}
-		locks, err := readLocks(ctx, tx, groups)
+		locks, err := readLocks(ctx, tx, sets)
 		if err != nil {
 			return err
 		}
-		docPlan := docgroup.Evaluate(mod, now, member,
-			func(g docgroup.Group) docgroup.Lock { return locks[g] },
+		docPlan := docset.Evaluate(mod, now, member,
+			func(g docset.Set) docset.Lock { return locks[g] },
 		)
 		if merged := depErr.Merge(docPlan.Err); merged != nil {
 			depErr = merged
 		}
-		// withLock gives a written member its group's new lock, the only
+		// withLock gives a written member its set's new lock, the only
 		// version and claim a member has.
 		withLock := func(f *docFields) *entroq.Doc {
-			g := docgroup.Group{Namespace: f.Namespace, Key: f.KeyPrimary}
+			g := docset.Set{Namespace: f.Namespace, Key: f.KeyPrimary}
 			l, ok := docPlan.Locks[g]
 			if !ok {
 				l = locks[g]
 			}
-			return docgroup.Overlay(f.toDoc(), l)
+			return docset.Overlay(f.toDoc(), l)
 		}
 		if depErr.HasAny() {
 			return depErr
@@ -480,7 +480,7 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 			for g, l := range docPlan.Locks {
 				writeLock(ctx, pipe, g, l, now)
 			}
-			resp.ChangedGroups = docPlan.Arrived
+			resp.ChangedSets = docPlan.Arrived
 
 			return nil
 		})

@@ -66,7 +66,7 @@ message, which a worker reads as protocol 0. The hello is sent even when the
 registration is then refused, so a worker can tell a registration it got wrong
 from a gateway it cannot talk to.
 
-Protocol 1 added the hello, doc groups in `doWork`, the `error` outcome, and
+Protocol 1 added the hello, doc sets in `doWork`, the `error` outcome, and
 `abort`.
 
 ## Phases
@@ -80,7 +80,7 @@ gateway -> hello {protocol, version}  # once, first
   (gateway claims a task and begins renewing it)
 gateway -> takeDocs {task}            # only if registered takeDocs
 client  -> docs {claims: [...]}
-gateway -> doWork {task, docs, groups}
+gateway -> doWork {task, docs, sets}
 gateway -> abort {id, version}        # only if the claim is lost mid-task
 client  -> result {outcome, ack?, modification?}
   (gateway stops renewal, freezes the stable version, commits atomically)
@@ -135,11 +135,11 @@ A worker that handles one task at a time without reading meanwhile sees the
 `abort` only after it has answered, when it reads the next message. It ignores an
 `abort` that names a task it is not working on.
 
-### Doc groups in `doWork`
+### Doc sets in `doWork`
 
-Each claim in `docs` takes a doc group: the docs sharing a primary key in a
+Each claim in `docs` takes a doc set: the docs sharing a primary key in a
 namespace, which have one version, claimant, and arrival time between them.
-`groups` carries each claimed group, in the order the gateway claimed them
+`sets` carries each claimed set, in the order the gateway claimed them
 (sorted by namespace, then key), as the protojson of the `Doc` standing for
 the set (no `id`, `secondaryKey`, or `content`) with its docs beside it:
 
@@ -148,8 +148,8 @@ the set (no `id`, `secondaryKey`, or `content`) with its docs beside it:
  "len": 1, "docs": [{"namespace": "ns", "id": "a", "key": "k", ...}]}
 ```
 
-`len` counts the group's docs. A group claimed with no docs appears with
-`"docs": []`, still reporting its version and claim. `docs` is every group's
+`len` counts the set's docs. A set claimed with no docs appears with
+`"docs": []`, still reporting its version and claim. `docs` is every set's
 docs in one list, as before protocol 1. As protojson, a zero is omitted, so
 read a missing `version` or `len` as 0.
 

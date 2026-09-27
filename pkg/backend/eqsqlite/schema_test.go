@@ -105,7 +105,7 @@ func checkSchemaRejects(ctx context.Context, t *testing.T, path string) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	// Only a CHECK should reject these rows, not a doc's missing group lock.
+	// Only a CHECK should reject these rows, not a doc's missing set lock.
 	db.SetMaxOpenConns(1)
 	if _, err := db.ExecContext(ctx, "PRAGMA foreign_keys = OFF"); err != nil {
 		t.Fatal(err)
@@ -189,7 +189,7 @@ func TestMigrateV1ToV2(t *testing.T) {
 	if err != nil || len(docs) != 1 {
 		t.Fatalf("docs after migration: %v, %v", docs, err)
 	}
-	// Migrating on to version 3 gives the doc's group a lock one version past
+	// Migrating on to version 3 gives the doc's set a lock one version past
 	// its highest member.
 	if got := docs[0]; got.ID != "doc-1" || got.Version != 5 || got.Key != "k" || got.SecondaryKey != "s" {
 		t.Fatalf("migrated doc = %#v", got)
@@ -225,7 +225,7 @@ func TestMigrateV1ToV2RollsBackOversizedRows(t *testing.T) {
 
 // checkVersion3Layout fails unless the database at path has the version 3
 // doc layout: no per-doc version, claimant, or arrival time, every doc tied to
-// its group's lock, and this build's schema digest.
+// its set's lock, and this build's schema digest.
 func checkVersion3Layout(ctx context.Context, t *testing.T, path string) {
 	t.Helper()
 	db, err := sql.Open("sqlite", sqliteDSN(path, 5*time.Second, false))
@@ -241,7 +241,7 @@ func checkVersion3Layout(ctx context.Context, t *testing.T, path string) {
 		t.Errorf("docs keep %d of their per-doc version, claimant, and at_ms columns", dropped)
 	}
 	if _, err := db.ExecContext(ctx, "INSERT INTO docs VALUES ('ns', 'orphan', 'nolock', '', NULL, 0, 0)"); err == nil {
-		t.Error("inserted a doc whose group has no lock")
+		t.Error("inserted a doc whose set has no lock")
 	}
 	var digest string
 	if err := db.QueryRowContext(ctx, "SELECT schema_digest FROM entroq_meta WHERE id = 1").Scan(&digest); err != nil {
@@ -253,8 +253,8 @@ func checkVersion3Layout(ctx context.Context, t *testing.T, path string) {
 }
 
 // TestMigrateV2ToV3 checks that a version 2 database, where each doc carried
-// its own version and claim, gains one lock per doc group, one version past
-// the group's highest member, with any claim released, and loses the per-doc
+// its own version and claim, gains one lock per doc set, one version past
+// the set's highest member, with any claim released, and loses the per-doc
 // columns.
 func TestMigrateV2ToV3(t *testing.T) {
 	ctx := context.Background()
@@ -285,7 +285,7 @@ func TestMigrateV2ToV3(t *testing.T) {
 			t.Errorf("migrated doc %q: want version %d and no claimant, got version %d, claimant %q", d.ID, want[d.ID], d.Version, d.Claimant)
 		}
 	}
-	// The migrated group is writable at its lock's version.
+	// The migrated set is writable at its lock's version.
 	if _, err := client.Modify(ctx, docs[0].Change(entroq.WithContent("after"))); err != nil {
 		t.Errorf("change after migration: %v", err)
 	}

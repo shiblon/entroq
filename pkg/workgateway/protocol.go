@@ -57,8 +57,8 @@ import (
 //	  (gateway claims a task and begins renewing it)
 //	gateway -> takeDocs {task}            # only if the worker registered takeDocs
 //	client  -> docs {claims: [...]}
-//	  (gateway claims the doc groups, sorted, and passes them along)
-//	gateway -> doWork {task, docs, groups}
+//	  (gateway claims the doc sets, sorted, and passes them along)
+//	gateway -> doWork {task, docs, sets}
 //	gateway -> abort {id, version}        # only if the claim is lost mid-task
 //	client  -> result {outcome, ack?, modification?, ...}
 //	  (gateway stops renewal, freezes the stable version, and commits atomically)
@@ -92,7 +92,7 @@ import (
 // hello. It advances when the protocol changes in a way a client must know
 // about; a gateway's release version is only for people to read.
 //
-// Protocol 1 added the hello itself, doc groups in doWork, the "error"
+// Protocol 1 added the hello itself, doc sets in doWork, the "error"
 // outcome, and abort.
 const Protocol = 1
 
@@ -219,29 +219,29 @@ type docClaim struct {
 	Key       string `json:"key"`
 }
 
-// doWorkMsg carries the task and any acquired doc groups to the client for the
+// doWorkMsg carries the task and any acquired doc sets to the client for the
 // actual work. Task is the identical task a native DoWork would receive, as
 // protojson, so a wire worker sees exactly what an in-process one does, down to
-// fields like attempt a reaper or authorizer might use. Groups are the claimed
-// doc groups in claim order, each with its docs, including groups with none;
-// Docs is every group's docs in one list, as before protocol 1.
+// fields like attempt a reaper or authorizer might use. Sets are the claimed
+// doc sets in claim order, each with its docs, including sets with none;
+// Docs is every set's docs in one list, as before protocol 1.
 type doWorkMsg struct {
-	Type   string      `json:"type"`
-	Task   wireTask    `json:"task"`
-	Docs   []wireDoc   `json:"docs,omitempty"`
-	Groups []wireGroup `json:"groups,omitempty"`
+	Type string    `json:"type"`
+	Task wireTask  `json:"task"`
+	Docs []wireDoc `json:"docs,omitempty"`
+	Sets []wireSet `json:"sets,omitempty"`
 }
 
-// wireGroup is a claimed doc set on the wire: the protojson of the pb.Doc
+// wireSet is a claimed doc set on the wire: the protojson of the pb.Doc
 // standing for the set (its lock and doc count, no ID or content), with its
 // docs beside those fields as "docs".
-type wireGroup struct {
+type wireSet struct {
 	*pb.Doc
 	Docs []wireDoc
 }
 
-// MarshalJSON renders the group's lock as protojson and adds its docs.
-func (w wireGroup) MarshalJSON() ([]byte, error) {
+// MarshalJSON renders the set's lock as protojson and adds its docs.
+func (w wireSet) MarshalJSON() ([]byte, error) {
 	b, err := protojson.Marshal(w.Doc)
 	if err != nil {
 		return nil, err
@@ -258,8 +258,8 @@ func (w wireGroup) MarshalJSON() ([]byte, error) {
 	return json.Marshal(fields)
 }
 
-// UnmarshalJSON reads a group's protojson lock and its docs.
-func (w *wireGroup) UnmarshalJSON(b []byte) error {
+// UnmarshalJSON reads a set's protojson lock and its docs.
+func (w *wireSet) UnmarshalJSON(b []byte) error {
 	fields := map[string]json.RawMessage{}
 	if err := json.Unmarshal(b, &fields); err != nil {
 		return err

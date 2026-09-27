@@ -6,7 +6,7 @@ import (
 	"log"
 
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/pkg/backend/internal/docgroup"
+	"github.com/shiblon/entroq/pkg/backend/internal/docset"
 	"github.com/shiblon/entroq/pkg/backend/internal/validate"
 )
 
@@ -14,7 +14,7 @@ import (
 // those docs are returned (key range is ignored and Limit does not apply).
 // Otherwise, docs are filtered by optional key range and subject to Limit.
 // Results are returned sorted by (key_primary, key_secondary). Each doc carries
-// its group's version and claim.
+// its set's version and claim.
 func (m *EQMem) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, error) {
 	if err := rq.Validate(); err != nil {
 		return nil, fmt.Errorf("eqmem docs: %w", err)
@@ -27,8 +27,8 @@ func (m *EQMem) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, e
 	}
 	nss := nls[0].docs
 
-	result := func(d *entroq.Doc, l docgroup.Lock) *entroq.Doc {
-		res := docgroup.Overlay(d, l)
+	result := func(d *entroq.Doc, l docset.Lock) *entroq.Doc {
+		res := docset.Overlay(d, l)
 		if rq.OmitValues {
 			res.Content = nil
 		}
@@ -90,11 +90,11 @@ func (m *EQMem) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, e
 	return found, nil
 }
 
-// ClaimDocs claims the group of docs sharing the given primary key in the
-// namespace and returns its members, which may be none: a group can be claimed
+// ClaimDocs claims the set of docs sharing the given primary key in the
+// namespace and returns its members, which may be none: a set can be claimed
 // before it has docs. It fails with a DependencyError listing the members while
-// someone else holds the group.
-func (m *EQMem) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) (*entroq.DocGroup, error) {
+// someone else holds the set.
+func (m *EQMem) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) (*entroq.DocSet, error) {
 	if err := validate.DocClaim(cq); err != nil {
 		return nil, fmt.Errorf("eqmem claim docs: %w", err)
 	}
@@ -105,15 +105,15 @@ func (m *EQMem) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) (*entroq.Doc
 	now, _ := m.Time(ctx)
 	members := nss.Members(cq.Key)
 	current := nss.Lock(cq.Key)
-	claimed, ok := docgroup.Claim(current, cq.Claimant, now, cq.Duration)
+	claimed, ok := docset.Claim(current, cq.Claimant, now, cq.Duration)
 	if !ok {
-		return nil, docgroup.HeldError(docgroup.Group{Namespace: cq.Namespace, Key: cq.Key}, current, members)
+		return nil, docset.HeldError(docset.Set{Namespace: cq.Namespace, Key: cq.Key}, current, members)
 	}
 
 	nss.SetLock(cq.Key, claimed)
-	if err := m.journalLocks(map[docgroup.Group]docgroup.Lock{{Namespace: cq.Namespace, Key: cq.Key}: claimed}); err != nil {
+	if err := m.journalLocks(map[docset.Set]docset.Lock{{Namespace: cq.Namespace, Key: cq.Key}: claimed}); err != nil {
 		log.Fatalf("Inconsistent internal state: doc claim succeeded but could not be journaled: %v", err)
 	}
 
-	return docgroup.Claimed(docgroup.Group{Namespace: cq.Namespace, Key: cq.Key}, claimed, members), nil
+	return docset.Claimed(docset.Set{Namespace: cq.Namespace, Key: cq.Key}, claimed, members), nil
 }

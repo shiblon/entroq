@@ -25,13 +25,13 @@ func (h *countingHandler) TakeDocs(context.Context, *entroq.Task, string) ([]*en
 	return nil, nil
 }
 
-func (h *countingHandler) DoWork(ctx context.Context, task *entroq.Task, _ string, _ []*entroq.DocGroup) error {
+func (h *countingHandler) DoWork(ctx context.Context, task *entroq.Task, _ string, _ []*entroq.DocSet) error {
 	h.uses++
 	h.observed <- h.uses
 	return nil
 }
 
-func (h *countingHandler) Finish(ctx context.Context, mod Modifier, task *entroq.Task, _ string, _ []*entroq.DocGroup) error {
+func (h *countingHandler) Finish(ctx context.Context, mod Modifier, task *entroq.Task, _ string, _ []*entroq.DocSet) error {
 	_, err := mod.Modify(ctx, task.Delete())
 	return err
 }

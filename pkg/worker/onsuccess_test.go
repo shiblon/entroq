@@ -34,7 +34,7 @@ func TestOnSuccess_RunsOnSuccess(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		w := New(client,
-			WithDoModify(func(ctx context.Context, task *entroq.Task, _ string, _ []*entroq.DocGroup) (*Result, error) {
+			WithDoModify(func(ctx context.Context, task *entroq.Task, _ string, _ []*entroq.DocSet) (*Result, error) {
 				return Modify(task.Delete()).OnSuccess(func(context.Context) error {
 					ran <- struct{}{}
 					return nil
@@ -79,7 +79,7 @@ func TestOnSuccess_FatalStopsWorker(t *testing.T) {
 	}
 
 	w := New(client,
-		WithDoModify(func(ctx context.Context, task *entroq.Task, _ string, _ []*entroq.DocGroup) (*Result, error) {
+		WithDoModify(func(ctx context.Context, task *entroq.Task, _ string, _ []*entroq.DocSet) (*Result, error) {
 			return Modify(task.Delete()).OnSuccess(func(context.Context) error {
 				return FatalErrorf("stop the worker")
 			}), nil
@@ -125,7 +125,7 @@ func TestOnSuccess_SkippedOnError(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		w := New(client,
-			WithDoModify(func(ctx context.Context, task *entroq.Task, _ string, _ []*entroq.DocGroup) (*Result, error) {
+			WithDoModify(func(ctx context.Context, task *entroq.Task, _ string, _ []*entroq.DocSet) (*Result, error) {
 				// A hook is attached, but the handler errors: OnSuccess must not run.
 				return Modify(task.Delete()).OnSuccess(func(context.Context) error {
 					ran <- struct{}{}

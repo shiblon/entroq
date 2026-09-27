@@ -496,14 +496,14 @@ func depErrorFromStat(stat *status.Status) error {
 
 		// Doc set dependency: a DocID naming a set by key failed as a whole.
 		if key := detail.GetDocId().GetKey(); key != "" {
-			g := &entroq.DocGroup{Namespace: detail.DocId.GetNamespace(), Key: key, Version: detail.DocId.GetVersion()}
+			g := &entroq.DocSet{Namespace: detail.DocId.GetNamespace(), Key: key, Version: detail.DocId.GetVersion()}
 			switch detail.Type {
 			case pb.ActionType_CLAIM:
-				depErr.GroupClaims = append(depErr.GroupClaims, g)
+				depErr.SetClaims = append(depErr.SetClaims, g)
 			case pb.ActionType_CHANGE:
 				depErr.DocArrives = append(depErr.DocArrives, g)
 			default:
-				return fmt.Errorf("grpc doc group dependency unknown type %v in detail %v", detail.Type, detail)
+				return fmt.Errorf("grpc doc set dependency unknown type %v in detail %v", detail.Type, detail)
 			}
 			continue
 		}
@@ -689,7 +689,7 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (*entroq
 	for _, d := range resp.GetChangedDocs() {
 		// A doc set whose lease changed comes back as a Doc with no ID.
 		if pbconv.IsDocSet(d) {
-			mResp.ChangedGroups = append(mResp.ChangedGroups, pbconv.DocGroupFromProto(d, nil))
+			mResp.ChangedSets = append(mResp.ChangedSets, pbconv.DocSetFromProto(d, nil))
 			continue
 		}
 		mResp.ChangedDocs = append(mResp.ChangedDocs, pbconv.MustDocFromProto(d))

@@ -29,7 +29,7 @@ func TestBackendContract(t *testing.T) {
 		{"ModifyRejectsDuplicateIDs", eqtest.ModifyRejectsDuplicateIDs},
 		{"ModifyRespectsTaskClaims", eqtest.ModifyRespectsTaskClaims},
 		{"TasksWithIDStaysInQueue", eqtest.TasksWithIDStaysInQueue},
-		{"DocGroups", eqtest.DocGroups},
+		{"DocSets", eqtest.DocSets},
 		{"UpdateArrival", eqtest.UpdateArrival},
 		{"TaskChangeFutureArrival", eqtest.TaskChangeFutureArrival},
 		{"TaskChangeFarPastArrivalNormalized", eqtest.TaskChangeFarPastArrivalNormalized},
@@ -354,7 +354,7 @@ func TestGCLoopCollects(t *testing.T) {
 	eqtest.GCCollectsInLoop(ctx, t, client, "sqlitetest")
 }
 
-func TestGCDocGroups(t *testing.T) {
+func TestGCDocSets(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	b, err := Open(ctx, filepath.Join(t.TempDir(), "entroq.sqlite"))
@@ -362,7 +362,7 @@ func TestGCDocGroups(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer b.Close()
-	eqtest.GCDocGroups(ctx, t, b, b.collectDocsOnce, "sqlitetest")
+	eqtest.GCDocSets(ctx, t, b, b.collectDocsOnce, "sqlitetest")
 }
 
 func TestBackendRejectsInvalidRequests(t *testing.T) {

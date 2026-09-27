@@ -141,8 +141,8 @@ func TestTasksWithIDStaysInQueue(t *testing.T) {
 	RunQTest(t, eqtest.TasksWithIDStaysInQueue)
 }
 
-func TestDocGroups(t *testing.T) {
-	RunQTest(t, eqtest.DocGroups)
+func TestDocSets(t *testing.T) {
+	RunQTest(t, eqtest.DocSets)
 }
 
 func TestUpdateArrival(t *testing.T) {

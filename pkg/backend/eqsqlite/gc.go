@@ -50,9 +50,9 @@ func (b *EQSQLite) collectDocsOnce(ctx context.Context, batch int) (int, error) 
 	return backendgc.CollectDocsOnce(ctx, b, batch, b.gcMetrics)
 }
 
-// collectLocksOnce removes the locks of up to batch doc groups that have no
-// docs and are not held, so claimed-then-abandoned groups do not accumulate.
-// Writes are serialized, so no insert can join a group between the check and
+// collectLocksOnce removes the locks of up to batch doc sets that have no
+// docs and are not held, so claimed-then-abandoned sets do not accumulate.
+// Writes are serialized, so no insert can join a set between the check and
 // the delete.
 func (b *EQSQLite) collectLocksOnce(ctx context.Context, batch int) (int, error) {
 	value, err := b.write(ctx, func(ctx context.Context, tx *sql.Tx) (any, error) {

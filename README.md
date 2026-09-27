@@ -170,7 +170,7 @@ svc, _ := entroq.New(ctx, eqgrpc.Opener("localhost:37706", eqgrpc.WithInsecure()
 defer svc.Close()
 
 w := worker.New(svc,
-    worker.WithDoModify(func(ctx context.Context, task *entroq.Task, val json.RawMessage, _ []*entroq.DocGroup) (*worker.Result, error) {
+    worker.WithDoModify(func(ctx context.Context, task *entroq.Task, val json.RawMessage, _ []*entroq.DocSet) (*worker.Result, error) {
         log.Printf("Processing: %s", string(task.Value))
         return worker.Modify(task.Delete()), nil // finish by deleting
     }),
@@ -260,8 +260,8 @@ to read or coordinate around.
 
 Doc namespaces can opt into the same built-in garbage collection as task queues
 by placing `/gc=<timestamp>` in the namespace. Once active, GC removes each
-primary-key group atomically, and only while every member of that group is
-unclaimed. A claimed group does not prevent collection of other groups in the
+primary-key set atomically, and only while every member of that set is
+unclaimed. A claimed set does not prevent collection of other sets in the
 same namespace. Malformed `gc=` values are reported and never collected.
 
 Docs and tasks share the same `Modify` call, so you can atomically insert a

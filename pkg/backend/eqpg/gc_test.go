@@ -111,7 +111,7 @@ func TestGCLoopCollects(t *testing.T) {
 	eqtest.GCCollectsInLoop(ctx, t, client, "/test/gcloop")
 }
 
-func TestGCDocGroups(t *testing.T) {
+func TestGCDocSets(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	b, err := Open(ctx, pgHostPort,
@@ -121,7 +121,7 @@ func TestGCDocGroups(t *testing.T) {
 		t.Fatalf("open backend: %v", err)
 	}
 	defer b.Close()
-	eqtest.GCDocGroups(ctx, t, b, b.collectDocsOnce, "/pgtest/"+entroq.GenHex16())
+	eqtest.GCDocSets(ctx, t, b, b.collectDocsOnce, "/pgtest/"+entroq.GenHex16())
 }
 
 // TestGCCollectOnce drives the shared claim/delete collector directly: due gc=
@@ -201,8 +201,8 @@ func TestGCCollectOnce(t *testing.T) {
 }
 
 // TestCollectLocksSkipsGroupBeingInserted holds an insert into an empty,
-// unheld group open while lock collection runs. The insert's lock on the row
-// keeps collection from deleting the lock of a group that is about to have a
+// unheld set open while lock collection runs. The insert's lock on the row
+// keeps collection from deleting the lock of a set that is about to have a
 // member.
 func TestCollectLocksSkipsGroupBeingInserted(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -225,7 +225,7 @@ func TestCollectLocksSkipsGroupBeingInserted(t *testing.T) {
 		return n == 1
 	}
 
-	// An empty group whose claim has lapsed: idle, so collectable.
+	// An empty set whose claim has lapsed: idle, so collectable.
 	if _, err := b.ClaimDocs(ctx, &entroq.DocClaim{Namespace: ns, Key: "k", Claimant: "me", Duration: time.Millisecond}); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -244,7 +244,7 @@ func TestCollectLocksSkipsGroupBeingInserted(t *testing.T) {
 	// Collection may wait for the insert, as a one-statement delete does, so
 	// run it alongside and commit the insert while it is going. A delete that
 	// waits then rechecks only the lock row, which the insert did not change,
-	// and removes the lock of a group that now has a member.
+	// and removes the lock of a set that now has a member.
 	collected := make(chan error, 1)
 	go func() {
 		_, err := b.collectLocksOnce(ctx, 1000)
@@ -258,12 +258,12 @@ func TestCollectLocksSkipsGroupBeingInserted(t *testing.T) {
 		t.Fatalf("Collect during insert: %v", err)
 	}
 	if !lockExists() {
-		t.Fatal("Collection deleted the lock of a group with an insert in progress")
+		t.Fatal("Collection deleted the lock of a set with an insert in progress")
 	}
 	if _, err := b.collectLocksOnce(ctx, 1000); err != nil {
 		t.Fatalf("Collect after insert: %v", err)
 	}
 	if !lockExists() {
-		t.Error("Collection deleted the lock of a group with a member")
+		t.Error("Collection deleted the lock of a set with a member")
 	}
 }

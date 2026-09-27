@@ -32,8 +32,8 @@ func (e *EQRedis) NamespaceStats(ctx context.Context, qq *entroq.MatchQuery) (ma
 		return map[string]*entroq.NamespaceStat{}, nil
 	}
 
-	// A doc is claimed while its group is held: count the members of each
-	// namespace's held groups.
+	// A doc is claimed while its set is held: count the members of each
+	// namespace's held sets.
 	pipe := e.client.Pipeline()
 	zcardCmds := make(map[string]*redis.IntCmd, len(names))
 	heldCmds := make(map[string]*redis.StringSliceCmd, len(names))
@@ -51,7 +51,7 @@ func (e *EQRedis) NamespaceStats(ctx context.Context, qq *entroq.MatchQuery) (ma
 	claimedCmds := make(map[string][]*redis.IntCmd, len(names))
 	for _, ns := range names {
 		for _, key := range heldCmds[ns].Val() {
-			min, max := groupMembersRange(key)
+			min, max := setMembersRange(key)
 			claimedCmds[ns] = append(claimedCmds[ns], pipe.ZLexCount(ctx, docNSIndexKey(ns), min, max))
 		}
 	}

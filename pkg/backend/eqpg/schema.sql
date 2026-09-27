@@ -52,10 +52,10 @@ CREATE TABLE IF NOT EXISTS entroq.docs (
     PRIMARY KEY (namespace, id)
 );
 
--- Each doc group (the docs sharing a primary key in a namespace) has one lock
+-- Each doc set (the docs sharing a primary key in a namespace) has one lock
 -- holding the only version, claimant, and arrival time its members have, and
--- how many there are. A group can be claimed before it has docs, so locks are
--- kept apart from docs, and every doc's group has a lock (docs_group_fk, added
+-- how many there are. A set can be claimed before it has docs, so locks are
+-- kept apart from docs, and every doc's set has a lock (docs_group_fk, added
 -- below).
 CREATE TABLE IF NOT EXISTS entroq.doc_locks (
     namespace   TEXT COLLATE "C"         NOT NULL CHECK (octet_length(namespace) <= 1024),
@@ -93,9 +93,9 @@ DROP INDEX IF EXISTS entroq.idx_docs_keys;
 CREATE INDEX IF NOT EXISTS idx_docs_order ON entroq.docs (namespace, key_primary, key_secondary, id);
 -- Covers NamespaceStats: GROUP BY namespace with FILTER on at/claimant, index-only.
 DROP INDEX IF EXISTS entroq.idx_docs_ns_stats;
--- Held groups, for counting claimed docs without reading every doc.
+-- Held sets, for counting claimed docs without reading every doc.
 CREATE INDEX IF NOT EXISTS idx_doc_locks_held ON entroq.doc_locks (namespace, at) WHERE claimant <> '';
--- Empty groups, the only ones lock collection considers.
+-- Empty sets, the only ones lock collection considers.
 CREATE INDEX IF NOT EXISTS idx_doc_locks_empty ON entroq.doc_locks (namespace, key_primary) WHERE num_docs = 0;
 
 -- Bucket index: supports range-based bucket selection in _try_claim_bucket.
@@ -531,7 +531,7 @@ DROP FUNCTION IF EXISTS entroq._modify_docs(
     text[], text[], text[], text[], text[],
     text[], text[], integer[], text[], text[], text[], timestamptz[]
 );
--- Doc operations run in Go, by the doc group rules every backend shares, inside
+-- Doc operations run in Go, by the doc set rules every backend shares, inside
 -- the same transaction as the task operations.
 DROP FUNCTION IF EXISTS entroq._modify_docs(
     text, text[], text[], integer[], text[], text[], integer[],
@@ -549,7 +549,7 @@ DROP FUNCTION IF EXISTS entroq.like_prefix(text);
 -- queries entroq.docs directly.
 DROP FUNCTION IF EXISTS entroq.docs(text, text, text, integer, boolean);
 
--- Doc claims run in Go, on the group's lock in entroq.doc_locks.
+-- Doc claims run in Go, on the set's lock in entroq.doc_locks.
 DROP FUNCTION IF EXISTS entroq._claim_docs(text, text, interval, text);
 
 -- Remove the retired raw-SQL claim wrapper. The locking implementation
@@ -661,11 +661,11 @@ DROP FUNCTION IF EXISTS entroq.gc_due(text);
 --       notification state, and the byAt index are dropped.
 --   (2) _modify_arrays refuses a change or delete of a task another claimant
 --       holds.
---   (3) Doc groups: a doc_locks row per group holds the group's version,
---       claimant, and arrival time. Existing groups get a lock one version
+--   (3) Doc sets: a doc_locks row per set holds the set's version,
+--       claimant, and arrival time. Existing sets get a lock one version
 --       past their highest member; the docs columns that held them are
 --       dropped, with their stats index; docs_group_fk ties each doc to its
---       group's lock. _modify_docs and _claim_docs are dropped: doc rules run
+--       set's lock. _modify_docs and _claim_docs are dropped: doc rules run
 --       in the Go backend inside the modify transaction.
 --   (4) idx_docs_keys becomes idx_docs_order, adding id, so doc listings have
 --       a total order.
@@ -806,9 +806,9 @@ BEGIN
 END $$;
 
 -- Migration: docs move their version, claimant, and arrival time to their
--- group's lock (1.13.0), which also counts them. Every group gets a lock one
+-- set's lock (1.13.0), which also counts them. Every set gets a lock one
 -- version past its highest member, so no version read before the upgrade can
--- match one written after it, even once the group has moved on: resetting to 0
+-- match one written after it, even once the set has moved on: resetting to 0
 -- would let a read held across the upgrade, such as a config doc's depend,
 -- succeed again after a few changes. Claims held at upgrade time are released.
 -- Then the docs columns go.
@@ -826,8 +826,8 @@ BEGIN
     END IF;
 END $$;
 
--- Every doc belongs to a group with a lock: inserts create the lock first,
--- and lock collection cannot remove the lock of a group that still has docs.
+-- Every doc belongs to a set with a lock: inserts create the lock first,
+-- and lock collection cannot remove the lock of a set that still has docs.
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint

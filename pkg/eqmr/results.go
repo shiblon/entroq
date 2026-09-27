@@ -103,7 +103,7 @@ func mergeKVRuns(runs [][]*KV) []*KV {
 //
 // For output that should simply expire, put the run's namespace under EntroQ's
 // /gc= convention. Activation is fixed in the namespace string when documents
-// are inserted, and collects any unclaimed doc group once it fires, so it suits
+// are inserted, and collects any unclaimed doc set once it fires, so it suits
 // output with a bounded reading window.
 func (c *Controller) Cleanup(ctx context.Context) error {
 	const batch = 250

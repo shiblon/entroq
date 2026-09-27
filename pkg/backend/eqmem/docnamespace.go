@@ -5,7 +5,7 @@ import (
 
 	"github.com/google/btree"
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/pkg/backend/internal/docgroup"
+	"github.com/shiblon/entroq/pkg/backend/internal/docset"
 )
 
 // docKeyEntry is the btree item type, ordered by (Key, Secondary, ID).
@@ -43,16 +43,16 @@ type docNamespace struct {
 	name  string
 	byID  map[string]*entroq.Doc
 	byKey *btree.BTreeG[docKeyEntry]
-	// locks holds each doc group's lock, by primary key. A group can have a
-	// lock and no docs (a claimed empty group), so locks is kept apart from
+	// locks holds each doc set's lock, by primary key. A set can have a
+	// lock and no docs (a claimed empty set), so locks is kept apart from
 	// the docs rather than on them.
 	locks *btree.BTreeG[lockEntry]
 }
 
-// lockEntry is a doc group's lock in a namespace.
+// lockEntry is a doc set's lock in a namespace.
 type lockEntry struct {
 	Key  string
-	Lock docgroup.Lock
+	Lock docset.Lock
 }
 
 func lockKeyLess(a, b lockEntry) bool {
@@ -100,7 +100,7 @@ func (s *docNamespace) Update(id string, f func(*entroq.Doc) *entroq.Doc) error 
 }
 
 // Len counts the namespace's docs and locks, so a namespace holding only a
-// claimed empty group is kept.
+// claimed empty set is kept.
 func (s *docNamespace) Len() int {
 	if s == nil {
 		return 0
@@ -108,32 +108,32 @@ func (s *docNamespace) Len() int {
 	return len(s.byID) + s.locks.Len()
 }
 
-// Lock returns the lock of the group with the given primary key, or
-// docgroup.Absent.
-func (s *docNamespace) Lock(key string) docgroup.Lock {
+// Lock returns the lock of the set with the given primary key, or
+// docset.Absent.
+func (s *docNamespace) Lock(key string) docset.Lock {
 	return lockIn(s.locks, key)
 }
 
-// lockIn returns key's lock in locks, or docgroup.Absent. It works on a
+// lockIn returns key's lock in locks, or docset.Absent. It works on a
 // snapshot as well as on the live tree.
-func lockIn(locks *btree.BTreeG[lockEntry], key string) docgroup.Lock {
+func lockIn(locks *btree.BTreeG[lockEntry], key string) docset.Lock {
 	if e, ok := locks.Get(lockEntry{Key: key}); ok {
 		return e.Lock
 	}
-	return docgroup.Absent
+	return docset.Absent
 }
 
-// SetLock records the lock of the group with the given primary key.
-func (s *docNamespace) SetLock(key string, l docgroup.Lock) {
+// SetLock records the lock of the set with the given primary key.
+func (s *docNamespace) SetLock(key string, l docset.Lock) {
 	s.locks.ReplaceOrInsert(lockEntry{Key: key, Lock: l})
 }
 
-// DeleteLock removes the lock of the group with the given primary key.
+// DeleteLock removes the lock of the set with the given primary key.
 func (s *docNamespace) DeleteLock(key string) {
 	s.locks.Delete(lockEntry{Key: key})
 }
 
-// Members returns the docs of the group with the given primary key, in
+// Members returns the docs of the set with the given primary key, in
 // secondary key order.
 func (s *docNamespace) Members(key string) []*entroq.Doc {
 	var docs []*entroq.Doc

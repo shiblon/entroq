@@ -12,7 +12,7 @@ import (
 	"github.com/shiblon/entroq/pkg/version"
 )
 
-// These tests cover what protocol 1 added: the hello, doc groups in doWork,
+// These tests cover what protocol 1 added: the hello, doc sets in doWork,
 // the "error" outcome, and the error-queue and retry-delay registration.
 
 func TestBridge_HelloFirst(t *testing.T) {
@@ -37,10 +37,10 @@ func TestBridge_HelloBeforeRegistrationError(t *testing.T) {
 	}
 }
 
-// TestBridge_DoWorkGroups checks that doWork carries each claimed group, in
-// claim order, with its docs and its version and claim, including a group
+// TestBridge_DoWorkSets checks that doWork carries each claimed set, in
+// claim order, with its docs and its version and claim, including a set
 // claimed with no docs, and still carries the flat docs as before.
-func TestBridge_DoWorkGroups(t *testing.T) {
+func TestBridge_DoWorkSets(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	eq := newEQ(t, ctx)
@@ -61,20 +61,20 @@ func TestBridge_DoWorkGroups(t *testing.T) {
 
 	var dw doWorkMsg
 	s.c.recv(&dw)
-	if len(dw.Groups) != 2 {
-		t.Fatalf("doWork carried %d groups, want 2", len(dw.Groups))
+	if len(dw.Sets) != 2 {
+		t.Fatalf("doWork carried %d sets, want 2", len(dw.Sets))
 	}
 	// Claims are taken sorted by namespace and key: "empty" before "full".
-	empty, full := dw.Groups[0], dw.Groups[1]
+	empty, full := dw.Sets[0], dw.Sets[1]
 	if empty.Key != "empty" || len(empty.Docs) != 0 || empty.Claimant == "" {
-		t.Errorf("empty group: got key %q, %d docs, claimant %q", empty.Key, len(empty.Docs), empty.Claimant)
+		t.Errorf("empty set: got key %q, %d docs, claimant %q", empty.Key, len(empty.Docs), empty.Claimant)
 	}
 	if full.Key != "full" || len(full.Docs) != 2 {
-		t.Fatalf("full group: got key %q, %d docs", full.Key, len(full.Docs))
+		t.Fatalf("full set: got key %q, %d docs", full.Key, len(full.Docs))
 	}
 	for _, d := range full.Docs {
 		if d.Version != full.Version || d.Claimant != full.Claimant {
-			t.Errorf("member %q: version %d claimant %q, group has %d %q", d.Id, d.Version, d.Claimant, full.Version, full.Claimant)
+			t.Errorf("member %q: version %d claimant %q, set has %d %q", d.Id, d.Version, d.Claimant, full.Version, full.Claimant)
 		}
 	}
 	if len(dw.Docs) != 2 {
@@ -172,10 +172,10 @@ func TestBridge_RetryDelay(t *testing.T) {
 	s.stop()
 }
 
-// TestWireGroupRoundTrip checks the group encoding: the lock's protojson fields
-// with the docs beside them, and an empty group's docs as [] rather than null.
+// TestWireGroupRoundTrip checks the set encoding: the lock's protojson fields
+// with the docs beside them, and an empty set's docs as [] rather than null.
 func TestWireGroupRoundTrip(t *testing.T) {
-	g := wireGroup{Doc: &pb.Doc{Namespace: "ns", Key: "k", Version: 3, Claimant: "me", AtMs: 42}}
+	g := wireSet{Doc: &pb.Doc{Namespace: "ns", Key: "k", Version: 3, Claimant: "me", AtMs: 42}}
 	b, err := json.Marshal(g)
 	if err != nil {
 		t.Fatal(err)
@@ -185,13 +185,13 @@ func TestWireGroupRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if string(fields["docs"]) != "[]" || string(fields["atMs"]) != `"42"` || string(fields["key"]) != `"k"` {
-		t.Errorf("encoded group: %s", b)
+		t.Errorf("encoded set: %s", b)
 	}
 	g.Docs = []wireDoc{{&pb.Doc{Namespace: "ns", Id: "a", Key: "k", Version: 3}}}
 	if b, err = json.Marshal(g); err != nil {
 		t.Fatal(err)
 	}
-	var back wireGroup
+	var back wireSet
 	if err := json.Unmarshal(b, &back); err != nil {
 		t.Fatal(err)
 	}
