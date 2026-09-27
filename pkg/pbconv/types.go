@@ -87,8 +87,39 @@ func TaskChangeToProto(t *entroq.Task) (*pb.TaskChange, error) {
 			Version: t.Version,
 			Queue:   t.FromQueue, // old queue goes in the ID for changes
 		},
-		NewData: nd,
+		Data: &pb.TaskChange_NewData{NewData: nd},
 	}, nil
+}
+
+// TaskArrivalToProto converts a task arrival to the lease-only TaskChange that
+// makes it, which a server at protocol 2 or later understands.
+func TaskArrivalToProto(a *entroq.TaskArrival) *pb.TaskChange {
+	return &pb.TaskChange{
+		OldId: &pb.TaskID{Id: a.ID, Version: a.Version, Queue: a.Queue},
+		Data:  &pb.TaskChange_NewLease{NewLease: &pb.TaskData{AtMs: ToMS(a.At)}},
+	}
+}
+
+// DocArrivalToProto converts a doc set arrival to the lease-only DocChange that
+// makes it, naming the set by its key, which a server at protocol 2 or later
+// understands.
+func DocArrivalToProto(a *entroq.DocArrival) *pb.DocChange {
+	return &pb.DocChange{
+		OldId: DocSetIDToProto(a.Namespace, a.Key, a.Version),
+		Data:  &pb.DocChange_NewLease{NewLease: &pb.DocData{AtMs: ToMS(a.At)}},
+	}
+}
+
+// DocIDToProto converts a doc's namespace, ID, and version to a wire DocID
+// naming it by ID.
+func DocIDToProto(ns, id string, version int32) *pb.DocID {
+	return &pb.DocID{Namespace: ns, Ref: &pb.DocID_Id{Id: id}, Version: version}
+}
+
+// DocSetIDToProto converts a doc set's namespace, key, and version to a wire
+// DocID naming the set by its key.
+func DocSetIDToProto(ns, key string, version int32) *pb.DocID {
+	return &pb.DocID{Namespace: ns, Ref: &pb.DocID_Key{Key: key}, Version: version}
 }
 
 // TaskIDFromProto converts a wire TaskID to an entroq.TaskID. It cannot fail, so
@@ -141,31 +172,37 @@ func DocFromProto(d *pb.Doc) (*entroq.Doc, error) {
 	}, nil
 }
 
-// DocGroupToProto converts a doc group's lock to its wire form. Its members
-// travel separately, as the docs beside it.
-func DocGroupToProto(g *entroq.DocGroup) *pb.DocGroup {
-	return &pb.DocGroup{
+// DocGroupToProto converts a doc set's lock to its wire form: a Doc with no
+// ID, secondary key, or content. Its members travel separately.
+func DocGroupToProto(g *entroq.DocGroup) *pb.Doc {
+	return &pb.Doc{
 		Namespace: g.Namespace,
 		Key:       g.Key,
 		Version:   g.Version,
 		Claimant:  g.Claimant,
 		AtMs:      ToMS(g.At),
-		NumDocs:   int32(g.NumDocs),
+		Len:       int32(g.NumDocs),
 	}
 }
 
-// DocGroupFromProto converts a wire doc group's lock and its members to an
-// entroq.DocGroup.
-func DocGroupFromProto(g *pb.DocGroup, docs []*entroq.Doc) *entroq.DocGroup {
+// DocGroupFromProto converts a wire doc set, a Doc with no ID, and its members
+// to an entroq.DocGroup.
+func DocGroupFromProto(d *pb.Doc, docs []*entroq.Doc) *entroq.DocGroup {
 	return &entroq.DocGroup{
-		Namespace: g.Namespace,
-		Key:       g.Key,
-		Version:   g.Version,
-		Claimant:  g.Claimant,
-		At:        fromMSOrUnset(g.AtMs),
-		NumDocs:   int(g.NumDocs),
+		Namespace: d.Namespace,
+		Key:       d.Key,
+		Version:   d.Version,
+		Claimant:  d.Claimant,
+		At:        fromMSOrUnset(d.AtMs),
+		NumDocs:   int(d.Len),
 		Docs:      docs,
 	}
+}
+
+// IsDocSet reports whether a wire Doc stands for a doc set rather than a doc:
+// sets have no ID.
+func IsDocSet(d *pb.Doc) bool {
+	return d.GetId() == ""
 }
 
 // MustDocFromProto is DocFromProto for callers converting a Doc whose content

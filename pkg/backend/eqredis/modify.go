@@ -9,6 +9,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/backend/internal/arrival"
 	"github.com/shiblon/entroq/pkg/backend/internal/docgroup"
 	"github.com/shiblon/entroq/pkg/backend/internal/validate"
 )
@@ -79,6 +80,9 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 	for _, t := range mod.Changes {
 		watchKeys = append(watchKeys, taskKey(t.ID))
 	}
+	for _, t := range mod.Arrives {
+		watchKeys = append(watchKeys, taskKey(t.ID))
+	}
 	// Inserts with explicit IDs must be watched so we can detect collisions.
 	for _, t := range mod.Inserts {
 		if t.ID != "" {
@@ -132,6 +136,9 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 			allIDs = append(allIDs, t.id)
 		}
 		for _, t := range mod.Changes {
+			allIDs = append(allIDs, t.ID)
+		}
+		for _, t := range mod.Arrives {
 			allIDs = append(allIDs, t.ID)
 		}
 		for _, t := range mod.Inserts {
@@ -210,6 +217,14 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 			}
 			docStates[k] = &docState{fields: f, found: true}
 		}
+
+		// Task arrivals are changes of the stored tasks' arrival times alone.
+		mod = arrival.Changes(mod, now, func(id string) *entroq.Task {
+			if st := states[id]; st != nil && st.found {
+				return st.fields.toTask()
+			}
+			return nil
+		})
 
 		// Step 2: verify versions -- semantic failure, no retry.
 		depErr := &entroq.DependencyError{}
@@ -465,6 +480,7 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 			for g, l := range docPlan.Locks {
 				writeLock(ctx, pipe, g, l, now)
 			}
+			resp.ChangedGroups = docPlan.Arrived
 
 			return nil
 		})

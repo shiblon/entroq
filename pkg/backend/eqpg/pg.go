@@ -27,6 +27,7 @@ import (
 
 	"github.com/lib/pq"
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/backend/internal/arrival"
 	"github.com/shiblon/entroq/pkg/backend/internal/gcmetrics"
 	"github.com/shiblon/entroq/pkg/backend/internal/validate"
 	"github.com/shiblon/entroq/pkg/internal/latency"
@@ -764,17 +765,37 @@ func (b *EQPG) modifyHandlingRetriable(ctx context.Context, doModify func() (*en
 	return nil, entroq.DependencyErrorf("retry limit: %v", err)
 }
 
+// lockArrivingTasks reads the tasks arrivals name, locked FOR UPDATE in ID
+// order; a missing one is absent from the result.
+func lockArrivingTasks(ctx context.Context, tx *sql.Tx, arrivals []*entroq.TaskArrival) (map[string]*entroq.Task, error) {
+	ids := make([]string, 0, len(arrivals))
+	for _, a := range arrivals {
+		ids = append(ids, a.ID)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id, version, queue, at, created, modified, claimant, value, claims, attempt, err
+		FROM entroq.tasks WHERE id = any($1) ORDER BY id FOR UPDATE`, pq.StringArray(ids))
+	if err != nil {
+		return nil, fmt.Errorf("pg lock arriving tasks: %w", err)
+	}
+	defer rows.Close()
+	tasks := make(map[string]*entroq.Task, len(ids))
+	for rows.Next() {
+		t := new(entroq.Task)
+		var val []byte
+		if err := rows.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Created, &t.Modified, &t.Claimant, &val, &t.Claims, &t.Attempt, &t.Err); err != nil {
+			return nil, fmt.Errorf("pg scan arriving task: %w", err)
+		}
+		t.Value = val
+		tasks[t.ID] = t
+	}
+	return tasks, rows.Err()
+}
+
 // modify calls the modify_arrays stored procedure, which atomically locks
 // dependencies, checks versions, and performs all inserts/changes/deletes in
 // one round trip. Returns a DependencyError (SQLSTATE EQ001) if any
 // dependency constraint is violated.
 func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *modifyConfig) (resp *entroq.ModifyResponse, err error) {
-	// Build parallel arrays for task operation set.
-	depIDs, depVers, depQueues := taskIDArrays(mod.Depends)
-	delIDs, delVers, delQueues := taskIDArrays(mod.Deletes)
-	insIDs, insQueues, insAts, insValues, insAttempts, insErrs := insertArrays(mod.Inserts)
-	chgIDs, chgVers, chgFromQueues, chgQueues, chgAts, chgValues, chgAttempts, chgErrs := changeArrays(mod.Changes)
-
 	if options == nil {
 		options = &modifyConfig{}
 	}
@@ -805,12 +826,30 @@ func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *mo
 
 	resp = new(entroq.ModifyResponse)
 
+	// Task arrivals are changes of the stored tasks' arrival times alone, so
+	// they are read first, locked, and passed on as ordinary changes.
+	if len(mod.Arrives) > 0 {
+		stored, err := lockArrivingTasks(ctx, tx, mod.Arrives)
+		if err != nil {
+			return nil, err
+		}
+		now, err := txNow(ctx, tx)
+		if err != nil {
+			return nil, err
+		}
+		mod = arrival.Changes(mod, now, func(id string) *entroq.Task { return stored[id] })
+	}
+
 	// Doc modifications, by the rules in docgroup.
 	if err := modifyDocs(ctx, tx, mod, resp); err != nil {
 		return nil, err
 	}
 
-	// Task modifications.
+	// Task modifications, as parallel arrays per operation.
+	depIDs, depVers, depQueues := taskIDArrays(mod.Depends)
+	delIDs, delVers, delQueues := taskIDArrays(mod.Deletes)
+	insIDs, insQueues, insAts, insValues, insAttempts, insErrs := insertArrays(mod.Inserts)
+	chgIDs, chgVers, chgFromQueues, chgQueues, chgAts, chgValues, chgAttempts, chgErrs := changeArrays(mod.Changes)
 	rows, err := tx.QueryContext(ctx, `
 		SELECT kind, id, version, queue, at, created, modified, claimant, value, claims, attempt, err
 		FROM _modify_arrays(

@@ -73,8 +73,8 @@ func TestModifyArgsFromProto(t *testing.T) {
 func TestModifyArgsFromProtoRejectsNamespaceMove(t *testing.T) {
 	req := &pb.ModifyRequest{
 		DocChanges: []*pb.DocChange{{
-			OldId:   &pb.DocID{Namespace: "ns-a", Id: "d1"},
-			NewData: &pb.DocData{Namespace: "ns-b"},
+			OldId: DocIDToProto("ns-a", "d1", 0),
+			Data:  &pb.DocChange_NewData{NewData: &pb.DocData{Namespace: "ns-b"}},
 		}},
 	}
 	_, err := ModifyArgsFromProto(req)
@@ -110,5 +110,94 @@ func TestDependencyErrorDetails(t *testing.T) {
 	}
 	if !gotDocDelete {
 		t.Errorf("missing DELETE detail for doc ns/d1 in %+v", deps)
+	}
+}
+
+func modification(t *testing.T, req *pb.ModifyRequest) (*entroq.Modification, error) {
+	t.Helper()
+	args, err := ModifyArgsFromProto(req)
+	if err != nil {
+		return nil, err
+	}
+	return entroq.NewModification("", args...), nil
+}
+
+func TestModifyArgsFromProtoRefusesMissingParts(t *testing.T) {
+	old := &pb.TaskID{Id: "t", Version: 1, Queue: "q"}
+	for name, req := range map[string]*pb.ModifyRequest{
+		"change with no task":      {Changes: []*pb.TaskChange{{Data: &pb.TaskChange_NewData{NewData: &pb.TaskData{}}}}},
+		"change with no data":      {Changes: []*pb.TaskChange{{OldId: old}}},
+		"doc change with no doc":   {DocChanges: []*pb.DocChange{{Data: &pb.DocChange_NewData{NewData: &pb.DocData{}}}}},
+		"doc change with no data":  {DocChanges: []*pb.DocChange{{OldId: DocIDToProto("ns", "d", 0)}}},
+		"doc delete naming none":   {DocDeletes: []*pb.DocID{{Namespace: "ns"}}},
+		"task lease with a value":  {Changes: []*pb.TaskChange{{OldId: old, Data: &pb.TaskChange_NewLease{NewLease: &pb.TaskData{Value: structpb.NewStringValue("x")}}}}},
+		"task lease moving it":     {Changes: []*pb.TaskChange{{OldId: old, Data: &pb.TaskChange_NewLease{NewLease: &pb.TaskData{Queue: "elsewhere"}}}}},
+		"doc lease with content":   {DocChanges: []*pb.DocChange{{OldId: DocSetIDToProto("ns", "k", 0), Data: &pb.DocChange_NewLease{NewLease: &pb.DocData{Content: structpb.NewStringValue("x")}}}}},
+		"doc lease of another key": {DocChanges: []*pb.DocChange{{OldId: DocSetIDToProto("ns", "k", 0), Data: &pb.DocChange_NewLease{NewLease: &pb.DocData{Key: "other"}}}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var inv *InvalidRequestError
+			if _, err := ModifyArgsFromProto(req); !errors.As(err, &inv) {
+				t.Errorf("got %v, want *InvalidRequestError", err)
+			}
+		})
+	}
+}
+
+func TestModifyArgsFromProtoLeases(t *testing.T) {
+	at := time.Date(2026, 9, 27, 12, 0, 0, 0, time.UTC)
+	mod, err := modification(t, &pb.ModifyRequest{
+		Changes: []*pb.TaskChange{{
+			OldId: &pb.TaskID{Id: "t", Version: 3, Queue: "q"},
+			Data:  &pb.TaskChange_NewLease{NewLease: &pb.TaskData{AtMs: ToMS(at)}},
+		}},
+		DocChanges: []*pb.DocChange{{
+			OldId: DocSetIDToProto("ns", "k", 5),
+			Data:  &pb.DocChange_NewLease{NewLease: &pb.DocData{AtMs: ToMS(at)}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("ModifyArgsFromProto: %v", err)
+	}
+	if len(mod.Changes) != 0 || len(mod.DocChanges) != 0 {
+		t.Errorf("Leases became changes: %v", mod)
+	}
+	if len(mod.Arrives) != 1 || mod.Arrives[0].TaskID != (entroq.TaskID{ID: "t", Version: 3, Queue: "q"}) || !mod.Arrives[0].At.Equal(at) {
+		t.Errorf("Task lease: got %+v", mod.Arrives)
+	}
+	if len(mod.DocArrives) != 1 || mod.DocArrives[0].DocSetID != (entroq.DocSetID{Namespace: "ns", Key: "k", Version: 5}) || !mod.DocArrives[0].At.Equal(at) {
+		t.Errorf("Doc set lease: got %+v", mod.DocArrives)
+	}
+}
+
+func TestModifyArgsFromProtoNotYetSupported(t *testing.T) {
+	for name, req := range map[string]*pb.ModifyRequest{
+		"doc change by key": {DocChanges: []*pb.DocChange{{OldId: DocSetIDToProto("ns", "k", 0), Data: &pb.DocChange_NewData{NewData: &pb.DocData{}}}}},
+		"doc delete by key": {DocDeletes: []*pb.DocID{DocSetIDToProto("ns", "k", 0)}},
+		"doc lease by ID":   {DocChanges: []*pb.DocChange{{OldId: DocIDToProto("ns", "d", 0), Data: &pb.DocChange_NewLease{NewLease: &pb.DocData{}}}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var uns *UnsupportedRequestError
+			if _, err := ModifyArgsFromProto(req); !errors.As(err, &uns) {
+				t.Errorf("got %v, want *UnsupportedRequestError", err)
+			}
+		})
+	}
+}
+
+func TestDependencyErrorDetailsNameSets(t *testing.T) {
+	deps := DependencyErrorDetails(&entroq.DependencyError{
+		GroupClaims: []*entroq.DocGroup{{Namespace: "ns", Key: "held", Version: 2}},
+		DocArrives:  []*entroq.DocGroup{{Namespace: "ns", Key: "stale", Version: 4}},
+	})
+	found := make(map[string]pb.ActionType)
+	for _, d := range deps[1:] {
+		if d.GetDocId().GetId() != "" {
+			t.Errorf("Set failure named by ID: %+v", d)
+		}
+		found[d.GetDocId().GetKey()] = d.Type
+	}
+	if found["held"] != pb.ActionType_CLAIM || found["stale"] != pb.ActionType_CHANGE {
+		t.Errorf("Set failures: got %v", found)
 	}
 }

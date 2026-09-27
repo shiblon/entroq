@@ -862,6 +862,7 @@ func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (*ModifyRespo
 		if !ok {
 			return nil, fmt.Errorf("modify: %w", err)
 		}
+		depErr.nameArrivals(mod)
 		// If anything is missing or there's a claim problem, bail.
 		if depErr.HasMissing() || depErr.HasClaims() {
 			return nil, fmt.Errorf("modify non-ins deps: %w", err)
@@ -969,6 +970,10 @@ type ModifyResponse struct {
 	ChangedTasks  []*Task
 	InsertedDocs  []*Doc
 	ChangedDocs   []*Doc
+
+	// ChangedGroups holds each doc group named in DocArrives at its new lock
+	// and doc count, without its docs: they are at the group's new version.
+	ChangedGroups []*DocGroup
 }
 
 // ModifyArg is an argument to the Modify function, which does batch modifications to the task store.
@@ -1024,15 +1029,17 @@ type Modification struct {
 
 	Claimant string `json:"claimant"`
 
-	Inserts []*TaskData `json:"inserts"`
-	Changes []*Task     `json:"changes"`
-	Deletes []*TaskID   `json:"deletes"`
-	Depends []*TaskID   `json:"depends"`
+	Inserts []*TaskData    `json:"inserts"`
+	Changes []*Task        `json:"changes"`
+	Deletes []*TaskID      `json:"deletes"`
+	Depends []*TaskID      `json:"depends"`
+	Arrives []*TaskArrival `json:"arrives,omitempty"`
 
-	DocInserts []*DocData `json:"doc_inserts"`
-	DocChanges []*Doc     `json:"doc_changes"`
-	DocDeletes []*DocID   `json:"doc_deletes"`
-	DocDepends []*DocID   `json:"doc_depends"`
+	DocInserts []*DocData    `json:"doc_inserts"`
+	DocChanges []*Doc        `json:"doc_changes"`
+	DocDeletes []*DocID      `json:"doc_deletes"`
+	DocDepends []*DocID      `json:"doc_depends"`
+	DocArrives []*DocArrival `json:"doc_arrives,omitempty"`
 }
 
 // String produces a friendly version of this modification.
@@ -1050,6 +1057,9 @@ func (m *Modification) String() string {
 	if len(m.Depends) != 0 {
 		out = append(out, fmt.Sprintf("dep: %v", m.Depends))
 	}
+	if len(m.Arrives) != 0 {
+		out = append(out, fmt.Sprintf("arr: %v", m.Arrives))
+	}
 	if len(m.DocInserts) != 0 {
 		out = append(out, fmt.Sprintf("doc-ins: %v", m.DocInserts))
 	}
@@ -1061,6 +1071,9 @@ func (m *Modification) String() string {
 	}
 	if len(m.DocDepends) != 0 {
 		out = append(out, fmt.Sprintf("doc-dep: %v", m.DocDepends))
+	}
+	if len(m.DocArrives) != 0 {
+		out = append(out, fmt.Sprintf("doc-arr: %v", m.DocArrives))
 	}
 	return "mod:\n\t" + strings.Join(out, "\n\t")
 }
@@ -1112,10 +1125,26 @@ func (m *Modification) EnsureModifyKeys() error {
 			return InvalidArgumentf("modify: change of task %q must name a destination queue", c.ID)
 		}
 	}
+	for _, a := range m.Arrives {
+		if a.Queue == "" {
+			return InvalidArgumentf("modify: arrival of task %q must name its queue", a.ID)
+		}
+	}
 	for _, ins := range m.DocInserts {
 		if ins.Namespace == "" {
 			return InvalidArgumentf("modify: doc insert %q must name a namespace", ins.ID)
 		}
+	}
+	groups := make(map[[2]string]bool, len(m.DocArrives))
+	for _, a := range m.DocArrives {
+		if a.Namespace == "" {
+			return InvalidArgumentf("modify: arrival of doc group %q must name a namespace", a.Key)
+		}
+		k := [2]string{a.Namespace, a.Key}
+		if groups[k] {
+			return InvalidArgumentf("modify: doc group %q in %q arrives more than once", a.Key, a.Namespace)
+		}
+		groups[k] = true
 	}
 	return nil
 }
@@ -1130,6 +1159,11 @@ func (m *Modification) modDependencies() (tasks map[string]int32, docs map[strin
 		}
 	}
 	for _, t := range m.Deletes {
+		if err := addTaskDep(tasks, t.ID, t.Version); err != nil {
+			return nil, nil, fmt.Errorf("modify task: %w", err)
+		}
+	}
+	for _, t := range m.Arrives {
 		if err := addTaskDep(tasks, t.ID, t.Version); err != nil {
 			return nil, nil, fmt.Errorf("modify task: %w", err)
 		}
@@ -1374,12 +1408,24 @@ type DependencyError struct {
 
 	Claims []*TaskID
 
+	// Task arrivals whose task was missing, or not at the version or in the
+	// queue named. One held by someone else is in Claims.
+	Arrives []*TaskID
+
 	DocInserts []*DocID
 	DocDepends []*DocID
 	DocDeletes []*DocID
 	DocChanges []*DocID
 
 	DocClaims []*DocID
+
+	// Doc groups that failed as a whole, each with its current lock:
+	// GroupClaims those held by someone else, whatever the operation, and
+	// DocArrives arriving groups that were missing or not at the version
+	// named. Over gRPC a failed group carries only its namespace, key, and
+	// version, not who holds it.
+	GroupClaims []*DocGroup
+	DocArrives  []*DocGroup
 
 	Message string
 }
@@ -1404,6 +1450,9 @@ func (m *DependencyError) Copy() *DependencyError {
 		DocClaims:  make([]*DocID, len(m.DocClaims)),
 		Message:    m.Message,
 	}
+	e.Arrives = append(e.Arrives, m.Arrives...)
+	e.GroupClaims = append(e.GroupClaims, m.GroupClaims...)
+	e.DocArrives = append(e.DocArrives, m.DocArrives...)
 	copy(e.Inserts, m.Inserts)
 	copy(e.Depends, m.Depends)
 	copy(e.Deletes, m.Deletes)
@@ -1419,19 +1468,19 @@ func (m *DependencyError) Copy() *DependencyError {
 
 // HasMissing indicates whether there was anything missing in this error.
 func (m *DependencyError) HasMissing() bool {
-	return len(m.Depends) > 0 || len(m.Deletes) > 0 || len(m.Changes) > 0
+	return len(m.Depends) > 0 || len(m.Deletes) > 0 || len(m.Changes) > 0 || len(m.Arrives) > 0
 }
 
-// HasMissingDocs indicates whether any docs a modification named were absent
-// or not at their group's version.
+// HasMissingDocs indicates whether any docs or doc groups the operation named
+// were absent or not at their group's version.
 func (m *DependencyError) HasMissingDocs() bool {
-	return len(m.DocDepends) > 0 || len(m.DocDeletes) > 0 || len(m.DocChanges) > 0
+	return len(m.DocDepends) > 0 || len(m.DocDeletes) > 0 || len(m.DocChanges) > 0 || len(m.DocArrives) > 0
 }
 
-// HasClaimedDocs indicates whether any docs were blocked by another
-// claimant. This is transient contention -- retry with backoff.
+// HasClaimedDocs indicates whether any docs or doc groups were blocked by
+// another claimant. This is transient contention -- retry with backoff.
 func (m *DependencyError) HasClaimedDocs() bool {
-	return len(m.DocClaims) > 0
+	return len(m.DocClaims) > 0 || len(m.GroupClaims) > 0
 }
 
 // HasClaims indicates whether any of the tasks were claimed by another claimant and unexpired.
@@ -1470,6 +1519,7 @@ func (m *DependencyError) Implicates(id string) bool {
 		slices.ContainsFunc(m.Depends, match) ||
 		slices.ContainsFunc(m.Deletes, match) ||
 		slices.ContainsFunc(m.Changes, match) ||
+		slices.ContainsFunc(m.Arrives, match) ||
 		slices.ContainsFunc(m.Claims, match)
 }
 
@@ -1493,17 +1543,20 @@ func (m *DependencyError) Merge(other *DependencyError) *DependencyError {
 	cat := func(a, b []*TaskID) []*TaskID { return append(append([]*TaskID{}, a...), b...) }
 	catDoc := func(a, b []*DocID) []*DocID { return append(append([]*DocID{}, a...), b...) }
 	merged := &DependencyError{
-		Inserts:    dedupTaskIDs(cat(m.Inserts, other.Inserts)),
-		Depends:    dedupTaskIDs(cat(m.Depends, other.Depends)),
-		Deletes:    dedupTaskIDs(cat(m.Deletes, other.Deletes)),
-		Changes:    dedupTaskIDs(cat(m.Changes, other.Changes)),
-		Claims:     dedupTaskIDs(cat(m.Claims, other.Claims)),
-		DocInserts: dedupDocIDs(catDoc(m.DocInserts, other.DocInserts)),
-		DocDepends: dedupDocIDs(catDoc(m.DocDepends, other.DocDepends)),
-		DocDeletes: dedupDocIDs(catDoc(m.DocDeletes, other.DocDeletes)),
-		DocChanges: dedupDocIDs(catDoc(m.DocChanges, other.DocChanges)),
-		DocClaims:  dedupDocIDs(catDoc(m.DocClaims, other.DocClaims)),
-		Message:    m.Message,
+		Inserts:     dedupTaskIDs(cat(m.Inserts, other.Inserts)),
+		Depends:     dedupTaskIDs(cat(m.Depends, other.Depends)),
+		Deletes:     dedupTaskIDs(cat(m.Deletes, other.Deletes)),
+		Changes:     dedupTaskIDs(cat(m.Changes, other.Changes)),
+		Claims:      dedupTaskIDs(cat(m.Claims, other.Claims)),
+		Arrives:     dedupTaskIDs(cat(m.Arrives, other.Arrives)),
+		DocInserts:  dedupDocIDs(catDoc(m.DocInserts, other.DocInserts)),
+		DocDepends:  dedupDocIDs(catDoc(m.DocDepends, other.DocDepends)),
+		DocDeletes:  dedupDocIDs(catDoc(m.DocDeletes, other.DocDeletes)),
+		DocChanges:  dedupDocIDs(catDoc(m.DocChanges, other.DocChanges)),
+		DocClaims:   dedupDocIDs(catDoc(m.DocClaims, other.DocClaims)),
+		GroupClaims: dedupGroups(append(append([]*DocGroup{}, m.GroupClaims...), other.GroupClaims...)),
+		DocArrives:  dedupGroups(append(append([]*DocGroup{}, m.DocArrives...), other.DocArrives...)),
+		Message:     m.Message,
 	}
 	if merged.Message == "" {
 		merged.Message = other.Message
@@ -1546,6 +1599,45 @@ func dedupDocIDs(ids []*DocID) []*DocID {
 	return out
 }
 
+// nameArrivals reports as arrivals the task arrivals of mod that failed as
+// changes: backends check an arrival as the change of arrival time it is.
+func (m *DependencyError) nameArrivals(mod *Modification) {
+	if len(mod.Arrives) == 0 {
+		return
+	}
+	arriving := make(map[string]bool, len(mod.Arrives))
+	for _, a := range mod.Arrives {
+		arriving[a.ID] = true
+	}
+	var changes []*TaskID
+	for _, c := range m.Changes {
+		if arriving[c.ID] {
+			m.Arrives = append(m.Arrives, c)
+		} else {
+			changes = append(changes, c)
+		}
+	}
+	m.Changes = changes
+}
+
+// dedupGroups keeps the first entry seen for each doc group.
+func dedupGroups(groups []*DocGroup) []*DocGroup {
+	seen := make(map[[2]string]bool, len(groups))
+	var out []*DocGroup
+	for _, g := range groups {
+		if g == nil {
+			continue
+		}
+		k := [2]string{g.Namespace, g.Key}
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, g)
+	}
+	return out
+}
+
 // Error produces a helpful error string indicating what was missing.
 func (m *DependencyError) Error() string {
 	lines := []string{
@@ -1581,6 +1673,12 @@ func (m *DependencyError) Error() string {
 			lines = append(lines, fmt.Sprintf("\t\t%s", tid))
 		}
 	}
+	if len(m.Arrives) > 0 {
+		lines = append(lines, "\tmissing task arrivals:")
+		for _, tid := range m.Arrives {
+			lines = append(lines, fmt.Sprintf("\t\t%s", tid))
+		}
+	}
 	if len(m.DocInserts) > 0 {
 		lines = append(lines, "\tcolliding doc inserts:")
 		for _, did := range m.DocInserts {
@@ -1609,6 +1707,18 @@ func (m *DependencyError) Error() string {
 		lines = append(lines, "\tclaimed modified docs:")
 		for _, did := range m.DocClaims {
 			lines = append(lines, fmt.Sprintf("\t\t%s", did))
+		}
+	}
+	if len(m.DocArrives) > 0 {
+		lines = append(lines, "\tmissing doc group arrivals:")
+		for _, g := range m.DocArrives {
+			lines = append(lines, fmt.Sprintf("\t\t%s", g.ID()))
+		}
+	}
+	if len(m.GroupClaims) > 0 {
+		lines = append(lines, "\tdoc groups held by another claimant:")
+		for _, g := range m.GroupClaims {
+			lines = append(lines, fmt.Sprintf("\t\t%s held by %q until %v", g.ID(), g.Claimant, g.At))
 		}
 	}
 	return strings.Join(lines, "\n")

@@ -172,14 +172,63 @@ runs, so plan a short maintenance window on large doc tables.
   `workgateway.Serve` takes it in place of the handler's arguments. A context no
   longer stops the connections: call `Close`. `Bridge.Shutdown` drains one
   session.
-- **A doc group counts its docs.** `entroq.DocGroup.NumDocs`, and `num_docs`
-  on the `DocGroup` message and in the work gateway's `doWork` groups, is how
-  many docs the group has. PostgreSQL and SQLite keep it on the group's lock
-  row, which every write already updates, and lock collection now checks it
-  instead of looking for docs; Redis counts it from its doc index when it reads
-  a lock; the in-memory backend keeps it on the lock and recounts after
-  replaying a journal. Upgrading from 1.12 counts each group's docs as it gives
-  the group its lock.
+- **Modify can change only when tasks and doc groups are ready again.**
+  `Modification` gains `Arrives` and `DocArrives`: a task or doc group at a
+  version, ready again at a given time, or now, which releases it. Each moves
+  one version and keeps everything else, its value, attempts, and claim count,
+  or its docs, and a doc group with no docs works like any other. Build them
+  with `entroq.Arriving`, or call `eq.UpdateArrival`:
+  `eq.UpdateArrival(ctx, entroq.ReadyIn(lease).Tasks(task).Docs(groups...))`
+  renews them for the lease, and `entroq.ReadyNow()` releases them. The claim
+  rules are Modify's: an item someone else holds fails the whole modification.
+  `ModifyResponse.ChangedGroups` returns the groups at their new locks and doc
+  counts; their docs are at the group's new version. Over gRPC they travel as
+  the protocol 2 lease changes below, and the client refuses to send them to a
+  server at protocol 1.
+- **The service reports its protocol.** Every gRPC and JSON response carries
+  an `entroq-protocol` header, 2 for this release (`version.Protocol`), and an
+  `entroq-version` header naming the release. A server that sends none speaks
+  protocol 1. The Go gRPC client records it from each response, and asks with
+  a `Time` call when it has not heard yet, before sending anything protocol 2
+  needs: a 1.12 server would apply a change carrying only a newer field as one
+  with empty data.
+- **Protocol 2 wire additions.** All additive; a 1.12 client sends none of
+  them.
+  - `TaskChange` puts `new_data` in a `data` oneof with `new_zero_claims` (a
+    change that will reset the task's claim count) and `new_lease` (only the
+    arrival time: renews or releases the task).
+  - `DocChange` puts `new_data` in a oneof with `new_lease`, which renews or
+    releases the doc set its `old_id` names.
+  - `DocID` names a doc by `id` or by `key`, in a oneof, with
+    `secondary_key`: a key alone names a doc set.
+  - `DocClaim.sets` names the doc sets to claim, by key; `namespace` and `key`
+    are for protocol 1 and ignored when sets are given. For now a claim names
+    one set, and more is `Unimplemented`.
+  - `ClaimDocsResponse.sets` lists every claimed set as a `Doc` with no ID or
+    content, empty sets included, and `ModifyResponse.changed_docs` returns a
+    set whose lease changed the same way. `Doc.len` counts a set's docs.
+  - Naming a doc by key for anything but a set lease, or naming a set lease by
+    a doc's ID, is `Unimplemented` for now.
+- **The service refuses changes with nothing in them.** A task or doc change
+  with no identifier or no data, a delete or depend naming no doc, and a lease
+  carrying anything but its arrival time are invalid arguments. A 1.12 server
+  applied a change with no data as one clearing every field.
+- **Dependency errors can name doc groups.** `entroq.DependencyError` gains
+  `GroupClaims` (held by someone else) and `DocArrives` (arriving groups not at
+  the version named), each carrying the group's current lock, and `Arrives`,
+  task arrivals that failed. Over the wire a group is a `ModifyDep` whose
+  `doc_id` names it by key, with its version but not who holds it. A claim or
+  modification refused because someone else holds a group names the group as
+  well as its members, so clients that read only doc failures see what they did
+  before.
+- **A doc group counts its docs.** `entroq.DocGroup.NumDocs`, and `len` on the
+  `Doc` standing for a set in claim responses and in the work gateway's
+  `doWork` groups, is how many docs the group has. PostgreSQL and SQLite keep it
+  on the group's lock row, which every write already updates, and lock
+  collection now checks it instead of looking for docs; Redis counts it from its
+  doc index when it reads a lock; the in-memory backend keeps it on the lock and
+  recounts after replaying a journal. Upgrading from 1.12 counts each group's
+  docs as it gives the group its lock.
 - **Breaking (Go): worker handlers receive doc groups.** `DoWork`, `DoModify`,
   and `Finish` handlers, and the `Handler` interface, take
   `[]*entroq.DocGroup` where they took `[]*entroq.Doc`: one group per claim

@@ -52,11 +52,7 @@ func (b *EQSQLite) ClaimDocs(ctx context.Context, q *entroq.DocClaim) (*entroq.D
 		current := lockOf(locks, g)
 		claimed, ok := docgroup.Claim(current, q.Claimant, now, q.Duration)
 		if !ok {
-			depErr := &entroq.DependencyError{}
-			for _, doc := range docs {
-				depErr.DocClaims = append(depErr.DocClaims, entroq.NewDocID(doc.Namespace, doc.ID, current.Version))
-			}
-			return nil, depErr
+			return nil, docgroup.HeldError(g, current, docs)
 		}
 		if err := saveDocLocks(ctx, tx, map[docgroup.Group]docgroup.Lock{g: claimed}); err != nil {
 			return nil, err

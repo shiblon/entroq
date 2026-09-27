@@ -325,11 +325,7 @@ func (e *EQRedis) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) (*entroq.D
 			return nil, fmt.Errorf("eqredis claim docs: %w", err)
 		}
 		if !ok {
-			depErr := &entroq.DependencyError{}
-			for _, d := range members {
-				depErr.DocClaims = append(depErr.DocClaims, entroq.NewDocID(d.Namespace, d.ID, current.Version))
-			}
-			return nil, depErr
+			return nil, docgroup.HeldError(g, current, members)
 		}
 		return docgroup.Claimed(g, next, members), nil
 	}

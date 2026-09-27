@@ -24,7 +24,12 @@ export interface TaskData {
  */
 export interface TaskChange {
   oldId: TaskID;
-  newData: TaskData;
+  // Exactly one of these. newZeroClaims and newLease are protocol 2: send them
+  // only to a server whose entroq-protocol response header is 2 or more, as a
+  // 1.12 server applies a change without newData as one with empty data.
+  newData?: TaskData;
+  newZeroClaims?: TaskData; // a change that resets the claim count
+  newLease?: TaskData;      // only atMs: renews or releases the task
 }
 
 /**
@@ -77,7 +82,11 @@ export interface ClaimResponse {
  */
 export interface DocID {
   namespace: string;
-  id: string;
+  // Exactly one of id and key. A key alone names a doc set; key with
+  // secondaryKey names a doc (protocol 2).
+  id?: string;
+  key?: string;
+  secondaryKey?: string;
   version: number;
 }
 
@@ -103,7 +112,10 @@ export interface DocData {
  */
 export interface DocChange {
   oldId: DocID;
-  newData: DocData;
+  // Exactly one of these. newLease (protocol 2) takes only atMs, and renews or
+  // releases the doc set oldId names by key.
+  newData?: DocData;
+  newLease?: DocData;
 }
 
 /**
@@ -120,6 +132,7 @@ export interface Doc {
   content?: any;
   createdMs: string; // int64 -> string
   modifiedMs: string; // int64 -> string
+  len?: number;       // for a Doc standing for a doc set: its doc count
 }
 
 /**
@@ -139,8 +152,9 @@ export interface DocQuery {
  * DocClaim describes an atomic all-or-nothing claim of docs sharing a key.
  */
 export interface DocClaim {
-  namespace: string;
-  key: string;
+  sets?: DocID[];     // protocol 2: the doc sets to claim, by key
+  namespace?: string; // protocol 1
+  key?: string;       // protocol 1
   durationMs?: string; // int64 -> string; defaults to DefaultClaimDuration
   claimant?: string;   // normally auto-set by the client
 }
@@ -167,26 +181,13 @@ export interface ClaimDocsRequest {
 }
 
 /**
- * DocGroup is a doc group's lock: the docs sharing a primary key in a
- * namespace have one version, claimant, and arrival time between them, which
- * each member reports. A group can be claimed before it has any docs.
- */
-export interface DocGroup {
-  namespace: string;
-  key: string;
-  version?: number;
-  claimant?: string;
-  atMs?: string;
-  numDocs?: number;
-}
-
-/**
- * ClaimDocsResponse contains the claimed docs, and the group they belong to,
- * present even when it has no docs. Servers before 1.13 omit the group.
+ * ClaimDocsResponse contains the claimed docs, and every claimed doc set as a
+ * Doc with no id or content, present even when the set has no docs. Servers
+ * at protocol 1 omit the sets.
  */
 export interface ClaimDocsResponse {
   docs: Doc[];
-  group?: DocGroup;
+  sets?: Doc[];
 }
 
 /**

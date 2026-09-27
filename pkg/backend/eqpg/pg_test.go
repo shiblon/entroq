@@ -512,6 +512,10 @@ func TestDocGroups(t *testing.T) {
 	RunQTest(t, eqtest.DocGroups)
 }
 
+func TestUpdateArrival(t *testing.T) {
+	RunQTest(t, eqtest.UpdateArrival)
+}
+
 func TestTaskChangeFarPastArrivalNormalized(t *testing.T) {
 	RunQTest(t, eqtest.TaskChangeFarPastArrivalNormalized)
 }

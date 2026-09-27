@@ -140,18 +140,18 @@ A worker that handles one task at a time without reading meanwhile sees the
 Each claim in `docs` takes a doc group: the docs sharing a primary key in a
 namespace, which have one version, claimant, and arrival time between them.
 `groups` carries each claimed group, in the order the gateway claimed them
-(sorted by namespace, then key), as the protojson of its `DocGroup` with its
-docs beside the lock's fields:
+(sorted by namespace, then key), as the protojson of the `Doc` standing for
+the set (no `id`, `secondaryKey`, or `content`) with its docs beside it:
 
 ```json
 {"namespace": "ns", "key": "k", "version": 3, "claimant": "...", "atMs": "...",
- "numDocs": 1, "docs": [{"namespace": "ns", "id": "a", "key": "k", ...}]}
+ "len": 1, "docs": [{"namespace": "ns", "id": "a", "key": "k", ...}]}
 ```
 
-`numDocs` counts the group's docs. A group claimed with no docs appears with
+`len` counts the group's docs. A group claimed with no docs appears with
 `"docs": []`, still reporting its version and claim. `docs` is every group's
 docs in one list, as before protocol 1. As protojson, a zero is omitted, so
-read a missing `version` or `numDocs` as 0.
+read a missing `version` or `len` as 0.
 
 ### Outcomes and the `ack` shorthand
 

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"connectrpc.com/connect"
@@ -13,6 +14,7 @@ import (
 	pb "github.com/shiblon/entroq/api"
 	"github.com/shiblon/entroq/api/apiconnect"
 	"github.com/shiblon/entroq/pkg/eqsvcgrpc"
+	"github.com/shiblon/entroq/pkg/version"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -59,7 +61,20 @@ func New(svc *eqsvcgrpc.QSvc, opts ...connect.HandlerOption) (string, http.Handl
 	mux.Handle(connectPath, connectHandler)
 	mux.Handle("/", transcoder)
 
-	return "/", mux, nil
+	return "/", withProtocolHeaders(mux), nil
+}
+
+// withProtocolHeaders sends the protocol headers on every response, whatever
+// its route or outcome, as the gRPC service does: the protocol this server
+// speaks, which a client checks before sending anything newer than protocol
+// 1, and its release.
+func withProtocolHeaders(next http.Handler) http.Handler {
+	protocol := strconv.Itoa(version.Protocol)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(version.ProtocolHeader, protocol)
+		w.Header().Set(version.VersionHeader, version.Version)
+		next.ServeHTTP(w, r)
+	})
 }
 
 func ctxWithMD(ctx context.Context, headers http.Header) context.Context {

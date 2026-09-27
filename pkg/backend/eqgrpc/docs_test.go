@@ -31,7 +31,7 @@ func TestClaimedGroupFromOlderServer(t *testing.T) {
 
 func TestClaimedGroupFromResponse(t *testing.T) {
 	at := time.UnixMilli(time.Now().Add(time.Minute).UnixMilli())
-	resp := &pb.ClaimDocsResponse{Group: &pb.DocGroup{Namespace: "ns", Key: "k", Version: 3, Claimant: "me", AtMs: at.UnixMilli()}}
+	resp := &pb.ClaimDocsResponse{Sets: []*pb.Doc{{Namespace: "ns", Key: "k", Version: 3, Claimant: "me", AtMs: at.UnixMilli()}}}
 	g := claimedGroup(entroq.ClaimKey("ns", "k"), resp)
 	if g.Version != 3 || g.Claimant != "me" || !g.At.Equal(at) || len(g.Docs) != 0 {
 		t.Errorf("Group from the response: got %+v", g)

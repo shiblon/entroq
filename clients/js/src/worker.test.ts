@@ -334,7 +334,7 @@ describe("EntroQWorker", () => {
     await vi.runOnlyPendingTimersAsync();
     await runPromise;
 
-    return modifySpy.mock.calls[modifySpy.mock.calls.length - 1][0].changes![0].newData;
+    return modifySpy.mock.calls[modifySpy.mock.calls.length - 1][0].changes![0].newData!;
   }
 
   it("quarantines on the final attempt rather than on a later claim", async () => {
@@ -406,7 +406,7 @@ describe("EntroQWorker", () => {
     await runPromise;
 
     expect(handlerRan).toBe(false);
-    const d = modifySpy.mock.calls[0][0].changes![0].newData;
+    const d = modifySpy.mock.calls[0][0].changes![0].newData!;
     expect(d.queue).toBe("q1/err");
     expect(d.err).toContain("maximum claims exceeded");
   });
@@ -439,7 +439,7 @@ describe("EntroQWorker", () => {
     await runPromise;
 
     expect(handlerRan).toBe(false);
-    const d = modifySpy.mock.calls[0][0].changes![0].newData;
+    const d = modifySpy.mock.calls[0][0].changes![0].newData!;
     expect(d.queue).toBe("q1/err");
     expect(d.err).toContain("required doc missing");
   });
@@ -463,7 +463,7 @@ describe("EntroQWorker", () => {
     worker.stop();
     await runPromise;
 
-    const d = modifySpy.mock.calls[0][0].changes![0].newData;
+    const d = modifySpy.mock.calls[0][0].changes![0].newData!;
     expect(d.queue).toBe("q1");
     expect(Number(d.atMs)).toBeGreaterThan(0);
     expect(d.err).toContain("doc contention");

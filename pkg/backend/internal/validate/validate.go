@@ -86,7 +86,8 @@ func Modification(mod *entroq.Modification) error {
 // reference existing rows, so they are not checked, and the claimant is
 // checked only when mod writes a row that records it.
 func lengths(mod *entroq.Modification) error {
-	writes := len(mod.Inserts) + len(mod.Changes) + len(mod.DocInserts) + len(mod.DocChanges)
+	writes := len(mod.Inserts) + len(mod.Changes) + len(mod.DocInserts) + len(mod.DocChanges) +
+		len(mod.Arrives) + len(mod.DocArrives)
 	if writes > 0 {
 		if err := Claimant(mod.Claimant); err != nil {
 			return err

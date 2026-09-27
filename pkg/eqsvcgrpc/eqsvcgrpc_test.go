@@ -12,6 +12,7 @@ import (
 	"github.com/shiblon/entroq/pkg/authn"
 	"github.com/shiblon/entroq/pkg/authz"
 	"github.com/shiblon/entroq/pkg/backend/eqmem"
+	"github.com/shiblon/entroq/pkg/pbconv"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -30,16 +31,16 @@ func TestModifyAuthzCoversEveryOp(t *testing.T) {
 	req := &pb.ModifyRequest{
 		Inserts: []*pb.TaskData{{Queue: "q-ins"}},
 		Changes: []*pb.TaskChange{{
-			OldId:   &pb.TaskID{Queue: "q-chg"},
-			NewData: &pb.TaskData{Queue: "q-chg"},
+			OldId: &pb.TaskID{Queue: "q-chg"},
+			Data:  &pb.TaskChange_NewData{NewData: &pb.TaskData{Queue: "q-chg"}},
 		}},
 		Deletes: []*pb.TaskID{{Queue: "q-del"}},
 		Depends: []*pb.TaskID{{Queue: "q-dep"}},
 
 		DocInserts: []*pb.DocData{{Namespace: "ns-ins"}},
 		DocChanges: []*pb.DocChange{{
-			OldId:   &pb.DocID{Namespace: "ns-chg"},
-			NewData: &pb.DocData{Namespace: "ns-chg"},
+			OldId: &pb.DocID{Namespace: "ns-chg"},
+			Data:  &pb.DocChange_NewData{NewData: &pb.DocData{Namespace: "ns-chg"}},
 		}},
 		DocDeletes: []*pb.DocID{{Namespace: "ns-del"}},
 		DocDepends: []*pb.DocID{{Namespace: "ns-dep"}},
@@ -108,11 +109,11 @@ func TestModifyAuthzFailsClosedOnEmptyTarget(t *testing.T) {
 		"empty insert queue":  {Inserts: []*pb.TaskData{{Queue: ""}}},
 		"empty delete queue":  {Deletes: []*pb.TaskID{{Queue: ""}}},
 		"empty depend queue":  {Depends: []*pb.TaskID{{Queue: ""}}},
-		"empty change queue":  {Changes: []*pb.TaskChange{{OldId: &pb.TaskID{Queue: ""}, NewData: &pb.TaskData{Queue: ""}}}},
+		"empty change queue":  {Changes: []*pb.TaskChange{{OldId: &pb.TaskID{Queue: ""}, Data: &pb.TaskChange_NewData{NewData: &pb.TaskData{Queue: ""}}}}},
 		"empty doc insert ns": {DocInserts: []*pb.DocData{{Namespace: ""}}},
 		"empty doc delete ns": {DocDeletes: []*pb.DocID{{Namespace: ""}}},
 		"empty doc depend ns": {DocDepends: []*pb.DocID{{Namespace: ""}}},
-		"empty doc change ns": {DocChanges: []*pb.DocChange{{OldId: &pb.DocID{Namespace: ""}, NewData: &pb.DocData{Namespace: ""}}}},
+		"empty doc change ns": {DocChanges: []*pb.DocChange{{OldId: &pb.DocID{Namespace: ""}, Data: &pb.DocChange_NewData{NewData: &pb.DocData{Namespace: ""}}}}},
 	}
 
 	for name, req := range cases {
@@ -135,8 +136,8 @@ func TestModifyAuthzMoveRequiresDeleteAndInsert(t *testing.T) {
 	// and a cross-namespace one is rejected (TestModifyRejectsDocNamespaceChange).
 	req := &pb.ModifyRequest{
 		Changes: []*pb.TaskChange{{
-			OldId:   &pb.TaskID{Queue: "q-from"},
-			NewData: &pb.TaskData{Queue: "q-to"},
+			OldId: &pb.TaskID{Queue: "q-from"},
+			Data:  &pb.TaskChange_NewData{NewData: &pb.TaskData{Queue: "q-to"}},
 		}},
 	}
 	authReq, err := s.modifyAuthz(context.Background(), req)
@@ -165,12 +166,12 @@ func TestModifyAuthzEmptyDestIsNoMove(t *testing.T) {
 	s := &QSvc{}
 	req := &pb.ModifyRequest{
 		Changes: []*pb.TaskChange{{
-			OldId:   &pb.TaskID{Queue: "q"},
-			NewData: &pb.TaskData{Queue: ""},
+			OldId: &pb.TaskID{Queue: "q"},
+			Data:  &pb.TaskChange_NewData{NewData: &pb.TaskData{Queue: ""}},
 		}},
 		DocChanges: []*pb.DocChange{{
-			OldId:   &pb.DocID{Namespace: "ns"},
-			NewData: &pb.DocData{Namespace: ""},
+			OldId: &pb.DocID{Namespace: "ns"},
+			Data:  &pb.DocChange_NewData{NewData: &pb.DocData{Namespace: ""}},
 		}},
 	}
 	authReq, err := s.modifyAuthz(context.Background(), req)
@@ -200,8 +201,8 @@ func TestModifyRejectsDocNamespaceChange(t *testing.T) {
 
 	req := &pb.ModifyRequest{
 		DocChanges: []*pb.DocChange{{
-			OldId:   &pb.DocID{Namespace: "ns-a", Id: "d1"},
-			NewData: &pb.DocData{Namespace: "ns-b"},
+			OldId: pbconv.DocIDToProto("ns-a", "d1", 0),
+			Data:  &pb.DocChange_NewData{NewData: &pb.DocData{Namespace: "ns-b"}},
 		}},
 	}
 	if _, err := svc.Modify(ctx, req); status.Code(err) != codes.InvalidArgument {
@@ -210,7 +211,7 @@ func TestModifyRejectsDocNamespaceChange(t *testing.T) {
 
 	// A same-namespace change (empty destination = unspecified) is NOT rejected
 	// for the namespace reason; it fails only because the doc does not exist.
-	req.DocChanges[0].NewData.Namespace = ""
+	req.DocChanges[0].GetNewData().Namespace = ""
 	if _, err := svc.Modify(ctx, req); status.Code(err) == codes.InvalidArgument {
 		t.Errorf("same-namespace doc change should not be an InvalidArgument, got %v", err)
 	}
@@ -503,7 +504,8 @@ type fakeTaskStream struct {
 	sent []*pb.TasksResponse
 }
 
-func (s *fakeTaskStream) Context() context.Context { return s.ctx }
+func (s *fakeTaskStream) Context() context.Context    { return s.ctx }
+func (s *fakeTaskStream) SetHeader(metadata.MD) error { return nil }
 func (s *fakeTaskStream) Send(r *pb.TasksResponse) error {
 	s.sent = append(s.sent, r)
 	return nil

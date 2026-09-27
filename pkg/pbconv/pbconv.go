@@ -13,6 +13,7 @@ package pbconv
 
 import (
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/shiblon/entroq"
@@ -91,6 +92,74 @@ func invalidf(format string, args ...any) *InvalidRequestError {
 	return &InvalidRequestError{msg: fmt.Sprintf(format, args...)}
 }
 
+// UnsupportedRequestError marks a request this server understands but does
+// not carry out yet. Callers map it onto their transport's "unimplemented"
+// status.
+type UnsupportedRequestError struct{ msg string }
+
+// Error implements the error interface.
+func (e *UnsupportedRequestError) Error() string { return e.msg }
+
+func unsupportedf(format string, args ...any) *UnsupportedRequestError {
+	return &UnsupportedRequestError{msg: fmt.Sprintf(format, args...)}
+}
+
+// docByID returns the ID a wire DocID names a doc by. Naming a doc by its keys
+// is protocol 2, not yet carried out for anything but set leases; a DocID
+// naming nothing is invalid.
+func docByID(d *pb.DocID, what string) (string, error) {
+	switch d.GetRef().(type) {
+	case *pb.DocID_Id:
+		return d.GetId(), nil
+	case *pb.DocID_Key:
+		return "", unsupportedf("%s naming a doc by key is not supported yet", what)
+	default:
+		return "", invalidf("%s names no doc", what)
+	}
+}
+
+// taskLease converts a lease-only task change. Only its arrival time is used;
+// a queue, if given, must be the task's own, and nothing else may be set.
+func taskLease(old *pb.TaskID, lease *pb.TaskData) (entroq.ModifyArg, error) {
+	if q := lease.GetQueue(); q != "" && q != old.GetQueue() {
+		return nil, invalidf("lease of task %s cannot move it: %q -> %q", old.GetId(), old.GetQueue(), q)
+	}
+	if lease.GetValue() != nil || lease.GetAttempt() != 0 || lease.GetErr() != "" || lease.GetId() != "" {
+		return nil, invalidf("lease of task %s may set only its arrival time", old.GetId())
+	}
+	return entroq.Arriving(entroq.ReadyAt(FromMS(lease.GetAtMs())).Tasks(
+		&entroq.Task{ID: old.GetId(), Version: old.GetVersion(), Queue: old.GetQueue()},
+	)), nil
+}
+
+// docLease converts a lease-only doc change, which renews or releases the doc
+// set old names by its key. Only the arrival time is used; a namespace, key,
+// or secondary key, if given, must match old, and no content may be.
+func docLease(old *pb.DocID, lease *pb.DocData) (entroq.ModifyArg, error) {
+	key, ok := old.GetRef().(*pb.DocID_Key)
+	switch {
+	case old.GetRef() == nil:
+		return nil, invalidf("doc lease names no doc set")
+	case !ok:
+		return nil, unsupportedf("doc lease naming a doc by ID is not supported yet; name its set by key")
+	}
+	if ns := lease.GetNamespace(); ns != "" && ns != old.GetNamespace() {
+		return nil, invalidf("doc lease of %q cannot name another namespace %q", old.GetNamespace(), ns)
+	}
+	if k := lease.GetKey(); k != "" && k != key.Key {
+		return nil, invalidf("doc lease of set %q cannot name another key %q", key.Key, k)
+	}
+	if sk := lease.GetSecondaryKey(); sk != "" && sk != old.GetSecondaryKey() {
+		return nil, invalidf("doc lease of set %q cannot name another secondary key %q", key.Key, sk)
+	}
+	if lease.GetContent() != nil || lease.GetId() != "" {
+		return nil, invalidf("doc lease of set %q may set only its arrival time", key.Key)
+	}
+	return entroq.Arriving(entroq.ReadyAt(FromMS(lease.GetAtMs())).Docs(
+		&entroq.DocGroup{Namespace: old.GetNamespace(), Key: key.Key, Version: old.GetVersion()},
+	)), nil
+}
+
 // ModifyArgsFromProto translates a wire ModifyRequest into the entroq modify
 // arguments that apply it. It is the one mapping from the language-agnostic
 // protocol onto the Go modify API, which is exactly why a client (or a
@@ -114,7 +183,27 @@ func ModifyArgsFromProto(req *pb.ModifyRequest) ([]entroq.ModifyArg, error) {
 				entroq.WithID(insert.Id)))
 	}
 	for _, change := range req.Changes {
-		val, err := ProtoToJSON(change.GetNewData().GetValue())
+		if change.GetOldId() == nil {
+			return nil, invalidf("task change names no task")
+		}
+		var nd *pb.TaskData
+		switch data := change.GetData().(type) {
+		case *pb.TaskChange_NewData:
+			nd = data.NewData
+		case *pb.TaskChange_NewZeroClaims:
+			// Claims are reset in a later step; until then this is new_data.
+			nd = data.NewZeroClaims
+		case *pb.TaskChange_NewLease:
+			arg, err := taskLease(change.GetOldId(), data.NewLease)
+			if err != nil {
+				return nil, err
+			}
+			modArgs = append(modArgs, arg)
+			continue
+		default:
+			return nil, invalidf("change of task %s carries no data", change.GetOldId().GetId())
+		}
+		val, err := ProtoToJSON(nd.GetValue())
 		if err != nil {
 			return nil, fmt.Errorf("change value: %w", err)
 		}
@@ -126,10 +215,8 @@ func ModifyArgsFromProto(req *pb.ModifyRequest) ([]entroq.ModifyArg, error) {
 		// field, so if we set Queue to the destination up front, every move would
 		// report its source as its own target and fail the integrity check. Setting
 		// Queue to the source and applying QueueTo only on an actual move yields the
-		// correct FromQueue for both cases. Nil-safe getters throughout: a change
-		// with OldId/NewData unset yields empty fields and fails the integrity check
-		// downstream rather than panicking.
-		oldQueue, newQueue := change.GetOldId().GetQueue(), change.GetNewData().GetQueue()
+		// correct FromQueue for both cases.
+		oldQueue, newQueue := change.GetOldId().GetQueue(), nd.GetQueue()
 		// An empty destination means "no move": normalize it to the current queue
 		// so a plain change stays put, and only a different, non-empty destination
 		// moves the task.
@@ -142,14 +229,14 @@ func ModifyArgsFromProto(req *pb.ModifyRequest) ([]entroq.ModifyArg, error) {
 			Claimant: req.ClaimantId,
 			Queue:    oldQueue, // current queue; Task.Change derives FromQueue from it
 			Value:    val,
-			Attempt:  change.GetNewData().GetAttempt(),
-			Err:      change.GetNewData().GetErr(),
+			Attempt:  nd.GetAttempt(),
+			Err:      nd.GetErr(),
 		}
 		var changeArgs []entroq.ChangeArg
 		if newQueue != oldQueue {
 			changeArgs = append(changeArgs, entroq.QueueTo(newQueue))
 		}
-		changeArgs = append(changeArgs, entroq.ArrivalTimeTo(FromMS(change.GetNewData().GetAtMs())))
+		changeArgs = append(changeArgs, entroq.ArrivalTimeTo(FromMS(nd.GetAtMs())))
 		modArgs = append(modArgs, t.Change(changeArgs...))
 	}
 	for _, del := range req.Deletes {
@@ -176,7 +263,27 @@ func ModifyArgsFromProto(req *pb.ModifyRequest) ([]entroq.ModifyArg, error) {
 	}
 	for _, dc := range req.DocChanges {
 		old := dc.GetOldId()
-		nd := dc.GetNewData()
+		if old == nil {
+			return nil, invalidf("doc change names no doc")
+		}
+		var nd *pb.DocData
+		switch data := dc.GetData().(type) {
+		case *pb.DocChange_NewData:
+			nd = data.NewData
+		case *pb.DocChange_NewLease:
+			arg, err := docLease(old, data.NewLease)
+			if err != nil {
+				return nil, err
+			}
+			modArgs = append(modArgs, arg)
+			continue
+		default:
+			return nil, invalidf("doc change in %q carries no data", old.GetNamespace())
+		}
+		id, err := docByID(old, "doc change")
+		if err != nil {
+			return nil, err
+		}
 		// Docs do not move between namespaces: a change is always in place. A
 		// non-empty destination namespace that differs from the source is rejected
 		// rather than silently applied in the source namespace. (An empty
@@ -190,7 +297,7 @@ func ModifyArgsFromProto(req *pb.ModifyRequest) ([]entroq.ModifyArg, error) {
 		}
 		d := &entroq.Doc{
 			Namespace:    old.GetNamespace(),
-			ID:           old.GetId(),
+			ID:           id,
 			Version:      old.GetVersion(),
 			Key:          nd.GetKey(),
 			SecondaryKey: nd.GetSecondaryKey(),
@@ -202,10 +309,18 @@ func ModifyArgsFromProto(req *pb.ModifyRequest) ([]entroq.ModifyArg, error) {
 		modArgs = append(modArgs, d.Change(entroq.WithDocArrivalTime(FromMS(nd.GetAtMs()))))
 	}
 	for _, dd := range req.DocDeletes {
-		modArgs = append(modArgs, entroq.NewDocID(dd.Namespace, dd.Id, dd.Version).Delete())
+		id, err := docByID(dd, "doc delete")
+		if err != nil {
+			return nil, err
+		}
+		modArgs = append(modArgs, entroq.NewDocID(dd.GetNamespace(), id, dd.GetVersion()).Delete())
 	}
 	for _, ddep := range req.DocDepends {
-		modArgs = append(modArgs, entroq.NewDocID(ddep.Namespace, ddep.Id, ddep.Version).Depend())
+		id, err := docByID(ddep, "doc depend")
+		if err != nil {
+			return nil, err
+		}
+		modArgs = append(modArgs, entroq.NewDocID(ddep.GetNamespace(), id, ddep.GetVersion()).Depend())
 	}
 	return modArgs, nil
 }
@@ -225,7 +340,9 @@ func DependencyErrorDetails(depErr *entroq.DependencyError) []*pb.ModifyDep {
 		pb.ActionType_INSERT: depErr.Inserts,
 		pb.ActionType_DEPEND: depErr.Depends,
 		pb.ActionType_DELETE: depErr.Deletes,
-		pb.ActionType_CHANGE: depErr.Changes,
+		// A task arrival is a change of arrival time on the wire; the client,
+		// which knows which of its changes were arrivals, names them again.
+		pb.ActionType_CHANGE: append(slices.Clone(depErr.Changes), depErr.Arrives...),
 		pb.ActionType_CLAIM:  depErr.Claims,
 	}
 	for dtype, dvals := range taskMap {
@@ -245,10 +362,16 @@ func DependencyErrorDetails(depErr *entroq.DependencyError) []*pb.ModifyDep {
 	}
 	for dtype, dvals := range docMap {
 		for _, did := range dvals {
-			details = append(details, &pb.ModifyDep{
-				Type:  dtype,
-				DocId: &pb.DocID{Namespace: did.Namespace, Id: did.ID, Version: did.Version},
-			})
+			details = append(details, &pb.ModifyDep{Type: dtype, DocId: DocIDToProto(did.Namespace, did.ID, did.Version)})
+		}
+	}
+	groupMap := map[pb.ActionType][]*entroq.DocGroup{
+		pb.ActionType_CHANGE: depErr.DocArrives,
+		pb.ActionType_CLAIM:  depErr.GroupClaims,
+	}
+	for dtype, groups := range groupMap {
+		for _, g := range groups {
+			details = append(details, &pb.ModifyDep{Type: dtype, DocId: DocSetIDToProto(g.Namespace, g.Key, g.Version)})
 		}
 	}
 	return details

@@ -175,7 +175,7 @@ func TestBridge_RetryDelay(t *testing.T) {
 // TestWireGroupRoundTrip checks the group encoding: the lock's protojson fields
 // with the docs beside them, and an empty group's docs as [] rather than null.
 func TestWireGroupRoundTrip(t *testing.T) {
-	g := wireGroup{DocGroup: &pb.DocGroup{Namespace: "ns", Key: "k", Version: 3, Claimant: "me", AtMs: 42}}
+	g := wireGroup{Doc: &pb.Doc{Namespace: "ns", Key: "k", Version: 3, Claimant: "me", AtMs: 42}}
 	b, err := json.Marshal(g)
 	if err != nil {
 		t.Fatal(err)
@@ -196,7 +196,7 @@ func TestWireGroupRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if back.Key != "k" || back.Version != 3 || back.AtMs != 42 || len(back.Docs) != 1 || back.Docs[0].Id != "a" {
-		t.Errorf("round trip: got %+v, docs %v", back.DocGroup, back.Docs)
+		t.Errorf("round trip: got %+v, docs %v", back.Doc, back.Docs)
 	}
 }
 

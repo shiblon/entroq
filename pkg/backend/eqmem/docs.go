@@ -107,13 +107,7 @@ func (m *EQMem) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) (*entroq.Doc
 	current := nss.Lock(cq.Key)
 	claimed, ok := docgroup.Claim(current, cq.Claimant, now, cq.Duration)
 	if !ok {
-		depErr := &entroq.DependencyError{
-			Message: fmt.Sprintf("doc group %q in namespace %q is claimed by %s until %v", cq.Key, cq.Namespace, current.Claimant, current.At),
-		}
-		for _, d := range members {
-			depErr.DocClaims = append(depErr.DocClaims, entroq.NewDocID(d.Namespace, d.ID, current.Version))
-		}
-		return nil, depErr
+		return nil, docgroup.HeldError(docgroup.Group{Namespace: cq.Namespace, Key: cq.Key}, current, members)
 	}
 
 	nss.SetLock(cq.Key, claimed)

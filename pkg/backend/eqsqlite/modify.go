@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/backend/internal/arrival"
 	"github.com/shiblon/entroq/pkg/backend/internal/docgroup"
 	"github.com/shiblon/entroq/pkg/backend/internal/validate"
 )
@@ -39,6 +40,8 @@ func modifyTx(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (*entro
 	if err != nil {
 		return nil, err
 	}
+	// Task arrivals are changes of the stored tasks' arrival times alone.
+	mod = arrival.Changes(mod, now, func(id string) *entroq.Task { return foundTasks[id] })
 	member := func(ns, id string) *entroq.Doc { return foundDocs[entroq.DocKey(ns, id)] }
 	locks, err := loadDocLocks(ctx, tx, docgroup.Groups(mod, member))
 	if err != nil {
@@ -143,6 +146,7 @@ func modifyTx(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (*entro
 	if err := saveDocLocks(ctx, tx, docPlan.Locks); err != nil {
 		return nil, err
 	}
+	resp.ChangedGroups = docPlan.Arrived
 	return resp, nil
 }
 

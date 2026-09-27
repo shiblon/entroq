@@ -52,7 +52,24 @@ message TaskData {
 // All fields should be filled in. Empty fields result in deleting data from that field.
 message TaskChange {
   TaskID old_id = 1;
-  TaskData new_data = 2;
+  oneof data {
+    // MUST use this with protocol 1. Anything else will delete task contents.
+    TaskData new_data = 2;
+
+    // Send new task data, request a claims reset. Default in newer clients.
+    // Changes the claims semantic to match original intent: if a task keeps
+    // getting abandoned, it can hit a max. If it is intentionally modified, it
+    // resets: not a poison pill.
+    //
+    // New clients for protocol 2 should use this field instead of new_data
+    // for intentional modification. For lease renewal, use new_lease instead,
+    // which requires no content to be passed, and does not reset claims.
+    TaskData new_zero_claims = 3;
+
+    // Update only the lease information. Only at_ms is used. If specified,
+    // queue must equal old_id.queue. For protocol 2.
+    TaskData new_lease = 4;
+  }
 }
 
 // Task is a complete task object, containing IDs, data, and metadata.
@@ -133,7 +150,15 @@ message ClaimResponse {
 // DocID identifies a specific version of a doc.
 message DocID {
   string namespace = 1;
-  string id = 2;
+  oneof ref {
+    string id = 2;
+
+    // Used for servers at protocol 2.
+    string key = 4;
+  }
+  // Only meaningful if key is present.
+  string secondary_key = 5;
+
   int32 version = 3;
 }
 
@@ -155,12 +180,23 @@ message DocData {
 
 // DocChange identifies a doc by DocID and provides updated data. Only content
 // from new_data is applied; keys are immutable after creation.
+//
+// Use new_lease to only update the arrival time for a doc set.
 message DocChange {
   DocID old_id = 1;
-  DocData new_data = 2;
+  oneof data {
+    DocData new_data = 2;
+
+    // Set only the lease information. Supply only at_ms. If namespace, key, or
+    // secondary_key are specified, they must be equal to the previous values
+    // in old_id. Can use with servers on protocol 2.
+    DocData new_lease = 3;
+  }
 }
 
 // Doc is a complete doc object with identity, data, and metadata.
+// Note that when representing a set, it will not contain id, secondary_key, or
+// content.
 message Doc {
   string namespace = 1;
   string id = 2;
@@ -172,6 +208,9 @@ message Doc {
   google.protobuf.Value content = 8;
   int64 created_ms = 9;
   int64 modified_ms = 10;
+
+  // Number of docs under a doc set, if applicable.
+  int32 len = 11;
 }
 
 // DocQuery describes a listing request for docs in a namespace. Exactly one
@@ -191,12 +230,21 @@ message DocQuery {
 }
 
 // DocClaim describes an atomic all-or-nothing claim of docs in a namespace.
-// All docs sharing the given key are claimed together.
+// In protocol 1, all docs sharing the given key are claimed together. For
+// protocol 2, only namespace and primary keys are specified and it will try to
+// claim all specified document sets by namespace and primary key.
+//
+// If sets are specified, namespace and key are ignored.
 message DocClaim {
-  string namespace = 1;
-  string claimant = 2;
-  string key = 3;
+  // Use for protocol 2.
+  repeated DocID sets = 5;
+
   int64 duration_ms = 4;
+  string claimant = 2;
+
+  // Use for protocol 1.
+  string namespace = 1;
+  string key = 3;
 }
 
 // DocsRequest asks for a listing of docs matching a query.
@@ -214,27 +262,16 @@ message ClaimDocsRequest {
   DocClaim claim_query = 1;
 }
 
-// DocGroup is a doc group's lock: the docs sharing a primary key in a
-// namespace have one version, claimant, and arrival time between them, held
-// here, and each member reports them. A group can be claimed before it has
-// any docs, so the lock stands on its own; its members travel separately.
-message DocGroup {
-  string namespace = 1;
-  string key = 2;
-  int32 version = 3;
-  string claimant = 4;
-  int64 at_ms = 5;
-  // How many docs the group has, whichever of them travel with it.
-  int32 num_docs = 6;
-}
-
 // ClaimDocsResponse contains the docs claimed by a ClaimDocs call, and the
-// group they belong to, which is present even when the group has no docs.
-// A dependency error (a group held by someone else) comes through as gRPC's
-// NOT_FOUND code with ModifyDep details carrying doc_id fields.
+// sets they belong to. All sets are present, but not all sets have docs.
 message ClaimDocsResponse {
+  // Contains all docs within any set, with content.
   repeated Doc docs = 1;
-  DocGroup group = 2;
+
+  // Contains all doc set top-level values.
+  // Not present for servers on protocol 1.
+  // Contains no content.
+  repeated Doc sets = 2;
 }
 
 // NamespaceStat contains statistics for a single doc namespace.

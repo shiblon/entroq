@@ -260,3 +260,33 @@ func TestEvaluateCountsDocs(t *testing.T) {
 		t.Errorf("Claim: want the count kept at 2, got %+v, %v", l, ok)
 	}
 }
+
+func TestEvaluateDocArrives(t *testing.T) {
+	s := newStore(Lock{Claimant: "me", At: now.Add(time.Second)})
+	renew := &entroq.DocGroup{Namespace: "ns", Key: "k", Version: 5}
+	p := s.evaluate("me", entroq.Arriving(entroq.ReadyAt(now.Add(time.Minute)).Docs(renew)))
+	if p.Err != nil {
+		t.Fatalf("Evaluate: %v", p.Err)
+	}
+	l := p.Locks[group]
+	if l.Version != 6 || l.Claimant != "me" || !l.At.Equal(now.Add(time.Minute)) || l.NumDocs != 2 {
+		t.Errorf("Renewed group: want version 6 held by me for a minute with 2 docs, got %+v", l)
+	}
+	if len(p.Arrived) != 1 || p.Arrived[0].Version != 6 || p.Arrived[0].Docs != nil {
+		t.Errorf("Arrived: want the group at its new lock without docs, got %+v", p.Arrived)
+	}
+	if p := s.evaluate("me", entroq.Arriving(entroq.ReadyNow().Docs(renew))); p.Locks[group].Claimant != "" {
+		t.Errorf("Released group: want it unheld, got %+v", p.Locks[group])
+	}
+	stale := &entroq.DocGroup{Namespace: "ns", Key: "k", Version: 4}
+	if p := s.evaluate("me", entroq.Arriving(entroq.ReadyNow().Docs(stale))); p.Err == nil || len(p.Err.DocArrives) != 1 {
+		t.Errorf("Stale group: want a group change failure, got %v", p.Err)
+	}
+	if p := s.evaluate("other", entroq.Arriving(entroq.ReadyNow().Docs(renew))); p.Err == nil || len(p.Err.GroupClaims) != 1 {
+		t.Errorf("Group held by someone else: want a group claim failure, got %v", p.Err)
+	}
+	absent := &entroq.DocGroup{Namespace: "ns", Key: "none", Version: -1}
+	if p := s.evaluate("me", entroq.Arriving(entroq.ReadyAt(now.Add(time.Minute)).Docs(absent))); p.Err == nil {
+		t.Error("Absent group: want a failure, even named at the absent version")
+	}
+}

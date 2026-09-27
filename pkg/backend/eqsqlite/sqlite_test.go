@@ -30,6 +30,7 @@ func TestBackendContract(t *testing.T) {
 		{"ModifyRespectsTaskClaims", eqtest.ModifyRespectsTaskClaims},
 		{"TasksWithIDStaysInQueue", eqtest.TasksWithIDStaysInQueue},
 		{"DocGroups", eqtest.DocGroups},
+		{"UpdateArrival", eqtest.UpdateArrival},
 		{"TaskChangeFutureArrival", eqtest.TaskChangeFutureArrival},
 		{"TaskChangeFarPastArrivalNormalized", eqtest.TaskChangeFarPastArrivalNormalized},
 		{"ModifyRejectsWrongQueue", eqtest.ModifyRejectsWrongQueue},

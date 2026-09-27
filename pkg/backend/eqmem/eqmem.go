@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/backend/internal/arrival"
 	"github.com/shiblon/entroq/pkg/backend/internal/docgroup"
 	"github.com/shiblon/entroq/pkg/backend/internal/gcmetrics"
 	"github.com/shiblon/entroq/pkg/backend/internal/validate"
@@ -601,6 +602,9 @@ func (m *EQMem) modPrep(mod *entroq.Modification, replay bool) (queueNames, name
 	for _, d := range mod.Depends {
 		queues[d.Queue] = true
 	}
+	for _, a := range mod.Arrives {
+		queues[a.Queue] = true
+	}
 
 	delete(queues, "") // in case there's an empty queue in there.
 
@@ -624,6 +628,9 @@ func (m *EQMem) modPrep(mod *entroq.Modification, replay bool) (queueNames, name
 	}
 	for _, d := range mod.DocDepends {
 		namespaces[d.Namespace] = true
+	}
+	for _, a := range mod.DocArrives {
+		namespaces[a.Namespace] = true
 	}
 
 	delete(namespaces, "")
@@ -779,6 +786,9 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 	for _, c := range mod.Changes {
 		addFound(c.FromQueue, c.ID)
 	}
+	for _, a := range mod.Arrives {
+		addFound(a.Queue, a.ID)
+	}
 	for _, t := range mod.Inserts {
 		addFound(t.Queue, t.ID)
 		if q, ok := misplacedInsIDs[t.ID]; ok {
@@ -803,6 +813,8 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 	if err != nil {
 		return nil, fmt.Errorf("modify get time: %w", err)
 	}
+	// Task arrivals are changes of the stored tasks' arrival times alone.
+	mod = arrival.Changes(mod, now, func(id string) *entroq.Task { return found[id] })
 
 	// Tasks are checked by the modification with its doc operations removed;
 	// doc groups follow their own rules, in docgroup. Replay applies recorded
@@ -992,6 +1004,7 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 	for g, l := range docPlan.Locks {
 		byNS[g.Namespace].docs.SetLock(g.Key, l)
 	}
+	resp.ChangedGroups = docPlan.Arrived
 
 	func() {
 		defer un(lock(m))

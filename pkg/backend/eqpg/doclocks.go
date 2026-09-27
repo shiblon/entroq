@@ -184,7 +184,7 @@ func saveLocks(ctx context.Context, tx *sql.Tx, locks map[docgroup.Group]docgrou
 // modifyDocs applies mod's doc operations inside tx, by the rules in
 // docgroup, adding the written docs to resp.
 func modifyDocs(ctx context.Context, tx *sql.Tx, mod *entroq.Modification, resp *entroq.ModifyResponse) error {
-	if len(mod.DocInserts)+len(mod.DocChanges)+len(mod.DocDeletes)+len(mod.DocDepends) == 0 {
+	if len(mod.DocInserts)+len(mod.DocChanges)+len(mod.DocDeletes)+len(mod.DocDepends)+len(mod.DocArrives) == 0 {
 		return nil
 	}
 	stored, err := lockMembers(ctx, tx, mod)
@@ -232,6 +232,7 @@ func modifyDocs(ctx context.Context, tx *sql.Tx, mod *entroq.Modification, resp 
 		d.Content, d.Modified = chg.Content, now
 		resp.ChangedDocs = append(resp.ChangedDocs, withLock(d))
 	}
+	resp.ChangedGroups = plan.Arrived
 	return writeDocGroups(ctx, tx, mod.DocDeletes, resp.InsertedDocs, resp.ChangedDocs, plan.Locks, now)
 }
 
@@ -372,11 +373,7 @@ func claimDocs(ctx context.Context, tx *sql.Tx, cq *entroq.DocClaim) (*entroq.Do
 	current := locks[g]
 	claimed, ok := docgroup.Claim(current, cq.Claimant, now, cq.Duration)
 	if !ok {
-		depErr := &entroq.DependencyError{}
-		for _, d := range members {
-			depErr.DocClaims = append(depErr.DocClaims, entroq.NewDocID(d.Namespace, d.ID, current.Version))
-		}
-		return nil, depErr
+		return nil, docgroup.HeldError(g, current, members)
 	}
 	if err := saveLocks(ctx, tx, map[docgroup.Group]docgroup.Lock{g: claimed}); err != nil {
 		return nil, err

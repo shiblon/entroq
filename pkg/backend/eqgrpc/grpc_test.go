@@ -131,6 +131,10 @@ func TestGRPCDocGroups(t *testing.T) {
 	RunQTest(t, eqtest.DocGroups)
 }
 
+func TestGRPCUpdateArrival(t *testing.T) {
+	RunQTest(t, eqtest.UpdateArrival)
+}
+
 func TestGRPCTaskChangeFutureArrival(t *testing.T) {
 	RunQTest(t, eqtest.TaskChangeFutureArrival)
 }

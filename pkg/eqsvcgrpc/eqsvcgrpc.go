@@ -39,6 +39,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
 	"sync"
 	"time"
 
@@ -48,9 +49,11 @@ import (
 	"github.com/shiblon/entroq/pkg/authz"
 	"github.com/shiblon/entroq/pkg/pbconv"
 	"github.com/shiblon/entroq/pkg/queues"
+	"github.com/shiblon/entroq/pkg/version"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -518,9 +521,16 @@ func (s *QSvc) modifyAuthz(ctx context.Context, req *pb.ModifyRequest) (*authz.R
 		q(ins.Queue, authz.Insert)
 	}
 	for _, chg := range req.Changes {
-		// Nil-safe getters: a change with OldId/NewData unset yields empty queues,
-		// which fail the queue-integrity check downstream rather than panicking here.
-		change(chg.GetOldId().GetQueue(), chg.GetNewData().GetQueue(), q)
+		// The destination is in whichever data the change carries; a lease
+		// cannot move a task, so it is a change of the task's own queue.
+		var dest string
+		switch data := chg.GetData().(type) {
+		case *pb.TaskChange_NewData:
+			dest = data.NewData.GetQueue()
+		case *pb.TaskChange_NewZeroClaims:
+			dest = data.NewZeroClaims.GetQueue()
+		}
+		change(chg.GetOldId().GetQueue(), dest, q)
 	}
 	for _, del := range req.Deletes {
 		q(del.Queue, authz.Delete)
@@ -550,8 +560,23 @@ func (s *QSvc) modifyAuthz(ctx context.Context, req *pb.ModifyRequest) (*authz.R
 	return authReq, nil
 }
 
+// protocolHeaders are the response headers every RPC sends: the protocol this
+// server speaks, which a client checks before sending anything newer than
+// protocol 1, and its release.
+var protocolHeaders = metadata.Pairs(
+	version.ProtocolHeader, strconv.Itoa(version.Protocol),
+	version.VersionHeader, version.Version,
+)
+
+// announce sends the protocol headers on a unary RPC. It does nothing for a
+// caller not over gRPC; the JSON handler sends them itself.
+func announce(ctx context.Context) {
+	_ = grpc.SetHeader(ctx, protocolHeaders)
+}
+
 // Claim is the blocking version of TryClaim.
 func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
+	announce(ctx)
 	pollTime := time.Duration(0)
 	if req.PollMs > 0 {
 		pollTime = time.Duration(req.PollMs) * time.Millisecond
@@ -591,6 +616,7 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 // available to claim. Callers can check for context cancelation codes to know
 // that this has happened, and may opt to immediately re-send the request.
 func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
+	announce(ctx)
 	opts := claimOpts(req)
 	if err := entroq.NewClaimQuery(opts...).Validate(); err != nil {
 		return nil, autoCodeErrorf("try claim: %w", err)
@@ -631,6 +657,7 @@ func claimOpts(req *pb.ClaimRequest) []entroq.ClaimOpt {
 // reconstruct an entroq.DependencyError, or directly to find out which IDs
 // caused the dependency failure. Code UNKNOWN is returned on other errors.
 func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyResponse, error) {
+	announce(ctx)
 	// Check the modification's shape before authorizing it, with the same
 	// check every backend runs, so a malformed request is InvalidArgument
 	// whether or not an authorizer is configured.
@@ -639,6 +666,10 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 		var inv *pbconv.InvalidRequestError
 		if errors.As(err, &inv) {
 			return nil, codeErrorf(codes.InvalidArgument, "%v", err)
+		}
+		var uns *pbconv.UnsupportedRequestError
+		if errors.As(err, &uns) {
+			return nil, codeErrorf(codes.Unimplemented, "%v", err)
 		}
 		return nil, autoCodeErrorf("modify: %w", err)
 	}
@@ -701,10 +732,15 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 		}
 		pbResp.ChangedDocs = append(pbResp.ChangedDocs, pd)
 	}
+	// A doc set whose lease changed comes back as a Doc with no ID.
+	for _, g := range resp.ChangedGroups {
+		pbResp.ChangedDocs = append(pbResp.ChangedDocs, pbconv.DocGroupToProto(g))
+	}
 	return pbResp, nil
 }
 
 func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksResponse, error) {
+	announce(ctx)
 	if err := (&entroq.TasksQuery{Queue: req.Queue, IDs: req.TaskId}).Validate(); err != nil {
 		return nil, autoCodeErrorf("tasks: %w", err)
 	}
@@ -743,6 +779,7 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 }
 
 func (s *QSvc) StreamTasks(req *pb.TasksRequest, stream pb.EntroQ_StreamTasksServer) error {
+	_ = stream.SetHeader(protocolHeaders)
 	resp, err := s.Tasks(stream.Context(), req)
 	if err != nil {
 		return autoCodeErrorf("get tasks to stream: %w", err)
@@ -766,6 +803,7 @@ func (s *QSvc) StreamTasks(req *pb.TasksRequest, stream pb.EntroQ_StreamTasksSer
 // a dedicated authz action (distinct from Read on task content). That lands in a
 // follow-up because it also requires an authz-policy/CRD schema change.
 func (s *QSvc) Queues(ctx context.Context, req *pb.QueuesRequest) (*pb.QueuesResponse, error) {
+	announce(ctx)
 	queueMap, err := s.impl.Queues(ctx,
 		entroq.MatchPrefix(req.MatchPrefix...),
 		entroq.MatchExact(req.MatchExact...),
@@ -788,6 +826,7 @@ func (s *QSvc) Queues(ctx context.Context, req *pb.QueuesRequest) (*pb.QueuesRes
 // TODO(listing-authz): currently UNGATED. Same listing capability as Queues;
 // see that method. Gated in the follow-up.
 func (s *QSvc) QueueStats(ctx context.Context, req *pb.QueuesRequest) (*pb.QueuesResponse, error) {
+	announce(ctx)
 	queueMap, err := s.impl.QueueStats(ctx,
 		entroq.MatchPrefix(req.MatchPrefix...),
 		entroq.MatchExact(req.MatchExact...),
@@ -814,6 +853,7 @@ func (s *QSvc) QueueStats(ctx context.Context, req *pb.QueuesRequest) (*pb.Queue
 // Intentionally UNAUTHENTICATED: it is the server clock, carries no queue or
 // task data, and clients need it to reason about arrival times.
 func (s *QSvc) Time(ctx context.Context, req *pb.TimeRequest) (*pb.TimeResponse, error) {
+	announce(ctx)
 	return &pb.TimeResponse{TimeMs: pbconv.ToMS(time.Now().UTC())}, nil
 }
 
@@ -833,6 +873,7 @@ func depDetails(depErr *entroq.DependencyError) []proto.Message {
 
 // Docs returns a listing of docs matching the given query.
 func (s *QSvc) Docs(ctx context.Context, req *pb.DocsRequest) (*pb.DocsResponse, error) {
+	announce(ctx)
 	q := req.GetQuery()
 	dq := &entroq.DocQuery{
 		Namespace:  q.GetNamespace(),
@@ -880,6 +921,7 @@ func (s *QSvc) Docs(ctx context.Context, req *pb.DocsRequest) (*pb.DocsResponse,
 // dedicated listing action in the follow-up (needs an authz-policy/CRD change).
 // Doc content (Docs) is already gated.
 func (s *QSvc) NamespaceStats(ctx context.Context, req *pb.NamespacesRequest) (*pb.NamespacesResponse, error) {
+	announce(ctx)
 	nsMap, err := s.impl.NamespaceStats(ctx,
 		entroq.MatchPrefix(req.MatchPrefix...),
 		entroq.MatchExact(req.MatchExact...),
@@ -902,14 +944,28 @@ func (s *QSvc) NamespaceStats(ctx context.Context, req *pb.NamespacesRequest) (*
 // Returns a NotFound status with ModifyDep details if any docs are missing or
 // already claimed.
 func (s *QSvc) ClaimDocs(ctx context.Context, req *pb.ClaimDocsRequest) (*pb.ClaimDocsResponse, error) {
+	announce(ctx)
 	cq := req.GetClaimQuery()
 	// The claimant is the request's: the service's client would otherwise fill
-	// in its own for an empty one, so check the claim as received.
+	// in its own for an empty one, so check the claim as received. At protocol
+	// 2 the sets name what to claim, and the namespace and key are ignored.
 	dc := &entroq.DocClaim{
 		Namespace: cq.GetNamespace(),
 		Claimant:  cq.GetClaimant(),
 		Key:       cq.GetKey(),
 		Duration:  time.Duration(cq.GetDurationMs()) * time.Millisecond,
+	}
+	if sets := cq.GetSets(); len(sets) > 0 {
+		// Transitional: claims of several sets at once come with atomic
+		// multi-set claims in every backend.
+		if len(sets) > 1 {
+			return nil, codeErrorf(codes.Unimplemented, "claim docs: claiming %d doc sets at once is not supported yet", len(sets))
+		}
+		key, ok := sets[0].GetRef().(*pb.DocID_Key)
+		if !ok {
+			return nil, codeErrorf(codes.InvalidArgument, "claim docs: a doc set is named by its key, not a doc ID")
+		}
+		dc.Namespace, dc.Key = sets[0].GetNamespace(), key.Key
 	}
 	if err := dc.Validate(); err != nil {
 		return nil, autoCodeErrorf("claim docs: %w", err)
@@ -920,7 +976,7 @@ func (s *QSvc) ClaimDocs(ctx context.Context, req *pb.ClaimDocsRequest) (*pb.Cla
 		authReq := s.newAuthzRequest(ctx)
 		authReq.ClaimantId = cq.GetClaimant()
 		authReq.Namespaces = append(authReq.Namespaces, &authz.Namespace{
-			Exact:   cq.GetNamespace(),
+			Exact:   dc.Namespace,
 			Actions: []authz.Action{authz.Claim},
 		})
 		if err := s.Authorize(ctx, authReq); err != nil {
@@ -939,7 +995,7 @@ func (s *QSvc) ClaimDocs(ctx context.Context, req *pb.ClaimDocsRequest) (*pb.Cla
 		}
 		return nil, autoCodeErrorf("claim docs: %w", err)
 	}
-	resp := &pb.ClaimDocsResponse{Group: pbconv.DocGroupToProto(claimed)}
+	resp := &pb.ClaimDocsResponse{Sets: []*pb.Doc{pbconv.DocGroupToProto(claimed)}}
 	for _, d := range claimed.Docs {
 		pd, err := pbconv.DocToProto(d)
 		if err != nil {

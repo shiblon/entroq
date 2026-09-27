@@ -555,7 +555,7 @@ func (b *Bridge) doWork(ctx context.Context, task *entroq.Task, _ json.RawMessag
 	}
 	msg := doWorkMsg{Type: msgDoWork, Task: wireTask{taskPB}}
 	for _, g := range groups {
-		wg := wireGroup{DocGroup: pbconv.DocGroupToProto(g)}
+		wg := wireGroup{Doc: pbconv.DocGroupToProto(g)}
 		for _, d := range g.Docs {
 			docPB, err := pbconv.DocToProto(d)
 			if err != nil {

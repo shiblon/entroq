@@ -232,16 +232,17 @@ type doWorkMsg struct {
 	Groups []wireGroup `json:"groups,omitempty"`
 }
 
-// wireGroup is a claimed doc group on the wire: the protojson of its pb.DocGroup
-// lock, with its docs beside the lock's fields as "docs".
+// wireGroup is a claimed doc set on the wire: the protojson of the pb.Doc
+// standing for the set (its lock and doc count, no ID or content), with its
+// docs beside those fields as "docs".
 type wireGroup struct {
-	*pb.DocGroup
+	*pb.Doc
 	Docs []wireDoc
 }
 
 // MarshalJSON renders the group's lock as protojson and adds its docs.
 func (w wireGroup) MarshalJSON() ([]byte, error) {
-	b, err := protojson.Marshal(w.DocGroup)
+	b, err := protojson.Marshal(w.Doc)
 	if err != nil {
 		return nil, err
 	}
@@ -273,8 +274,8 @@ func (w *wireGroup) UnmarshalJSON(b []byte) error {
 	if err != nil {
 		return err
 	}
-	w.DocGroup = &pb.DocGroup{}
-	return unmarshalPB(lock, w.DocGroup)
+	w.Doc = &pb.Doc{}
+	return unmarshalPB(lock, w.Doc)
 }
 
 // orEmpty returns s, or an empty slice for nil, so it encodes as [] not null.

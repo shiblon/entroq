@@ -15,6 +15,7 @@
 package docgroup
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/shiblon/entroq"
@@ -88,12 +89,42 @@ func Claimed(g Group, l Lock, members []*entroq.Doc) *entroq.DocGroup {
 	return dg
 }
 
+// Current returns the group g as its lock l stands, without its docs: what a
+// dependency error or an arrival update reports.
+func Current(g Group, l Lock) *entroq.DocGroup {
+	return &entroq.DocGroup{
+		Namespace: g.Namespace,
+		Key:       g.Key,
+		Version:   l.Version,
+		Claimant:  l.Claimant,
+		At:        l.At,
+		NumDocs:   l.NumDocs,
+	}
+}
+
+// HeldError is the error for a claim of g, holding lock l, by someone else:
+// it names the group, with its lock, and its members, for clients that know
+// only doc failures.
+func HeldError(g Group, l Lock, members []*entroq.Doc) *entroq.DependencyError {
+	depErr := &entroq.DependencyError{
+		Message:     fmt.Sprintf("doc group %q in namespace %q is claimed by %s until %v", g.Key, g.Namespace, l.Claimant, l.At),
+		GroupClaims: []*entroq.DocGroup{Current(g, l)},
+	}
+	for _, d := range members {
+		depErr.DocClaims = append(depErr.DocClaims, entroq.NewDocID(d.Namespace, d.ID, l.Version))
+	}
+	return depErr
+}
+
 // Plan is what a modification does to doc groups.
 type Plan struct {
 	// Err describes every doc operation that cannot proceed, or is nil.
 	Err *entroq.DependencyError
 	// Locks holds the new lock of every group the modification writes.
 	Locks map[Group]Lock
+	// Arrived holds each group mod.DocArrives names at its new lock, in the
+	// order named: a modify response's changed groups.
+	Arrived []*entroq.DocGroup
 }
 
 // Evaluate checks mod's doc operations and computes the lock each written
@@ -123,8 +154,20 @@ func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string
 		}
 		held[g] = latest
 	}
+	// claimed reports whether someone else holds g, naming the group in the
+	// error the first time. The members are named too, for clients that
+	// know only doc failures.
+	reported := make(map[Group]bool)
 	claimed := func(g Group) bool {
-		return lock(g).HeldByOther(mod.Claimant, now)
+		l := lock(g)
+		if !l.HeldByOther(mod.Claimant, now) {
+			return false
+		}
+		if !reported[g] {
+			reported[g] = true
+			depErr.GroupClaims = append(depErr.GroupClaims, Current(g, l))
+		}
+		return true
 	}
 	// stored returns the member's group and lock, or false if it does not
 	// exist at version.
@@ -181,6 +224,19 @@ func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string
 			depErr.DocDepends = append(depErr.DocDepends, dep)
 		}
 	}
+	// An arrival names the group itself, at its version, and writes only when
+	// it is ready again.
+	for _, a := range mod.DocArrives {
+		g := Group{Namespace: a.Namespace, Key: a.Key}
+		l := lock(g)
+		switch {
+		case l.Version < 0 || l.Version != a.Version:
+			depErr.DocArrives = append(depErr.DocArrives, Current(g, l))
+		case claimed(g):
+		default:
+			write(g, a.At)
+		}
+	}
 
 	plan := Plan{Locks: make(map[Group]Lock, len(held))}
 	if depErr.HasAny() {
@@ -195,12 +251,16 @@ func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string
 		}
 		plan.Locks[g] = next
 	}
+	for _, a := range mod.DocArrives {
+		g := Group{Namespace: a.Namespace, Key: a.Key}
+		plan.Arrived = append(plan.Arrived, Current(g, plan.Locks[g]))
+	}
 	return plan
 }
 
 // Groups lists the doc groups mod's doc operations name, each once: an
-// insert's by its key, and every other operation's by its stored member's
-// key. member returns the stored doc with the given namespace and ID, or nil.
+// insert's and an arrival's by its key, and every other operation's by its
+// stored member's key. member returns the stored doc with the given namespace and ID, or nil.
 // A backend locks or reads these groups before calling Evaluate; see
 // Exclusive for which need an exclusive lock.
 func Groups(mod *entroq.Modification, member func(ns, id string) *entroq.Doc) []Group {
@@ -229,12 +289,16 @@ func Groups(mod *entroq.Modification, member func(ns, id string) *entroq.Doc) []
 	for _, dep := range mod.DocDepends {
 		stored(dep.Namespace, dep.ID)
 	}
+	for _, a := range mod.DocArrives {
+		add(Group{Namespace: a.Namespace, Key: a.Key})
+	}
 	return groups
 }
 
 // Exclusive reports which of mod's groups a backend must lock exclusively
-// before calling Evaluate: those it writes, by inserting into them or changing
-// or deleting a member. mod only depends on the rest, so they may be locked
+// before calling Evaluate: those it writes, by inserting into them, changing
+// or deleting a member, or changing their arrival. mod only depends on the
+// rest, so they may be locked
 // shared, and since a depend names a stored member, they already exist.
 func Exclusive(mod *entroq.Modification, member func(ns, id string) *entroq.Doc) map[Group]bool {
 	exclusive := make(map[Group]bool)
@@ -251,6 +315,9 @@ func Exclusive(mod *entroq.Modification, member func(ns, id string) *entroq.Doc)
 	}
 	for _, del := range mod.DocDeletes {
 		stored(del.Namespace, del.ID)
+	}
+	for _, a := range mod.DocArrives {
+		exclusive[Group{Namespace: a.Namespace, Key: a.Key}] = true
 	}
 	return exclusive
 }

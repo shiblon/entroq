@@ -7,12 +7,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/shiblon/entroq/pkg/backend/eqmem"
 	"github.com/shiblon/entroq/pkg/eqsvcgrpc"
 	"github.com/shiblon/entroq/pkg/eqsvcjson"
+	"github.com/shiblon/entroq/pkg/version"
 )
 
 // newTestServer stands up an in-memory EntroQ backend behind the JSON/Connect
@@ -140,6 +142,28 @@ func TestOverLimitValuesAre400(t *testing.T) {
 			code, out := postJSON(t, ts.URL+test.path, test.body)
 			if code != http.StatusBadRequest {
 				t.Fatalf("status = %d, want 400; body=%v", code, out)
+			}
+		})
+	}
+}
+
+// TestResponsesCarryProtocol checks that JSON responses, successful or not,
+// carry the server's protocol, as gRPC responses do.
+func TestResponsesCarryProtocol(t *testing.T) {
+	ts, cleanup := newTestServer(t)
+	defer cleanup()
+	for name, body := range map[string]string{
+		"success": `{"claimantId": "test", "inserts": [{"queue": "/q", "value": "x"}]}`,
+		"error":   `{"claimantId": "test", "deletes": [{"id": "none", "version": 1, "queue": "/q"}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			resp, err := http.Post(ts.URL+"/api/v0/modify", "application/json", strings.NewReader(body))
+			if err != nil {
+				t.Fatalf("post: %v", err)
+			}
+			resp.Body.Close()
+			if got := resp.Header.Get(version.ProtocolHeader); got != strconv.Itoa(version.Protocol) {
+				t.Errorf("status %d: protocol header %q, want %d", resp.StatusCode, got, version.Protocol)
 			}
 		})
 	}

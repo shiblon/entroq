@@ -83,6 +83,10 @@ func TestEQMemDocGroups(t *testing.T) {
 	RunQTest(t, eqtest.DocGroups)
 }
 
+func TestEQMemUpdateArrival(t *testing.T) {
+	RunQTest(t, eqtest.UpdateArrival)
+}
+
 func TestEQMemTaskChangeFutureArrival(t *testing.T) {
 	RunQTest(t, eqtest.TaskChangeFutureArrival)
 }
@@ -993,4 +997,56 @@ func TestEQMemDocsOrderAndLimits(t *testing.T) {
 
 func TestEQMemTaskClaimantIsHolder(t *testing.T) {
 	RunQTest(t, eqtest.TaskClaimantIsHolder)
+}
+
+// TestEQMemJournalUpdateArrival renews a task and a group, reopens, and checks
+// that replay restores both at their renewed versions and claims.
+func TestEQMemJournalUpdateArrival(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	opener := Opener(WithJournal(t.TempDir()))
+	eq, err := entroq.New(ctx, opener)
+	if err != nil {
+		t.Fatalf("Open journaled client: %v", err)
+	}
+	const queue, namespace = "/journal/arrival/tasks", "/journal/arrival/docs"
+	if _, err := eq.Modify(ctx,
+		entroq.InsertingInto(queue, entroq.WithValue("task")),
+		entroq.PuttingDocInto(namespace, entroq.WithKeys("g", "a")),
+	); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	task, err := eq.Claim(ctx, entroq.From(queue), entroq.ClaimFor(time.Minute))
+	if err != nil {
+		t.Fatalf("Claim task: %v", err)
+	}
+	group, err := eq.ClaimDocs(ctx, entroq.ClaimKey(namespace, "g").For(time.Minute))
+	if err != nil {
+		t.Fatalf("Claim group: %v", err)
+	}
+	resp, err := eq.UpdateArrival(ctx, entroq.ReadyIn(time.Hour).Tasks(task).Docs(group))
+	if err != nil {
+		t.Fatalf("Renew: %v", err)
+	}
+	holder := eq.ClientID
+	if err := eq.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if eq, err = entroq.New(ctx, opener); err != nil {
+		t.Fatalf("Reopen: %v", err)
+	}
+	defer eq.Close()
+	tasks, err := eq.Tasks(ctx, queue)
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("Tasks after replay: %v, %v", tasks, err)
+	}
+	if got, want := tasks[0], resp.ChangedTasks[0]; got.Version != want.Version || got.Claimant != holder || !got.At.Equal(want.At) {
+		t.Errorf("Task after replay: want version %d held by %s until %v, got %+v", want.Version, holder, want.At, got)
+	}
+	renewed := resp.ChangedGroups[0]
+	if _, err := eq.Modify(ctx, entroq.Arriving(entroq.ReadyNow().Docs(renewed)), entroq.ModifyAs(holder)); err != nil {
+		t.Errorf("Release of the group at its renewed version after replay: %v", err)
+	}
 }

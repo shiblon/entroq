@@ -392,13 +392,18 @@ components:
                     type: array
                     items:
                         $ref: '#/components/schemas/Doc'
-                group:
-                    $ref: '#/components/schemas/DocGroup'
+                    description: Contains all docs within any set, with content.
+                sets:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/Doc'
+                    description: |-
+                        Contains all doc set top-level values.
+                         Not present for servers on protocol 1.
+                         Contains no content.
             description: |-
                 ClaimDocsResponse contains the docs claimed by a ClaimDocs call, and the
-                 group they belong to, which is present even when the group has no docs.
-                 A dependency error (a group held by someone else) comes through as gRPC's
-                 NOT_FOUND code with ModifyDep details carrying doc_id fields.
+                 sets they belong to. All sets are present, but not all sets have docs.
         ClaimRequest:
             type: object
             properties:
@@ -457,7 +462,14 @@ components:
                     type: string
                 modifiedMs:
                     type: string
-            description: Doc is a complete doc object with identity, data, and metadata.
+                len:
+                    type: integer
+                    description: Number of docs under a doc set, if applicable.
+                    format: int32
+            description: |-
+                Doc is a complete doc object with identity, data, and metadata.
+                 Note that when representing a set, it will not contain id, secondary_key, or
+                 content.
         DocChange:
             type: object
             properties:
@@ -465,23 +477,42 @@ components:
                     $ref: '#/components/schemas/DocID'
                 newData:
                     $ref: '#/components/schemas/DocData'
+                newLease:
+                    allOf:
+                        - $ref: '#/components/schemas/DocData'
+                    description: |-
+                        Set only the lease information. Supply only at_ms. If namespace, key, or
+                         secondary_key are specified, they must be equal to the previous values
+                         in old_id. Can use with servers on protocol 2.
             description: |-
                 DocChange identifies a doc by DocID and provides updated data. Only content
                  from new_data is applied; keys are immutable after creation.
+
+                 Use new_lease to only update the arrival time for a doc set.
         DocClaim:
             type: object
             properties:
-                namespace:
+                sets:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/DocID'
+                    description: Use for protocol 2.
+                durationMs:
                     type: string
                 claimant:
                     type: string
-                key:
+                namespace:
                     type: string
-                durationMs:
+                    description: Use for protocol 1.
+                key:
                     type: string
             description: |-
                 DocClaim describes an atomic all-or-nothing claim of docs in a namespace.
-                 All docs sharing the given key are claimed together.
+                 In protocol 1, all docs sharing the given key are claimed together. For
+                 protocol 2, only namespace and primary keys are specified and it will try to
+                 claim all specified document sets by namespace and primary key.
+
+                 If sets are specified, namespace and key are ignored.
         DocData:
             type: object
             properties:
@@ -508,29 +539,6 @@ components:
                 DocData holds the data portion of a doc, used for insertions. The created_ms
                  and modified_ms fields are used only for journal replay; leave them zero for
                  normal insertions.
-        DocGroup:
-            type: object
-            properties:
-                namespace:
-                    type: string
-                key:
-                    type: string
-                version:
-                    type: integer
-                    format: int32
-                claimant:
-                    type: string
-                atMs:
-                    type: string
-                numDocs:
-                    type: integer
-                    description: How many docs the group has, whichever of them travel with it.
-                    format: int32
-            description: |-
-                DocGroup is a doc group's lock: the docs sharing a primary key in a
-                 namespace have one version, claimant, and arrival time between them, held
-                 here, and each member reports them. A group can be claimed before it has
-                 any docs, so the lock stands on its own; its members travel separately.
         DocID:
             type: object
             properties:
@@ -538,6 +546,12 @@ components:
                     type: string
                 id:
                     type: string
+                key:
+                    type: string
+                    description: Used for servers at protocol 2.
+                secondaryKey:
+                    type: string
+                    description: Only meaningful if key is present.
                 version:
                     type: integer
                     format: int32
@@ -742,7 +756,27 @@ components:
                 oldId:
                     $ref: '#/components/schemas/TaskID'
                 newData:
-                    $ref: '#/components/schemas/TaskData'
+                    allOf:
+                        - $ref: '#/components/schemas/TaskData'
+                    description: MUST use this with protocol 1. Anything else will delete task contents.
+                newZeroClaims:
+                    allOf:
+                        - $ref: '#/components/schemas/TaskData'
+                    description: |-
+                        Send new task data, request a claims reset. Default in newer clients.
+                         Changes the claims semantic to match original intent: if a task keeps
+                         getting abandoned, it can hit a max. If it is intentionally modified, it
+                         resets: not a poison pill.
+
+                         New clients for protocol 2 should use this field instead of new_data
+                         for intentional modification. For lease renewal, use new_lease instead,
+                         which requires no content to be passed, and does not reset claims.
+                newLease:
+                    allOf:
+                        - $ref: '#/components/schemas/TaskData'
+                    description: |-
+                        Update only the lease information. Only at_ms is used. If specified,
+                         queue must equal old_id.queue. For protocol 2.
             description: |-
                 TaskChange identifies a task by ID and specifies the new data it should contain.
                  All fields should be filled in. Empty fields result in deleting data from that field.
