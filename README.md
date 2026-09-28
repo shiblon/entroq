@@ -245,8 +245,12 @@ A worker can be written in **any** language without importing EntroQ or gRPC:
 behalf and speaks a small newline-delimited JSON protocol over a stdio pipe or a
 WebSocket. See the wire contract and the client recipes in
 [`docs/workgateway-protocol.md`](docs/workgateway-protocol.md), and a minimal
-Python example in [`examples/workgateway/`](examples/workgateway/). This surface
-is new and currently experimental (see the [changelog](CHANGELOG.md)).
+Python example in [`examples/workgateway/`](examples/workgateway/).
+
+> [!WARNING]
+> The work gateway is experimental. Its protocol and its behavior under
+> cancellation and disconnection may change without backward compatibility
+> (see the [changelog](CHANGELOG.md)).
 
 ## Document Store
 

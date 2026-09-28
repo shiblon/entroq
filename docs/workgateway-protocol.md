@@ -1,5 +1,9 @@
 # Work Gateway Protocol
 
+> [!WARNING]
+> The work gateway is experimental. Its wire protocol and its behavior under
+> cancellation and disconnection may change without backward compatibility.
+
 The work gateway (`eqlink work`, package `workgateway`) lets a worker written in
 any language run the EntroQ worker loop without importing EntroQ, gRPC, or the
 queue API. The gateway runs the hard, stateful part in Go — claim, renew at half

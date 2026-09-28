@@ -1,4 +1,7 @@
-// Package workgateway bridges EntroQ's worker loop to a language-agnostic worker
+// Package workgateway is EXPERIMENTAL: its wire protocol and its handling of
+// cancellation and disconnection may change without backward compatibility.
+//
+// It bridges EntroQ's worker loop to a language-agnostic worker
 // spoken to over a small newline-delimited JSON protocol. eqlink runs the hard,
 // stateful part (claim, renew at half the lease, stop-and-freeze before commit,
 // version fix-up, retry/move/backoff, doc-claim ordering) once, in Go; a worker
