@@ -3,6 +3,7 @@ package eqsqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -374,4 +375,34 @@ func TestBackendRejectsInvalidRequests(t *testing.T) {
 	defer b.Close()
 	eqtest.BackendRejectsInvalidRequests(ctx, t, b, "sqlitetest")
 	eqtest.StorageRejectsZeroDurations(ctx, t, b, "sqlitetest")
+}
+
+// TestWriteEndedByContextIsCanceled checks that a write whose context ends
+// mid-transaction reports the cancellation. database/sql rolls such a
+// transaction back itself, and Commit then says only that it is done, which a
+// worker would take for a failure rather than a clean stop.
+func TestWriteEndedByContextIsCanceled(t *testing.T) {
+	b, err := Open(context.Background(), filepath.Join(t.TempDir(), "entroq.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	_, err = b.write(ctx, func(_ context.Context, tx *sql.Tx) (any, error) {
+		cancel()
+		// Wait for database/sql to roll the transaction back.
+		for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+			var one int
+			if err := tx.QueryRowContext(context.Background(), "SELECT 1").Scan(&one); errors.Is(err, sql.ErrTxDone) {
+				return nil, nil
+			}
+			if time.Now().After(deadline) {
+				return nil, fmt.Errorf("transaction not rolled back after cancel")
+			}
+		}
+	})
+	if !entroq.IsCanceled(err) {
+		t.Errorf("Write ended by its context: want a cancellation, got %v", err)
+	}
 }

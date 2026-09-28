@@ -360,12 +360,23 @@ func (b *EQSQLite) write(ctx context.Context, call func(context.Context, *sql.Tx
 	defer tx.Rollback()
 	value, err = call(ctx, tx)
 	if err != nil {
-		return nil, fmt.Errorf("write call: %w", err)
+		return nil, fmt.Errorf("write call: %w", ended(ctx, err))
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("write commit: %w", err)
+		return nil, fmt.Errorf("write commit: %w", ended(ctx, err))
 	}
 	return value, nil
+}
+
+// ended reports a transaction that database/sql rolled back because ctx
+// ended as the context's error. Its own error says only that the transaction
+// is done, which hides a clean stop as a failure. Nothing was written either
+// way.
+func ended(ctx context.Context, err error) error {
+	if errors.Is(err, sql.ErrTxDone) && ctx.Err() != nil {
+		return errors.Join(ctx.Err(), err)
+	}
+	return err
 }
 
 // Close stops background work and closes all SQLite connections.
