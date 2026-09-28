@@ -2,11 +2,13 @@ package workgateway
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
 	"github.com/shiblon/entroq"
 	pb "github.com/shiblon/entroq/api"
+	"github.com/shiblon/entroq/pkg/worker"
 )
 
 // These tests cover the failure contract: what the gateway does when the
@@ -278,5 +280,41 @@ func TestContract_HangUpInDependency(t *testing.T) {
 	tasks, err := eq.Tasks(ctx, "in")
 	if err != nil || len(tasks) != 1 || !tasks[0].At.After(time.Now()) {
 		t.Fatalf("want the task still held for its lease, got %v, %v", tasks, err)
+	}
+}
+
+// nopConn sends nothing anywhere and never receives, for driving a Bridge's
+// request machinery directly.
+type nopConn struct{}
+
+func (nopConn) Send(context.Context, any) error { return nil }
+func (nopConn) Recv(ctx context.Context, _ any) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// TestRequestPrefersArrivedReply: a reply already delivered when the context
+// ends still answers the request, whichever case select picks.
+func TestRequestPrefersArrivedReply(t *testing.T) {
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	for range 200 {
+		b := NewBridge(nopConn{})
+		b.replies <- json.RawMessage(`{"type":"done","outcome":"ok"}`)
+		var d done
+		if err := b.request(canceled, successMsg{Type: msgSuccess}, &d, nil); err != nil || d.Type != msgDone {
+			t.Fatalf("request with a waiting reply: got %+v, %v", d, err)
+		}
+	}
+}
+
+// TestSuccessStopIsClean: a success phase cut short by stopping is a clean
+// stop, not the fatal a dropped connection escalates to.
+func TestSuccessStopIsClean(t *testing.T) {
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := NewBridge(nopConn{}).success(canceled)
+	if _, fatal := worker.AsFatal(err); fatal || !entroq.IsCanceled(err) {
+		t.Errorf("success when stopped: want a cancellation, got %v", err)
 	}
 }

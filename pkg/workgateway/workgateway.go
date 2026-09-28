@@ -210,6 +210,13 @@ func (b *Bridge) request(ctx context.Context, msg, reply any, abort *abortMsg) e
 		return b.goneErr()
 	case <-ctx.Done():
 	}
+	// A reply that arrived as ctx ended still answers the request: select
+	// picks among ready cases at random.
+	select {
+	case raw := <-b.replies:
+		return json.Unmarshal(raw, reply)
+	default:
+	}
 	if abort != nil {
 		return b.awaitAbort(ctx, abort)
 	}
@@ -689,6 +696,10 @@ func (b *Bridge) report(ctx context.Context, depErr *entroq.DependencyError) err
 func (b *Bridge) success(ctx context.Context) error {
 	var d done
 	if err := b.request(ctx, successMsg{Type: msgSuccess}, &d, nil); err != nil {
+		// Stopping is a clean stop, not the dropped connection escalated below.
+		if entroq.IsCanceled(err) || entroq.IsTimeout(err) {
+			return fmt.Errorf("success: %w", err)
+		}
 		return worker.FatalErrorf("success: %v", err)
 	}
 	if d.Type != msgDone {
