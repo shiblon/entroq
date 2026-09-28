@@ -732,42 +732,58 @@ type RenewResponse struct {
 	Docs  []*Doc
 }
 
-// RenewEverything updates the At time of all specified tasks and docs.
+// Renew makes the tasks and docs it names ready again after the renewal
+// interval, keeping their claims. A doc renews its whole doc set, as every
+// member of a set shares its lease: the docs come back at their set's new
+// version, and a set is renewed once however many of its docs are named.
+//
+// Deprecated: use UpdateArrival, which renews doc sets directly, including
+// sets with no docs.
 func (c *EntroQ) Renew(ctx context.Context, opts ...RenewOption) (*RenewResponse, error) {
 	conf := NewRenewConfig(opts...)
-	if len(conf.Tasks) == 0 && len(conf.Docs) == 0 {
-		return nil, fmt.Errorf("renew: no docs or tasks specified")
+	if conf.IsEmpty() {
+		return nil, InvalidArgumentf("renew: no docs or tasks specified")
 	}
-	// Note that we use the default claimant always in this situation. These
-	// functions are high-level user-friendly things and don't allow some of
-	// the other hocus pocus that might happen in a grpc proxy situation (where
-	// claimant IDs need to come from the request, not the client it uses to
-	// perform its work).
-	var modArgs []ModifyArg
-	var taskIDs []string
-	var docIDs []string
-	for _, t := range conf.Tasks {
-		modArgs = append(modArgs, t.Change(ArrivalTimeBy(conf.Interval)))
-		taskIDs = append(taskIDs, t.IDVersion().String())
-	}
+	type setKey struct{ ns, key string }
+	var sets []*DocSet
+	seen := make(map[setKey]bool)
 	for _, d := range conf.Docs {
-		modArgs = append(modArgs, d.Change(WithDocArrivalTimeBy(conf.Interval)))
-		docIDs = append(docIDs, d.IDVersion().String())
+		k := setKey{d.Namespace, d.Key}
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		sets = append(sets, &DocSet{Namespace: d.Namespace, Key: d.Key, Version: d.Version})
 	}
-	resp, err := c.Modify(ctx, modArgs...)
+	resp, err := c.UpdateArrival(ctx, ReadyIn(conf.Interval).Tasks(conf.Tasks...).Docs(sets...))
 	if err != nil {
-		return nil, fmt.Errorf("renewal failed for tasks/docs %q/%q: %w", taskIDs, docIDs, err)
+		return nil, fmt.Errorf("renew: %w", err)
 	}
-	changed := resp.ChangedTasks
-	changedDocs := resp.ChangedDocs
-	if len(changed) != len(conf.Tasks) || len(changedDocs) != len(conf.Docs) {
-		return nil, fmt.Errorf("renewal expected updates of %d tasks / %d docs, got %d / %d", len(conf.Tasks), len(conf.Docs), len(changed), len(changedDocs))
+	tasks, err := inOrder(conf.Tasks, resp.ChangedTasks)
+	if err != nil {
+		return nil, fmt.Errorf("renew: %w", err)
 	}
-	return &RenewResponse{Tasks: changed, Docs: changedDocs}, nil
+	locks := make(map[setKey]*DocSet, len(resp.ChangedSets))
+	for _, g := range resp.ChangedSets {
+		locks[setKey{g.Namespace, g.Key}] = g
+	}
+	docs := make([]*Doc, 0, len(conf.Docs))
+	for _, d := range conf.Docs {
+		g, ok := locks[setKey{d.Namespace, d.Key}]
+		if !ok {
+			return nil, fmt.Errorf("renew: doc set %q in %q was not renewed", d.Key, d.Namespace)
+		}
+		nd := *d
+		nd.Version, nd.Claimant, nd.At = g.Version, g.Claimant, g.At
+		docs = append(docs, &nd)
+	}
+	return &RenewResponse{Tasks: tasks, Docs: docs}, nil
 }
 
-// RenewFor attempts to renew the given task's lease (update arrival time) for
-// the given duration. Returns the new task.
+// RenewFor makes a task ready again after duration, keeping its claim, and
+// returns it at its new version.
+//
+// Deprecated: use UpdateArrival.
 func (c *EntroQ) RenewFor(ctx context.Context, task *Task, duration time.Duration) (*Task, error) {
 	changed, err := c.RenewAllFor(ctx, []*Task{task}, duration)
 	if err != nil {
@@ -776,32 +792,36 @@ func (c *EntroQ) RenewFor(ctx context.Context, task *Task, duration time.Duratio
 	return changed[0], nil
 }
 
-// RenewAllFor attempts to renew all given tasks' leases (update arrival times)
-// for the given duration. Returns the new tasks.
-func (c *EntroQ) RenewAllFor(ctx context.Context, tasks []*Task, duration time.Duration) (result []*Task, err error) {
+// RenewAllFor makes tasks ready again after duration, keeping their claims,
+// and returns them at their new versions, in the order given.
+//
+// Deprecated: use UpdateArrival.
+func (c *EntroQ) RenewAllFor(ctx context.Context, tasks []*Task, duration time.Duration) ([]*Task, error) {
 	if len(tasks) == 0 {
 		return nil, nil
 	}
-	// Note that we use the default claimant always in this situation. These
-	// functions are high-level user-friendly things and don't allow some of
-	// the other hocus pocus that might happen in a grpc proxy situation (where
-	// claimant IDs need to come from the request, not the client it uses to
-	// perform its work).
-	var modArgs []ModifyArg
-	var taskIDs []string
-	for _, t := range tasks {
-		modArgs = append(modArgs, t.Change(ArrivalTimeBy(duration)))
-		taskIDs = append(taskIDs, t.IDVersion().String())
-	}
-	resp, err := c.Modify(ctx, modArgs...)
+	resp, err := c.UpdateArrival(ctx, ReadyIn(duration).Tasks(tasks...))
 	if err != nil {
-		return nil, fmt.Errorf("renewal failed for tasks %q: %w", taskIDs, err)
+		return nil, fmt.Errorf("renew tasks: %w", err)
 	}
-	changed := resp.ChangedTasks
-	if len(changed) != len(tasks) {
-		return nil, fmt.Errorf("renewal expected %d updated tasks, got %d", len(tasks), len(changed))
+	return inOrder(tasks, resp.ChangedTasks)
+}
+
+// inOrder returns changed in the order of the tasks they are new versions of.
+func inOrder(tasks, changed []*Task) ([]*Task, error) {
+	byID := make(map[string]*Task, len(changed))
+	for _, t := range changed {
+		byID[t.ID] = t
 	}
-	return changed, nil
+	out := make([]*Task, 0, len(tasks))
+	for _, t := range tasks {
+		nt, ok := byID[t.ID]
+		if !ok {
+			return nil, fmt.Errorf("task %s was not renewed", t.ID)
+		}
+		out = append(out, nt)
+	}
+	return out, nil
 }
 
 // Modify allows a batch of mutations to be applied atomically to the task store.

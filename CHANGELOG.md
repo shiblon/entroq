@@ -273,6 +273,11 @@ runs, so plan a short maintenance window on large doc tables.
 
 ### Deprecated
 
+- **`EntroQ.Renew`, `RenewFor`, and `RenewAllFor`.** They now make one
+  `UpdateArrival` rather than rewriting every task and doc, so a renewal no
+  longer resends values. A doc passed to `Renew` renews its whole set, and
+  comes back at the set's new version. Use `UpdateArrival`, which also renews
+  a set with no docs; these will be removed.
 - **`EntroQ.TryClaimDocByID`.** A doc has no claim of its own: it claimed the
   doc's whole set and returned only the named doc. Claim the set with
   `ClaimDocs(ctx, entroq.ClaimKey(ns, doc.Key))`, which also works for a set
