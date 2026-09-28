@@ -15,7 +15,7 @@ func TestArrivingBuildsArrivals(t *testing.T) {
 	if got := mod.Arrives[0]; got.TaskID != (TaskID{ID: "t", Version: 3, Queue: "q"}) || time.Until(got.At) < 59*time.Second {
 		t.Errorf("Task arrival: want task t ready in a minute, got %+v", got)
 	}
-	if got := mod.DocArrives[0]; got.DocSetID != (DocSetID{Namespace: "ns", Key: "k", Version: 5}) || !got.At.IsZero() {
+	if got := mod.DocArrives[0]; got.DocID != *NewDocSetRef("ns", "k", 5) || !got.At.IsZero() {
 		t.Errorf("Set arrival: want set ns/k ready now, got %+v", got)
 	}
 }
@@ -35,6 +35,10 @@ func TestArrivalsValidate(t *testing.T) {
 		{"task twice", []ModifyArg{Arriving(ReadyNow().Tasks(task), ReadyIn(time.Second).Tasks(task))}, false},
 		{"task arriving and deleted", []ModifyArg{Arriving(ReadyNow().Tasks(task)), task.Delete()}, false},
 		{"set twice", []ModifyArg{Arriving(ReadyNow().Docs(set, set))}, false},
+		{"set with no key", []ModifyArg{Arriving(ReadyNow().Docs(&DocSet{Namespace: "ns"}))}, false},
+		{"doc, not a set", []ModifyArg{func(m *Modification) {
+			m.DocArrives = append(m.DocArrives, &DocArrival{DocID: *NewDocID("ns", "d", 0)})
+		}}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mod := NewModification("me", tc.args...)

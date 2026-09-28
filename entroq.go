@@ -1137,6 +1137,9 @@ func (m *Modification) EnsureModifyKeys() error {
 	}
 	sets := make(map[[2]string]bool, len(m.DocArrives))
 	for _, a := range m.DocArrives {
+		if !a.IsSetRef() {
+			return InvalidArgumentf("modify: doc arrival %v must name a doc set by key, not a doc", a.DocID)
+		}
 		if a.Namespace == "" {
 			return InvalidArgumentf("modify: arrival of doc set %q must name a namespace", a.Key)
 		}

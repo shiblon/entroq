@@ -2,25 +2,12 @@ package entroq
 
 import (
 	"context"
-	"fmt"
 	"time"
 )
 
-// DocSetID names a doc set at a version.
-type DocSetID struct {
-	Namespace string `json:"namespace"`
-	Key       string `json:"key"`
-	Version   int32  `json:"version"`
-}
-
-// String produces the set's namespace, key, and version for display.
-func (g *DocSetID) String() string {
-	return fmt.Sprintf("%s:%s:v%d", g.Namespace, g.Key, g.Version)
-}
-
-// ID returns the set's name and version.
-func (g *DocSet) ID() *DocSetID {
-	return &DocSetID{Namespace: g.Namespace, Key: g.Key, Version: g.Version}
+// Ref names the set at its version.
+func (g *DocSet) Ref() *DocID {
+	return NewDocSetRef(g.Namespace, g.Key, g.Version)
 }
 
 // TaskArrival changes only when a task is ready again: at At, holding it until
@@ -32,9 +19,10 @@ type TaskArrival struct {
 }
 
 // DocArrival changes only when a doc set is ready again, as TaskArrival does
-// for a task. The set may have no docs.
+// for a task. It names the set by reference (see DocID.IsSetRef). The set may
+// have no docs.
 type DocArrival struct {
-	DocSetID
+	DocID
 	At time.Time `json:"at"`
 }
 
@@ -103,7 +91,7 @@ func Arriving(entries ...*ArrivalEntry) ModifyArg {
 				m.Arrives = append(m.Arrives, &TaskArrival{TaskID: *t.IDVersion(), At: at})
 			}
 			for _, g := range e.sets {
-				m.DocArrives = append(m.DocArrives, &DocArrival{DocSetID: *g.ID(), At: at})
+				m.DocArrives = append(m.DocArrives, &DocArrival{DocID: *g.Ref(), At: at})
 			}
 		}
 	}

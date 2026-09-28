@@ -165,7 +165,7 @@ func TestModifyArgsFromProtoLeases(t *testing.T) {
 	if len(mod.Arrives) != 1 || mod.Arrives[0].TaskID != (entroq.TaskID{ID: "t", Version: 3, Queue: "q"}) || !mod.Arrives[0].At.Equal(at) {
 		t.Errorf("Task lease: got %+v", mod.Arrives)
 	}
-	if len(mod.DocArrives) != 1 || mod.DocArrives[0].DocSetID != (entroq.DocSetID{Namespace: "ns", Key: "k", Version: 5}) || !mod.DocArrives[0].At.Equal(at) {
+	if len(mod.DocArrives) != 1 || mod.DocArrives[0].DocID != *entroq.NewDocSetRef("ns", "k", 5) || !mod.DocArrives[0].At.Equal(at) {
 		t.Errorf("Doc set lease: got %+v", mod.DocArrives)
 	}
 }

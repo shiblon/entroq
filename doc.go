@@ -103,7 +103,7 @@ func WithSkipCollidingDoc(skip bool) DocOpt {
 // namespace and a primary key. Either way, Version is the set's.
 type DocID struct {
 	Namespace string `json:"namespace"`
-	ID        string `json:"id"`
+	ID        string `json:"id,omitempty"`
 	Key       string `json:"key,omitempty"`
 	Version   int32  `json:"version"`
 }

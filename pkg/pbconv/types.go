@@ -105,7 +105,7 @@ func TaskArrivalToProto(a *entroq.TaskArrival) *pb.TaskChange {
 // understands.
 func DocArrivalToProto(a *entroq.DocArrival) *pb.DocChange {
 	return &pb.DocChange{
-		OldId: DocSetIDToProto(a.Namespace, a.Key, a.Version),
+		OldId: DocRefToProto(&a.DocID),
 		Data:  &pb.DocChange_NewLease{NewLease: &pb.DocData{AtMs: ToMS(a.At)}},
 	}
 }

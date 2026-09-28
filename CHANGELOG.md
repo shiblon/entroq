@@ -176,7 +176,9 @@ runs, so plan a short maintenance window on large doc tables.
   `Modification` gains `Arrives` and `DocArrives`: a task or doc set at a
   version, ready again at a given time, or now, which releases it. Each moves
   one version and keeps everything else, its value, attempts, and claim count,
-  or its docs, and a doc set with no docs works like any other. Build them
+  or its docs, and a doc set with no docs works like any other. A doc
+  arrival names its set by reference (`DocSet.Ref`, a `DocID` with a key and
+  no ID); naming a doc there is an invalid argument. Build them
   with `entroq.Arriving`, or call `eq.UpdateArrival`:
   `eq.UpdateArrival(ctx, entroq.ReadyIn(lease).Tasks(task).Docs(sets...))`
   renews them for the lease, and `entroq.ReadyNow()` releases them. The claim
