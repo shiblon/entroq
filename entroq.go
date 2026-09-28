@@ -1417,15 +1417,15 @@ type DependencyError struct {
 	DocDeletes []*DocID
 	DocChanges []*DocID
 
+	// Docs held by someone else. A doc set held by someone else appears as
+	// a set reference (see DocID.IsSetRef) at its current version, whatever
+	// the operation, followed by its members.
 	DocClaims []*DocID
 
-	// Doc sets that failed as a whole, each with its current lock:
-	// SetClaims those held by someone else, whatever the operation, and
-	// DocArrives arriving sets that were missing or not at the version
-	// named. Over gRPC a failed set carries only its namespace, key, and
-	// version, not who holds it.
-	SetClaims  []*DocSet
-	DocArrives []*DocSet
+	// Doc set arrivals whose set was missing or not at the version named,
+	// each a set reference at the set's current version. One held by
+	// someone else is in DocClaims.
+	DocArrives []*DocID
 
 	Message string
 }
@@ -1451,7 +1451,6 @@ func (m *DependencyError) Copy() *DependencyError {
 		Message:    m.Message,
 	}
 	e.Arrives = append(e.Arrives, m.Arrives...)
-	e.SetClaims = append(e.SetClaims, m.SetClaims...)
 	e.DocArrives = append(e.DocArrives, m.DocArrives...)
 	copy(e.Inserts, m.Inserts)
 	copy(e.Depends, m.Depends)
@@ -1480,7 +1479,7 @@ func (m *DependencyError) HasMissingDocs() bool {
 // HasClaimedDocs indicates whether any docs or doc sets were blocked by
 // another claimant. This is transient contention -- retry with backoff.
 func (m *DependencyError) HasClaimedDocs() bool {
-	return len(m.DocClaims) > 0 || len(m.SetClaims) > 0
+	return len(m.DocClaims) > 0
 }
 
 // HasClaims indicates whether any of the tasks were claimed by another claimant and unexpired.
@@ -1554,8 +1553,7 @@ func (m *DependencyError) Merge(other *DependencyError) *DependencyError {
 		DocDeletes: dedupDocIDs(catDoc(m.DocDeletes, other.DocDeletes)),
 		DocChanges: dedupDocIDs(catDoc(m.DocChanges, other.DocChanges)),
 		DocClaims:  dedupDocIDs(catDoc(m.DocClaims, other.DocClaims)),
-		SetClaims:  dedupGroups(append(append([]*DocSet{}, m.SetClaims...), other.SetClaims...)),
-		DocArrives: dedupGroups(append(append([]*DocSet{}, m.DocArrives...), other.DocArrives...)),
+		DocArrives: dedupDocIDs(catDoc(m.DocArrives, other.DocArrives)),
 		Message:    m.Message,
 	}
 	if merged.Message == "" {
@@ -1581,15 +1579,15 @@ func dedupTaskIDs(ids []*TaskID) []*TaskID {
 	return out
 }
 
-// dedupDocIDs keeps the first DocID seen for each namespaced doc ID.
+// dedupDocIDs keeps the first DocID seen for each doc or doc set it names.
 func dedupDocIDs(ids []*DocID) []*DocID {
-	seen := make(map[string]bool, len(ids))
+	seen := make(map[[3]string]bool, len(ids))
 	var out []*DocID
 	for _, id := range ids {
 		if id == nil {
 			continue
 		}
-		k := DocKey(id.Namespace, id.ID)
+		k := [3]string{id.Namespace, id.ID, id.Key}
 		if seen[k] {
 			continue
 		}
@@ -1618,24 +1616,6 @@ func (m *DependencyError) nameArrivals(mod *Modification) {
 		}
 	}
 	m.Changes = changes
-}
-
-// dedupGroups keeps the first entry seen for each doc set.
-func dedupGroups(sets []*DocSet) []*DocSet {
-	seen := make(map[[2]string]bool, len(sets))
-	var out []*DocSet
-	for _, g := range sets {
-		if g == nil {
-			continue
-		}
-		k := [2]string{g.Namespace, g.Key}
-		if seen[k] {
-			continue
-		}
-		seen[k] = true
-		out = append(out, g)
-	}
-	return out
 }
 
 // Error produces a helpful error string indicating what was missing.
@@ -1704,21 +1684,15 @@ func (m *DependencyError) Error() string {
 		}
 	}
 	if len(m.DocClaims) > 0 {
-		lines = append(lines, "\tclaimed modified docs:")
+		lines = append(lines, "\tdocs and doc sets held by another claimant:")
 		for _, did := range m.DocClaims {
 			lines = append(lines, fmt.Sprintf("\t\t%s", did))
 		}
 	}
 	if len(m.DocArrives) > 0 {
 		lines = append(lines, "\tmissing doc set arrivals:")
-		for _, g := range m.DocArrives {
-			lines = append(lines, fmt.Sprintf("\t\t%s", g.ID()))
-		}
-	}
-	if len(m.SetClaims) > 0 {
-		lines = append(lines, "\tdoc sets held by another claimant:")
-		for _, g := range m.SetClaims {
-			lines = append(lines, fmt.Sprintf("\t\t%s held by %q until %v", g.ID(), g.Claimant, g.At))
+		for _, did := range m.DocArrives {
+			lines = append(lines, fmt.Sprintf("\t\t%s", did))
 		}
 	}
 	return strings.Join(lines, "\n")

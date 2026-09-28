@@ -116,6 +116,15 @@ func DocIDToProto(ns, id string, version int32) *pb.DocID {
 	return &pb.DocID{Namespace: ns, Ref: &pb.DocID_Id{Id: id}, Version: version}
 }
 
+// DocRefToProto converts a DocID to the wire, naming a set by its key when it
+// is a set reference and a doc by its ID otherwise.
+func DocRefToProto(did *entroq.DocID) *pb.DocID {
+	if did.IsSetRef() {
+		return DocSetIDToProto(did.Namespace, did.Key, did.Version)
+	}
+	return DocIDToProto(did.Namespace, did.ID, did.Version)
+}
+
 // DocSetIDToProto converts a doc set's namespace, key, and version to a wire
 // DocID naming the set by its key.
 func DocSetIDToProto(ns, key string, version int32) *pb.DocID {

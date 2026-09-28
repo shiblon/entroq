@@ -496,12 +496,12 @@ func depErrorFromStat(stat *status.Status) error {
 
 		// Doc set dependency: a DocID naming a set by key failed as a whole.
 		if key := detail.GetDocId().GetKey(); key != "" {
-			g := &entroq.DocSet{Namespace: detail.DocId.GetNamespace(), Key: key, Version: detail.DocId.GetVersion()}
+			ref := entroq.NewDocSetRef(detail.DocId.GetNamespace(), key, detail.DocId.GetVersion())
 			switch detail.Type {
 			case pb.ActionType_CLAIM:
-				depErr.SetClaims = append(depErr.SetClaims, g)
+				depErr.DocClaims = append(depErr.DocClaims, ref)
 			case pb.ActionType_CHANGE:
-				depErr.DocArrives = append(depErr.DocArrives, g)
+				depErr.DocArrives = append(depErr.DocArrives, ref)
 			default:
 				return fmt.Errorf("grpc doc set dependency unknown type %v in detail %v", detail.Type, detail)
 			}

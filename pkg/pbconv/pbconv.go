@@ -357,21 +357,13 @@ func DependencyErrorDetails(depErr *entroq.DependencyError) []*pb.ModifyDep {
 		pb.ActionType_INSERT: depErr.DocInserts,
 		pb.ActionType_DELETE: depErr.DocDeletes,
 		pb.ActionType_DEPEND: depErr.DocDepends,
-		pb.ActionType_CHANGE: depErr.DocChanges,
+		// A set arrival is a change of the set on the wire, named by key.
+		pb.ActionType_CHANGE: append(slices.Clone(depErr.DocChanges), depErr.DocArrives...),
 		pb.ActionType_CLAIM:  depErr.DocClaims,
 	}
 	for dtype, dvals := range docMap {
 		for _, did := range dvals {
-			details = append(details, &pb.ModifyDep{Type: dtype, DocId: DocIDToProto(did.Namespace, did.ID, did.Version)})
-		}
-	}
-	groupMap := map[pb.ActionType][]*entroq.DocSet{
-		pb.ActionType_CHANGE: depErr.DocArrives,
-		pb.ActionType_CLAIM:  depErr.SetClaims,
-	}
-	for dtype, sets := range groupMap {
-		for _, g := range sets {
-			details = append(details, &pb.ModifyDep{Type: dtype, DocId: DocSetIDToProto(g.Namespace, g.Key, g.Version)})
+			details = append(details, &pb.ModifyDep{Type: dtype, DocId: DocRefToProto(did)})
 		}
 	}
 	return details

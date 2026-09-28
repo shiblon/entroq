@@ -52,18 +52,32 @@ func TestArrivalsValidate(t *testing.T) {
 	}
 }
 
-func TestDependencyErrorGroups(t *testing.T) {
-	held := &DocSet{Namespace: "ns", Key: "k", Version: 2, Claimant: "them"}
-	a := &DependencyError{SetClaims: []*DocSet{held}}
-	b := &DependencyError{SetClaims: []*DocSet{held}, DocArrives: []*DocSet{{Namespace: "ns", Key: "other"}}}
+func TestDependencyErrorSets(t *testing.T) {
+	held := NewDocSetRef("ns", "k", 2)
+	// A doc whose ID is the set's key is a different thing from the set.
+	doc := NewDocID("ns", "k", 2)
+	a := &DependencyError{DocClaims: []*DocID{held}}
+	b := &DependencyError{DocClaims: []*DocID{held, doc}, DocArrives: []*DocID{NewDocSetRef("ns", "other", 0)}}
 	m := a.Merge(b)
-	if len(m.SetClaims) != 1 || len(m.DocArrives) != 1 {
-		t.Errorf("Merge: want one set of each, got %v", m)
+	if len(m.DocClaims) != 2 || len(m.DocArrives) != 1 {
+		t.Errorf("Merge: want the set and the doc held, and one arrival, got %v", m)
 	}
 	if !m.HasClaimedDocs() || !m.HasMissingDocs() || !m.HasAny() {
 		t.Errorf("Set failures: want them to count as claimed and missing docs, got %v", m)
 	}
-	if c := m.Copy(); len(c.SetClaims) != 1 || len(c.DocArrives) != 1 {
+	if c := m.Copy(); len(c.DocClaims) != 2 || len(c.DocArrives) != 1 {
 		t.Errorf("Copy: got %v", c)
+	}
+}
+
+func TestDocIDIsSetRef(t *testing.T) {
+	if !NewDocSetRef("ns", "k", 1).IsSetRef() {
+		t.Error("Set reference: want IsSetRef")
+	}
+	if NewDocID("ns", "id", 1).IsSetRef() {
+		t.Error("Doc reference: want not IsSetRef")
+	}
+	if got, want := NewDocSetRef("ns", "k", 1).String(), "ns/[k]:v1"; got != want {
+		t.Errorf("Set reference string: got %q, want %q", got, want)
 	}
 }

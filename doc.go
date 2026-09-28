@@ -98,20 +98,37 @@ func WithSkipCollidingDoc(skip bool) DocOpt {
 	}
 }
 
-// DocID contains the identifying parts of a storage doc.
+// DocID contains the identifying parts of a storage doc. It names a doc by
+// ID, or, with no ID, a whole doc set by its key: a set is a doc with only a
+// namespace and a primary key. Either way, Version is the set's.
 type DocID struct {
 	Namespace string `json:"namespace"`
 	ID        string `json:"id"`
+	Key       string `json:"key,omitempty"`
 	Version   int32  `json:"version"`
 }
 
 // NewDocID creates a DocID for the given namespace, id, and version. The
 // namespace is part of the doc's modify key, the way a queue is for a task.
 func NewDocID(ns string, id string, version int32) *DocID {
-	return &DocID{ns, id, version}
+	return &DocID{Namespace: ns, ID: id, Version: version}
+}
+
+// NewDocSetRef creates a DocID naming the doc set with the given namespace
+// and key, at version.
+func NewDocSetRef(ns, key string, version int32) *DocID {
+	return &DocID{Namespace: ns, Key: key, Version: version}
+}
+
+// IsSetRef reports whether r names a whole doc set rather than one doc.
+func (r DocID) IsSetRef() bool {
+	return r.ID == "" && r.Key != ""
 }
 
 func (r DocID) String() string {
+	if r.IsSetRef() {
+		return fmt.Sprintf("%s/[%s]:v%d", r.Namespace, r.Key, r.Version)
+	}
 	return fmt.Sprintf("%s/%s:v%d", r.Namespace, r.ID, r.Version)
 }
 

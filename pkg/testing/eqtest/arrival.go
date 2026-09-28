@@ -140,7 +140,7 @@ func UpdateArrival(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPr
 		stale.Version--
 		_, err := client.UpdateArrival(ctx, entroq.ReadyIn(time.Hour).Tasks(task).Docs(&stale))
 		depErr, ok := entroq.AsDependency(err)
-		if !ok || len(depErr.DocArrives) != 1 || depErr.DocArrives[0].Version != set.Version {
+		if !ok || len(depErr.DocArrives) != 1 || !depErr.DocArrives[0].IsSetRef() || depErr.DocArrives[0].Version != set.Version {
 			t.Fatalf("Update naming a stale set: want the set reported at its current version %d, got %v", set.Version, err)
 		}
 		staleTask := *task
@@ -162,8 +162,8 @@ func UpdateArrival(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPr
 		_, err = client.Modify(ctx, entroq.Arriving(entroq.ReadyIn(time.Hour).Docs(set)), entroq.ModifyAs(intruder))
 		// The failure names the set; who holds it is not carried over every
 		// transport.
-		if depErr, ok := entroq.AsDependency(err); !ok || len(depErr.SetClaims) != 1 ||
-			depErr.SetClaims[0].Namespace != ns || depErr.SetClaims[0].Key != "whole" {
+		if depErr, ok := entroq.AsDependency(err); !ok || len(depErr.DocClaims) != 1 || !depErr.DocClaims[0].IsSetRef() ||
+			depErr.DocClaims[0].Namespace != ns || depErr.DocClaims[0].Key != "whole" {
 			t.Errorf("Set update by someone else: want the set reported as held, got %v", err)
 		}
 	})

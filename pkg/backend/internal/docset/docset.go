@@ -89,8 +89,8 @@ func Claimed(g Set, l Lock, members []*entroq.Doc) *entroq.DocSet {
 	return dg
 }
 
-// Current returns the set g as its lock l stands, without its docs: what a
-// dependency error or an arrival update reports.
+// Current returns the set g as its lock l stands, without its docs: what an
+// arrival update reports.
 func Current(g Set, l Lock) *entroq.DocSet {
 	return &entroq.DocSet{
 		Namespace: g.Namespace,
@@ -102,13 +102,18 @@ func Current(g Set, l Lock) *entroq.DocSet {
 	}
 }
 
+// Ref names the set g at its lock l's version, as a dependency error does.
+func Ref(g Set, l Lock) *entroq.DocID {
+	return entroq.NewDocSetRef(g.Namespace, g.Key, l.Version)
+}
+
 // HeldError is the error for a claim of g, holding lock l, by someone else:
-// it names the set, with its lock, and its members, for clients that know
-// only doc failures.
+// it names the set and then its members, for clients that know only doc
+// failures.
 func HeldError(g Set, l Lock, members []*entroq.Doc) *entroq.DependencyError {
 	depErr := &entroq.DependencyError{
 		Message:   fmt.Sprintf("doc set %q in namespace %q is claimed by %s until %v", g.Key, g.Namespace, l.Claimant, l.At),
-		SetClaims: []*entroq.DocSet{Current(g, l)},
+		DocClaims: []*entroq.DocID{Ref(g, l)},
 	}
 	for _, d := range members {
 		depErr.DocClaims = append(depErr.DocClaims, entroq.NewDocID(d.Namespace, d.ID, l.Version))
@@ -165,7 +170,7 @@ func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string
 		}
 		if !reported[g] {
 			reported[g] = true
-			depErr.SetClaims = append(depErr.SetClaims, Current(g, l))
+			depErr.DocClaims = append(depErr.DocClaims, Ref(g, l))
 		}
 		return true
 	}
@@ -231,7 +236,7 @@ func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string
 		l := lock(g)
 		switch {
 		case l.Version < 0 || l.Version != a.Version:
-			depErr.DocArrives = append(depErr.DocArrives, Current(g, l))
+			depErr.DocArrives = append(depErr.DocArrives, Ref(g, l))
 		case claimed(g):
 		default:
 			write(g, a.At)

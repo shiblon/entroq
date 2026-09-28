@@ -282,7 +282,7 @@ func TestEvaluateDocArrives(t *testing.T) {
 	if p := s.evaluate("me", entroq.Arriving(entroq.ReadyNow().Docs(stale))); p.Err == nil || len(p.Err.DocArrives) != 1 {
 		t.Errorf("Stale set: want a set change failure, got %v", p.Err)
 	}
-	if p := s.evaluate("other", entroq.Arriving(entroq.ReadyNow().Docs(renew))); p.Err == nil || len(p.Err.SetClaims) != 1 {
+	if p := s.evaluate("other", entroq.Arriving(entroq.ReadyNow().Docs(renew))); p.Err == nil || len(p.Err.DocClaims) != 1 || !p.Err.DocClaims[0].IsSetRef() {
 		t.Errorf("Set held by someone else: want a set claim failure, got %v", p.Err)
 	}
 	absent := &entroq.DocSet{Namespace: "ns", Key: "none", Version: -1}

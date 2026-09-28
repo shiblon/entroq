@@ -213,14 +213,15 @@ runs, so plan a short maintenance window on large doc tables.
   with no identifier or no data, a delete or depend naming no doc, and a lease
   carrying anything but its arrival time are invalid arguments. A 1.12 server
   applied a change with no data as one clearing every field.
-- **Dependency errors can name doc sets.** `entroq.DependencyError` gains
-  `SetClaims` (held by someone else) and `DocArrives` (arriving sets not at
-  the version named), each carrying the set's current lock, and `Arrives`,
-  task arrivals that failed. Over the wire a set is a `ModifyDep` whose
-  `doc_id` names it by key, with its version but not who holds it. A claim or
-  modification refused because someone else holds a set names the set as
-  well as its members, so clients that read only doc failures see what they did
-  before.
+- **Dependency errors can name doc sets.** `entroq.DocID` gains `Key`: with
+  no `ID`, it names a whole doc set by its key (`IsSetRef`, `NewDocSetRef`),
+  since a set is a doc with only a namespace and a primary key.
+  `entroq.DependencyError.DocClaims` names a set held by someone else this
+  way, at its current version, followed by its members, so clients that read
+  only doc failures see what they did before. `DocArrives` names arriving sets
+  that were missing or not at the version named, and `Arrives` task arrivals
+  that failed. Over the wire a set is a `ModifyDep` whose `doc_id` names it by
+  key, with its version but not who holds it.
 - **A doc set counts its docs.** `entroq.DocSet.NumDocs`, and `len` on the
   `Doc` standing for a set in claim responses and in the work gateway's
   `doWork` sets, is how many docs the set has. PostgreSQL and SQLite keep it
