@@ -35,7 +35,7 @@ func init() {
 
 // jwksServer starts an httptest.Server that serves the public RSA key as a
 // minimal JWKS document. The caller must close the server.
-func jwksServer(t *testing.T, key *rsa.PrivateKey) *httptest.Server {
+func jwksServer(t testing.TB, key *rsa.PrivateKey) *httptest.Server {
 	t.Helper()
 	pub := key.Public().(*rsa.PublicKey)
 	doc := map[string]any{
@@ -57,7 +57,7 @@ func jwksServer(t *testing.T, key *rsa.PrivateKey) *httptest.Server {
 }
 
 // makeToken signs a JWT for the given subject using the test RSA key.
-func makeToken(t *testing.T, key *rsa.PrivateKey, subject, audience, issuer string, expiry time.Duration) string {
+func makeToken(t testing.TB, key *rsa.PrivateKey, subject, audience, issuer string, expiry time.Duration) string {
 	t.Helper()
 	claims := jwt.RegisteredClaims{
 		Subject:   subject,

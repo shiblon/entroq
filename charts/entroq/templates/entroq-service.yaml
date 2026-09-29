@@ -14,8 +14,10 @@ spec:
     port: {{ .Values.entroq.service.grpcPort }}
     targetPort: {{ .Values.entroq.service.grpcPort }}
     protocol: TCP
+  {{- if eq .Values.entroq.authorization.strategy "opahttp" }}
   - name: opa
     port: {{ .Values.entroq.service.opaPort }}
     targetPort: {{ .Values.entroq.service.opaPort }}
     protocol: TCP
+  {{- end }}
 {{- end }}

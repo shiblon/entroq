@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
 	"github.com/spf13/pflag"
 	"go.opentelemetry.io/otel/metric"
 )
@@ -23,6 +24,17 @@ func TestBindFlagsDefaults(t *testing.T) {
 	}
 	if cfg.AuthzStrategy != "none" {
 		t.Fatalf("authz default = %q, want none", cfg.AuthzStrategy)
+	}
+}
+
+func TestServerKeepalivePolicyAcceptsDefaultClient(t *testing.T) {
+	policy := serverKeepalivePolicy()
+	if policy.MinTime > eqgrpc.DefaultKeepaliveTime {
+		t.Fatalf("server minimum ping interval %v exceeds client interval %v",
+			policy.MinTime, eqgrpc.DefaultKeepaliveTime)
+	}
+	if policy.PermitWithoutStream {
+		t.Fatal("server permits keepalive without an active RPC")
 	}
 }
 

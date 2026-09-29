@@ -7,6 +7,28 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Local Kubernetes mesh benchmark.** A pinned, disposable k3d harness compares
+  raw direct HTTP, OPA-authorized direct HTTP, one-hop, and two-hop EntroQ mesh
+  paths from fresh in-cluster load jobs. Authorization can be removed or reduced
+  to a trivial OPA decision, and reports preserve latency, validation, topology,
+  resource, authorization, and source-specific eqlink telemetry.
+- **Configurable chart authorization.** The EntroQ Helm chart can explicitly
+  omit the OPA sidecar and OPA-only resources for trusted-network deployments,
+  or select a custom OPA endpoint and data path.
+
+### Fixed
+
+- **eqlink data-path metrics.** The `send`, `recv`, and combined `run` commands
+  now attach their Prometheus meter provider to the async sender and receiver,
+  so deployed sidecars expose handled, error, inflight, and duration metrics.
+- **gRPC keepalive compatibility.** The server now permits the client's
+  30-second transport keepalive interval, preventing long-held claim streams
+  from being disconnected by the default five-minute enforcement policy.
+
 ## [1.8.2] - 2026-08-31
 
 Go module `v1.8.2`. No PostgreSQL schema or client version changes.

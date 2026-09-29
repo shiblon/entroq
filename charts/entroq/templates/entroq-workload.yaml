@@ -1,4 +1,9 @@
 {{- if .Values.entroq.enabled -}}
+{{- $authzStrategy := .Values.entroq.authorization.strategy -}}
+{{- if not (has $authzStrategy (list "none" "opahttp")) -}}
+{{- fail (printf "entroq.authorization.strategy must be none or opahttp, got %q" $authzStrategy) -}}
+{{- end -}}
+{{- $usesOPA := eq $authzStrategy "opahttp" -}}
 {{- $backend := .Values.entroq.backend.type -}}
 {{- $isJournal  := eq $backend "journal"  -}}
 {{- $isPostgres := eq $backend "postgres" -}}
@@ -28,8 +33,13 @@ spec:
         imagePullPolicy: {{ .Values.entroq.images.pullPolicy }}
         args:
         - serve
-        - --authz=opahttp
-        - --opa_url=http://localhost:{{ .Values.entroq.service.opaPort }}
+        - --authz={{ $authzStrategy }}
+        {{- if $usesOPA }}
+        - --opa_url={{ .Values.entroq.authorization.opaUrl }}
+        {{- if .Values.entroq.authorization.opaPath }}
+        - --opa_path={{ .Values.entroq.authorization.opaPath }}
+        {{- end }}
+        {{- end }}
         {{- if $isJournal }}
         - --journal={{ .Values.entroq.storage.mountPath }}
         - --mkdir
@@ -77,6 +87,7 @@ spec:
           mountPath: {{ .Values.entroq.storage.mountPath }}
         {{- end }}
 
+      {{- if $usesOPA }}
       - name: opa
         image: "{{ .Values.entroq.opa.image.repository }}:{{ .Values.entroq.opa.image.tag }}"
         imagePullPolicy: {{ .Values.entroq.opa.image.pullPolicy }}
@@ -113,14 +124,17 @@ spec:
         - name: opa-data
           mountPath: /data
           readOnly: true
+      {{- end }}
 
       volumes:
+      {{- if $usesOPA }}
       - name: opa-rego
         configMap:
           name: opa-rego
       - name: opa-data
         configMap:
           name: opa-data
+      {{- end }}
 
   {{- if $isJournal }}
   volumeClaimTemplates:

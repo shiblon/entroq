@@ -31,11 +31,9 @@
 //	client, err := entroq.New(ctx, eqgrpc.Opener("myhost:54321", eqgrpc.WithInsecure()))
 //
 // That creates a client library that uses a gRPC connection to do its work.
-// Note that Claim will block on the *client* side doing this instead of
-// holding the *server* connection hostage while a claim fails to go through.
-// That is actually what we want; rather than hold connections open, we allow
-// the client to poll with exponential backoff. In large-scale systems, this is
-// better behavior.
+// Claim is one long-held RPC, canceled only by the caller. Servers must accept
+// the client keepalive interval while that RPC is active; see
+// DefaultKeepaliveTime.
 package eqgrpc
 
 import (
@@ -60,6 +58,16 @@ import (
 const (
 	// DefaultAddr is the default listening address for gRPC services.
 	DefaultAddr = ":37706"
+
+	// DefaultKeepaliveTime is how long an idle client transport waits before
+	// probing a server while an RPC such as Claim remains active. A server must
+	// configure keepalive.EnforcementPolicy.MinTime to this value or lower. The
+	// grpc-go server default is five minutes and is not compatible.
+	DefaultKeepaliveTime = 30 * time.Second
+
+	// DefaultKeepaliveTimeout is how long a keepalive probe waits for activity
+	// before treating the transport as dead.
+	DefaultKeepaliveTimeout = 20 * time.Second
 
 	// MB helps with conversion to and from megabytes.
 	MB = 1024 * 1024
@@ -165,12 +173,13 @@ func Opener(addr string, opts ...Option) entroq.BackendOpener {
 		// instead of hanging on a silently-broken connection. This matters because
 		// Claim has no per-attempt deadline (see backend.Claim): a dead connection
 		// is caught here, by keepalive, not by canceling the RPC. PermitWithoutStream
-		// stays false, so pings go only while a Claim stream is active, which a
-		// default server tolerates. Prepended so a caller's WithDialOpts can override it.
+		// stays false, so pings go only while an RPC such as Claim is active. Servers
+		// must accept DefaultKeepaliveTime; the official server does. Prepended so a
+		// caller's WithDialOpts can override it.
 		dialOpts := append([]grpc.DialOption{
 			grpc.WithKeepaliveParams(keepalive.ClientParameters{
-				Time:    30 * time.Second,
-				Timeout: 20 * time.Second,
+				Time:    DefaultKeepaliveTime,
+				Timeout: DefaultKeepaliveTimeout,
 			}),
 		}, options.dialOpts...)
 		conn, err := grpc.DialContext(ctx, addr, dialOpts...)

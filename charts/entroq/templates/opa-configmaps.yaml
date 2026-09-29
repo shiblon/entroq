@@ -1,4 +1,4 @@
-{{- if .Values.entroq.enabled }}
+{{- if and .Values.entroq.enabled (eq .Values.entroq.authorization.strategy "opahttp") }}
 # opa-rego: all Rego policy files. Populated from files/rego/ in the chart.
 # Run 'make helm-sync' from the repo root to refresh these from source.
 apiVersion: v1
