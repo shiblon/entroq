@@ -1,0 +1,9 @@
+{
+  "profile_user": "system:serviceaccount:mesh-bench:leaf",
+  "authz": {"type": "Bearer", "credentials": "profiled-separately"},
+  "claimant_id": "system:serviceaccount:mesh-bench:leaf#receiver",
+  "queues": [
+    {"exact": "/mesh-bench/leaf/inbox", "actions": ["DELETE"]},
+    {"exact": "/mesh-bench/leaf/response/gc=1788273063/request", "actions": ["INSERT"]}
+  ]
+}

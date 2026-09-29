@@ -1,0 +1,16 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: meshbench-opa-policy
+  namespace: mesh-bench
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: policy
+        image: entroq-mesh-workload:@IMAGE_TAG@
+        imagePullPolicy: Never
+        args:
+        - opa-allow-all
