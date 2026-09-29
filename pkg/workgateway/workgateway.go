@@ -537,7 +537,7 @@ func (b *Bridge) takeDocs(ctx context.Context, task *entroq.Task, _ json.RawMess
 	if err := b.request(ctx, takeDocsMsg{Type: msgTakeDocs, Task: wireTask{taskPB}}, &d, nil); err != nil {
 		if errors.Is(err, errConnLost) {
 			// Renewal has not started, so the claimed version is current.
-			if _, rerr := b.eq.Modify(ctx, task.Change(entroq.ArrivalTimeBy(0))); rerr != nil {
+			if _, rerr := b.eq.UpdateArrival(ctx, entroq.ReadyNow().Tasks(task)); rerr != nil {
 				log.Printf("work gateway: release task %s after hang-up: %v", task.ID, rerr)
 			}
 		}
@@ -580,9 +580,10 @@ func (b *Bridge) doWork(ctx context.Context, task *entroq.Task, _ json.RawMessag
 	abort := &abortMsg{Type: msgAbort, ID: task.ID, Version: task.Version}
 	if err := b.request(ctx, msg, &res, abort); err != nil {
 		if errors.Is(err, errConnLost) {
-			// Commit the release like any result, so the worker fixes up the
-			// version renewal has moved it to.
-			return worker.Modify(task.Change(entroq.ArrivalTimeBy(0))), nil
+			// Release the task and its sets for another worker. The worker
+			// commits the release once renewal has stopped, at the versions
+			// renewal moved them to.
+			return worker.Modify(entroq.Arriving(entroq.ReadyNow().Tasks(task).Docs(sets...))), nil
 		}
 		return nil, fmt.Errorf("doWork: %w", err)
 	}

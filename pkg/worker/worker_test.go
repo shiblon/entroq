@@ -134,18 +134,18 @@ func TestWorkerRenewal(t *testing.T) {
 	}
 
 	// Renewal fires at interval/2 = 3 s; 10 s → 3 renewals expected.
-	if err := doWhileRenewing(ctx, client, nil, func(ctx context.Context, stop finalizeRenew) error {
+	if err := doWhileRenewing(ctx, client, 6*time.Second, 3*time.Second, held{task: task}, func(ctx context.Context, stop finalizeRenew) error {
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("doWhileRenewing: %w", ctx.Err())
 		case <-time.After(10 * time.Second):
 		}
 		stable := stop()
-		if want, got := task.Version+3, stable.Tasks[0].Version; want != got {
+		if want, got := task.Version+3, stable.task.Version; want != got {
 			t.Errorf("expected version %d after 3 renewals, got %d", want, got)
 		}
 		return nil
-	}, entroq.RenewingTask(task), entroq.WithRenewInterval(6*time.Second)); err != nil {
+	}); err != nil {
 		t.Fatalf("doWhileRenewing: %v", err)
 	}
 }
@@ -174,10 +174,10 @@ func TestDoWhileRenewing_ImmediateCancellationOnLeaseLoss(t *testing.T) {
 
 	errChan := make(chan error, 1)
 	go func() {
-		errChan <- doWhileRenewing(ctx, client, nil, func(ctx context.Context, _ finalizeRenew) error {
+		errChan <- doWhileRenewing(ctx, client, 100*time.Millisecond, 50*time.Millisecond, held{task: claimed}, func(ctx context.Context, _ finalizeRenew) error {
 			<-ctx.Done()
 			return ctx.Err()
-		}, entroq.RenewingTask(claimed), entroq.WithRenewInterval(100*time.Millisecond))
+		})
 	}()
 
 	// Delete the task to break renewal.
@@ -261,29 +261,53 @@ func TestDoModify_DocVersionFixedAfterRenewal(t *testing.T) {
 	}
 }
 
-// TestWithRenewed checks that renewal's copies replace a set's members and
-// carry the set's new version and claim, and that an empty set, which
-// renewal of docs cannot reach, comes back as it was.
-func TestWithRenewed(t *testing.T) {
+// TestHeldRenewed checks that a renewal's response moves the task, and each
+// set and its docs, to their new versions and claims, and that a response
+// missing anything it renewed is an error.
+func TestHeldRenewed(t *testing.T) {
 	later := time.Now().Add(time.Minute)
-	full := &entroq.DocSet{Namespace: "ns", Key: "k", Version: 1, Docs: []*entroq.Doc{
+	task := &entroq.Task{ID: "t", Version: 3}
+	full := &entroq.DocSet{Namespace: "ns", Key: "k", Version: 1, NumDocs: 2, Docs: []*entroq.Doc{
 		{Namespace: "ns", ID: "a", Key: "k", Version: 1},
 		{Namespace: "ns", ID: "b", Key: "k", Version: 1},
 	}}
 	empty := &entroq.DocSet{Namespace: "ns", Key: "e", Version: 4}
-	renewed := []*entroq.Doc{
-		{Namespace: "ns", ID: "a", Key: "k", Version: 2, Claimant: "me", At: later},
-		{Namespace: "ns", ID: "b", Key: "k", Version: 2, Claimant: "me", At: later},
+	h := held{task: task, sets: []*entroq.DocSet{full, empty}}
+	resp := &entroq.ModifyResponse{
+		ChangedTasks: []*entroq.Task{{ID: "t", Version: 4}},
+		ChangedSets: []*entroq.DocSet{
+			{Namespace: "ns", Key: "e", Version: 5, Claimant: "me", At: later},
+			{Namespace: "ns", Key: "k", Version: 2, Claimant: "me", At: later, NumDocs: 2},
+		},
 	}
-	got := withRenewed([]*entroq.DocSet{full, empty}, renewed)
-	if g := got[0]; g.Version != 2 || g.Claimant != "me" || !g.At.Equal(later) || g.Docs[0] != renewed[0] || g.Docs[1] != renewed[1] {
+	got, err := h.renewed(resp)
+	if err != nil {
+		t.Fatalf("Renewed: %v", err)
+	}
+	if got.task.Version != 4 {
+		t.Errorf("Renewed task: got %+v", got.task)
+	}
+	if g := got.sets[0]; g.Version != 2 || g.Claimant != "me" || !g.At.Equal(later) || len(g.Docs) != 2 {
 		t.Errorf("Renewed set: got %+v", g)
 	}
-	if e := got[1]; e == empty || e.Key != "e" || e.Version != 4 || len(e.Docs) != 0 {
-		t.Errorf("Empty set: want an unchanged copy, got %+v", e)
+	for _, d := range got.sets[0].Docs {
+		if d.Version != 2 || d.Claimant != "me" || !d.At.Equal(later) {
+			t.Errorf("Renewed member: want it at its set's lock, got %+v", d)
+		}
 	}
-	if full.Version != 1 {
-		t.Error("withRenewed changed the set it was given")
+	if e := got.sets[1]; e.Key != "e" || e.Version != 5 || e.Claimant != "me" || len(e.Docs) != 0 {
+		t.Errorf("Renewed empty set: got %+v", e)
+	}
+	if full.Version != 1 || full.Docs[0].Version != 1 {
+		t.Error("renewed changed the sets it was given")
+	}
+
+	missingSet := &entroq.ModifyResponse{ChangedTasks: resp.ChangedTasks, ChangedSets: resp.ChangedSets[:1]}
+	if _, err := h.renewed(missingSet); err == nil {
+		t.Error("Response missing a set: want an error")
+	}
+	if _, err := h.renewed(&entroq.ModifyResponse{ChangedSets: resp.ChangedSets}); err == nil {
+		t.Error("Response missing the task: want an error")
 	}
 }
 
@@ -298,5 +322,100 @@ func TestErrQTemplate(t *testing.T) {
 		if got := ErrQTemplate(template)("jobs"); got != want {
 			t.Errorf("ErrQTemplate(%q)(jobs) = %q, want %q", template, got, want)
 		}
+	}
+}
+
+// oldServer is a backend whose server speaks protocol 1.
+type oldServer struct{ entroq.Backend }
+
+func (oldServer) ServerProtocol(context.Context) (int32, error) { return 1, nil }
+
+// TestRunRefusesOldServer checks that a worker refuses, before claiming
+// anything, a server too old to renew by lease.
+func TestRunRefusesOldServer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	client, err := entroq.New(ctx, func(ctx context.Context) (entroq.Backend, error) {
+		b, err := eqmem.Opener()(ctx)
+		return oldServer{b}, err
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer client.Close()
+	if _, err := client.Modify(ctx, entroq.InsertingInto("q")); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	w := New[string](client, WithDoWork(func(context.Context, *entroq.Task, string, []*entroq.DocSet) error {
+		t.Error("Worker claimed a task from a protocol 1 server")
+		return nil
+	}))
+	if err := w.Run(ctx, Watching("q")); !entroq.IsUnsupported(err) {
+		t.Errorf("Run against a protocol 1 server: want an unsupported error, got %v", err)
+	}
+}
+
+// TestSlowTakeDocsRenewsAtOnce checks that when claiming the sets takes more
+// than half the lease, the first renewal comes at once rather than half a
+// lease later, when the task's claim would already have lapsed.
+func TestSlowTakeDocsRenewsAtOnce(t *testing.T) {
+	const lease = 400 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	backend, err := eqmem.Opener()(ctx)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	shared := func(context.Context) (entroq.Backend, error) { return backend, nil }
+	client, err := entroq.New(ctx, shared)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer client.Close()
+	// The intruder shares the store, not the claimant; closing the client
+	// above closes the store for both.
+	intruder, err := entroq.New(ctx, shared, entroq.WithClaimantID("intruder"))
+	if err != nil {
+		t.Fatalf("New intruder: %v", err)
+	}
+	if _, err := client.Modify(ctx, entroq.InsertingInto("q")); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	working := make(chan time.Time, 1)
+	finish := make(chan bool)
+	w := New[string](client,
+		WithTakeDocs(func(context.Context, *entroq.Task, string) ([]*entroq.DocClaim, error) {
+			time.Sleep(lease * 7 / 10)
+			return []*entroq.DocClaim{entroq.ClaimKey("ns", "k")}, nil
+		}),
+		WithDoModify(func(_ context.Context, task *entroq.Task, _ string, _ []*entroq.DocSet) (*Result, error) {
+			working <- time.Now()
+			<-finish
+			return Modify(task.Delete()), nil
+		}),
+	)
+	runCtx, runCancel := context.WithCancel(ctx)
+	errCh := make(chan error, 1)
+	go func() { errCh <- w.Run(runCtx, Watching("q"), WithLease(lease)) }()
+
+	started := <-working
+	// The task was claimed about 0.7 leases before work started; its first
+	// lease ends 0.3 leases from now. Try to take it just after that.
+	time.Sleep(time.Until(started.Add(lease * 4 / 10)))
+	task, err := intruder.TryClaim(ctx, entroq.From("q"))
+	if err != nil {
+		t.Fatalf("Intruder claim: %v", err)
+	}
+	if task != nil {
+		t.Error("Another claimant took the task: its claim lapsed before the first renewal")
+	}
+	close(finish)
+	runCancel()
+	if err := <-errCh; err != nil {
+		t.Errorf("Run: %v", err)
 	}
 }

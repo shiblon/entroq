@@ -282,6 +282,12 @@ func protocolOf(md metadata.MD) int32 {
 	return int32(p)
 }
 
+// ServerProtocol returns the protocol the server speaks (see
+// entroq.ProtocolReporter).
+func (b *backend) ServerProtocol(ctx context.Context) (int32, error) {
+	return b.serverProtocol(ctx)
+}
+
 // serverProtocol returns the protocol the server speaks, asking it with a
 // Time call if no response has said yet.
 func (b *backend) serverProtocol(ctx context.Context) (int32, error) {
@@ -303,7 +309,7 @@ func (b *backend) needProtocol(ctx context.Context, p int32, what string) error 
 		return err
 	}
 	if got < p {
-		return fmt.Errorf("grpc: %s needs a server at protocol %d, and this one speaks protocol %d", what, p, got)
+		return entroq.Unsupportedf("grpc: %s needs a server at protocol %d, and this one speaks protocol %d", what, p, got)
 	}
 	return nil
 }
@@ -570,6 +576,8 @@ func unpackGRPCError(grpcErr error) error {
 		return authzErrFromStat(stat)
 	case codes.InvalidArgument:
 		return entroq.InvalidArgumentf("%s", stat.Message())
+	case codes.Unimplemented:
+		return entroq.Unsupportedf("%s", stat.Message())
 	case codes.Unavailable:
 		// The server is unreachable (down, restarting, or being relocated).
 		// Translate to entroq's transient-unavailable error so callers can retry

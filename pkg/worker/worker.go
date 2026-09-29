@@ -79,16 +79,15 @@ type Handler[T any] interface {
 	// nil to skip doc acquisition. Each claim takes a whole set, which may have
 	// no docs yet. A set someone else holds causes a retry.
 	//
-	// Note: task renewal begins as soon as the task is claimed, before TakeDocs
-	// is called. Doc renewal (alongside the task) starts only once TakeDocs
-	// returns and the docs are acquired. This means a very slow TakeDocs
-	// implementation creates a window where the task is being renewed but claimed
-	// docs are not yet. In natural use — where TakeDocs just returns a list of
-	// DocClaim specs without doing I/O — this window is negligible.
+	// Note: renewal of the task and its sets begins once TakeDocs returns and
+	// the sets are claimed, so a slow TakeDocs spends the task's first lease. In
+	// natural use, where TakeDocs just returns a list of DocClaim specs without
+	// doing I/O, this is negligible.
 	TakeDocs(context.Context, *entroq.Task, T) ([]*entroq.DocClaim, error)
 
-	// DoWork is called by Worker.Run for each claimed task. The task is renewed in
-	// the background while this function runs. value holds the result of
+	// DoWork is called by Worker.Run for each claimed task. The task and its
+	// doc sets, empty ones included, are renewed together in the background
+	// while this function runs. value holds the result of
 	// unmarshaling task.Value into T. The sets are those TakeDocs claimed, in
 	// the order they were claimed (by namespace, then key), each with its docs;
 	// the slice is non-nil but empty when none were claimed, and a set may have
@@ -100,7 +99,7 @@ type Handler[T any] interface {
 	// On RetryError or MoveError, the task is retried or moved and Finish
 	// is skipped. In both cases, the task's availability is set in the future
 	// and its attempt count is incremented (these errors, while convenient for
-	// managing task movement, are still errors).
+	// managing task movement, are still errors), and its doc sets are released.
 	//
 	// On any other error, Finish is skipped and the worker exits. Backoff and
 	// restart are the responsibility of the process orchestrator (e.g.
@@ -157,8 +156,24 @@ type Result struct {
 }
 
 // Modify begins a Result that applies args after work completes. The worker
-// commits them at the stable (renewed) task version. Chain OnSuccess for an
-// optimistic step that runs once the task is handled successfully.
+// commits them at the stable (renewed) versions of the task and its doc sets.
+// Chain OnSuccess for an optimistic step that runs once the task is handled
+// successfully.
+//
+// Doc sets follow their task: when the commit writes the task (changes,
+// deletes, or makes it arrive, rather than only depending on it), the worker
+// releases each set the commit did not write once OnSuccess has run, so other
+// workers can claim it at once. A set the commit wrote keeps the arrival the
+// commit gave it. The release is best-effort: one that fails is logged, and
+// its sets wait out their leases.
+//
+// The usual result deletes the task, or moves it on. A result that leaves the
+// task in its queue ready now, such as one that only makes it arrive now
+// (entroq.Arriving with entroq.ReadyNow), hands it straight back to the next
+// claim, very likely this worker's: like a loop that never changes its exit
+// condition, it spins. Leave the task where it cannot be claimed again at
+// once, or give it a later arrival. A commit that only makes the task arrive
+// is counted as released rather than done.
 func Modify(args ...entroq.ModifyArg) *Result {
 	return &Result{mods: args}
 }
@@ -277,6 +292,7 @@ type doModifyHandler[T any] struct {
 
 	initialTask *entroq.Task
 	result      *Result
+	released    bool // the commit only made the task arrive
 }
 
 func (h *doModifyHandler[T]) TakeDocs(ctx context.Context, task *entroq.Task, val T) ([]*entroq.DocClaim, error) {
@@ -307,91 +323,209 @@ func (h *doModifyHandler[T]) Finish(ctx context.Context, mod Modifier, finalTask
 		return nil
 	}
 
+	var release []*entroq.DocSet
 	if len(h.result.mods) > 0 {
 		if finalTask == nil {
 			return FatalErrorf("doModify finish: nil finalized task with modifications to apply")
 		}
-
-		modification := entroq.NewModification("", h.result.mods...)
-
 		if h.initialTask.Version > finalTask.Version {
 			return fmt.Errorf("task updated inside worker body, expected version <= %v, got %v", finalTask.Version, h.initialTask.Version)
 		}
 
-		// Fix up task modification versions to reflect the final renewed state.
-		for _, t := range modification.Changes {
-			if t.ID == finalTask.ID {
-				t.Version = finalTask.Version
-			}
-		}
-		for _, t := range modification.Depends {
-			if t.ID == finalTask.ID {
-				t.Version = finalTask.Version
-			}
-		}
-		for _, t := range modification.Deletes {
-			if t.ID == finalTask.ID {
-				t.Version = finalTask.Version
-			}
-		}
-
-		// Fix up doc modification versions to reflect the final renewed state.
-		type nsID = [2]string
-		finalDocs := entroq.DocsIn(finalSets)
-		docVers := make(map[nsID]int32, len(finalDocs))
-		for _, d := range finalDocs {
-			docVers[nsID{d.Namespace, d.ID}] = d.Version
-		}
-		for _, dc := range modification.DocChanges {
-			if v, ok := docVers[nsID{dc.Namespace, dc.ID}]; ok {
-				dc.Version = v
-			}
-		}
-		for _, dd := range modification.DocDeletes {
-			if v, ok := docVers[nsID{dd.Namespace, dd.ID}]; ok {
-				dd.Version = v
-			}
-		}
-		for _, dd := range modification.DocDepends {
-			if v, ok := docVers[nsID{dd.Namespace, dd.ID}]; ok {
-				dd.Version = v
-			}
-		}
-
+		modification := entroq.NewModification("", h.result.mods...)
+		fixVersions(modification, finalTask, finalSets)
 		if _, err := mod.Modify(ctx, entroq.WithModification(modification)); err != nil {
-			if depErr, ok := entroq.AsDependency(err); ok {
-				log.Printf("Worker ack failed: %v", err)
-				if fn := h.result.onDependency; fn != nil {
-					// A returned Retry/Move/Fatal sentinel is honored by runOne
-					// via handleSentinelErrors, exactly like a work-phase sentinel;
-					// any other non-nil error stops the worker. A nil return falls
-					// through to the default reclaim below.
-					if ferr := fn(ctx, depErr); ferr != nil {
-						return ferr
-					}
-				}
-				return fmt.Errorf("worker doModify finish dependency: %w", err)
-			}
-			if entroq.IsCanceled(err) || entroq.IsTimeout(err) {
-				log.Printf("Worker exiting cleanly instead of acking: %v", err)
-				return fmt.Errorf("canceled doModify finish: %w", err)
-			}
-			return fmt.Errorf("worker doModify finish: %w", err)
+			return h.commitFailed(ctx, err)
 		}
+		// The sets follow the task: once the commit lets go of it, the sets
+		// the commit did not write are released too, after OnSuccess, which
+		// may still use them.
+		if writesTask(modification, finalTask.ID) {
+			release = untouched(modification, finalSets)
+		}
+		h.released = onlyArrives(modification, finalTask.ID)
 	}
 
 	// The task was handled successfully (no error; any modifications committed).
 	// OnSuccess is the optimistic post-success step: best-effort (its error is
 	// logged), unless it returns a FatalError, which stops the worker.
+	var fatal error
 	if h.result.onSuccess != nil {
 		if err := h.result.onSuccess(ctx); err != nil {
 			if _, ok := AsFatal(err); ok {
-				return err
+				fatal = err
+			} else {
+				log.Printf("worker on-success: %v", err)
 			}
-			log.Printf("worker on-success: %v", err)
 		}
 	}
-	return nil
+	releaseSets(ctx, mod, release)
+	return fatal
+}
+
+// commitFailed handles a commit of the handler's result that did not apply.
+func (h *doModifyHandler[T]) commitFailed(ctx context.Context, err error) error {
+	if depErr, ok := entroq.AsDependency(err); ok {
+		log.Printf("Worker ack failed: %v", err)
+		if fn := h.result.onDependency; fn != nil {
+			// A returned Retry/Move/Fatal sentinel is honored by runOne
+			// via handleSentinelErrors, exactly like a work-phase sentinel;
+			// any other non-nil error stops the worker. A nil return falls
+			// through to the default reclaim below.
+			if ferr := fn(ctx, depErr); ferr != nil {
+				return ferr
+			}
+		}
+		return fmt.Errorf("worker doModify finish dependency: %w", err)
+	}
+	if entroq.IsCanceled(err) || entroq.IsTimeout(err) {
+		log.Printf("Worker exiting cleanly instead of acking: %v", err)
+		return fmt.Errorf("canceled doModify finish: %w", err)
+	}
+	return fmt.Errorf("worker doModify finish: %w", err)
+}
+
+// fixVersions moves m's operations on the task and its doc sets to the
+// versions renewal left them at. Every doc in a set is at the set's version.
+func fixVersions(m *entroq.Modification, task *entroq.Task, sets []*entroq.DocSet) {
+	for _, t := range m.Changes {
+		if t.ID == task.ID {
+			t.Version = task.Version
+		}
+	}
+	for _, t := range m.Depends {
+		if t.ID == task.ID {
+			t.Version = task.Version
+		}
+	}
+	for _, t := range m.Deletes {
+		if t.ID == task.ID {
+			t.Version = task.Version
+		}
+	}
+	for _, a := range m.Arrives {
+		if a.ID == task.ID {
+			a.Version = task.Version
+		}
+	}
+
+	setVers := make(map[setKey]int32, len(sets))
+	for _, g := range sets {
+		setVers[setKey{g.Namespace, g.Key}] = g.Version
+	}
+	docVers := make(map[docKey]int32)
+	for _, d := range entroq.DocsIn(sets) {
+		docVers[docKey{d.Namespace, d.ID}] = d.Version
+	}
+	for _, dc := range m.DocChanges {
+		if v, ok := docVers[docKey{dc.Namespace, dc.ID}]; ok {
+			dc.Version = v
+		}
+	}
+	for _, dd := range m.DocDeletes {
+		if v, ok := docVers[docKey{dd.Namespace, dd.ID}]; ok {
+			dd.Version = v
+		}
+	}
+	for _, dd := range m.DocDepends {
+		if v, ok := docVers[docKey{dd.Namespace, dd.ID}]; ok {
+			dd.Version = v
+		}
+	}
+	for _, a := range m.DocArrives {
+		if v, ok := setVers[setKey{a.Namespace, a.Key}]; ok {
+			a.Version = v
+		}
+	}
+}
+
+type (
+	setKey struct{ ns, key string }
+	docKey struct{ ns, id string }
+)
+
+// writesTask reports whether m changes, deletes, or makes arrive the task
+// with the given ID, rather than only depending on it.
+func writesTask(m *entroq.Modification, id string) bool {
+	return rewritesTask(m, id) || arrives(m, id)
+}
+
+// rewritesTask reports whether m changes or deletes the task with the given
+// ID.
+func rewritesTask(m *entroq.Modification, id string) bool {
+	for _, t := range m.Changes {
+		if t.ID == id {
+			return true
+		}
+	}
+	for _, t := range m.Deletes {
+		if t.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// arrives reports whether m makes the task with the given ID arrive.
+func arrives(m *entroq.Modification, id string) bool {
+	for _, a := range m.Arrives {
+		if a.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// onlyArrives reports whether m makes the task with the given ID arrive
+// without changing or deleting it: a release, or a deferral.
+func onlyArrives(m *entroq.Modification, id string) bool {
+	return arrives(m, id) && !rewritesTask(m, id)
+}
+
+// untouched returns the sets m does not write: none of their docs is
+// inserted, changed, or deleted, and the set does not arrive. Depending on a
+// doc does not write its set.
+func untouched(m *entroq.Modification, sets []*entroq.DocSet) []*entroq.DocSet {
+	memberOf := make(map[docKey]setKey)
+	for _, g := range sets {
+		for _, d := range g.Docs {
+			memberOf[docKey{d.Namespace, d.ID}] = setKey{g.Namespace, g.Key}
+		}
+	}
+	written := make(map[setKey]bool)
+	for _, ins := range m.DocInserts {
+		written[setKey{ins.Namespace, ins.Key}] = true
+	}
+	for _, dc := range m.DocChanges {
+		written[setKey{dc.Namespace, dc.Key}] = true
+	}
+	for _, dd := range m.DocDeletes {
+		if k, ok := memberOf[docKey{dd.Namespace, dd.ID}]; ok {
+			written[k] = true
+		}
+	}
+	for _, a := range m.DocArrives {
+		written[setKey{a.Namespace, a.Key}] = true
+	}
+	var out []*entroq.DocSet
+	for _, g := range sets {
+		if !written[setKey{g.Namespace, g.Key}] {
+			out = append(out, g)
+		}
+	}
+	return out
+}
+
+// releaseSets makes sets ready again now, after a commit that let go of the
+// task holding them. It is best-effort: a set it cannot release waits out its
+// lease, as it would have without it.
+func releaseSets(ctx context.Context, mod Modifier, sets []*entroq.DocSet) {
+	if len(sets) == 0 {
+		return
+	}
+	if _, err := mod.Modify(ctx, entroq.Arriving(entroq.ReadyNow().Docs(sets...))); err != nil {
+		log.Printf("worker: release doc sets after commit: %v", err)
+	}
 }
 
 // Worker[T] defines a looping protocol that processes tasks in a queue. It
@@ -629,7 +763,10 @@ func WithErrQMap[T any](f ErrQMap) Option[T] {
 	}
 }
 
-func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, task *entroq.Task, errQ string, opts *runOpt) (isSentinel bool, err error) {
+// handleSentinelErrors commits the disposition a sentinel error asks for. A
+// retry or move lets go of the task, so the doc sets it held, in sets, are
+// released after it commits.
+func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, task *entroq.Task, sets []*entroq.DocSet, errQ string, opts *runOpt) (isSentinel bool, err error) {
 	if re, ok := AsRetry(sentinel); ok {
 		delay := opts.baseRetryDelay
 		if re.hasAfter {
@@ -648,6 +785,7 @@ func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, ta
 			}
 			return true, fmt.Errorf("retry or quarantine modify: %w", err)
 		}
+		releaseSets(ctx, w.eqc, sets)
 		return true, nil
 	}
 	if me, ok := AsMove(sentinel); ok {
@@ -664,6 +802,7 @@ func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, ta
 			}
 			return true, fmt.Errorf("quarantine modify: %w", err)
 		}
+		releaseSets(ctx, w.eqc, sets)
 		return true, nil
 	}
 	if fe, ok := AsFatal(sentinel); ok {
@@ -676,23 +815,21 @@ func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, ta
 // It calls the provided take function to learn what is needed, then claims
 // ownership of those documents.
 //
-// It returns the claimed sets in claim order, and the claims of those that
-// had no docs: renewing the docs renews their sets, but nothing renews an
-// empty set, so the caller re-claims those as it renews.
+// It returns the claimed sets in claim order, sets with no docs included.
 //
 // Returns a *entroq.DependencyError while another claimant holds a set; the
 // caller retries the task with backoff.
-func acquireDocs[T any](ctx context.Context, eqc *entroq.EntroQ, task *entroq.Task, value T, lease time.Duration, take TakeRun[T]) (sets []*entroq.DocSet, empty []*entroq.DocClaim, err error) {
-	sets = []*entroq.DocSet{}
+func acquireDocs[T any](ctx context.Context, eqc *entroq.EntroQ, task *entroq.Task, value T, lease time.Duration, take TakeRun[T]) ([]*entroq.DocSet, error) {
+	sets := []*entroq.DocSet{}
 	if take == nil {
-		return sets, nil, nil
+		return sets, nil
 	}
 	req, err := take(ctx, task, value)
 	if err != nil {
-		return nil, nil, fmt.Errorf("take docs: %w", err)
+		return nil, fmt.Errorf("take docs: %w", err)
 	}
 	if req == nil {
-		return sets, nil, nil
+		return sets, nil
 	}
 
 	// Sort to avoid livelock from dining philosophers.
@@ -707,42 +844,11 @@ func acquireDocs[T any](ctx context.Context, eqc *entroq.EntroQ, task *entroq.Ta
 		cq.Duration = lease
 		set, err := eqc.ClaimDocs(ctx, cq)
 		if err != nil {
-			return nil, nil, err // caller inspects DependencyError
-		}
-		if len(set.Docs) == 0 {
-			empty = append(empty, cq)
+			return nil, err // caller inspects DependencyError
 		}
 		sets = append(sets, set)
 	}
-	return sets, empty, nil
-}
-
-// withRenewed returns sets with their members replaced by the renewed copies
-// in renewed, and each set's version and claim taken from them, as renewal
-// moves every member of a set together. A set with no docs is returned as
-// it was.
-func withRenewed(sets []*entroq.DocSet, renewed []*entroq.Doc) []*entroq.DocSet {
-	type nsID struct{ ns, id string }
-	byID := make(map[nsID]*entroq.Doc, len(renewed))
-	for _, d := range renewed {
-		byID[nsID{d.Namespace, d.ID}] = d
-	}
-	out := make([]*entroq.DocSet, 0, len(sets))
-	for _, g := range sets {
-		ng := *g
-		ng.Docs = make([]*entroq.Doc, 0, len(g.Docs))
-		for _, d := range g.Docs {
-			if r, ok := byID[nsID{d.Namespace, d.ID}]; ok {
-				d = r
-			}
-			ng.Docs = append(ng.Docs, d)
-		}
-		if len(ng.Docs) > 0 {
-			ng.Version, ng.Claimant, ng.At = ng.Docs[0].Version, ng.Docs[0].Claimant, ng.Docs[0].At
-		}
-		out = append(out, &ng)
-	}
-	return out
+	return sets, nil
 }
 
 // runOne claims one task, unmarshals its value into T, runs the work function
@@ -762,6 +868,7 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 		return err
 	}
 	task, err := w.eqc.Claim(claimCtx, entroq.From(opts.qs...), entroq.ClaimFor(opts.lease))
+	claimed := time.Now()
 	endClaim()
 	if err != nil {
 		return fmt.Errorf("worker (%q) claim: %w", opts.qs, err)
@@ -778,7 +885,7 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 	if opts.maxClaims > 0 && task.Claims > opts.maxClaims {
 		errQ := w.ErrorQueueFor(task.Queue)
 		if _, err := w.handleSentinelErrors(ctx,
-			MoveErrorf("maximum claims exceeded (%d)", opts.maxClaims), task, errQ, opts,
+			MoveErrorf("maximum claims exceeded (%d)", opts.maxClaims), task, nil, errQ, opts,
 		); err != nil {
 			return fmt.Errorf("handle max claims: %w", err)
 		}
@@ -798,14 +905,15 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 	// Phase 2: Acquire docs before renewal starts. Doc claims are sorted by
 	// (namespace, key) to prevent dining-philosopher livelock when multiple
 	// doc sets are acquired.
-	sets, emptySets, err := acquireDocs(rCtx, w.eqc, task, value, opts.lease, handler.TakeDocs)
+	sets, err := acquireDocs(rCtx, w.eqc, task, value, opts.lease, handler.TakeDocs)
 	if err != nil {
 		// A claim fails only while someone else holds the set, which is
-		// transient: retry with backoff.
+		// transient: retry with backoff. Sets claimed before it keep their
+		// leases.
 		if _, ok := entroq.AsDependency(err); ok {
 			outcome = outcomeRetried
 			errQ := w.ErrorQueueFor(task.Queue)
-			if _, herr := w.handleSentinelErrors(ctx, RetryErrorf("doc contention"), task, errQ, opts); herr != nil {
+			if _, herr := w.handleSentinelErrors(ctx, RetryErrorf("doc contention"), task, nil, errQ, opts); herr != nil {
 				return fmt.Errorf("handle sentinel error: %w", herr)
 			}
 			return nil
@@ -820,14 +928,14 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 		finalSets   []*entroq.DocSet
 	)
 
-	handleErr := doWhileRenewing(rCtx, w.eqc, emptySets,
+	// Renew first half a lease after the claim, at once if claiming the sets
+	// took longer: the task's lease has run since then.
+	first := max(0, opts.lease/2-time.Since(claimed))
+	handleErr := doWhileRenewing(rCtx, w.eqc, opts.lease, first, held{task: task, sets: sets},
 		func(ctx context.Context, stop finalizeRenew) error {
 			defer func() {
-				stable := stop()
-				if len(stable.Tasks) > 0 {
-					finalTask = stable.Tasks[0]
-				}
-				finalSets = withRenewed(sets, stable.Docs)
+				final := stop()
+				finalTask, finalSets = final.task, final.sets
 			}()
 			if err := handler.DoWork(ctx, task, value, sets); err != nil {
 				if !isSentinelError(err) {
@@ -837,15 +945,12 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 			}
 			return nil
 		},
-		entroq.RenewingTask(task),
-		entroq.RenewingDocs(entroq.DocsIn(sets)),
-		entroq.WithRenewInterval(opts.lease),
 	)
 
 	if sentinelErr != nil {
 		outcome = sentinelOutcome(sentinelErr)
 		errQ := w.ErrorQueueFor(task.Queue)
-		if _, err := w.handleSentinelErrors(ctx, sentinelErr, finalTask, errQ, opts); err != nil {
+		if _, err := w.handleSentinelErrors(ctx, sentinelErr, finalTask, finalSets, errQ, opts); err != nil {
 			return fmt.Errorf("handle sentinel error: %w", err)
 		}
 		return nil
@@ -861,7 +966,7 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 		// sentinel; route it through the same machinery as a work-phase sentinel
 		// before falling back to the default dependency reclaim.
 		errQ := w.ErrorQueueFor(task.Queue)
-		if isSentinel, serr := w.handleSentinelErrors(ctx, err, finalTask, errQ, opts); isSentinel {
+		if isSentinel, serr := w.handleSentinelErrors(ctx, err, finalTask, finalSets, errQ, opts); isSentinel {
 			return serr
 		}
 		if de, ok := entroq.AsDependency(err); ok {
@@ -876,6 +981,9 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 		return fmt.Errorf("worker finish (%q): %w", opts.qs, err)
 	}
 	outcome = outcomeDone
+	if h, ok := handler.(*doModifyHandler[T]); ok && h.released {
+		outcome = outcomeReleased
+	}
 	return nil
 }
 
@@ -971,6 +1079,14 @@ func isSentinelError(err error) bool {
 //     louder and thus more fixable, than continuing from state neither the author
 //     nor the framework reasoned about. Classify the failures you understand as
 //     Retry/Move so only genuine surprises bring the worker down.
+//
+// A claimant is a consumer, not a process. Run claims as the worker's client
+// ID, so concurrent Runs of one worker, or of workers sharing a client, are
+// one claimant to EntroQ: it cannot tell them apart. Two of them can then
+// hold the same doc set at once, and each invalidates the versions the other
+// holds whenever it renews, commits, or releases the set. Give Runs that
+// claim doc sets their own clients (see entroq.WithClaimantID), or keep the
+// sets they claim apart.
 func (w *Worker[T]) Run(ctx context.Context, opts ...RunOption) error {
 	ro := &runOpt{
 		lease:          entroq.DefaultClaimDuration,
@@ -982,6 +1098,9 @@ func (w *Worker[T]) Run(ctx context.Context, opts ...RunOption) error {
 
 	if len(ro.qs) == 0 {
 		return fmt.Errorf("no queues specified to work on")
+	}
+	if err := w.checkProtocol(ctx); err != nil {
+		return fmt.Errorf("worker (%q): %w", ro.qs, err)
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -1006,6 +1125,24 @@ func (w *Worker[T]) Run(ctx context.Context, opts ...RunOption) error {
 			return fmt.Errorf("worker (%q): %w", ro.qs, err)
 		}
 	}
+}
+
+// minServerProtocol is the oldest wire protocol a worker can run against: it
+// renews and releases with lease-only changes, which protocol 2 added.
+const minServerProtocol = 2
+
+// checkProtocol refuses a server too old for the worker. Servers upgrade
+// before their clients, so this is a deployment mistake, and reported as one
+// before anything is claimed.
+func (w *Worker[T]) checkProtocol(ctx context.Context) error {
+	p, err := w.eqc.ServerProtocol(ctx)
+	if err != nil {
+		return fmt.Errorf("check server protocol: %w", err)
+	}
+	if p < minServerProtocol {
+		return entroq.Unsupportedf("the EntroQ server speaks protocol %d, and this worker needs protocol %d or later: upgrade the server first", p, minServerProtocol)
+	}
+	return nil
 }
 
 // join registers run for Shutdown, or refuses once Shutdown has been called.
@@ -1185,27 +1322,66 @@ func AsFatal(err error) (*FatalError, bool) {
 
 // Renewal Machinery
 
-// finalizeRenew is a function that can be called to stop renewal from a
-// worker routine. It returns a RenewResponse with tasks and/or docs with
-// stable versions (no longer renewing).
-type finalizeRenew func() *entroq.RenewResponse
+// held is what a worker holds while it works: its task and the doc sets it
+// claimed, at their latest versions.
+type held struct {
+	task *entroq.Task
+	sets []*entroq.DocSet
+}
+
+// renewed returns h as a renewal left it, from its response: the task at its
+// new version, and each set, and its docs, at the set's new lock.
+func (h held) renewed(resp *entroq.ModifyResponse) (held, error) {
+	if len(resp.ChangedTasks) != 1 || resp.ChangedTasks[0].ID != h.task.ID {
+		return held{}, fmt.Errorf("renewal of task %s returned tasks %v", h.task.ID, resp.ChangedTasks)
+	}
+	locks := make(map[setKey]*entroq.DocSet, len(resp.ChangedSets))
+	for _, l := range resp.ChangedSets {
+		locks[setKey{l.Namespace, l.Key}] = l
+	}
+	out := held{task: resp.ChangedTasks[0], sets: make([]*entroq.DocSet, 0, len(h.sets))}
+	for _, g := range h.sets {
+		l, ok := locks[setKey{g.Namespace, g.Key}]
+		if !ok {
+			return held{}, fmt.Errorf("renewal did not return doc set %q in %q", g.Key, g.Namespace)
+		}
+		out.sets = append(out.sets, relocked(g, l))
+	}
+	return out, nil
+}
+
+// relocked returns g, and each of its docs, at lock l.
+func relocked(g, l *entroq.DocSet) *entroq.DocSet {
+	ng := *g
+	ng.Version, ng.Claimant, ng.At, ng.NumDocs = l.Version, l.Claimant, l.At, l.NumDocs
+	ng.Docs = make([]*entroq.Doc, 0, len(g.Docs))
+	for _, d := range g.Docs {
+		nd := *d
+		nd.Version, nd.Claimant, nd.At = l.Version, l.Claimant, l.At
+		ng.Docs = append(ng.Docs, &nd)
+	}
+	return &ng
+}
+
+// finalizeRenew stops renewal from a worker routine and returns what it held,
+// at the stable versions it left them at.
+type finalizeRenew func() held
 
 // workFn handles tasks and docs while renewal runs in the background.
 type workFn func(ctx context.Context, stop finalizeRenew) error
 
-// doWhileRenewing runs the given work function while keeping the provided
-// tasks and docs claimed in the background. Sets in empty had no docs when
-// claimed, so renewing docs cannot renew them; each renewal claims them again,
-// which extends a claim its holder already has.
-func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, empty []*entroq.DocClaim, work workFn, opts ...entroq.RenewOption) error {
-	conf := entroq.NewRenewConfig(opts...)
-	if conf.IsEmpty() {
+// doWhileRenewing runs work while keeping h claimed in the background: after
+// first, and then every half lease, one UpdateArrival renews the task and
+// every set, sets with no docs included. A renewal that finds the claim lost, a server that cannot
+// renew, or a renewal that does not return what it renewed cancels work with
+// that error as its cause.
+func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, lease, first time.Duration, h held, work workFn) error {
+	if h.task == nil {
 		return fmt.Errorf("do while renewing: nothing to renew")
 	}
 	type outVal struct {
-		tasks []*entroq.Task
-		docs  []*entroq.Doc
-		err   error
+		held held
+		err  error
 	}
 	taskCh := make(chan outVal, 1)
 
@@ -1216,10 +1392,15 @@ func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, empty []*entroq.DocC
 
 	stopRenew := make(chan struct{})
 	g.Go(func() error {
-		renewed := conf.Tasks
-		renewedDocs := conf.Docs
+		cur := h
+		next := first
 		var out chan<- outVal
 		var stopErr error
+		stop := func(err error) {
+			fcancel(err)
+			stopErr = err
+			out = taskCh
+		}
 		doneCh := ctx.Done()
 		for {
 			select {
@@ -1229,34 +1410,31 @@ func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, empty []*entroq.DocC
 			case <-doneCh:
 				out = taskCh
 				doneCh = nil
-			case <-time.After(conf.Interval / 2):
+			case <-time.After(next):
+				next = lease / 2
 				if stopErr != nil {
 					break
 				}
-				resp, err := c.Renew(ctx,
-					entroq.RenewingTasks(renewed),
-					entroq.RenewingDocs(renewedDocs),
-					entroq.WithRenewInterval(conf.Interval))
-				if err == nil {
-					err = reclaimSets(ctx, c, empty)
-				}
-				if err != nil {
-					if entroq.IsCanceled(err) {
-						out = taskCh
+				resp, err := c.UpdateArrival(ctx, entroq.ReadyIn(lease).Tasks(cur.task).Docs(cur.sets...))
+				_, lost := entroq.AsDependency(err)
+				switch {
+				case err == nil:
+					next, err := cur.renewed(resp)
+					if err != nil {
+						stop(err)
 						break
 					}
-					if depErr, ok := entroq.AsDependency(err); ok {
-						fcancel(depErr)
-						stopErr = depErr
-						out = taskCh
-						break
-					}
+					cur = next
+				case entroq.IsCanceled(err):
+					out = taskCh
+				case lost || entroq.IsUnsupported(err):
+					// The claim is gone, or the server cannot renew it:
+					// nothing holds the work any longer.
+					stop(err)
+				default:
 					log.Printf("Transient renewal error: %v", err)
-					continue
 				}
-				renewed = resp.Tasks
-				renewedDocs = resp.Docs
-			case out <- outVal{renewed, renewedDocs, stopErr}:
+			case out <- outVal{cur, stopErr}:
 				return nil
 			}
 		}
@@ -1264,24 +1442,21 @@ func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, empty []*entroq.DocC
 
 	// finalize is safe to call any number of times from any goroutine.
 	// sync.Once ensures stopRenew is closed exactly once and taskCh is read
-	// exactly once; subsequent calls return the already-captured response.
+	// exactly once; subsequent calls return the already-captured result.
 	var (
 		finalizeOnce sync.Once
-		finalResp    *entroq.RenewResponse
+		final        held
 	)
-	finalize := func() *entroq.RenewResponse {
+	finalize := func() held {
 		finalizeOnce.Do(func() {
 			close(stopRenew)
 			out := <-taskCh
 			if out.err != nil {
 				fcancel(out.err)
 			}
-			finalResp = &entroq.RenewResponse{
-				Tasks: out.tasks,
-				Docs:  out.docs,
-			}
+			final = out.held
 		})
-		return finalResp
+		return final
 	}
 
 	g.Go(func() error {
@@ -1299,18 +1474,6 @@ func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, empty []*entroq.DocC
 
 	if err := g.Wait(); err != nil {
 		return fmt.Errorf("do with renew all: %w", err)
-	}
-	return nil
-}
-
-// reclaimSets claims each set again, extending its holder's claim. A set
-// that has gained docs since is still renewed this way; its docs are not
-// tracked, as the handler did not receive them.
-func reclaimSets(ctx context.Context, c *entroq.EntroQ, claims []*entroq.DocClaim) error {
-	for _, cq := range claims {
-		if _, err := c.ClaimDocs(ctx, cq); err != nil {
-			return fmt.Errorf("renew doc set %q in %q: %w", cq.Key, cq.Namespace, err)
-		}
 	}
 	return nil
 }

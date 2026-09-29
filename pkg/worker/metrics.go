@@ -28,6 +28,8 @@ const (
 	outcomeRetried = "retried"
 	outcomeMoved   = "moved"
 	outcomeFailed  = "failed"
+	// A task whose commit only made it arrive: released, or deferred.
+	outcomeReleased = "released"
 )
 
 type workerMetrics struct {

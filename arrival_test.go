@@ -1,6 +1,7 @@
 package entroq
 
 import (
+	"reflect"
 	"testing"
 	"time"
 )
@@ -83,5 +84,52 @@ func TestDocIDIsSetRef(t *testing.T) {
 	}
 	if got, want := NewDocSetRef("ns", "k", 1).String(), "ns/[k]:v1"; got != want {
 		t.Errorf("Set reference string: got %q, want %q", got, want)
+	}
+}
+
+// TestWithModificationCopiesEveryList checks that WithModification carries
+// every operation list of a Modification, so one added later cannot be
+// dropped without notice: a modification of only arrivals once became an
+// empty one.
+func TestWithModificationCopiesEveryList(t *testing.T) {
+	src := new(Modification)
+	v := reflect.ValueOf(src).Elem()
+	for i := 0; i < v.NumField(); i++ {
+		f := v.Field(i)
+		if !v.Type().Field(i).IsExported() || f.Kind() != reflect.Slice {
+			continue
+		}
+		f.Set(reflect.MakeSlice(f.Type(), 1, 1))
+	}
+	dest := NewModification("", WithModification(src))
+	d := reflect.ValueOf(dest).Elem()
+	for i := 0; i < v.NumField(); i++ {
+		if !v.Type().Field(i).IsExported() || v.Field(i).Kind() != reflect.Slice {
+			continue
+		}
+		if d.Field(i).Len() != 1 {
+			t.Errorf("WithModification dropped %s", v.Type().Field(i).Name)
+		}
+	}
+}
+
+// TestIsEmptyCountsEveryList checks that a modification with any one
+// operation list filled is not empty, so a list added later cannot be
+// refused as nothing to do.
+func TestIsEmptyCountsEveryList(t *testing.T) {
+	if !new(Modification).IsEmpty() {
+		t.Error("A modification with no operations: want empty")
+	}
+	typ := reflect.TypeOf(Modification{})
+	for i := 0; i < typ.NumField(); i++ {
+		if !typ.Field(i).IsExported() || typ.Field(i).Type.Kind() != reflect.Slice {
+			continue
+		}
+		m := new(Modification)
+		f := reflect.ValueOf(m).Elem().Field(i)
+		f.Set(reflect.MakeSlice(f.Type(), 1, 1))
+		if m.IsEmpty() {
+			t.Errorf("A modification with one %s: want it not empty", typ.Field(i).Name)
+		}
 	}
 }

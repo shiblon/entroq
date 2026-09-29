@@ -106,6 +106,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/shiblon/entroq/pkg/version"
 )
 
 const (
@@ -614,6 +616,44 @@ func IsInvalidArgument(err error) bool {
 	return errors.As(err, &e)
 }
 
+// UnsupportedError indicates a request the backend does not understand, such
+// as one needing a newer wire protocol than its server speaks. Retrying it
+// cannot succeed until the server is upgraded. The service reports it as
+// codes.Unimplemented, and the gRPC backend translates that code back to it.
+type UnsupportedError struct{ msg string }
+
+// Error implements the error interface.
+func (e *UnsupportedError) Error() string { return e.msg }
+
+// Unsupportedf builds an UnsupportedError with a formatted message.
+func Unsupportedf(format string, args ...any) *UnsupportedError {
+	return &UnsupportedError{msg: fmt.Sprintf(format, args...)}
+}
+
+// IsUnsupported reports whether err indicates a request the backend does not
+// understand (see UnsupportedError).
+func IsUnsupported(err error) bool {
+	var e *UnsupportedError
+	return errors.As(err, &e)
+}
+
+// ProtocolReporter is implemented by a backend that reaches its store through
+// a server, which may speak an older wire protocol than this build.
+type ProtocolReporter interface {
+	// ServerProtocol returns the wire protocol the server speaks.
+	ServerProtocol(ctx context.Context) (int32, error)
+}
+
+// ServerProtocol returns the wire protocol the client's store speaks: its
+// server's, for a backend that reaches the store over the wire (see
+// ProtocolReporter), and this build's, version.Protocol, otherwise.
+func (c *EntroQ) ServerProtocol(ctx context.Context) (int32, error) {
+	if r, ok := c.backend.(ProtocolReporter); ok {
+		return r.ServerProtocol(ctx)
+	}
+	return version.Protocol, nil
+}
+
 // NewClaimQuery builds the claim query that Claim and TryClaim would send for
 // opts, with no default claimant. The service uses it to check a claim's shape
 // before authorizing it.
@@ -931,6 +971,11 @@ func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (*ModifyRespo
 			newDocInserts = append(newDocInserts, dd)
 		}
 		mod.DocInserts = newDocInserts
+
+		// Every operation was a skipped insert: the modification is done.
+		if mod.IsEmpty() {
+			return new(ModifyResponse), nil
+		}
 	}
 }
 
@@ -1035,10 +1080,12 @@ func WithModification(src *Modification) ModifyArg {
 		dest.Changes = append(dest.Changes, src.Changes...)
 		dest.Deletes = append(dest.Deletes, src.Deletes...)
 		dest.Depends = append(dest.Depends, src.Depends...)
+		dest.Arrives = append(dest.Arrives, src.Arrives...)
 		dest.DocInserts = append(dest.DocInserts, src.DocInserts...)
 		dest.DocChanges = append(dest.DocChanges, src.DocChanges...)
 		dest.DocDeletes = append(dest.DocDeletes, src.DocDeletes...)
 		dest.DocDepends = append(dest.DocDepends, src.DocDepends...)
+		dest.DocArrives = append(dest.DocArrives, src.DocArrives...)
 	}
 }
 
@@ -1118,6 +1165,14 @@ func (m *Modification) Options() []ModifyOption {
 	return m.options
 }
 
+// IsEmpty reports whether m names no operation at all. Modify refuses such a
+// modification: one that does nothing is a mistake, most often a list its
+// builder forgot to carry.
+func (m *Modification) IsEmpty() bool {
+	return len(m.Inserts)+len(m.Changes)+len(m.Deletes)+len(m.Depends)+len(m.Arrives)+
+		len(m.DocInserts)+len(m.DocChanges)+len(m.DocDeletes)+len(m.DocDepends)+len(m.DocArrives) == 0
+}
+
 // EnsureModifyKeys rejects a modification that would write to an empty queue or
 // namespace. The write targets are the operations with no prior record to look
 // up, so an empty key would otherwise be silently written to "": a task insert
@@ -1135,6 +1190,9 @@ func (m *Modification) Options() []ModifyOption {
 // start of Modify. Because direct-to-backend clients are not a supported path,
 // enforcing in the Go backend is sufficient: every supported write reaches one.
 func (m *Modification) EnsureModifyKeys() error {
+	if m.IsEmpty() {
+		return InvalidArgumentf("modify: nothing to do")
+	}
 	for _, ins := range m.Inserts {
 		if ins.Queue == "" {
 			return InvalidArgumentf("modify: insert of task %q must name a queue", ins.ID)

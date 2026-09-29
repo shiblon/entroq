@@ -50,8 +50,48 @@ runs, so plan a short maintenance window on large doc tables.
   commits the task it holds, and returns nil. If Shutdown's context ends first,
   it cancels the handlers still running and returns the context's error. `Run`
   on a shut-down worker returns `worker.ErrShutdown`.
+- **The worker outcome `released`.** A `worker.Modify` result that only
+  makes the task arrive, releasing or deferring it, is counted in
+  `entroq.worker.tasks_total` as `released` rather than `done`. The work
+  gateway releases the task and its doc sets this way when a worker hangs up
+  during `doWork`; before, it released only the task and counted it as done.
+- **`entroq.UnsupportedError` and `EntroQ.ServerProtocol`.** A request the
+  backend does not understand, such as one needing a newer protocol than its
+  server speaks, is an `UnsupportedError` (`IsUnsupported`); the gRPC backend
+  translates `codes.Unimplemented` to it. `ServerProtocol` returns the wire
+  protocol the client's store speaks: the server's for a backend that
+  implements the new `entroq.ProtocolReporter`, as the gRPC backend does, and
+  this build's otherwise.
 
 ### Changed
+
+- **The worker renews and releases doc sets directly.** Renewal is one
+  `UpdateArrival` per half lease for the task and every set it holds, sets
+  with no docs included, rather than a rewrite of every task and doc plus a
+  claim of each empty set again. The handler's sets, and their docs, come to
+  `Finish` at the sets' final versions. Doc sets follow their task: once a
+  commit the worker makes writes the task (a `Modify` result that changes,
+  deletes, or makes the task arrive, or a retry or move), the worker releases
+  each set the commit did not write, after `OnSuccess`, so another worker can
+  claim it at once instead of waiting out its lease. The release is
+  best-effort, one call for all the sets, and a failure is logged. A failed
+  commit releases nothing, and neither does a user `Finish`, which owns its
+  own commits. The first renewal now comes half a lease after the task was
+  claimed, at once if claiming its doc sets took longer, rather than half a
+  lease after the sets were claimed, when a slow `TakeDocs` could let the
+  task's claim lapse first.
+- **Modify refuses a modification that does nothing.** One with no
+  operation at all is an invalid argument, from the client and from the
+  service: it is almost always a mistake, such as a list its builder forgot
+  to carry. A modification whose only inserts were skippable collisions
+  (`WithSkipColliding`, `WithSkipCollidingDoc`) still succeeds with an empty
+  response once they are dropped.
+- **A worker refuses a server below protocol 2.** `worker.Run` checks the
+  server's protocol before claiming anything, and returns an
+  `UnsupportedError` for an older server: upgrade servers before their
+  clients. A renewal the server refuses as unsupported now stops the work, as
+  a lost claim does, rather than being logged and retried until the lease
+  runs out.
 
 - **eqmr map outputs have a primary key per split.** A mapper writes each
   partition's output under `mapout/<partition>/<split>` instead of sharing
@@ -291,6 +331,11 @@ runs, so plan a short maintenance window on large doc tables.
   versions.
 
 ### Fixed
+
+- **A SQLite write stopped by its context reports the cancellation.**
+  `database/sql` rolls such a transaction back itself, and the backend then
+  returned `sql: transaction has already been committed or rolled back`, so a
+  worker being stopped exited with an error instead of cleanly.
 
 - **A canceled PostgreSQL call reports the cancellation.** When a caller's
   context ended while its query was running, lib/pq returned the server's

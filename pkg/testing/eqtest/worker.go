@@ -758,3 +758,156 @@ func WorkerHoldsEmptyGroup(ctx context.Context, t *testing.T, client *entroq.Ent
 		t.Errorf("Worker exit: %v", err)
 	}
 }
+
+// WorkerReleasesSets verifies that a worker's doc sets follow its task: when
+// a commit the worker makes lets go of the task, the sets it held and did not
+// write are released at once, not left to their leases.
+func WorkerReleasesSets(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	// The lease is long, so a set that is free soon after the task was
+	// handled was released, not expired.
+	const lease = 10 * time.Second
+
+	// run works queue until done is closed, and returns a function that stops
+	// it and reports how it exited.
+	run := func(t *testing.T, queue string, opts ...worker.Option[json.RawMessage]) func() {
+		t.Helper()
+		w := worker.New(client, opts...)
+		runCtx, cancel := context.WithCancel(ctx)
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- w.Run(runCtx, worker.Watching(queue), worker.WithLease(lease))
+		}()
+		return func() {
+			cancel()
+			if err := <-errCh; err != nil && !entroq.IsCanceled(err) {
+				t.Errorf("Worker exit: %v", err)
+			}
+		}
+	}
+	// free reports whether an intruder can claim the set at once.
+	free := func(t *testing.T, ns, key string) bool {
+		t.Helper()
+		_, err := client.ClaimDocs(ctx, &entroq.DocClaim{Namespace: ns, Key: key, Claimant: "intruder", Duration: time.Second})
+		if err != nil && !entroq.IsDependency(err) {
+			t.Fatalf("Intruder claim of %q: %v", key, err)
+		}
+		return err == nil
+	}
+	// gone waits for the queue to empty.
+	gone := func(t *testing.T, queue string) {
+		t.Helper()
+		for deadline := time.Now().Add(lease / 2); ; time.Sleep(20 * time.Millisecond) {
+			tasks, err := client.Tasks(ctx, queue)
+			if err != nil {
+				t.Fatalf("Tasks: %v", err)
+			}
+			if len(tasks) == 0 {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("Task in %q not handled in time", queue)
+			}
+		}
+	}
+
+	t.Run("a commit releases the sets it did not write", func(t *testing.T) {
+		queue := path.Join(qPrefix, "worker_releases_commit")
+		ns := path.Join(qPrefix, "worker_releases_commit_docs")
+		if _, err := client.Modify(ctx,
+			entroq.InsertingInto(queue),
+			entroq.PuttingDocInto(ns, entroq.WithKeys("written", "")),
+			entroq.PuttingDocInto(ns, entroq.WithKeys("depended", "")),
+		); err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+		stop := run(t, queue,
+			worker.WithTakeDocs(func(context.Context, *entroq.Task, json.RawMessage) ([]*entroq.DocClaim, error) {
+				return []*entroq.DocClaim{entroq.ClaimKey(ns, "written"), entroq.ClaimKey(ns, "depended"), entroq.ClaimKey(ns, "empty")}, nil
+			}),
+			worker.WithDoModify(func(_ context.Context, task *entroq.Task, _ json.RawMessage, sets []*entroq.DocSet) (*worker.Result, error) {
+				written, depended := sets[2].Docs[0], sets[0].Docs[0] // sorted by key
+				return worker.Modify(
+					task.Delete(),
+					written.Change(entroq.WithContent("done"), entroq.WithDocArrivalTimeBy(lease)),
+					depended.Depend(),
+				), nil
+			}),
+		)
+		defer stop()
+		gone(t, queue)
+
+		if !free(t, ns, "depended") {
+			t.Error("A set the commit only depended on: want it released")
+		}
+		if !free(t, ns, "empty") {
+			t.Error("An empty set the commit did not touch: want it released")
+		}
+		if free(t, ns, "written") {
+			t.Error("A set the commit wrote: want it to keep the arrival the commit gave it")
+		}
+	})
+
+	t.Run("a retry releases the sets", func(t *testing.T) {
+		queue := path.Join(qPrefix, "worker_releases_retry")
+		ns := path.Join(qPrefix, "worker_releases_retry_docs")
+		if _, err := client.Modify(ctx, entroq.InsertingInto(queue)); err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+		retried := make(chan bool, 1)
+		stop := run(t, queue,
+			worker.WithTakeDocs(func(context.Context, *entroq.Task, json.RawMessage) ([]*entroq.DocClaim, error) {
+				return []*entroq.DocClaim{entroq.ClaimKey(ns, "held")}, nil
+			}),
+			worker.WithDoModify(func(context.Context, *entroq.Task, json.RawMessage, []*entroq.DocSet) (*worker.Result, error) {
+				select {
+				case retried <- true:
+				default:
+				}
+				return nil, worker.RetryErrorf("not yet").After(time.Hour)
+			}),
+		)
+		defer stop()
+		<-retried
+		for deadline := time.Now().Add(lease / 2); !free(t, ns, "held"); time.Sleep(20 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatal("A set held by a retried task: want it released")
+			}
+		}
+	})
+
+	t.Run("a release makes the task and its sets ready now", func(t *testing.T) {
+		queue := path.Join(qPrefix, "worker_releases_release")
+		ns := path.Join(qPrefix, "worker_releases_release_docs")
+		if _, err := client.Modify(ctx, entroq.InsertingInto(queue)); err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+		calls := make(chan time.Time, 2)
+		first := true
+		stop := run(t, queue,
+			worker.WithTakeDocs(func(context.Context, *entroq.Task, json.RawMessage) ([]*entroq.DocClaim, error) {
+				return []*entroq.DocClaim{entroq.ClaimKey(ns, "held")}, nil
+			}),
+			worker.WithDoModify(func(_ context.Context, task *entroq.Task, _ json.RawMessage, sets []*entroq.DocSet) (*worker.Result, error) {
+				calls <- time.Now()
+				if first {
+					first = false
+					return worker.Modify(entroq.Arriving(entroq.ReadyNow().Tasks(task).Docs(sets...))), nil
+				}
+				return worker.Modify(task.Delete()), nil
+			}),
+		)
+		defer stop()
+		released := <-calls
+		// The worker claims the task and its set again at once: both were
+		// ready, not left to their leases.
+		select {
+		case again := <-calls:
+			if d := again.Sub(released); d > lease/2 {
+				t.Errorf("Released task claimed again after %v, want well within its lease %v", d, lease)
+			}
+		case <-time.After(lease / 2):
+			t.Fatal("Released task not claimed again within half its lease")
+		}
+		gone(t, queue)
+	})
+}

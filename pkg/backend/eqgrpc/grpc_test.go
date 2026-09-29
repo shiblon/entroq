@@ -195,6 +195,10 @@ func TestGRPCWorkerHoldsEmptyGroup(t *testing.T) {
 	RunQTest(t, eqtest.WorkerHoldsEmptyGroup)
 }
 
+func TestGRPCWorkerReleasesSets(t *testing.T) {
+	RunQTest(t, eqtest.WorkerReleasesSets)
+}
+
 func TestGRPCSimpleDocLifecycle(t *testing.T) {
 	RunQTest(t, eqtest.SimpleDocLifecycle)
 }

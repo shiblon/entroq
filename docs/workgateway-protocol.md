@@ -231,7 +231,7 @@ in `pkg/workgateway` (`contract_test.go` unless noted).
 | Situation | Gateway | Task | Class |
 |---|---|---|---|
 | Worker hangs up while the gateway waits for a task | stops claiming at once | none claimed | `ok` |
-| Worker hangs up with `takeDocs` or `doWork` unanswered | releases the task | released | `ok` |
+| Worker hangs up with `takeDocs` or `doWork` unanswered | releases the task, and its doc sets once `doWork` holds them | released | `ok` |
 | Worker sends its `result`, then hangs up | commits the result | committed | `ok` |
 | Worker hangs up during `success` | stops (`workgateway_test.go`) | committed | `ok` |
 | Worker hangs up during `dependency` (the commit failed) | stops | its lease, as after any failed commit: the lease is the backoff | `ok` |

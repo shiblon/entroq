@@ -575,6 +575,10 @@ func TestEQMemWorkerHoldsEmptyGroup(t *testing.T) {
 	RunQTest(t, eqtest.WorkerHoldsEmptyGroup)
 }
 
+func TestEQMemWorkerReleasesSets(t *testing.T) {
+	RunQTest(t, eqtest.WorkerReleasesSets)
+}
+
 func TestEQMemSimpleDocLifecycle(t *testing.T) {
 	RunQTest(t, eqtest.SimpleDocLifecycle)
 }
