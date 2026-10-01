@@ -891,11 +891,15 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 		newTask := c.Copy()
 		newTask.Version++
 		// Claims and Created belong to the backend, not the caller (who cannot
-		// send them over the wire). Replay applies the journaled final state
-		// as-is: claims are journaled as changes carrying the new count.
+		// send them over the wire): a change keeps the claim count unless it
+		// resets it. Replay applies the journaled final state as-is: claims are
+		// journaled as changes carrying the new count.
 		if !replay {
 			old := found[c.ID]
 			newTask.Claims = old.Claims
+			if mod.ResetsClaims(c.ID) {
+				newTask.Claims = 0
+			}
 			newTask.Created = old.Created
 		}
 		// Cap a far-past arrival to now (backend Modify contract): an omitted At

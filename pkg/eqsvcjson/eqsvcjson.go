@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"connectrpc.com/connect"
@@ -65,13 +64,13 @@ func New(svc *eqsvcgrpc.QSvc, opts ...connect.HandlerOption) (string, http.Handl
 }
 
 // withProtocolHeaders sends the protocol headers on every response, whatever
-// its route or outcome, as the gRPC service does: the protocol this server
-// speaks, which a client checks before sending anything newer than protocol
-// 1, and its release.
+// its route or outcome, as the gRPC service does: the protocols this server
+// serves, from which a client chooses, and its release. The protocol a
+// request declares reaches the service with its other headers.
 func withProtocolHeaders(next http.Handler) http.Handler {
-	protocol := strconv.Itoa(version.Protocol)
+	served := version.FormatProtocols(version.ServedProtocols)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set(version.ProtocolHeader, protocol)
+		w.Header().Set(version.ProtocolHeader, served)
 		w.Header().Set(version.VersionHeader, version.Version)
 		next.ServeHTTP(w, r)
 	})

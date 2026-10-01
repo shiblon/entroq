@@ -284,10 +284,12 @@ type Task struct {
 	ID      string `json:"id"`
 	Version int32  `json:"version"`
 
-	At       time.Time       `json:"at"`
-	Claimant string          `json:"claimant"`
-	Claims   int32           `json:"claims"`
-	Value    json.RawMessage `json:"value"`
+	At       time.Time `json:"at"`
+	Claimant string    `json:"claimant"`
+	// Claims counts the task's claims since it was last reset (see
+	// ResettingClaims). A claim adds one; nothing else changes it.
+	Claims int32           `json:"claims"`
+	Value  json.RawMessage `json:"value"`
 
 	Created  time.Time `json:"created"`
 	Modified time.Time `json:"modified"`
@@ -407,6 +409,20 @@ func ErrToZero() ChangeArg {
 	return ErrTo("")
 }
 
+// ResettingClaims makes a change reset the task's claim count to zero. A change
+// leaves the count alone without it, and a claim adds one, so the count is of
+// claims since the task was last reset. A worker resets it when it modifies a
+// task, so that a task that keeps coming back untouched (a poison pill, a
+// crash loop) reaches a claim limit, while one being worked on does not.
+func ResettingClaims() ChangeArg {
+	return func(m *Modification, t *Task) {
+		if m.resetClaims == nil {
+			m.resetClaims = make(map[string]bool)
+		}
+		m.resetClaims[t.ID] = true
+	}
+}
+
 // AttemptToNext sets the Attempt field in Task to the next value (increments it).
 func AttemptToNext() ChangeArg {
 	return func(_ *Modification, t *Task) {
@@ -460,8 +476,10 @@ func (t *Task) Depend() ModifyArg {
 // this will only retry.
 // Arrival-time overrides apply while retrying; quarantine always resets the
 // arrival time so the task is released and immediately available for inspection.
+// Either way the task's claim count is reset (see ResettingClaims): the failure
+// was handled, so the claims before it do not point at a poison pill.
 func (t *Task) RetryOrQuarantine(errMsg, quarantineTo string, afterMaxAttempts int32, overrides ...ChangeArg) ModifyArg {
-	args := []ChangeArg{AttemptToNext(), AppendingErr(errMsg)}
+	args := []ChangeArg{AttemptToNext(), AppendingErr(errMsg), ResettingClaims()}
 	quarantining := quarantineTo != "" && afterMaxAttempts != 0 && t.Attempt+1 >= afterMaxAttempts
 	if quarantining {
 		args = append(args, QueueTo(quarantineTo))

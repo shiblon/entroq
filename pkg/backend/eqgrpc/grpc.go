@@ -43,6 +43,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"slices"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -240,78 +241,94 @@ func closeFailedConnection(conn *grpc.ClientConn, openErr error) error {
 
 type backend struct {
 	conn *grpc.ClientConn
-	// protocol is the wire protocol the server last reported in its response
-	// headers: 0 before any response, 1 for a server that reports none.
+	// protocol is the protocol this client chose with the server: 0 until a
+	// response has said which the server serves.
 	protocol atomic.Int32
 }
 
-// client returns a gRPC client whose calls record the server's protocol.
+// client returns a gRPC client whose calls negotiate the protocol with the
+// server.
 func (b *backend) client() pb.EntroQClient {
 	return pb.NewEntroQClient(listeningConn{b.conn, b})
 }
 
-// listeningConn records the protocol a server reports in the response headers
-// of every unary call made through it.
+// listeningConn refuses a server that does not serve this client's protocol,
+// before making any call to it, and declares the protocol on every call.
 type listeningConn struct {
 	*grpc.ClientConn
 	b *backend
 }
 
-// Invoke makes a unary call and records the protocol from its response
-// headers, when there were any.
+// Invoke makes a unary call to a server that serves this client's protocol,
+// declaring it, and notes a server that stops serving it.
 func (c listeningConn) Invoke(ctx context.Context, method string, args, reply any, opts ...grpc.CallOption) error {
+	if err := c.b.checkServer(ctx); err != nil {
+		return err
+	}
 	var md metadata.MD
-	err := c.ClientConn.Invoke(ctx, method, args, reply, append(opts, grpc.Header(&md))...)
-	if md.Len() > 0 {
-		c.b.protocol.Store(protocolOf(md))
+	err := c.ClientConn.Invoke(declare(ctx), method, args, reply, append(opts, grpc.Header(&md))...)
+	if md.Len() > 0 && !slices.Contains(servedOf(md), version.Protocol) {
+		c.b.protocol.Store(0) // ask again before the next call
 	}
 	return err
 }
 
-// protocolOf reads the protocol from response headers; a server that sends
-// none speaks protocol 1.
-func protocolOf(md metadata.MD) int32 {
+// NewStream opens a stream to a server that serves this client's protocol,
+// declaring it.
+func (c listeningConn) NewStream(ctx context.Context, desc *grpc.StreamDesc, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+	if err := c.b.checkServer(ctx); err != nil {
+		return nil, err
+	}
+	return c.ClientConn.NewStream(declare(ctx), desc, method, opts...)
+}
+
+// declare adds this client's protocol to a call's request headers.
+func declare(ctx context.Context) context.Context {
+	return metadata.AppendToOutgoingContext(ctx, version.ProtocolHeader, strconv.Itoa(version.Protocol))
+}
+
+// servedOf reads the protocols a server serves from its response headers; a
+// server that sends none serves only protocol 1.
+func servedOf(md metadata.MD) []int32 {
 	vals := md.Get(version.ProtocolHeader)
 	if len(vals) == 0 {
-		return 1
+		return []int32{1}
 	}
-	p, err := strconv.Atoi(vals[0])
-	if err != nil || p < 1 {
-		return 1
-	}
-	return int32(p)
-}
-
-// ServerProtocol returns the protocol the server speaks (see
-// entroq.ProtocolReporter).
-func (b *backend) ServerProtocol(ctx context.Context) (int32, error) {
-	return b.serverProtocol(ctx)
-}
-
-// serverProtocol returns the protocol the server speaks, asking it with a
-// Time call if no response has said yet.
-func (b *backend) serverProtocol(ctx context.Context) (int32, error) {
-	if p := b.protocol.Load(); p > 0 {
-		return p, nil
-	}
-	if _, err := b.client().Time(ctx, new(pb.TimeRequest)); err != nil {
-		return 0, fmt.Errorf("grpc server protocol: %w", unpackGRPCError(err))
-	}
-	return b.protocol.Load(), nil
-}
-
-// needProtocol refuses what a server below protocol p cannot safely receive:
-// a 1.12 server applies a change carrying only a newer field as one with
-// empty data.
-func (b *backend) needProtocol(ctx context.Context, p int32, what string) error {
-	got, err := b.serverProtocol(ctx)
+	ps, err := version.ParseProtocols(vals[0])
 	if err != nil {
-		return err
+		return []int32{1}
 	}
-	if got < p {
-		return entroq.Unsupportedf("grpc: %s needs a server at protocol %d, and this one speaks protocol %d", what, p, got)
+	return ps
+}
+
+// checkServer refuses a server that does not serve this client's protocol,
+// asking it with a Time call if no response has said yet. A client speaks
+// one protocol and never falls back to another: the server lists what it
+// serves, and upgrading means moving that list.
+func (b *backend) checkServer(ctx context.Context) error {
+	if b.protocol.Load() != 0 {
+		return nil
 	}
-	return nil
+	var md metadata.MD
+	// Ask on the bare connection: this is the check the others wait on.
+	if _, err := pb.NewEntroQClient(b.conn).Time(declare(ctx), new(pb.TimeRequest), grpc.Header(&md)); err != nil {
+		if status.Code(err) != codes.Unimplemented {
+			return fmt.Errorf("grpc server protocol: %w", unpackGRPCError(err))
+		}
+		// A server that does not serve the protocol the probe declared
+		// refuses it, and still says what it serves.
+	}
+	served := servedOf(md)
+	if slices.Contains(served, version.Protocol) {
+		b.protocol.Store(version.Protocol)
+		return nil
+	}
+	upgrade := "this client"
+	if slices.Max(served) < version.Protocol {
+		upgrade = "the server"
+	}
+	return entroq.Unsupportedf("grpc: the EntroQ server serves protocols %s, and this client speaks protocol %d: upgrade %s",
+		version.FormatProtocols(served), version.Protocol, upgrade)
 }
 
 // New creates a new gRPC backend that attaches to the task service via gRPC.
@@ -590,13 +607,49 @@ func unpackGRPCError(grpcErr error) error {
 
 // Modify modifies the task system with the given batch of modifications.
 func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (*entroq.ModifyResponse, error) {
+	req, err := b.modifyRequest(mod)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := b.client().Modify(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("grpc modify: %w", unpackGRPCError(err))
+	}
+
+	mResp := new(entroq.ModifyResponse)
+	for _, t := range resp.GetInserted() {
+		task, err := pbconv.TaskFromProto(t)
+		if err != nil {
+			return nil, fmt.Errorf("grpc modify task proto: %w", err)
+		}
+		mResp.InsertedTasks = append(mResp.InsertedTasks, task)
+	}
+	for _, t := range resp.GetChanged() {
+		task, err := pbconv.TaskFromProto(t)
+		if err != nil {
+			return nil, fmt.Errorf("grpc modify changed: %w", err)
+		}
+		mResp.ChangedTasks = append(mResp.ChangedTasks, task)
+	}
+	for _, d := range resp.GetInsertedDocs() {
+		mResp.InsertedDocs = append(mResp.InsertedDocs, pbconv.MustDocFromProto(d))
+	}
+	for _, d := range resp.GetChangedDocs() {
+		// A doc set whose lease changed comes back as a Doc with no ID.
+		if pbconv.IsDocSet(d) {
+			mResp.ChangedSets = append(mResp.ChangedSets, pbconv.DocSetFromProto(d, nil))
+			continue
+		}
+		mResp.ChangedDocs = append(mResp.ChangedDocs, pbconv.MustDocFromProto(d))
+	}
+
+	return mResp, nil
+}
+
+// modifyRequest builds the wire request for mod.
+func (b *backend) modifyRequest(mod *entroq.Modification) (*pb.ModifyRequest, error) {
 	req := &pb.ModifyRequest{
 		ClaimantId: mod.Claimant,
-	}
-	if len(mod.Arrives) > 0 || len(mod.DocArrives) > 0 {
-		if err := b.needProtocol(ctx, 2, "an arrival change"); err != nil {
-			return nil, err
-		}
 	}
 	for _, a := range mod.Arrives {
 		req.Changes = append(req.Changes, pbconv.TaskArrivalToProto(a))
@@ -612,7 +665,7 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (*entroq
 		req.Inserts = append(req.Inserts, pd)
 	}
 	for _, task := range mod.Changes {
-		pc, err := pbconv.TaskChangeToProto(task)
+		pc, err := pbconv.TaskChangeToProto(task, mod.ResetsClaims(task.ID))
 		if err != nil {
 			return nil, fmt.Errorf("grpc modify change value: %w", err)
 		}
@@ -656,12 +709,12 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (*entroq
 		}
 		req.DocChanges = append(req.DocChanges, &pb.DocChange{
 			OldId: pbconv.DocIDToProto(dc.Namespace, dc.ID, dc.Version),
-			Data: &pb.DocChange_NewData{NewData: &pb.DocData{
+			NewData: &pb.DocData{
 				Key:          dc.Key,
 				SecondaryKey: dc.SecondaryKey,
 				Content:      val,
 				AtMs:         pbconv.ToMS(dc.At),
-			}},
+			},
 		})
 	}
 	for _, dd := range mod.DocDeletes {
@@ -670,40 +723,7 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (*entroq
 	for _, ddep := range mod.DocDepends {
 		req.DocDepends = append(req.DocDepends, pbconv.DocIDToProto(ddep.Namespace, ddep.ID, ddep.Version))
 	}
-
-	resp, err := b.client().Modify(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("grpc modify: %w", unpackGRPCError(err))
-	}
-
-	mResp := new(entroq.ModifyResponse)
-	for _, t := range resp.GetInserted() {
-		task, err := pbconv.TaskFromProto(t)
-		if err != nil {
-			return nil, fmt.Errorf("grpc modify task proto: %w", err)
-		}
-		mResp.InsertedTasks = append(mResp.InsertedTasks, task)
-	}
-	for _, t := range resp.GetChanged() {
-		task, err := pbconv.TaskFromProto(t)
-		if err != nil {
-			return nil, fmt.Errorf("grpc modify changed: %w", err)
-		}
-		mResp.ChangedTasks = append(mResp.ChangedTasks, task)
-	}
-	for _, d := range resp.GetInsertedDocs() {
-		mResp.InsertedDocs = append(mResp.InsertedDocs, pbconv.MustDocFromProto(d))
-	}
-	for _, d := range resp.GetChangedDocs() {
-		// A doc set whose lease changed comes back as a Doc with no ID.
-		if pbconv.IsDocSet(d) {
-			mResp.ChangedSets = append(mResp.ChangedSets, pbconv.DocSetFromProto(d, nil))
-			continue
-		}
-		mResp.ChangedDocs = append(mResp.ChangedDocs, pbconv.MustDocFromProto(d))
-	}
-
-	return mResp, nil
+	return req, nil
 }
 
 // Time returns the time as reported by the server.

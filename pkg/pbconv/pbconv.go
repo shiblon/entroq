@@ -118,8 +118,9 @@ func docByID(d *pb.DocID, what string) (string, error) {
 	}
 }
 
-// taskLease converts a lease-only task change. Only its arrival time is used;
-// a queue, if given, must be the task's own, and nothing else may be set.
+// taskLease converts a lease-only task change, which renews or releases the
+// task old names. Only the arrival time is used; a queue, if given, must be
+// the task's own, and no value, attempt, error, or ID may be.
 func taskLease(old *pb.TaskID, lease *pb.TaskData) (entroq.ModifyArg, error) {
 	if q := lease.GetQueue(); q != "" && q != old.GetQueue() {
 		return nil, invalidf("lease of task %s cannot move it: %q -> %q", old.GetId(), old.GetQueue(), q)
@@ -160,12 +161,29 @@ func docLease(old *pb.DocID, lease *pb.DocData) (entroq.ModifyArg, error) {
 	)), nil
 }
 
+// changeMode checks a change's mode against the protocol the request
+// declares: modes other than CHANGE_DEFAULT are protocol 2, and a mode this
+// build does not know is refused rather than read as the default.
+func changeMode(mode pb.ChangeMode, protocol int32, what string) error {
+	switch mode {
+	case pb.ChangeMode_CHANGE_DEFAULT:
+		return nil
+	case pb.ChangeMode_CHANGE_RESET_CLAIMS, pb.ChangeMode_CHANGE_LEASE:
+		if protocol < 2 {
+			return invalidf("%s: mode %v is protocol 2, and the request declares protocol %d", what, mode, protocol)
+		}
+		return nil
+	default:
+		return invalidf("%s: unknown mode %v", what, mode)
+	}
+}
+
 // ModifyArgsFromProto translates a wire ModifyRequest into the entroq modify
-// arguments that apply it. It is the one mapping from the language-agnostic
+// arguments that apply it, read under the protocol the request declares. It is the one mapping from the language-agnostic
 // protocol onto the Go modify API, which is exactly why a client (or a
 // gateway-driven worker) never has to import entroq. The claimant is taken from
 // the request so the applied modification is attributed to the caller.
-func ModifyArgsFromProto(req *pb.ModifyRequest) ([]entroq.ModifyArg, error) {
+func ModifyArgsFromProto(req *pb.ModifyRequest, protocol int32) ([]entroq.ModifyArg, error) {
 	modArgs := []entroq.ModifyArg{
 		entroq.ModifyAs(req.ClaimantId),
 	}
@@ -186,23 +204,22 @@ func ModifyArgsFromProto(req *pb.ModifyRequest) ([]entroq.ModifyArg, error) {
 		if change.GetOldId() == nil {
 			return nil, invalidf("task change names no task")
 		}
-		var nd *pb.TaskData
-		switch data := change.GetData().(type) {
-		case *pb.TaskChange_NewData:
-			nd = data.NewData
-		case *pb.TaskChange_NewZeroClaims:
-			// Claims are reset in a later step; until then this is new_data.
-			nd = data.NewZeroClaims
-		case *pb.TaskChange_NewLease:
-			arg, err := taskLease(change.GetOldId(), data.NewLease)
+		nd := change.GetNewData()
+		if nd == nil {
+			return nil, invalidf("change of task %s carries no data", change.GetOldId().GetId())
+		}
+		if err := changeMode(change.GetMode(), protocol, "change of task "+change.GetOldId().GetId()); err != nil {
+			return nil, err
+		}
+		if change.GetMode() == pb.ChangeMode_CHANGE_LEASE {
+			arg, err := taskLease(change.GetOldId(), nd)
 			if err != nil {
 				return nil, err
 			}
 			modArgs = append(modArgs, arg)
 			continue
-		default:
-			return nil, invalidf("change of task %s carries no data", change.GetOldId().GetId())
 		}
+		reset := change.GetMode() == pb.ChangeMode_CHANGE_RESET_CLAIMS
 		val, err := ProtoToJSON(nd.GetValue())
 		if err != nil {
 			return nil, fmt.Errorf("change value: %w", err)
@@ -237,6 +254,9 @@ func ModifyArgsFromProto(req *pb.ModifyRequest) ([]entroq.ModifyArg, error) {
 			changeArgs = append(changeArgs, entroq.QueueTo(newQueue))
 		}
 		changeArgs = append(changeArgs, entroq.ArrivalTimeTo(FromMS(nd.GetAtMs())))
+		if reset {
+			changeArgs = append(changeArgs, entroq.ResettingClaims())
+		}
 		modArgs = append(modArgs, t.Change(changeArgs...))
 	}
 	for _, del := range req.Deletes {
@@ -266,19 +286,24 @@ func ModifyArgsFromProto(req *pb.ModifyRequest) ([]entroq.ModifyArg, error) {
 		if old == nil {
 			return nil, invalidf("doc change names no doc")
 		}
-		var nd *pb.DocData
-		switch data := dc.GetData().(type) {
-		case *pb.DocChange_NewData:
-			nd = data.NewData
-		case *pb.DocChange_NewLease:
-			arg, err := docLease(old, data.NewLease)
+		nd := dc.GetNewData()
+		if nd == nil {
+			return nil, invalidf("doc change in %q carries no data", old.GetNamespace())
+		}
+		what := fmt.Sprintf("doc change in %q", old.GetNamespace())
+		if err := changeMode(dc.GetMode(), protocol, what); err != nil {
+			return nil, err
+		}
+		switch dc.GetMode() {
+		case pb.ChangeMode_CHANGE_LEASE:
+			arg, err := docLease(old, nd)
 			if err != nil {
 				return nil, err
 			}
 			modArgs = append(modArgs, arg)
 			continue
-		default:
-			return nil, invalidf("doc change in %q carries no data", old.GetNamespace())
+		case pb.ChangeMode_CHANGE_RESET_CLAIMS:
+			return nil, invalidf("%s: a doc has no claim count to reset", what)
 		}
 		id, err := docByID(old, "doc change")
 		if err != nil {

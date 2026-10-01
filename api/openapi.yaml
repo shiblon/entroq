@@ -477,18 +477,12 @@ components:
                     $ref: '#/components/schemas/DocID'
                 newData:
                     $ref: '#/components/schemas/DocData'
-                newLease:
-                    allOf:
-                        - $ref: '#/components/schemas/DocData'
-                    description: |-
-                        Set only the lease information. Supply only at_ms. If namespace, key, or
-                         secondary_key are specified, they must be equal to the previous values
-                         in old_id. Can use with servers on protocol 2.
+                mode:
+                    type: integer
+                    format: enum
             description: |-
                 DocChange identifies a doc by DocID and provides updated data. Only content
                  from new_data is applied; keys are immutable after creation.
-
-                 Use new_lease to only update the arrival time for a doc set.
         DocClaim:
             type: object
             properties:
@@ -638,6 +632,9 @@ components:
                     type: array
                     items:
                         $ref: '#/components/schemas/Doc'
+                    description: |-
+                        Changed docs, and the doc sets a CHANGE_LEASE change named, each at its
+                         new lock as a Doc with no id or content. A real doc always has an id.
             description: |-
                 ModifyResponse returns inserted and updated tasks and docs when successful.
                  A dependency error (which is permanent) comes through as gRPC's NOT_FOUND code.
@@ -756,27 +753,10 @@ components:
                 oldId:
                     $ref: '#/components/schemas/TaskID'
                 newData:
-                    allOf:
-                        - $ref: '#/components/schemas/TaskData'
-                    description: MUST use this with protocol 1. Anything else will delete task contents.
-                newZeroClaims:
-                    allOf:
-                        - $ref: '#/components/schemas/TaskData'
-                    description: |-
-                        Send new task data, request a claims reset. Default in newer clients.
-                         Changes the claims semantic to match original intent: if a task keeps
-                         getting abandoned, it can hit a max. If it is intentionally modified, it
-                         resets: not a poison pill.
-
-                         New clients for protocol 2 should use this field instead of new_data
-                         for intentional modification. For lease renewal, use new_lease instead,
-                         which requires no content to be passed, and does not reset claims.
-                newLease:
-                    allOf:
-                        - $ref: '#/components/schemas/TaskData'
-                    description: |-
-                        Update only the lease information. Only at_ms is used. If specified,
-                         queue must equal old_id.queue. For protocol 2.
+                    $ref: '#/components/schemas/TaskData'
+                mode:
+                    type: integer
+                    format: enum
             description: |-
                 TaskChange identifies a task by ID and specifies the new data it should contain.
                  All fields should be filled in. Empty fields result in deleting data from that field.

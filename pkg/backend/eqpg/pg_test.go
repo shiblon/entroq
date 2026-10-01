@@ -651,6 +651,10 @@ func TestWorkerReleasesSets(t *testing.T) {
 	RunQTest(t, eqtest.WorkerReleasesSets)
 }
 
+func TestClaimsReset(t *testing.T) {
+	RunQTest(t, eqtest.ClaimsReset)
+}
+
 func TestPGSimpleDocLifecycle(t *testing.T) {
 	RunQTest(t, eqtest.SimpleDocLifecycle)
 }

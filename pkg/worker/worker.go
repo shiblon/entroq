@@ -174,6 +174,9 @@ type Result struct {
 // condition, it spins. Leave the task where it cannot be claimed again at
 // once, or give it a later arrival. A commit that only makes the task arrive
 // is counted as released rather than done.
+//
+// A result that changes the task resets its claim count (see
+// entroq.ResettingClaims): the worker handled it.
 func Modify(args ...entroq.ModifyArg) *Result {
 	return &Result{mods: args}
 }
@@ -334,6 +337,13 @@ func (h *doModifyHandler[T]) Finish(ctx context.Context, mod Modifier, finalTask
 
 		modification := entroq.NewModification("", h.result.mods...)
 		fixVersions(modification, finalTask, finalSets)
+		// The worker changed the task on purpose, so the claims before this
+		// one no longer point at a poison pill.
+		for _, c := range modification.Changes {
+			if c.ID == finalTask.ID {
+				entroq.ResettingClaims()(modification, c)
+			}
+		}
 		if _, err := mod.Modify(ctx, entroq.WithModification(modification)); err != nil {
 			return h.commitFailed(ctx, err)
 		}
@@ -885,7 +895,8 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 	if opts.maxClaims > 0 && task.Claims > opts.maxClaims {
 		errQ := w.ErrorQueueFor(task.Queue)
 		if _, err := w.handleSentinelErrors(ctx,
-			MoveErrorf("maximum claims exceeded (%d)", opts.maxClaims), task, nil, errQ, opts,
+			MoveErrorf("maximum claims exceeded: %d claims without modification (limit %d, lease %v)",
+				task.Claims, opts.maxClaims, opts.lease), task, nil, errQ, opts,
 		); err != nil {
 			return fmt.Errorf("handle max claims: %w", err)
 		}
@@ -1031,9 +1042,17 @@ func WithMaxAttempts(m int32) RunOption {
 	}
 }
 
-// WithMaxClaims sets the maximum number of times a task may be claimed before
-// it is moved to the worker's error queue without constructing or invoking the
-// handler. If 0 (the default), there is no maximum.
+// WithMaxClaims sets the maximum number of times a task may be claimed without
+// being modified before it is moved to the worker's error queue without
+// constructing or invoking the handler. If 0 (the default), there is no
+// maximum.
+//
+// The worker resets a task's claim count whenever it modifies the task (see
+// entroq.ResettingClaims), including a retry, and renewal keeps it. So the count
+// is of claims the task did not survive: a handler that crashed, hung, or
+// needed longer than the lease. A task that reaches the limit is a poison
+// pill, or runs under too short a lease; the error it is moved with gives the
+// count, the limit, and the lease.
 func WithMaxClaims(m int32) RunOption {
 	return func(ro *runOpt) {
 		ro.maxClaims = m
@@ -1099,9 +1118,6 @@ func (w *Worker[T]) Run(ctx context.Context, opts ...RunOption) error {
 	if len(ro.qs) == 0 {
 		return fmt.Errorf("no queues specified to work on")
 	}
-	if err := w.checkProtocol(ctx); err != nil {
-		return fmt.Errorf("worker (%q): %w", ro.qs, err)
-	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -1125,24 +1141,6 @@ func (w *Worker[T]) Run(ctx context.Context, opts ...RunOption) error {
 			return fmt.Errorf("worker (%q): %w", ro.qs, err)
 		}
 	}
-}
-
-// minServerProtocol is the oldest wire protocol a worker can run against: it
-// renews and releases with lease-only changes, which protocol 2 added.
-const minServerProtocol = 2
-
-// checkProtocol refuses a server too old for the worker. Servers upgrade
-// before their clients, so this is a deployment mistake, and reported as one
-// before anything is claimed.
-func (w *Worker[T]) checkProtocol(ctx context.Context) error {
-	p, err := w.eqc.ServerProtocol(ctx)
-	if err != nil {
-		return fmt.Errorf("check server protocol: %w", err)
-	}
-	if p < minServerProtocol {
-		return entroq.Unsupportedf("the EntroQ server speaks protocol %d, and this worker needs protocol %d or later: upgrade the server first", p, minServerProtocol)
-	}
-	return nil
 }
 
 // join registers run for Shutdown, or refuses once Shutdown has been called.

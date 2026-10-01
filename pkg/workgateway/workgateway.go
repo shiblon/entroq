@@ -601,7 +601,7 @@ func (b *Bridge) doWork(ctx context.Context, task *entroq.Task, _ json.RawMessag
 	// Go DoModify that returns no mods.
 	var args []entroq.ModifyArg
 	if res.Modification != nil {
-		args, err = pbconv.ModifyArgsFromProto(res.Modification.ModifyRequest)
+		args, err = pbconv.ModifyArgsFromProto(res.Modification.ModifyRequest, version.Protocol)
 		if err != nil {
 			// A malformed modification is a client bug, not a transient fault:
 			// retrying would only replay the same bad message, so stop the worker.

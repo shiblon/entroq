@@ -74,9 +74,14 @@ func modifyTx(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (*entro
 		if at.After(now) {
 			claimant = mod.Claimant
 		}
+		// A change keeps the claim count unless it resets it.
+		claims := old.Claims
+		if mod.ResetsClaims(change.ID) {
+			claims = 0
+		}
 		updated := &entroq.Task{
 			ID: change.ID, Version: old.Version + 1, Queue: change.Queue,
-			At: at, Claimant: claimant, Claims: old.Claims, Value: change.Value,
+			At: at, Claimant: claimant, Claims: claims, Value: change.Value,
 			Created: old.Created, Modified: now, Attempt: change.Attempt, Err: change.Err,
 		}
 		resp.ChangedTasks = append(resp.ChangedTasks, updated)
@@ -188,21 +193,22 @@ func deleteTasks(ctx context.Context, tx *sql.Tx, deletes []*entroq.TaskID) erro
 }
 
 func changeTasks(ctx context.Context, tx *sql.Tx, tasks []*entroq.Task) error {
-	const columns = 9
+	const columns = 10
 	return batchRanges(len(tasks), columns, func(start, end int) error {
 		args := make([]any, 0, columns*(end-start))
 		for _, task := range tasks[start:end] {
 			args = append(args, task.ID, task.Version, task.Queue, task.At.UnixMilli(),
-				task.Claimant, jsonValue(task.Value), task.Modified.UnixMilli(), task.Attempt, task.Err)
+				task.Claimant, task.Claims, jsonValue(task.Value), task.Modified.UnixMilli(), task.Attempt, task.Err)
 		}
 		query := `WITH changes(id, new_version, new_queue, new_at_ms, new_claimant,
-			new_value, new_modified_ms, new_attempt, new_err) AS (VALUES ` +
+			new_claims, new_value, new_modified_ms, new_attempt, new_err) AS (VALUES ` +
 			rowPlaceholders(end-start, columns) + `)
 			UPDATE tasks SET
 				version = changes.new_version,
 				queue = changes.new_queue,
 				at_ms = changes.new_at_ms,
 				claimant = changes.new_claimant,
+				claims = changes.new_claims,
 				value = changes.new_value,
 				modified_ms = changes.new_modified_ms,
 				attempt = changes.new_attempt,

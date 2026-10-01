@@ -298,8 +298,8 @@ func TestBridge_ChangeMovePreservesID(t *testing.T) {
 	nd := echoData(dw.Task.Task)
 	nd.Queue = "moved"
 	mr := &pb.ModifyRequest{Changes: []*pb.TaskChange{{
-		OldId: &pb.TaskID{Id: dw.Task.Id, Version: dw.Task.Version, Queue: dw.Task.Queue},
-		Data:  &pb.TaskChange_NewData{NewData: nd},
+		OldId:   &pb.TaskID{Id: dw.Task.Id, Version: dw.Task.Version, Queue: dw.Task.Queue},
+		NewData: nd,
 	}}}
 	s.c.send(okResult(mr))
 
@@ -342,8 +342,8 @@ func TestBridge_ChangeDefers(t *testing.T) {
 	nd := echoData(dw.Task.Task)
 	nd.AtMs = pbconv.ToMS(future) // defer: push the arrival time out, no move
 	mr := &pb.ModifyRequest{Changes: []*pb.TaskChange{{
-		OldId: &pb.TaskID{Id: dw.Task.Id, Version: dw.Task.Version, Queue: dw.Task.Queue},
-		Data:  &pb.TaskChange_NewData{NewData: nd},
+		OldId:   &pb.TaskID{Id: dw.Task.Id, Version: dw.Task.Version, Queue: dw.Task.Queue},
+		NewData: nd,
 	}}}
 	s.c.send(okResult(mr))
 
@@ -385,8 +385,8 @@ func TestBridge_ChangeSetsValue(t *testing.T) {
 	nd.Value = structpb.NewStringValue("changed") // set a new value
 	nd.Queue = "moved"                            // move too, so it lands where this worker won't re-claim
 	mr := &pb.ModifyRequest{Changes: []*pb.TaskChange{{
-		OldId: &pb.TaskID{Id: dw.Task.Id, Version: dw.Task.Version, Queue: dw.Task.Queue},
-		Data:  &pb.TaskChange_NewData{NewData: nd},
+		OldId:   &pb.TaskID{Id: dw.Task.Id, Version: dw.Task.Version, Queue: dw.Task.Queue},
+		NewData: nd,
 	}}}
 	s.c.send(okResult(mr))
 
@@ -524,12 +524,12 @@ func TestBridge_DocChange(t *testing.T) {
 	mr := deleteTask(dw.Task.Task)
 	mr.DocChanges = []*pb.DocChange{{
 		OldId: pbconv.DocIDToProto(doc.Namespace, doc.Id, doc.Version),
-		Data: &pb.DocChange_NewData{NewData: &pb.DocData{
+		NewData: &pb.DocData{
 			Namespace:    doc.Namespace,
 			Key:          doc.Key, // keys are immutable; echo them
 			SecondaryKey: doc.SecondaryKey,
 			Content:      structpb.NewStringValue("new"), // the edit
-		}},
+		},
 	}}
 	s.c.send(okResult(mr))
 
@@ -684,8 +684,8 @@ func TestBridge_AckModifyWins(t *testing.T) {
 	nd := echoData(dw.Task.Task)
 	nd.Queue = "moved"
 	mr := &pb.ModifyRequest{Changes: []*pb.TaskChange{{
-		OldId: &pb.TaskID{Id: dw.Task.Id, Version: dw.Task.Version, Queue: dw.Task.Queue},
-		Data:  &pb.TaskChange_NewData{NewData: nd},
+		OldId:   &pb.TaskID{Id: dw.Task.Id, Version: dw.Task.Version, Queue: dw.Task.Queue},
+		NewData: nd,
 	}}}
 	r := okResult(mr)
 	r.Ack = true // ignored: the change already disposes of the input

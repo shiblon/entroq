@@ -349,6 +349,11 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 				if newAtMs > nowMs {
 					newClaimant = claimant
 				}
+				// A change keeps the claim count unless it resets it.
+				claims := st.fields.Claims
+				if mod.ResetsClaims(t.ID) {
+					claims = 0
+				}
 
 				f := &taskFields{
 					ID:       t.ID,
@@ -359,7 +364,7 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 					Modified: nowMs,
 					Claimant: newClaimant,
 					Version:  st.fields.Version + 1,
-					Claims:   st.fields.Claims,
+					Claims:   claims,
 					Attempt:  t.Attempt,
 					Err:      t.Err,
 				}
@@ -375,6 +380,8 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 					if f.Claims > 0 {
 						pipe.ZAdd(ctx, qsclaimsKey(newQueue), redis.Z{Score: float64(f.Claims), Member: t.ID})
 					}
+				} else if f.Claims == 0 {
+					pipe.ZRem(ctx, qsclaimsKey(newQueue), t.ID)
 				}
 				// Claimed means not yet available and claimed at least once; a
 				// task that was never claimed is future, however it got there.

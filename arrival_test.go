@@ -133,3 +133,16 @@ func TestIsEmptyCountsEveryList(t *testing.T) {
 		}
 	}
 }
+
+// TestResettingClaims checks that a claims reset is recorded for its change, and
+// carried by WithModification.
+func TestResettingClaims(t *testing.T) {
+	a, b := &Task{ID: "a", Queue: "q"}, &Task{ID: "b", Queue: "q"}
+	src := NewModification("", a.Change(ResettingClaims()), b.Change())
+	if !src.ResetsClaims("a") || src.ResetsClaims("b") {
+		t.Errorf("Resets: want a's change to reset claims and b's not")
+	}
+	if dest := NewModification("", WithModification(src)); !dest.ResetsClaims("a") || dest.ResetsClaims("b") {
+		t.Error("WithModification: want the reset carried over")
+	}
+}

@@ -199,6 +199,10 @@ func TestGRPCWorkerReleasesSets(t *testing.T) {
 	RunQTest(t, eqtest.WorkerReleasesSets)
 }
 
+func TestGRPCClaimsReset(t *testing.T) {
+	RunQTest(t, eqtest.ClaimsReset)
+}
+
 func TestGRPCSimpleDocLifecycle(t *testing.T) {
 	RunQTest(t, eqtest.SimpleDocLifecycle)
 }

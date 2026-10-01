@@ -48,28 +48,32 @@ message TaskData {
   string err = 6;
 }
 
+// ChangeMode says how a TaskChange or DocChange treats what is already
+// stored. Modes other than CHANGE_DEFAULT are protocol 2: a request that
+// declares protocol 1 (or no protocol) may not use them.
+enum ChangeMode {
+  // Apply new_data as the new contents, keeping a task's claim count. The
+  // only mode of protocol 1.
+  CHANGE_DEFAULT = 0;
+
+  // As CHANGE_DEFAULT, and reset the task's claim count to zero: the task was
+  // modified on purpose, so its earlier claims no longer point at a poison
+  // pill. Tasks only.
+  CHANGE_RESET_CLAIMS = 1;
+
+  // Change only when the task, or the doc set old_id names by key, is ready
+  // again: renewing a lease on it, or releasing it. Only new_data.at_ms is
+  // read; anything else given must match what old_id names. Keeps a task's
+  // claim count.
+  CHANGE_LEASE = 2;
+}
+
 // TaskChange identifies a task by ID and specifies the new data it should contain.
 // All fields should be filled in. Empty fields result in deleting data from that field.
 message TaskChange {
   TaskID old_id = 1;
-  oneof data {
-    // MUST use this with protocol 1. Anything else will delete task contents.
-    TaskData new_data = 2;
-
-    // Send new task data, request a claims reset. Default in newer clients.
-    // Changes the claims semantic to match original intent: if a task keeps
-    // getting abandoned, it can hit a max. If it is intentionally modified, it
-    // resets: not a poison pill.
-    //
-    // New clients for protocol 2 should use this field instead of new_data
-    // for intentional modification. For lease renewal, use new_lease instead,
-    // which requires no content to be passed, and does not reset claims.
-    TaskData new_zero_claims = 3;
-
-    // Update only the lease information. Only at_ms is used. If specified,
-    // queue must equal old_id.queue. For protocol 2.
-    TaskData new_lease = 4;
-  }
+  TaskData new_data = 2;
+  ChangeMode mode = 3;
 }
 
 // Task is a complete task object, containing IDs, data, and metadata.
@@ -180,18 +184,10 @@ message DocData {
 
 // DocChange identifies a doc by DocID and provides updated data. Only content
 // from new_data is applied; keys are immutable after creation.
-//
-// Use new_lease to only update the arrival time for a doc set.
 message DocChange {
   DocID old_id = 1;
-  oneof data {
-    DocData new_data = 2;
-
-    // Set only the lease information. Supply only at_ms. If namespace, key, or
-    // secondary_key are specified, they must be equal to the previous values
-    // in old_id. Can use with servers on protocol 2.
-    DocData new_lease = 3;
-  }
+  DocData new_data = 2;
+  ChangeMode mode = 3;
 }
 
 // Doc is a complete doc object with identity, data, and metadata.
@@ -320,6 +316,8 @@ message ModifyResponse {
   repeated Task inserted = 1;
   repeated Task changed = 2;
   repeated Doc inserted_docs = 3;
+  // Changed docs, and the doc sets a CHANGE_LEASE change named, each at its
+  // new lock as a Doc with no id or content. A real doc always has an id.
   repeated Doc changed_docs = 4;
 }
 
@@ -425,6 +423,7 @@ service EntroQ {
       body: "*"
     };
   }
+
   rpc Tasks(TasksRequest) returns (TasksResponse) {
     option (google.api.http) = {
       get: "/api/v0/tasks"

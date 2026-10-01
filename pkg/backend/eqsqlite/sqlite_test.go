@@ -56,6 +56,7 @@ func TestBackendContract(t *testing.T) {
 		{"WorkerDependencyMove", eqtest.WorkerDependencyMove},
 		{"WorkerHoldsEmptyGroup", eqtest.WorkerHoldsEmptyGroup},
 		{"WorkerReleasesSets", eqtest.WorkerReleasesSets},
+		{"ClaimsReset", eqtest.ClaimsReset},
 		{"InvalidRequests", eqtest.InvalidRequests},
 		{"TasksClaimantFilter", eqtest.TasksClaimantFilter},
 		{"QueueStatsCounts", eqtest.QueueStatsCounts},

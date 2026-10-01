@@ -306,15 +306,25 @@ $$;
 -- operation as a missing dependency (the queue authorizes access, so it must
 -- not be silently filled in from stored state).
 --
--- The signature gained the queue arrays in schema 1.7.1; drop the prior overload
--- first, since a changed argument list would otherwise leave the old function
--- behind on a re-applied schema.
+-- A change keeps the task's claim count unless p_chg_reset_claims resets it
+-- to zero.
+--
+-- The signature gained the queue arrays in schema 1.7.1, and the reset-claims
+-- array in 1.13.0; drop the prior overloads first, since a changed argument
+-- list would otherwise leave the old function behind on a re-applied schema.
 DROP FUNCTION IF EXISTS entroq._modify_arrays(
     text,
     text[], integer[],
     text[], integer[],
     text[], text[], timestamptz[], text[], integer[], text[],
     text[], integer[], text[], timestamptz[], text[], integer[], text[]
+);
+DROP FUNCTION IF EXISTS entroq._modify_arrays(
+    text,
+    text[], integer[], text[],
+    text[], integer[], text[],
+    text[], text[], timestamptz[], text[], integer[], text[],
+    text[], integer[], text[], text[], timestamptz[], text[], integer[], text[]
 );
 CREATE OR REPLACE FUNCTION entroq._modify_arrays(
     p_claimant        text,
@@ -342,7 +352,8 @@ CREATE OR REPLACE FUNCTION entroq._modify_arrays(
     p_chg_ats         timestamptz[],
     p_chg_values      text[],
     p_chg_attempts    integer[],
-    p_chg_errs        text[]
+    p_chg_errs        text[],
+    p_chg_reset_claims boolean[]
 ) RETURNS TABLE(
     kind     text,
     id       text,
@@ -493,6 +504,7 @@ BEGIN
                 value    = c.chg_value::jsonb,
                 attempt  = c.chg_attempt,
                 err      = c.chg_err,
+                claims   = CASE WHEN c.chg_reset_claims THEN 0 ELSE entroq.tasks.claims END,
                 claimant = CASE WHEN c.chg_at > v_now THEN p_claimant ELSE '' END
             FROM unnest(
                 coalesce(p_chg_ids,         '{}'::text[]),
@@ -502,8 +514,9 @@ BEGIN
                 coalesce(p_chg_ats,         '{}'::timestamptz[]),
                 coalesce(p_chg_values,      '{}'::text[]),
                 coalesce(p_chg_attempts,    '{}'::integer[]),
-                coalesce(p_chg_errs,        '{}'::text[])
-            ) AS c(chg_id, chg_version, chg_from_queue, chg_queue, chg_at, chg_value, chg_attempt, chg_err)
+                coalesce(p_chg_errs,        '{}'::text[]),
+                coalesce(p_chg_reset_claims, '{}'::boolean[])
+            ) AS c(chg_id, chg_version, chg_from_queue, chg_queue, chg_at, chg_value, chg_attempt, chg_err, chg_reset_claims)
             WHERE entroq.tasks.id = c.chg_id AND entroq.tasks.version = c.chg_version AND entroq.tasks.queue = c.chg_from_queue
             RETURNING *
         )

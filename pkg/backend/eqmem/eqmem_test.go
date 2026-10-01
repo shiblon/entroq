@@ -579,6 +579,10 @@ func TestEQMemWorkerReleasesSets(t *testing.T) {
 	RunQTest(t, eqtest.WorkerReleasesSets)
 }
 
+func TestEQMemClaimsReset(t *testing.T) {
+	RunQTest(t, eqtest.ClaimsReset)
+}
+
 func TestEQMemSimpleDocLifecycle(t *testing.T) {
 	RunQTest(t, eqtest.SimpleDocLifecycle)
 }

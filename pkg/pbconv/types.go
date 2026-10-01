@@ -75,38 +75,44 @@ func TaskDataToProto(td *entroq.TaskData) (*pb.TaskData, error) {
 
 // TaskChangeToProto converts a task into the wire TaskChange that updates it: the
 // old identity (with the source queue in the ID, per the change protocol) plus
-// the task's new data.
-func TaskChangeToProto(t *entroq.Task) (*pb.TaskChange, error) {
+// the task's new data. With resetClaims, the change also resets the task's
+// claim count, which a server that does not know change modes leaves alone.
+func TaskChangeToProto(t *entroq.Task, resetClaims bool) (*pb.TaskChange, error) {
 	nd, err := TaskDataToProto(t.Data())
 	if err != nil {
 		return nil, fmt.Errorf("change task %s: %w", t.ID, err)
 	}
-	return &pb.TaskChange{
+	pc := &pb.TaskChange{
 		OldId: &pb.TaskID{
 			Id:      t.ID,
 			Version: t.Version,
 			Queue:   t.FromQueue, // old queue goes in the ID for changes
 		},
-		Data: &pb.TaskChange_NewData{NewData: nd},
-	}, nil
+		NewData: nd,
+	}
+	if resetClaims {
+		pc.Mode = pb.ChangeMode_CHANGE_RESET_CLAIMS
+	}
+	return pc, nil
 }
 
-// TaskArrivalToProto converts a task arrival to the lease-only TaskChange that
-// makes it, which a server at protocol 2 or later understands.
+// TaskArrivalToProto converts a task arrival to the lease-only TaskChange
+// that makes it.
 func TaskArrivalToProto(a *entroq.TaskArrival) *pb.TaskChange {
 	return &pb.TaskChange{
-		OldId: &pb.TaskID{Id: a.ID, Version: a.Version, Queue: a.Queue},
-		Data:  &pb.TaskChange_NewLease{NewLease: &pb.TaskData{AtMs: ToMS(a.At)}},
+		OldId:   &pb.TaskID{Id: a.ID, Version: a.Version, Queue: a.Queue},
+		NewData: &pb.TaskData{AtMs: ToMS(a.At)},
+		Mode:    pb.ChangeMode_CHANGE_LEASE,
 	}
 }
 
-// DocArrivalToProto converts a doc set arrival to the lease-only DocChange that
-// makes it, naming the set by its key, which a server at protocol 2 or later
-// understands.
+// DocArrivalToProto converts a doc set arrival to the lease-only DocChange
+// that makes it, naming the set by its key.
 func DocArrivalToProto(a *entroq.DocArrival) *pb.DocChange {
 	return &pb.DocChange{
-		OldId: DocRefToProto(&a.DocID),
-		Data:  &pb.DocChange_NewLease{NewLease: &pb.DocData{AtMs: ToMS(a.At)}},
+		OldId:   DocRefToProto(&a.DocID),
+		NewData: &pb.DocData{AtMs: ToMS(a.At)},
+		Mode:    pb.ChangeMode_CHANGE_LEASE,
 	}
 }
 

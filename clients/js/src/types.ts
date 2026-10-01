@@ -22,14 +22,17 @@ export interface TaskData {
 /**
  * TaskChange identifies a task by ID and specifies new data.
  */
+/**
+ * ChangeMode says how a change treats what is stored. Modes other than
+ * CHANGE_DEFAULT are protocol 2: the request must declare it in its
+ * entroq-protocol header, or the server refuses them.
+ */
+export type ChangeMode = "CHANGE_DEFAULT" | "CHANGE_RESET_CLAIMS" | "CHANGE_LEASE";
+
 export interface TaskChange {
   oldId: TaskID;
-  // Exactly one of these. newZeroClaims and newLease are protocol 2: send them
-  // only to a server whose entroq-protocol response header is 2 or more, as a
-  // 1.12 server applies a change without newData as one with empty data.
-  newData?: TaskData;
-  newZeroClaims?: TaskData; // a change that resets the claim count
-  newLease?: TaskData;      // only atMs: renews or releases the task
+  newData: TaskData;
+  mode?: ChangeMode;
 }
 
 /**
@@ -112,10 +115,8 @@ export interface DocData {
  */
 export interface DocChange {
   oldId: DocID;
-  // Exactly one of these. newLease (protocol 2) takes only atMs, and renews or
-  // releases the doc set oldId names by key.
-  newData?: DocData;
-  newLease?: DocData;
+  newData: DocData;
+  mode?: ChangeMode; // CHANGE_LEASE names a doc set by key; no claims reset
 }
 
 /**

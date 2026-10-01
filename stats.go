@@ -83,13 +83,15 @@ func newMatchQuery(opts ...QueuesOpt) *MatchQuery {
 type QueueStat struct {
 	Name      string `json:"name"`      // The queue name.
 	Size      int    `json:"size"`      // The total number of tasks.
-	Claimed   int    `json:"claimed"`   // Tasks not yet available that were claimed at least once.
+	Claimed   int    `json:"claimed"`   // Tasks not yet available, claimed since their claims were last reset.
 	Available int    `json:"available"` // Tasks whose arrival time has come.
-	Future    int    `json:"future"`    // Tasks not yet available that were never claimed.
+	Future    int    `json:"future"`    // Tasks not yet available, not claimed since their claims were last reset.
 
-	// MaxClaims is the most claims any task still in the queue has had. A
-	// high value points at a task that keeps failing, or at a task used as
-	// a recurring job; it falls when that task leaves the queue.
+	// MaxClaims is the most claims any task in the queue has had since its
+	// count was last reset (see ResettingClaims), as a worker does whenever it
+	// modifies a task. A high value points at a task that keeps coming back
+	// untouched, a poison pill or a lease too short for its handler; it falls
+	// when that task's count is reset or the task leaves the queue.
 	MaxClaims int `json:"maxClaims"`
 }
 

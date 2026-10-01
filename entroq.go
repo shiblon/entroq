@@ -106,8 +106,6 @@ import (
 	"slices"
 	"strings"
 	"time"
-
-	"github.com/shiblon/entroq/pkg/version"
 )
 
 const (
@@ -637,23 +635,6 @@ func IsUnsupported(err error) bool {
 	return errors.As(err, &e)
 }
 
-// ProtocolReporter is implemented by a backend that reaches its store through
-// a server, which may speak an older wire protocol than this build.
-type ProtocolReporter interface {
-	// ServerProtocol returns the wire protocol the server speaks.
-	ServerProtocol(ctx context.Context) (int32, error)
-}
-
-// ServerProtocol returns the wire protocol the client's store speaks: its
-// server's, for a backend that reaches the store over the wire (see
-// ProtocolReporter), and this build's, version.Protocol, otherwise.
-func (c *EntroQ) ServerProtocol(ctx context.Context) (int32, error) {
-	if r, ok := c.backend.(ProtocolReporter); ok {
-		return r.ServerProtocol(ctx)
-	}
-	return version.Protocol, nil
-}
-
 // NewClaimQuery builds the claim query that Claim and TryClaim would send for
 // opts, with no default claimant. The service uses it to check a claim's shape
 // before authorizing it.
@@ -1086,6 +1067,12 @@ func WithModification(src *Modification) ModifyArg {
 		dest.DocDeletes = append(dest.DocDeletes, src.DocDeletes...)
 		dest.DocDepends = append(dest.DocDepends, src.DocDepends...)
 		dest.DocArrives = append(dest.DocArrives, src.DocArrives...)
+		for id := range src.resetClaims {
+			if dest.resetClaims == nil {
+				dest.resetClaims = make(map[string]bool)
+			}
+			dest.resetClaims[id] = true
+		}
 	}
 }
 
@@ -1093,6 +1080,10 @@ func WithModification(src *Modification) ModifyArg {
 type Modification struct {
 	now     time.Time
 	options []ModifyOption
+
+	// resetClaims holds the IDs of changed tasks whose claim count the change
+	// resets (see ResettingClaims).
+	resetClaims map[string]bool
 
 	Claimant string `json:"claimant"`
 
@@ -1163,6 +1154,13 @@ func NewModification(claimant string, modArgs ...ModifyArg) *Modification {
 // change how an individual call to Modify operates.
 func (m *Modification) Options() []ModifyOption {
 	return m.options
+}
+
+// ResetsClaims reports whether m's change of the task with the given ID
+// resets its claim count to zero (see ResettingClaims). Otherwise a change leaves
+// the count as it is stored.
+func (m *Modification) ResetsClaims(id string) bool {
+	return m.resetClaims[id]
 }
 
 // IsEmpty reports whether m names no operation at all. Modify refuses such a

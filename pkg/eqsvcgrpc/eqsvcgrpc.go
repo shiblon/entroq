@@ -39,7 +39,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"strconv"
 	"sync"
 	"time"
 
@@ -521,16 +520,7 @@ func (s *QSvc) modifyAuthz(ctx context.Context, req *pb.ModifyRequest) (*authz.R
 		q(ins.Queue, authz.Insert)
 	}
 	for _, chg := range req.Changes {
-		// The destination is in whichever data the change carries; a lease
-		// cannot move a task, so it is a change of the task's own queue.
-		var dest string
-		switch data := chg.GetData().(type) {
-		case *pb.TaskChange_NewData:
-			dest = data.NewData.GetQueue()
-		case *pb.TaskChange_NewZeroClaims:
-			dest = data.NewZeroClaims.GetQueue()
-		}
-		change(chg.GetOldId().GetQueue(), dest, q)
+		change(chg.GetOldId().GetQueue(), chg.GetNewData().GetQueue(), q)
 	}
 	for _, del := range req.Deletes {
 		q(del.Queue, authz.Delete)
@@ -560,23 +550,47 @@ func (s *QSvc) modifyAuthz(ctx context.Context, req *pb.ModifyRequest) (*authz.R
 	return authReq, nil
 }
 
-// protocolHeaders are the response headers every RPC sends: the protocol this
-// server speaks, which a client checks before sending anything newer than
-// protocol 1, and its release.
+// protocolHeaders are the response headers every RPC sends: the protocols
+// this server serves, from which a client chooses, and its release.
 var protocolHeaders = metadata.Pairs(
-	version.ProtocolHeader, strconv.Itoa(version.Protocol),
+	version.ProtocolHeader, version.FormatProtocols(version.ServedProtocols),
 	version.VersionHeader, version.Version,
 )
 
-// announce sends the protocol headers on a unary RPC. It does nothing for a
-// caller not over gRPC; the JSON handler sends them itself.
-func announce(ctx context.Context) {
+// negotiate sends the protocol headers on a unary RPC, and returns the
+// protocol the request declares, under which the server reads it. A request
+// that declares none is protocol 1, as every client before the header is. One
+// declaring a protocol this server does not serve is refused, naming what to
+// upgrade. Sending the headers does nothing for a caller not over gRPC; the
+// JSON handler sends them itself.
+func negotiate(ctx context.Context) (int32, error) {
 	_ = grpc.SetHeader(ctx, protocolHeaders)
+	md, _ := metadata.FromIncomingContext(ctx)
+	vals := md.Get(version.ProtocolHeader)
+	if len(vals) == 0 {
+		return 1, nil
+	}
+	ps, err := version.ParseProtocols(vals[0])
+	if err != nil || len(ps) != 1 {
+		return 0, codeErrorf(codes.InvalidArgument, "a request declares one protocol in %s, got %q", version.ProtocolHeader, vals[0])
+	}
+	p := ps[0]
+	if !version.Serves(p) {
+		upgrade := "the client"
+		if p > version.Protocol {
+			upgrade = "the server"
+		}
+		return 0, codeErrorf(codes.Unimplemented, "this server serves EntroQ protocols %s, not %d: upgrade %s",
+			version.FormatProtocols(version.ServedProtocols), p, upgrade)
+	}
+	return p, nil
 }
 
 // Claim is the blocking version of TryClaim.
 func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
-	announce(ctx)
+	if _, err := negotiate(ctx); err != nil {
+		return nil, err
+	}
 	pollTime := time.Duration(0)
 	if req.PollMs > 0 {
 		pollTime = time.Duration(req.PollMs) * time.Millisecond
@@ -616,7 +630,9 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 // available to claim. Callers can check for context cancelation codes to know
 // that this has happened, and may opt to immediately re-send the request.
 func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
-	announce(ctx)
+	if _, err := negotiate(ctx); err != nil {
+		return nil, err
+	}
 	opts := claimOpts(req)
 	if err := entroq.NewClaimQuery(opts...).Validate(); err != nil {
 		return nil, autoCodeErrorf("try claim: %w", err)
@@ -657,11 +673,14 @@ func claimOpts(req *pb.ClaimRequest) []entroq.ClaimOpt {
 // reconstruct an entroq.DependencyError, or directly to find out which IDs
 // caused the dependency failure. Code UNKNOWN is returned on other errors.
 func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyResponse, error) {
-	announce(ctx)
+	protocol, err := negotiate(ctx)
+	if err != nil {
+		return nil, err
+	}
 	// Check the modification's shape before authorizing it, with the same
 	// check every backend runs, so a malformed request is InvalidArgument
 	// whether or not an authorizer is configured.
-	modArgs, err := pbconv.ModifyArgsFromProto(req)
+	modArgs, err := pbconv.ModifyArgsFromProto(req, protocol)
 	if err != nil {
 		var inv *pbconv.InvalidRequestError
 		if errors.As(err, &inv) {
@@ -740,7 +759,9 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 }
 
 func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksResponse, error) {
-	announce(ctx)
+	if _, err := negotiate(ctx); err != nil {
+		return nil, err
+	}
 	if err := (&entroq.TasksQuery{Queue: req.Queue, IDs: req.TaskId}).Validate(); err != nil {
 		return nil, autoCodeErrorf("tasks: %w", err)
 	}
@@ -803,7 +824,9 @@ func (s *QSvc) StreamTasks(req *pb.TasksRequest, stream pb.EntroQ_StreamTasksSer
 // a dedicated authz action (distinct from Read on task content). That lands in a
 // follow-up because it also requires an authz-policy/CRD schema change.
 func (s *QSvc) Queues(ctx context.Context, req *pb.QueuesRequest) (*pb.QueuesResponse, error) {
-	announce(ctx)
+	if _, err := negotiate(ctx); err != nil {
+		return nil, err
+	}
 	queueMap, err := s.impl.Queues(ctx,
 		entroq.MatchPrefix(req.MatchPrefix...),
 		entroq.MatchExact(req.MatchExact...),
@@ -826,7 +849,9 @@ func (s *QSvc) Queues(ctx context.Context, req *pb.QueuesRequest) (*pb.QueuesRes
 // TODO(listing-authz): currently UNGATED. Same listing capability as Queues;
 // see that method. Gated in the follow-up.
 func (s *QSvc) QueueStats(ctx context.Context, req *pb.QueuesRequest) (*pb.QueuesResponse, error) {
-	announce(ctx)
+	if _, err := negotiate(ctx); err != nil {
+		return nil, err
+	}
 	queueMap, err := s.impl.QueueStats(ctx,
 		entroq.MatchPrefix(req.MatchPrefix...),
 		entroq.MatchExact(req.MatchExact...),
@@ -853,7 +878,9 @@ func (s *QSvc) QueueStats(ctx context.Context, req *pb.QueuesRequest) (*pb.Queue
 // Intentionally UNAUTHENTICATED: it is the server clock, carries no queue or
 // task data, and clients need it to reason about arrival times.
 func (s *QSvc) Time(ctx context.Context, req *pb.TimeRequest) (*pb.TimeResponse, error) {
-	announce(ctx)
+	if _, err := negotiate(ctx); err != nil {
+		return nil, err
+	}
 	return &pb.TimeResponse{TimeMs: pbconv.ToMS(time.Now().UTC())}, nil
 }
 
@@ -873,7 +900,9 @@ func depDetails(depErr *entroq.DependencyError) []proto.Message {
 
 // Docs returns a listing of docs matching the given query.
 func (s *QSvc) Docs(ctx context.Context, req *pb.DocsRequest) (*pb.DocsResponse, error) {
-	announce(ctx)
+	if _, err := negotiate(ctx); err != nil {
+		return nil, err
+	}
 	q := req.GetQuery()
 	dq := &entroq.DocQuery{
 		Namespace:  q.GetNamespace(),
@@ -921,7 +950,9 @@ func (s *QSvc) Docs(ctx context.Context, req *pb.DocsRequest) (*pb.DocsResponse,
 // dedicated listing action in the follow-up (needs an authz-policy/CRD change).
 // Doc content (Docs) is already gated.
 func (s *QSvc) NamespaceStats(ctx context.Context, req *pb.NamespacesRequest) (*pb.NamespacesResponse, error) {
-	announce(ctx)
+	if _, err := negotiate(ctx); err != nil {
+		return nil, err
+	}
 	nsMap, err := s.impl.NamespaceStats(ctx,
 		entroq.MatchPrefix(req.MatchPrefix...),
 		entroq.MatchExact(req.MatchExact...),
@@ -944,7 +975,10 @@ func (s *QSvc) NamespaceStats(ctx context.Context, req *pb.NamespacesRequest) (*
 // Returns a NotFound status with ModifyDep details if any docs are missing or
 // already claimed.
 func (s *QSvc) ClaimDocs(ctx context.Context, req *pb.ClaimDocsRequest) (*pb.ClaimDocsResponse, error) {
-	announce(ctx)
+	protocol, err := negotiate(ctx)
+	if err != nil {
+		return nil, err
+	}
 	cq := req.GetClaimQuery()
 	// The claimant is the request's: the service's client would otherwise fill
 	// in its own for an empty one, so check the claim as received. At protocol
@@ -956,6 +990,9 @@ func (s *QSvc) ClaimDocs(ctx context.Context, req *pb.ClaimDocsRequest) (*pb.Cla
 		Duration:  time.Duration(cq.GetDurationMs()) * time.Millisecond,
 	}
 	if sets := cq.GetSets(); len(sets) > 0 {
+		if protocol < 2 {
+			return nil, codeErrorf(codes.InvalidArgument, "claim docs: sets are protocol 2, and the request declares protocol %d", protocol)
+		}
 		// Transitional: claims of several sets at once come with atomic
 		// multi-set claims in every backend.
 		if len(sets) > 1 {

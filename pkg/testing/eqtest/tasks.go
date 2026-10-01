@@ -1247,3 +1247,53 @@ func TasksWithIDStaysInQueue(ctx context.Context, t *testing.T, client *entroq.E
 		t.Errorf("Tasks by ID alone: want %q, got %v", inB.ID, got)
 	}
 }
+
+// ClaimsReset verifies that a task's claim count is of claims since it was
+// last reset: a change made with ResettingClaims resets it, while any other
+// change, and an arrival, which only refreshes the task, keep it.
+func ClaimsReset(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	queue := path.Join(qPrefix, "claims_reset")
+	if _, err := client.Modify(ctx, entroq.InsertingInto(queue)); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	claim := func(t *testing.T, want int32) *entroq.Task {
+		t.Helper()
+		task, err := client.TryClaim(ctx, entroq.From(queue), entroq.ClaimFor(time.Minute))
+		if err != nil || task == nil {
+			t.Fatalf("Claim: %v, %v", task, err)
+		}
+		if task.Claims != want {
+			t.Fatalf("Claimed task: want claims %d, got %d", want, task.Claims)
+		}
+		return task
+	}
+	changed := func(t *testing.T, step string, resp *entroq.ModifyResponse, err error, want int32) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("%s: %v", step, err)
+		}
+		if got := resp.ChangedTasks[0].Claims; got != want {
+			t.Errorf("%s: want claims %d, got %d", step, want, got)
+		}
+		stats, err := client.QueueStats(ctx, entroq.MatchExact(queue))
+		if err != nil {
+			t.Fatalf("Stats: %v", err)
+		}
+		if got := stats[queue].MaxClaims; got != int(want) {
+			t.Errorf("%s: want the queue's max claims %d, got %d", step, want, got)
+		}
+	}
+
+	task := claim(t, 1)
+	resp, err := client.UpdateArrival(ctx, entroq.ReadyNow().Tasks(task))
+	changed(t, "Release by arrival", resp, err, 1)
+	task = claim(t, 2)
+
+	resp, err = client.Modify(ctx, task.Change(entroq.ValueTo("worked"), entroq.ArrivalTimeBy(0)))
+	changed(t, "Change", resp, err, 2)
+	task = claim(t, 3)
+
+	resp, err = client.Modify(ctx, task.Change(entroq.ResettingClaims(), entroq.ArrivalTimeBy(0)))
+	changed(t, "Change resetting claims", resp, err, 0)
+	claim(t, 1)
+}

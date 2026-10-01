@@ -162,8 +162,44 @@ func TestResponsesCarryProtocol(t *testing.T) {
 				t.Fatalf("post: %v", err)
 			}
 			resp.Body.Close()
-			if got := resp.Header.Get(version.ProtocolHeader); got != strconv.Itoa(version.Protocol) {
-				t.Errorf("status %d: protocol header %q, want %d", resp.StatusCode, got, version.Protocol)
+			if got, want := resp.Header.Get(version.ProtocolHeader), version.FormatProtocols(version.ServedProtocols); got != want {
+				t.Errorf("status %d: protocol header %q, want %q", resp.StatusCode, got, want)
+			}
+		})
+	}
+}
+
+// TestRequestsDeclareProtocol checks that a JSON request is read under the
+// protocol its header declares: none is protocol 1, which has no change
+// modes, and one the server does not serve is refused.
+func TestRequestsDeclareProtocol(t *testing.T) {
+	ts, cleanup := newTestServer(t)
+	defer cleanup()
+	lease := `{"claimantId": "test", "changes": [{"oldId": {"id": "t", "version": 1, "queue": "/q"}, "newData": {"atMs": "1"}, "mode": "CHANGE_LEASE"}]}`
+	for _, tc := range []struct {
+		name, protocol string
+		want           int
+	}{
+		{"a lease with no protocol", "", http.StatusBadRequest},
+		{"a lease at protocol 1", "1", http.StatusBadRequest},
+		{"an unserved protocol", strconv.Itoa(version.Protocol + 1), http.StatusNotImplemented},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v0/modify", strings.NewReader(lease))
+			if err != nil {
+				t.Fatalf("request: %v", err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			if tc.protocol != "" {
+				req.Header.Set(version.ProtocolHeader, tc.protocol)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("post: %v", err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != tc.want {
+				t.Errorf("status %d, want %d", resp.StatusCode, tc.want)
 			}
 		})
 	}

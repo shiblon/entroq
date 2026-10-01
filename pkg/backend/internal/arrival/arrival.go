@@ -12,8 +12,8 @@ import (
 // Changes returns mod with its task arrivals appended to its changes, and
 // none left as arrivals. Each becomes its stored task, from stored, with only
 // its arrival time moved, to the arrival's At, which the change path then
-// holds or releases as for any change. It
-// keeps the version and queue the arrival named, so Modify's version, queue,
+// holds or releases as for any change, keeping its claim count, as a change
+// does unless it resets it. It keeps the version and queue the arrival named, so Modify's version, queue,
 // and claim checks apply as for any change, and a missing task becomes a
 // change that fails as missing. A backend calls it once the named tasks are
 // loaded, with the time it checks against.

@@ -12,13 +12,16 @@ import (
 	"github.com/shiblon/entroq/pkg/testing/eqtest"
 	"github.com/shiblon/entroq/pkg/version"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 // TestServerSendsProtocolHeaders checks that every response carries the
-// server's protocol and release, which a client reads before sending anything
-// newer than protocol 1.
+// protocols the server serves, from which a client chooses, and its release,
+// and that the server refuses a request declaring a protocol it does not
+// serve.
 func TestServerSendsProtocolHeaders(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -39,10 +42,15 @@ func TestServerSendsProtocolHeaders(t *testing.T) {
 	if _, err := pb.NewEntroQClient(conn).Time(ctx, new(pb.TimeRequest), grpc.Header(&md)); err != nil {
 		t.Fatalf("Time: %v", err)
 	}
-	if got := md.Get(version.ProtocolHeader); len(got) != 1 || got[0] != strconv.Itoa(version.Protocol) {
-		t.Errorf("Protocol header: got %v, want %d", got, version.Protocol)
+	if got, want := md.Get(version.ProtocolHeader), version.FormatProtocols(version.ServedProtocols); len(got) != 1 || got[0] != want {
+		t.Errorf("Protocol header: got %v, want %q", got, want)
 	}
 	if got := md.Get(version.VersionHeader); len(got) != 1 || got[0] != version.Version {
 		t.Errorf("Version header: got %v, want %q", got, version.Version)
+	}
+
+	ahead := metadata.AppendToOutgoingContext(ctx, version.ProtocolHeader, strconv.Itoa(int(version.Protocol)+1))
+	if _, err := pb.NewEntroQClient(conn).Time(ahead, new(pb.TimeRequest)); status.Code(err) != codes.Unimplemented {
+		t.Errorf("Request declaring an unserved protocol: want Unimplemented, got %v", err)
 	}
 }

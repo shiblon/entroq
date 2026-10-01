@@ -55,13 +55,10 @@ runs, so plan a short maintenance window on large doc tables.
   `entroq.worker.tasks_total` as `released` rather than `done`. The work
   gateway releases the task and its doc sets this way when a worker hangs up
   during `doWork`; before, it released only the task and counted it as done.
-- **`entroq.UnsupportedError` and `EntroQ.ServerProtocol`.** A request the
-  backend does not understand, such as one needing a newer protocol than its
-  server speaks, is an `UnsupportedError` (`IsUnsupported`); the gRPC backend
-  translates `codes.Unimplemented` to it. `ServerProtocol` returns the wire
-  protocol the client's store speaks: the server's for a backend that
-  implements the new `entroq.ProtocolReporter`, as the gRPC backend does, and
-  this build's otherwise.
+- **`entroq.UnsupportedError`.** A request the backend does not understand,
+  such as a call an older server lacks, or any call to a server whose
+  protocol the client does not accept, is an `UnsupportedError`
+  (`IsUnsupported`); the gRPC backend translates `codes.Unimplemented` to it.
 
 ### Changed
 
@@ -80,19 +77,30 @@ runs, so plan a short maintenance window on large doc tables.
   claimed, at once if claiming its doc sets took longer, rather than half a
   lease after the sets were claimed, when a slow `TakeDocs` could let the
   task's claim lapse first.
+- **A change can reset the task's claim count.** A change made with the new
+  `entroq.ResettingClaims()` sets `Task.Claims` to zero; any other change, and
+  every arrival, keeps it. The worker resets the count whenever it modifies a
+  task: a `Modify` result that changes it, a retry, or a move to quarantine
+  (`Task.RetryOrQuarantine` and `Task.Quarantine` reset it). So a claim limit
+  catches a task that keeps coming back untouched, a poison pill or a lease
+  too short for its handler, rather than one being worked on, and
+  `QueueStat.MaxClaims` is the most claims any task has had since it was
+  last reset. On the wire a change has a `mode`, `CHANGE_RESET_CLAIMS` for a
+  reset; a server that does not know modes applies the change without it, so
+  older clients and servers see no change. PostgreSQL: `_modify_arrays`
+  gains a reset-claims argument.
+- **The max-claims quarantine gives its numbers.** A task
+  `worker.WithMaxClaims` moves to the error queue now records its claims
+  without modification, the limit, and the lease, to tell a crash loop from a
+  lease too short for its handler.
 - **Modify refuses a modification that does nothing.** One with no
   operation at all is an invalid argument, from the client and from the
   service: it is almost always a mistake, such as a list its builder forgot
   to carry. A modification whose only inserts were skippable collisions
   (`WithSkipColliding`, `WithSkipCollidingDoc`) still succeeds with an empty
   response once they are dropped.
-- **A worker refuses a server below protocol 2.** `worker.Run` checks the
-  server's protocol before claiming anything, and returns an
-  `UnsupportedError` for an older server: upgrade servers before their
-  clients. A renewal the server refuses as unsupported now stops the work, as
-  a lost claim does, rather than being logged and retried until the lease
-  runs out.
-
+- **A renewal refused as unsupported stops the work,** as a lost claim does,
+  rather than being logged and retried until the lease runs out.
 - **eqmr map outputs have a primary key per split.** A mapper writes each
   partition's output under `mapout/<partition>/<split>` instead of sharing
   `mapout/<partition>` with every other mapper, so concurrent mappers write
@@ -225,22 +233,27 @@ runs, so plan a short maintenance window on large doc tables.
   rules are Modify's: an item someone else holds fails the whole modification.
   `ModifyResponse.ChangedSets` returns the sets at their new locks and doc
   counts; their docs are at the set's new version. Over gRPC they travel as
-  the protocol 2 lease changes below, and the client refuses to send them to a
-  server at protocol 1.
-- **The service reports its protocol.** Every gRPC and JSON response carries
-  an `entroq-protocol` header, 2 for this release (`version.Protocol`), and an
-  `entroq-version` header naming the release. A server that sends none speaks
-  protocol 1. The Go gRPC client records it from each response, and asks with
-  a `Time` call when it has not heard yet, before sending anything protocol 2
-  needs: a 1.12 server would apply a change carrying only a newer field as one
-  with empty data.
-- **Protocol 2 wire additions.** All additive; a 1.12 client sends none of
-  them.
-  - `TaskChange` puts `new_data` in a `data` oneof with `new_zero_claims` (a
-    change that will reset the task's claim count) and `new_lease` (only the
-    arrival time: renews or releases the task).
-  - `DocChange` puts `new_data` in a oneof with `new_lease`, which renews or
-    releases the doc set its `old_id` names.
+  lease changes (`CHANGE_LEASE`), in `Modify` with any other operations.
+- **Client and server negotiate the protocol.** Every gRPC and JSON response
+  carries an `entroq-protocol` header listing the protocols the server serves
+  (`version.ServedProtocols`, "1,2" for this release), and an
+  `entroq-version` header naming the release. A server that sends none serves
+  only protocol 1. A request declares the one protocol it chose in the same
+  header, and the server reads the request under it: a request with none is
+  protocol 1, as every client before the header is, and may use nothing
+  protocol 2 added, and one declaring a protocol the server does not serve is
+  refused as `Unimplemented`. The Go gRPC client speaks `version.Protocol`,
+  learns what the server serves with a `Time` call before its first call,
+  declares its protocol on every call, and refuses a server that does not
+  serve it, a 1.12 server included, with an `UnsupportedError` that says what
+  to upgrade. Dropping a protocol from a server's list is how a service stops
+  serving the clients that speak it.
+- **Protocol 2 wire additions.** A 1.12 client sends none of them.
+  - `TaskChange.mode` and `DocChange.mode`: `CHANGE_DEFAULT` (0, protocol 1's
+    change), `CHANGE_RESET_CLAIMS` (tasks only), which also resets the task's
+    claim count, and `CHANGE_LEASE`, which changes only when the task, or the
+    doc set `old_id` names by key, is ready again, reading only
+    `new_data.at_ms`. The service refuses a mode it does not know.
   - `DocID` names a doc by `id` or by `key`, in a oneof, with
     `secondary_key`: a key alone names a doc set.
   - `DocClaim.sets` names the doc sets to claim, by key; `namespace` and `key`
@@ -249,12 +262,12 @@ runs, so plan a short maintenance window on large doc tables.
   - `ClaimDocsResponse.sets` lists every claimed set as a `Doc` with no ID or
     content, empty sets included, and `ModifyResponse.changed_docs` returns a
     set whose lease changed the same way. `Doc.len` counts a set's docs.
-  - Naming a doc by key for anything but a set lease, or naming a set lease by
-    a doc's ID, is `Unimplemented` for now.
+  - Naming a doc by key for anything but a set arrival, or naming a set
+    arrival by a doc's ID, is `Unimplemented` for now.
 - **The service refuses changes with nothing in them.** A task or doc change
-  with no identifier or no data, a delete or depend naming no doc, and a lease
-  carrying anything but its arrival time are invalid arguments. A 1.12 server
-  applied a change with no data as one clearing every field.
+  with no identifier or no data, a delete or depend naming no doc, and an
+  arrival naming no task or set are invalid arguments. A 1.12 server applied
+  a change with no data as one clearing every field.
 - **Dependency errors can name doc sets.** `entroq.DocID` gains `Key`: with
   no `ID`, it names a whole doc set by its key (`IsSetRef`, `NewDocSetRef`),
   since a set is a doc with only a namespace and a primary key.

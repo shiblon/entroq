@@ -37,24 +37,14 @@ func (b *backend) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc,
 
 // ClaimDocs claims the doc set sharing a primary key in the namespace and
 // returns it, with its members. Returns a DependencyError while someone else
-// holds it. A server at protocol 2 is asked for the set by key, and answers
-// with it; an older one is asked by namespace and key, claimed nothing for a
-// set with no docs, and sends no set; see claimedSet.
+// holds it. The set is asked for by key, and the server answers with it.
 //
 // TODO: allow multiple claim sets at once when backends support it.
 func (b *backend) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) (*entroq.DocSet, error) {
-	p, err := b.serverProtocol(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("grpc claim docs: %w", err)
-	}
 	claim := &pb.DocClaim{
 		Claimant:   cq.Claimant,
 		DurationMs: int64(cq.Duration / time.Millisecond),
-	}
-	if p >= 2 {
-		claim.Sets = []*pb.DocID{pbconv.DocSetIDToProto(cq.Namespace, cq.Key, 0)}
-	} else {
-		claim.Namespace, claim.Key = cq.Namespace, cq.Key
+		Sets:       []*pb.DocID{pbconv.DocSetIDToProto(cq.Namespace, cq.Key, 0)},
 	}
 	resp, err := b.client().ClaimDocs(ctx, &pb.ClaimDocsRequest{ClaimQuery: claim})
 	if err != nil {

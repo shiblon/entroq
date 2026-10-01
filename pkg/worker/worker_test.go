@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -75,7 +76,8 @@ func TestWorker_MaxClaimsQuarantinesBeforeHandler(t *testing.T) {
 	if err != nil {
 		t.Fatalf("First claim: %v", err)
 	}
-	if _, err := client.Modify(ctx, claimed.Change(entroq.ArrivalTimeBy(0))); err != nil {
+	// Release it without modifying it, so its claim still counts.
+	if _, err := client.UpdateArrival(ctx, entroq.ReadyNow().Tasks(claimed)); err != nil {
 		t.Fatalf("Release first claim: %v", err)
 	}
 
@@ -105,8 +107,13 @@ func TestWorker_MaxClaimsQuarantinesBeforeHandler(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error queue tasks: %v", err)
 	}
-	if got, want := tasks[0].Claims, int32(2); got != want {
-		t.Errorf("quarantined task claims = %d, want %d", got, want)
+	// The move to quarantine is a modification, so it resets the count; the
+	// error records the count that sent the task there, and the lease.
+	if got := tasks[0].Claims; got != 0 {
+		t.Errorf("quarantined task claims = %d, want 0", got)
+	}
+	if e := tasks[0].Err; !strings.Contains(e, "2 claims without modification") || !strings.Contains(e, "lease ") {
+		t.Errorf("quarantined task err = %q, want it to name the claim count and the lease", e)
 	}
 }
 
@@ -322,38 +329,6 @@ func TestErrQTemplate(t *testing.T) {
 		if got := ErrQTemplate(template)("jobs"); got != want {
 			t.Errorf("ErrQTemplate(%q)(jobs) = %q, want %q", template, got, want)
 		}
-	}
-}
-
-// oldServer is a backend whose server speaks protocol 1.
-type oldServer struct{ entroq.Backend }
-
-func (oldServer) ServerProtocol(context.Context) (int32, error) { return 1, nil }
-
-// TestRunRefusesOldServer checks that a worker refuses, before claiming
-// anything, a server too old to renew by lease.
-func TestRunRefusesOldServer(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	client, err := entroq.New(ctx, func(ctx context.Context) (entroq.Backend, error) {
-		b, err := eqmem.Opener()(ctx)
-		return oldServer{b}, err
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	defer client.Close()
-	if _, err := client.Modify(ctx, entroq.InsertingInto("q")); err != nil {
-		t.Fatalf("Insert: %v", err)
-	}
-
-	w := New[string](client, WithDoWork(func(context.Context, *entroq.Task, string, []*entroq.DocSet) error {
-		t.Error("Worker claimed a task from a protocol 1 server")
-		return nil
-	}))
-	if err := w.Run(ctx, Watching("q")); !entroq.IsUnsupported(err) {
-		t.Errorf("Run against a protocol 1 server: want an unsupported error, got %v", err)
 	}
 }
 
