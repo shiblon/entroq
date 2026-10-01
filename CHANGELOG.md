@@ -89,6 +89,14 @@ runs, so plan a short maintenance window on large doc tables.
   reset; a server that does not know modes applies the change without it, so
   older clients and servers see no change. PostgreSQL: `_modify_arrays`
   gains a reset-claims argument.
+- **A handler's error at the claim limit moves the task with it.** Under
+  `worker.WithMaxClaims`, a `TakeDocs` or `DoWork` that returns an error
+  other than a sentinel on the task's last allowed claim now moves the task
+  to its error queue at once, recording the error, and releases its doc
+  sets; the next claim would have moved it without saying why. The worker
+  still stops as before, and the move is best-effort, with its own short
+  timeout. Below the limit nothing is recorded: a record is a modification,
+  and would reset the count.
 - **The max-claims quarantine gives its numbers.** A task
   `worker.WithMaxClaims` moves to the error queue now records its claims
   without modification, the limit, and the lease, to tell a crash loop from a
@@ -377,6 +385,11 @@ runs, so plan a short maintenance window on large doc tables.
   versions.
 
 ### Fixed
+
+- **A sentinel from `TakeDocs` acts on the task.** `WithTakeDocs` said a
+  `TakeDocs` may return a `MoveError`, but any error from it stopped the
+  worker. A retry, move, or fatal error from `TakeDocs` is now handled as one
+  from `DoWork` is.
 
 - **A SQLite write stopped by its context reports the cancellation.**
   `database/sql` rolls such a transaction back itself, and the backend then

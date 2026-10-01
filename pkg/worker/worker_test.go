@@ -76,8 +76,7 @@ func TestWorker_MaxClaimsQuarantinesBeforeHandler(t *testing.T) {
 	if err != nil {
 		t.Fatalf("First claim: %v", err)
 	}
-	// Release it without modifying it, so its claim still counts.
-	if _, err := client.UpdateArrival(ctx, entroq.ReadyNow().Tasks(claimed)); err != nil {
+	if _, err := client.Modify(ctx, claimed.Change(entroq.ArrivalTimeBy(0))); err != nil {
 		t.Fatalf("Release first claim: %v", err)
 	}
 
@@ -443,5 +442,101 @@ func TestDocsExpireWithTheirTask(t *testing.T) {
 	runCancel()
 	if err := <-errCh; err != nil {
 		t.Errorf("Run: %v", err)
+	}
+}
+
+// TestQuarantineAtClaimLimit checks that a handler's unknown error on the
+// task's last allowed claim moves the task to its error queue with that error,
+// from DoWork and from TakeDocs alike, and that the worker still stops; and
+// that below the limit nothing is recorded.
+func TestQuarantineAtClaimLimit(t *testing.T) {
+	boom := errors.New("boom")
+	for _, tc := range []struct {
+		name      string
+		maxClaims int32
+		takeFails bool
+		wantMoved bool
+	}{
+		{"DoWork at the limit", 1, false, true},
+		{"TakeDocs at the limit", 1, true, true},
+		{"below the limit", 3, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			client, err := entroq.New(ctx, eqmem.Opener())
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			defer client.Close()
+			if _, err := client.Modify(ctx, entroq.InsertingInto("q")); err != nil {
+				t.Fatalf("Insert: %v", err)
+			}
+
+			w := New[string](client,
+				WithTakeDocs(func(context.Context, *entroq.Task, string) (*TakeResult, error) {
+					if tc.takeFails {
+						return nil, boom
+					}
+					return Take(entroq.ClaimKey("ns", "k")), nil
+				}),
+				WithDoWork(func(context.Context, *entroq.Task, string, []*entroq.DocSet) error {
+					return boom
+				}),
+			)
+			if err := w.Run(ctx, Watching("q"), WithMaxClaims(tc.maxClaims), WithLease(time.Minute)); !errors.Is(err, boom) {
+				t.Fatalf("Run: want it to stop with the handler's error, got %v", err)
+			}
+
+			moved, err := client.Tasks(ctx, "q/err")
+			if err != nil {
+				t.Fatalf("Tasks: %v", err)
+			}
+			if !tc.wantMoved {
+				if len(moved) != 0 {
+					t.Errorf("Below the limit: want nothing moved, got %v", moved)
+				}
+				return
+			}
+			if len(moved) != 1 || !strings.Contains(moved[0].Err, "boom") || !strings.Contains(moved[0].Err, "claim limit") {
+				t.Fatalf("At the limit: want the task moved with the error, got %v", moved)
+			}
+			// Its doc set was released with it.
+			if _, err := client.ClaimDocs(ctx, entroq.ClaimKey("ns", "k"), entroq.ClaimingSetsAs("other")); err != nil {
+				t.Errorf("Set after the move: want it free, got %v", err)
+			}
+		})
+	}
+}
+
+// TestTakeDocsSentinel checks that a sentinel from TakeDocs acts on the task as
+// one from DoWork does: a move moves it, and the worker goes on.
+func TestTakeDocsSentinel(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, err := entroq.New(ctx, eqmem.Opener())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer client.Close()
+	if _, err := client.Modify(ctx, entroq.InsertingInto("q")); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	w := New[string](client,
+		WithTakeDocs(func(context.Context, *entroq.Task, string) (*TakeResult, error) {
+			return nil, MoveErrorf("no docs for this one")
+		}),
+		WithDoWork(func(context.Context, *entroq.Task, string, []*entroq.DocSet) error {
+			t.Error("DoWork ran for a task TakeDocs moved")
+			return nil
+		}),
+	)
+	runCtx, runCancel := context.WithCancel(ctx)
+	errCh := make(chan error, 1)
+	go func() { errCh <- w.Run(runCtx, Watching("q")) }()
+	waitForTasks(ctx, t, client, "q/err", 1)
+	runCancel()
+	if err := <-errCh; err != nil {
+		t.Errorf("Run: want it to go on after the move, got %v", err)
 	}
 }

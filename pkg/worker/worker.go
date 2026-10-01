@@ -841,22 +841,14 @@ func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, ta
 	return false, nil
 }
 
-// acquireDocs performs the doc acquisition phase for a claimed task.
-// It calls the provided take function to learn what is needed, then claims
-// ownership of those documents.
+// acquireDocs performs the doc acquisition phase for a claimed task: it
+// claims the doc sets the handler's TakeDocs named in tr.
 //
 // It returns the claimed sets in claim order, sets with no docs included.
 //
 // Returns a *entroq.DependencyError while another claimant holds a set; the
 // caller retries the task with backoff.
-func acquireDocs[T any](ctx context.Context, eqc *entroq.EntroQ, task *entroq.Task, value T, take TakeRun[T]) ([]*entroq.DocSet, error) {
-	if take == nil {
-		return []*entroq.DocSet{}, nil
-	}
-	tr, err := take(ctx, task, value)
-	if err != nil {
-		return nil, fmt.Errorf("take docs: %w", err)
-	}
+func acquireDocs(ctx context.Context, eqc *entroq.EntroQ, task *entroq.Task, tr *TakeResult) ([]*entroq.DocSet, error) {
 	if tr == nil {
 		return []*entroq.DocSet{}, nil
 	}
@@ -939,11 +931,25 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 	// Phase 2: Acquire docs before renewal starts. Doc claims are sorted by
 	// (namespace, key) to prevent dining-philosopher livelock when multiple
 	// doc sets are acquired.
-	sets, err := acquireDocs(rCtx, w.eqc, task, value, handler.TakeDocs)
+	tr, err := handler.TakeDocs(rCtx, task, value)
 	if err != nil {
-		// A claim fails only while someone else holds the set, which is
-		// transient: retry with backoff. Sets claimed before it keep their
-		// leases.
+		// A sentinel acts on the task as it does from DoWork; nothing is
+		// claimed yet.
+		if isSentinelError(err) {
+			outcome = sentinelOutcome(err)
+			_, serr := w.handleSentinelErrors(ctx, err, task, nil, w.ErrorQueueFor(task.Queue), opts)
+			return serr
+		}
+		if w.quarantineAtLimit(ctx, task, nil, err, opts) {
+			outcome = outcomeMoved
+		}
+		return fmt.Errorf("take docs: %w", err)
+	}
+	sets, err := acquireDocs(rCtx, w.eqc, task, tr)
+	if err != nil {
+		// A claim fails only while someone else holds a set, which is
+		// transient: retry with backoff. The claim is all or none, so
+		// nothing is held.
 		if _, ok := entroq.AsDependency(err); ok {
 			outcome = outcomeRetried
 			errQ := w.ErrorQueueFor(task.Queue)
@@ -958,6 +964,7 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 	// Phase 3: DoWork with background renewal of task + docs together.
 	var (
 		sentinelErr error
+		workErr     error // the handler's own error, other than a sentinel
 		finalTask   *entroq.Task
 		finalSets   []*entroq.DocSet
 	)
@@ -973,6 +980,7 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 			}()
 			if err := handler.DoWork(ctx, task, value, sets); err != nil {
 				if !isSentinelError(err) {
+					workErr = err
 					return fmt.Errorf("task do: %w", err)
 				}
 				sentinelErr = err
@@ -991,6 +999,9 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 	}
 
 	if handleErr != nil {
+		if workErr != nil && w.quarantineAtLimit(ctx, finalTask, finalSets, workErr, opts) {
+			outcome = outcomeMoved
+		}
 		return fmt.Errorf("worker (%q): %w", opts.qs, handleErr)
 	}
 
@@ -1019,6 +1030,34 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 		outcome = outcomeReleased
 	}
 	return nil
+}
+
+// atLimitTimeout bounds quarantineAtLimit's attempt, which must not hold up a
+// worker that is about to stop.
+const atLimitTimeout = 5 * time.Second
+
+// quarantineAtLimit moves task to its error queue at once, recording err,
+// which its handler returned (not a sentinel), when this claim was the last
+// the claim limit allows: the next claim would move it
+// anyway, without saying why. Below the limit it records nothing, since a
+// record is a modification and would reset the claim count; the task waits
+// out its lease, as before.
+//
+// The attempt is best-effort, with its own short timeout, apart from a
+// shutdown in progress, and the worker stops afterward exactly as it would
+// have without it: nothing is swallowed. It reports whether the task moved.
+func (w *Worker[T]) quarantineAtLimit(ctx context.Context, task *entroq.Task, sets []*entroq.DocSet, err error, opts *runOpt) bool {
+	if opts.maxClaims <= 0 || task == nil || task.Claims < opts.maxClaims {
+		return false
+	}
+	qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), atLimitTimeout)
+	defer cancel()
+	move := MoveErrorf("handler failed at the claim limit (%d claims, limit %d): %v", task.Claims, opts.maxClaims, err)
+	if _, qerr := w.handleSentinelErrors(qctx, move, task, sets, w.ErrorQueueFor(task.Queue), opts); qerr != nil {
+		log.Printf("worker: quarantine of task %s at its claim limit: %v", task.ID, qerr)
+		return false
+	}
+	return true
 }
 
 // sentinelOutcome maps a handler sentinel onto the outcome it produces.
@@ -1076,6 +1115,10 @@ func WithMaxAttempts(m int32) RunOption {
 // needed longer than the lease. A task that reaches the limit is a poison
 // pill, or runs under too short a lease; the error it is moved with gives the
 // count, the limit, and the lease.
+//
+// On a task's last allowed claim, a handler that returns an error other than
+// a sentinel moves it to the error queue at once, with that error, before
+// the worker stops: the next claim would have moved it without saying why.
 func WithMaxClaims(m int32) RunOption {
 	return func(ro *runOpt) {
 		ro.maxClaims = m
@@ -1119,7 +1162,9 @@ func isSentinelError(err error) bool {
 //   - Anything else: the worker exits. An unclassified error leaves the loop in an
 //     unknown state, and crashing for an orchestrator to restart is safer, and
 //     louder and thus more fixable, than continuing from state neither the author
-//     nor the framework reasoned about. Classify the failures you understand as
+//     nor the framework reasoned about. If the handler returned it on the task's
+//     last claim under WithMaxClaims, the task is moved to its error queue with
+//     the error first. Classify the failures you understand as
 //     Retry/Move so only genuine surprises bring the worker down.
 //
 // A claimant is a consumer, not a process. Run claims as the worker's client
