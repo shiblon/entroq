@@ -140,7 +140,7 @@ func TestWorkerRenewal(t *testing.T) {
 	}
 
 	// Renewal fires at interval/2 = 3 s; 10 s → 3 renewals expected.
-	if err := doWhileRenewing(ctx, client, 6*time.Second, 3*time.Second, held{task: task}, func(ctx context.Context, stop finalizeRenew) error {
+	if renewErr, err := doWhileRenewing(ctx, client, 6*time.Second, 3*time.Second, held{task: task}, func(ctx context.Context, stop finalizeRenew) error {
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("doWhileRenewing: %w", ctx.Err())
@@ -151,8 +151,8 @@ func TestWorkerRenewal(t *testing.T) {
 			t.Errorf("expected version %d after 3 renewals, got %d", want, got)
 		}
 		return nil
-	}); err != nil {
-		t.Fatalf("doWhileRenewing: %v", err)
+	}); renewErr != nil || err != nil {
+		t.Fatalf("doWhileRenewing: %v, %v", renewErr, err)
 	}
 }
 
@@ -180,10 +180,11 @@ func TestDoWhileRenewing_ImmediateCancellationOnLeaseLoss(t *testing.T) {
 
 	errChan := make(chan error, 1)
 	go func() {
-		errChan <- doWhileRenewing(ctx, client, 100*time.Millisecond, 50*time.Millisecond, held{task: claimed}, func(ctx context.Context, _ finalizeRenew) error {
+		renewErr, _ := doWhileRenewing(ctx, client, 100*time.Millisecond, 50*time.Millisecond, held{task: claimed}, func(ctx context.Context, _ finalizeRenew) error {
 			<-ctx.Done()
 			return ctx.Err()
 		})
+		errChan <- renewErr
 	}()
 
 	// Delete the task to break renewal.
@@ -609,5 +610,109 @@ func TestContentionDelayJitter(t *testing.T) {
 		if d := ro.contentionDelay(); d < time.Minute || d > time.Minute*5/4 {
 			t.Fatalf("Contention delay: want 1m to 1m15s, got %v", d)
 		}
+	}
+}
+
+// TestLostClaimGoesOn checks that a lost claim ends that task, not the
+// worker, whatever the handler returns once its context is canceled: the
+// worker goes on to the next task, and the lost task is not quarantined, even
+// at its claim limit.
+func TestLostClaimGoesOn(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		result func(ctx context.Context) error
+	}{
+		{"handler returns the cancellation", func(ctx context.Context) error { return ctx.Err() }},
+		{"handler returns its own error", func(context.Context) error { return errors.New("write failed") }},
+		{"handler returns a retry", func(context.Context) error { return RetryErrorf("again") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			client, err := entroq.New(ctx, eqmem.Opener())
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			defer client.Close()
+			resp, err := client.Modify(ctx, entroq.InsertingInto("q", entroq.WithValue("lost")))
+			if err != nil {
+				t.Fatalf("Insert: %v", err)
+			}
+			lostID := resp.InsertedTasks[0].ID
+
+			working := make(chan *entroq.Task, 1)
+			second := make(chan bool, 1)
+			w := New[string](client, WithDoWork(func(ctx context.Context, task *entroq.Task, v string, _ []*entroq.DocSet) error {
+				if v != "lost" {
+					second <- true
+					return nil
+				}
+				working <- task
+				<-ctx.Done() // the claim is lost underneath
+				return tc.result(ctx)
+			}))
+			runCtx, runCancel := context.WithCancel(ctx)
+			errCh := make(chan error, 1)
+			go func() {
+				errCh <- w.Run(runCtx, Watching("q"), WithLease(200*time.Millisecond), WithMaxClaims(1))
+			}()
+
+			task := <-working
+			// The task changes underneath the worker: the version it holds is
+			// gone, so its next renewal finds the claim lost.
+			if _, err := client.Modify(ctx, task.Change(entroq.ValueTo("taken"), entroq.ArrivalTimeBy(time.Hour))); err != nil {
+				t.Fatalf("Change underneath: %v", err)
+			}
+			if _, err := client.Modify(ctx, entroq.InsertingInto("q", entroq.WithValue("next"))); err != nil {
+				t.Fatalf("Insert next: %v", err)
+			}
+			select {
+			case <-second:
+			case err := <-errCh:
+				t.Fatalf("Run stopped after the lost claim: %v", err)
+			case <-ctx.Done():
+				t.Fatal("Worker did not go on to the next task")
+			}
+			runCancel()
+			if err := <-errCh; err != nil {
+				t.Errorf("Run: %v", err)
+			}
+			if moved, _ := client.Tasks(ctx, "q/err"); len(moved) != 0 {
+				t.Errorf("Lost task quarantined: %v", moved)
+			}
+			if tasks, _ := client.Tasks(ctx, "q", entroq.WithTaskID(lostID)); len(tasks) != 1 || string(tasks[0].Value) != `"taken"` {
+				t.Errorf("Lost task: want it as the change left it, got %v", tasks)
+			}
+		})
+	}
+}
+
+// TestLostClaimFatalStops checks that a handler's FatalError still stops the
+// worker when its claim was lost: handlers keep that control.
+func TestLostClaimFatalStops(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client, err := entroq.New(ctx, eqmem.Opener())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer client.Close()
+	if _, err := client.Modify(ctx, entroq.InsertingInto("q")); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	working := make(chan *entroq.Task, 1)
+	w := New[string](client, WithDoWork(func(ctx context.Context, task *entroq.Task, _ string, _ []*entroq.DocSet) error {
+		working <- task
+		<-ctx.Done()
+		return FatalErrorf("cannot go on")
+	}))
+	errCh := make(chan error, 1)
+	go func() { errCh <- w.Run(ctx, Watching("q"), WithLease(200*time.Millisecond)) }()
+	task := <-working
+	if _, err := client.Modify(ctx, task.Change(entroq.ArrivalTimeBy(time.Hour))); err != nil {
+		t.Fatalf("Change underneath: %v", err)
+	}
+	if _, ok := AsFatal(<-errCh); !ok {
+		t.Error("Run after a lost claim and a FatalError: want it to stop with the fatal error")
 	}
 }

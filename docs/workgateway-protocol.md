@@ -239,15 +239,12 @@ in `pkg/workgateway` (`contract_test.go` unless noted).
 | Worker replies with the wrong message type | stops (`workgateway_test.go`) | its lease | `caller` |
 | Worker sends a message that does not decode | treats it as a hang-up (`workgateway_test.go`) | released | `ok` |
 | Worker reports the `error` outcome | stops (`protocol1_test.go`) | its lease | `caller` |
-| The claim is lost while the worker works | sends `abort`, discards the `result` | the new holder's | `gateway`, for now[^w5] |
+| The claim is lost while the worker works | sends `abort`, discards the `result`, and goes on to the next task | the new holder's | `ok` |
 | No `result` within a lease of an `abort` | ends the session | the new holder's | `caller` |
 | EntroQ is unreachable | reports `transient`, rides it out for `--entroq-timeout` (`reconnect_test.go`) | its lease | `transient` if it gives up |
 | Operator's first `SIGTERM`/`SIGINT` | drains, closing WebSocket connections normally (also `ws_test.go`) | committed as usual | `ok` |
 | Operator's second signal | stops at once (`cmd/eqlink/cmd/drain_test.go`) | its lease | `ok` |
 | The gateway itself crashes | nothing: the worker sees the connection end | its lease | none |
-
-[^w5]: Once the Go worker keeps running after a lost claim, the session will
-continue instead.
 
 ## Handling disconnects: two recipes
 

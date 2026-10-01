@@ -94,6 +94,15 @@ runs, so plan a short maintenance window on large doc tables.
   reset; a server that does not know modes applies the change without it, so
   older clients and servers see no change. PostgreSQL: `_modify_arrays`
   gains a reset-claims argument.
+- **A lost claim ends the task, not the worker.** When renewal finds a task's
+  claim lost (a dependency error: the task or one of its doc sets moved on
+  without it), the worker logs it, counts it in `entroq.worker.tasks_total`
+  with the outcome `lost`, and goes on to the next task, where `Run` used to
+  return the error. This holds whatever the handler returns once its
+  context is canceled, except a `FatalError`, which still stops the
+  worker. A server refusing renewal, or a renewal that does not
+  return what it renewed, still stops the worker. The work gateway inherits
+  it: a lost claim no longer ends a session.
 - **A handler's error at the claim limit moves the task with it.** Under
   `worker.WithMaxClaims`, a `TakeDocs` or `DoWork` that returns an error
   other than a sentinel on the task's last allowed claim now moves the task

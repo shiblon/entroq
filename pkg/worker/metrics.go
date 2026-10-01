@@ -28,6 +28,8 @@ const (
 	outcomeRetried = "retried"
 	outcomeMoved   = "moved"
 	outcomeFailed  = "failed"
+	// A task whose claim was lost while it was worked: someone else has it.
+	outcomeLost = "lost"
 	// A task whose commit only made it arrive: released, or deferred.
 	outcomeReleased = "released"
 )

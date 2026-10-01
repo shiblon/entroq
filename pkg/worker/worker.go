@@ -973,7 +973,7 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 	// Renew first half a lease after the claim, at once if claiming the sets
 	// took longer: the task's lease has run since then.
 	first := max(0, opts.lease/2-time.Since(claimed))
-	handleErr := doWhileRenewing(rCtx, w.eqc, opts.lease, first, held{task: task, sets: sets},
+	renewErr, handleErr := doWhileRenewing(rCtx, w.eqc, opts.lease, first, held{task: task, sets: sets},
 		func(ctx context.Context, stop finalizeRenew) error {
 			defer func() {
 				final := stop()
@@ -989,6 +989,24 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 			return nil
 		},
 	)
+
+	// Once renewal has stopped, that is why the work ended, whatever the
+	// handler returned, except that a handler's FatalError still stops the
+	// worker: handlers keep that control. A lost claim ends this task, not the
+	// worker: the task is someone else's now, and there is nothing to commit,
+	// so a retry or move could not land either. Anything else that stops
+	// renewal is the deployment's to fix.
+	if renewErr != nil {
+		if fe, ok := AsFatal(sentinelErr); ok {
+			return fe
+		}
+		if _, ok := entroq.AsDependency(renewErr); ok {
+			log.Printf("worker (%q): claim of task %s lost, going on: %v", opts.qs, task.ID, renewErr)
+			outcome = outcomeLost
+			return nil
+		}
+		return fmt.Errorf("worker (%q) renewal: %w", opts.qs, renewErr)
+	}
 
 	if sentinelErr != nil {
 		outcome = sentinelOutcome(sentinelErr)
@@ -1185,7 +1203,11 @@ func isSentinelError(err error) bool {
 //   - DependencyError: reclaimed. The commit cleanly did not apply (a version
 //     moved, a dependency was lost), a known state, so the task is left to be
 //     re-claimed on lease expiry and the loop continues. See OnDependency to
-//     inspect and redirect this case.
+//     inspect and redirect this case. A claim lost while the handler works
+//     (renewal finds the task or a set no longer ours) is the same: the task is
+//     someone else's, it is logged and counted as lost, and the loop continues,
+//     whatever the handler returned once its context was canceled, except a
+//     FatalError, which still stops the worker.
 //   - Context cancellation or timeout: a clean stop; Run returns nil. Shutdown
 //     stops Run the same way, after its task is done.
 //   - Anything else: the worker exits. An unclassified error leaves the loop in an
@@ -1467,12 +1489,14 @@ type workFn func(ctx context.Context, stop finalizeRenew) error
 
 // doWhileRenewing runs work while keeping h claimed in the background: after
 // first, and then every half lease, one UpdateArrival renews the task and
-// every set, sets with no docs included. A renewal that finds the claim lost, a server that cannot
-// renew, or a renewal that does not return what it renewed cancels work with
-// that error as its cause.
-func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, lease, first time.Duration, h held, work workFn) error {
+// every set, sets with no docs included. A renewal that finds the claim lost,
+// a server that cannot renew, or a renewal that does not return what it
+// renewed cancels work with that error as its cause, and returns it as
+// renewErr, whatever the work then returned: once renewal has stopped, that
+// is why the work ended.
+func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, lease, first time.Duration, h held, work workFn) (renewErr, err error) {
 	if h.task == nil {
-		return fmt.Errorf("do while renewing: nothing to renew")
+		return nil, fmt.Errorf("do while renewing: nothing to renew")
 	}
 	type outVal struct {
 		held held
@@ -1485,12 +1509,14 @@ func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, lease, first time.Du
 	fctx, fcancel := context.WithCancelCause(ctx)
 	defer fcancel(nil)
 
+	// stopErr is why renewal stopped, if it did; only the renewal goroutine
+	// writes it, and it is read after both have finished.
+	var stopErr error
 	stopRenew := make(chan struct{})
 	g.Go(func() error {
 		cur := h
 		next := first
 		var out chan<- outVal
-		var stopErr error
 		stop := func(err error) {
 			fcancel(err)
 			stopErr = err
@@ -1568,7 +1594,7 @@ func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, lease, first time.Du
 	})
 
 	if err := g.Wait(); err != nil {
-		return fmt.Errorf("do with renew all: %w", err)
+		return stopErr, fmt.Errorf("do with renew all: %w", err)
 	}
-	return nil
+	return stopErr, nil
 }

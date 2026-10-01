@@ -120,13 +120,28 @@ func TestContract_AbortOnLostClaim(t *testing.T) {
 	readAbort(t, s, dw)
 	s.c.send(okResult(deleteTask(dw.Task.Task)))
 
-	// Until the worker keeps running after a lost claim (Tier 2, W5), the
-	// lost claim ends the session with a gateway-class error.
-	var em errorMsg
-	s.c.recv(&em)
-	s.wait()
+	// A lost claim ends that task, not the session: the worker goes on to
+	// the next task.
+	insertTask(t, ctx, eq, "in", "again")
+	var next doWorkMsg
+	s.c.recv(&next)
+	if next.Type != msgDoWork || next.Task.Id == stolen.ID {
+		t.Fatalf("after the lost claim: want the session to go on to the next task, got %+v", next)
+	}
+	s.c.send(okResult(deleteTask(next.Task.Task)))
+	for {
+		left, err := eq.Tasks(ctx, "in", entroq.WithTaskID(next.Task.Id))
+		if err != nil {
+			t.Fatalf("tasks: %v", err)
+		}
+		if len(left) == 0 {
+			break // the next task's result committed
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	s.stop()
 
-	tasks, err := eq.Tasks(ctx, "in")
+	tasks, err := eq.Tasks(ctx, "in", entroq.WithTaskID(stolen.ID))
 	if err != nil || len(tasks) != 1 || tasks[0].Version != stolen.Version {
 		t.Fatalf("the late result must not commit: got %v, %v", tasks, err)
 	}
