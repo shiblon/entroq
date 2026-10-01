@@ -2,6 +2,7 @@ package entroq
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -144,5 +145,14 @@ func TestResettingClaims(t *testing.T) {
 	}
 	if dest := NewModification("", WithModification(src)); !dest.ResetsClaims("a") || dest.ResetsClaims("b") {
 		t.Error("WithModification: want the reset carried over")
+	}
+}
+
+// TestModificationStringShowsResets checks that a modification's claim resets
+// show when it is logged, since they are not among its operation lists.
+func TestModificationStringShowsResets(t *testing.T) {
+	m := NewModification("", (&Task{ID: "a", Queue: "q"}).Change(ResettingClaims()))
+	if s := m.String(); !strings.Contains(s, "reset-claims: [a]") {
+		t.Errorf("String: want the reset of a shown, got %q", s)
 	}
 }

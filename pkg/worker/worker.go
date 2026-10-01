@@ -341,7 +341,7 @@ func (h *doModifyHandler[T]) Finish(ctx context.Context, mod Modifier, finalTask
 		// one no longer point at a poison pill.
 		for _, c := range modification.Changes {
 			if c.ID == finalTask.ID {
-				entroq.ResettingClaims()(modification, c)
+				modification.ResetClaims(c.ID)
 			}
 		}
 		if _, err := mod.Modify(ctx, entroq.WithModification(modification)); err != nil {

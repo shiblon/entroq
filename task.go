@@ -83,11 +83,6 @@ type TaskData struct {
 	// to-be-inserted tasks.
 	ID string `json:"id"`
 
-	// skipCollidingID indicates that a collision on insertion is not fatal,
-	// and the insertion can be removed if that happens, and then the
-	// modification can be retried.
-	skipCollidingID bool
-
 	// These timings are here so that journaling can restore full state.
 	// Usually they are blank, and there are no convenience methods to allow
 	// them to be set. Leave them at default values in all cases.
@@ -222,17 +217,6 @@ func WithErr(value string) InsertArg {
 func WithID(id string) InsertArg {
 	return func(_ *Modification, d *TaskData) {
 		d.ID = id
-	}
-}
-
-// WithSkipColliding sets the insert argument to allow itself to be removed if
-// the only error encountered is an ID collision. This can help when it is
-// desired to insert multiple tasks, but a previous subset was already inserted
-// with similar IDs. Sometimes you want to specify a superset to "catch what we
-// missed".
-func WithSkipColliding(s bool) InsertArg {
-	return func(_ *Modification, d *TaskData) {
-		d.skipCollidingID = s
 	}
 }
 
@@ -416,10 +400,7 @@ func ErrToZero() ChangeArg {
 // crash loop) reaches a claim limit, while one being worked on does not.
 func ResettingClaims() ChangeArg {
 	return func(m *Modification, t *Task) {
-		if m.resetClaims == nil {
-			m.resetClaims = make(map[string]bool)
-		}
-		m.resetClaims[t.ID] = true
+		m.ResetClaims(t.ID)
 	}
 }
 

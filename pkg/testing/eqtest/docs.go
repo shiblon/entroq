@@ -540,8 +540,8 @@ func DocClaimLocking(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 	}
 }
 
-// DocInsertWithID tests collision detection and skip-colliding behavior for
-// doc inserts that specify an explicit ID.
+// DocInsertWithID tests collision detection for doc inserts that specify an
+// explicit ID.
 //
 // This test specifically exercises the bug path that existed before the fix:
 //   - eqredis silently overwrote on explicit-ID collision instead of returning
@@ -599,51 +599,28 @@ func DocInsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 		t.Errorf("verify after collision: content changed to %s, want %q", docs[0].Content, `"first"`)
 	}
 
-	// Inserting with WithSkipCollidingDoc must succeed and leave the original intact.
-	_, err = client.Modify(ctx, entroq.PuttingDocInto(ns,
-		entroq.WithIDKeys(knownID, "pk", "sk"),
-		entroq.WithContent("overwrite-attempt"),
-		entroq.WithSkipCollidingDoc(true),
-	))
-	if err != nil {
-		t.Fatalf("skip-colliding insert: expected no error, got %v", err)
-	}
-
-	docs, err = client.Docs(ctx, &entroq.DocQuery{Namespace: ns, IDs: []string{knownID}})
-	if err != nil {
-		t.Fatalf("verify after skip: %v", err)
-	}
-	if len(docs) != 1 {
-		t.Fatalf("verify after skip: want 1 doc, got %d", len(docs))
-	}
-	if string(docs[0].Content) != `"first"` {
-		t.Errorf("verify after skip: content changed to %s, want %q", docs[0].Content, `"first"`)
-	}
-
-	// Skip-colliding insert alongside another real operation must execute the
-	// real operation while dropping the colliding insert.
+	// A colliding insert fails its whole modification: the insert beside it
+	// does not happen either.
 	otherID := client.GenID()
 	_, err = client.Modify(ctx,
 		entroq.PuttingDocInto(ns,
 			entroq.WithIDKeys(knownID, "pk", "sk"),
 			entroq.WithContent("overwrite-attempt"),
-			entroq.WithSkipCollidingDoc(true),
 		),
 		entroq.PuttingDocInto(ns,
 			entroq.WithIDKeys(otherID, "pk2", "sk2"),
 			entroq.WithContent("new-doc"),
 		),
 	)
-	if err != nil {
-		t.Fatalf("skip-colliding + new insert: expected no error, got %v", err)
+	if depErr, ok := entroq.AsDependency(err); !ok || !depErr.OnlyCollisions() {
+		t.Fatalf("Colliding insert with another: want an error of only collisions, got %v", err)
 	}
-
 	docs, err = client.Docs(ctx, &entroq.DocQuery{Namespace: ns})
 	if err != nil {
 		t.Fatalf("final list: %v", err)
 	}
-	if len(docs) != 2 {
-		t.Fatalf("final list: want 2 docs, got %d", len(docs))
+	if len(docs) != 1 {
+		t.Fatalf("final list: want only the original doc, got %d", len(docs))
 	}
 }
 

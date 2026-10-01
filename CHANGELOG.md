@@ -96,9 +96,7 @@ runs, so plan a short maintenance window on large doc tables.
 - **Modify refuses a modification that does nothing.** One with no
   operation at all is an invalid argument, from the client and from the
   service: it is almost always a mistake, such as a list its builder forgot
-  to carry. A modification whose only inserts were skippable collisions
-  (`WithSkipColliding`, `WithSkipCollidingDoc`) still succeeds with an empty
-  response once they are dropped.
+  to carry.
 - **A renewal refused as unsupported stops the work,** as a lost claim does,
   rather than being logged and retried until the lease runs out.
 - **eqmr map outputs have a primary key per split.** A mapper writes each
@@ -172,6 +170,16 @@ runs, so plan a short maintenance window on large doc tables.
   receive default, so a response the server was configured to send (up to
   `--max_size_mb`, default 10MB), such as a large task listing, failed on the
   client. The server's limit now governs; `eqgrpc.WithMaxSize` still sets one.
+- **Breaking (Go): skipping colliding inserts is gone.** `WithSkipColliding`
+  and `WithSkipCollidingDoc` are removed, with the retry in `Modify` that
+  dropped colliding inserts and sent the rest again: a colliding insert now
+  fails its whole modification, as any dependency does. Skipping was for an
+  inserter run again after a failure, and it re-inserted work already done,
+  since a finished task is deleted. Insert a batch in one modification with a
+  marker doc of explicit ID instead, and read a collision on the marker as
+  "already committed": the new `DependencyError.OnlyCollisions` says when a
+  failure was only collisions. For docs, claim the set (it may be empty),
+  look, then insert what is missing.
 - **Breaking (Go): `ClaimDocs` returns the set it claimed.**
   `EntroQ.ClaimDocs` and `Backend.ClaimDocs` return a `*entroq.DocSet`: the
   set's namespace, key, version, claimant, and arrival time, with its

@@ -640,10 +640,8 @@ func InsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 		t.Fatalf("Expected %d insertion errors in dependency error, got %v", want, got)
 	}
 
-	// Try to insert again, but allow it to be skipped.
-	_, err = client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithID(knownID), entroq.WithSkipColliding(true)))
-	if err != nil {
-		t.Fatalf("Expected no error inserting with existing skippable ID %v: %v", knownID, err)
+	if !depErr.OnlyCollisions() {
+		t.Errorf("Collision: want an error of only collisions, got %v", depErr)
 	}
 
 	resp, err = client.Modify(ctx, entroq.InsertingInto(queue))
@@ -652,26 +650,19 @@ func InsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 	}
 	inserted = resp.InsertedTasks
 
-	// Try to insert the known ID and delete the new ID at the same time. This
-	// should work when it's set to skip colliding.
-	if _, err = client.Modify(ctx,
-		entroq.InsertingInto(queue,
-			entroq.WithID(knownID),
-			entroq.WithSkipColliding(true)),
-		inserted[0].Delete()); err != nil {
-		t.Fatalf("Expected no error inserting skippable and deleting, got: %v", err)
+	// A colliding insert fails its whole modification: the delete beside it
+	// does not happen either. The collision says the insert was committed
+	// before, which is how a restarted inserter knows its batch is done.
+	_, err = client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithID(knownID)), inserted[0].Delete())
+	if depErr, ok := entroq.AsDependency(err); !ok || !depErr.OnlyCollisions() {
+		t.Fatalf("Colliding insert with a delete: want an error of only collisions, got %v", err)
 	}
-
-	// Check that we have only one task in the queue, and that it's the expected one.
 	tasks, err := client.Tasks(ctx, queue)
 	if err != nil {
 		t.Fatalf("Error getting tasks: %v", err)
 	}
-	if want, got := 1, len(tasks); want != got {
-		t.Fatalf("Expected len(tasks) = %d, got %v", want, got)
-	}
-	if want, got := knownID, tasks[0].ID; want != got {
-		t.Fatalf("Expected ID %v found, got %v", want, got)
+	if want, got := 2, len(tasks); want != got {
+		t.Fatalf("After the refused modification: want %d tasks, nothing deleted, got %d", want, got)
 	}
 }
 
@@ -967,8 +958,8 @@ func EmptyWriteTargetRejected(ctx context.Context, t *testing.T, client *entroq.
 // ModifyReportsAllFailureClasses verifies the Backend.Modify contract that a
 // failed modification reports EVERY failing operation across all classes in a
 // single DependencyError, not just the first class encountered. A caller's
-// skip-colliding insert logic in particular depends on collisions always being
-// reported even alongside other failures.
+// OnlyCollisions check in particular is true only when collisions are the
+// whole story, so every other failure beside them must be reported too.
 func ModifyReportsAllFailureClasses(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	q := path.Join(qPrefix, "all_failures")
 	wrongQ := path.Join(qPrefix, "all_failures_wrong")

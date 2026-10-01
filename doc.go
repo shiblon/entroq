@@ -13,12 +13,11 @@ import (
 type DocOpt func(*docOpts)
 
 type docOpts struct {
-	id              string
-	key             string
-	secondaryKey    string
-	content         json.RawMessage
-	at              time.Time
-	skipCollidingID bool
+	id           string
+	key          string
+	secondaryKey string
+	content      json.RawMessage
+	at           time.Time
 }
 
 // WithKeys sets the primary and secondary keys for doc creation. The ID is
@@ -88,16 +87,6 @@ func WithDocArrivalTimeBy(d time.Duration) DocOpt {
 	}
 }
 
-// WithSkipCollidingDoc marks a doc insert as skippable when its explicit ID
-// already exists. When the caller specifies an ID and that doc is already
-// present, the Modify call removes this insert and retries rather than
-// returning an error. Analogous to WithSkipColliding for task inserts.
-func WithSkipCollidingDoc(skip bool) DocOpt {
-	return func(o *docOpts) {
-		o.skipCollidingID = skip
-	}
-}
-
 // DocID contains the identifying parts of a storage doc. It names a doc by
 // ID, or, with no ID, a whole doc set by its key: a set is a doc with only a
 // namespace and a primary key. Either way, Version is the set's.
@@ -158,11 +147,6 @@ type DocData struct {
 	Content      json.RawMessage `json:"content"`
 	Created      time.Time       `json:"created"`
 	Modified     time.Time       `json:"modified"`
-
-	// skipCollidingID indicates that a collision on insertion is not fatal.
-	// When the explicit ID already exists, Modify removes this insert and
-	// retries rather than returning an error. Analogous to TaskData's field.
-	skipCollidingID bool
 }
 
 // Doc represents a durable state record in EntroQ.
@@ -294,7 +278,6 @@ func PuttingDoc(rd *DocData) ModifyArg {
 // Use WithKeys to set the primary and secondary keys, WithContent/WithRawContent
 // to set the payload, and WithDocArrivalTime/WithDocArrivalTimeBy to insert the
 // doc with a claim. Use WithIDKeys only when explicit ID control is required.
-// Use WithSkipCollidingDoc to allow the insert to be silently dropped on ID collision.
 func PuttingDocInto(ns string, opts ...DocOpt) ModifyArg {
 	return func(m *Modification) {
 		o := &docOpts{}
@@ -302,13 +285,12 @@ func PuttingDocInto(ns string, opts ...DocOpt) ModifyArg {
 			opt(o)
 		}
 		rd := &DocData{
-			Namespace:       ns,
-			ID:              o.id,
-			At:              o.at,
-			Key:             o.key,
-			SecondaryKey:    o.secondaryKey,
-			Content:         o.content,
-			skipCollidingID: o.skipCollidingID,
+			Namespace:    ns,
+			ID:           o.id,
+			At:           o.at,
+			Key:          o.key,
+			SecondaryKey: o.secondaryKey,
+			Content:      o.content,
 		}
 		m.DocInserts = append(m.DocInserts, rd)
 	}

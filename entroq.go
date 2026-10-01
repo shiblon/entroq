@@ -102,6 +102,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand"
 	"slices"
 	"strings"
@@ -368,8 +369,9 @@ type Backend interface {
 	// across all classes -- insert/doc-insert collisions, missing or
 	// version-mismatched changes/deletes/depends, claimed targets, and
 	// queue/namespace mismatches -- not merely the first class encountered. A
-	// caller acts on the full set: skip-colliding inserts in particular depend on
-	// collisions always being reported, even alongside other failures.
+	// caller acts on the full set: OnlyCollisions in particular is true only
+	// when collisions are the whole story, so every other failure beside them
+	// must be reported too.
 	// (*DependencyError).Merge helps a backend that discovers failures in more
 	// than one pass fold them into a single such error.
 	Modify(ctx context.Context, mod *Modification) (*ModifyResponse, error)
@@ -893,71 +895,14 @@ func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (*ModifyRespo
 			return nil, fmt.Errorf("modify change %s: value is not valid JSON", chg.ID)
 		}
 	}
-	for {
-		resp, err := c.backend.Modify(ctx, mod)
-		if err == nil {
-			return resp, nil
+	resp, err := c.backend.Modify(ctx, mod)
+	if err != nil {
+		if depErr, ok := AsDependency(err); ok {
+			depErr.nameArrivals(mod)
 		}
-		depErr, ok := AsDependency(err)
-		// If not a dependency error, pass it on out.
-		if !ok {
-			return nil, fmt.Errorf("modify: %w", err)
-		}
-		depErr.nameArrivals(mod)
-		// If anything is missing or there's a claim problem, bail.
-		if depErr.HasMissing() || depErr.HasClaims() {
-			return nil, fmt.Errorf("modify non-ins deps: %w", err)
-		}
-		// No collisions? Not sure what's going on.
-		if !depErr.HasCollisions() {
-			return nil, fmt.Errorf("non-collision errors: %w", err)
-		}
-
-		// If we get this far, the only errors we have are insertion collisions.
-		// If any of them cannot be skipped, we bail out.
-		// Otherwise we remove them and try again.
-
-		// Now check all collisions. If we can remove all of them safely, do so
-		// and try again.
-		collidingIDs := make(map[string]bool)
-		for _, ins := range depErr.Inserts {
-			collidingIDs[ins.ID] = true
-		}
-		var newInserts []*TaskData
-		for _, td := range mod.Inserts {
-			if collidingIDs[td.ID] {
-				if td.skipCollidingID {
-					// Skippable, so skip.
-					continue
-				}
-				// Can't skip this one. Bail.
-				return nil, fmt.Errorf("unskippable collision: %w", err)
-			}
-			newInserts = append(newInserts, td)
-		}
-		mod.Inserts = newInserts
-
-		collidingDocKeys := make(map[string]bool)
-		for _, ins := range depErr.DocInserts {
-			collidingDocKeys[DocKey(ins.Namespace, ins.ID)] = true
-		}
-		var newDocInserts []*DocData
-		for _, dd := range mod.DocInserts {
-			if collidingDocKeys[DocKey(dd.Namespace, dd.ID)] {
-				if dd.skipCollidingID {
-					continue
-				}
-				return nil, fmt.Errorf("unskippable doc collision: %w", err)
-			}
-			newDocInserts = append(newDocInserts, dd)
-		}
-		mod.DocInserts = newDocInserts
-
-		// Every operation was a skipped insert: the modification is done.
-		if mod.IsEmpty() {
-			return new(ModifyResponse), nil
-		}
+		return nil, fmt.Errorf("modify: %w", err)
 	}
+	return resp, nil
 }
 
 // TryClaimDocByID attempts to claim the doc identified by ns and id by
@@ -1133,6 +1078,9 @@ func (m *Modification) String() string {
 	if len(m.DocArrives) != 0 {
 		out = append(out, fmt.Sprintf("doc-arr: %v", m.DocArrives))
 	}
+	if len(m.resetClaims) != 0 {
+		out = append(out, fmt.Sprintf("reset-claims: %v", slices.Sorted(maps.Keys(m.resetClaims))))
+	}
 	return "mod:\n\t" + strings.Join(out, "\n\t")
 }
 
@@ -1154,6 +1102,16 @@ func NewModification(claimant string, modArgs ...ModifyArg) *Modification {
 // change how an individual call to Modify operates.
 func (m *Modification) Options() []ModifyOption {
 	return m.options
+}
+
+// ResetClaims makes m's change of the task with the given ID reset its claim
+// count to zero, as a change made with ResettingClaims does. It is for adding
+// the reset to a modification already built.
+func (m *Modification) ResetClaims(id string) {
+	if m.resetClaims == nil {
+		m.resetClaims = make(map[string]bool)
+	}
+	m.resetClaims[id] = true
 }
 
 // ResetsClaims reports whether m's change of the task with the given ID
@@ -1574,6 +1532,16 @@ func (m *DependencyError) HasCollisions() bool {
 // HasAny reports whether any dependency fields are populated.
 func (m *DependencyError) HasAny() bool {
 	return m.HasMissing() || m.HasCollisions() || m.HasClaims() || m.HasMissingDocs() || m.HasClaimedDocs()
+}
+
+// OnlyCollisions reports whether the only failures were inserts, of tasks or
+// docs, whose explicit IDs already exist. For an inserter that may be run
+// again, that means its modification was committed before: insert a batch
+// in one modification with a marker doc of explicit ID, and a collision on
+// the marker says the batch is in. (Finished tasks are deleted, so the
+// tasks' own IDs cannot say that.)
+func (m *DependencyError) OnlyCollisions() bool {
+	return m.HasCollisions() && !m.HasMissing() && !m.HasClaims() && !m.HasMissingDocs() && !m.HasClaimedDocs()
 }
 
 // OnlyClaims indicates that the error was only related to claimants (tasks or
