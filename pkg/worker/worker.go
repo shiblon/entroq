@@ -926,7 +926,14 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 	}
 	value, err := entroq.GetValue[T](task)
 	if err != nil {
-		return fmt.Errorf("worker (%q) unmarshal: %w", opts.qs, err)
+		// A value that does not decode is a poison pill: no claim of it will
+		// do better. Move it to the error queue, saying why, and go on.
+		outcome = outcomeMoved
+		move := MoveErrorf("value does not decode as %T: %v", value, err)
+		if _, herr := w.handleSentinelErrors(ctx, move, task, nil, w.ErrorQueueFor(task.Queue), opts); herr != nil {
+			return fmt.Errorf("worker (%q) move undecodable task: %w", opts.qs, herr)
+		}
+		return nil
 	}
 
 	// Phase 2: Acquire docs before renewal starts. Doc claims are sorted by
@@ -1208,6 +1215,8 @@ func isSentinelError(err error) bool {
 //     someone else's, it is logged and counted as lost, and the loop continues,
 //     whatever the handler returned once its context was canceled, except a
 //     FatalError, which still stops the worker.
+//   - A value that does not decode into T: a poison pill. The task moves to
+//     its error queue, saying why, and the loop continues.
 //   - Context cancellation or timeout: a clean stop; Run returns nil. Shutdown
 //     stops Run the same way, after its task is done.
 //   - Anything else: the worker exits. An unclassified error leaves the loop in an

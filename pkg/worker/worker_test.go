@@ -716,3 +716,52 @@ func TestLostClaimFatalStops(t *testing.T) {
 		t.Error("Run after a lost claim and a FatalError: want it to stop with the fatal error")
 	}
 }
+
+// TestUndecodableValueMoves checks that a task whose value does not decode
+// into the worker's type moves to its error queue, saying why, and that the
+// worker goes on to the next task.
+func TestUndecodableValueMoves(t *testing.T) {
+	type job struct{ N int }
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, err := entroq.New(ctx, eqmem.Opener())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer client.Close()
+	if _, err := client.Modify(ctx, entroq.InsertingInto("q", entroq.WithValue("not an object"))); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	done := make(chan int, 1)
+	w := New[job](client, WithDoModify(func(_ context.Context, task *entroq.Task, v job, _ []*entroq.DocSet) (*Result, error) {
+		done <- v.N
+		return Modify(task.Delete()), nil
+	}))
+	runCtx, runCancel := context.WithCancel(ctx)
+	errCh := make(chan error, 1)
+	go func() { errCh <- w.Run(runCtx, Watching("q")) }()
+
+	waitForTasks(ctx, t, client, "q/err", 1)
+	moved, err := client.Tasks(ctx, "q/err")
+	if err != nil || len(moved) != 1 || !strings.Contains(moved[0].Err, "does not decode") || !strings.Contains(moved[0].Err, "job") {
+		t.Fatalf("Moved task: want it in the error queue saying it does not decode as job, got %v, %v", moved, err)
+	}
+	if _, err := client.Modify(ctx, entroq.InsertingInto("q", entroq.WithValue(job{N: 7}))); err != nil {
+		t.Fatalf("Insert next: %v", err)
+	}
+	select {
+	case n := <-done:
+		if n != 7 {
+			t.Errorf("Next task: got value %d, want 7", n)
+		}
+	case err := <-errCh:
+		t.Fatalf("Run stopped after the undecodable task: %v", err)
+	case <-ctx.Done():
+		t.Fatal("Worker did not go on to the next task")
+	}
+	runCancel()
+	if err := <-errCh; err != nil {
+		t.Errorf("Run: %v", err)
+	}
+}

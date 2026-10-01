@@ -94,6 +94,11 @@ runs, so plan a short maintenance window on large doc tables.
   reset; a server that does not know modes applies the change without it, so
   older clients and servers see no change. PostgreSQL: `_modify_arrays`
   gains a reset-claims argument.
+- **A task whose value does not decode moves to the error queue.** The worker
+  used to stop when a claimed task's value did not decode into its type. No
+  claim of such a task can do better, so it now moves to the error queue,
+  saying it does not decode as the worker's type and why, and the worker
+  goes on.
 - **A lost claim ends the task, not the worker.** When renewal finds a task's
   claim lost (a dependency error: the task or one of its doc sets moved on
   without it), the worker logs it, counts it in `entroq.worker.tasks_total`
