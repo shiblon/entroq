@@ -247,6 +247,17 @@ runs, so plan a short maintenance window on large doc tables.
   `ModifyResponse.ChangedSets` returns the sets at their new locks and doc
   counts; their docs are at the set's new version. Over gRPC they travel as
   lease changes (`CHANGE_LEASE`), in `Modify` with any other operations.
+- **The service refuses requests with fields it does not know.** A client
+  may ignore what it does not understand; a server that did would do
+  something other than what was asked. Over gRPC and binary connect, a
+  request carrying an unknown field, at any depth, is an `InvalidArgument`
+  naming each such field's path and number, the protocol the request
+  declared, and this server's release and protocols. A JSON request with an
+  unknown field fails to decode, on the REST routes and the connect ones
+  alike, as a 400 naming it. Negotiation already refuses a client declaring a
+  protocol the server does not serve; this catches one whose request does not
+  match what it declared. Keep a deprecated proto field declared, and
+  ignored, until no client still sends it.
 - **Client and server negotiate the protocol.** Every gRPC and JSON response
   carries an `entroq-protocol` header listing the protocols the server serves
   (`version.ServedProtocols`, "1,2" for this release), and an
@@ -269,8 +280,8 @@ runs, so plan a short maintenance window on large doc tables.
     `new_data.at_ms`. The service refuses a mode it does not know.
   - `DocID` names a doc by `id` or by `key`, in a oneof, with
     `secondary_key`: a key alone names a doc set.
-  - `DocClaim.sets` names the doc sets to claim, as `SetClaim`s (a set by key,
-    and `omit_members`), all or none; `namespace` and `key` are for protocol
+  - `DocClaim.sets` names the doc sets to claim, as `DocSetClaim`s (a set by
+    key, and `omit_members`), all or none; `namespace` and `key` are for protocol
     1 and ignored when sets are given. `DocClaim.at_ms` holds the sets until
     a time instead of for `duration_ms`.
   - `ClaimDocsResponse.sets` lists every claimed set as a `Doc` with no ID or

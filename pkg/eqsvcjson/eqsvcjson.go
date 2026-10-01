@@ -35,6 +35,7 @@ func New(svc *eqsvcgrpc.QSvc, opts ...connect.HandlerOption) (string, http.Handl
 	// with their status code stringified into the message and their details
 	// dropped. Translate them centrally so codes and details survive over JSON.
 	opts = append(opts, connect.WithInterceptors(errTranslator()))
+	opts = append(opts, strictCodecs()...)
 
 	connectPath, connectHandler := apiconnect.NewEntroQHandler(h, opts...)
 
@@ -51,7 +52,7 @@ func New(svc *eqsvcgrpc.QSvc, opts ...connect.HandlerOption) (string, http.Handl
 		),
 	}
 
-	transcoder, err := vanguard.NewTranscoder(services)
+	transcoder, err := vanguard.NewTranscoder(services, vanguard.WithCodec(strictRESTCodec))
 	if err != nil {
 		return "", nil, err
 	}

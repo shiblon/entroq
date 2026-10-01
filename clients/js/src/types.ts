@@ -153,9 +153,9 @@ export interface DocQuery {
  * DocClaim describes an atomic all-or-nothing claim of docs sharing a key.
  */
 /**
- * SetClaim names one doc set of a claim, by key (protocol 2).
+ * DocSetClaim names one doc set of a claim, by key (protocol 2).
  */
-export interface SetClaim {
+export interface DocSetClaim {
   set: DocID;
   omitMembers?: boolean; // return the set alone, without its docs
 }
@@ -164,7 +164,7 @@ export interface SetClaim {
  * DocClaim claims doc sets, all of them or none.
  */
 export interface DocClaim {
-  sets?: SetClaim[];   // protocol 2: the doc sets to claim
+  sets?: DocSetClaim[];   // protocol 2: the doc sets to claim
   namespace?: string;  // protocol 1
   key?: string;        // protocol 1
   durationMs?: string; // int64 -> string; defaults to DefaultClaimDuration

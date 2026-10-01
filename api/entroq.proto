@@ -225,9 +225,9 @@ message DocQuery {
   string key_exact = 7;
 }
 
-// SetClaim names one doc set of a claim, by key (DocID.key, with no id),
+// DocSetClaim names one doc set of a claim, by key (DocID.key, with no id),
 // and whether its members come back.
-message SetClaim {
+message DocSetClaim {
   DocID set = 1;
 
   // Return the set alone, with its lock and len, and none of its docs. The
@@ -243,7 +243,7 @@ message SetClaim {
 // key. Protocol 2 names the sets in sets, and namespace and key are ignored.
 message DocClaim {
   // Protocol 2.
-  repeated SetClaim sets = 5;
+  repeated DocSetClaim sets = 5;
 
   int64 duration_ms = 4;
 

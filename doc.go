@@ -346,9 +346,9 @@ func DocsIn(sets []*DocSet) []*Doc {
 	return docs
 }
 
-// SetClaim names one doc set of a claim: the docs sharing a primary key in a
+// DocSetClaim names one doc set of a claim: the docs sharing a primary key in a
 // namespace, which may be none. Build one with ClaimKey.
-type SetClaim struct {
+type DocSetClaim struct {
 	Namespace string `json:"namespace"`
 	Key       string `json:"key"`
 	// OmitMembers returns the set alone, with its lock and count, and none
@@ -359,13 +359,13 @@ type SetClaim struct {
 
 // ClaimKey names the doc set with the given namespace and primary key, for
 // ClaimDocs.
-func ClaimKey(ns, key string) *SetClaim {
-	return &SetClaim{Namespace: ns, Key: key}
+func ClaimKey(ns, key string) *DocSetClaim {
+	return &DocSetClaim{Namespace: ns, Key: key}
 }
 
 // WithoutMembers makes the claim of this set return the set alone, without
-// its docs (see SetClaim.OmitMembers).
-func (s *SetClaim) WithoutMembers() *SetClaim {
+// its docs (see DocSetClaim.OmitMembers).
+func (s *DocSetClaim) WithoutMembers() *DocSetClaim {
 	s.OmitMembers = true
 	return s
 }
@@ -379,9 +379,9 @@ func (s *SetClaim) WithoutMembers() *SetClaim {
 //		entroq.ClaimingSetsFor(time.Minute),
 //	)
 type DocClaim struct {
-	Sets     []*SetClaim   `json:"sets"`
-	Claimant string        `json:"claimant"`
-	Duration time.Duration `json:"duration"`
+	Sets     []*DocSetClaim `json:"sets"`
+	Claimant string         `json:"claimant"`
+	Duration time.Duration  `json:"duration"`
 	// At, if set, holds the sets until then instead of for Duration.
 	At time.Time `json:"at"`
 
@@ -394,7 +394,7 @@ type DocClaimArg interface {
 	applyDocClaim(*DocClaim)
 }
 
-func (s *SetClaim) applyDocClaim(c *DocClaim) {
+func (s *DocSetClaim) applyDocClaim(c *DocClaim) {
 	c.Sets = append(c.Sets, s)
 }
 

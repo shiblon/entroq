@@ -57,6 +57,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	protov2 "google.golang.org/protobuf/proto"
 
 	pb "github.com/shiblon/entroq/api"
 )
@@ -562,14 +563,15 @@ var protocolHeaders = metadata.Pairs(
 // protocol the request declares, under which the server reads it. A request
 // that declares none is protocol 1, as every client before the header is. One
 // declaring a protocol this server does not serve is refused, naming what to
-// upgrade. Sending the headers does nothing for a caller not over gRPC; the
-// JSON handler sends them itself.
-func negotiate(ctx context.Context) (int32, error) {
+// upgrade, and so is one carrying fields this server does not know (see
+// checkKnown). Sending the headers does nothing for a caller not over gRPC;
+// the JSON handler sends them itself.
+func negotiate(ctx context.Context, req protov2.Message) (int32, error) {
 	_ = grpc.SetHeader(ctx, protocolHeaders)
 	md, _ := metadata.FromIncomingContext(ctx)
 	vals := md.Get(version.ProtocolHeader)
 	if len(vals) == 0 {
-		return 1, nil
+		return 1, checkKnown(req, 1)
 	}
 	ps, err := version.ParseProtocols(vals[0])
 	if err != nil || len(ps) != 1 {
@@ -584,12 +586,15 @@ func negotiate(ctx context.Context) (int32, error) {
 		return 0, codeErrorf(codes.Unimplemented, "this server serves EntroQ protocols %s, not %d: upgrade %s",
 			version.FormatProtocols(version.ServedProtocols), p, upgrade)
 	}
+	if err := checkKnown(req, p); err != nil {
+		return 0, err
+	}
 	return p, nil
 }
 
 // Claim is the blocking version of TryClaim.
 func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
-	if _, err := negotiate(ctx); err != nil {
+	if _, err := negotiate(ctx, req); err != nil {
 		return nil, err
 	}
 	pollTime := time.Duration(0)
@@ -631,7 +636,7 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 // available to claim. Callers can check for context cancelation codes to know
 // that this has happened, and may opt to immediately re-send the request.
 func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
-	if _, err := negotiate(ctx); err != nil {
+	if _, err := negotiate(ctx, req); err != nil {
 		return nil, err
 	}
 	opts := claimOpts(req)
@@ -674,7 +679,7 @@ func claimOpts(req *pb.ClaimRequest) []entroq.ClaimOpt {
 // reconstruct an entroq.DependencyError, or directly to find out which IDs
 // caused the dependency failure. Code UNKNOWN is returned on other errors.
 func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyResponse, error) {
-	protocol, err := negotiate(ctx)
+	protocol, err := negotiate(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -760,7 +765,7 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 }
 
 func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksResponse, error) {
-	if _, err := negotiate(ctx); err != nil {
+	if _, err := negotiate(ctx, req); err != nil {
 		return nil, err
 	}
 	if err := (&entroq.TasksQuery{Queue: req.Queue, IDs: req.TaskId}).Validate(); err != nil {
@@ -825,7 +830,7 @@ func (s *QSvc) StreamTasks(req *pb.TasksRequest, stream pb.EntroQ_StreamTasksSer
 // a dedicated authz action (distinct from Read on task content). That lands in a
 // follow-up because it also requires an authz-policy/CRD schema change.
 func (s *QSvc) Queues(ctx context.Context, req *pb.QueuesRequest) (*pb.QueuesResponse, error) {
-	if _, err := negotiate(ctx); err != nil {
+	if _, err := negotiate(ctx, req); err != nil {
 		return nil, err
 	}
 	queueMap, err := s.impl.Queues(ctx,
@@ -850,7 +855,7 @@ func (s *QSvc) Queues(ctx context.Context, req *pb.QueuesRequest) (*pb.QueuesRes
 // TODO(listing-authz): currently UNGATED. Same listing capability as Queues;
 // see that method. Gated in the follow-up.
 func (s *QSvc) QueueStats(ctx context.Context, req *pb.QueuesRequest) (*pb.QueuesResponse, error) {
-	if _, err := negotiate(ctx); err != nil {
+	if _, err := negotiate(ctx, req); err != nil {
 		return nil, err
 	}
 	queueMap, err := s.impl.QueueStats(ctx,
@@ -879,7 +884,7 @@ func (s *QSvc) QueueStats(ctx context.Context, req *pb.QueuesRequest) (*pb.Queue
 // Intentionally UNAUTHENTICATED: it is the server clock, carries no queue or
 // task data, and clients need it to reason about arrival times.
 func (s *QSvc) Time(ctx context.Context, req *pb.TimeRequest) (*pb.TimeResponse, error) {
-	if _, err := negotiate(ctx); err != nil {
+	if _, err := negotiate(ctx, req); err != nil {
 		return nil, err
 	}
 	return &pb.TimeResponse{TimeMs: pbconv.ToMS(time.Now().UTC())}, nil
@@ -901,7 +906,7 @@ func depDetails(depErr *entroq.DependencyError) []proto.Message {
 
 // Docs returns a listing of docs matching the given query.
 func (s *QSvc) Docs(ctx context.Context, req *pb.DocsRequest) (*pb.DocsResponse, error) {
-	if _, err := negotiate(ctx); err != nil {
+	if _, err := negotiate(ctx, req); err != nil {
 		return nil, err
 	}
 	q := req.GetQuery()
@@ -951,7 +956,7 @@ func (s *QSvc) Docs(ctx context.Context, req *pb.DocsRequest) (*pb.DocsResponse,
 // dedicated listing action in the follow-up (needs an authz-policy/CRD change).
 // Doc content (Docs) is already gated.
 func (s *QSvc) NamespaceStats(ctx context.Context, req *pb.NamespacesRequest) (*pb.NamespacesResponse, error) {
-	if _, err := negotiate(ctx); err != nil {
+	if _, err := negotiate(ctx, req); err != nil {
 		return nil, err
 	}
 	nsMap, err := s.impl.NamespaceStats(ctx,
@@ -976,7 +981,7 @@ func (s *QSvc) NamespaceStats(ctx context.Context, req *pb.NamespacesRequest) (*
 // Returns a NotFound status with ModifyDep details if any docs are missing or
 // already claimed.
 func (s *QSvc) ClaimDocs(ctx context.Context, req *pb.ClaimDocsRequest) (*pb.ClaimDocsResponse, error) {
-	protocol, err := negotiate(ctx)
+	protocol, err := negotiate(ctx, req)
 	if err != nil {
 		return nil, err
 	}

@@ -48,7 +48,7 @@ func (b *backend) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq
 		claim.AtMs = pbconv.ToMS(cq.At)
 	}
 	for _, s := range cq.Sets {
-		claim.Sets = append(claim.Sets, &pb.SetClaim{
+		claim.Sets = append(claim.Sets, &pb.DocSetClaim{
 			Set:         pbconv.DocSetIDToProto(s.Namespace, s.Key, 0),
 			OmitMembers: s.OmitMembers,
 		})

@@ -490,7 +490,7 @@ components:
                 sets:
                     type: array
                     items:
-                        $ref: '#/components/schemas/SetClaim'
+                        $ref: '#/components/schemas/DocSetClaim'
                     description: Protocol 2.
                 durationMs:
                     type: string
@@ -556,6 +556,20 @@ components:
                     type: integer
                     format: int32
             description: DocID identifies a specific version of a doc.
+        DocSetClaim:
+            type: object
+            properties:
+                set:
+                    $ref: '#/components/schemas/DocID'
+                omitMembers:
+                    type: boolean
+                    description: |-
+                        Return the set alone, with its lock and len, and none of its docs. The
+                         holder can read them later, or insert one it knows is new, without
+                         racing anyone.
+            description: |-
+                DocSetClaim names one doc set of a claim, by key (DocID.key, with no id),
+                 and whether its members come back.
         DocsResponse:
             type: object
             properties:
@@ -697,20 +711,6 @@ components:
                     items:
                         $ref: '#/components/schemas/QueueStats'
             description: QueuesResponse contains the requested list of queue statistics.
-        SetClaim:
-            type: object
-            properties:
-                set:
-                    $ref: '#/components/schemas/DocID'
-                omitMembers:
-                    type: boolean
-                    description: |-
-                        Return the set alone, with its lock and len, and none of its docs. The
-                         holder can read them later, or insert one it knows is new, without
-                         racing anyone.
-            description: |-
-                SetClaim names one doc set of a claim, by key (DocID.key, with no id),
-                 and whether its members come back.
         Status:
             type: object
             properties:

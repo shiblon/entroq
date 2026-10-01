@@ -204,3 +204,37 @@ func TestRequestsDeclareProtocol(t *testing.T) {
 		})
 	}
 }
+
+// TestUnknownJSONFieldsRefused checks that a JSON request with a field the
+// server does not know is refused on both routes, the REST one and the
+// connect one, and nothing is done.
+func TestUnknownJSONFieldsRefused(t *testing.T) {
+	ts, cleanup := newTestServer(t)
+	defer cleanup()
+	for _, tc := range []struct{ name, path, body string }{
+		{"REST, nested", "/api/v0/modify", `{"claimantId": "test", "inserts": [{"queue": "/strict", "bogus": 1}]}`},
+		{"REST, top level", "/api/v0/modify", `{"claimantId": "test", "inserts": [{"queue": "/strict"}], "bogus": true}`},
+		{"connect, nested", "/api.EntroQ/Modify", `{"claimantId": "test", "inserts": [{"queue": "/strict", "bogus": 1}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := http.Post(ts.URL+tc.path, "application/json", strings.NewReader(tc.body))
+			if err != nil {
+				t.Fatalf("post: %v", err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "bogus") {
+				t.Errorf("Unknown field: want 400 naming it, got %d %s", resp.StatusCode, body)
+			}
+		})
+	}
+	resp, err := http.Get(ts.URL + "/api/v0/tasks?queue=/strict")
+	if err != nil {
+		t.Fatalf("tasks: %v", err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if strings.Contains(string(b), `"queue":"/strict"`) {
+		t.Errorf("After the refused requests: want nothing inserted, got %s", b)
+	}
+}
