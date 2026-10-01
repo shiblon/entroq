@@ -13,21 +13,21 @@ import (
 )
 
 type objectIntermediateStore struct {
-	storeName string
-	objects   objectStore
+	desc    storeDescriptor
+	objects objectStore
 }
 
-func newObjectIntermediateStore(name string, objects objectStore) (*objectIntermediateStore, error) {
-	if name == "" {
-		return nil, fmt.Errorf("eqmr intermediate object store: name is required")
+func newObjectIntermediateStore(desc storeDescriptor, objects objectStore) (*objectIntermediateStore, error) {
+	if err := desc.validate(); err != nil {
+		return nil, fmt.Errorf("eqmr intermediate object store: %w", err)
 	}
 	if objects == nil {
-		return nil, fmt.Errorf("eqmr intermediate object store %q: nil object store", name)
+		return nil, fmt.Errorf("eqmr intermediate object store %q: nil object store", desc.Name)
 	}
-	return &objectIntermediateStore{storeName: name, objects: objects}, nil
+	return &objectIntermediateStore{desc: desc, objects: objects}, nil
 }
 
-func (s *objectIntermediateStore) name() string { return s.storeName }
+func (s *objectIntermediateStore) descriptor() storeDescriptor { return s.desc }
 
 type objectIntermediateRunRef struct {
 	Object  json.RawMessage `json:"object"`

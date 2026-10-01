@@ -12,9 +12,10 @@ import (
 )
 
 const (
-	documentIntermediateStoreName = "documents"
-	intermediateRunPrefix         = "run/"
-	documentRunChunkBytes         = 64 << 10
+	documentIntermediateStoreName   = "documents"
+	documentIntermediateStoreDriver = "entroq.documents/1"
+	intermediateRunPrefix           = "run/"
+	documentRunChunkBytes           = 64 << 10
 )
 
 type documentIntermediateStore struct {
@@ -22,7 +23,26 @@ type documentIntermediateStore struct {
 	namespace string
 }
 
-func (c *Controller) intermediateStore() intermediateStore {
+// intermediateStores is the set of stores this process can reach. Only the
+// run's own document store exists so far.
+func (c *Controller) intermediateStores() (intermediateStores, error) {
+	return newIntermediateStores(c.documentStore())
+}
+
+func (c *Controller) resolveStore(d storeDescriptor) (intermediateStore, error) {
+	stores, err := c.intermediateStores()
+	if err != nil {
+		return nil, err
+	}
+	return stores.resolve(d)
+}
+
+// defaultStore is the store Setup stamps on a new run's map tasks.
+func (c *Controller) defaultStore() storeDescriptor {
+	return c.documentStore().descriptor()
+}
+
+func (c *Controller) documentStore() *documentIntermediateStore {
 	return &documentIntermediateStore{client: c.client, namespace: c.DocNS()}
 }
 
@@ -37,7 +57,15 @@ type documentRunChunkRef struct {
 	Version int32  `json:"version"`
 }
 
-func (s *documentIntermediateStore) name() string { return documentIntermediateStoreName }
+// descriptor identifies the store by the run's document namespace, so a run
+// pointer cannot be resolved against another run's documents.
+func (s *documentIntermediateStore) descriptor() storeDescriptor {
+	return storeDescriptor{
+		Name:     documentIntermediateStoreName,
+		Driver:   documentIntermediateStoreDriver,
+		Identity: s.namespace,
+	}
+}
 
 func (s *documentIntermediateStore) put(ctx context.Context, records []intermediateRecord) (json.RawMessage, error) {
 	if len(records) == 0 {

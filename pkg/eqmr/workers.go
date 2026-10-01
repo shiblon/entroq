@@ -63,6 +63,10 @@ func (c *Controller) Setup(ctx context.Context, input []*KV) error {
 		return err
 	}
 	splits := splitInput(input, c.cfg.MapShards)
+	store := c.defaultStore()
+	if err := store.validate(); err != nil {
+		return fmt.Errorf("eqmr setup: %w", err)
+	}
 
 	// Empty splits are never written, so the number of map units is not
 	// necessarily MapShards. Progress reporting needs the real total, and it is
@@ -112,6 +116,7 @@ func (c *Controller) Setup(ctx context.Context, input []*KV) error {
 				NS:           c.DocNS(),
 				Key:          key,
 				ReduceShards: c.cfg.ReduceShards,
+				Store:        store,
 			})),
 		)
 		if len(args) >= batchSize {
@@ -194,7 +199,6 @@ func (c *Controller) MapperWorker(mapFn Mapper, opts ...MapperOption) *worker.Wo
 		opt(o)
 	}
 
-	store := c.intermediateStore()
 	return worker.New[docRef](c.client,
 		worker.WithErrQMap[docRef](c.errQMap),
 		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, ref docRef, _ []*entroq.Doc) (*worker.Result, error) {
@@ -229,6 +233,17 @@ func (c *Controller) MapperWorker(mapFn Mapper, opts ...MapperOption) *worker.Wo
 			// run it is serving.
 			if ref.ReduceShards <= 0 {
 				return nil, worker.MoveErrorf("map task for %q carries no partition count", ref.Key)
+			}
+			// The store comes from the task for the same reason. A missing or
+			// malformed one is a data error, but a store this process cannot
+			// reach is a deployment error: exit, and leave the task to a worker
+			// that can serve it.
+			if err := ref.Store.validate(); err != nil {
+				return nil, worker.MoveErrorf("map task for %q: %v", ref.Key, err)
+			}
+			store, err := c.resolveStore(ref.Store)
+			if err != nil {
+				return nil, fmt.Errorf("map task for %q: %w", ref.Key, err)
 			}
 			sink := newIntermediateSink(store, ref.ReduceShards, o.intermediateRunBytes, o.combiner)
 			if err := runMapper(ctx, mapFn, split, sink); err != nil {
@@ -334,7 +349,6 @@ func runMapper(ctx context.Context, mapFn Mapper, split []*KV, sink *intermediat
 // sorted runs, runs reduceFn once per distinct key, and commits the pointer
 // deletions together with the partition's result doc.
 func (c *Controller) ReducerWorker(reduceFn Reducer) *worker.Worker[reduceClaim] {
-	store := c.intermediateStore()
 	return worker.New[reduceClaim](c.client,
 		worker.WithErrQMap[reduceClaim](c.errQMap),
 		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, rc reduceClaim, _ []*entroq.Doc) (*worker.Result, error) {
@@ -383,7 +397,11 @@ func (c *Controller) ReducerWorker(reduceFn Reducer) *worker.Worker[reduceClaim]
 				runs = append(runs, run)
 			}
 
-			merged, err := openMergedIntermediate(ctx, store, runs)
+			stores, err := c.intermediateStores()
+			if err != nil {
+				return nil, err
+			}
+			merged, err := openMergedIntermediate(ctx, stores, runs)
 			if err != nil {
 				return nil, fmt.Errorf("open partition %d: %w", rc.Partition, err)
 			}

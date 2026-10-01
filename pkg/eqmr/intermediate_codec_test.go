@@ -103,7 +103,11 @@ func TestObjectIntermediateStoreOverHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new HTTP store: %v", err)
 	}
-	store, err := newObjectIntermediateStore("test-http", objects)
+	store, err := newObjectIntermediateStore(storeDescriptor{
+		Name:     "test-http",
+		Driver:   "test-http/1",
+		Identity: server.URL,
+	}, objects)
 	if err != nil {
 		t.Fatalf("new intermediate store: %v", err)
 	}

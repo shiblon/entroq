@@ -33,7 +33,9 @@ func (r *testRunReader) Next(context.Context) (intermediateRecord, error) {
 }
 func (r *testRunReader) Close() error { return nil }
 
-func (s *testRunStore) name() string { return "test" }
+func (s *testRunStore) descriptor() storeDescriptor {
+	return storeDescriptor{Name: "test", Driver: "test/1", Identity: "memory"}
+}
 func (s *testRunStore) put(_ context.Context, records []intermediateRecord) (json.RawMessage, error) {
 	id := len(s.runs)
 	s.runs = append(s.runs, append([]intermediateRecord(nil), records...))
@@ -153,11 +155,15 @@ func TestReduceIntermediateDrainsUnreadValues(t *testing.T) {
 		{{Primary: "alpha", Value: "1"}, {Primary: "beta", Value: "2"}},
 		{{Primary: "alpha", Value: "0"}, {Primary: "beta", Value: "3"}},
 	}}
-	runs := []intermediateRun{
-		{Store: store.name(), Ref: json.RawMessage("0")},
-		{Store: store.name(), Ref: json.RawMessage("1")},
+	stores, err := newIntermediateStores(store)
+	if err != nil {
+		t.Fatalf("new stores: %v", err)
 	}
-	merged, err := openMergedIntermediate(ctx, store, runs)
+	runs := []intermediateRun{
+		{Store: store.descriptor(), Ref: json.RawMessage("0")},
+		{Store: store.descriptor(), Ref: json.RawMessage("1")},
+	}
+	merged, err := openMergedIntermediate(ctx, stores, runs)
 	if err != nil {
 		t.Fatalf("open merge: %v", err)
 	}

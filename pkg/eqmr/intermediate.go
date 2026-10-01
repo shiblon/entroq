@@ -24,10 +24,11 @@ type intermediateRecord struct {
 }
 
 // intermediateRun is the durable pointer published by a mapper. Ref is opaque
-// to the pipeline and interpreted only by the named store.
+// to the pipeline and interpreted only by the store Store describes, so each
+// pointer names its store completely and runs from different stores can mix.
 type intermediateRun struct {
 	Partition int             `json:"partition"`
-	Store     string          `json:"store"`
+	Store     storeDescriptor `json:"store"`
 	Ref       json.RawMessage `json:"ref"`
 }
 
@@ -41,7 +42,7 @@ type intermediateReader interface {
 // complete bounded run; readers expose records one at a time so file-backed
 // stores need not materialize the run when they are added.
 type intermediateStore interface {
-	name() string
+	descriptor() storeDescriptor
 	put(context.Context, []intermediateRecord) (json.RawMessage, error)
 	open(context.Context, json.RawMessage) (intermediateReader, error)
 	delete(context.Context, json.RawMessage) error
@@ -140,7 +141,7 @@ func (s *intermediateSink) flush(ctx context.Context, partition int) error {
 		}
 		s.runs = append(s.runs, intermediateRun{
 			Partition: partition,
-			Store:     s.store.name(),
+			Store:     s.store.descriptor(),
 			Ref:       ref,
 		})
 	}
@@ -272,12 +273,13 @@ func (h *intermediateHeap) Pop() any {
 	return x
 }
 
-func openMergedIntermediate(ctx context.Context, store intermediateStore, runs []intermediateRun) (*mergedIntermediate, error) {
+func openMergedIntermediate(ctx context.Context, stores intermediateStores, runs []intermediateRun) (*mergedIntermediate, error) {
 	merged := new(mergedIntermediate)
 	for i, run := range runs {
-		if run.Store != store.name() {
+		store, err := stores.resolve(run.Store)
+		if err != nil {
 			return nil, errors.Join(
-				fmt.Errorf("open intermediate run: store %q is not configured store %q", run.Store, store.name()),
+				fmt.Errorf("open intermediate run %d: %w", i, err),
 				merged.Close(),
 			)
 		}

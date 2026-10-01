@@ -397,6 +397,10 @@ type docRef struct {
 	// to, so mapper processes need no configuration of their own and no two
 	// can disagree about it.
 	ReduceShards int `json:"reduce_shards"`
+	// Store is the intermediate store for the run, also stamped by Setup, so
+	// every mapper writes where the run's reducers will read. A process that
+	// cannot resolve it exits rather than write somewhere else.
+	Store storeDescriptor `json:"store,omitzero"`
 }
 
 // asQuery reads the doc group by primary key without claiming it. Reading

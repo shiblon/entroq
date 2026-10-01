@@ -23,8 +23,10 @@ service.
   canonical framed-run codec, and object-backed intermediate-store adapter.
   Idempotent put, open, and delete stream over locally selected HTTP transport
   such as stdin/stdout or a Unix socket, while xxHash64 footers detect corrupt
-  or partial runs. Process launching and controller selection remain follow-up
-  work.
+  or partial runs. Map tasks and run pointers record a credential-free store
+  descriptor (logical name, versioned driver, store identity), and a worker
+  refuses to read or write a run through a different store that shares its
+  name. Process launching and controller selection remain follow-up work.
 - **Readiness loops for SQLite and Redis.** Both backends now wake claims for
   tasks that become available with time, every `WithReadinessInterval`
   (default 5s; `--readiness_interval` on `eqsqlite serve` and `eqredis serve`),
