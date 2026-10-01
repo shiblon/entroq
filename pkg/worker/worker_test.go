@@ -540,3 +540,74 @@ func TestTakeDocsSentinel(t *testing.T) {
 		t.Errorf("Run: want it to go on after the move, got %v", err)
 	}
 }
+
+// TestDocContentionDelay checks that a task whose doc set someone else holds
+// is retried after the contention delay, with up to a quarter more, and that
+// the retry counts as an attempt.
+func TestDocContentionDelay(t *testing.T) {
+	const delay = 10 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, err := entroq.New(ctx, eqmem.Opener())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer client.Close()
+	if _, err := client.ClaimDocs(ctx, entroq.ClaimKey("ns", "busy"), entroq.ClaimingSetsAs("holder"), entroq.ClaimingSetsFor(time.Hour)); err != nil {
+		t.Fatalf("Holder claim: %v", err)
+	}
+	if _, err := client.Modify(ctx, entroq.InsertingInto("q")); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	w := New[string](client,
+		WithTakeDocs(func(context.Context, *entroq.Task, string) (*TakeResult, error) {
+			return Take(entroq.ClaimKey("ns", "busy")), nil
+		}),
+		WithDoWork(func(context.Context, *entroq.Task, string, []*entroq.DocSet) error {
+			t.Error("DoWork ran without its doc set")
+			return nil
+		}),
+	)
+	runCtx, runCancel := context.WithCancel(ctx)
+	errCh := make(chan error, 1)
+	before := time.Now()
+	go func() { errCh <- w.Run(runCtx, Watching("q"), WithDocContentionDelay(delay)) }()
+
+	var task *entroq.Task
+	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		tasks, err := client.Tasks(ctx, "q")
+		if err != nil {
+			t.Fatalf("Tasks: %v", err)
+		}
+		if len(tasks) == 1 && tasks[0].Attempt == 1 {
+			task = tasks[0]
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Task not retried after contention: %v", tasks)
+		}
+	}
+	runCancel()
+	if err := <-errCh; err != nil {
+		t.Errorf("Run: %v", err)
+	}
+	if wait := task.At.Sub(before); wait < delay || wait > delay*5/4+time.Second {
+		t.Errorf("Retry after contention: want it ready in %v to %v, got %v", delay, delay*5/4, wait)
+	}
+}
+
+func TestContentionDelayJitter(t *testing.T) {
+	ro := &runOpt{baseRetryDelay: time.Second}
+	for range 100 {
+		if d := ro.contentionDelay(); d < time.Second || d > time.Second*5/4 {
+			t.Fatalf("Default contention delay: want 1s to 1.25s, got %v", d)
+		}
+	}
+	ro.docContentionDelay = time.Minute
+	for range 100 {
+		if d := ro.contentionDelay(); d < time.Minute || d > time.Minute*5/4 {
+			t.Fatalf("Contention delay: want 1m to 1m15s, got %v", d)
+		}
+	}
+}

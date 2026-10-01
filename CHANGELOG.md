@@ -45,6 +45,11 @@ runs, so plan a short maintenance window on large doc tables.
   task to the error queue without running the command. The default 0 means no
   maximum, matching `worker.WithMaxClaims`. Tasks the worker moves itself now
   honor `--error-queue` too.
+- **`worker.WithDocContentionDelay`.** Sets the delay before a task is retried
+  because a doc set it needs is held by someone else, which used the base
+  retry delay and still does by default. Up to a quarter more is added at
+  random, so tasks that lost to the same holder do not come back at once and
+  collide again. The retry still counts as an attempt.
 - **`worker.Shutdown`.** Stops a worker gracefully, like
   `http.Server.Shutdown`: every `Run` stops claiming at once, finishes and
   commits the task it holds, and returns nil. If Shutdown's context ends first,

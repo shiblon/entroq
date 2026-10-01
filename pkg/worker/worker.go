@@ -36,6 +36,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"sort"
 	"strings"
 	"sync"
@@ -953,7 +954,7 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 		if _, ok := entroq.AsDependency(err); ok {
 			outcome = outcomeRetried
 			errQ := w.ErrorQueueFor(task.Queue)
-			if _, herr := w.handleSentinelErrors(ctx, RetryErrorf("doc contention"), task, nil, errQ, opts); herr != nil {
+			if _, herr := w.handleSentinelErrors(ctx, RetryErrorf("doc contention").After(opts.contentionDelay()), task, nil, errQ, opts); herr != nil {
 				return fmt.Errorf("handle sentinel error: %w", herr)
 			}
 			return nil
@@ -1075,11 +1076,12 @@ func sentinelOutcome(err error) string {
 type RunOption func(*runOpt)
 
 type runOpt struct {
-	qs             []string
-	baseRetryDelay time.Duration
-	maxAttempts    int32
-	maxClaims      int32
-	lease          time.Duration
+	qs                 []string
+	baseRetryDelay     time.Duration
+	docContentionDelay time.Duration // 0: baseRetryDelay
+	maxAttempts        int32
+	maxClaims          int32
+	lease              time.Duration
 }
 
 // Watching specifies the queues Run will watch.
@@ -1130,6 +1132,33 @@ func WithBaseRetryDelay(d time.Duration) RunOption {
 	return func(ro *runOpt) {
 		ro.baseRetryDelay = d
 	}
+}
+
+// WithDocContentionDelay sets the delay before a task is retried because a
+// doc set it needs is held by someone else; by default it is the base retry
+// delay. Up to a quarter more is added at random, so tasks that lost to the
+// same holder do not all come back at once and collide again. The retry
+// counts as an attempt: contention is the task's intent failing, which
+// should be rare, and repeated contention points at a design that lets many
+// owners want the same set.
+func WithDocContentionDelay(d time.Duration) RunOption {
+	return func(ro *runOpt) {
+		ro.docContentionDelay = d
+	}
+}
+
+// contentionDelay returns the delay before a retry after doc contention:
+// the configured delay, or the base retry delay, plus up to a quarter more
+// at random.
+func (ro *runOpt) contentionDelay() time.Duration {
+	d := ro.docContentionDelay
+	if d <= 0 {
+		d = ro.baseRetryDelay
+	}
+	if d <= 0 {
+		return d
+	}
+	return d + rand.N(d/4+1)
 }
 
 func isSentinelError(err error) bool {
