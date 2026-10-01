@@ -1122,11 +1122,11 @@ func (b *EQPG) Docs(ctx context.Context, rq *entroq.DocQuery) (_ []*entroq.Doc, 
 	return scanDocRows(rows)
 }
 
-// ClaimDocs claims the set of docs sharing the given primary key in the
-// namespace and returns its members, which may be none: a set can be claimed
-// before it has docs. It returns a DependencyError listing the members while
-// someone else holds the set.
-func (b *EQPG) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) (set *entroq.DocSet, err error) {
+// ClaimDocs claims every doc set cq names, all or none, in one transaction
+// (see claimDocs). A set can be claimed before it has docs. It returns a
+// DependencyError naming the held sets, and their members, while someone else
+// holds any of them.
+func (b *EQPG) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) (sets []*entroq.DocSet, err error) {
 	defer func() { err = interrupted(ctx, err) }()
 	if err := validate.DocClaim(cq); err != nil {
 		return nil, fmt.Errorf("claim docs: %w", err)
@@ -1141,7 +1141,7 @@ func (b *EQPG) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) (set *entroq.
 			return
 		}
 		if cmErr := tx.Commit(); cmErr != nil {
-			set, err = nil, fmt.Errorf("pg claim docs commit: %w", cmErr)
+			sets, err = nil, fmt.Errorf("pg claim docs commit: %w", cmErr)
 		}
 	}()
 	return claimDocs(ctx, tx, cq)

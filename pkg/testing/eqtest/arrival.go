@@ -33,7 +33,7 @@ func UpdateArrival(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPr
 		if err != nil {
 			t.Fatalf("Claim task: %v", err)
 		}
-		set, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, key).For(time.Minute))
+		set, err := oneSet(client.ClaimDocs(ctx, entroq.ClaimKey(ns, key), entroq.ClaimingSetsFor(time.Minute)))
 		if err != nil {
 			t.Fatalf("Claim set: %v", err)
 		}
@@ -67,7 +67,7 @@ func UpdateArrival(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPr
 		if _, err := client.Modify(ctx, rt.Delete(), set.Docs[0].Delete()); !entroq.IsDependency(err) {
 			t.Errorf("Delete a doc at its version before renewal: want a dependency error, got %v", err)
 		}
-		if _, err := client.ClaimDocs(ctx, &entroq.DocClaim{Namespace: ns, Key: "renew", Claimant: intruder, Duration: time.Minute}); !entroq.IsDependency(err) {
+		if _, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "renew"), entroq.ClaimingSetsAs(intruder), entroq.ClaimingSetsFor(time.Minute)); !entroq.IsDependency(err) {
 			t.Errorf("Intruder claim of a renewed set: want a dependency error, got %v", err)
 		}
 	})
@@ -87,7 +87,7 @@ func UpdateArrival(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPr
 		if got, err := client.TryClaim(ctx, entroq.From(queue("release"))); err != nil || got == nil || got.ID != task.ID {
 			t.Errorf("Claim after release: want task %s, got %v, %v", task.ID, got, err)
 		}
-		if _, err := client.ClaimDocs(ctx, &entroq.DocClaim{Namespace: ns, Key: "release", Claimant: intruder, Duration: time.Minute}); err != nil {
+		if _, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "release"), entroq.ClaimingSetsAs(intruder), entroq.ClaimingSetsFor(time.Minute)); err != nil {
 			t.Errorf("Intruder claim of a released set: %v", err)
 		}
 	})
@@ -121,7 +121,7 @@ func UpdateArrival(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPr
 	})
 
 	t.Run("an empty set renews", func(t *testing.T) {
-		set, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "empty").For(time.Minute))
+		set, err := oneSet(client.ClaimDocs(ctx, entroq.ClaimKey(ns, "empty"), entroq.ClaimingSetsFor(time.Minute)))
 		if err != nil {
 			t.Fatalf("Claim empty set: %v", err)
 		}

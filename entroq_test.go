@@ -395,11 +395,11 @@ func Example_docAtomicTaskCommit() {
 	}
 
 	// Claim the state doc's set for exclusive modification.
-	claimed, err := eq.ClaimDocs(ctx, entroq.ClaimKey("state", stateDoc.Key).For(5*time.Second))
+	claimed, err := eq.ClaimDocs(ctx, entroq.ClaimKey("state", stateDoc.Key), entroq.ClaimingSetsFor(5*time.Second))
 	if err != nil {
 		log.Fatalf("claim doc: %v", err)
 	}
-	counter := claimed.Docs[0]
+	counter := claimed[0].Docs[0]
 
 	var count int
 	if err := json.Unmarshal(counter.Content, &count); err != nil {
@@ -456,11 +456,11 @@ func Example_docClaimContention() {
 	const key = "resource"
 
 	// A key with no docs is an empty set, claimed like any other.
-	empty, err := eq.ClaimDocs(ctx, entroq.ClaimKey(ns, "no-such-key").For(time.Second))
+	empty, err := eq.ClaimDocs(ctx, entroq.ClaimKey(ns, "no-such-key"), entroq.ClaimingSetsFor(time.Second))
 	if err != nil {
 		log.Fatalf("empty set claim: %v", err)
 	}
-	fmt.Printf("empty set: %d docs\n", len(empty.Docs))
+	fmt.Printf("empty set: %d docs\n", len(empty[0].Docs))
 
 	// Create two docs sharing the same primary key.
 	if _, err := eq.Modify(ctx,
@@ -471,21 +471,16 @@ func Example_docClaimContention() {
 	}
 
 	// First claimant acquires both docs atomically.
-	set, err := eq.ClaimDocs(ctx, entroq.ClaimKey(ns, key))
+	sets, err := eq.ClaimDocs(ctx, entroq.ClaimKey(ns, key))
 	if err != nil {
 		log.Fatalf("first claim: %v", err)
 	}
-	fmt.Printf("first claim: %d docs\n", len(set.Docs))
+	fmt.Printf("first claim: %d docs\n", len(sets[0].Docs))
 
 	// A second claimant is blocked while the first holds the lock.
 	// The lock expires automatically after Duration; use doc.Change() to
 	// release it early (which increments the version).
-	_, err = eq.ClaimDocs(ctx, &entroq.DocClaim{
-		Namespace: ns,
-		Claimant:  "other-claimant",
-		Key:       key,
-		Duration:  entroq.DefaultClaimDuration,
-	})
+	_, err = eq.ClaimDocs(ctx, entroq.ClaimKey(ns, key), entroq.ClaimingSetsAs("other-claimant"))
 	fmt.Printf("contention: IsDependency=%v\n", entroq.IsDependency(err))
 
 	// Output:

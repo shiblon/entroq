@@ -455,13 +455,11 @@ func (r *Receiver) runResponseWorkers(ctx context.Context, start sessionStart, s
 			// Letting both concurrent workers claim it under the same claimant
 			// ID would remove mutual exclusion and create version races between
 			// doc renewals.
-			worker.WithTakeDocs(func(_ context.Context, _ *entroq.Task, ack Response) ([]*entroq.DocClaim, error) {
+			worker.WithTakeDocs(func(_ context.Context, _ *entroq.Task, ack Response) (*worker.TakeResult, error) {
 				if ack.Session != start.session {
 					return nil, worker.FatalErrorf("session mismatch: ACK %q, worker %q", ack.Session, start.session)
 				}
-				return []*entroq.DocClaim{
-					entroq.ClaimKey(start.receiverDocNS, start.session),
-				}, nil
+				return worker.Take(entroq.ClaimKey(start.receiverDocNS, start.session)), nil
 			}),
 			worker.WithDoModify(r.responseHandler(start, state, socket, complete)),
 			worker.WithMeterProvider[Response](r.cfg.mp),

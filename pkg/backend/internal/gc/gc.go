@@ -126,18 +126,18 @@ func CollectDocsOnce(ctx context.Context, backend entroq.Backend, batch int, rep
 		if collected >= batch {
 			break
 		}
-		group, err := backend.ClaimDocs(ctx, &entroq.DocClaim{
-			Namespace: candidate.namespace,
-			Key:       candidate.key,
-			Claimant:  claimant,
-			Duration:  entroq.DefaultClaimDuration,
-		})
+		sets, err := backend.ClaimDocs(ctx, entroq.NewDocClaim(
+			entroq.ClaimKey(candidate.namespace, candidate.key),
+			entroq.ClaimingSetsAs(claimant),
+			entroq.ClaimingSetsFor(entroq.DefaultClaimDuration),
+		))
 		if err != nil {
 			if _, ok := entroq.AsDependency(err); ok {
 				continue
 			}
 			return collected, fmt.Errorf("doc gc claim %q/%q: %w", candidate.namespace, candidate.key, err)
 		}
+		group := sets[0]
 		if len(group.Docs) == 0 {
 			continue
 		}

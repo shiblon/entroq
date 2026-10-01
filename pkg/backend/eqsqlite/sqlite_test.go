@@ -57,6 +57,7 @@ func TestBackendContract(t *testing.T) {
 		{"WorkerHoldsEmptyGroup", eqtest.WorkerHoldsEmptyGroup},
 		{"WorkerReleasesSets", eqtest.WorkerReleasesSets},
 		{"ClaimsReset", eqtest.ClaimsReset},
+		{"DocClaimSets", eqtest.DocClaimSets},
 		{"InvalidRequests", eqtest.InvalidRequests},
 		{"TasksClaimantFilter", eqtest.TasksClaimantFilter},
 		{"QueueStatsCounts", eqtest.QueueStatsCounts},

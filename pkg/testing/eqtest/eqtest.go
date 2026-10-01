@@ -232,10 +232,22 @@ func uniqueTaskIDOfLen(n int) string {
 	return strings.Repeat("a", n-16) + entroq.GenHex16()
 }
 
-// docsOf returns the members of a claimed doc set, or the claim's error.
-func docsOf(g *entroq.DocSet, err error) ([]*entroq.Doc, error) {
+// docsOf returns the members of the claimed doc sets, or the claim's error.
+func docsOf(sets []*entroq.DocSet, err error) ([]*entroq.Doc, error) {
 	if err != nil {
 		return nil, err
 	}
-	return g.Docs, nil
+	return entroq.DocsIn(sets), nil
+}
+
+// oneSet returns the one doc set a claim of one set returns, or the claim's
+// error.
+func oneSet(sets []*entroq.DocSet, err error) (*entroq.DocSet, error) {
+	if err != nil {
+		return nil, err
+	}
+	if len(sets) != 1 {
+		return nil, fmt.Errorf("claim of one doc set returned %d", len(sets))
+	}
+	return sets[0], nil
 }

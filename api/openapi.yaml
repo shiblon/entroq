@@ -392,15 +392,16 @@ components:
                     type: array
                     items:
                         $ref: '#/components/schemas/Doc'
-                    description: Contains all docs within any set, with content.
+                    description: |-
+                        The members of every claimed set not claimed with omit_members, with
+                         content.
                 sets:
                     type: array
                     items:
                         $ref: '#/components/schemas/Doc'
                     description: |-
-                        Contains all doc set top-level values.
+                        Every claimed set, as a Doc with no id or content, in the order named.
                          Not present for servers on protocol 1.
-                         Contains no content.
             description: |-
                 ClaimDocsResponse contains the docs claimed by a ClaimDocs call, and the
                  sets they belong to. All sets are present, but not all sets have docs.
@@ -489,24 +490,29 @@ components:
                 sets:
                     type: array
                     items:
-                        $ref: '#/components/schemas/DocID'
-                    description: Use for protocol 2.
+                        $ref: '#/components/schemas/SetClaim'
+                    description: Protocol 2.
                 durationMs:
                     type: string
+                atMs:
+                    type: string
+                    description: |-
+                        Protocol 2: hold the sets until this time instead of for duration_ms,
+                         for example to expire in step with a task. It must be in the future; 0
+                         means unset.
                 claimant:
                     type: string
                 namespace:
                     type: string
-                    description: Use for protocol 1.
+                    description: Protocol 1.
                 key:
                     type: string
             description: |-
-                DocClaim describes an atomic all-or-nothing claim of docs in a namespace.
-                 In protocol 1, all docs sharing the given key are claimed together. For
-                 protocol 2, only namespace and primary keys are specified and it will try to
-                 claim all specified document sets by namespace and primary key.
+                DocClaim describes an atomic all-or-nothing claim of doc sets: every set
+                 named is claimed, or none is.
 
-                 If sets are specified, namespace and key are ignored.
+                 In protocol 1, namespace and key name the one set, the docs sharing that
+                 key. Protocol 2 names the sets in sets, and namespace and key are ignored.
         DocData:
             type: object
             properties:
@@ -691,6 +697,20 @@ components:
                     items:
                         $ref: '#/components/schemas/QueueStats'
             description: QueuesResponse contains the requested list of queue statistics.
+        SetClaim:
+            type: object
+            properties:
+                set:
+                    $ref: '#/components/schemas/DocID'
+                omitMembers:
+                    type: boolean
+                    description: |-
+                        Return the set alone, with its lock and len, and none of its docs. The
+                         holder can read them later, or insert one it knows is new, without
+                         racing anyone.
+            description: |-
+                SetClaim names one doc set of a claim, by key (DocID.key, with no id),
+                 and whether its members come back.
         Status:
             type: object
             properties:

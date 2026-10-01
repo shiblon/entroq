@@ -152,11 +152,23 @@ export interface DocQuery {
 /**
  * DocClaim describes an atomic all-or-nothing claim of docs sharing a key.
  */
+/**
+ * SetClaim names one doc set of a claim, by key (protocol 2).
+ */
+export interface SetClaim {
+  set: DocID;
+  omitMembers?: boolean; // return the set alone, without its docs
+}
+
+/**
+ * DocClaim claims doc sets, all of them or none.
+ */
 export interface DocClaim {
-  sets?: DocID[];     // protocol 2: the doc sets to claim, by key
-  namespace?: string; // protocol 1
-  key?: string;       // protocol 1
+  sets?: SetClaim[];   // protocol 2: the doc sets to claim
+  namespace?: string;  // protocol 1
+  key?: string;        // protocol 1
   durationMs?: string; // int64 -> string; defaults to DefaultClaimDuration
+  atMs?: string;       // protocol 2: hold until this time instead; future only
   claimant?: string;   // normally auto-set by the client
 }
 
@@ -182,9 +194,10 @@ export interface ClaimDocsRequest {
 }
 
 /**
- * ClaimDocsResponse contains the claimed docs, and every claimed doc set as a
- * Doc with no id or content, present even when the set has no docs. Servers
- * at protocol 1 omit the sets.
+ * ClaimDocsResponse contains the members of every set not claimed with
+ * omitMembers, and every claimed doc set, in the order named, as a Doc with no
+ * id or content, present even when the set has no docs. Servers at protocol 1
+ * omit the sets.
  */
 export interface ClaimDocsResponse {
   docs: Doc[];

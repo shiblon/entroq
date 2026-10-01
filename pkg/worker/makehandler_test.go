@@ -21,7 +21,7 @@ type countingHandler struct {
 	uses     int
 }
 
-func (h *countingHandler) TakeDocs(context.Context, *entroq.Task, string) ([]*entroq.DocClaim, error) {
+func (h *countingHandler) TakeDocs(context.Context, *entroq.Task, string) (*TakeResult, error) {
 	return nil, nil
 }
 

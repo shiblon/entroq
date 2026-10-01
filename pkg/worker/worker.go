@@ -81,9 +81,9 @@ type Handler[T any] interface {
 	//
 	// Note: renewal of the task and its sets begins once TakeDocs returns and
 	// the sets are claimed, so a slow TakeDocs spends the task's first lease. In
-	// natural use, where TakeDocs just returns a list of DocClaim specs without
+	// natural use, where TakeDocs just returns Take of some ClaimKey sets without
 	// doing I/O, this is negligible.
-	TakeDocs(context.Context, *entroq.Task, T) ([]*entroq.DocClaim, error)
+	TakeDocs(context.Context, *entroq.Task, T) (*TakeResult, error)
 
 	// DoWork is called by Worker.Run for each claimed task. The task and its
 	// doc sets, empty ones included, are renewed together in the background
@@ -225,19 +225,38 @@ func (r *Result) OnDependency(fn func(context.Context, *entroq.DependencyError) 
 	return r
 }
 
-// TakeRun[T] is a function that inspects a newly claimed task and
-// declares what resources the worker needs before doing work. Returning a nil
-// *ResourceRequest (or not setting WithTakeDocs) skips the acquisition phase.
+// TakeRun[T] is a function that inspects a newly claimed task and names the
+// doc sets the worker must hold to do it, with Take, as a DoModifyRun names
+// its commit with Modify:
 //
-// Note that if you want to specify multiple document claims (multiple primary
-// keys, essentially), you can get into a situation where you fail to claim
-// them all, leaving those whose claim succeeded in a waiting state until the
-// lease expires.
+//	func(ctx context.Context, task *entroq.Task, v Order) (*worker.TakeResult, error) {
+//		return worker.Take(
+//			entroq.ClaimKey("orders", v.Customer),
+//			entroq.ClaimKey("stock", v.SKU).WithoutMembers(),
+//		), nil
+//	}
 //
-// The proper recipe for taking documents safely is to claim them only if they
-// must be claimed in order to carry out the task referenced in the parameters.
-// Then it makes sense to hold a full exclusive lock on them all.
-type TakeRun[T any] func(context.Context, *entroq.Task, T) ([]*entroq.DocClaim, error)
+// Returning nil, or naming no sets (or not setting WithTakeDocs), skips the
+// acquisition phase. The worker claims every set at once, all or none, as its
+// own claimant and until the task's own arrival time, so the task and its
+// sets expire together; a set someone else holds leaves nothing claimed, and
+// the task is retried with backoff.
+type TakeRun[T any] func(context.Context, *entroq.Task, T) (*TakeResult, error)
+
+// TakeResult is what a TakeRun returns: the doc sets the worker claims for
+// the task before work begins. Build it with Take.
+type TakeResult struct {
+	args []entroq.DocClaimArg
+}
+
+// Take begins a TakeResult that claims the doc sets args name, built with
+// entroq.ClaimKey. The worker owns the claim's lease and claimant, as it owns
+// the versions of a Modify result: it claims the sets as itself, until the
+// task's own arrival time, and ignores any lease (entroq.ClaimingSetsFor,
+// entroq.ClaimingSetsUntil) or claimant (entroq.ClaimingSetsAs) in args.
+func Take(args ...entroq.DocClaimArg) *TakeResult {
+	return &TakeResult{args: args}
+}
 
 // DoRun[T] is the WithDoWork function shape: the work phase. It is given the
 // task, its typed value, and any claimed doc sets, but no client -- it runs under
@@ -258,7 +277,7 @@ type funcHandler[T any] struct {
 }
 
 // TakeDocs runs the specified take function if set, otherwise returns nil.
-func (h *funcHandler[T]) TakeDocs(ctx context.Context, task *entroq.Task, value T) ([]*entroq.DocClaim, error) {
+func (h *funcHandler[T]) TakeDocs(ctx context.Context, task *entroq.Task, value T) (*TakeResult, error) {
 	if h.take == nil {
 		return nil, nil
 	}
@@ -298,7 +317,7 @@ type doModifyHandler[T any] struct {
 	released    bool // the commit only made the task arrive
 }
 
-func (h *doModifyHandler[T]) TakeDocs(ctx context.Context, task *entroq.Task, val T) ([]*entroq.DocClaim, error) {
+func (h *doModifyHandler[T]) TakeDocs(ctx context.Context, task *entroq.Task, val T) (*TakeResult, error) {
 	h.initialTask = task
 	if h.take == nil {
 		return nil, nil
@@ -722,7 +741,8 @@ func WithDoModify[T any](f DoModifyRun[T]) Option[T] {
 
 // WithTakeDocs sets the doc acquisition function. Before work begins, this
 // function is called with the claimed task to declare which doc sets are
-// needed. A set claimed by another worker causes a backoff-and-retry. A
+// needed, with Take (see TakeRun). The worker claims them all at once, and a
+// set claimed by another worker causes a backoff-and-retry with none held. A
 // set may have no docs yet; the handler decides what an empty set means,
 // and can return a MoveError if it should have had some.
 //
@@ -829,36 +849,39 @@ func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, ta
 //
 // Returns a *entroq.DependencyError while another claimant holds a set; the
 // caller retries the task with backoff.
-func acquireDocs[T any](ctx context.Context, eqc *entroq.EntroQ, task *entroq.Task, value T, lease time.Duration, take TakeRun[T]) ([]*entroq.DocSet, error) {
-	sets := []*entroq.DocSet{}
+func acquireDocs[T any](ctx context.Context, eqc *entroq.EntroQ, task *entroq.Task, value T, take TakeRun[T]) ([]*entroq.DocSet, error) {
 	if take == nil {
-		return sets, nil
+		return []*entroq.DocSet{}, nil
 	}
-	req, err := take(ctx, task, value)
+	tr, err := take(ctx, task, value)
 	if err != nil {
 		return nil, fmt.Errorf("take docs: %w", err)
 	}
-	if req == nil {
-		return sets, nil
+	if tr == nil {
+		return []*entroq.DocSet{}, nil
+	}
+	// Only the sets are the handler's; the lease and claimant are the
+	// worker's.
+	sets := entroq.NewDocClaim(tr.args...).Sets
+	if len(sets) == 0 {
+		return []*entroq.DocSet{}, nil
 	}
 
-	// Sort to avoid livelock from dining philosophers.
-	sort.Slice(req, func(i, j int) bool {
-		if req[i].Namespace != req[j].Namespace {
-			return req[i].Namespace < req[j].Namespace
+	// One claim of every set, all or none, so contention leaves nothing
+	// held. The sets are held until the task's own arrival, so that if the
+	// worker dies they come free with it.
+	sort.Slice(sets, func(i, j int) bool {
+		if sets[i].Namespace != sets[j].Namespace {
+			return sets[i].Namespace < sets[j].Namespace
 		}
-		return req[i].Key < req[j].Key
+		return sets[i].Key < sets[j].Key
 	})
-
-	for _, cq := range req {
-		cq.Duration = lease
-		set, err := eqc.ClaimDocs(ctx, cq)
-		if err != nil {
-			return nil, err // caller inspects DependencyError
-		}
-		sets = append(sets, set)
+	args := make([]entroq.DocClaimArg, 0, len(sets)+1)
+	for _, s := range sets {
+		args = append(args, s)
 	}
-	return sets, nil
+	args = append(args, entroq.ClaimingSetsUntil(task.At))
+	return eqc.ClaimDocs(ctx, args...) // caller inspects DependencyError
 }
 
 // runOne claims one task, unmarshals its value into T, runs the work function
@@ -916,7 +939,7 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 	// Phase 2: Acquire docs before renewal starts. Doc claims are sorted by
 	// (namespace, key) to prevent dining-philosopher livelock when multiple
 	// doc sets are acquired.
-	sets, err := acquireDocs(rCtx, w.eqc, task, value, opts.lease, handler.TakeDocs)
+	sets, err := acquireDocs(rCtx, w.eqc, task, value, handler.TakeDocs)
 	if err != nil {
 		// A claim fails only while someone else holds the set, which is
 		// transient: retry with backoff. Sets claimed before it keep their

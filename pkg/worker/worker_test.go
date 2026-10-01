@@ -231,8 +231,8 @@ func TestDoModify_DocVersionFixedAfterRenewal(t *testing.T) {
 
 	go func() {
 		err := New(client,
-			WithTakeDocs(func(_ context.Context, _ *entroq.Task, _ string) ([]*entroq.DocClaim, error) {
-				return []*entroq.DocClaim{entroq.ClaimKey("ns", "k")}, nil
+			WithTakeDocs(func(_ context.Context, _ *entroq.Task, _ string) (*TakeResult, error) {
+				return Take(entroq.ClaimKey("ns", "k")), nil
 			}),
 			WithDoModify(func(_ context.Context, task *entroq.Task, _ string, sets []*entroq.DocSet) (*Result, error) {
 				docs := entroq.DocsIn(sets)
@@ -363,9 +363,9 @@ func TestSlowTakeDocsRenewsAtOnce(t *testing.T) {
 	working := make(chan time.Time, 1)
 	finish := make(chan bool)
 	w := New[string](client,
-		WithTakeDocs(func(context.Context, *entroq.Task, string) ([]*entroq.DocClaim, error) {
+		WithTakeDocs(func(context.Context, *entroq.Task, string) (*TakeResult, error) {
 			time.Sleep(lease * 7 / 10)
-			return []*entroq.DocClaim{entroq.ClaimKey("ns", "k")}, nil
+			return Take(entroq.ClaimKey("ns", "k")), nil
 		}),
 		WithDoModify(func(_ context.Context, task *entroq.Task, _ string, _ []*entroq.DocSet) (*Result, error) {
 			working <- time.Now()
@@ -389,6 +389,57 @@ func TestSlowTakeDocsRenewsAtOnce(t *testing.T) {
 		t.Error("Another claimant took the task: its claim lapsed before the first renewal")
 	}
 	close(finish)
+	runCancel()
+	if err := <-errCh; err != nil {
+		t.Errorf("Run: %v", err)
+	}
+}
+
+// TestDocsExpireWithTheirTask checks that the worker claims a task's doc sets
+// as itself, until the task's own arrival time, so that if the worker dies they
+// come free together, before any renewal, whatever lease or claimant the
+// handler named.
+func TestDocsExpireWithTheirTask(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, err := entroq.New(ctx, eqmem.Opener())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer client.Close()
+	if _, err := client.Modify(ctx, entroq.InsertingInto("q")); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	type seen struct {
+		task, a, b time.Time
+		holders    []string
+	}
+	got := make(chan seen, 1)
+	w := New[string](client,
+		WithTakeDocs(func(context.Context, *entroq.Task, string) (*TakeResult, error) {
+			// The lease and claimant are the worker's: these are ignored.
+			return Take(entroq.ClaimKey("ns", "a"), entroq.ClaimKey("ns", "b").WithoutMembers(),
+				entroq.ClaimingSetsFor(time.Hour), entroq.ClaimingSetsAs("someone else")), nil
+		}),
+		WithDoModify(func(_ context.Context, task *entroq.Task, _ string, sets []*entroq.DocSet) (*Result, error) {
+			got <- seen{task.At, sets[0].At, sets[1].At, []string{sets[0].Claimant, sets[1].Claimant}}
+			return Modify(task.Delete()), nil
+		}),
+	)
+	runCtx, runCancel := context.WithCancel(ctx)
+	errCh := make(chan error, 1)
+	go func() { errCh <- w.Run(runCtx, Watching("q"), WithLease(time.Minute)) }()
+
+	s := <-got
+	if !s.a.Equal(s.task) || !s.b.Equal(s.task) {
+		t.Errorf("Sets held until %v and %v, want both until the task's arrival %v", s.a, s.b, s.task)
+	}
+	for _, h := range s.holders {
+		if h != client.ClientID {
+			t.Errorf("Set held by %q, want the worker's own claimant %q", h, client.ClientID)
+		}
+	}
 	runCancel()
 	if err := <-errCh; err != nil {
 		t.Errorf("Run: %v", err)

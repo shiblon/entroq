@@ -278,39 +278,45 @@ func (e *EQRedis) readDocsWithLocks(ctx context.Context, rq *entroq.DocQuery, id
 	return docs, true, nil
 }
 
-// ClaimDocs claims the set of docs sharing a primary key in a namespace and
-// returns its members, which may be none: a set can be claimed before it has
-// docs. It returns a DependencyError listing the members while someone else
-// holds the set.
+// ClaimDocs claims every doc set cq names, all or none (see
+// docset.ClaimAll), watching every set's lock and writing them in one MULTI.
+// A set can be claimed before it has docs. It returns a DependencyError naming
+// the held sets, and their members, while someone else holds any of them.
 //
 // The claim is written before the members are read. Every insert writes and
 // watches its set's lock: one that commits before the claim is in the
 // members read after it, and one that has not committed yet fails its watch
 // when the claim writes the lock, then retries and finds the set held.
-func (e *EQRedis) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) (*entroq.DocSet, error) {
+func (e *EQRedis) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.DocSet, error) {
 	if err := validate.DocClaim(cq); err != nil {
 		return nil, fmt.Errorf("eqredis claim docs: %w", err)
 	}
-	g := docset.Set{Namespace: cq.Namespace, Key: cq.Key}
+	sets := docset.SetsOf(cq)
+	keys := make([]string, len(sets))
+	for i, g := range sets {
+		keys[i] = lockKey(g)
+	}
 	for attempt := range maxClaimRetries {
-		var current, next docset.Lock
-		var ok bool
+		var claimed []docset.Lock
 		err := e.client.Watch(ctx, func(tx *redis.Tx) error {
 			now := time.Now().UTC()
-			locks, err := readLocks(ctx, tx, []docset.Set{g})
+			locks, err := readLocks(ctx, tx, sets)
 			if err != nil {
 				return err
 			}
-			current = locks[g]
-			if next, ok = docset.Claim(current, cq.Claimant, now, cq.Duration); !ok {
-				return nil
+			lock := func(g docset.Set) docset.Lock { return locks[g] }
+			members := func(g docset.Set) ([]*entroq.Doc, error) { return setMembers(ctx, tx, g) }
+			if claimed, err = docset.ClaimAll(cq, now, lock, members); err != nil {
+				return err
 			}
 			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-				writeLock(ctx, pipe, g, next, now)
+				for i, g := range sets {
+					writeLock(ctx, pipe, g, claimed[i], now)
+				}
 				return nil
 			})
 			return err
-		}, lockKey(g))
+		}, keys...)
 		if errors.Is(err, redis.TxFailedErr) {
 			if err := waitToRetry(ctx, attempt); err != nil {
 				return nil, fmt.Errorf("eqredis claim docs: %w", err)
@@ -320,14 +326,12 @@ func (e *EQRedis) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) (*entroq.D
 		if err != nil {
 			return nil, fmt.Errorf("eqredis claim docs: %w", err)
 		}
-		members, err := setMembers(ctx, e.client, g)
+		members := func(g docset.Set) ([]*entroq.Doc, error) { return setMembers(ctx, e.client, g) }
+		out, err := docset.ClaimedSets(cq, claimed, members)
 		if err != nil {
 			return nil, fmt.Errorf("eqredis claim docs: %w", err)
 		}
-		if !ok {
-			return nil, docset.HeldError(g, current, members)
-		}
-		return docset.Claimed(g, next, members), nil
+		return out, nil
 	}
-	return nil, fmt.Errorf("eqredis claim docs: too much contention on %q in %q", cq.Key, cq.Namespace)
+	return nil, fmt.Errorf("eqredis claim docs: too much contention on %v", sets)
 }

@@ -39,6 +39,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 	"sync"
 	"time"
 
@@ -983,44 +984,62 @@ func (s *QSvc) ClaimDocs(ctx context.Context, req *pb.ClaimDocsRequest) (*pb.Cla
 	// The claimant is the request's: the service's client would otherwise fill
 	// in its own for an empty one, so check the claim as received. At protocol
 	// 2 the sets name what to claim, and the namespace and key are ignored.
-	dc := &entroq.DocClaim{
-		Namespace: cq.GetNamespace(),
-		Claimant:  cq.GetClaimant(),
-		Key:       cq.GetKey(),
-		Duration:  time.Duration(cq.GetDurationMs()) * time.Millisecond,
-	}
+	args := []entroq.DocClaimArg{entroq.ClaimingSetsAs(cq.GetClaimant())}
 	if sets := cq.GetSets(); len(sets) > 0 {
 		if protocol < 2 {
 			return nil, codeErrorf(codes.InvalidArgument, "claim docs: sets are protocol 2, and the request declares protocol %d", protocol)
 		}
-		// Transitional: claims of several sets at once come with atomic
-		// multi-set claims in every backend.
-		if len(sets) > 1 {
-			return nil, codeErrorf(codes.Unimplemented, "claim docs: claiming %d doc sets at once is not supported yet", len(sets))
+		for _, sc := range sets {
+			key, ok := sc.GetSet().GetRef().(*pb.DocID_Key)
+			if !ok {
+				return nil, codeErrorf(codes.InvalidArgument, "claim docs: a doc set is named by its key, not a doc ID")
+			}
+			set := entroq.ClaimKey(sc.GetSet().GetNamespace(), key.Key)
+			if sc.GetOmitMembers() {
+				set = set.WithoutMembers()
+			}
+			args = append(args, set)
 		}
-		key, ok := sets[0].GetRef().(*pb.DocID_Key)
-		if !ok {
-			return nil, codeErrorf(codes.InvalidArgument, "claim docs: a doc set is named by its key, not a doc ID")
-		}
-		dc.Namespace, dc.Key = sets[0].GetNamespace(), key.Key
+	} else {
+		args = append(args, entroq.ClaimKey(cq.GetNamespace(), cq.GetKey()))
 	}
+	switch {
+	case cq.GetAtMs() != 0:
+		if protocol < 2 {
+			return nil, codeErrorf(codes.InvalidArgument, "claim docs: at_ms is protocol 2, and the request declares protocol %d", protocol)
+		}
+		if cq.GetDurationMs() != 0 {
+			return nil, codeErrorf(codes.InvalidArgument, "claim docs: give a duration or a time, not both")
+		}
+		args = append(args, entroq.ClaimingSetsUntil(pbconv.FromMS(cq.GetAtMs())))
+	case cq.GetDurationMs() != 0:
+		args = append(args, entroq.ClaimingSetsFor(time.Duration(cq.GetDurationMs())*time.Millisecond))
+	}
+	dc := entroq.NewDocClaim(args...)
 	if err := dc.Validate(); err != nil {
 		return nil, autoCodeErrorf("claim docs: %w", err)
 	}
-	// Claiming a doc is gated on Claim for the namespace. Enforced only when an
-	// authorizer is set.
+	// Claiming a doc set is gated on Claim for its namespace. Enforced only
+	// when an authorizer is set.
 	if s.az != nil {
 		authReq := s.newAuthzRequest(ctx)
 		authReq.ClaimantId = cq.GetClaimant()
-		authReq.Namespaces = append(authReq.Namespaces, &authz.Namespace{
-			Exact:   dc.Namespace,
-			Actions: []authz.Action{authz.Claim},
-		})
+		var named []string
+		for _, set := range dc.Sets {
+			if slices.Contains(named, set.Namespace) {
+				continue
+			}
+			named = append(named, set.Namespace)
+			authReq.Namespaces = append(authReq.Namespaces, &authz.Namespace{
+				Exact:   set.Namespace,
+				Actions: []authz.Action{authz.Claim},
+			})
+		}
 		if err := s.Authorize(ctx, authReq); err != nil {
 			return nil, err // don't wrap, has status codes
 		}
 	}
-	claimed, err := s.impl.ClaimDocs(ctx, dc)
+	claimed, err := s.impl.ClaimDocs(ctx, args...)
 	if err != nil {
 		if depErr, ok := entroq.AsDependency(err); ok {
 			details := depDetails(depErr)
@@ -1032,13 +1051,16 @@ func (s *QSvc) ClaimDocs(ctx context.Context, req *pb.ClaimDocsRequest) (*pb.Cla
 		}
 		return nil, autoCodeErrorf("claim docs: %w", err)
 	}
-	resp := &pb.ClaimDocsResponse{Sets: []*pb.Doc{pbconv.DocSetToProto(claimed)}}
-	for _, d := range claimed.Docs {
-		pd, err := pbconv.DocToProto(d)
-		if err != nil {
-			return nil, autoCodeErrorf("claim docs doc proto: %w", err)
+	resp := new(pb.ClaimDocsResponse)
+	for _, g := range claimed {
+		resp.Sets = append(resp.Sets, pbconv.DocSetToProto(g))
+		for _, d := range g.Docs {
+			pd, err := pbconv.DocToProto(d)
+			if err != nil {
+				return nil, autoCodeErrorf("claim docs doc proto: %w", err)
+			}
+			resp.Docs = append(resp.Docs, pd)
 		}
-		resp.Docs = append(resp.Docs, pd)
 	}
 	return resp, nil
 }

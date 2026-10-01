@@ -226,7 +226,7 @@ func TestCollectLocksSkipsGroupBeingInserted(t *testing.T) {
 	}
 
 	// An empty set whose claim has lapsed: idle, so collectable.
-	if _, err := b.ClaimDocs(ctx, &entroq.DocClaim{Namespace: ns, Key: "k", Claimant: "me", Duration: time.Millisecond}); err != nil {
+	if _, err := b.ClaimDocs(ctx, entroq.NewDocClaim(entroq.ClaimKey(ns, "k"), entroq.ClaimingSetsAs("me"), entroq.ClaimingSetsFor(time.Millisecond))); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
 	time.Sleep(10 * time.Millisecond)

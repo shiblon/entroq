@@ -106,12 +106,9 @@ func Example_workerWithDocs() {
 	done := make(chan struct{})
 
 	w := worker.New[jobValue](eq,
-		worker.WithTakeDocs(func(_ context.Context, _ *entroq.Task, val jobValue) ([]*entroq.DocClaim, error) {
-			// Declare which docs to claim before work begins.
-			return []*entroq.DocClaim{{
-				Namespace: val.NS,
-				Key:       val.Key,
-			}}, nil
+		worker.WithTakeDocs(func(_ context.Context, _ *entroq.Task, val jobValue) (*worker.TakeResult, error) {
+			// Declare which doc sets to claim before work begins.
+			return worker.Take(entroq.ClaimKey(val.NS, val.Key)), nil
 		}),
 		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, val jobValue, sets []*entroq.DocSet) (*worker.Result, error) {
 			// One claim, one set; its docs are sorted by secondary key.

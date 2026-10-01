@@ -185,6 +185,7 @@ func TestModifyArgsFromProtoModes(t *testing.T) {
 		"doc claims reset":           {2, &pb.ModifyRequest{DocChanges: []*pb.DocChange{{OldId: DocIDToProto("ns", "d", 0), NewData: &pb.DocData{}, Mode: pb.ChangeMode_CHANGE_RESET_CLAIMS}}}},
 		"task lease at protocol 1":   {1, &pb.ModifyRequest{Changes: []*pb.TaskChange{{OldId: old, NewData: &pb.TaskData{}, Mode: lease}}}},
 		"claims reset at protocol 1": {1, &pb.ModifyRequest{Changes: []*pb.TaskChange{{OldId: old, NewData: &pb.TaskData{}, Mode: pb.ChangeMode_CHANGE_RESET_CLAIMS}}}},
+		"doc lease by ID":            {2, &pb.ModifyRequest{DocChanges: []*pb.DocChange{{OldId: DocIDToProto("ns", "d", 0), NewData: &pb.DocData{}, Mode: lease}}}},
 		"doc lease at protocol 1":    {1, &pb.ModifyRequest{DocChanges: []*pb.DocChange{{OldId: DocSetIDToProto("ns", "k", 0), NewData: &pb.DocData{}, Mode: lease}}}},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -203,7 +204,6 @@ func TestModifyArgsFromProtoNotYetSupported(t *testing.T) {
 	for name, req := range map[string]*pb.ModifyRequest{
 		"doc change by key": {DocChanges: []*pb.DocChange{{OldId: DocSetIDToProto("ns", "k", 0), NewData: &pb.DocData{}}}},
 		"doc delete by key": {DocDeletes: []*pb.DocID{DocSetIDToProto("ns", "k", 0)}},
-		"doc lease by ID":   {DocChanges: []*pb.DocChange{{OldId: DocIDToProto("ns", "d", 0), NewData: &pb.DocData{}, Mode: pb.ChangeMode_CHANGE_LEASE}}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var uns *UnsupportedRequestError

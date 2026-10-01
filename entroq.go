@@ -379,9 +379,13 @@ type Backend interface {
 	// Docs returns a list of docs matching the given query.
 	Docs(ctx context.Context, rq *DocQuery) ([]*Doc, error)
 
-	// ClaimDocs attempts to claim a set of docs for modification (including
-	// deletion).
-	ClaimDocs(ctx context.Context, cq *DocClaim) (*DocSet, error)
+	// ClaimDocs claims every doc set cq names, atomically: all of them, or,
+	// if anyone else holds one, none, with a DependencyError naming the held
+	// sets. It returns them in the order named, each at its new lock with its
+	// members, unless claimed with OmitMembers. The claim holds the sets until
+	// cq.Until(now), by the backend's clock; a time not in the future is an
+	// invalid argument.
+	ClaimDocs(ctx context.Context, cq *DocClaim) ([]*DocSet, error)
 
 	// NamespaceStats returns statistics for doc namespaces matching the query.
 	NamespaceStats(ctx context.Context, qq *MatchQuery) (map[string]*NamespaceStat, error)
@@ -940,13 +944,25 @@ func (c *EntroQ) Docs(ctx context.Context, rq *DocQuery) ([]*Doc, error) {
 	return c.backend.Docs(ctx, rq)
 }
 
-// ClaimDocs claims the doc set sharing a primary key in a namespace and
-// returns it, with its members, which may be none.
-func (c *EntroQ) ClaimDocs(ctx context.Context, cq *DocClaim) (*DocSet, error) {
+// ClaimDocs claims the doc sets args name, all of them or none, and returns
+// them in the order named, each with its members, which may be none, unless
+// it was claimed WithoutMembers. A set someone else holds fails the whole
+// claim with a DependencyError naming it, and nothing is claimed.
+//
+//	sets, err := eq.ClaimDocs(ctx,
+//		entroq.ClaimKey("orders", "cust-17"),
+//		entroq.ClaimKey("stock", "sku-9").WithoutMembers(),
+//		entroq.ClaimingSetsFor(time.Minute),
+//	)
+//
+// The claim lasts DefaultClaimDuration unless ClaimingSetsFor or
+// ClaimingSetsUntil says otherwise.
+func (c *EntroQ) ClaimDocs(ctx context.Context, args ...DocClaimArg) ([]*DocSet, error) {
+	cq := NewDocClaim(args...)
 	if cq.Claimant == "" {
 		cq.Claimant = c.ClientID
 	}
-	if cq.Duration == 0 {
+	if cq.Duration == 0 && cq.At.IsZero() {
 		cq.Duration = DefaultClaimDuration
 	}
 	if err := cq.Validate(); err != nil {

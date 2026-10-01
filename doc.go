@@ -346,69 +346,144 @@ func DocsIn(sets []*DocSet) []*Doc {
 	return docs
 }
 
-// DocClaim is used to claim all docs that share a primary key in a namespace.
+// SetClaim names one doc set of a claim: the docs sharing a primary key in a
+// namespace, which may be none. Build one with ClaimKey.
+type SetClaim struct {
+	Namespace string `json:"namespace"`
+	Key       string `json:"key"`
+	// OmitMembers returns the set alone, with its lock and count, and none
+	// of its docs. Its holder can read them later, or insert one it knows is
+	// new, without racing anyone.
+	OmitMembers bool `json:"omit_members,omitempty"`
+}
+
+// ClaimKey names the doc set with the given namespace and primary key, for
+// ClaimDocs.
+func ClaimKey(ns, key string) *SetClaim {
+	return &SetClaim{Namespace: ns, Key: key}
+}
+
+// WithoutMembers makes the claim of this set return the set alone, without
+// its docs (see SetClaim.OmitMembers).
+func (s *SetClaim) WithoutMembers() *SetClaim {
+	s.OmitMembers = true
+	return s
+}
+
+// DocClaim claims doc sets, all of them or none, for one claimant until one
+// time. Build one with ClaimDocs's arguments:
 //
-// Construct with ClaimKey for a fluent interface:
-//
-//	eq.ClaimDocs(ctx, entroq.ClaimKey("state", "counter"))
-//	eq.ClaimDocs(ctx, entroq.ClaimKey("state", "counter").For(5*time.Second))
+//	eq.ClaimDocs(ctx,
+//		entroq.ClaimKey("orders", "cust-17").WithoutMembers(),
+//		entroq.ClaimKey("stock", "sku-9"),
+//		entroq.ClaimingSetsFor(time.Minute),
+//	)
 type DocClaim struct {
-	Namespace string        `json:"namespace"`
-	Claimant  string        `json:"claimant"`
-	Key       string        `json:"key"`
-	Duration  time.Duration `json:"duration"`
+	Sets     []*SetClaim   `json:"sets"`
+	Claimant string        `json:"claimant"`
+	Duration time.Duration `json:"duration"`
+	// At, if set, holds the sets until then instead of for Duration.
+	At time.Time `json:"at"`
+
+	leases int // lease arguments given, of which there may be one
 }
 
-// ClaimKey returns a DocClaim for the given namespace and primary key, using
-// DefaultClaimDuration. Call For to override the duration.
-func ClaimKey(ns, key string) *DocClaim {
-	return &DocClaim{
-		Namespace: ns,
-		Key:       key,
-		Duration:  DefaultClaimDuration,
+// DocClaimArg is an argument to ClaimDocs: a set to claim (ClaimKey), or an
+// option of the whole claim.
+type DocClaimArg interface {
+	applyDocClaim(*DocClaim)
+}
+
+func (s *SetClaim) applyDocClaim(c *DocClaim) {
+	c.Sets = append(c.Sets, s)
+}
+
+type docClaimOption func(*DocClaim)
+
+func (o docClaimOption) applyDocClaim(c *DocClaim) {
+	o(c)
+}
+
+// ClaimingSetsFor holds a claim's sets for d from when it is made. Without a
+// lease argument a claim lasts DefaultClaimDuration.
+func ClaimingSetsFor(d time.Duration) DocClaimArg {
+	return docClaimOption(func(c *DocClaim) {
+		c.Duration, c.At = d, time.Time{}
+		c.leases++
+	})
+}
+
+// ClaimingSetsUntil holds a claim's sets until t, which must be in the future:
+// a worker claims its task's sets until its task's arrival time, so that they
+// expire together.
+func ClaimingSetsUntil(t time.Time) DocClaimArg {
+	return docClaimOption(func(c *DocClaim) {
+		c.Duration, c.At = 0, t
+		c.leases++
+	})
+}
+
+// ClaimingSetsAs makes the claim for claimant instead of the client's own ID,
+// as ModifyAs does for a modification. A service claiming on a caller's
+// behalf needs it; a client otherwise does not.
+func ClaimingSetsAs(claimant string) DocClaimArg {
+	return docClaimOption(func(c *DocClaim) {
+		c.Claimant = claimant
+	})
+}
+
+// NewDocClaim builds the claim that args describe, filling in nothing.
+func NewDocClaim(args ...DocClaimArg) *DocClaim {
+	c := new(DocClaim)
+	for _, a := range args {
+		a.applyDocClaim(c)
 	}
-}
-
-// For sets the claim duration, overriding the DefaultClaimDuration set by ClaimKey.
-func (c *DocClaim) For(d time.Duration) *DocClaim {
-	c.Duration = d
 	return c
 }
 
-// Validate checks that the claim names a namespace, a key, and a claimant. A
-// zero duration means the default, which ClaimDocs fills in.
+// Validate checks that the claim names at least one set, each once by
+// namespace and key, a claimant, and at most one lease, and that its duration
+// is not negative. A zero duration and no time means the default, which
+// ClaimDocs fills in. Whether At is in the future is the backend's to check,
+// by its own clock.
 func (q *DocClaim) Validate() error {
-	if q.Namespace == "" {
-		return InvalidArgumentf("doc claim must name a namespace")
+	if len(q.Sets) == 0 {
+		return InvalidArgumentf("doc claim must name a doc set")
 	}
-	if q.Key == "" {
-		return InvalidArgumentf("doc claim must name a key")
+	seen := make(map[[2]string]bool, len(q.Sets))
+	for _, s := range q.Sets {
+		if s == nil || s.Namespace == "" {
+			return InvalidArgumentf("doc claim must name a namespace for each set")
+		}
+		if s.Key == "" {
+			return InvalidArgumentf("doc claim must name a key for each set")
+		}
+		k := [2]string{s.Namespace, s.Key}
+		if seen[k] {
+			return InvalidArgumentf("doc claim names set %q in %q more than once", s.Key, s.Namespace)
+		}
+		seen[k] = true
 	}
 	if q.Claimant == "" {
 		return InvalidArgumentf("doc claim must name a claimant")
 	}
+	if q.leases > 1 {
+		return InvalidArgumentf("doc claim gives more than one lease")
+	}
 	if q.Duration < 0 {
 		return InvalidArgumentf("doc claim duration must not be negative, got %v", q.Duration)
+	}
+	if q.Duration > 0 && !q.At.IsZero() {
+		return InvalidArgumentf("doc claim gives both a duration and a time")
 	}
 	return nil
 }
 
-// DocClaimOpt specifies document claim functionality.
-type DocClaimOpt func(*DocClaim)
-
-// LockingFor specifies the duration of a successful claim before it becomes
-// available for other claimants..
-func LockingFor(dt time.Duration) DocClaimOpt {
-	return func(dc *DocClaim) {
-		dc.Duration = dt
+// Until returns when the claim's sets are held until, for a claim made at
+// now.
+func (q *DocClaim) Until(now time.Time) time.Time {
+	if !q.At.IsZero() {
+		return q.At
 	}
-}
-
-// WithDocClaimant specifies the claimant ID for this document. Only needed
-// in very specific circmunstances, such as developing a server that proxies
-// through to an EntroQ backend. Otherwise don't use it - it's set for you.
-func WithDocClaimant(id string) DocClaimOpt {
-	return func(dc *DocClaim) {
-		dc.Claimant = id
-	}
+	return now.Add(q.Duration)
 }

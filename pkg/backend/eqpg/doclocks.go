@@ -351,34 +351,42 @@ func txNow(ctx context.Context, tx *sql.Tx) (time.Time, error) {
 	return now, nil
 }
 
-// claimDocs claims the set g inside tx and returns its members.
-func claimDocs(ctx context.Context, tx *sql.Tx, cq *entroq.DocClaim) (*entroq.DocSet, error) {
-	g := docset.Set{Namespace: cq.Namespace, Key: cq.Key}
-	locks, now, err := lockSets(ctx, tx, []docset.Set{g}, map[docset.Set]bool{g: true})
+// claimDocs claims every set cq names inside tx, all or none (see
+// docset.ClaimAll), and returns them. lockSets takes their lock rows in
+// order, so claims of overlapping sets cannot deadlock.
+func claimDocs(ctx context.Context, tx *sql.Tx, cq *entroq.DocClaim) ([]*entroq.DocSet, error) {
+	sets := docset.SetsOf(cq)
+	exclusive := make(map[docset.Set]bool, len(sets))
+	for _, g := range sets {
+		exclusive[g] = true
+	}
+	locks, now, err := lockSets(ctx, tx, sets, exclusive)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT `+docColumns+` FROM `+docsWithLocks+`
-		WHERE d.namespace = $1 AND d.key_primary = $2
-		ORDER BY d.key_secondary, d.id`, cq.Namespace, cq.Key)
-	if err != nil {
-		return nil, fmt.Errorf("read doc set: %w", err)
+	lock := func(g docset.Set) docset.Lock { return locks[g] }
+	members := func(g docset.Set) ([]*entroq.Doc, error) {
+		rows, err := tx.QueryContext(ctx, `SELECT `+docColumns+` FROM `+docsWithLocks+`
+			WHERE d.namespace = $1 AND d.key_primary = $2
+			ORDER BY d.key_secondary, d.id`, g.Namespace, g.Key)
+		if err != nil {
+			return nil, fmt.Errorf("read doc set: %w", err)
+		}
+		defer rows.Close()
+		return scanDocRows(rows)
 	}
-	members, err := scanDocRows(rows)
-	rows.Close()
+	claimed, err := docset.ClaimAll(cq, now, lock, members)
 	if err != nil {
 		return nil, err
 	}
-
-	current := locks[g]
-	claimed, ok := docset.Claim(current, cq.Claimant, now, cq.Duration)
-	if !ok {
-		return nil, docset.HeldError(g, current, members)
+	written := make(map[docset.Set]docset.Lock, len(sets))
+	for i, g := range sets {
+		written[g] = claimed[i]
 	}
-	if err := saveLocks(ctx, tx, map[docset.Set]docset.Lock{g: claimed}); err != nil {
+	if err := saveLocks(ctx, tx, written); err != nil {
 		return nil, err
 	}
-	return docset.Claimed(g, claimed, members), nil
+	return docset.ClaimedSets(cq, claimed, members)
 }
 
 // collectLocksOnce removes the locks of up to batch sets that have no docs

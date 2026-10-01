@@ -61,14 +61,77 @@ func Overlay(member *entroq.Doc, l Lock) *entroq.Doc {
 	return d
 }
 
-// Claim returns l claimed by claimant until now+d, or false if someone else
-// holds it. Claiming moves the version, so any earlier read of the set is
-// stale; the holder claiming again extends its claim the same way.
-func Claim(l Lock, claimant string, now time.Time, d time.Duration) (Lock, bool) {
+// Claim returns lock l claimed by claimant until until, or false if someone
+// else holds it at now.
+func Claim(l Lock, claimant string, now, until time.Time) (Lock, bool) {
 	if l.HeldByOther(claimant, now) {
 		return l, false
 	}
-	return Lock{Version: l.Version + 1, Claimant: claimant, At: now.Add(d), NumDocs: l.NumDocs}, true
+	return Lock{Version: l.Version + 1, Claimant: claimant, At: until, NumDocs: l.NumDocs}, true
+}
+
+// SetsOf returns the sets cq names, in the order named.
+func SetsOf(cq *entroq.DocClaim) []Set {
+	sets := make([]Set, len(cq.Sets))
+	for i, s := range cq.Sets {
+		sets[i] = Set{Namespace: s.Namespace, Key: s.Key}
+	}
+	return sets
+}
+
+// ClaimAll claims every set cq names, all or none, at now, and returns each
+// set's new lock in the order named. lock gives each set's current lock;
+// members gives a set's docs, and is asked only for sets held by someone
+// else, which the error names along with their members. A claim whose time
+// is not after now is an invalid argument.
+func ClaimAll(cq *entroq.DocClaim, now time.Time, lock func(Set) Lock, members func(Set) ([]*entroq.Doc, error)) ([]Lock, error) {
+	until := cq.Until(now)
+	if !until.After(now) {
+		return nil, entroq.InvalidArgumentf("doc claim until %v, which is not after now (%v)", until, now)
+	}
+	sets := SetsOf(cq)
+	claimed := make([]Lock, len(sets))
+	var held *entroq.DependencyError
+	for i, g := range sets {
+		l := lock(g)
+		next, ok := Claim(l, cq.Claimant, now, until)
+		if ok {
+			claimed[i] = next
+			continue
+		}
+		ms, err := members(g)
+		if err != nil {
+			return nil, err
+		}
+		if held == nil {
+			held = HeldError(g, l, ms)
+		} else {
+			held = held.Merge(HeldError(g, l, ms))
+		}
+	}
+	if held != nil {
+		return nil, held
+	}
+	return claimed, nil
+}
+
+// ClaimedSets returns what a claim of cq returns: each set at its new lock,
+// in locks, in the order named, with its members unless it was claimed
+// OmitMembers. members is asked only for the sets whose docs come back.
+func ClaimedSets(cq *entroq.DocClaim, locks []Lock, members func(Set) ([]*entroq.Doc, error)) ([]*entroq.DocSet, error) {
+	out := make([]*entroq.DocSet, len(cq.Sets))
+	for i, g := range SetsOf(cq) {
+		if cq.Sets[i].OmitMembers {
+			out[i] = Current(g, locks[i])
+			continue
+		}
+		ms, err := members(g)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = Claimed(g, locks[i], ms)
+	}
+	return out, nil
 }
 
 // Claimed returns the set g as its claim left it: holding lock l, with each

@@ -712,8 +712,8 @@ func WorkerHoldsEmptyGroup(ctx context.Context, t *testing.T, client *entroq.Ent
 	inWork := make(chan int, 1)
 	letFinish := make(chan bool)
 	w := worker.New(client,
-		worker.WithTakeDocs(func(context.Context, *entroq.Task, json.RawMessage) ([]*entroq.DocClaim, error) {
-			return []*entroq.DocClaim{entroq.ClaimKey(ns, "empty")}, nil
+		worker.WithTakeDocs(func(context.Context, *entroq.Task, json.RawMessage) (*worker.TakeResult, error) {
+			return worker.Take(entroq.ClaimKey(ns, "empty")), nil
 		}),
 		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, _ json.RawMessage, sets []*entroq.DocSet) (*worker.Result, error) {
 			inWork <- len(sets[0].Docs)
@@ -743,7 +743,7 @@ func WorkerHoldsEmptyGroup(ctx context.Context, t *testing.T, client *entroq.Ent
 	// Several leases pass while the handler works; nobody else may claim the
 	// set meanwhile.
 	for deadline := time.Now().Add(4 * lease); time.Now().Before(deadline); time.Sleep(lease / 4) {
-		_, err := client.ClaimDocs(ctx, &entroq.DocClaim{Namespace: ns, Key: "empty", Claimant: "intruder", Duration: lease})
+		_, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "empty"), entroq.ClaimingSetsAs("intruder"), entroq.ClaimingSetsFor(lease))
 		if err == nil {
 			t.Fatal("Another claimant took the worker's empty set while its handler ran")
 		}
@@ -787,7 +787,7 @@ func WorkerReleasesSets(ctx context.Context, t *testing.T, client *entroq.EntroQ
 	// free reports whether an intruder can claim the set at once.
 	free := func(t *testing.T, ns, key string) bool {
 		t.Helper()
-		_, err := client.ClaimDocs(ctx, &entroq.DocClaim{Namespace: ns, Key: key, Claimant: "intruder", Duration: time.Second})
+		_, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, key), entroq.ClaimingSetsAs("intruder"), entroq.ClaimingSetsFor(time.Second))
 		if err != nil && !entroq.IsDependency(err) {
 			t.Fatalf("Intruder claim of %q: %v", key, err)
 		}
@@ -821,8 +821,8 @@ func WorkerReleasesSets(ctx context.Context, t *testing.T, client *entroq.EntroQ
 			t.Fatalf("Insert: %v", err)
 		}
 		stop := run(t, queue,
-			worker.WithTakeDocs(func(context.Context, *entroq.Task, json.RawMessage) ([]*entroq.DocClaim, error) {
-				return []*entroq.DocClaim{entroq.ClaimKey(ns, "written"), entroq.ClaimKey(ns, "depended"), entroq.ClaimKey(ns, "empty")}, nil
+			worker.WithTakeDocs(func(context.Context, *entroq.Task, json.RawMessage) (*worker.TakeResult, error) {
+				return worker.Take(entroq.ClaimKey(ns, "written"), entroq.ClaimKey(ns, "depended"), entroq.ClaimKey(ns, "empty")), nil
 			}),
 			worker.WithDoModify(func(_ context.Context, task *entroq.Task, _ json.RawMessage, sets []*entroq.DocSet) (*worker.Result, error) {
 				written, depended := sets[2].Docs[0], sets[0].Docs[0] // sorted by key
@@ -855,8 +855,8 @@ func WorkerReleasesSets(ctx context.Context, t *testing.T, client *entroq.EntroQ
 		}
 		retried := make(chan bool, 1)
 		stop := run(t, queue,
-			worker.WithTakeDocs(func(context.Context, *entroq.Task, json.RawMessage) ([]*entroq.DocClaim, error) {
-				return []*entroq.DocClaim{entroq.ClaimKey(ns, "held")}, nil
+			worker.WithTakeDocs(func(context.Context, *entroq.Task, json.RawMessage) (*worker.TakeResult, error) {
+				return worker.Take(entroq.ClaimKey(ns, "held")), nil
 			}),
 			worker.WithDoModify(func(context.Context, *entroq.Task, json.RawMessage, []*entroq.DocSet) (*worker.Result, error) {
 				select {
@@ -884,8 +884,8 @@ func WorkerReleasesSets(ctx context.Context, t *testing.T, client *entroq.EntroQ
 		calls := make(chan time.Time, 2)
 		first := true
 		stop := run(t, queue,
-			worker.WithTakeDocs(func(context.Context, *entroq.Task, json.RawMessage) ([]*entroq.DocClaim, error) {
-				return []*entroq.DocClaim{entroq.ClaimKey(ns, "held")}, nil
+			worker.WithTakeDocs(func(context.Context, *entroq.Task, json.RawMessage) (*worker.TakeResult, error) {
+				return worker.Take(entroq.ClaimKey(ns, "held")), nil
 			}),
 			worker.WithDoModify(func(_ context.Context, task *entroq.Task, _ json.RawMessage, sets []*entroq.DocSet) (*worker.Result, error) {
 				calls <- time.Now()

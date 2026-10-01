@@ -63,12 +63,7 @@ func GCDocSets(ctx context.Context, t *testing.T, backend entroq.Backend, collec
 	)); err != nil {
 		t.Fatalf("GCDocSets: insert: %v", err)
 	}
-	claimed, err := docsOf(backend.ClaimDocs(ctx, &entroq.DocClaim{
-		Namespace: ns,
-		Key:       claimedKey,
-		Claimant:  "doc-gc-test",
-		Duration:  time.Hour,
-	}))
+	claimed, err := docsOf(backend.ClaimDocs(ctx, entroq.NewDocClaim(entroq.ClaimKey(ns, claimedKey), entroq.ClaimingSetsAs("doc-gc-test"), entroq.ClaimingSetsFor(time.Hour))))
 	if err != nil {
 		t.Fatalf("GCDocSets: claim: %v", err)
 	}

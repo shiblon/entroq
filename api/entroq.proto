@@ -225,20 +225,36 @@ message DocQuery {
   string key_exact = 7;
 }
 
-// DocClaim describes an atomic all-or-nothing claim of docs in a namespace.
-// In protocol 1, all docs sharing the given key are claimed together. For
-// protocol 2, only namespace and primary keys are specified and it will try to
-// claim all specified document sets by namespace and primary key.
+// SetClaim names one doc set of a claim, by key (DocID.key, with no id),
+// and whether its members come back.
+message SetClaim {
+  DocID set = 1;
+
+  // Return the set alone, with its lock and len, and none of its docs. The
+  // holder can read them later, or insert one it knows is new, without
+  // racing anyone.
+  bool omit_members = 2;
+}
+
+// DocClaim describes an atomic all-or-nothing claim of doc sets: every set
+// named is claimed, or none is.
 //
-// If sets are specified, namespace and key are ignored.
+// In protocol 1, namespace and key name the one set, the docs sharing that
+// key. Protocol 2 names the sets in sets, and namespace and key are ignored.
 message DocClaim {
-  // Use for protocol 2.
-  repeated DocID sets = 5;
+  // Protocol 2.
+  repeated SetClaim sets = 5;
 
   int64 duration_ms = 4;
+
+  // Protocol 2: hold the sets until this time instead of for duration_ms,
+  // for example to expire in step with a task. It must be in the future; 0
+  // means unset.
+  int64 at_ms = 6;
+
   string claimant = 2;
 
-  // Use for protocol 1.
+  // Protocol 1.
   string namespace = 1;
   string key = 3;
 }
@@ -261,12 +277,12 @@ message ClaimDocsRequest {
 // ClaimDocsResponse contains the docs claimed by a ClaimDocs call, and the
 // sets they belong to. All sets are present, but not all sets have docs.
 message ClaimDocsResponse {
-  // Contains all docs within any set, with content.
+  // The members of every claimed set not claimed with omit_members, with
+  // content.
   repeated Doc docs = 1;
 
-  // Contains all doc set top-level values.
+  // Every claimed set, as a Doc with no id or content, in the order named.
   // Not present for servers on protocol 1.
-  // Contains no content.
   repeated Doc sets = 2;
 }
 

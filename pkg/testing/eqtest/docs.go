@@ -497,12 +497,7 @@ func DocClaimLocking(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 
 	// First claimant acquires the lock.
 	const claimDur = 500 * time.Millisecond
-	docs, err := docsOf(client.ClaimDocs(ctx, &entroq.DocClaim{
-		Namespace: ns,
-		Claimant:  "claimant-A",
-		Key:       key,
-		Duration:  claimDur,
-	}))
+	docs, err := docsOf(client.ClaimDocs(ctx, entroq.ClaimKey(ns, key), entroq.ClaimingSetsAs("claimant-A"), entroq.ClaimingSetsFor(claimDur)))
 	if err != nil {
 		t.Fatalf("first claim: %v", err)
 	}
@@ -511,12 +506,7 @@ func DocClaimLocking(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 	}
 
 	// Second claimant must fail while first holds the lock.
-	_, err = client.ClaimDocs(ctx, &entroq.DocClaim{
-		Namespace: ns,
-		Claimant:  "claimant-B",
-		Key:       key,
-		Duration:  claimDur,
-	})
+	_, err = client.ClaimDocs(ctx, entroq.ClaimKey(ns, key), entroq.ClaimingSetsAs("claimant-B"), entroq.ClaimingSetsFor(claimDur))
 	if err == nil {
 		t.Fatal("second claim should fail while first holds lock, got nil error")
 	}
@@ -526,12 +516,7 @@ func DocClaimLocking(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 
 	// After the claim duration expires, a third claimant can succeed.
 	time.Sleep(claimDur + 50*time.Millisecond)
-	docs2, err := docsOf(client.ClaimDocs(ctx, &entroq.DocClaim{
-		Namespace: ns,
-		Claimant:  "claimant-C",
-		Key:       key,
-		Duration:  claimDur,
-	}))
+	docs2, err := docsOf(client.ClaimDocs(ctx, entroq.ClaimKey(ns, key), entroq.ClaimingSetsAs("claimant-C"), entroq.ClaimingSetsFor(claimDur)))
 	if err != nil {
 		t.Fatalf("claim after expiry: %v", err)
 	}
@@ -651,7 +636,7 @@ func DocClaimantBehavior(ctx context.Context, t *testing.T, client *entroq.Entro
 	if time.Until(inserted.At) <= 0 {
 		t.Errorf("after future-at insert: at %v is not in the future", inserted.At)
 	}
-	reclaimed, err := docsOf(client.ClaimDocs(ctx, entroq.ClaimKey(ns, "claimed-on-insert").For(insertLease)))
+	reclaimed, err := docsOf(client.ClaimDocs(ctx, entroq.ClaimKey(ns, "claimed-on-insert"), entroq.ClaimingSetsFor(insertLease)))
 	if err != nil {
 		t.Fatalf("same-client reclaim after future-at insert: %v", err)
 	}
@@ -898,7 +883,7 @@ func DocSets(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix s
 
 	t.Run("a claim makes earlier reads stale", func(t *testing.T) {
 		before := readGroup("g")
-		set, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "g").For(lease))
+		set, err := oneSet(client.ClaimDocs(ctx, entroq.ClaimKey(ns, "g"), entroq.ClaimingSetsFor(lease)))
 		if err != nil || len(set.Docs) != 2 {
 			t.Fatalf("Claim: %v, %v", err, set)
 		}
@@ -923,7 +908,7 @@ func DocSets(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix s
 	})
 
 	t.Run("a held set refuses other writers", func(t *testing.T) {
-		held, err := docsOf(client.ClaimDocs(ctx, entroq.ClaimKey(ns, "g").For(lease)))
+		held, err := docsOf(client.ClaimDocs(ctx, entroq.ClaimKey(ns, "g"), entroq.ClaimingSetsFor(lease)))
 		if err != nil {
 			t.Fatalf("Claim: %v", err)
 		}
@@ -940,7 +925,7 @@ func DocSets(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix s
 		if _, err := client.Modify(ctx, held[0].Depend(), entroq.ModifyAs(intruder)); err != nil {
 			t.Errorf("Intruder depend on a held set: %v", err)
 		}
-		if _, err := client.ClaimDocs(ctx, &entroq.DocClaim{Namespace: ns, Key: "g", Claimant: intruder, Duration: lease}); !entroq.IsDependency(err) {
+		if _, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "g"), entroq.ClaimingSetsAs(intruder), entroq.ClaimingSetsFor(lease)); !entroq.IsDependency(err) {
 			t.Errorf("Intruder claim of a held set: want a dependency error, got %v", err)
 		}
 
@@ -963,7 +948,7 @@ func DocSets(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix s
 
 	t.Run("an empty set can be claimed", func(t *testing.T) {
 		before := time.Now()
-		set, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "empty").For(lease))
+		set, err := oneSet(client.ClaimDocs(ctx, entroq.ClaimKey(ns, "empty"), entroq.ClaimingSetsFor(lease)))
 		if err != nil {
 			t.Fatalf("Claim of an empty set: %v", err)
 		}
@@ -1028,7 +1013,7 @@ func DocSets(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix s
 	})
 
 	t.Run("a held set and an unheld one in one modification", func(t *testing.T) {
-		held, err := docsOf(client.ClaimDocs(ctx, entroq.ClaimKey(ns, "g").For(lease)))
+		held, err := docsOf(client.ClaimDocs(ctx, entroq.ClaimKey(ns, "g"), entroq.ClaimingSetsFor(lease)))
 		if err != nil || len(held) == 0 {
 			t.Fatalf("Claim: %v, %d docs", err, len(held))
 		}
@@ -1040,7 +1025,7 @@ func DocSets(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix s
 
 		// A set someone else holds fails the whole modification, so the
 		// caller keeps the set it holds.
-		if _, err := client.ClaimDocs(ctx, &entroq.DocClaim{Namespace: ns, Key: "blocked", Claimant: intruder, Duration: lease}); err != nil {
+		if _, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "blocked"), entroq.ClaimingSetsAs(intruder), entroq.ClaimingSetsFor(lease)); err != nil {
 			t.Fatalf("Intruder claim: %v", err)
 		}
 		if _, err := client.Modify(ctx,
@@ -1139,7 +1124,7 @@ func DocSets(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix s
 	t.Run("a set counts its docs", func(t *testing.T) {
 		claim := func(want int) *entroq.DocSet {
 			t.Helper()
-			set, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "count").For(lease))
+			set, err := oneSet(client.ClaimDocs(ctx, entroq.ClaimKey(ns, "count"), entroq.ClaimingSetsFor(lease)))
 			if err != nil {
 				t.Fatalf("Claim: %v", err)
 			}
@@ -1174,5 +1159,100 @@ func DocSets(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix s
 			t.Fatalf("Delete all: %v", err)
 		}
 		claim(0)
+	})
+}
+
+// DocClaimSets verifies claims of several doc sets: all of them or none,
+// each returned in the order named, members left out on request, and held
+// for a duration or until a given time.
+func DocClaimSets(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	ns := path.Join(qPrefix, "doc_claim_sets")
+	if _, err := client.Modify(ctx,
+		entroq.PuttingDocInto(ns, entroq.WithKeys("a", "1")),
+		entroq.PuttingDocInto(ns, entroq.WithKeys("a", "2")),
+		entroq.PuttingDocInto(ns, entroq.WithKeys("b", "1")),
+	); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	other := path.Join(qPrefix, "doc_claim_sets_other")
+
+	t.Run("every set comes back, in order, members as asked", func(t *testing.T) {
+		sets, err := client.ClaimDocs(ctx,
+			entroq.ClaimKey(ns, "b"),
+			entroq.ClaimKey(ns, "a").WithoutMembers(),
+			entroq.ClaimKey(other, "empty"),
+			entroq.ClaimingSetsFor(time.Minute),
+		)
+		if err != nil {
+			t.Fatalf("Claim: %v", err)
+		}
+		if len(sets) != 3 || sets[0].Key != "b" || sets[1].Key != "a" || sets[2].Key != "empty" {
+			t.Fatalf("Claim: want b, a, empty in order, got %+v", sets)
+		}
+		if len(sets[0].Docs) != 1 {
+			t.Errorf("Set b: want its 1 doc, got %d", len(sets[0].Docs))
+		}
+		if len(sets[1].Docs) != 0 || sets[1].NumDocs != 2 {
+			t.Errorf("Set a claimed without members: want no docs and a count of 2, got %d docs, count %d", len(sets[1].Docs), sets[1].NumDocs)
+		}
+		for _, g := range sets {
+			if g.Claimant != client.ClientID {
+				t.Errorf("Set %s: want it held by %s, got %q", g.Key, client.ClientID, g.Claimant)
+			}
+		}
+		if _, err := client.UpdateArrival(ctx, entroq.ReadyNow().Docs(sets...)); err != nil {
+			t.Fatalf("Release: %v", err)
+		}
+	})
+
+	t.Run("a held set leaves nothing claimed", func(t *testing.T) {
+		held, err := oneSet(client.ClaimDocs(ctx, entroq.ClaimKey(ns, "b"), entroq.ClaimingSetsAs("holder")))
+		if err != nil {
+			t.Fatalf("Holder claim: %v", err)
+		}
+		_, err = client.ClaimDocs(ctx, entroq.ClaimKey(ns, "a"), entroq.ClaimKey(ns, "b"))
+		depErr, ok := entroq.AsDependency(err)
+		if !ok || !depErr.HasClaimedDocs() {
+			t.Fatalf("Claim of a free set and a held one: want a claimed-docs dependency, got %v", err)
+		}
+		if ref := depErr.DocClaims[0]; !ref.IsSetRef() || ref.Key != "b" {
+			t.Errorf("Claim failure: want it to name set b first, got %v", ref)
+		}
+		// The free set was not claimed: someone else can take it at once.
+		if _, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "a"), entroq.ClaimingSetsAs("third")); err != nil {
+			t.Errorf("Free set after the failed claim: want it unclaimed, got %v", err)
+		}
+		if _, err := client.UpdateArrival(ctx, entroq.ReadyNow().Docs(held)); err == nil {
+			t.Error("Release of another's set: want a dependency error")
+		}
+	})
+
+	t.Run("a claim until a time holds every set until then", func(t *testing.T) {
+		until := time.Now().Add(time.Hour).Truncate(time.Millisecond)
+		sets, err := client.ClaimDocs(ctx,
+			entroq.ClaimKey(other, "until-1"), entroq.ClaimKey(other, "until-2"),
+			entroq.ClaimingSetsUntil(until),
+		)
+		if err != nil {
+			t.Fatalf("Claim: %v", err)
+		}
+		for _, g := range sets {
+			if !g.At.Equal(until) {
+				t.Errorf("Set %s: want it held until %v, got %v", g.Key, until, g.At)
+			}
+		}
+	})
+
+	t.Run("a claim must name its sets once, with one lease, not in the past", func(t *testing.T) {
+		for name, args := range map[string][]entroq.DocClaimArg{
+			"no sets":     {entroq.ClaimingSetsFor(time.Minute)},
+			"a set twice": {entroq.ClaimKey(other, "twice"), entroq.ClaimKey(other, "twice")},
+			"two leases":  {entroq.ClaimKey(other, "leases"), entroq.ClaimingSetsFor(time.Minute), entroq.ClaimingSetsFor(time.Hour)},
+			"a past time": {entroq.ClaimKey(other, "past"), entroq.ClaimingSetsUntil(time.Now().Add(-time.Minute))},
+		} {
+			if _, err := client.ClaimDocs(ctx, args...); !entroq.IsInvalidArgument(err) {
+				t.Errorf("%s: want an invalid argument, got %v", name, err)
+			}
+		}
 	})
 }

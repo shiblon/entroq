@@ -180,16 +180,21 @@ runs, so plan a short maintenance window on large doc tables.
   "already committed": the new `DependencyError.OnlyCollisions` says when a
   failure was only collisions. For docs, claim the set (it may be empty),
   look, then insert what is missing.
-- **Breaking (Go): `ClaimDocs` returns the set it claimed.**
-  `EntroQ.ClaimDocs` and `Backend.ClaimDocs` return a `*entroq.DocSet`: the
-  set's namespace, key, version, claimant, and arrival time, with its
-  members in `Docs`. A set claimed with no docs still reports its version
-  and claim, which a list of members could not. On the wire,
-  `ClaimDocsResponse` gains a `set` field beside its docs, so older clients
-  keep reading the members as before; the Go client rebuilds the set from
-  the members when a server older than this one sends none. Replace
-  `docs, err := eq.ClaimDocs(...)` with `set, err := ...` and read
-  `set.Docs`.
+- **Breaking (Go): `ClaimDocs` claims several doc sets, all or none.**
+  `eq.ClaimDocs(ctx, args...)` takes `entroq.DocClaimArg`s: each
+  `entroq.ClaimKey(ns, key)` names a set (`.WithoutMembers()` returns it
+  without its docs, with its count), and one `entroq.ClaimingSetsFor(d)` or
+  `entroq.ClaimingSetsUntil(t)` sets the lease, `DefaultClaimDuration` by
+  default; `entroq.ClaimingSetsAs` claims for another claimant, as `ModifyAs`
+  modifies. Every set is claimed, or, if anyone else holds one, none is, with
+  a `DependencyError` naming each held set. It returns `[]*entroq.DocSet`,
+  in the order named, each with its namespace, key, version, claimant,
+  arrival time, count, and members; a set claimed with no docs still reports
+  its lock. `Backend.ClaimDocs` takes the `*entroq.DocClaim` they build
+  (`entroq.NewDocClaim`). Replace `eq.ClaimDocs(ctx, entroq.ClaimKey(ns,
+  k).For(d))` with `eq.ClaimDocs(ctx, entroq.ClaimKey(ns, k),
+  entroq.ClaimingSetsFor(d))`, and read the set as the result's first.
+  The unused `DocClaimOpt`, `LockingFor`, and `WithDocClaimant` are removed.
 - **Work gateway protocol 1.** `eqlink work` opens every session with a
   `hello` naming the protocol version it speaks (`workgateway.Protocol`) and
   its release, so a worker checks compatibility before any task and names both
@@ -264,14 +269,16 @@ runs, so plan a short maintenance window on large doc tables.
     `new_data.at_ms`. The service refuses a mode it does not know.
   - `DocID` names a doc by `id` or by `key`, in a oneof, with
     `secondary_key`: a key alone names a doc set.
-  - `DocClaim.sets` names the doc sets to claim, by key; `namespace` and `key`
-    are for protocol 1 and ignored when sets are given. For now a claim names
-    one set, and more is `Unimplemented`.
+  - `DocClaim.sets` names the doc sets to claim, as `SetClaim`s (a set by key,
+    and `omit_members`), all or none; `namespace` and `key` are for protocol
+    1 and ignored when sets are given. `DocClaim.at_ms` holds the sets until
+    a time instead of for `duration_ms`.
   - `ClaimDocsResponse.sets` lists every claimed set as a `Doc` with no ID or
     content, empty sets included, and `ModifyResponse.changed_docs` returns a
     set whose lease changed the same way. `Doc.len` counts a set's docs.
-  - Naming a doc by key for anything but a set arrival, or naming a set
-    arrival by a doc's ID, is `Unimplemented` for now.
+  - Naming a doc by key for anything but a set arrival is `Unimplemented`
+    for now. A set arrival naming a doc's ID is an invalid argument: a set is
+    named by its namespace and key.
 - **The service refuses changes with nothing in them.** A task or doc change
   with no identifier or no data, a delete or depend naming no doc, and an
   arrival naming no task or set are invalid arguments. A 1.12 server applied
@@ -293,11 +300,18 @@ runs, so plan a short maintenance window on large doc tables.
   doc index when it reads a lock; the in-memory backend keeps it on the lock and
   recounts after replaying a journal. Upgrading from 1.12 counts each set's
   docs as it gives the set its lock.
-- **Breaking (Go): worker handlers receive doc sets.** `DoWork`, `DoModify`,
-  and `Finish` handlers, and the `Handler` interface, take
-  `[]*entroq.DocSet` where they took `[]*entroq.Doc`: one set per claim
-  from `TakeDocs`, in claim order, each with its docs and its version and
-  claim, including a set claimed with no docs. `entroq.DocsIn(sets)`
+- **Breaking (Go): worker handlers receive doc sets, and name them with
+  `worker.Take`.** `TakeDocs` returns a `*worker.TakeResult`, built with
+  `worker.Take(entroq.ClaimKey(...), ...)` as a DoModify result is with
+  `worker.Modify`. The worker claims every set at once, as itself and until
+  the task's own arrival time, so the task and its sets expire together; it
+  ignores any lease or claimant among the arguments, as it fixes the versions
+  of a `Modify` result. A set someone else holds leaves none claimed, and the
+  task retries with backoff. `DoWork`, `DoModify`, and `Finish` handlers, and
+  the `Handler` interface, take `[]*entroq.DocSet` where they took
+  `[]*entroq.Doc`: one set per `ClaimKey`, sorted by namespace and key, each
+  with its docs and its version and claim, including a set claimed with no
+  docs. `entroq.DocsIn(sets)`
   flattens them to the docs handlers received before. A handler that ignored
   its docs only changes the parameter type.
 - **Schemas carry a digest, and unreleased ones a `-dev` version.**

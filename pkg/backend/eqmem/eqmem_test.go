@@ -583,6 +583,10 @@ func TestEQMemClaimsReset(t *testing.T) {
 	RunQTest(t, eqtest.ClaimsReset)
 }
 
+func TestEQMemDocClaimSets(t *testing.T) {
+	RunQTest(t, eqtest.DocClaimSets)
+}
+
 func TestEQMemSimpleDocLifecycle(t *testing.T) {
 	RunQTest(t, eqtest.SimpleDocLifecycle)
 }
@@ -766,11 +770,11 @@ func TestEQMemJournalDocClaim(t *testing.T) {
 	); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
-	set, err := eq.ClaimDocs(ctx, entroq.ClaimKey(namespace, "g").For(time.Hour))
-	if err != nil || len(set.Docs) != 2 {
-		t.Fatalf("Claim: %v, %v", err, set)
+	sets, err := eq.ClaimDocs(ctx, entroq.ClaimKey(namespace, "g"), entroq.ClaimingSetsFor(time.Hour))
+	if err != nil || len(sets[0].Docs) != 2 {
+		t.Fatalf("Claim: %v, %v", err, sets)
 	}
-	held := set.Docs
+	held := sets[0].Docs
 	holder := eq.ClientID
 	if err := eq.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -781,15 +785,15 @@ func TestEQMemJournalDocClaim(t *testing.T) {
 		t.Fatalf("Reopen: %v", err)
 	}
 	defer eq.Close()
-	if _, err := eq.ClaimDocs(ctx, &entroq.DocClaim{Namespace: namespace, Key: "g", Claimant: "other", Duration: time.Minute}); !entroq.IsDependency(err) {
+	if _, err := eq.ClaimDocs(ctx, entroq.ClaimKey(namespace, "g"), entroq.ClaimingSetsAs("other"), entroq.ClaimingSetsFor(time.Minute)); !entroq.IsDependency(err) {
 		t.Errorf("Claim by another after replay: want a dependency error, got %v", err)
 	}
 	if _, err := eq.Modify(ctx, held[0].Delete(), entroq.ModifyAs(holder)); err != nil {
 		t.Errorf("Holder delete at the claimed version after replay: %v", err)
 	}
 	// The journal records no doc counts; replay sets them from the docs.
-	if set, err := eq.ClaimDocs(ctx, entroq.ClaimKey(namespace, "g").For(time.Minute)); err != nil || set.NumDocs != 1 {
-		t.Errorf("Claim after replay and a delete: want 1 doc counted, got %v, %v", set, err)
+	if sets, err := eq.ClaimDocs(ctx, entroq.ClaimKey(namespace, "g"), entroq.ClaimingSetsFor(time.Minute)); err != nil || sets[0].NumDocs != 1 {
+		t.Errorf("Claim after replay and a delete: want 1 doc counted, got %v, %v", sets, err)
 	}
 }
 
@@ -1029,10 +1033,11 @@ func TestEQMemJournalUpdateArrival(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Claim task: %v", err)
 	}
-	set, err := eq.ClaimDocs(ctx, entroq.ClaimKey(namespace, "g").For(time.Minute))
+	sets, err := eq.ClaimDocs(ctx, entroq.ClaimKey(namespace, "g"), entroq.ClaimingSetsFor(time.Minute))
 	if err != nil {
 		t.Fatalf("Claim set: %v", err)
 	}
+	set := sets[0]
 	resp, err := eq.UpdateArrival(ctx, entroq.ReadyIn(time.Hour).Tasks(task).Docs(set))
 	if err != nil {
 		t.Fatalf("Renew: %v", err)

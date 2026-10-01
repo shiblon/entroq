@@ -203,6 +203,10 @@ func TestGRPCClaimsReset(t *testing.T) {
 	RunQTest(t, eqtest.ClaimsReset)
 }
 
+func TestGRPCDocClaimSets(t *testing.T) {
+	RunQTest(t, eqtest.DocClaimSets)
+}
+
 func TestGRPCSimpleDocLifecycle(t *testing.T) {
 	RunQTest(t, eqtest.SimpleDocLifecycle)
 }

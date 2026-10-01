@@ -4,36 +4,40 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shiblon/entroq"
 	pb "github.com/shiblon/entroq/api"
 )
 
-// TestClaimedGroupFromOlderServer checks the set a client builds from a
-// ClaimDocs response without one, as servers before 1.13 send: its version and
-// claim come from the members, which carry them.
-func TestClaimedGroupFromOlderServer(t *testing.T) {
-	cq := entroq.ClaimKey("ns", "k")
+// TestClaimedSets checks that a ClaimDocs response's members go to their
+// sets, in the order the sets came, and that a set claimed without its
+// members comes back with none.
+func TestClaimedSets(t *testing.T) {
 	at := time.UnixMilli(time.Now().Add(time.Minute).UnixMilli())
-	resp := &pb.ClaimDocsResponse{Docs: []*pb.Doc{
-		{Namespace: "ns", Id: "a", Key: "k", Version: 7, Claimant: "me", AtMs: at.UnixMilli()},
-		{Namespace: "ns", Id: "b", Key: "k", Version: 7, Claimant: "me", AtMs: at.UnixMilli()},
-	}}
-	g := claimedSet(cq, resp)
-	if g.Namespace != "ns" || g.Key != "k" || g.Version != 7 || g.Claimant != "me" || !g.At.Equal(at) || len(g.Docs) != 2 {
-		t.Errorf("Set rebuilt from members: got %+v", g)
+	resp := &pb.ClaimDocsResponse{
+		Sets: []*pb.Doc{
+			{Namespace: "ns", Key: "b", Version: 3, Claimant: "me", AtMs: at.UnixMilli(), Len: 1},
+			{Namespace: "ns", Key: "a", Version: 7, Claimant: "me", AtMs: at.UnixMilli(), Len: 2},
+			{Namespace: "ns", Key: "omitted", Version: 1, Claimant: "me", AtMs: at.UnixMilli(), Len: 5},
+		},
+		Docs: []*pb.Doc{
+			{Namespace: "ns", Id: "a1", Key: "a", Version: 7, Claimant: "me", AtMs: at.UnixMilli()},
+			{Namespace: "ns", Id: "b1", Key: "b", Version: 3, Claimant: "me", AtMs: at.UnixMilli()},
+			{Namespace: "ns", Id: "a2", Key: "a", Version: 7, Claimant: "me", AtMs: at.UnixMilli()},
+		},
 	}
-
-	empty := claimedSet(cq, &pb.ClaimDocsResponse{})
-	if empty.Namespace != "ns" || empty.Key != "k" || len(empty.Docs) != 0 {
-		t.Errorf("Empty set from an older server: got %+v", empty)
+	sets, err := claimedSets(resp)
+	if err != nil {
+		t.Fatalf("claimedSets: %v", err)
 	}
-}
-
-func TestClaimedGroupFromResponse(t *testing.T) {
-	at := time.UnixMilli(time.Now().Add(time.Minute).UnixMilli())
-	resp := &pb.ClaimDocsResponse{Sets: []*pb.Doc{{Namespace: "ns", Key: "k", Version: 3, Claimant: "me", AtMs: at.UnixMilli()}}}
-	g := claimedSet(entroq.ClaimKey("ns", "k"), resp)
-	if g.Version != 3 || g.Claimant != "me" || !g.At.Equal(at) || len(g.Docs) != 0 {
+	if len(sets) != 3 || sets[0].Key != "b" || sets[1].Key != "a" || sets[2].Key != "omitted" {
+		t.Fatalf("Sets: want b, a, omitted in that order, got %+v", sets)
+	}
+	if len(sets[0].Docs) != 1 || len(sets[1].Docs) != 2 || len(sets[2].Docs) != 0 {
+		t.Errorf("Members: want 1, 2, and none, got %d, %d, %d", len(sets[0].Docs), len(sets[1].Docs), len(sets[2].Docs))
+	}
+	if g := sets[1]; g.Version != 7 || g.Claimant != "me" || !g.At.Equal(at) || g.NumDocs != 2 {
 		t.Errorf("Set from the response: got %+v", g)
+	}
+	if sets[2].NumDocs != 5 {
+		t.Errorf("Set claimed without members: want its count, 5, got %d", sets[2].NumDocs)
 	}
 }

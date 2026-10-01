@@ -245,6 +245,10 @@ func TestClaimsReset(t *testing.T) {
 	RunQTest(t, eqtest.ClaimsReset)
 }
 
+func TestDocClaimSets(t *testing.T) {
+	RunQTest(t, eqtest.DocClaimSets)
+}
+
 func TestSimpleDocLifecycle(t *testing.T) {
 	RunQTest(t, eqtest.SimpleDocLifecycle)
 }

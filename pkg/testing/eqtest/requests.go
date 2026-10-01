@@ -27,7 +27,7 @@ func InvalidRequests(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 		"docs by ID with no namespace": second(client.Docs(ctx, &entroq.DocQuery{IDs: []string{"a"}})),
 		"doc claim with no namespace":  second(client.ClaimDocs(ctx, entroq.ClaimKey("", "k"))),
 		"doc claim with no key":        second(client.ClaimDocs(ctx, entroq.ClaimKey(ns, ""))),
-		"doc claim, negative duration": second(client.ClaimDocs(ctx, entroq.ClaimKey(ns, "k").For(-time.Second))),
+		"doc claim, negative duration": second(client.ClaimDocs(ctx, entroq.ClaimKey(ns, "k"), entroq.ClaimingSetsFor(-time.Second))),
 	} {
 		if !entroq.IsInvalidArgument(err) {
 			t.Errorf("%s: want an invalid argument, got %v", name, err)
@@ -53,11 +53,11 @@ func InvalidRequests(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 	if !task.At.After(before.Add(entroq.DefaultClaimDuration / 2)) {
 		t.Errorf("Claim for a zero duration: held until %v, want about %v from %v", task.At, entroq.DefaultClaimDuration, before)
 	}
-	docs, err := docsOf(client.ClaimDocs(ctx, entroq.ClaimKey(ns, "zero").For(0)))
+	docs, err := docsOf(client.ClaimDocs(ctx, entroq.ClaimKey(ns, "zero"), entroq.ClaimingSetsFor(0)))
 	if err != nil {
 		t.Fatalf("Doc claim for a zero duration: %v", err)
 	}
-	if _, err := client.ClaimDocs(ctx, &entroq.DocClaim{Namespace: ns, Key: "zero", Claimant: "intruder"}); !entroq.IsDependency(err) {
+	if _, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "zero"), entroq.ClaimingSetsAs("intruder")); !entroq.IsDependency(err) {
 		t.Errorf("Doc claim for a zero duration: want the group held, another claim got %v (docs %v)", err, docs)
 	}
 }
@@ -78,7 +78,7 @@ func BackendRejectsInvalidRequests(ctx context.Context, t *testing.T, backend en
 		"tasks with no queue or IDs": second(backend.Tasks(ctx, &entroq.TasksQuery{})),
 		"docs with no namespace":     second(backend.Docs(ctx, &entroq.DocQuery{IDs: []string{"a"}})),
 		"doc claim with no claimant": second(backend.ClaimDocs(ctx,
-			&entroq.DocClaim{Namespace: ns, Key: "k", Duration: time.Minute})),
+			entroq.NewDocClaim(entroq.ClaimKey(ns, "k"), entroq.ClaimingSetsFor(time.Minute)))),
 	} {
 		if !entroq.IsInvalidArgument(err) {
 			t.Errorf("%s: want an invalid argument, got %v", name, err)
@@ -98,7 +98,7 @@ func StorageRejectsZeroDurations(ctx context.Context, t *testing.T, backend entr
 		"claim": second(backend.TryClaim(ctx,
 			&entroq.ClaimQuery{Queues: []string{queue}, Claimant: "me"})),
 		"doc claim": second(backend.ClaimDocs(ctx,
-			&entroq.DocClaim{Namespace: ns, Key: "k", Claimant: "me"})),
+			entroq.NewDocClaim(entroq.ClaimKey(ns, "k"), entroq.ClaimingSetsAs("me")))),
 	} {
 		if !entroq.IsInvalidArgument(err) {
 			t.Errorf("%s for no duration: want an invalid argument, got %v", name, err)

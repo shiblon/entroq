@@ -50,8 +50,16 @@ func DocClaim(cq *entroq.DocClaim) error {
 	if err := cq.Validate(); err != nil {
 		return err
 	}
-	if cq.Duration == 0 {
-		return entroq.InvalidArgumentf("doc claim duration must be positive")
+	if cq.Duration == 0 && cq.At.IsZero() {
+		return entroq.InvalidArgumentf("doc claim must give a duration or a time")
+	}
+	for _, s := range cq.Sets {
+		if err := check("doc namespace", s.Namespace, MaxNamespaceBytes); err != nil {
+			return err
+		}
+		if err := check("doc key", s.Key, MaxDocKeyBytes); err != nil {
+			return err
+		}
 	}
 	return Claimant(cq.Claimant)
 }

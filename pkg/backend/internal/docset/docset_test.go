@@ -164,20 +164,20 @@ func TestEvaluateExpiredClaimProtectsNothing(t *testing.T) {
 }
 
 func TestClaimNewGroupStartsAtZero(t *testing.T) {
-	if l, ok := Claim(Absent, "me", now, time.Minute); !ok || l.Version != 0 {
+	if l, ok := Claim(Absent, "me", now, now.Add(time.Minute)); !ok || l.Version != 0 {
 		t.Errorf("First claim of a new set: want version 0, got %+v, %v", l, ok)
 	}
 }
 
 func TestClaim(t *testing.T) {
-	l, ok := Claim(Lock{Version: 2}, "me", now, time.Minute)
+	l, ok := Claim(Lock{Version: 2}, "me", now, now.Add(time.Minute))
 	if !ok || l.Version != 3 || l.Claimant != "me" || !l.At.Equal(now.Add(time.Minute)) {
 		t.Fatalf("Claim of an unheld set: got %+v, %v", l, ok)
 	}
-	if again, ok := Claim(l, "me", now, time.Hour); !ok || again.Version != 4 || !again.At.Equal(now.Add(time.Hour)) {
+	if again, ok := Claim(l, "me", now, now.Add(time.Hour)); !ok || again.Version != 4 || !again.At.Equal(now.Add(time.Hour)) {
 		t.Errorf("Holder claiming again: want version 4 and the new expiry, got %+v, %v", again, ok)
 	}
-	if _, ok := Claim(l, "other", now, time.Minute); ok {
+	if _, ok := Claim(l, "other", now, now.Add(time.Minute)); ok {
 		t.Error("Claim of a set held by someone else succeeded")
 	}
 }
@@ -256,7 +256,7 @@ func TestEvaluateCountsDocs(t *testing.T) {
 	if got := p.Locks[set].NumDocs; got != 3 {
 		t.Errorf("Two inserts, a delete, and a change in a set of 2: want 3 docs, got %d", got)
 	}
-	if l, ok := Claim(s.lock(set), "me", now, time.Minute); !ok || l.NumDocs != 2 {
+	if l, ok := Claim(s.lock(set), "me", now, now.Add(time.Minute)); !ok || l.NumDocs != 2 {
 		t.Errorf("Claim: want the count kept at 2, got %+v, %v", l, ok)
 	}
 }

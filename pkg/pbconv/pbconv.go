@@ -142,7 +142,7 @@ func docLease(old *pb.DocID, lease *pb.DocData) (entroq.ModifyArg, error) {
 	case old.GetRef() == nil:
 		return nil, invalidf("doc lease names no doc set")
 	case !ok:
-		return nil, unsupportedf("doc lease naming a doc by ID is not supported yet; name its set by key")
+		return nil, invalidf("doc lease names a doc by ID; name its set by key")
 	}
 	if ns := lease.GetNamespace(); ns != "" && ns != old.GetNamespace() {
 		return nil, invalidf("doc lease of %q cannot name another namespace %q", old.GetNamespace(), ns)

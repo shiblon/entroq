@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"slices"
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/backend/internal/docset"
@@ -90,30 +91,41 @@ func (m *EQMem) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, e
 	return found, nil
 }
 
-// ClaimDocs claims the set of docs sharing the given primary key in the
-// namespace and returns its members, which may be none: a set can be claimed
-// before it has docs. It fails with a DependencyError listing the members while
-// someone else holds the set.
-func (m *EQMem) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) (*entroq.DocSet, error) {
+// ClaimDocs claims every doc set cq names, all or none (see
+// docset.ClaimAll), holding every namespace involved at once, in order.
+func (m *EQMem) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.DocSet, error) {
 	if err := validate.DocClaim(cq); err != nil {
 		return nil, fmt.Errorf("eqmem claim docs: %w", err)
 	}
-	nls, unlock := m.lockNamespaces([]string{cq.Namespace})
+	sets := docset.SetsOf(cq)
+	var names []string
+	for _, g := range sets {
+		if !slices.Contains(names, g.Namespace) {
+			names = append(names, g.Namespace)
+		}
+	}
+	nls, unlock := m.lockNamespaces(names)
 	defer unlock()
-	nss := nls[0].docs
+	byNS := make(map[string]*docNamespace, len(nls))
+	for _, nl := range nls {
+		byNS[nl.namespace] = nl.docs
+	}
 
 	now, _ := m.Time(ctx)
-	members := nss.Members(cq.Key)
-	current := nss.Lock(cq.Key)
-	claimed, ok := docset.Claim(current, cq.Claimant, now, cq.Duration)
-	if !ok {
-		return nil, docset.HeldError(docset.Set{Namespace: cq.Namespace, Key: cq.Key}, current, members)
+	lock := func(g docset.Set) docset.Lock { return byNS[g.Namespace].Lock(g.Key) }
+	members := func(g docset.Set) ([]*entroq.Doc, error) { return byNS[g.Namespace].Members(g.Key), nil }
+	claimed, err := docset.ClaimAll(cq, now, lock, members)
+	if err != nil {
+		return nil, fmt.Errorf("eqmem claim docs: %w", err)
 	}
 
-	nss.SetLock(cq.Key, claimed)
-	if err := m.journalLocks(map[docset.Set]docset.Lock{{Namespace: cq.Namespace, Key: cq.Key}: claimed}); err != nil {
+	written := make(map[docset.Set]docset.Lock, len(sets))
+	for i, g := range sets {
+		byNS[g.Namespace].SetLock(g.Key, claimed[i])
+		written[g] = claimed[i]
+	}
+	if err := m.journalLocks(written); err != nil {
 		log.Fatalf("Inconsistent internal state: doc claim succeeded but could not be journaled: %v", err)
 	}
-
-	return docset.Claimed(docset.Set{Namespace: cq.Namespace, Key: cq.Key}, claimed, members), nil
+	return docset.ClaimedSets(cq, claimed, members)
 }
