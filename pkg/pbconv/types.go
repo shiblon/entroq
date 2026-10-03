@@ -45,12 +45,12 @@ func TaskFromProto(t *pb.Task) (*entroq.Task, error) {
 		Queue:    t.Queue,
 		ID:       t.Id,
 		Version:  t.Version,
-		At:       FromMS(t.AtMs),
+		At:       FromMSOrUnset(t.AtMs),
 		Claimant: t.ClaimantId,
 		Claims:   t.Claims,
 		Value:    val,
-		Created:  FromMS(t.CreatedMs),
-		Modified: FromMS(t.ModifiedMs),
+		Created:  FromMSOrUnset(t.CreatedMs),
+		Modified: FromMSOrUnset(t.ModifiedMs),
 		Attempt:  t.Attempt,
 		Err:      t.Err,
 	}, nil
@@ -178,12 +178,12 @@ func DocFromProto(d *pb.Doc) (*entroq.Doc, error) {
 		ID:           d.Id,
 		Version:      d.Version,
 		Claimant:     d.Claimant,
-		At:           FromMS(d.AtMs),
+		At:           FromMSOrUnset(d.AtMs),
 		Key:          d.Key,
 		SecondaryKey: d.SecondaryKey,
 		Content:      content,
-		Created:      FromMS(d.CreatedMs),
-		Modified:     FromMS(d.ModifiedMs),
+		Created:      FromMSOrUnset(d.CreatedMs),
+		Modified:     FromMSOrUnset(d.ModifiedMs),
 	}, nil
 }
 
@@ -208,7 +208,7 @@ func DocSetFromProto(d *pb.Doc, docs []*entroq.Doc) *entroq.DocSet {
 		Key:       d.Key,
 		Version:   d.Version,
 		Claimant:  d.Claimant,
-		At:        fromMSOrUnset(d.AtMs),
+		At:        FromMSOrUnset(d.AtMs),
 		NumDocs:   int(d.Len),
 		Docs:      docs,
 	}

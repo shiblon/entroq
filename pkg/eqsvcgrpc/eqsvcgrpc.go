@@ -1016,7 +1016,7 @@ func (s *QSvc) ClaimDocs(ctx context.Context, req *pb.ClaimDocsRequest) (*pb.Cla
 		if cq.GetDurationMs() != 0 {
 			return nil, codeErrorf(codes.InvalidArgument, "claim docs: give a duration or a time, not both")
 		}
-		args = append(args, entroq.ClaimingSetsUntil(pbconv.FromMS(cq.GetAtMs())))
+		args = append(args, entroq.ClaimingSetsUntil(pbconv.FromMSOrUnset(cq.GetAtMs())))
 	case cq.GetDurationMs() != 0:
 		args = append(args, entroq.ClaimingSetsFor(time.Duration(cq.GetDurationMs())*time.Millisecond))
 	}

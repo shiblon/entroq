@@ -27,12 +27,17 @@ func FromMS(ms int64) time.Time {
 	return time.Unix(0, ms*int64(time.Millisecond))
 }
 
-// fromMSOrUnset is FromMS for optional timestamps: a non-positive value means
+// FromMSOrUnset is FromMS for optional timestamps: a non-positive value means
 // the field was not set and yields Go's zero time, so a backend's IsZero
 // default applies. Go's zero time has no exact wire form (it encodes as a
 // large negative value), and clients that omit the field send 0, which would
 // otherwise decode as a real 1970 timestamp.
-func fromMSOrUnset(ms int64) time.Time {
+//
+// Decode every optional timestamp with this, not with FromMS: the IsZero
+// checks downstream are only correct when "unset" arrives as Go's zero time.
+// Reserve FromMS for a timestamp the wire always carries, such as a server's
+// own clock in a Time response.
+func FromMSOrUnset(ms int64) time.Time {
 	if ms <= 0 {
 		return time.Time{}
 	}
@@ -194,7 +199,7 @@ func ModifyArgsFromProto(req *pb.ModifyRequest, protocol int32) ([]entroq.Modify
 		}
 		modArgs = append(modArgs,
 			entroq.InsertingInto(insert.Queue,
-				entroq.WithArrivalTime(FromMS(insert.AtMs)),
+				entroq.WithArrivalTime(FromMSOrUnset(insert.AtMs)),
 				entroq.WithRawValue(val),
 				entroq.WithAttempt(insert.Attempt),
 				entroq.WithErr(insert.Err),
@@ -253,7 +258,7 @@ func ModifyArgsFromProto(req *pb.ModifyRequest, protocol int32) ([]entroq.Modify
 		if newQueue != oldQueue {
 			changeArgs = append(changeArgs, entroq.QueueTo(newQueue))
 		}
-		changeArgs = append(changeArgs, entroq.ArrivalTimeTo(FromMS(nd.GetAtMs())))
+		changeArgs = append(changeArgs, entroq.ArrivalTimeTo(FromMSOrUnset(nd.GetAtMs())))
 		if reset {
 			changeArgs = append(changeArgs, entroq.ResettingClaims())
 		}
@@ -273,12 +278,12 @@ func ModifyArgsFromProto(req *pb.ModifyRequest, protocol int32) ([]entroq.Modify
 		modArgs = append(modArgs, entroq.PuttingDoc(&entroq.DocData{
 			Namespace:    di.Namespace,
 			ID:           di.Id,
-			At:           FromMS(di.AtMs),
+			At:           FromMSOrUnset(di.AtMs),
 			Key:          di.Key,
 			SecondaryKey: di.SecondaryKey,
 			Content:      val,
-			Created:      fromMSOrUnset(di.CreatedMs),
-			Modified:     fromMSOrUnset(di.ModifiedMs),
+			Created:      FromMSOrUnset(di.CreatedMs),
+			Modified:     FromMSOrUnset(di.ModifiedMs),
 		}))
 	}
 	for _, dc := range req.DocChanges {
@@ -329,9 +334,10 @@ func ModifyArgsFromProto(req *pb.ModifyRequest, protocol int32) ([]entroq.Modify
 			Content:      val,
 		}
 		// Pass the wire arrival time as an option: Change resets At by default
-		// (release), so an explicit time must come through the option to survive. A
-		// far-past value (an unset wire time) is capped to now by the backend.
-		modArgs = append(modArgs, d.Change(entroq.WithDocArrivalTime(FromMS(nd.GetAtMs()))))
+		// (release), so an explicit time must come through the option to survive. An
+		// unset wire time decodes to Go's zero time, which the backend caps to now
+		// along with any other far-past value.
+		modArgs = append(modArgs, d.Change(entroq.WithDocArrivalTime(FromMSOrUnset(nd.GetAtMs()))))
 	}
 	for _, dd := range req.DocDeletes {
 		id, err := docByID(dd, "doc delete")
