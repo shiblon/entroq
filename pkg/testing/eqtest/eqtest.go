@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/shiblon/entroq"
@@ -69,9 +70,18 @@ func ClientService(ctx context.Context, opener entroq.BackendOpener) (client *en
 // backend's readiness/GC loops are rooted at context.Background(), so a service
 // left unclosed leaks a heartbeat ticker that keeps mutating shared state (e.g.
 // eqpg's notification watermark) and can perturb later tests.
+//
+// The service's claim lease bounds are opened up to a millisecond floor. The
+// contract tests claim with sub-second leases on purpose, to watch a lease
+// expire and the next claimant take over, and the production floor of thirty
+// seconds would turn those into thirty-second waits that no longer test
+// expiry at all. This widens a policy knob; it does not weaken an assertion,
+// and every test keeps asserting exactly what it did before.
 func StartService(ctx context.Context, opener entroq.BackendOpener) (stop func(), dial Dialer, err error) {
 	lis := bufconn.Listen(bufSize)
-	svc, err := eqsvcgrpc.New(ctx, opener)
+	svc, err := eqsvcgrpc.New(ctx, opener,
+		eqsvcgrpc.WithClaimLeaseBounds(time.Millisecond, entroq.MaxClaimDuration),
+	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("start service: %w", err)
 	}

@@ -71,6 +71,10 @@ type QSvc struct {
 	mp             metric.MeterProvider
 	metricInterval time.Duration
 
+	leaseFloor   time.Duration
+	leaseCeiling time.Duration
+	leaseClamped metric.Int64Counter
+
 	// guards the cached stats used by the observable gauge callback.
 	mu                   sync.Mutex
 	lastQueueRefresh     time.Time
@@ -104,6 +108,37 @@ func WithMetricInterval(d time.Duration) Option {
 			d = 5 * time.Second
 		}
 		s.metricInterval = d
+	}
+}
+
+// Default bounds a client's requested claim lease is clamped into, for tasks
+// and doc sets alike, unless WithClaimLeaseBounds says otherwise.
+//
+// The floor is the default claim duration, so a client may ask for a LONGER
+// lease but never a shorter one. The server dictates lease length because a
+// client has no incentive to be careful with it: a lease too short to survive
+// its own first renewal churns storage and burns claim counts for every other
+// client, not just the one that asked. The ceiling bounds the other direction,
+// how long a worker that died holding a claim can strand it, since guaranteed
+// forward progress matters more than any one holder's wishes.
+const (
+	DefaultClaimLeaseFloor   = entroq.DefaultClaimDuration
+	DefaultClaimLeaseCeiling = time.Hour
+)
+
+// WithClaimLeaseBounds sets the range a client's requested claim lease is
+// clamped into, replacing DefaultClaimLeaseFloor and DefaultClaimLeaseCeiling.
+// A request naming no duration is left alone for the default to apply; one
+// outside the bounds is clamped to the nearer bound and counted, rather than
+// refused, because a lease shorter than the floor is a legitimate thing for a
+// client to ask when its own deadline is near. Asking for something nobody
+// could have meant is refused earlier, by entroq.MaxClaimDuration.
+//
+// New reports an error if the ceiling is below the floor, or either is not
+// positive.
+func WithClaimLeaseBounds(floor, ceiling time.Duration) Option {
+	return func(s *QSvc) {
+		s.leaseFloor, s.leaseCeiling = floor, ceiling
 	}
 }
 
@@ -142,6 +177,8 @@ func New(ctx context.Context, opener entroq.BackendOpener, opts ...Option) (*QSv
 		mp:             noop.NewMeterProvider(),
 		metricInterval: time.Minute,
 		authzHeader:    "authorization",
+		leaseFloor:     DefaultClaimLeaseFloor,
+		leaseCeiling:   DefaultClaimLeaseCeiling,
 	}
 
 	for _, o := range opts {
@@ -150,6 +187,14 @@ func New(ctx context.Context, opener entroq.BackendOpener, opts ...Option) (*QSv
 	if (svc.an == nil) != (svc.az == nil) {
 		_ = impl.Close()
 		return nil, fmt.Errorf("eqsvcgrpc authentication and authorization must be configured together")
+	}
+	if svc.leaseFloor <= 0 || svc.leaseCeiling <= 0 || svc.leaseCeiling < svc.leaseFloor {
+		_ = impl.Close()
+		return nil, fmt.Errorf("eqsvcgrpc claim lease bounds must be positive with ceiling >= floor, got [%v, %v]", svc.leaseFloor, svc.leaseCeiling)
+	}
+	if svc.leaseCeiling > entroq.MaxClaimDuration {
+		_ = impl.Close()
+		return nil, fmt.Errorf("eqsvcgrpc claim lease ceiling %v exceeds the sanity bound %v", svc.leaseCeiling, entroq.MaxClaimDuration)
 	}
 
 	if err := svc.initMetrics(); err != nil {
@@ -179,6 +224,11 @@ func (s *QSvc) initMetrics() error {
 	)
 	if err != nil {
 		return fmt.Errorf("namespace size gauge: %w", err)
+	}
+	if s.leaseClamped, err = meter.Int64Counter("entroq.claim.lease_clamped",
+		metric.WithDescription("Claims whose requested lease was clamped into the service's bounds, by kind and reason."),
+	); err != nil {
+		return fmt.Errorf("lease clamped counter: %w", err)
 	}
 
 	_, err = meter.RegisterCallback(func(ctx context.Context, o metric.Observer) error {
@@ -601,7 +651,7 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 	if req.PollMs > 0 {
 		pollTime = time.Duration(req.PollMs) * time.Millisecond
 	}
-	opts := append(claimOpts(req), entroq.ClaimPollTime(pollTime))
+	opts := append(s.claimOpts(ctx, req), entroq.ClaimPollTime(pollTime))
 	if err := entroq.NewClaimQuery(opts...).Validate(); err != nil {
 		return nil, autoCodeErrorf("claim: %w", err)
 	}
@@ -639,7 +689,7 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 	if _, err := negotiate(ctx, req); err != nil {
 		return nil, err
 	}
-	opts := claimOpts(req)
+	opts := s.claimOpts(ctx, req)
 	if err := entroq.NewClaimQuery(opts...).Validate(); err != nil {
 		return nil, autoCodeErrorf("try claim: %w", err)
 	}
@@ -663,12 +713,42 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 
 // claimOpts are the claim options a request asks for. The claimant is the
 // request's, never the service's own: an empty one fails the claim's check.
-func claimOpts(req *pb.ClaimRequest) []entroq.ClaimOpt {
+func (s *QSvc) claimOpts(ctx context.Context, req *pb.ClaimRequest) []entroq.ClaimOpt {
 	return []entroq.ClaimOpt{
 		entroq.From(req.Queues...),
-		entroq.ClaimFor(time.Duration(req.DurationMs) * time.Millisecond),
+		entroq.ClaimFor(s.clampLease(ctx, "task", time.Duration(req.DurationMs)*time.Millisecond)),
 		entroq.WithClaimant(req.ClaimantId),
 	}
+}
+
+// clampLease brings a client's requested lease within the service's bounds,
+// counting any clamp it makes so an operator can see a client asking for
+// something it will not get. A non-positive duration means the request named
+// none, and comes back unchanged so the caller's own default applies.
+//
+// It clamps rather than refuses. A lease below the floor is a reasonable thing
+// to ask for -- a worker whose own deadline is near wants its doc sets to
+// expire with it -- it just cannot have it, because a lease too short to
+// survive its first renewal costs every other client. A lease nobody could
+// have meant was already refused by entroq.MaxClaimDuration.
+func (s *QSvc) clampLease(ctx context.Context, kind string, d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	bounded, reason := d, ""
+	switch {
+	case d < s.leaseFloor:
+		bounded, reason = s.leaseFloor, "below_floor"
+	case d > s.leaseCeiling:
+		bounded, reason = s.leaseCeiling, "above_ceiling"
+	}
+	if reason != "" {
+		s.leaseClamped.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("kind", kind),
+			attribute.String("reason", reason),
+		))
+	}
+	return bounded
 }
 
 // Modify attempts to make the specified modification from the given
@@ -1018,7 +1098,7 @@ func (s *QSvc) ClaimDocs(ctx context.Context, req *pb.ClaimDocsRequest) (*pb.Cla
 		}
 		args = append(args, entroq.ClaimingSetsUntil(pbconv.FromMSOrUnset(cq.GetAtMs())))
 	case cq.GetDurationMs() != 0:
-		args = append(args, entroq.ClaimingSetsFor(time.Duration(cq.GetDurationMs())*time.Millisecond))
+		args = append(args, entroq.ClaimingSetsFor(s.clampLease(ctx, "doc", time.Duration(cq.GetDurationMs())*time.Millisecond)))
 	}
 	dc := entroq.NewDocClaim(args...)
 	if err := dc.Validate(); err != nil {
