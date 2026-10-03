@@ -1067,3 +1067,16 @@ func TestEQMemJournalUpdateArrival(t *testing.T) {
 		t.Errorf("Release of the set at its renewed version after replay: %v", err)
 	}
 }
+
+// TestEQMemJournalRestoresArrivals runs the journal arrival contract against
+// eqmem, the one backend that journals. The contract lives in eqtest so a
+// second journaling backend inherits it rather than reinventing it.
+func TestEQMemJournalRestoresArrivals(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	journalDir := t.TempDir()
+	eqtest.JournalRestoresArrivals(ctx, t, func() (*entroq.EntroQ, error) {
+		return entroq.New(ctx, Opener(WithJournal(journalDir)))
+	}, "/journal/arrivals")
+}
