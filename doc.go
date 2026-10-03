@@ -443,9 +443,9 @@ func NewDocClaim(args ...DocClaimArg) *DocClaim {
 
 // Validate checks that the claim names at least one set, each once by
 // namespace and key, a claimant, and at most one lease, and that its duration
-// is not negative. A zero duration and no time means the default, which
-// ClaimDocs fills in. Whether At is in the future is the backend's to check,
-// by its own clock.
+// is neither negative nor longer than MaxClaimDuration. A zero duration and no
+// time means the default, which ClaimDocs fills in. Whether At is in the
+// future, or too far into it, is the backend's to check, by its own clock.
 func (q *DocClaim) Validate() error {
 	if len(q.Sets) == 0 {
 		return InvalidArgumentf("doc claim must name a doc set")
@@ -472,6 +472,9 @@ func (q *DocClaim) Validate() error {
 	}
 	if q.Duration < 0 {
 		return InvalidArgumentf("doc claim duration must not be negative, got %v", q.Duration)
+	}
+	if q.Duration > MaxClaimDuration {
+		return InvalidArgumentf("doc claim duration is %v, limit is %v (a unit error?)", q.Duration, MaxClaimDuration)
 	}
 	if q.Duration > 0 && !q.At.IsZero() {
 		return InvalidArgumentf("doc claim gives both a duration and a time")

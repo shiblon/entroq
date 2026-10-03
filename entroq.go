@@ -114,6 +114,19 @@ const (
 	DefaultClaimDuration = 30 * time.Second
 )
 
+// MaxClaimDuration bounds how long any claim may hold a task or doc set. It is
+// a sanity bound, not a policy one: a service sets policy, and its limits are
+// far tighter, measured in minutes. This one only refuses a lease nobody could
+// have meant, so that a backend never stores an arrival no one can wait out.
+//
+// It sits below the most common way to get one by accident. A time.Duration
+// counts nanoseconds, so an int64(30*time.Second) passed where milliseconds
+// were expected asks for thirty billion milliseconds, or about 347 days; a
+// bound of a year would let that through, and thirty days does not. Nothing
+// legitimate wants a claim this long, because a lease is held by a live worker
+// that renews it, not by one that asks for a month up front.
+const MaxClaimDuration = 30 * 24 * time.Hour
+
 // ClaimQuery contains information necessary to attempt to make a claim on a task in a specific queue.
 type ClaimQuery struct {
 	Queues   []string      // Queues to attempt to claim from. Only one wins.
@@ -123,7 +136,8 @@ type ClaimQuery struct {
 }
 
 // Validate checks that the claim names at least one queue, a claimant, and a
-// positive duration, returning an InvalidArgumentError otherwise.
+// duration that is positive and no longer than MaxClaimDuration, returning an
+// InvalidArgumentError otherwise.
 func (q *ClaimQuery) Validate() error {
 	if len(q.Queues) == 0 {
 		return InvalidArgumentf("claim must name at least one queue")
@@ -133,6 +147,9 @@ func (q *ClaimQuery) Validate() error {
 	}
 	if q.Duration <= 0 {
 		return InvalidArgumentf("claim duration must be positive, got %v", q.Duration)
+	}
+	if q.Duration > MaxClaimDuration {
+		return InvalidArgumentf("claim duration is %v, limit is %v (a unit error?)", q.Duration, MaxClaimDuration)
 	}
 	return nil
 }
