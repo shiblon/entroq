@@ -142,7 +142,10 @@ func TestModifyArgsFromProtoRefusesMissingParts(t *testing.T) {
 }
 
 func TestModifyArgsFromProtoLeases(t *testing.T) {
-	at := time.Date(2026, 9, 27, 12, 0, 0, 0, time.UTC)
+	// A lease renews into the future, and at_ms carries milliseconds, so the
+	// instant is truncated to what the wire can represent exactly.
+	const ahead = time.Minute
+	at := time.Now().Add(ahead).Truncate(time.Millisecond)
 	mod, err := modification(t, &pb.ModifyRequest{
 		Changes: []*pb.TaskChange{{
 			OldId:   &pb.TaskID{Id: "t", Version: 3, Queue: "q"},
@@ -161,8 +164,12 @@ func TestModifyArgsFromProtoLeases(t *testing.T) {
 	if len(mod.Changes) != 0 || len(mod.DocChanges) != 0 {
 		t.Errorf("Leases became changes: %v", mod)
 	}
-	if len(mod.Arrives) != 1 || mod.Arrives[0].TaskID != (entroq.TaskID{ID: "t", Version: 3, Queue: "q"}) || !mod.Arrives[0].At.Equal(at) {
-		t.Errorf("Task lease: got %+v", mod.Arrives)
+	// A task lease arrives as a duration: at_ms, which only a protocol-1 client
+	// still sends, is converted against the server's now, so the assertion is
+	// on how far ahead it lands, not on the instant itself.
+	if len(mod.Arrives) != 1 || mod.Arrives[0].TaskID != (entroq.TaskID{ID: "t", Version: 3, Queue: "q"}) ||
+		(mod.Arrives[0].By - ahead).Abs() > time.Second {
+		t.Errorf("Task lease: got %+v, want ready in %v", mod.Arrives, ahead)
 	}
 	if len(mod.DocArrives) != 1 || mod.DocArrives[0].DocID != *entroq.NewDocSetRef("ns", "k", 5) || !mod.DocArrives[0].At.Equal(at) {
 		t.Errorf("Doc set lease: got %+v", mod.DocArrives)

@@ -14,7 +14,8 @@ func TestArrivingBuildsArrivals(t *testing.T) {
 	if len(mod.Arrives) != 1 || len(mod.DocArrives) != 1 {
 		t.Fatalf("Modification: got %v", mod)
 	}
-	if got := mod.Arrives[0]; got.TaskID != (TaskID{ID: "t", Version: 3, Queue: "q"}) || time.Until(got.At) < 59*time.Second {
+	// A duration needs no drift tolerance: it is exactly what was asked for.
+	if got := mod.Arrives[0]; got.TaskID != (TaskID{ID: "t", Version: 3, Queue: "q"}) || got.By != time.Minute {
 		t.Errorf("Task arrival: want task t ready in a minute, got %+v", got)
 	}
 	if got := mod.DocArrives[0]; got.DocID != *NewDocSetRef("ns", "k", 5) || !got.At.IsZero() {

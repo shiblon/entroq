@@ -219,7 +219,7 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 		}
 
 		// Task arrivals are changes of the stored tasks' arrival times alone.
-		mod = arrival.Changes(mod, now, func(id string) *entroq.Task {
+		mod = arrival.Changes(mod, func(id string) *entroq.Task {
 			if st := states[id]; st != nil && st.found {
 				return st.fields.toTask()
 			}
@@ -340,8 +340,11 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 				// EnsureModifyKeys (called at Modify entry) rejects an empty change
 				// destination, so t.Queue is non-empty here.
 				newQueue := t.Queue
-				// Cap a far-past arrival to now (backend Modify contract).
-				newAtMs := entroq.NormalizeArrival(t.At, now).UnixMilli()
+				// A write names its arrival only as a duration from this
+				// backend's own now (backend Modify contract). The cap keeps a
+				// negative one from ordering the task ahead of everything
+				// already waiting.
+				newAtMs := entroq.NormalizeArrival(now.Add(t.By()), now).UnixMilli()
 
 				// Future at: claim/renew (set claimant to modifier).
 				// Past/zero at: release (clear claimant).
@@ -400,7 +403,7 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 				if id == "" {
 					id = entroq.GenHex16()
 				}
-				atMs := entroq.NormalizeArrival(td.At, now).UnixMilli()
+				atMs := entroq.NormalizeArrival(now.Add(td.By()), now).UnixMilli()
 				// As for a change, the writer holds a task that is not yet
 				// available.
 				insClaimant := ""

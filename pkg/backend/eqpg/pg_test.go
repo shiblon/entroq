@@ -87,8 +87,7 @@ func TestReadinessLoop(t *testing.T) {
 	queue := fmt.Sprintf("/test/readiness/%d", time.Now().UnixNano())
 
 	// Arrive in the future so the insert itself wakes no one.
-	at := time.Now().Add(2 * time.Second)
-	if _, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithArrivalTime(at))); err != nil {
+	if _, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithArrivalTimeIn(2*time.Second))); err != nil {
 		t.Fatalf("Failed to insert delayed task: %v", err)
 	}
 

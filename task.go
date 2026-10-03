@@ -61,8 +61,14 @@ func (t TaskID) Depend() ModifyArg {
 
 // TaskData contains just the data, not the identifier or metadata. Used for insertions.
 type TaskData struct {
-	Queue string          `json:"queue"`
-	At    time.Time       `json:"at"`
+	Queue string `json:"queue"`
+
+	// by is how long from the backend's own now the task arrives, and is the
+	// only way an insert names an arrival. Unexported, and not serialized,
+	// because it is an instruction rather than stored state: only
+	// WithArrivalTimeIn sets it, and By reads it.
+	by time.Duration
+
 	Value json.RawMessage `json:"value"`
 
 	// Attempt indicates which "attempt number" this task is on. Used by workers.
@@ -85,7 +91,11 @@ type TaskData struct {
 
 	// These timings are here so that journaling can restore full state.
 	// Usually they are blank, and there are no convenience methods to allow
-	// them to be set. Leave them at default values in all cases.
+	// them to be set. Leave them at default values in all cases. At is among
+	// them: an insert asks for an arrival only as by, and a backend resolves
+	// it against its own now, so At carries an arrival only back out of a
+	// journal, where it is an instant the backend already decided.
+	At       time.Time `json:"at"`
 	Created  time.Time `json:"created"`
 	Modified time.Time `json:"modified"`
 }
@@ -102,27 +112,23 @@ func (t *TaskData) String() string {
 // InsertArg is an argument to task insertion.
 type InsertArg func(*Modification, *TaskData)
 
-// WithArrivalTime changes the arrival time to a fixed moment during task insertion.
-// The time is taken as-is from the caller. If tight synchronization with the
-// backend clock is required, use EntroQ.Time to obtain the reference time first.
-func WithArrivalTime(at time.Time) InsertArg {
-	return func(_ *Modification, d *TaskData) {
-		d.At = at
-	}
-}
-
-// WithArrivalTimeIn computes the arrival time based on the duration from now, e.g.,
+// WithArrivalTimeIn makes the task arrive the given duration from the
+// backend's now, e.g.,
 //
 //	cli.Modify(ctx,
 //	  InsertingInto("my queue",
-//	    WithTimeIn(2 * time.Minute)))
+//	    WithArrivalTimeIn(2 * time.Minute)))
 //
-// The duration is added to Go's wall clock time at the point of Modify. If tight
-// synchronization with the backend clock is required, use EntroQ.Time and
-// WithArrivalTime instead.
+// Zero means available immediately, and a negative duration puts the arrival
+// in the past, which the backend caps (see NormalizeArrival).
+//
+// An arrival is always requested as a duration, never as an instant: the
+// duration is resolved against the backend's own clock, so no disagreement
+// between this process's clock and the backend's can shift it. To arrive at a
+// particular moment, subtract: WithArrivalTimeIn(when.Sub(time.Now())).
 func WithArrivalTimeIn(duration time.Duration) InsertArg {
-	return func(m *Modification, d *TaskData) {
-		d.At = m.now.Add(duration)
+	return func(_ *Modification, d *TaskData) {
+		d.by = duration
 	}
 }
 
@@ -282,6 +288,12 @@ type Task struct {
 	// Usually not present, can be used for change authorization (since two queues are in play, there).
 	FromQueue string `json:"fromqueue,omitempty"`
 
+	// by is how long from the backend's own now a CHANGED task arrives, and
+	// like FromQueue it is an instruction rather than stored state: it is set
+	// on the task a Change builds, never on one that was read. Unexported, and
+	// not serialized, so only ArrivalTimeBy can set it and By reads it.
+	by time.Duration
+
 	// Worker retry logic uses these fields when moving tasks and when retrying them.
 	// It is left up to the consumer to determine how many attempts is too many
 	// and to produce a suitable retry or move error.
@@ -327,20 +339,29 @@ func QueueTo(q string) ChangeArg {
 	}
 }
 
-// ArrivalTimeTo sets a specific arrival time on a changed task in Task.Change.
-func ArrivalTimeTo(at time.Time) ChangeArg {
-	return func(_ *Modification, t *Task) {
-		t.At = at
-	}
-}
+// By returns how long from the backend's own now this task's arrival was
+// requested, for a task built by Change. A backend resolves an arrival from
+// this and nothing else; At on a write carries no instruction.
+func (t *Task) By() time.Duration { return t.by }
 
-// ArrivalTimeBy sets the arrival time to a time in the future, by the given duration.
-// The duration is added to Go's wall clock time at the point of Modify. If tight
-// synchronization with the backend clock is required, use EntroQ.Time and
-// WithArrivalTime instead. Send a duration of 0 for immediate availability.
+// By returns how long from the backend's own now this insert's arrival was
+// requested. See Task.By.
+func (d *TaskData) By() time.Duration { return d.by }
+
+// ArrivalTimeBy sets a changed task's arrival to the given duration from the
+// backend's now. Pass 0 to release the task immediately, or a negative
+// duration to put its arrival in the past, which the backend caps (see
+// NormalizeArrival).
+//
+// An arrival is always requested as a duration, never as an instant: the
+// duration is resolved against the backend's own clock, so no disagreement
+// between this process's clock and the backend's can shift it. That matters
+// most at exactly the boundary a release sits on, where a millisecond of skew
+// decides whether the task reads as held or free. To arrive at a particular
+// moment, subtract: ArrivalTimeBy(when.Sub(time.Now())).
 func ArrivalTimeBy(d time.Duration) ChangeArg {
-	return func(m *Modification, t *Task) {
-		t.At = m.now.Add(d)
+	return func(_ *Modification, t *Task) {
+		t.by = d
 	}
 }
 
@@ -431,10 +452,11 @@ func (t *Task) Change(args ...ChangeArg) ModifyArg {
 		newTask := *t
 		// From queue is always the current queue.
 		newTask.FromQueue = t.Queue
-		// Zero time signals the backend to use its own "now" and clear the
-		// claimant (t is released). Callers may override via ArrivalTimeTo
-		// or ArrivalTimeBy to renew or defer.
-		newTask.At = time.Time{}
+		// A change names its arrival as a duration from the backend's own now,
+		// zero by default: t is released. ArrivalTimeBy renews or defers it.
+		// The stored instant is dropped so nothing downstream can read it as
+		// the arrival this change asks for.
+		newTask.At, newTask.by = time.Time{}, 0
 		for _, a := range args {
 			a(m, &newTask)
 		}
@@ -467,10 +489,10 @@ func (t *Task) RetryOrQuarantine(errMsg, quarantineTo string, afterMaxAttempts i
 	}
 	args = append(args, overrides...)
 	if quarantining {
-		// A quarantined task is ready for inspection immediately. Force the
-		// default release after overrides so a retry delay cannot leak into the
-		// quarantine disposition.
-		args = append(args, ArrivalTimeTo(time.Time{}))
+		// A quarantined task is ready for inspection immediately. Force it
+		// after overrides so a retry delay cannot leak into the quarantine
+		// disposition.
+		args = append(args, ArrivalTimeBy(0))
 	}
 	return t.Change(args...)
 }
@@ -498,6 +520,7 @@ func (t *Task) Data() *TaskData {
 	return &TaskData{
 		Queue:    t.Queue,
 		At:       t.At,
+		by:       t.by,
 		Value:    t.Value,
 		ID:       t.ID,
 		Attempt:  t.Attempt,

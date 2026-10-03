@@ -18,17 +18,17 @@ import (
 func TasksClaimantFilter(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	queue := path.Join(qPrefix, "tasks_claimant_filter")
 	const me, other = "filter-me", "filter-other"
-	later := time.Now().Add(time.Hour)
-	insert := func(claimant string, at time.Time) string {
+	const later = time.Hour
+	insert := func(claimant string, by time.Duration) string {
 		t.Helper()
-		resp, err := client.Modify(ctx, entroq.ModifyAs(claimant), entroq.InsertingInto(queue, entroq.WithArrivalTime(at)))
+		resp, err := client.Modify(ctx, entroq.ModifyAs(claimant), entroq.InsertingInto(queue, entroq.WithArrivalTimeIn(by)))
 		if err != nil {
 			t.Fatalf("Insert as %q: %v", claimant, err)
 		}
 		return resp.InsertedTasks[0].ID
 	}
 	want := []string{
-		insert(other, time.Time{}), // available, last written by someone else
+		insert(other, 0), // available, last written by someone else
 		insert(me, later),          // held by me
 	}
 	insert(other, later) // held by someone else
@@ -55,10 +55,10 @@ func TasksClaimantFilter(ctx context.Context, t *testing.T, client *entroq.Entro
 // most-claimed task still in the queue, so it falls when that task leaves.
 func QueueStatsCounts(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	queue := path.Join(qPrefix, "queue_stats_counts")
-	later := time.Now().Add(time.Hour)
+	const later = time.Hour
 
 	resp, err := client.Modify(ctx,
-		entroq.InsertingInto(queue, entroq.WithArrivalTime(later)), // future: inserted that way
+		entroq.InsertingInto(queue, entroq.WithArrivalTimeIn(later)), // future: inserted that way
 		entroq.InsertingInto(queue),                                // future by a change
 		entroq.InsertingInto(queue),                                // claimed three times, then held
 	)
@@ -215,7 +215,7 @@ func keys[V any](m map[string]V) []string {
 func TaskClaimantIsHolder(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	queue := path.Join(qPrefix, "task_claimant_is_holder")
 	const writer, worker = "holder-writer", "holder-worker"
-	later := time.Now().Add(time.Hour)
+	const later = time.Hour
 	// A claimant is derived from the arrival on every write, never carried over,
 	// so a wrong one is not a stale value: it means the backend read the arrival
 	// as held or as free when it should have read the other. Report the arrival
@@ -236,7 +236,7 @@ func TaskClaimantIsHolder(ctx context.Context, t *testing.T, client *entroq.Entr
 
 	resp, err := client.Modify(ctx, entroq.ModifyAs(writer),
 		entroq.InsertingInto(queue),
-		entroq.InsertingInto(queue, entroq.WithArrivalTime(later)),
+		entroq.InsertingInto(queue, entroq.WithArrivalTimeIn(later)),
 	)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)

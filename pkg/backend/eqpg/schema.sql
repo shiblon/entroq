@@ -326,6 +326,16 @@ DROP FUNCTION IF EXISTS entroq._modify_arrays(
     text[], text[], timestamptz[], text[], integer[], text[],
     text[], integer[], text[], text[], timestamptz[], text[], integer[], text[]
 );
+-- Arrivals used to arrive as absolute timestamps; they are now durations in
+-- milliseconds from this transaction's now(). Dropping the timestamptz
+-- overload keeps a stale caller from resolving to it.
+DROP FUNCTION IF EXISTS entroq._modify_arrays(
+    text,
+    text[], integer[], text[],
+    text[], integer[], text[],
+    text[], text[], timestamptz[], text[], integer[], text[],
+    text[], integer[], text[], text[], timestamptz[], text[], integer[], text[], boolean[]
+);
 CREATE OR REPLACE FUNCTION entroq._modify_arrays(
     p_claimant        text,
     -- depends: must exist at the given (version, queue)
@@ -336,10 +346,14 @@ CREATE OR REPLACE FUNCTION entroq._modify_arrays(
     p_del_ids         text[],
     p_del_vers        integer[],
     p_del_queues      text[],
-    -- inserts: empty string = auto-generate, zero timestamptz = now()
+    -- inserts: empty string = auto-generate. An arrival is named only as
+    -- p_ins_bys, milliseconds from this transaction's now(): zero arrives now,
+    -- positive holds, negative is already available. A caller never names an
+    -- instant, so no arrival depends on the offset between its clock and this
+    -- database's.
     p_ins_ids         text[],
     p_ins_queues      text[],
-    p_ins_ats         timestamptz[],
+    p_ins_bys         bigint[],
     p_ins_values      text[],
     p_ins_attempts    integer[],
     p_ins_errs        text[],
@@ -349,7 +363,7 @@ CREATE OR REPLACE FUNCTION entroq._modify_arrays(
     p_chg_vers        integer[],
     p_chg_from_queues text[],
     p_chg_queues      text[],
-    p_chg_ats         timestamptz[],
+    p_chg_bys         bigint[],
     p_chg_values      text[],
     p_chg_attempts    integer[],
     p_chg_errs        text[],
@@ -370,6 +384,13 @@ CREATE OR REPLACE FUNCTION entroq._modify_arrays(
 ) LANGUAGE plpgsql AS $$
 DECLARE
     v_now          timestamptz := now();
+    -- Mirrors entroq.ArrivalPastWindow: an arrival reaching further back than
+    -- this is treated as unset and capped up to now, so it cannot order ahead
+    -- of everything already waiting. In milliseconds it matches the Go
+    -- constant exactly, where interval '1 year' did not.
+    -- 365::bigint, not 365: the product overflows integer before it is
+    -- assigned, and Postgres raises 22003 rather than widening.
+    v_past_ms      bigint := 365::bigint * 24 * 60 * 60 * 1000;
     v_missing      jsonb;
     v_mismatched   jsonb;
     v_claimed      jsonb;
@@ -468,20 +489,23 @@ BEGIN
                 CASE WHEN ins_id = '' THEN encode(gen_random_bytes(8), 'hex') ELSE ins_id END,
                 0,
                 ins_queue,
-                CASE WHEN ins_at < v_now - interval '1 year' THEN v_now ELSE ins_at END,
+                CASE WHEN ins_by < -v_past_ms THEN v_now
+                     ELSE v_now + ins_by * interval '1 millisecond' END,
                 -- As for a change, the writer holds a task not yet available.
-                CASE WHEN ins_at > v_now THEN p_claimant ELSE '' END,
+                -- In duration space that is just a positive arrival, so the
+                -- clock does not come into it.
+                CASE WHEN ins_by > 0 THEN p_claimant ELSE '' END,
                 ins_value::jsonb,
                 v_now, v_now,
                 ins_attempt, ins_err
             FROM unnest(
                 coalesce(p_ins_ids,      '{}'::text[]),
                 coalesce(p_ins_queues,   '{}'::text[]),
-                coalesce(p_ins_ats,      '{}'::timestamptz[]),
+                coalesce(p_ins_bys,      '{}'::bigint[]),
                 coalesce(p_ins_values,   '{}'::text[]),
                 coalesce(p_ins_attempts, '{}'::integer[]),
                 coalesce(p_ins_errs,     '{}'::text[])
-            ) AS ins(ins_id, ins_queue, ins_at, ins_value, ins_attempt, ins_err)
+            ) AS ins(ins_id, ins_queue, ins_by, ins_value, ins_attempt, ins_err)
             RETURNING *
         )
         SELECT 'inserted'::text, r.id, r.version, r.queue, r.at,
@@ -489,9 +513,11 @@ BEGIN
             r.claims, r.attempt, r.err
         FROM r;
 
-    -- Changes: at older than 1 year snaps to v_now (covers Go's zero time);
-    -- otherwise preserved as-is (a past at is harmless). Claimant is set only
-    -- when chg_at is strictly in the future; past/present releases the task.
+    -- Changes: an arrival reaching further back than the past window snaps to
+    -- v_now; otherwise it resolves against v_now as given (a past arrival is
+    -- harmless). Claimant is set only when the arrival is strictly in the
+    -- future, which in duration space is a positive by; zero or less releases
+    -- the task, and is how a release is spelled.
     -- CTE for the same reason as inserts: avoid RETURNS TABLE OUT-parameter shadowing.
     RETURN QUERY
         WITH r AS (
@@ -500,23 +526,24 @@ BEGIN
                 version  = entroq.tasks.version + 1,
                 modified = v_now,
                 queue    = c.chg_queue,
-                at       = CASE WHEN c.chg_at < v_now - interval '1 year' THEN v_now ELSE c.chg_at END,
+                at       = CASE WHEN c.chg_by < -v_past_ms THEN v_now
+                                ELSE v_now + c.chg_by * interval '1 millisecond' END,
                 value    = c.chg_value::jsonb,
                 attempt  = c.chg_attempt,
                 err      = c.chg_err,
                 claims   = CASE WHEN c.chg_reset_claims THEN 0 ELSE entroq.tasks.claims END,
-                claimant = CASE WHEN c.chg_at > v_now THEN p_claimant ELSE '' END
+                claimant = CASE WHEN c.chg_by > 0 THEN p_claimant ELSE '' END
             FROM unnest(
                 coalesce(p_chg_ids,         '{}'::text[]),
                 coalesce(p_chg_vers,        '{}'::integer[]),
                 coalesce(p_chg_from_queues, '{}'::text[]),
                 coalesce(p_chg_queues,      '{}'::text[]),
-                coalesce(p_chg_ats,         '{}'::timestamptz[]),
+                coalesce(p_chg_bys,         '{}'::bigint[]),
                 coalesce(p_chg_values,      '{}'::text[]),
                 coalesce(p_chg_attempts,    '{}'::integer[]),
                 coalesce(p_chg_errs,        '{}'::text[]),
                 coalesce(p_chg_reset_claims, '{}'::boolean[])
-            ) AS c(chg_id, chg_version, chg_from_queue, chg_queue, chg_at, chg_value, chg_attempt, chg_err, chg_reset_claims)
+            ) AS c(chg_id, chg_version, chg_from_queue, chg_queue, chg_by, chg_value, chg_attempt, chg_err, chg_reset_claims)
             WHERE entroq.tasks.id = c.chg_id AND entroq.tasks.version = c.chg_version AND entroq.tasks.queue = c.chg_from_queue
             RETURNING *
         )

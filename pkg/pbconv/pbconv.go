@@ -27,6 +27,34 @@ func FromMS(ms int64) time.Time {
 	return time.Unix(0, ms*int64(time.Millisecond))
 }
 
+// arrivalBy reads the arrival a request asks for as a duration from the
+// server's now, which is the only form the entroq API and the backends accept.
+//
+// by_ms is protocol 2 and is used as given. at_ms is the PROTOCOL 1 SHIM: a
+// client that has no by_ms names an instant on its own clock, so the instant is
+// converted here, once, against this server's clock. Doing it here rather than
+// in the backends keeps the conversion in the one layer that is defined by
+// protocol version, so it can be deleted outright when protocol 1 leaves
+// version.ServedProtocols, and keeps every backend taking durations only.
+//
+// An at_ms that is unset, or farther back than entroq.ArrivalPastWindow, is no
+// instruction at all and becomes zero: arrive now. Converting it literally
+// would yield a duration of some two thousand years, which only works because
+// something downstream caps it -- the same laundering that made FromMS wrong.
+//
+// Zero needs no distinguishing from absent in either field, because both mean
+// now.
+func arrivalBy(atMs, byMs int64, now time.Time) time.Duration {
+	if byMs != 0 {
+		return time.Duration(byMs) * time.Millisecond
+	}
+	at := FromMSOrUnset(atMs)
+	if at.IsZero() || at.Before(now.Add(-entroq.ArrivalPastWindow)) {
+		return 0
+	}
+	return at.Sub(now)
+}
+
 // FromMSOrUnset is FromMS for optional timestamps: a non-positive value means
 // the field was not set and yields Go's zero time, so a backend's IsZero
 // default applies. Go's zero time has no exact wire form (it encodes as a
@@ -126,14 +154,14 @@ func docByID(d *pb.DocID, what string) (string, error) {
 // taskLease converts a lease-only task change, which renews or releases the
 // task old names. Only the arrival time is used; a queue, if given, must be
 // the task's own, and no value, attempt, error, or ID may be.
-func taskLease(old *pb.TaskID, lease *pb.TaskData) (entroq.ModifyArg, error) {
+func taskLease(old *pb.TaskID, lease *pb.TaskData, now time.Time) (entroq.ModifyArg, error) {
 	if q := lease.GetQueue(); q != "" && q != old.GetQueue() {
 		return nil, invalidf("lease of task %s cannot move it: %q -> %q", old.GetId(), old.GetQueue(), q)
 	}
 	if lease.GetValue() != nil || lease.GetAttempt() != 0 || lease.GetErr() != "" || lease.GetId() != "" {
 		return nil, invalidf("lease of task %s may set only its arrival time", old.GetId())
 	}
-	return entroq.Arriving(entroq.ReadyAt(FromMSOrUnset(lease.GetAtMs())).Tasks(
+	return entroq.Arriving(entroq.ReadyIn(arrivalBy(lease.GetAtMs(), lease.GetByMs(), now)).Tasks(
 		&entroq.Task{ID: old.GetId(), Version: old.GetVersion(), Queue: old.GetQueue()},
 	)), nil
 }
@@ -192,6 +220,9 @@ func ModifyArgsFromProto(req *pb.ModifyRequest, protocol int32) ([]entroq.Modify
 	modArgs := []entroq.ModifyArg{
 		entroq.ModifyAs(req.ClaimantId),
 	}
+	// This server's clock, used only to convert a protocol-1 client's absolute
+	// arrival into the duration everything downstream speaks. See arrivalBy.
+	now := entroq.ProcessTime()
 	for _, insert := range req.Inserts {
 		val, err := ProtoToJSON(insert.Value)
 		if err != nil {
@@ -199,7 +230,7 @@ func ModifyArgsFromProto(req *pb.ModifyRequest, protocol int32) ([]entroq.Modify
 		}
 		modArgs = append(modArgs,
 			entroq.InsertingInto(insert.Queue,
-				entroq.WithArrivalTime(FromMSOrUnset(insert.AtMs)),
+				entroq.WithArrivalTimeIn(arrivalBy(insert.AtMs, insert.ByMs, now)),
 				entroq.WithRawValue(val),
 				entroq.WithAttempt(insert.Attempt),
 				entroq.WithErr(insert.Err),
@@ -217,7 +248,7 @@ func ModifyArgsFromProto(req *pb.ModifyRequest, protocol int32) ([]entroq.Modify
 			return nil, err
 		}
 		if change.GetMode() == pb.ChangeMode_CHANGE_LEASE {
-			arg, err := taskLease(change.GetOldId(), nd)
+			arg, err := taskLease(change.GetOldId(), nd, now)
 			if err != nil {
 				return nil, err
 			}
@@ -258,7 +289,7 @@ func ModifyArgsFromProto(req *pb.ModifyRequest, protocol int32) ([]entroq.Modify
 		if newQueue != oldQueue {
 			changeArgs = append(changeArgs, entroq.QueueTo(newQueue))
 		}
-		changeArgs = append(changeArgs, entroq.ArrivalTimeTo(FromMSOrUnset(nd.GetAtMs())))
+		changeArgs = append(changeArgs, entroq.ArrivalTimeBy(arrivalBy(nd.GetAtMs(), nd.GetByMs(), now)))
 		if reset {
 			changeArgs = append(changeArgs, entroq.ResettingClaims())
 		}

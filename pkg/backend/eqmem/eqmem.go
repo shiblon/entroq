@@ -814,7 +814,7 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 		return nil, fmt.Errorf("modify get time: %w", err)
 	}
 	// Task arrivals are changes of the stored tasks' arrival times alone.
-	mod = arrival.Changes(mod, now, func(id string) *entroq.Task { return found[id] })
+	mod = arrival.Changes(mod, func(id string) *entroq.Task { return found[id] })
 
 	// Tasks are checked by the modification with its doc operations removed;
 	// doc sets follow their own rules, in docset. Replay applies recorded
@@ -902,13 +902,18 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 			}
 			newTask.Created = old.Created
 		}
-		// Cap a far-past arrival to now (backend Modify contract): an omitted At
-		// arrives now and is ordered at now, not in the distant past.
-		newTask.At = entroq.NormalizeArrival(newTask.At, now)
+		// A write names its arrival only as a duration from this backend's own
+		// now (backend Modify contract), which NormalizeArrival caps if it
+		// reaches back past the window. Replay restores the arrival as
+		// journaled, the instant this backend already resolved: a duration is
+		// not journaled, because a journal records what was decided rather
+		// than what was asked for.
+		//
 		// The claimant is the task's holder: the modifier while the task is
 		// not yet available, no one once it is. Replay restores the recorded
-		// claimant.
+		// claimant along with the arrival that decided it.
 		if !replay {
+			newTask.At = entroq.NormalizeArrival(now.Add(newTask.By()), now)
 			newTask.Claimant = holder(mod.Claimant, newTask.At, now)
 		}
 		if !replay || newTask.Modified.IsZero() {
@@ -934,12 +939,21 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 		if modified.IsZero() {
 			modified = now
 		}
+		// An insert names its arrival only as a duration from this backend's
+		// own now (backend Modify contract). Replay restores the instant this
+		// backend resolved, which the journal carries; the duration that asked
+		// for it is not journaled, so the claimant below is recomputed against
+		// the journaled arrival and lapses if it has passed.
+		at := td.At
+		if !replay {
+			at = entroq.NormalizeArrival(now.Add(td.By()), now)
+		}
 		newTask := &entroq.Task{
 			ID:       id,
 			Queue:    td.Queue,
-			At:       entroq.NormalizeArrival(td.At, now),
+			At:       at,
 			Value:    td.Value,
-			Claimant: holder(mod.Claimant, entroq.NormalizeArrival(td.At, now), now),
+			Claimant: holder(mod.Claimant, at, now),
 			Created:  created,
 			Modified: modified,
 			Attempt:  td.Attempt,

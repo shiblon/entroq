@@ -833,11 +833,7 @@ func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *mo
 		if err != nil {
 			return nil, err
 		}
-		now, err := txNow(ctx, tx)
-		if err != nil {
-			return nil, err
-		}
-		mod = arrival.Changes(mod, now, func(id string) *entroq.Task { return stored[id] })
+		mod = arrival.Changes(mod, func(id string) *entroq.Task { return stored[id] })
 	}
 
 	// Doc modifications, by the rules in docset.
@@ -848,22 +844,22 @@ func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *mo
 	// Task modifications, as parallel arrays per operation.
 	depIDs, depVers, depQueues := taskIDArrays(mod.Depends)
 	delIDs, delVers, delQueues := taskIDArrays(mod.Deletes)
-	insIDs, insQueues, insAts, insValues, insAttempts, insErrs := insertArrays(mod.Inserts)
-	chgIDs, chgVers, chgFromQueues, chgQueues, chgAts, chgValues, chgAttempts, chgErrs, chgResets := changeArrays(mod)
+	insIDs, insQueues, insBys, insValues, insAttempts, insErrs := insertArrays(mod.Inserts)
+	chgIDs, chgVers, chgFromQueues, chgQueues, chgBys, chgValues, chgAttempts, chgErrs, chgResets := changeArrays(mod)
 	rows, err := tx.QueryContext(ctx, `
 		SELECT kind, id, version, queue, at, created, modified, claimant, value, claims, attempt, err
 		FROM _modify_arrays(
 			$1,
 			$2::text[], $3::integer[], $4::text[],
 			$5::text[], $6::integer[], $7::text[],
-			$8::text[], $9::text[], $10::timestamptz[], $11::text[], $12::integer[], $13::text[],
-			$14::text[], $15::integer[], $16::text[], $17::text[], $18::timestamptz[], $19::text[], $20::integer[], $21::text[], $22::boolean[]
+			$8::text[], $9::text[], $10::bigint[], $11::text[], $12::integer[], $13::text[],
+			$14::text[], $15::integer[], $16::text[], $17::text[], $18::bigint[], $19::text[], $20::integer[], $21::text[], $22::boolean[]
 		)`,
 		mod.Claimant,
 		pq.Array(depIDs), pq.Array(depVers), pq.Array(depQueues),
 		pq.Array(delIDs), pq.Array(delVers), pq.Array(delQueues),
-		pq.Array(insIDs), pq.Array(insQueues), pq.Array(insAts), pq.Array(insValues), pq.Array(insAttempts), pq.Array(insErrs),
-		pq.Array(chgIDs), pq.Array(chgVers), pq.Array(chgFromQueues), pq.Array(chgQueues), pq.Array(chgAts), pq.Array(chgValues), pq.Array(chgAttempts), pq.Array(chgErrs), pq.Array(chgResets),
+		pq.Array(insIDs), pq.Array(insQueues), pq.Array(insBys), pq.Array(insValues), pq.Array(insAttempts), pq.Array(insErrs),
+		pq.Array(chgIDs), pq.Array(chgVers), pq.Array(chgFromQueues), pq.Array(chgQueues), pq.Array(chgBys), pq.Array(chgValues), pq.Array(chgAttempts), pq.Array(chgErrs), pq.Array(chgResets),
 	)
 	if err != nil {
 		return nil, parseModifyError(err, mod)
@@ -988,18 +984,20 @@ func jsonTextVal(v json.RawMessage) *string {
 	return &s
 }
 
-// insertArrays splits a slice of TaskData inserts into parallel arrays for the stored procedure.
-func insertArrays(inserts []*entroq.TaskData) (ids []string, queues []string, ats []time.Time, values []*string, attempts []int32, errs []string) {
+// insertArrays splits a slice of TaskData inserts into parallel arrays for the
+// stored procedure. An arrival travels as milliseconds from the database's own
+// now(), so no instant from this process's clock reaches the schema.
+func insertArrays(inserts []*entroq.TaskData) (ids []string, queues []string, bys []int64, values []*string, attempts []int32, errs []string) {
 	ids = make([]string, len(inserts))
 	queues = make([]string, len(inserts))
-	ats = make([]time.Time, len(inserts))
+	bys = make([]int64, len(inserts))
 	values = make([]*string, len(inserts))
 	attempts = make([]int32, len(inserts))
 	errs = make([]string, len(inserts))
 	for i, ins := range inserts {
 		ids[i] = ins.ID // empty signals auto-generate, the common case
 		queues[i] = ins.Queue
-		ats[i] = ins.At // zero time signals use now()
+		bys[i] = ins.By().Milliseconds()
 		values[i] = jsonTextVal(ins.Value)
 		attempts[i] = ins.Attempt
 		errs[i] = ins.Err
@@ -1011,13 +1009,15 @@ func insertArrays(inserts []*entroq.TaskData) (ids []string, queues []string, at
 // stored procedure. fromQueues is the source (current) queue matched by the
 // modify key; queues is the destination the task moves to (equal for a plain
 // change).
-func changeArrays(mod *entroq.Modification) (ids []string, versions []int32, fromQueues []string, queues []string, ats []time.Time, values []*string, attempts []int32, errs []string, resets []bool) {
+// change). An arrival travels as milliseconds from the database's own now(),
+// as it does for an insert.
+func changeArrays(mod *entroq.Modification) (ids []string, versions []int32, fromQueues []string, queues []string, bys []int64, values []*string, attempts []int32, errs []string, resets []bool) {
 	changes := mod.Changes
 	ids = make([]string, len(changes))
 	versions = make([]int32, len(changes))
 	fromQueues = make([]string, len(changes))
 	queues = make([]string, len(changes))
-	ats = make([]time.Time, len(changes))
+	bys = make([]int64, len(changes))
 	values = make([]*string, len(changes))
 	attempts = make([]int32, len(changes))
 	errs = make([]string, len(changes))
@@ -1027,7 +1027,7 @@ func changeArrays(mod *entroq.Modification) (ids []string, versions []int32, fro
 		versions[i] = chg.Version
 		fromQueues[i] = chg.FromQueue
 		queues[i] = chg.Queue
-		ats[i] = chg.At
+		bys[i] = chg.By().Milliseconds()
 		values[i] = jsonTextVal(chg.Value)
 		attempts[i] = chg.Attempt
 		errs[i] = chg.Err

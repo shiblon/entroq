@@ -608,29 +608,31 @@ func containsAll(s string, subs ...string) bool {
 }
 
 func TestRetryOrQuarantineArrival(t *testing.T) {
-	future := time.Now().Add(time.Hour)
+	// An arrival is requested as a duration, so the override and the
+	// assertions are durations too.
+	const delay = time.Hour
 
 	t.Run("retry honors arrival override", func(t *testing.T) {
 		task := &entroq.Task{ID: "task", Version: 1, Queue: "work"}
 		mod := entroq.NewModification("worker",
-			task.RetryOrQuarantine("retry", "errors", 2, entroq.ArrivalTimeTo(future)),
+			task.RetryOrQuarantine("retry", "errors", 2, entroq.ArrivalTimeBy(delay)),
 		)
-		if got := mod.Changes[0].At; !got.Equal(future) {
-			t.Fatalf("retry arrival = %s, want %s", got, future)
+		if got := mod.Changes[0].By(); got != delay {
+			t.Fatalf("retry arrival = %s, want %s from now", got, delay)
 		}
 	})
 
 	t.Run("quarantine forces immediate arrival", func(t *testing.T) {
 		task := &entroq.Task{ID: "task", Version: 1, Queue: "work", Attempt: 1}
 		mod := entroq.NewModification("worker",
-			task.RetryOrQuarantine("failed", "errors", 2, entroq.ArrivalTimeTo(future)),
+			task.RetryOrQuarantine("failed", "errors", 2, entroq.ArrivalTimeBy(delay)),
 		)
 		change := mod.Changes[0]
 		if change.Queue != "errors" {
 			t.Fatalf("quarantine queue = %q, want %q", change.Queue, "errors")
 		}
-		if !change.At.IsZero() {
-			t.Fatalf("quarantine arrival = %s, want zero time", change.At)
+		if got := change.By(); got != 0 {
+			t.Fatalf("quarantine arrival = %s from now, want 0: a retry delay must not leak into it", got)
 		}
 	})
 }

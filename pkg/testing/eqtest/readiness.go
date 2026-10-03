@@ -32,7 +32,7 @@ func ReadinessFanout(interval time.Duration) Tester {
 		arrival := time.Now().Add(interval)
 		var inserts []entroq.ModifyArg
 		for range waiters {
-			inserts = append(inserts, entroq.InsertingInto(queue, entroq.WithArrivalTime(arrival)))
+			inserts = append(inserts, entroq.InsertingInto(queue, entroq.WithArrivalTimeIn(interval)))
 		}
 		if _, err := client.Modify(ctx, inserts...); err != nil {
 			t.Fatalf("Insert future tasks: %v", err)

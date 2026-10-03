@@ -107,8 +107,7 @@ func TaskChangeFarPastArrivalNormalized(ctx context.Context, t *testing.T, clien
 		t.Fatalf("time: %v", err)
 	}
 	// Two windows in the past: well beyond the far-past cap.
-	farPast := before.Add(-2 * entroq.ArrivalPastWindow)
-	resp, err = client.Modify(ctx, inserted.Change(entroq.ArrivalTimeTo(farPast)))
+	resp, err = client.Modify(ctx, inserted.Change(entroq.ArrivalTimeBy(-2*entroq.ArrivalPastWindow)))
 	if err != nil {
 		t.Fatalf("change far-past arrival: %v", err)
 	}
@@ -377,10 +376,10 @@ func TasksClaimantLimit(ctx context.Context, t *testing.T, client *entroq.EntroQ
 	// matches (available tasks always satisfy a claimant filter).
 	t.Run("available_limit", func(t *testing.T) {
 		queue := path.Join(qPrefix, "claimant_limit", "available")
-		past := time.Now().Add(-time.Hour).UTC()
+		const past = -time.Hour
 		var args []entroq.ModifyArg
 		for range 10 {
-			args = append(args, entroq.InsertingInto(queue, entroq.WithArrivalTime(past)))
+			args = append(args, entroq.InsertingInto(queue, entroq.WithArrivalTimeIn(past)))
 		}
 		if _, err := client.Modify(ctx, args...); err != nil {
 			t.Fatalf("insert available: %v", err)
@@ -419,10 +418,10 @@ func TasksClaimantLimit(ctx context.Context, t *testing.T, client *entroq.EntroQ
 			otherClaim = 10 * time.Second // nearer expiry: sorts ahead of mine
 		)
 
-		past := time.Now().Add(-time.Hour).UTC()
+		const past = -time.Hour
 		var args []entroq.ModifyArg
 		for range nMine + nOther {
-			args = append(args, entroq.InsertingInto(queue, entroq.WithArrivalTime(past)))
+			args = append(args, entroq.InsertingInto(queue, entroq.WithArrivalTimeIn(past)))
 		}
 		if _, err := client.Modify(ctx, args...); err != nil {
 			t.Fatalf("insert pool: %v", err)
@@ -703,12 +702,14 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 			Claimant: client.ID(),
 		},
 	}
-	var insData []*entroq.TaskData
-	for _, task := range insWant {
-		insData = append(insData, task.Data())
-	}
-
-	resp, err := client.Modify(ctx, entroq.Inserting(insData...))
+	// An insert names its arrival as a duration, so the second task is asked
+	// for futureTaskDuration out and the backend resolves both against the one
+	// now of this modification. The wanted tasks above keep the equivalent
+	// instants, which the comparison below skips and the later claim uses.
+	resp, err := client.Modify(ctx,
+		entroq.InsertingInto(queue, entroq.WithRawValue(helloVal)),
+		entroq.InsertingInto(queue, entroq.WithRawValue(thereVal), entroq.WithArrivalTimeIn(futureTaskDuration)),
+	)
 	if err != nil {
 		t.Fatalf("Got unexpected error inserting two tasks: %+v", err)
 	}
@@ -874,15 +875,15 @@ func ClaimRandomHead(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 
 	// A fixed arrival time in the past: both tasks are immediately claimable and
 	// perfectly tied, so nothing but the backend's tiebreak decides the winner.
-	at := time.Now().Add(-time.Hour).UTC()
+	const at = -time.Hour
 
 	var smallerIDWins, firstInsertedWins int
 	for i := range trials {
 		queue := path.Join(qPrefix, "claim_random_head", fmt.Sprint(i))
 
 		resp, err := client.Modify(ctx,
-			entroq.InsertingInto(queue, entroq.WithValue("a"), entroq.WithArrivalTime(at)),
-			entroq.InsertingInto(queue, entroq.WithValue("b"), entroq.WithArrivalTime(at)),
+			entroq.InsertingInto(queue, entroq.WithValue("a"), entroq.WithArrivalTimeIn(at)),
+			entroq.InsertingInto(queue, entroq.WithValue("b"), entroq.WithArrivalTimeIn(at)),
 		)
 		if err != nil {
 			t.Fatalf("trial %d: insert pair: %v", i, err)

@@ -40,7 +40,15 @@ func TestMain(m *testing.M) {
 	// A short readiness interval wakes claims promptly when a task becomes
 	// available only through time, such as an expired claim, so tests that
 	// wait on that do not race the default 5-second tick.
-	svc, err := eqsvcgrpc.New(ctx, eqmem.Opener(eqmem.WithReadinessInterval(100*time.Millisecond)))
+	//
+	// A one-second lease floor for the same reason: a test that stands a dead
+	// worker up by letting a short claim expire needs the short claim it asked
+	// for. The floor exists so a lease can survive its first renewal, and
+	// against an in-process service a renewal is sub-millisecond, so a second
+	// is a real setting here rather than one picked to make a test pass.
+	svc, err := eqsvcgrpc.New(ctx,
+		eqmem.Opener(eqmem.WithReadinessInterval(100*time.Millisecond)),
+		eqsvcgrpc.WithClaimLeaseBounds(time.Second, eqsvcgrpc.DefaultClaimLeaseCeiling))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eqsvcgrpc: %v\n", err)
 		os.Exit(1)

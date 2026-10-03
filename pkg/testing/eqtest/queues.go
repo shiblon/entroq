@@ -192,7 +192,7 @@ func QueueStatsAccuracy(ctx context.Context, t *testing.T, client *entroq.EntroQ
 		entroq.InsertingInto(partial),
 		entroq.InsertingInto(partial),
 		entroq.InsertingInto(partial),
-		entroq.InsertingInto(future, entroq.WithArrivalTime(time.Now().Add(time.Hour))),
+		entroq.InsertingInto(future, entroq.WithArrivalTimeIn(time.Hour)),
 	); err != nil {
 		t.Fatalf("insert: %v", err)
 	}

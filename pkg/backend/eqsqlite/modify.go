@@ -41,7 +41,7 @@ func modifyTx(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (*entro
 		return nil, err
 	}
 	// Task arrivals are changes of the stored tasks' arrival times alone.
-	mod = arrival.Changes(mod, now, func(id string) *entroq.Task { return foundTasks[id] })
+	mod = arrival.Changes(mod, func(id string) *entroq.Task { return foundTasks[id] })
 	member := func(ns, id string) *entroq.Doc { return foundDocs[entroq.DocKey(ns, id)] }
 	locks, err := loadDocLocks(ctx, tx, docset.Sets(mod, member))
 	if err != nil {
@@ -69,7 +69,7 @@ func modifyTx(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (*entro
 	}
 	for _, change := range mod.Changes {
 		old := foundTasks[change.ID]
-		at := storedAt(change.At, now)
+		at := storedAt(change.By(), now)
 		claimant := ""
 		if at.After(now) {
 			claimant = mod.Claimant
@@ -94,7 +94,7 @@ func modifyTx(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (*entro
 		if id == "" {
 			id = entroq.GenHex16()
 		}
-		at := storedAt(insert.At, now)
+		at := storedAt(insert.By(), now)
 		created := time.UnixMilli(storedTime(insert.Created, now)).UTC()
 		modified := time.UnixMilli(storedTime(insert.Modified, now)).UTC()
 		// As for a change, the writer holds a task that is not yet available.
@@ -485,10 +485,12 @@ func saveDocLocks(ctx context.Context, tx *sql.Tx, locks map[docset.Set]docset.L
 	})
 }
 
-// storedAt is the arrival time a write stores: normalized, then cut to the
-// millisecond the database keeps, so comparing it with now, which is kept the
-// same way, gives the answer a later read will, and the response carries what
-// was stored.
-func storedAt(at, now time.Time) time.Time {
-	return time.UnixMilli(entroq.NormalizeArrival(at, now).UnixMilli()).UTC()
+// storedAt is the arrival time a write stores. A write names its arrival only
+// as a duration from this backend's own now (backend Modify contract); the cap
+// keeps a negative one from ordering the task ahead of everything already
+// waiting. The result is cut to the millisecond the database keeps, so
+// comparing it with now, which is kept the same way, gives the answer a later
+// read will, and the response carries what was stored.
+func storedAt(by time.Duration, now time.Time) time.Time {
+	return time.UnixMilli(entroq.NormalizeArrival(now.Add(by), now).UnixMilli()).UTC()
 }

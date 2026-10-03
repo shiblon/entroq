@@ -30,6 +30,21 @@ message TaskData {
   // The epoch time in millis when this task becomes available.
   int64 at_ms = 2;
 
+  // Protocol 2: how long from the SERVER's now until this task becomes
+  // available, in millis. Nonzero wins over at_ms, and may be negative.
+  //
+  // Prefer it to at_ms whenever the arrival is meant to be relative, as a
+  // release ("now") or a delay ("in an hour") is. An at_ms is an instant on
+  // the caller's clock that the server then compares against its own, so the
+  // two disagree by whatever the clocks do; a by_ms is resolved entirely on
+  // the server's clock and cannot. It also lets a store be driven directly,
+  // through psql and stored procedures, with no client clock involved at all.
+  //
+  // Zero means the same as absent, because an absent at_ms already means the
+  // server's now. So no presence flag is needed: a caller that omits this and
+  // a caller that sends zero both get now.
+  int64 by_ms = 7;
+
   // The task's JSON payload.
   google.protobuf.Value value = 3;
 

@@ -3,6 +3,7 @@ package pbconv
 import (
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/shiblon/entroq"
 	pb "github.com/shiblon/entroq/api"
@@ -57,7 +58,9 @@ func TaskFromProto(t *pb.Task) (*entroq.Task, error) {
 }
 
 // TaskDataToProto converts an entroq.TaskData (an insert payload) to its wire
-// form.
+// form. The arrival goes out as by_ms alone: at_ms is read from a protocol-1
+// client and never written, so no arrival this client asks for depends on the
+// offset between its clock and the server's.
 func TaskDataToProto(td *entroq.TaskData) (*pb.TaskData, error) {
 	val, err := JSONToProto(td.Value)
 	if err != nil {
@@ -65,7 +68,7 @@ func TaskDataToProto(td *entroq.TaskData) (*pb.TaskData, error) {
 	}
 	return &pb.TaskData{
 		Queue:   td.Queue,
-		AtMs:    ToMS(td.At),
+		ByMs:    int64(td.By() / time.Millisecond),
 		Value:   val,
 		Attempt: td.Attempt,
 		Err:     td.Err,
@@ -101,7 +104,7 @@ func TaskChangeToProto(t *entroq.Task, resetClaims bool) (*pb.TaskChange, error)
 func TaskArrivalToProto(a *entroq.TaskArrival) *pb.TaskChange {
 	return &pb.TaskChange{
 		OldId:   &pb.TaskID{Id: a.ID, Version: a.Version, Queue: a.Queue},
-		NewData: &pb.TaskData{AtMs: ToMS(a.At)},
+		NewData: &pb.TaskData{ByMs: int64(a.By / time.Millisecond)},
 		Mode:    pb.ChangeMode_CHANGE_LEASE,
 	}
 }
