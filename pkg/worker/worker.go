@@ -36,7 +36,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math/rand/v2"
 	"sort"
 	"strings"
 	"sync"
@@ -1183,7 +1182,7 @@ func (ro *runOpt) contentionDelay() time.Duration {
 	if d <= 0 {
 		return d
 	}
-	return d + rand.N(d/4+1)
+	return jitterLater(d, d/4)
 }
 
 func isSentinelError(err error) bool {
