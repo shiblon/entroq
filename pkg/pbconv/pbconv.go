@@ -133,7 +133,7 @@ func taskLease(old *pb.TaskID, lease *pb.TaskData) (entroq.ModifyArg, error) {
 	if lease.GetValue() != nil || lease.GetAttempt() != 0 || lease.GetErr() != "" || lease.GetId() != "" {
 		return nil, invalidf("lease of task %s may set only its arrival time", old.GetId())
 	}
-	return entroq.Arriving(entroq.ReadyAt(FromMS(lease.GetAtMs())).Tasks(
+	return entroq.Arriving(entroq.ReadyAt(FromMSOrUnset(lease.GetAtMs())).Tasks(
 		&entroq.Task{ID: old.GetId(), Version: old.GetVersion(), Queue: old.GetQueue()},
 	)), nil
 }
@@ -161,7 +161,7 @@ func docLease(old *pb.DocID, lease *pb.DocData) (entroq.ModifyArg, error) {
 	if lease.GetContent() != nil || lease.GetId() != "" {
 		return nil, invalidf("doc lease of set %q may set only its arrival time", key.Key)
 	}
-	return entroq.Arriving(entroq.ReadyAt(FromMS(lease.GetAtMs())).Docs(
+	return entroq.Arriving(entroq.ReadyAt(FromMSOrUnset(lease.GetAtMs())).Docs(
 		&entroq.DocSet{Namespace: old.GetNamespace(), Key: key.Key, Version: old.GetVersion()},
 	)), nil
 }

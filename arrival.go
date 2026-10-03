@@ -58,7 +58,10 @@ func ReadyNow() *ArrivalEntry {
 }
 
 // When returns when the entry's items are ready again, for a modification
-// made at now. The zero time means now.
+// made at now. The zero time means now, and is deliberately left zero for the
+// backend to resolve against its own clock: a release must happen at the
+// backend's now, not at this process's, or a client whose clock runs fast
+// would release an item into the future and leave it unavailable.
 func (e *ArrivalEntry) When(now time.Time) time.Time {
 	if e.in > 0 {
 		return now.Add(e.in)
