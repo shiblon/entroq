@@ -118,9 +118,11 @@ func WithMetricInterval(d time.Duration) Option {
 // lease but never a shorter one. The server dictates lease length because a
 // client has no incentive to be careful with it: a lease too short to survive
 // its own first renewal churns storage and burns claim counts for every other
-// client, not just the one that asked. The ceiling bounds the other direction,
-// how long a worker that died holding a claim can strand it, since guaranteed
-// forward progress matters more than any one holder's wishes.
+// client, not just the one that asked.
+//
+// The ceiling bounds how long a claim may hold what it took, on its FIRST hold
+// only: renewal is a lease change rather than a claim, and is not clamped. A
+// holder that keeps renewing is not bounded by it.
 const (
 	DefaultClaimLeaseFloor   = entroq.DefaultClaimDuration
 	DefaultClaimLeaseCeiling = time.Hour
