@@ -112,7 +112,7 @@ func TestRetryError_After(t *testing.T) {
 	// far-future arrival and the worker blocks claiming it. Wait for that retry.
 	deadline := time.After(5 * time.Second)
 	var retried *entroq.Task
-	for retried == nil {
+	for {
 		tasks, err := client.Tasks(ctx, q)
 		if err != nil {
 			t.Fatalf("tasks: %v", err)
