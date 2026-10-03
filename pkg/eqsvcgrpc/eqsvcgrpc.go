@@ -761,51 +761,37 @@ func (s *QSvc) countLeaseClamp(ctx context.Context, kind, reason string) {
 
 // resolveSetLease decides how long a doc claim holds its sets, given the
 // duration and the absolute time a request may each name. Protocol 2 allows
-// both, which protocol 1 refused: together they say "hold these until my
-// task's arrival, but for no less than this lease", so a claim can line up
-// with something else and still survive its own renewal.
+// both, which protocol 1 refused; an absolute time wins when one is given, and
+// the duration is what a request falls back on when it names no time.
 //
-// The absolute time wins when it is far enough out to be worth honoring, which
-// means at least half a lease -- one renewal interval. Below that the sets
-// would lapse before their holder could renew them, so the duration wins
-// instead. That leaves the floor only half enforced on the absolute path, at
-// least FLOOR/2 rather than FLOOR, and that is deliberate: one constant
-// protects both paths, at full strength for a duration and half strength for a
-// time, which is what lets a claim expire in step with a task whose own lease
-// is already part spent.
+// Either way the answer is clamped, because a lease too short churns storage
+// for every other client and one too long strands what a dead holder was
+// holding. A duration is clamped into the service's bounds whole; a time is
+// clamped into the same ceiling but to two thirds of the floor.
 //
 // A time in the past cannot be honored at all and is refused, because it is
-// always the caller's mistake and never a race. A time beyond the ceiling is
-// clamped exactly as a duration would be: stranding is stranding however it
-// was asked for.
+// always the caller's mistake and never a race.
 //
 // A nil result means the request named no lease worth passing on, and
 // entroq.ClaimDocs fills in DefaultClaimDuration.
 func (s *QSvc) resolveSetLease(ctx context.Context, now time.Time, duration time.Duration, at time.Time) (entroq.DocClaimArg, error) {
-	if !at.IsZero() && !at.After(now) {
+	if at.IsZero() {
+		if duration = s.clampLease(ctx, "doc", duration); duration <= 0 {
+			return nil, nil
+		}
+		return entroq.ClaimingSetsFor(duration), nil
+	}
+	if !at.After(now) {
 		return nil, codeErrorf(codes.InvalidArgument, "claim docs: at_ms names %v, which is not in the future", at)
 	}
-	// The clamped duration is never inert, even when the absolute time wins: it
-	// sets the half-lease threshold that decides whether the time is honored.
-	duration = s.clampLease(ctx, "doc", duration)
-	byDuration := func() entroq.DocClaimArg {
-		if duration <= 0 {
-			return nil
-		}
-		return entroq.ClaimingSetsFor(duration)
-	}
-	if at.IsZero() {
-		return byDuration(), nil
-	}
-
-	threshold := duration
-	if threshold <= 0 {
-		threshold = entroq.DefaultClaimDuration
-	}
+	// A named time may reach below the lease floor, down to one renewal's worth
+	// of it, which is what lets a claim expire in step with a task whose lease
+	// is part spent -- the reason to name a time rather than a duration.
+	minHold := entroq.RenewalDurationFor(s.leaseFloor)
 	switch {
-	case at.Before(now.Add(threshold / 2)):
-		s.countLeaseClamp(ctx, "doc", "at_too_soon")
-		return byDuration(), nil
+	case at.Before(now.Add(minHold)):
+		s.countLeaseClamp(ctx, "doc", "below_floor")
+		return entroq.ClaimingSetsUntil(now.Add(minHold)), nil
 	case at.After(now.Add(s.leaseCeiling)):
 		s.countLeaseClamp(ctx, "doc", "above_ceiling")
 		return entroq.ClaimingSetsUntil(now.Add(s.leaseCeiling)), nil

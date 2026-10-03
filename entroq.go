@@ -111,8 +111,29 @@ import (
 
 const (
 	DefaultClaimPollTime = 30 * time.Second
-	DefaultClaimDuration = 30 * time.Second
+
+	// DefaultClaimDuration is how long a claim holds a task or doc set when
+	// nothing says otherwise. A holder renews after RenewalDurationFor of it,
+	// so what is left over is the margin: for the renewal to complete in, and
+	// for claiming doc sets before they stop expiring in step with their task.
+	//
+	// Lengthening it costs only the sad path, where a dead holder keeps what it
+	// held for up to a lease. That is multiplied by the failure rate; anything
+	// on the happy path is multiplied by throughput.
+	DefaultClaimDuration = 45 * time.Second
 )
+
+// RenewalDurationFor returns how far into lease its holder renews, leaving the
+// rest as margin.
+//
+// A service also applies it to its lease floor, to decide how far below that
+// floor a claim may name an arrival: that far down is one renewal's worth of a
+// lease, which is as low as a holder can be given and still renew in time. The
+// two uses are not forced to match, but equal is always safe where drifting
+// apart would need an argument, so one fraction serves both.
+func RenewalDurationFor(lease time.Duration) time.Duration {
+	return lease * 2 / 3
+}
 
 // MaxClaimDuration bounds how long any claim may hold a task or doc set. It is
 // a sanity bound, not a policy one: a service sets policy, and its limits are

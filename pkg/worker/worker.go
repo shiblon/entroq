@@ -1482,23 +1482,18 @@ func (h held) renewed(resp *entroq.ModifyResponse) (held, error) {
 }
 
 // renewInterval returns how long after a claim, and after each renewal, a hold
-// should be renewed: two thirds of the lease the claim actually GRANTED,
-// leaving a third as margin for the renewal itself to complete, and asking for
-// one renewal per hold rather than two.
+// should be renewed.
 //
-// At minus Modified is that lease exactly. A claim stamps both from one server
-// clock -- at = now + duration, modified = now, in every backend, which
-// eqtest.ClaimStampsLease holds them to -- so the difference is immune to
-// network latency and to any disagreement between this process's clock and the
-// server's. Going by the lease that was REQUESTED instead would first renew
-// after the hold had already expired, whenever a service clamped the claim
-// into bounds of its own.
+// At minus Modified is the lease the claim actually GRANTED, which a service
+// may have clamped: both are stamped from one server clock, so the difference
+// is immune to network latency and to clock disagreement, where going by the
+// REQUESTED lease would first renew after the granted hold had expired.
+// eqtest.ClaimStampsLease holds every backend to that pairing.
 //
 // Only the task is worth measuring: its doc sets are claimed until its own
-// arrival, and a clamp can only move those later, so the task always expires
-// first.
+// arrival and a clamp can only move those later, so the task expires first.
 func renewInterval(t *entroq.Task) time.Duration {
-	return max(0, t.At.Sub(t.Modified)*2/3)
+	return max(0, entroq.RenewalDurationFor(t.At.Sub(t.Modified)))
 }
 
 // relocked returns g, and each of its docs, at lock l.

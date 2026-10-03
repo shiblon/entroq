@@ -38,6 +38,9 @@ func TestResolveSetLease(t *testing.T) {
 		floor   = 30 * time.Second
 		ceiling = time.Hour
 	)
+	// The shortest hold a named time can produce. Taken from the function the
+	// service itself uses, so these cases cannot drift from it.
+	minHold := entroq.RenewalDurationFor(floor)
 	now := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
 
 	for _, tc := range []struct {
@@ -67,30 +70,35 @@ func TestResolveSetLease(t *testing.T) {
 		at:       now.Add(10 * time.Minute),
 		want:     10 * time.Minute,
 	}, {
-		// Below half a lease the sets would lapse before renewal could extend
-		// them, so the duration wins instead.
-		name:     "a time inside half a lease falls back to the duration",
+		// A time wins outright: the two are never weighed against each other,
+		// so naming a duration as well changes nothing.
+		name:     "a duration is ignored when a time is given",
 		duration: time.Minute,
-		at:       now.Add(20 * time.Second),
-		want:     time.Minute,
+		at:       now.Add(25 * time.Second),
+		want:     25 * time.Second,
 	}, {
-		// Deliberate: the threshold enforces only half the floor on the time
-		// path, which is what lets a claim expire with a part-spent task.
-		name: "a time past half the default is honored below the floor",
-		at:   now.Add(20 * time.Second),
-		want: 20 * time.Second,
+		// Deliberate: a time may reach below the floor, which is what lets a
+		// claim expire in step with a part-spent task.
+		name: "a time above the minimum hold is honored below the lease floor",
+		at:   now.Add(25 * time.Second),
+		want: 25 * time.Second,
+	}, {
+		// The boundary is inclusive: pins the comparison, not just the clamp.
+		name: "a time exactly at the minimum hold is honored",
+		at:   now.Add(minHold),
+		want: minHold,
 	}, {
 		name:     "a time beyond the ceiling is clamped down",
 		duration: time.Minute,
 		at:       now.Add(48 * time.Hour),
 		want:     ceiling,
 	}, {
-		// The clamped duration sets the threshold even when the time wins, so a
-		// tiny duration does not drag the threshold down with it.
-		name:     "a clamped duration still sets the threshold",
+		// Clamped up to the minimum hold, not down to the absurd duration beside
+		// it: a time is bounded on its own terms.
+		name:     "a time below the minimum hold is clamped up",
 		duration: time.Millisecond,
 		at:       now.Add(10 * time.Second),
-		want:     floor,
+		want:     minHold,
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := leaseSvc(t, floor, ceiling)
