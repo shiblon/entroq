@@ -216,17 +216,21 @@ func TaskClaimantIsHolder(ctx context.Context, t *testing.T, client *entroq.Entr
 	queue := path.Join(qPrefix, "task_claimant_is_holder")
 	const writer, worker = "holder-writer", "holder-worker"
 	later := time.Now().Add(time.Hour)
+	// A claimant is derived from the arrival on every write, never carried over,
+	// so a wrong one is not a stale value: it means the backend read the arrival
+	// as held or as free when it should have read the other. Report the arrival
+	// alongside, since that is what decided it.
 	check := func(what string, task *entroq.Task, want string) {
 		t.Helper()
 		if task.Claimant != want {
-			t.Errorf("%s: claimant %q, want %q", what, task.Claimant, want)
+			t.Errorf("%s: claimant %q, want %q (arrival %v, caller now %v)", what, task.Claimant, want, task.At, time.Now().UTC())
 		}
 		stored, err := client.Tasks(ctx, queue, entroq.WithTaskID(task.ID))
 		if err != nil || len(stored) != 1 {
 			t.Fatalf("%s: read back: %v, %v", what, stored, err)
 		}
 		if stored[0].Claimant != want {
-			t.Errorf("%s: stored claimant %q, want %q", what, stored[0].Claimant, want)
+			t.Errorf("%s: stored claimant %q, want %q (arrival %v)", what, stored[0].Claimant, want, stored[0].At)
 		}
 	}
 
