@@ -743,12 +743,74 @@ func (s *QSvc) clampLease(ctx context.Context, kind string, d time.Duration) tim
 		bounded, reason = s.leaseCeiling, "above_ceiling"
 	}
 	if reason != "" {
-		s.leaseClamped.Add(ctx, 1, metric.WithAttributes(
-			attribute.String("kind", kind),
-			attribute.String("reason", reason),
-		))
+		s.countLeaseClamp(ctx, kind, reason)
 	}
 	return bounded
+}
+
+// countLeaseClamp records that a claim did not get the lease it asked for.
+// Attributes stay low-cardinality on purpose: a claimant would name the client
+// at fault, but claimant IDs are per-consumer and would make this unusable as
+// a time series.
+func (s *QSvc) countLeaseClamp(ctx context.Context, kind, reason string) {
+	s.leaseClamped.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("kind", kind),
+		attribute.String("reason", reason),
+	))
+}
+
+// resolveSetLease decides how long a doc claim holds its sets, given the
+// duration and the absolute time a request may each name. Protocol 2 allows
+// both, which protocol 1 refused: together they say "hold these until my
+// task's arrival, but for no less than this lease", so a claim can line up
+// with something else and still survive its own renewal.
+//
+// The absolute time wins when it is far enough out to be worth honoring, which
+// means at least half a lease -- one renewal interval. Below that the sets
+// would lapse before their holder could renew them, so the duration wins
+// instead. That leaves the floor only half enforced on the absolute path, at
+// least FLOOR/2 rather than FLOOR, and that is deliberate: one constant
+// protects both paths, at full strength for a duration and half strength for a
+// time, which is what lets a claim expire in step with a task whose own lease
+// is already part spent.
+//
+// A time in the past cannot be honored at all and is refused, because it is
+// always the caller's mistake and never a race. A time beyond the ceiling is
+// clamped exactly as a duration would be: stranding is stranding however it
+// was asked for.
+//
+// A nil result means the request named no lease worth passing on, and
+// entroq.ClaimDocs fills in DefaultClaimDuration.
+func (s *QSvc) resolveSetLease(ctx context.Context, now time.Time, duration time.Duration, at time.Time) (entroq.DocClaimArg, error) {
+	if !at.IsZero() && !at.After(now) {
+		return nil, codeErrorf(codes.InvalidArgument, "claim docs: at_ms names %v, which is not in the future", at)
+	}
+	// The clamped duration is never inert, even when the absolute time wins: it
+	// sets the half-lease threshold that decides whether the time is honored.
+	duration = s.clampLease(ctx, "doc", duration)
+	byDuration := func() entroq.DocClaimArg {
+		if duration <= 0 {
+			return nil
+		}
+		return entroq.ClaimingSetsFor(duration)
+	}
+	if at.IsZero() {
+		return byDuration(), nil
+	}
+
+	threshold := duration
+	if threshold <= 0 {
+		threshold = entroq.DefaultClaimDuration
+	}
+	switch {
+	case at.Before(now.Add(threshold / 2)):
+		s.countLeaseClamp(ctx, "doc", "at_too_soon")
+		return byDuration(), nil
+	case at.After(now.Add(s.leaseCeiling)):
+		s.countLeaseClamp(ctx, "doc", "above_ceiling")
+		return entroq.ClaimingSetsUntil(now.Add(s.leaseCeiling)), nil
+	}
+	return entroq.ClaimingSetsUntil(at), nil
 }
 
 // Modify attempts to make the specified modification from the given
@@ -1088,17 +1150,18 @@ func (s *QSvc) ClaimDocs(ctx context.Context, req *pb.ClaimDocsRequest) (*pb.Cla
 	} else {
 		args = append(args, entroq.ClaimKey(cq.GetNamespace(), cq.GetKey()))
 	}
-	switch {
-	case cq.GetAtMs() != 0:
-		if protocol < 2 {
-			return nil, codeErrorf(codes.InvalidArgument, "claim docs: at_ms is protocol 2, and the request declares protocol %d", protocol)
-		}
-		if cq.GetDurationMs() != 0 {
-			return nil, codeErrorf(codes.InvalidArgument, "claim docs: give a duration or a time, not both")
-		}
-		args = append(args, entroq.ClaimingSetsUntil(pbconv.FromMSOrUnset(cq.GetAtMs())))
-	case cq.GetDurationMs() != 0:
-		args = append(args, entroq.ClaimingSetsFor(s.clampLease(ctx, "doc", time.Duration(cq.GetDurationMs())*time.Millisecond)))
+	if cq.GetAtMs() != 0 && protocol < 2 {
+		return nil, codeErrorf(codes.InvalidArgument, "claim docs: at_ms is protocol 2, and the request declares protocol %d", protocol)
+	}
+	lease, err := s.resolveSetLease(ctx, entroq.ProcessTime(),
+		time.Duration(cq.GetDurationMs())*time.Millisecond,
+		pbconv.FromMSOrUnset(cq.GetAtMs()),
+	)
+	if err != nil {
+		return nil, err
+	}
+	if lease != nil {
+		args = append(args, lease)
 	}
 	dc := entroq.NewDocClaim(args...)
 	if err := dc.Validate(); err != nil {
