@@ -149,7 +149,7 @@ func TestWorkerRenewal(t *testing.T) {
 	if wantRenewals < 2 {
 		t.Fatalf("test needs at least two renewals in %v, got %d (interval %v)", working, wantRenewals, renewInterval(task))
 	}
-	if renewErr, err := doWhileRenewing(ctx, client, 6*time.Second, 0, held{task: task}, func(ctx context.Context, stop finalizeRenew) error {
+	if renewErr, err := doWhileRenewing(ctx, client, 0, held{task: task}, func(ctx context.Context, stop finalizeRenew) error {
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("doWhileRenewing: %w", ctx.Err())
@@ -193,7 +193,7 @@ func TestDoWhileRenewing_ImmediateCancellationOnLeaseLoss(t *testing.T) {
 
 	errChan := make(chan error, 1)
 	go func() {
-		renewErr, _ := doWhileRenewing(ctx, client, 100*time.Millisecond, 0, held{task: claimed}, func(ctx context.Context, _ finalizeRenew) error {
+		renewErr, _ := doWhileRenewing(ctx, client, 0, held{task: claimed}, func(ctx context.Context, _ finalizeRenew) error {
 			<-ctx.Done()
 			return ctx.Err()
 		})
@@ -776,5 +776,106 @@ func TestUndecodableValueMoves(t *testing.T) {
 	runCancel()
 	if err := <-errCh; err != nil {
 		t.Errorf("Run: %v", err)
+	}
+}
+
+// leaseFloorBackend grants at least floor, however short a lease the claim
+// asked for, the way a service's lease floor does. Embedding the interface
+// leaves every other method alone, so only claiming behaves differently.
+type leaseFloorBackend struct {
+	entroq.Backend
+	floor time.Duration
+}
+
+func (b *leaseFloorBackend) raise(cq *entroq.ClaimQuery) *entroq.ClaimQuery {
+	if cq.Duration >= b.floor {
+		return cq
+	}
+	raised := *cq
+	raised.Duration = b.floor
+	return &raised
+}
+
+func (b *leaseFloorBackend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
+	return b.Backend.Claim(ctx, b.raise(cq))
+}
+
+func (b *leaseFloorBackend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
+	return b.Backend.TryClaim(ctx, b.raise(cq))
+}
+
+func leaseFloorOpener(inner entroq.BackendOpener, floor time.Duration) entroq.BackendOpener {
+	return func(ctx context.Context) (entroq.Backend, error) {
+		b, err := inner(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return &leaseFloorBackend{Backend: b, floor: floor}, nil
+	}
+}
+
+// TestRenewalHoldsTheGrantedLease pins the half of the granted-lease rule that
+// only shows when a claim is clamped: the hold a renewal asks for.
+//
+// The claim requests far less than the floor, so the lease it is GRANTED is
+// much longer than the one it asked for. A renewal that asked for the original
+// request would shorten the hold to less than the cadence and the task would
+// fall free between renewals, which is exactly what happened before
+// doWhileRenewing stopped being given a lease at all. Renewing for the granted
+// lease instead keeps every grant equal to the last, which is also why
+// computing the cadence once is exact rather than merely convenient.
+//
+// Run against a default service this would pass either way, because the
+// default lease equals the default floor and the two values coincide. The
+// clamp is what makes the assertion mean anything.
+func TestRenewalHoldsTheGrantedLease(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	const (
+		asked = 50 * time.Millisecond
+		floor = 2 * time.Second
+	)
+	client, err := entroq.New(ctx, leaseFloorOpener(eqmem.Opener(), floor))
+	if err != nil {
+		t.Fatalf("New client: %v", err)
+	}
+	defer client.Close()
+
+	const queue = "renewal_granted_lease"
+	if _, err := client.Modify(ctx, entroq.InsertingInto(queue)); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	task, err := client.Claim(ctx, entroq.From(queue), entroq.ClaimFor(asked))
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	granted := grantedLease(task)
+	if granted < floor {
+		t.Fatalf("claim granted %v, want at least the floor %v: the backend did not clamp, so this test proves nothing", granted, floor)
+	}
+
+	// Long enough for several renewals, and far longer than the lease the
+	// claim asked for.
+	working := 3 * renewInterval(task)
+	renewErr, err := doWhileRenewing(ctx, client, 0, held{task: task}, func(ctx context.Context, stop finalizeRenew) error {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("work: %w", ctx.Err())
+		case <-time.After(working):
+		}
+		stable := stop()
+		if stable.task.Version <= task.Version {
+			t.Errorf("no renewal happened in %v: version still %d", working, stable.task.Version)
+		}
+		// Each renewal must grant what the last one did. A renewal for the
+		// asked-for lease would show up here as a hold collapsed to ~asked.
+		if got := grantedLease(stable.task); got != granted {
+			t.Errorf("renewed hold is %v, want the granted lease %v (the claim asked for %v)", got, granted, asked)
+		}
+		return nil
+	})
+	if renewErr != nil || err != nil {
+		t.Fatalf("doWhileRenewing: renew %v, work %v", renewErr, err)
 	}
 }
