@@ -139,16 +139,25 @@ func TestWorkerRenewal(t *testing.T) {
 		t.Fatalf("Claim: %v", err)
 	}
 
-	// Renewal fires at interval/2 = 3 s; 10 s → 3 renewals expected.
-	if renewErr, err := doWhileRenewing(ctx, client, 6*time.Second, 3*time.Second, held{task: task}, func(ctx context.Context, stop finalizeRenew) error {
+	// The cadence is derived from the task, not given, so derive the expected
+	// renewal count the same way rather than hard-coding one: a count tied to
+	// the fraction in renewInterval would fail as a mystery if that changed,
+	// while this keeps asserting what the test is about, that renewal actually
+	// fires on the cadence and that stop() returns the versions it left behind.
+	const working = 10 * time.Second
+	wantRenewals := int32(working / renewInterval(task))
+	if wantRenewals < 2 {
+		t.Fatalf("test needs at least two renewals in %v, got %d (interval %v)", working, wantRenewals, renewInterval(task))
+	}
+	if renewErr, err := doWhileRenewing(ctx, client, 6*time.Second, 0, held{task: task}, func(ctx context.Context, stop finalizeRenew) error {
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("doWhileRenewing: %w", ctx.Err())
-		case <-time.After(10 * time.Second):
+		case <-time.After(working):
 		}
 		stable := stop()
-		if want, got := task.Version+3, stable.task.Version; want != got {
-			t.Errorf("expected version %d after 3 renewals, got %d", want, got)
+		if want, got := task.Version+wantRenewals, stable.task.Version; want != got {
+			t.Errorf("expected version %d after %d renewals, got %d", want, wantRenewals, got)
 		}
 		return nil
 	}); renewErr != nil || err != nil {
@@ -173,14 +182,18 @@ func TestDoWhileRenewing_ImmediateCancellationOnLeaseLoss(t *testing.T) {
 	if _, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue("work"))); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
-	claimed, err := client.Claim(ctx, entroq.From(queue), entroq.ClaimFor(10*time.Second))
+	// The cadence is two thirds of the granted lease, so claim for a short one:
+	// renewal has to fire, and find the task gone, well inside this test's
+	// budget. The assertion is about what a failed renewal does, not about how
+	// long the lease was.
+	claimed, err := client.Claim(ctx, entroq.From(queue), entroq.ClaimFor(150*time.Millisecond))
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
 
 	errChan := make(chan error, 1)
 	go func() {
-		renewErr, _ := doWhileRenewing(ctx, client, 100*time.Millisecond, 50*time.Millisecond, held{task: claimed}, func(ctx context.Context, _ finalizeRenew) error {
+		renewErr, _ := doWhileRenewing(ctx, client, 100*time.Millisecond, 0, held{task: claimed}, func(ctx context.Context, _ finalizeRenew) error {
 			<-ctx.Done()
 			return ctx.Err()
 		})

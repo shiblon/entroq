@@ -9,6 +9,38 @@ import (
 	"github.com/shiblon/entroq"
 )
 
+// ClaimStampsLease checks that a claim records both when it happened and how
+// long it granted: Modified is the claim's own instant and At is that instant
+// plus the lease, so their difference is the granted lease measured entirely
+// on the server's clock.
+//
+// pkg/worker renews on that difference rather than on the lease it requested,
+// because a service may clamp a claim into bounds of its own and renewing on
+// the requested lease would then first renew after the hold had expired.
+// Reading it from two server stamps needs no agreement between the worker's
+// clock and the server's, and no guess at how long the claim took to arrive --
+// which is why only the difference is asserted here, and not either stamp
+// against this process's wall clock.
+//
+// Every backend must agree. They implement it separately (eqmem assigns,
+// eqsqlite and eqpg in SQL, eqredis in Lua), all from one server now.
+func ClaimStampsLease(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	queue := path.Join(qPrefix, "claim-stamps-lease")
+	if _, err := client.Modify(ctx, entroq.InsertingInto(queue)); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	// Not a round number, so a backend defaulting the lease cannot pass by luck.
+	const lease = 37 * time.Second
+	task, err := client.Claim(ctx, entroq.From(queue), entroq.ClaimFor(lease))
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if got := task.At.Sub(task.Modified); got != lease {
+		t.Errorf("At - Modified = %v, want the granted lease %v (At %v, Modified %v)", got, lease, task.At, task.Modified)
+	}
+}
+
 // UpdateArrival checks the arrival update contract: tasks and doc sets the
 // caller holds are renewed or released together, each moving one version and
 // nothing else, and an update that names anything the caller does not hold at

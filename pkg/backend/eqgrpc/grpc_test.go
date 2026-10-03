@@ -135,6 +135,10 @@ func TestGRPCUpdateArrival(t *testing.T) {
 	RunQTest(t, eqtest.UpdateArrival)
 }
 
+func TestGRPCClaimStampsLease(t *testing.T) {
+	RunQTest(t, eqtest.ClaimStampsLease)
+}
+
 func TestGRPCTaskChangeFutureArrival(t *testing.T) {
 	RunQTest(t, eqtest.TaskChangeFutureArrival)
 }

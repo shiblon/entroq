@@ -976,10 +976,9 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 		finalSets   []*entroq.DocSet
 	)
 
-	// Renew first half a lease after the claim, at once if claiming the sets
-	// took longer: the task's lease has run since then.
-	first := max(0, opts.lease/2-time.Since(claimed))
-	renewErr, handleErr := doWhileRenewing(rCtx, w.eqc, opts.lease, first, held{task: task, sets: sets},
+	// Only a duration crosses into doWhileRenewing: how long the claim has
+	// already been running locally. It derives the cadence itself from the task.
+	renewErr, handleErr := doWhileRenewing(rCtx, w.eqc, opts.lease, time.Since(claimed), held{task: task, sets: sets},
 		func(ctx context.Context, stop finalizeRenew) error {
 			defer func() {
 				final := stop()
@@ -1115,7 +1114,14 @@ func Watching(qs ...string) RunOption {
 	}
 }
 
-// WithLease sets the frequency of task renewal.
+// WithLease sets the lease a Run claims for, which also sets the frequency of
+// renewal: a hold is renewed two thirds of the way through what the claim
+// granted. There is no minimum. Whether a renewal arrives before the server's
+// clock runs the lease out is the server's to judge, and a renewal that does
+// not arrive in time loses the claim, which is a designed outcome rather than
+// a failure: the task returns to its queue and another worker takes it. A
+// service clamps a lease it considers too short, so what is left here is a
+// caller's own process holding its own claims.
 func WithLease(d time.Duration) RunOption {
 	return func(ro *runOpt) {
 		ro.lease = d
@@ -1475,6 +1481,26 @@ func (h held) renewed(resp *entroq.ModifyResponse) (held, error) {
 	return out, nil
 }
 
+// renewInterval returns how long after a claim, and after each renewal, a hold
+// should be renewed: two thirds of the lease the claim actually GRANTED,
+// leaving a third as margin for the renewal itself to complete, and asking for
+// one renewal per hold rather than two.
+//
+// At minus Modified is that lease exactly. A claim stamps both from one server
+// clock -- at = now + duration, modified = now, in every backend, which
+// eqtest.ClaimStampsLease holds them to -- so the difference is immune to
+// network latency and to any disagreement between this process's clock and the
+// server's. Going by the lease that was REQUESTED instead would first renew
+// after the hold had already expired, whenever a service clamped the claim
+// into bounds of its own.
+//
+// Only the task is worth measuring: its doc sets are claimed until its own
+// arrival, and a clamp can only move those later, so the task always expires
+// first.
+func renewInterval(t *entroq.Task) time.Duration {
+	return max(0, t.At.Sub(t.Modified)*2/3)
+}
+
 // relocked returns g, and each of its docs, at lock l.
 func relocked(g, l *entroq.DocSet) *entroq.DocSet {
 	ng := *g
@@ -1495,17 +1521,29 @@ type finalizeRenew func() held
 // workFn handles tasks and docs while renewal runs in the background.
 type workFn func(ctx context.Context, stop finalizeRenew) error
 
-// doWhileRenewing runs work while keeping h claimed in the background: after
-// first, and then every half lease, one UpdateArrival renews the task and
-// every set, sets with no docs included. A renewal that finds the claim lost,
-// a server that cannot renew, or a renewal that does not return what it
-// renewed cancels work with that error as its cause, and returns it as
-// renewErr, whatever the work then returned: once renewal has stopped, that
-// is why the work ended.
-func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, lease, first time.Duration, h held, work workFn) (renewErr, err error) {
+// doWhileRenewing runs work while keeping h claimed in the background: every
+// interval, one UpdateArrival renews the task and every set for lease, sets
+// with no docs included. A renewal that finds the claim lost, a server that
+// cannot renew, or a renewal that does not return what it renewed cancels work
+// with that error as its cause, and returns it as renewErr, whatever the work
+// then returned: once renewal has stopped, that is why the work ended.
+//
+// The cadence comes from renewInterval and never changes, so a renewal that
+// fails comes back on the same schedule rather than any sooner for having
+// failed: losing the claim is a designed outcome, and retrying a struggling
+// server faster is the wrong direction.
+//
+// sinceClaim is how long the claim has already been running when renewal
+// starts, which is not zero: the doc sets were claimed in between, and the
+// lease was running throughout. Only the first wait is shortened by it, to
+// nothing at all if claiming the sets outlasted a whole interval. It arrives
+// as a duration rather than an instant on purpose, so that no clock reading
+// crosses into here and the local and server clocks never meet.
+func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, lease, sinceClaim time.Duration, h held, work workFn) (renewErr, err error) {
 	if h.task == nil {
 		return nil, fmt.Errorf("do while renewing: nothing to renew")
 	}
+	interval := renewInterval(h.task)
 	type outVal struct {
 		held held
 		err  error
@@ -1523,7 +1561,7 @@ func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, lease, first time.Du
 	stopRenew := make(chan struct{})
 	g.Go(func() error {
 		cur := h
-		next := first
+		next := max(0, interval-sinceClaim)
 		var out chan<- outVal
 		stop := func(err error) {
 			fcancel(err)
@@ -1540,7 +1578,10 @@ func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, lease, first time.Du
 				out = taskCh
 				doneCh = nil
 			case <-time.After(next):
-				next = lease / 2
+				// Leave the first interval behind, which may have been short or
+				// zero because the claim's lease had already run, and settle
+				// onto the steady cadence.
+				next = interval
 				if stopErr != nil {
 					break
 				}
@@ -1548,12 +1589,12 @@ func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, lease, first time.Du
 				_, lost := entroq.AsDependency(err)
 				switch {
 				case err == nil:
-					next, err := cur.renewed(resp)
+					renewedHeld, err := cur.renewed(resp)
 					if err != nil {
 						stop(err)
 						break
 					}
-					cur = next
+					cur = renewedHeld
 				case entroq.IsCanceled(err):
 					out = taskCh
 				case lost || entroq.IsUnsupported(err):

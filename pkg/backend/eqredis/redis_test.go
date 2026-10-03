@@ -149,6 +149,10 @@ func TestUpdateArrival(t *testing.T) {
 	RunQTest(t, eqtest.UpdateArrival)
 }
 
+func TestClaimStampsLease(t *testing.T) {
+	RunQTest(t, eqtest.ClaimStampsLease)
+}
+
 func TestTaskChangeFarPastArrivalNormalized(t *testing.T) {
 	RunQTest(t, eqtest.TaskChangeFarPastArrivalNormalized)
 }
