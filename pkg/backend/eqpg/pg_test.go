@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/testing/dockerprobe"
 	"github.com/shiblon/entroq/pkg/testing/eqtest"
 	"github.com/shiblon/entroq/pkg/worker"
 	"github.com/testcontainers/testcontainers-go"
@@ -23,31 +24,15 @@ import (
 
 var pgHostPort string
 
-// dockerAvailable reports whether a Docker daemon is reachable. The eqpg tests
-// run Postgres in a testcontainer, so without Docker there is nothing to test
-// against. Detecting its absence lets TestMain skip cleanly (exit 0) instead of
-// failing the package -- important because a bare `go test ./...` (or any CI
-// without a Docker service) would otherwise hard-fail here, and the Example_*
-// functions, which run unconditionally, would crash on an empty endpoint.
-func dockerAvailable(ctx context.Context) bool {
-	cli, err := testcontainers.NewDockerClient()
-	if err != nil {
-		return false
-	}
-	defer cli.Close()
-	// NewDockerClient does not fail when the daemon is unreachable (it swallows
-	// the probe and hands back an env-derived client), so the ping is the real
-	// check. Bound it: an unreachable or black-hole endpoint must not hang here.
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	_, err = cli.Ping(ctx)
-	return err == nil
-}
+// The eqpg tests run Postgres in a testcontainer, so without a usable Docker
+// daemon there is nothing to test against and TestMain skips the package. The
+// Example_* functions run unconditionally and would crash on an empty endpoint,
+// so the skip has to happen before them.
 
 func TestMain(m *testing.M) {
 	ctx := context.Background()
 
-	if !dockerAvailable(ctx) {
+	if !dockerprobe.Available(ctx) {
 		log.Println("SKIP: Docker is not available; skipping eqpg integration tests (they require a Postgres testcontainer).")
 		os.Exit(0)
 	}
