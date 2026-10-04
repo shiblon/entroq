@@ -251,17 +251,25 @@ type ListenerCounter interface {
 	Listeners() map[string]int
 }
 
-// NotifyModified takes inserted and changed tasks and notifies once per unique queue/ID pair.
+// NotifyModified takes inserted and changed tasks and notifies once per unique
+// queue/ID pair, for those that are available rather than held.
+//
+// Availability is read as At at or before Modified, not against a clock. Every
+// task here was just written by one backend transaction, which stamped both
+// fields from its own now, so the two are comparable exactly and the question
+// needs no third reading of any clock: a held task arrives after it was
+// written, an available one does not. Reading an ambient time.Now() here was
+// wrong for eqpg, whose Modified and At come from Postgres while this process
+// has a clock of its own.
 func NotifyModified(n Notifier, inserted, changed []*Task) {
-	now := time.Now()
 	qs := make(map[string]string)
 	for _, t := range inserted {
-		if !now.Before(t.At) {
+		if !t.At.After(t.Modified) {
 			qs[t.ID] = t.Queue
 		}
 	}
 	for _, t := range changed {
-		if !now.Before(t.At) {
+		if !t.At.After(t.Modified) {
 			qs[t.ID] = t.Queue
 		}
 	}
@@ -1077,7 +1085,6 @@ func WithModification(src *Modification) ModifyArg {
 
 // Modification contains all of the information for a single batch modification in the task store.
 type Modification struct {
-	now     time.Time
 	options []ModifyOption
 
 	// resetClaims holds the IDs of changed tasks whose claim count the change
@@ -1142,10 +1149,7 @@ func (m *Modification) String() string {
 // and dependencies all together. When creating this for the purpose of passing
 // to WithModification, set the claimant to empty (it is ignored in that case).
 func NewModification(claimant string, modArgs ...ModifyArg) *Modification {
-	m := &Modification{
-		Claimant: claimant,
-		now:      time.Now(),
-	}
+	m := &Modification{Claimant: claimant}
 	for _, arg := range modArgs {
 		arg(m)
 	}
@@ -1339,8 +1343,15 @@ func (m *Modification) AllDependencies() (tasks map[string]int32, docs map[strin
 	return tasks, docs, nil
 }
 
-func (m *Modification) otherwiseClaimed(task *Task) bool {
-	return task.At.After(m.now) && task.Claimant != "" && task.Claimant != m.Claimant
+// otherwiseClaimed reports whether task is held by someone other than this
+// modification's claimant, at now.
+//
+// now is the BACKEND's reading of its own clock, taken while it holds the
+// task: a stored task carries no field that can answer "is it held right
+// now", so unlike NotifyModified this genuinely needs a clock, and it must be
+// the one that stamped the arrival being compared.
+func (m *Modification) otherwiseClaimed(task *Task, now time.Time) bool {
+	return task.At.After(now) && task.Claimant != "" && task.Claimant != m.Claimant
 }
 
 func (m *Modification) badInserts(foundDeps map[string]*Task) []*TaskID {
@@ -1353,7 +1364,7 @@ func (m *Modification) badInserts(foundDeps map[string]*Task) []*TaskID {
 	return present
 }
 
-func (m *Modification) badChanges(foundDeps map[string]*Task) (missing []*TaskID, claimed []*TaskID) {
+func (m *Modification) badChanges(foundDeps map[string]*Task, now time.Time) (missing []*TaskID, claimed []*TaskID) {
 	for _, t := range m.Changes {
 		found := foundDeps[t.ID]
 		if found == nil || found.Version != t.Version {
@@ -1363,7 +1374,7 @@ func (m *Modification) badChanges(foundDeps map[string]*Task) (missing []*TaskID
 			})
 			continue
 		}
-		if m.otherwiseClaimed(found) {
+		if m.otherwiseClaimed(found, now) {
 			claimed = append(claimed, &TaskID{
 				ID:      t.ID,
 				Version: t.Version,
@@ -1374,14 +1385,14 @@ func (m *Modification) badChanges(foundDeps map[string]*Task) (missing []*TaskID
 	return missing, claimed
 }
 
-func (m *Modification) badDeletes(foundDeps map[string]*Task) (missing []*TaskID, claimed []*TaskID) {
+func (m *Modification) badDeletes(foundDeps map[string]*Task, now time.Time) (missing []*TaskID, claimed []*TaskID) {
 	for _, t := range m.Deletes {
 		found := foundDeps[t.ID]
 		if found == nil || found.Version != t.Version {
 			missing = append(missing, t)
 			continue
 		}
-		if m.otherwiseClaimed(found) {
+		if m.otherwiseClaimed(found, now) {
 			claimed = append(claimed, t)
 			continue
 		}
@@ -1403,15 +1414,15 @@ func (m *Modification) missingDepends(foundDeps map[string]*Task) []*TaskID {
 // dependencies found in the backend, or nil if everything is fine. Problems
 // include missing or claimed dependencies, both of which will block a
 // modification.
-func (m *Modification) DependencyError(found map[string]*Task, foundDocs map[string]*Doc) error {
+func (m *Modification) DependencyError(found map[string]*Task, foundDocs map[string]*Doc, now time.Time) error {
 	presentInserts := m.badInserts(found)
-	missingChanges, claimedChanges := m.badChanges(found)
-	missingDeletes, claimedDeletes := m.badDeletes(found)
+	missingChanges, claimedChanges := m.badChanges(found, now)
+	missingDeletes, claimedDeletes := m.badDeletes(found, now)
 	missingDepends := m.missingDepends(found)
 
 	presentDocIns := m.badDocInserts(foundDocs)
-	missingDocChg, claimedDocChg := m.badDocChanges(foundDocs)
-	missingDocDel, claimedDocDel := m.badDocDeletes(foundDocs)
+	missingDocChg, claimedDocChg := m.badDocChanges(foundDocs, now)
+	missingDocDel, claimedDocDel := m.badDocDeletes(foundDocs, now)
 	missingDocDep := m.missingDocDepends(foundDocs)
 
 	if len(presentInserts) > 0 || len(missingChanges) > 0 || len(claimedChanges) > 0 || len(missingDeletes) > 0 || len(claimedDeletes) > 0 || len(missingDepends) > 0 ||
@@ -1451,28 +1462,28 @@ func (m *Modification) badDocInserts(found map[string]*Doc) []*DocID {
 	return bad
 }
 
-func (m *Modification) badDocChanges(found map[string]*Doc) (missing, claimed []*DocID) {
+func (m *Modification) badDocChanges(found map[string]*Doc, now time.Time) (missing, claimed []*DocID) {
 	for _, chg := range m.DocChanges {
 		r, ok := found[DocKey(chg.Namespace, chg.ID)]
 		if !ok || r.Version != chg.Version {
 			missing = append(missing, &DocID{Namespace: chg.Namespace, ID: chg.ID, Version: chg.Version})
 			continue
 		}
-		if r.Claimant != "" && r.Claimant != m.Claimant && time.Now().Before(r.At) {
+		if r.Claimant != "" && r.Claimant != m.Claimant && now.Before(r.At) {
 			claimed = append(claimed, &DocID{Namespace: chg.Namespace, ID: chg.ID, Version: chg.Version})
 		}
 	}
 	return missing, claimed
 }
 
-func (m *Modification) badDocDeletes(found map[string]*Doc) (missing, claimed []*DocID) {
+func (m *Modification) badDocDeletes(found map[string]*Doc, now time.Time) (missing, claimed []*DocID) {
 	for _, del := range m.DocDeletes {
 		r, ok := found[DocKey(del.Namespace, del.ID)]
 		if !ok || r.Version != del.Version {
 			missing = append(missing, del)
 			continue
 		}
-		if r.Claimant != "" && r.Claimant != m.Claimant && time.Now().Before(r.At) {
+		if r.Claimant != "" && r.Claimant != m.Claimant && now.Before(r.At) {
 			claimed = append(claimed, del)
 		}
 	}

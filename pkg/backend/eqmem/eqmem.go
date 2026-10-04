@@ -823,7 +823,7 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 	taskMod := *mod
 	taskMod.DocInserts, taskMod.DocChanges, taskMod.DocDeletes, taskMod.DocDepends = nil, nil, nil, nil
 	var foundDeps *entroq.DependencyError
-	if err := taskMod.DependencyError(found, nil); err != nil {
+	if err := taskMod.DependencyError(found, nil, now); err != nil {
 		fd, ok := entroq.AsDependency(err)
 		if !ok {
 			return nil, fmt.Errorf("eqmem modify: %w", err)
