@@ -54,7 +54,10 @@ func heldByOther(f *taskFields, callerClaimant string, nowMs int64) bool {
 }
 
 func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*entroq.ModifyResponse, error) {
-	now := time.Now().UTC()
+	// Truncated to the precision Redis stores, so instants kept as Go values
+	// and instants written as milliseconds come from the same reading. See
+	// nowUTC.
+	now := nowUTC()
 	nowMs := now.UnixMilli()
 	claimant := mod.Claimant
 

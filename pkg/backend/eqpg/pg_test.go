@@ -417,6 +417,10 @@ func TestClaimStampsLease(t *testing.T) {
 	RunQTest(t, eqtest.ClaimStampsLease)
 }
 
+func TestArrivalResolvesOnBackendClock(t *testing.T) {
+	RunQTest(t, eqtest.ArrivalResolvesOnBackendClock)
+}
+
 func TestTaskChangeFarPastArrivalNormalized(t *testing.T) {
 	RunQTest(t, eqtest.TaskChangeFarPastArrivalNormalized)
 }

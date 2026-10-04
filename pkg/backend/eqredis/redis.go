@@ -307,9 +307,21 @@ func (e *EQRedis) Close() error {
 	return e.client.Close()
 }
 
-// Time returns the current time in UTC.
+// Time returns the current time in UTC, at the millisecond precision this
+// backend stores. Reporting finer precision than it can store would make the
+// reported time disagree with every stamp derived from it.
 func (e *EQRedis) Time(_ context.Context) (time.Time, error) {
-	return time.Now().UTC(), nil
+	return nowUTC(), nil
+}
+
+// nowUTC is this backend's clock, truncated to the millisecond precision Redis
+// stores, so that every instant derived from one reading agrees with every
+// other. Without it, a time kept as a Go value (a doc set's lock arrival, say)
+// carries microseconds that the same reading loses when it is written as
+// milliseconds, and At minus Modified comes out slightly longer than the
+// duration that was asked for. eqsqlite truncates for the same reason.
+func nowUTC() time.Time {
+	return time.UnixMilli(time.Now().UTC().UnixMilli()).UTC()
 }
 
 // taskFields is the canonical set of Hash fields for a task.

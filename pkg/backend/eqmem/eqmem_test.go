@@ -92,6 +92,10 @@ func TestEQMemClaimStampsLease(t *testing.T) {
 	RunQTest(t, eqtest.ClaimStampsLease)
 }
 
+func TestEQMemArrivalResolvesOnBackendClock(t *testing.T) {
+	RunQTest(t, eqtest.ArrivalResolvesOnBackendClock)
+}
+
 func TestEQMemTaskChangeFutureArrival(t *testing.T) {
 	RunQTest(t, eqtest.TaskChangeFutureArrival)
 }

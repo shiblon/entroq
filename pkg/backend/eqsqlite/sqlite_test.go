@@ -33,6 +33,7 @@ func TestBackendContract(t *testing.T) {
 		{"DocSets", eqtest.DocSets},
 		{"UpdateArrival", eqtest.UpdateArrival},
 		{"ClaimStampsLease", eqtest.ClaimStampsLease},
+		{"ArrivalResolvesOnBackendClock", eqtest.ArrivalResolvesOnBackendClock},
 		{"TaskChangeFutureArrival", eqtest.TaskChangeFutureArrival},
 		{"TaskChangeFarPastArrivalNormalized", eqtest.TaskChangeFarPastArrivalNormalized},
 		{"ModifyRejectsWrongQueue", eqtest.ModifyRejectsWrongQueue},
