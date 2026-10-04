@@ -611,9 +611,10 @@ func DocInsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 
 // DocClaimantBehavior verifies the claimant field semantics for doc modifications.
 //
-// The rule: after a Modify, current.Claimant = requested.Claimant if requested.At > now, else "".
-// requested.At comes from WithDocArrivalTime/WithDocArrivalTimeBy; if not supplied,
-// current.At is used (the existing value is copied through).
+// The rule: after a Modify, current.Claimant = requested.Claimant when the
+// write asked for a positive arrival, else "". The arrival comes from
+// WithDocArrivalTimeBy as a duration from the backend's own now, and a write
+// that names none releases the set.
 func DocClaimantBehavior(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	t.Helper()
 	ns := path.Join(qPrefix, "doc_claimant_behavior")

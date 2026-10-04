@@ -533,8 +533,27 @@ components:
                 atMs:
                     type: string
                     description: |-
-                        at_ms is the requested arrival/claim-expiry time for doc inserts and changes.
-                         Zero means "use the backend's current time and release any claim."
+                        at_ms is the requested arrival/claim-expiry time for doc inserts and
+                         changes. Zero means "use the backend's current time and release any
+                         claim." Only a protocol 1 client still sends it; see by_ms.
+                byMs:
+                    type: string
+                    description: |-
+                        by_ms is how long from the backend's own now the doc's set arrives, in
+                         millis. Nonzero wins over at_ms, and may be negative. Positive holds the
+                         set, claimed by the caller; zero or less releases it.
+
+                         Prefer it to at_ms always, and for a renewal it is the only safe choice.
+                         An at_ms is an instant on the caller's clock, so it is wrong by whatever
+                         the two clocks disagree by, AND it can go stale in flight: an at_ms that
+                         is no longer in the future when the backend evaluates it is
+                         indistinguishable from a deliberate release, so a renewal merely delayed
+                         releases the set instead of holding it. A by_ms is resolved entirely on
+                         the backend's clock, where a delay can postpone an arrival but cannot
+                         invert its meaning.
+
+                         Zero means the same as absent, because an absent arrival already means
+                         "release now", so nothing is lost by conflating them.
             description: |-
                 DocData holds the data portion of a doc, used for insertions. The created_ms
                  and modified_ms fields are used only for journal replay; leave them zero for

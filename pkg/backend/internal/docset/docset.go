@@ -215,9 +215,16 @@ func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string
 	held := make(map[Set]time.Time) // written sets, with the latest future arrival
 	added := make(map[Set]int)      // docs inserted less docs deleted, per set
 
-	write := func(g Set, at time.Time) {
+	// write records that mod writes g, holding it until the latest arrival any
+	// of those writes asks for. An arrival is named only as a duration from
+	// now, so whether this holds or releases is the SIGN of that duration and
+	// nothing else. That matters: when an arrival arrived as an instant
+	// computed by the caller, one that went stale in flight was no longer
+	// after now, which read as a release -- so a renewal merely delayed would
+	// hand the set away and report success doing it.
+	write := func(g Set, by time.Duration) {
 		latest := held[g]
-		if at.After(now) && at.After(latest) {
+		if at := now.Add(by); by > 0 && at.After(latest) {
 			latest = at
 		}
 		held[g] = latest
@@ -260,7 +267,7 @@ func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string
 			depErr.DocClaims = append(depErr.DocClaims, id)
 			continue
 		}
-		write(g, ins.At)
+		write(g, ins.By())
 		added[g]++
 	}
 	for _, chg := range mod.DocChanges {
@@ -272,7 +279,7 @@ func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string
 		case claimed(g):
 			depErr.DocClaims = append(depErr.DocClaims, id)
 		default:
-			write(g, chg.At)
+			write(g, chg.By())
 		}
 	}
 	for _, del := range mod.DocDeletes {
@@ -283,7 +290,7 @@ func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string
 		case claimed(g):
 			depErr.DocClaims = append(depErr.DocClaims, del)
 		default:
-			write(g, time.Time{})
+			write(g, 0) // a delete never holds its set
 			added[g]--
 		}
 	}
@@ -302,7 +309,7 @@ func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string
 			depErr.DocArrives = append(depErr.DocArrives, Ref(g, l))
 		case claimed(g):
 		default:
-			write(g, a.At)
+			write(g, a.By)
 		}
 	}
 

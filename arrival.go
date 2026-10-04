@@ -38,11 +38,12 @@ func (a *TaskArrival) Change(stored *Task) *Task {
 }
 
 // DocArrival changes only when a doc set is ready again, as TaskArrival does
-// for a task. It names the set by reference (see DocID.IsSetRef). The set may
-// have no docs.
+// for a task: By from the backend's own now, holding it until then, or now,
+// releasing it, for a By of zero or less. It names the set by reference (see
+// DocID.IsSetRef). The set may have no docs.
 type DocArrival struct {
 	DocID
-	At time.Time `json:"at"`
+	By time.Duration `json:"by"`
 }
 
 // ArrivalEntry makes tasks and doc sets ready again after a duration. Build
@@ -81,18 +82,6 @@ func ReadyNow() *ArrivalEntry {
 	return new(ArrivalEntry)
 }
 
-// When returns when the entry's items are ready again, for a modification
-// made at now. The zero time means now, and is deliberately left zero for the
-// backend to resolve against its own clock: a release must happen at the
-// backend's now, not at this process's, or a client whose clock runs fast
-// would release an item into the future and leave it unavailable.
-func (e *ArrivalEntry) When(now time.Time) time.Time {
-	if e.rel && e.in > 0 {
-		return now.Add(e.in)
-	}
-	return e.at
-}
-
 // By returns how long after a modification made at now the entry's items are
 // ready again. Zero means now, releasing them. An entry built from an instant
 // is converted here, at the edge, because an arrival travels as a duration:
@@ -129,14 +118,12 @@ func Arriving(entries ...*ArrivalEntry) ModifyArg {
 	return func(m *Modification) {
 		now := ProcessTime()
 		for _, e := range entries {
+			by := e.By(now)
 			for _, t := range e.tasks {
-				m.Arrives = append(m.Arrives, &TaskArrival{TaskID: *t.IDVersion(), By: e.By(now)})
+				m.Arrives = append(m.Arrives, &TaskArrival{TaskID: *t.IDVersion(), By: by})
 			}
-			// Doc arrivals still travel as instants, and go relative with the
-			// rest of the doc path.
-			at := e.When(now)
 			for _, g := range e.sets {
-				m.DocArrives = append(m.DocArrives, &DocArrival{DocID: *g.Ref(), At: at})
+				m.DocArrives = append(m.DocArrives, &DocArrival{DocID: *g.Ref(), By: by})
 			}
 		}
 	}

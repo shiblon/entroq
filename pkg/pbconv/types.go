@@ -114,7 +114,7 @@ func TaskArrivalToProto(a *entroq.TaskArrival) *pb.TaskChange {
 func DocArrivalToProto(a *entroq.DocArrival) *pb.DocChange {
 	return &pb.DocChange{
 		OldId:   DocRefToProto(&a.DocID),
-		NewData: &pb.DocData{AtMs: ToMS(a.At)},
+		NewData: &pb.DocData{ByMs: int64(a.By / time.Millisecond)},
 		Mode:    pb.ChangeMode_CHANGE_LEASE,
 	}
 }

@@ -164,15 +164,16 @@ func TestModifyArgsFromProtoLeases(t *testing.T) {
 	if len(mod.Changes) != 0 || len(mod.DocChanges) != 0 {
 		t.Errorf("Leases became changes: %v", mod)
 	}
-	// A task lease arrives as a duration: at_ms, which only a protocol-1 client
-	// still sends, is converted against the server's now, so the assertion is
-	// on how far ahead it lands, not on the instant itself.
+	// A lease arrives as a duration: at_ms, which only a protocol-1 client
+	// still sends, is converted against the server's now, so the assertions
+	// are on how far ahead it lands, not on the instant itself.
 	if len(mod.Arrives) != 1 || mod.Arrives[0].TaskID != (entroq.TaskID{ID: "t", Version: 3, Queue: "q"}) ||
 		(mod.Arrives[0].By - ahead).Abs() > time.Second {
 		t.Errorf("Task lease: got %+v, want ready in %v", mod.Arrives, ahead)
 	}
-	if len(mod.DocArrives) != 1 || mod.DocArrives[0].DocID != *entroq.NewDocSetRef("ns", "k", 5) || !mod.DocArrives[0].At.Equal(at) {
-		t.Errorf("Doc set lease: got %+v", mod.DocArrives)
+	if len(mod.DocArrives) != 1 || mod.DocArrives[0].DocID != *entroq.NewDocSetRef("ns", "k", 5) ||
+		(mod.DocArrives[0].By - ahead).Abs() > time.Second {
+		t.Errorf("Doc set lease: got %+v, want ready in %v", mod.DocArrives, ahead)
 	}
 }
 

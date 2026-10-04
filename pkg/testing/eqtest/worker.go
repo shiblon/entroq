@@ -742,10 +742,30 @@ func WorkerHoldsEmptyGroup(ctx context.Context, t *testing.T, client *entroq.Ent
 
 	// Several leases pass while the handler works; nobody else may claim the
 	// set meanwhile.
-	for deadline := time.Now().Add(4 * lease); time.Now().Before(deadline); time.Sleep(lease / 4) {
-		_, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "empty"), entroq.ClaimingSetsAs("intruder"), entroq.ClaimingSetsFor(lease))
+	//
+	// How far into the hold an intruder got through says which thing broke. A
+	// win after more than one lease means a renewal was late or missing, so the
+	// set really had lapsed. A win inside the first renewal interval means the
+	// set was still held and the claim was allowed through anyway, which is a
+	// doc-locking defect and not a timing one. Without the elapsed time the two
+	// are indistinguishable, and the second is far more serious.
+	workStarted := time.Now()
+	for deadline := workStarted.Add(4 * lease); time.Now().Before(deadline); time.Sleep(lease / 4) {
+		got, err := client.ClaimDocs(ctx, entroq.ClaimKey(ns, "empty"), entroq.ClaimingSetsAs("intruder"), entroq.ClaimingSetsFor(lease))
 		if err == nil {
-			t.Fatal("Another claimant took the worker's empty set while its handler ran")
+			elapsed := time.Since(workStarted)
+			// A renewal that stopped is the cause, where a lapsed set is only
+			// the symptom, and the worker reports the former through errCh. It
+			// is read without blocking, because a worker still renewing
+			// correctly has nothing to say here and must not be waited for.
+			cause := "worker still running, so renewal did not stop"
+			select {
+			case werr := <-errCh:
+				cause = fmt.Sprintf("worker had already exited: %v", werr)
+			default:
+			}
+			t.Fatalf("Another claimant took the worker's empty set %v into its handler (lease %v, renewal every %v, so %v of margin per cycle); %s; took %v",
+				elapsed.Round(time.Millisecond), lease, entroq.RenewalDurationFor(lease), lease-entroq.RenewalDurationFor(lease), cause, got)
 		}
 		if !entroq.IsDependency(err) {
 			t.Fatalf("Intruder claim: %v", err)

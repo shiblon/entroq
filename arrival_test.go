@@ -18,7 +18,7 @@ func TestArrivingBuildsArrivals(t *testing.T) {
 	if got := mod.Arrives[0]; got.TaskID != (TaskID{ID: "t", Version: 3, Queue: "q"}) || got.By != time.Minute {
 		t.Errorf("Task arrival: want task t ready in a minute, got %+v", got)
 	}
-	if got := mod.DocArrives[0]; got.DocID != *NewDocSetRef("ns", "k", 5) || !got.At.IsZero() {
+	if got := mod.DocArrives[0]; got.DocID != *NewDocSetRef("ns", "k", 5) || got.By != 0 {
 		t.Errorf("Set arrival: want set ns/k ready now, got %+v", got)
 	}
 }

@@ -66,10 +66,12 @@ func TestEvaluateWriteMovesVersionOnceAndReleases(t *testing.T) {
 
 func TestEvaluateFutureArrivalKeepsGroupHeld(t *testing.T) {
 	s := newStore(Lock{Claimant: "me", At: now.Add(time.Minute)})
+	// Arrivals are durations from the backend's now; later is the instant the
+	// longer of them resolves to, which the lock below must carry.
 	later := now.Add(time.Hour)
 	p := s.evaluate("me",
-		doc("a", 5).Change(entroq.WithDocArrivalTime(now.Add(time.Minute))),
-		doc("b", 5).Change(entroq.WithDocArrivalTime(later)),
+		doc("a", 5).Change(entroq.WithDocArrivalTimeBy(time.Minute)),
+		doc("b", 5).Change(entroq.WithDocArrivalTimeBy(time.Hour)),
 	)
 	if p.Err != nil {
 		t.Fatalf("Evaluate: %v", p.Err)
@@ -212,7 +214,7 @@ func TestEvaluateHolderInsertReleases(t *testing.T) {
 func TestEvaluateInsertWithArrivalClaims(t *testing.T) {
 	s := newStore(Lock{})
 	at := now.Add(time.Minute)
-	p := s.evaluate("me", entroq.PuttingDocInto("ns", entroq.WithKeys("k", "c"), entroq.WithDocArrivalTime(at)))
+	p := s.evaluate("me", entroq.PuttingDocInto("ns", entroq.WithKeys("k", "c"), entroq.WithDocArrivalTimeBy(time.Minute)))
 	if got := p.Locks[set]; p.Err != nil || got.Version != 6 || got.Claimant != "me" || !got.At.Equal(at) {
 		t.Errorf("Insert with a future arrival: want held by me at version 6, got %+v, %v", got, p.Err)
 	}
@@ -229,7 +231,7 @@ func TestExclusive(t *testing.T) {
 	s := newStore(Lock{})
 	mod := entroq.NewModification("me",
 		entroq.PuttingDocInto("ns", entroq.WithKeys("appended", "")),
-		entroq.PuttingDocInto("ns", entroq.WithKeys("claimed", ""), entroq.WithDocArrivalTime(now)),
+		entroq.PuttingDocInto("ns", entroq.WithKeys("claimed", ""), entroq.WithDocArrivalTimeBy(time.Minute)),
 		doc("a", 5).Depend(),
 	)
 	got := Exclusive(mod, s.member)
@@ -264,7 +266,11 @@ func TestEvaluateCountsDocs(t *testing.T) {
 func TestEvaluateDocArrives(t *testing.T) {
 	s := newStore(Lock{Claimant: "me", At: now.Add(time.Second)})
 	renew := &entroq.DocSet{Namespace: "ns", Key: "k", Version: 5}
-	p := s.evaluate("me", entroq.Arriving(entroq.ReadyAt(now.Add(time.Minute)).Docs(renew)))
+	// ReadyIn, not ReadyAt: an entry built from an instant is converted
+	// against the real process clock when the modification is built, so a
+	// fixed fake instant would resolve to a long-past duration and release the
+	// set. A duration is the same here as it is on the wire.
+	p := s.evaluate("me", entroq.Arriving(entroq.ReadyIn(time.Minute).Docs(renew)))
 	if p.Err != nil {
 		t.Fatalf("Evaluate: %v", p.Err)
 	}

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/eqmr/eqmrtest"
 	"github.com/shiblon/entroq/pkg/testing/eqtest"
@@ -853,7 +854,9 @@ func TestEQMemSnapshotKeepsDocs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Read docs after snapshot: %v", err)
 	}
-	if diff := cmp.Diff(want, got); diff != "" {
+	// A doc's by is the arrival an in-flight write asks for, never stored and
+	// never snapshotted, so a restored doc is compared on its state alone.
+	if diff := cmp.Diff(want, got, cmpopts.IgnoreUnexported(entroq.Doc{})); diff != "" {
 		t.Errorf("Docs after snapshot (-want +got):\n%s", diff)
 	}
 	tasks, err := eq.Tasks(ctx, queue)

@@ -691,10 +691,14 @@ func (b *backend) modifyRequest(mod *entroq.Modification) (*pb.ModifyRequest, er
 		if err != nil {
 			return nil, fmt.Errorf("doc insert value: %w", err)
 		}
+		// The arrival goes out as by_ms alone: at_ms is read from a protocol-1
+		// client and never written, so no arrival this client asks for depends
+		// on the offset between its clock and the server's, nor on how long
+		// the request takes to arrive.
 		req.DocInserts = append(req.DocInserts, &pb.DocData{
 			Namespace:    di.Namespace,
 			Id:           di.ID,
-			AtMs:         pbconv.ToMS(di.At),
+			ByMs:         di.By().Milliseconds(),
 			Key:          di.Key,
 			SecondaryKey: di.SecondaryKey,
 			Content:      val,
@@ -713,7 +717,7 @@ func (b *backend) modifyRequest(mod *entroq.Modification) (*pb.ModifyRequest, er
 				Key:          dc.Key,
 				SecondaryKey: dc.SecondaryKey,
 				Content:      val,
-				AtMs:         pbconv.ToMS(dc.At),
+				ByMs:         dc.By().Milliseconds(),
 			},
 		})
 	}

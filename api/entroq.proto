@@ -192,9 +192,26 @@ message DocData {
   google.protobuf.Value content = 5;
   int64 created_ms = 6;
   int64 modified_ms = 7;
-  // at_ms is the requested arrival/claim-expiry time for doc inserts and changes.
-  // Zero means "use the backend's current time and release any claim."
+  // at_ms is the requested arrival/claim-expiry time for doc inserts and
+  // changes. Zero means "use the backend's current time and release any
+  // claim." Only a protocol 1 client still sends it; see by_ms.
   int64 at_ms = 8;
+  // by_ms is how long from the backend's own now the doc's set arrives, in
+  // millis. Nonzero wins over at_ms, and may be negative. Positive holds the
+  // set, claimed by the caller; zero or less releases it.
+  //
+  // Prefer it to at_ms always, and for a renewal it is the only safe choice.
+  // An at_ms is an instant on the caller's clock, so it is wrong by whatever
+  // the two clocks disagree by, AND it can go stale in flight: an at_ms that
+  // is no longer in the future when the backend evaluates it is
+  // indistinguishable from a deliberate release, so a renewal merely delayed
+  // releases the set instead of holding it. A by_ms is resolved entirely on
+  // the backend's clock, where a delay can postpone an arrival but cannot
+  // invert its meaning.
+  //
+  // Zero means the same as absent, because an absent arrival already means
+  // "release now", so nothing is lost by conflating them.
+  int64 by_ms = 9;
 }
 
 // DocChange identifies a doc by DocID and provides updated data. Only content

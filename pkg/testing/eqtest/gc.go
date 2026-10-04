@@ -53,7 +53,6 @@ func GCDocSets(ctx context.Context, t *testing.T, backend entroq.Backend, collec
 	unclaimedKey := "unclaimed"
 	ordinaryNS := path.Join(prefix, "doc-gc-unmarked")
 	markedKey := path.Join(prefix, "legacy", "gc=0")
-	past := time.Now().Add(-time.Hour)
 
 	if _, err := backend.Modify(ctx, entroq.NewModification("",
 		entroq.PuttingDocInto(ns, entroq.WithIDKeys(entroq.GenHex16(), claimedKey, "a")),
@@ -95,7 +94,9 @@ func GCDocSets(ctx context.Context, t *testing.T, backend entroq.Backend, collec
 
 	args := make([]entroq.ModifyArg, 0, len(claimed))
 	for _, doc := range claimed {
-		args = append(args, doc.Change(entroq.WithDocArrivalTime(past)))
+		// An arrival of zero releases the set, which is what a past instant
+		// used to mean here and now says outright.
+		args = append(args, doc.Change(entroq.WithDocArrivalTimeBy(0)))
 	}
 	if _, err := backend.Modify(ctx, entroq.NewModification("doc-gc-test", args...)); err != nil {
 		t.Fatalf("GCDocSets: release: %v", err)
