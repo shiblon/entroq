@@ -511,9 +511,19 @@ func onlyArrives(m *entroq.Modification, id string) bool {
 	return arrives(m, id) && !rewritesTask(m, id)
 }
 
-// untouched returns the sets m does not write: none of their docs is
-// inserted, changed, or deleted, and the set does not arrive. Depending on a
-// doc does not write its set.
+// untouched returns, of the doc sets claimed here, those m has not already
+// modified.
+//
+// Its result is always a subset of sets, and must stay one: releasing a set
+// moves its version, so naming one this worker holds no lease on would
+// disturb a set that is somebody else's or nobody's. A modification may
+// mention sets that were never claimed here, so the leasehold decides what
+// may be released and m only decides what to leave out of it.
+//
+// Modified means a member inserted, changed, or deleted, or the set given an
+// arrival: then the modification has already decided its arrival and must not
+// be second-guessed. Depending on a doc only watches its set, which leaves it
+// eligible for release.
 func untouched(m *entroq.Modification, sets []*entroq.DocSet) []*entroq.DocSet {
 	memberOf := make(map[docKey]setKey)
 	for _, g := range sets {

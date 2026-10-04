@@ -779,9 +779,21 @@ func WorkerHoldsEmptyGroup(ctx context.Context, t *testing.T, client *entroq.Ent
 	}
 }
 
-// WorkerReleasesSets verifies that a worker's doc sets follow its task: when
-// a commit the worker makes lets go of the task, the sets it held and did not
-// write are released at once, not left to their leases.
+// WorkerReleasesSets verifies that a worker's doc sets follow its task: once
+// a commit lets go of the task, the sets it held and did not write are freed
+// promptly rather than left to their leases.
+//
+// The freeing is NOT part of the commit, and cannot be. A set the modify only
+// DEPENDS on is watched, not mutated: its version is checked and nothing is
+// written to it. A set the modify never names is not there to free. Only a
+// set the modify IMPLICATES -- inserted into, changed, deleted from, or given
+// an arrival -- is mutated, and then under its own version check, inside the
+// one transaction.
+//
+// So the worker issues a second, best-effort modification afterwards for the
+// sets it still holds and did not implicate, and a set it fails to free
+// simply waits out its lease. These subtests therefore await the release
+// rather than asserting it the instant the commit lands.
 func WorkerReleasesSets(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	// The lease is long, so a set that is free soon after the task was
 	// handled was released, not expired.
@@ -830,7 +842,7 @@ func WorkerReleasesSets(ctx context.Context, t *testing.T, client *entroq.EntroQ
 		}
 	}
 
-	t.Run("a commit releases the sets it did not write", func(t *testing.T) {
+	t.Run("a commit is followed by releasing the sets it did not write", func(t *testing.T) {
 		queue := path.Join(qPrefix, "worker_releases_commit")
 		ns := path.Join(qPrefix, "worker_releases_commit_docs")
 		if _, err := client.Modify(ctx,
@@ -856,12 +868,40 @@ func WorkerReleasesSets(ctx context.Context, t *testing.T, client *entroq.EntroQ
 		defer stop()
 		gone(t, queue)
 
-		if !free(t, ns, "depended") {
-			t.Error("A set the commit only depended on: want it released")
+		// Three separate things are in play here, and only the third frees a
+		// set:
+		//
+		//   - "depended" is named in the modify's Depends. It is WATCHED: its
+		//     version is checked and it is never mutated.
+		//   - "written" is IMPLICATED by the modify. Its version is checked
+		//     and it is mutated under that check, in the one transaction.
+		//   - "empty" is not in the modify at all.
+		//
+		// So the commit frees nothing. The sets it did not implicate are freed
+		// AFTERWARDS, by a separate best-effort modification, which is why
+		// these are awaited rather than checked the instant the commit lands.
+		//
+		// The deadline is half a lease on purpose. The sets were claimed until
+		// the task's own arrival, so nothing here can pass by merely lapsing;
+		// it passes only if the release actually ran, which is what keeps
+		// "released promptly" distinct from "expired on its own".
+		// ONE deadline for all of them, not one each: waiting per key would let
+		// the total run past a lease, and a set that came free by lapsing
+		// would then be mistaken for one that was released.
+		deadline := time.Now().Add(lease / 2)
+		for _, key := range []string{"depended", "empty"} {
+			for !free(t, ns, key) {
+				if time.Now().After(deadline) {
+					t.Errorf("A set the commit did not write (%q): want it released within %v of the commit", key, lease/2)
+					break
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
 		}
-		if !free(t, ns, "empty") {
-			t.Error("An empty set the commit did not touch: want it released")
-		}
+		// Checked last, after the releases have been awaited: by now a release
+		// that wrongly swept up a written set has had its chance to land, so
+		// this is a stronger statement here than it would be straight after
+		// the commit.
 		if free(t, ns, "written") {
 			t.Error("A set the commit wrote: want it to keep the arrival the commit gave it")
 		}
