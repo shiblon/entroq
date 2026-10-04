@@ -669,40 +669,6 @@ func isRetryable(err error) bool {
 	return false
 }
 
-// modifyConfig holds options for how Modify should execute.
-type modifyConfig struct {
-	runInTx func(context.Context, *sql.Tx) error
-}
-
-// modOpt is a private type for options that only this backend understands.
-// It satisfies the entroq.ModifyOption interface so that it can be passed
-// there.
-type modOpt func(c *modifyConfig)
-
-// IsModifyBackend returns nil if b is an *EQPG, or a descriptive error otherwise.
-// Its presence also causes modOpt to satisfy the entroq.ModifyOption interface.
-func (modOpt) IsModifyBackend(b entroq.Backend) error {
-	if _, ok := b.(*EQPG); !ok {
-		return fmt.Errorf("requires a PostgreSQL (*eqpg.EQPG) backend, got %T", b)
-	}
-	return nil
-}
-
-// RunningInTx returns an entroq.ModifyOption that signals to this backend
-// to run f inside the Modify transaction.
-//
-// Experimental: it may change or be removed. It predates docs, which now keep
-// state that must change atomically with tasks on every backend, including
-// through the service; prefer them.
-//
-// Important: the callback is responsible for managing any rows returned,
-// including closing them before the callback completes.
-func RunningInTx(f func(context.Context, *sql.Tx) error) entroq.ModifyOption {
-	return modOpt(func(c *modifyConfig) {
-		c.runInTx = f
-	})
-}
-
 // Modify attempts to apply an atomic modification to the task store. Either
 // all succeeds or all fails.
 func (b *EQPG) Modify(ctx context.Context, mod *entroq.Modification) (_ *entroq.ModifyResponse, err error) {
@@ -716,14 +682,8 @@ func (b *EQPG) Modify(ctx context.Context, mod *entroq.Modification) (_ *entroq.
 	defer func() {
 		b.modifyDuration.Record(ctx, time.Since(start).Seconds())
 	}()
-	options := &modifyConfig{}
-	for _, o := range mod.Options() {
-		if pgOpt, ok := o.(modOpt); ok {
-			pgOpt(options)
-		}
-	}
 	return b.modifyHandlingRetriable(ctx, func() (*entroq.ModifyResponse, error) {
-		return b.modify(ctx, mod, options)
+		return b.modify(ctx, mod)
 	})
 }
 
@@ -795,11 +755,7 @@ func lockArrivingTasks(ctx context.Context, tx *sql.Tx, arrivals []*entroq.TaskA
 // dependencies, checks versions, and performs all inserts/changes/deletes in
 // one round trip. Returns a DependencyError (SQLSTATE EQ001) if any
 // dependency constraint is violated.
-func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *modifyConfig) (resp *entroq.ModifyResponse, err error) {
-	if options == nil {
-		options = &modifyConfig{}
-	}
-
+func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification) (resp *entroq.ModifyResponse, err error) {
 	tx, err := b.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("pg modify begin tx: %w", err)
@@ -816,13 +772,6 @@ func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *mo
 			}
 		}
 	}()
-
-	// Run caller's DB work first, inside the same transaction, if specified.
-	if options.runInTx != nil {
-		if err := options.runInTx(ctx, tx); err != nil {
-			return nil, fmt.Errorf("pg modify caller tx work: %w", err)
-		}
-	}
 
 	resp = new(entroq.ModifyResponse)
 

@@ -3,7 +3,6 @@ package eqpg
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -349,92 +348,6 @@ func Example() {
 	// Output:
 	// hello
 	// hello
-}
-
-func Example_inTransaction() {
-	ctx := context.Background()
-	// Create the backend separately to get access to the database for raw SQL.
-	backend, err := Open(ctx, // eqpg.Open
-		pgHostPort,
-		WithDB("postgres"),
-		WithUsername("postgres"),
-		WithPassword("password"),
-		WithConnectAttempts(2))
-	if err != nil {
-		log.Fatalf("EQPG failed to open: %v", err)
-	}
-	client, err := entroq.New(ctx, nil /* no opener */, entroq.WithBackend(backend))
-	if err != nil {
-		log.Fatalf("Entroq init error: %v", err)
-	}
-	defer client.Close()
-
-	// Prep a simple database table. We'll update it inside the Modify transaction.
-	if _, err := backend.DB.ExecContext(ctx,
-		`CREATE TABLE IF NOT EXISTS exampleCounter (id int);
-		 TRUNCATE exampleCounter;
-		 INSERT INTO exampleCounter (id) VALUES (0);`,
-	); err != nil {
-		log.Fatalf("Failed to prep exampleCounter: %v", err)
-	}
-
-	// Insert some tasks.
-	_, err = client.Modify(ctx,
-		entroq.InsertingInto("/example/queue 1", entroq.WithValue("hello")),
-		entroq.InsertingInto("/example/queue 2", entroq.WithValue("hello")),
-		entroq.InsertingInto("/example/queue 2", entroq.WithValue("hello")),
-	)
-	if err != nil {
-		log.Fatalf("insertion failed: %v", err)
-	}
-
-	// For the sake of the example: cancel the worker after 2 seconds. Usually you won't ever cancel a worker.
-	// Note that timeouts are considered unclean shutdowns, so we do a pure cancel in a goroutine.
-	workerCtx, cancel := context.WithCancel(ctx) // don't overwrite the main context, we'll need it after Run!
-	defer cancel()
-	go func() { time.Sleep(2 * time.Second); cancel() }()
-
-	// Create a worker that just prints the task value, then in finalization,
-	// when the task version is finalized (background renewal is stopped),
-	// updates the counter table.
-	w := worker.New(client,
-		worker.WithDoWork(func(ctx context.Context, claimed *entroq.Task, s string, _ []*entroq.DocSet) error {
-			// Do work with the task.
-			fmt.Println(s)
-			return nil
-		}),
-		worker.WithFinish(func(ctx context.Context, mod worker.Modifier, final *entroq.Task, _ string, _ []*entroq.DocSet) error {
-			// Delete the task to "commit" the work.
-
-			// The counter is updated in the same transaction as the entroq modification.
-			// If either fails, the entire transaction fails, leaving all work
-			// items in a consistent state.
-			inTx := func(ctx context.Context, tx *sql.Tx) error {
-				_, err := tx.ExecContext(ctx, "UPDATE exampleCounter SET id = id + 1")
-				return err
-			}
-			if _, err := mod.Modify(ctx, final.Delete(), entroq.WithModifyOption(RunningInTx(inTx))); err != nil {
-				return fmt.Errorf("Failed to delete/commit task: %w", err)
-			}
-			return nil
-		}),
-	)
-	if err := w.Run(workerCtx, worker.Watching("/example/queue 1", "/example/queue 2")); err != nil && !errors.Is(err, context.Canceled) {
-		log.Fatalf("worker run failed: %v", err)
-	}
-
-	// The worker's context is canceled, so we use a fresh context to check the DB.
-	var count int
-	if err := backend.DB.QueryRowContext(ctx, "SELECT id FROM exampleCounter").Scan(&count); err != nil {
-		log.Fatalf("Failed to get count: %v", err)
-	}
-	fmt.Printf("Count: %d\n", count)
-
-	// Output:
-	// hello
-	// hello
-	// hello
-	// Count: 3
 }
 
 func RunQTest(t *testing.T, tester eqtest.Tester) {
@@ -806,66 +719,6 @@ func TestModifyRejectsWrongNamespace(t *testing.T) {
 	RunQTest(t, eqtest.ModifyRejectsWrongNamespace)
 }
 
-// TestRunningInTxCommitsWithModify checks that caller work done through
-// RunningInTx commits or rolls back with the modification, including when the
-// modification fails in Go rather than in the database, which leaves the
-// transaction healthy enough to commit.
-func TestRunningInTxCommitsWithModify(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	b, err := Open(ctx, pgHostPort, WithDB("postgres"), WithUsername("postgres"), WithPassword("password"), WithConnectAttempts(10))
-	if err != nil {
-		t.Fatalf("Open backend: %v", err)
-	}
-	defer b.Close()
-	if _, err := b.DB.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS public.running_in_tx_test (id text PRIMARY KEY)`); err != nil {
-		t.Fatalf("Create table: %v", err)
-	}
-
-	prefix := entroq.GenHex16()
-	queue := "/test/running-in-tx/" + prefix
-	written := func(id string) bool {
-		t.Helper()
-		var n int
-		if err := b.DB.QueryRowContext(ctx, `SELECT count(*) FROM public.running_in_tx_test WHERE id = $1`, id).Scan(&n); err != nil {
-			t.Fatalf("Read caller row: %v", err)
-		}
-		return n == 1
-	}
-	modify := func(id string, fail error, args ...entroq.ModifyArg) error {
-		args = append(args, entroq.WithModifyOption(RunningInTx(func(ctx context.Context, tx *sql.Tx) error {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO public.running_in_tx_test (id) VALUES ($1)`, id); err != nil {
-				return err
-			}
-			return fail
-		})))
-		_, err := b.Modify(ctx, entroq.NewModification("me", args...))
-		return err
-	}
-
-	if err := modify(prefix+"-fails", errors.New("caller failed"), entroq.InsertingInto(queue)); err == nil {
-		t.Error("Modify with failing caller work: want an error")
-	}
-	if written(prefix + "-fails") {
-		t.Error("Caller work committed although the caller failed")
-	}
-
-	missing := entroq.NewDocID(queue, "missing", 0)
-	if err := modify(prefix+"-dep", nil, entroq.InsertingInto(queue), missing.Depend()); !entroq.IsDependency(err) {
-		t.Errorf("Modify depending on a missing doc: want a dependency error, got %v", err)
-	}
-	if written(prefix + "-dep") {
-		t.Error("Caller work committed although the modification failed a doc dependency")
-	}
-
-	if err := modify(prefix+"-ok", nil, entroq.InsertingInto(queue)); err != nil {
-		t.Fatalf("Modify: %v", err)
-	}
-	if !written(prefix + "-ok") {
-		t.Error("Caller work did not commit with a successful modification")
-	}
-}
-
 func TestInvalidRequests(t *testing.T) {
 	RunQTest(t, eqtest.InvalidRequests)
 }
@@ -917,35 +770,4 @@ func TestDocConcurrencyStress(t *testing.T) {
 func TestMixedAtomicStress(t *testing.T) {
 	t.Parallel()
 	RunQTest(t, eqtest.MixedAtomicStress)
-}
-
-// TestCanceledQueryIsCanceled cancels a modification while its transaction is
-// running a query. lib/pq then reports the server's "canceling statement due
-// to user request", which must still read as the caller's cancellation.
-func TestCanceledQueryIsCanceled(t *testing.T) {
-	ctx := context.Background()
-	b, err := Open(ctx, pgHostPort, WithDB("postgres"), WithUsername("postgres"), WithPassword("password"), WithConnectAttempts(10))
-	if err != nil {
-		t.Fatalf("Open backend: %v", err)
-	}
-	defer b.Close()
-
-	cctx, cancel := context.WithCancel(ctx)
-	running := make(chan struct{})
-	go func() {
-		<-running
-		time.Sleep(100 * time.Millisecond)
-		cancel()
-	}()
-	_, err = b.Modify(cctx, entroq.NewModification("me",
-		entroq.InsertingInto("/test/canceled-query"),
-		entroq.WithModifyOption(RunningInTx(func(ctx context.Context, tx *sql.Tx) error {
-			close(running)
-			_, err := tx.ExecContext(ctx, "SELECT pg_sleep(10)")
-			return err
-		})),
-	))
-	if !entroq.IsCanceled(err) {
-		t.Errorf("Modify canceled mid-query: want a cancellation, got %v", err)
-	}
 }

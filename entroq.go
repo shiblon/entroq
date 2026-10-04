@@ -930,11 +930,6 @@ func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (*ModifyRespo
 			ins.ID = c.GenID()
 		}
 	}
-	for _, opt := range mod.Options() {
-		if err := opt.IsModifyBackend(c.backend); err != nil {
-			return nil, fmt.Errorf("modify option incompatible with backend %T: %w", c.backend, err)
-		}
-	}
 	for _, ins := range mod.Inserts {
 		if ins.Value != nil && !json.Valid(ins.Value) {
 			return nil, fmt.Errorf("modify insert %q: value is not valid JSON", ins.Queue)
@@ -1041,25 +1036,6 @@ func ModifyAs(id string) ModifyArg {
 	}
 }
 
-// ModifyOption is an option that can be passed through to a backend's Modify
-// implementation. Backend-specific options use IsModifyBackend to validate that
-// the correct backend is in use; generic options return nil unconditionally.
-type ModifyOption interface {
-	// IsModifyBackend returns nil if the given backend supports this option, or a
-	// descriptive error if not. Returning non-nil causes Modify to fail before
-	// the backend is called. Generic options always return nil.
-	IsModifyBackend(Backend) error
-}
-
-// WithModifyOption allows an option the backend understands to be added.
-// These are accessible in the backend if additional modification settings
-// are needed (example: modifying inside an SQL transaction).
-func WithModifyOption(opt ModifyOption) ModifyArg {
-	return func(m *Modification) {
-		m.options = append(m.options, opt)
-	}
-}
-
 // WithModification returns a ModifyArg that merges the given Modification with whatever it is so far.
 // Ignores Claimant field, and simply appends to all others.
 func WithModification(src *Modification) ModifyArg {
@@ -1085,8 +1061,6 @@ func WithModification(src *Modification) ModifyArg {
 
 // Modification contains all of the information for a single batch modification in the task store.
 type Modification struct {
-	options []ModifyOption
-
 	// resetClaims holds the IDs of changed tasks whose claim count the change
 	// resets (see ResettingClaims).
 	resetClaims map[string]bool
@@ -1154,12 +1128,6 @@ func NewModification(claimant string, modArgs ...ModifyArg) *Modification {
 		arg(m)
 	}
 	return m
-}
-
-// Options returns a slice of ModifyOption, which backends can use to
-// change how an individual call to Modify operates.
-func (m *Modification) Options() []ModifyOption {
-	return m.options
 }
 
 // ResetClaims makes m's change of the task with the given ID reset its claim
