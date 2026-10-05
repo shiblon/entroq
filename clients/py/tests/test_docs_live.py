@@ -11,7 +11,7 @@ import uuid
 import pytest
 
 from entroq.json import EntroQJSON
-from entroq.types import DocData, Modification
+from entroq.types import DocClaim, DocData, Modification, TaskData
 
 
 @pytest.fixture
@@ -103,3 +103,69 @@ async def test_docs_omit_values_drops_content(seeded):
     assert got, "expected docs"
     assert all(d.content is None for d in got)
     assert all(d.key for d in got), "metadata must survive omit_values"
+
+
+async def test_claim_doc_sets_names_sets_and_matches_a_task(seeded):
+    """A multi-set claim against a real server, held in step with a task.
+
+    This is the only test that can catch a wrong nested name in the claim
+    request: ``claimQuery.sets`` and ``claimQuery.taskToMatch`` are transcoded
+    field paths, and a misspelled one claims nothing rather than failing.
+
+    The set with no docs is the point. Its lock comes back regardless, which
+    is what makes it renewable; a claim that reported only members would have
+    nothing to say about it.
+    """
+    eq, ns = seeded
+    task = await eq.try_claim(
+        (await eq.modify(Modification(
+            Modification.inserting(TaskData(queue=f"{ns}/q"))))).tasks_inserted[0].queue)
+    assert task is not None
+
+    claimed = await eq.claim_doc_sets(
+        [DocClaim(ns, "a"), DocClaim(ns, "b"), DocClaim(ns, "empty")],
+        task_to_match=task,
+    )
+
+    assert [(d.key, d.secondary_key) for d in claimed] == [
+        ("a", "1"), ("b", "1"), ("b", "2"),
+    ]
+    assert [g.key for g in claimed.sets] == ["a", "b", "empty"], (
+        "every claimed set comes back, in the order named, members or not")
+    assert all(g.is_set_ref() for g in claimed.sets)
+    assert all(g.claimant for g in claimed.sets), "all claimed, or none is"
+    assert all(g.at == task.at for g in claimed.sets), (
+        "a set matched to a task must expire exactly with it")
+    # Every set here is at version 1, by the same rule and from different
+    # histories: "a" and "b" were created by their inserts at version 0 and
+    # moved by this claim, while "empty" was never written, so the claim acts
+    # on the empty set that was already there at version 0. A claim is a
+    # write; only an insert creates.
+    assert [g.version for g in claimed.sets] == [1, 1, 1]
+
+
+async def test_doc_set_arrival_renews_an_empty_set(seeded):
+    """Renewing by set reference holds a set with no docs in it.
+
+    Naming members cannot do this: there are none to name. The arrival travels
+    as a duration, so the server resolves it on its own clock.
+    """
+    eq, ns = seeded
+    claimed = await eq.claim_doc_sets([DocClaim(ns, "empty")], duration_ms=60000)
+    (empty,) = claimed.sets
+    assert list(claimed) == []
+
+    res = await eq.modify(Modification(Modification.arriving(empty, 120.0)))
+
+    (renewed,) = res.docs_changed
+    assert renewed.is_set_ref()
+    assert (renewed.namespace, renewed.key) == (ns, "empty")
+    assert empty.version == 1, (
+        "claiming a set nothing has stored moves it off version 0, because it "
+        "acts on the empty set that was in effect already there")
+    assert renewed.version == 2, "and the renewal moves it again"
+    assert renewed.at > empty.at, "and pushes its arrival out"
+
+    released = await eq.modify(Modification(Modification.arriving(renewed, 0.0)))
+    (gone,) = released.docs_changed
+    assert gone.claimant == "", "a zero arrival releases the set"

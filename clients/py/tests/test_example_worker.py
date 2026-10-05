@@ -8,8 +8,13 @@ import importlib.util
 import uuid
 from pathlib import Path
 
+import pytest
+
 from entroq.json import EntroQJSON
-from entroq.types import DocData, Modification, TaskData
+from entroq.types import (
+    DependencyError, DocClaim, DocData, Modification, TaskData,
+)
+from entroq.worker import EntroQWorker
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _EXAMPLE = _REPO_ROOT / "clients" / "py" / "examples" / "worker" / "example_worker.py"
@@ -105,3 +110,57 @@ async def test_json_docs_filters_against_live_server(eqmem_url):
             ('b', '1'), ('b', '2'),
         ]
         assert [d.id for d in by_id] == [listed[0].id, listed[3].id]
+
+
+async def test_worker_claims_and_releases_doc_sets_over_json(eqmem_url):
+    """A worker's whole doc round trip against a real server.
+
+    The pieces only meet here: the handler's DocClaim list becomes one atomic
+    claim naming the task to expire with, the commit resets the task's claim
+    count, and a set the commit did not write is released once the task is
+    gone. A wrong nested name in any of those requests claims or releases
+    nothing rather than failing.
+
+    The renewal cadence is not exercised: the service clamps a claim up to its
+    lease floor, so the shortest lease a client can get here is long enough
+    that waiting out two thirds of it would dominate the suite.
+    """
+    ns = f"live-{uuid.uuid4().hex}"
+    queue = f"{ns}/q"
+    async with EntroQJSON(eqmem_url) as eq:
+        await eq.modify(Modification(
+            Modification.inserting(TaskData(queue=queue, value="work")),
+            Modification.inserting(DocData(namespace=ns, key="cfg", content={"n": 1})),
+        ))
+
+        seen = []
+
+        @EntroQWorker.handler
+        async def process(task, docs):
+            seen.append([(d.key, d.content) for d in docs])
+            # The set is held while the handler runs: a claim of it now gets
+            # nothing back, because another claimant cannot have it.
+            with pytest.raises(DependencyError):
+                async with EntroQJSON(eqmem_url) as other:
+                    await other.claim_doc_sets(
+                        [DocClaim(ns, "cfg")], duration_ms=1000)
+            return Modification(Modification.deleting(task))
+
+        @process.selector
+        async def process(task):
+            return [DocClaim(ns, "cfg"), DocClaim(ns, "empty")]
+
+        worker = EntroQWorker(eq, queue)
+        task = await eq.try_claim(queue)
+        assert task is not None
+
+        await asyncio.wait_for(worker._process(task, process), timeout=30)
+
+        assert seen == [[("cfg", {"n": 1})]], "the handler saw the set's members"
+        assert await eq.tasks(queue=queue) == [], "the task was committed"
+
+        # The commit deleted the task and wrote neither set, so both were
+        # released on the way out and are free to claim again.
+        again = await eq.claim_doc_sets(
+            [DocClaim(ns, "cfg"), DocClaim(ns, "empty")], duration_ms=1000)
+        assert [g.key for g in again.sets] == ["cfg", "empty"]

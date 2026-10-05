@@ -8,11 +8,20 @@ from datetime import datetime, timezone
 import httpx
 
 from .types import (
-    Task, TaskData, TaskChange, TaskID,
-    Doc, DocData, DocChange, DocID,
+    Task, TaskData, TaskChange, TaskID, TaskArrival,
+    Doc, DocData, DocChange, DocID, DocArrival, DocClaim, ClaimedDocs,
     DependencyError, Modification, ModifyResult, TransportError,
 )
 from .base import EntroQBase
+
+# PROTOCOL is declared on every request. This client speaks protocol 2 only:
+# atomic multi-set doc claims and matching a doc claim to a task's lease are
+# gated on it, and a server that does not serve it answers Unimplemented
+# naming the side to upgrade. There is no downgrade path, deliberately -- the
+# branching would cost more than it bought, and a protocol 1 CLIENT still
+# works against a protocol 2 server, which is the compatibility that matters.
+PROTOCOL = 2
+_PROTOCOL_HEADERS = {"entroq-protocol": str(PROTOCOL)}
 
 
 def _parse_ms(ms: int | str) -> datetime:
@@ -74,7 +83,7 @@ def _task_insert_json(i: TaskData) -> dict:
 
 
 def _task_change_json(c: TaskChange) -> dict:
-    return {
+    j = {
         # oldId.queue is the source (from_queue), part of the modify key that the
         # service matches; newData.queue is the destination (equal for no move).
         "oldId": {"id": c.id, "version": c.version, "queue": c.from_queue},
@@ -85,6 +94,28 @@ def _task_change_json(c: TaskChange) -> dict:
             "attempt": c.attempt,
             "err": c.err,
         },
+    }
+    if c.reset_claims:
+        j["mode"] = "CHANGE_RESET_CLAIMS"
+    return j
+
+
+def _task_arrival_json(a: TaskArrival) -> dict:
+    # A lease change carries the arrival and nothing else; the service refuses
+    # one that sets a value, attempt, error or ID.
+    return {
+        "oldId": {"id": a.id, "version": a.version, "queue": a.queue},
+        "newData": {"byMs": int(a.by_s * 1000)},
+        "mode": "CHANGE_LEASE",
+    }
+
+
+def _doc_arrival_json(a: DocArrival) -> dict:
+    # The set is named by key, with no doc ID: that is what a set reference is.
+    return {
+        "oldId": {"namespace": a.namespace, "key": a.key, "version": a.version},
+        "newData": {"byMs": int(a.by_s * 1000)},
+        "mode": "CHANGE_LEASE",
     }
 
 
@@ -156,7 +187,10 @@ class EntroQJSON(EntroQBase):
 
     async def _request(self, method: str, path: str, *, json=None, params=None) -> dict:
         try:
-            resp = await self.http.request(method, f"{self._base_url}{path}", json=json, params=params)
+            resp = await self.http.request(
+                method, f"{self._base_url}{path}",
+                json=json, params=params, headers=_PROTOCOL_HEADERS,
+            )
         except httpx.TransportError as e:
             # Connect and pool failures happen before an HTTP request reaches the
             # service. Read/write/protocol failures are ambiguous: the service may
@@ -180,13 +214,15 @@ class EntroQJSON(EntroQBase):
         if resp.status_code in (409, 404):
             try:
                 body = resp.json()
-                details = body.get("details", [])
+            except ValueError:
+                body = None
+            if isinstance(body, dict):
+                details = [d for d in body.get("details", []) if isinstance(d, dict)]
                 _DEP_TYPES = {"INSERT", "CHANGE", "DELETE", "DEPEND", "CLAIM", "DETAIL"}
                 if any(d.get("type") in _DEP_TYPES for d in details):
                     kwargs: dict = {"message": body.get("message", "")}
                     # A ModifyDep carries either a task id or a doc_id, never
-                    # both. Reading only "id" collapses every doc dependency to
-                    # None, which is what made doc failures uninspectable.
+                    # both, so the two are read into separate lists.
                     _TASK_KEY = {
                         "INSERT": "inserts", "CHANGE": "changes", "DELETE": "deletes",
                         "DEPEND": "depends", "CLAIM": "claims",
@@ -205,10 +241,13 @@ class EntroQJSON(EntroQBase):
                         if did_raw:
                             key = _DOC_KEY.get(dtype)
                             if key:
+                                # A doc is named by id and a set by key, and
+                                # the other field is absent rather than empty.
                                 kwargs.setdefault(key, []).append(DocID(
                                     namespace=did_raw.get("namespace", ""),
-                                    id=did_raw["id"],
+                                    id=did_raw.get("id") or "",
                                     version=int(did_raw.get("version", 0)),
+                                    key=did_raw.get("key") or "",
                                 ))
                             continue
                         tid_raw = d.get("id")
@@ -217,15 +256,13 @@ class EntroQJSON(EntroQBase):
                         key = _TASK_KEY.get(dtype)
                         if key:
                             kwargs.setdefault(key, []).append(TaskID(
-                                id=tid_raw["id"],
+                                id=tid_raw.get("id") or "",
                                 version=int(tid_raw.get("version", 0)),
                                 queue=tid_raw.get("queue", ""),
                             ))
                     kwargs["missing"] = kwargs.get("depends", []) + kwargs.get("deletes", [])
                     kwargs["collisions"] = kwargs.get("inserts", [])
                     raise DependencyError(**kwargs)
-            except (ValueError, KeyError):
-                pass
         resp.raise_for_status()
 
     async def time(self) -> datetime:
@@ -294,11 +331,15 @@ class EntroQJSON(EntroQBase):
         data = await self._request("POST", "/api/v0/modify", json={
             "claimantId": unsafe_claimant_id or self.claimant_id,
             "inserts":    [_task_insert_json(i) for i in modification.task_inserts],
-            "changes":    [_task_change_json(c) for c in modification.task_changes],
+            # Arrivals ride in with the changes, as lease-only ones: that is
+            # what they are on the wire.
+            "changes":    ([_task_change_json(c) for c in modification.task_changes]
+                           + [_task_arrival_json(a) for a in modification.task_arrivals]),
             "deletes":    [_task_id_json(d) for d in modification.task_deletes],
             "depends":    [_task_id_json(d) for d in modification.task_depends],
             "docInserts": [_doc_insert_json(i) for i in modification.doc_inserts],
-            "docChanges": [_doc_change_json(c) for c in modification.doc_changes],
+            "docChanges": ([_doc_change_json(c) for c in modification.doc_changes]
+                           + [_doc_arrival_json(a) for a in modification.doc_arrivals]),
             "docDeletes": [_doc_id_json(d) for d in modification.doc_deletes],
             "docDepends": [_doc_id_json(d) for d in modification.doc_depends],
         })
@@ -332,13 +373,34 @@ class EntroQJSON(EntroQBase):
         data = await self._request("GET", "/api/v0/docs", params=params)
         return [_doc_from_json(d) for d in data.get("docs", [])]
 
-    async def claim_docs(self, namespace: str, key: str, duration_ms: int = 30000) -> list[Doc]:
-        data = await self._request("POST", "/api/v0/docs/claim", json={
-            "claimQuery": {
-                "namespace": namespace,
-                "claimant": self.claimant_id,
-                "key": key,
-                "durationMs": duration_ms,
-            },
-        })
-        return [_doc_from_json(d) for d in data.get("docs", [])]
+    async def claim_docs(self, namespace: str, key: str, duration_ms: int = 30000) -> ClaimedDocs:
+        return await self.claim_doc_sets(
+            [DocClaim(namespace, key)], duration_ms=duration_ms)
+
+    async def claim_doc_sets(
+        self,
+        sets: Sequence[DocClaim],
+        *,
+        duration_ms: int = 30000,
+        task_to_match: Task | None = None,
+    ) -> ClaimedDocs:
+        query: dict = {
+            "claimant": self.claimant_id,
+            "sets": [
+                {
+                    "set": {"namespace": c.namespace, "key": c.key},
+                    "omitMembers": c.omit_members,
+                }
+                for c in sets
+            ],
+        }
+        if task_to_match is not None:
+            query["taskToMatch"] = _task_id_json(task_to_match)
+        else:
+            query["durationMs"] = duration_ms
+        data = await self._request("POST", "/api/v0/docs/claim",
+                                   json={"claimQuery": query})
+        return ClaimedDocs(
+            (_doc_from_json(d) for d in data.get("docs", [])),
+            (_doc_from_json(d) for d in data.get("sets", [])),
+        )

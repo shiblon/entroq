@@ -11,11 +11,13 @@ import logging
 import random
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from typing import AsyncIterator, Callable, Awaitable
+from typing import AsyncIterator, Awaitable, Callable, Sequence
 
-from .types import Task, Doc, DependencyError, Modification, TransportError
+from .types import (
+    ClaimedDocs, DependencyError, Doc, DocClaim, Modification, Task,
+    TransportError,
+)
 from .base import EntroQBase
 
 # ---------------------------------------------------------------------------
@@ -64,15 +66,15 @@ def default_err_q_map(inbox: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# DocClaim
+# Claim duration
 # ---------------------------------------------------------------------------
 
-@dataclass
-class DocClaim:
-    """Describes a set of docs (by namespace + key) to claim atomically for a task."""
-    namespace: str
-    key: str
-    duration_s: float = 30.0
+# DEFAULT_CLAIM_DURATION_S matches entroq.DefaultClaimDuration in Go, and the
+# service's own lease floor: a shorter default is clamped up to it anyway.
+# Lengthening a lease costs only the sad path, where a dead holder keeps what
+# it held for up to one lease, while the margin it leaves covers latency and
+# small clock disagreement on every renewal.
+DEFAULT_CLAIM_DURATION_S = 45.0
 
 
 # ---------------------------------------------------------------------------
@@ -198,9 +200,14 @@ class _FnHandler(Handler):
 # ---------------------------------------------------------------------------
 
 class _RenewState:
-    def __init__(self, task: Task, docs: list[Doc]) -> None:
+    def __init__(self, task: Task, docs: ClaimedDocs) -> None:
         self.task = task
         self.docs = list(docs)
+        # The claimed sets, at their lock versions: what a renewal or release
+        # names. Separate from docs because a set holds its own lock and may
+        # have no members at all. A client whose claim_doc_sets does not
+        # report its sets renews the task alone, as it did before it could.
+        self.sets: list[Doc] = list(getattr(docs, 'sets', ()))
         self.error: Exception | None = None
         # Set by the renewer when the claim is lost, so _process can tell its
         # own cancellation apart from one arriving from outside the worker.
@@ -217,32 +224,70 @@ class _RenewState:
             self.work.cancel()
 
 
+def granted_lease_s(task: Task) -> float:
+    """Return the lease a claim or renewal actually granted, in seconds.
+
+    At minus Modified. Both are stamped from one backend clock, so the
+    difference is exact and owes nothing to this process's clock. The lease
+    asked for is not the same number: a service clamps a claim into its own
+    bounds, and renewing for the request rather than the grant would leave the
+    task free between renewals.
+    """
+    if task.modified is None:
+        return DEFAULT_CLAIM_DURATION_S
+    return max(0.0, (task.at - task.modified).total_seconds())
+
+
+def renewal_interval_s(task: Task) -> float:
+    """Return how long to wait between renewals of task: two thirds of the
+    lease it was granted, leaving the rest as margin for a renewal to complete
+    in. Matches the Go worker, which derives both from one fraction."""
+    return granted_lease_s(task) * 2.0 / 3.0
+
+
 @asynccontextmanager
 async def _renewing(
     client: EntroQBase,
     task: Task,
-    docs: list[Doc],
-    duration_s: float,
+    docs: ClaimedDocs,
 ) -> AsyncIterator[_RenewState]:
     state = _RenewState(task, docs)
 
     async def _renewer() -> None:
+        # Both the hold and the cadence come from the granted lease, read off
+        # the claim itself, so there is no requested duration in scope to renew
+        # on by mistake. Computed once: renewing for what is held makes every
+        # grant equal the last.
+        lease_s = granted_lease_s(task)
+        interval_s = renewal_interval_s(task)
         while True:
             try:
-                await asyncio.sleep(duration_s / 2)
+                await asyncio.sleep(interval_s)
             except asyncio.CancelledError:
                 return
-            at = datetime.now(tz=timezone.utc) + timedelta(seconds=duration_s)
-            ops: list = [Modification.changing(state.task, at=at)]
-            for doc in state.docs:
-                ops.append(Modification.changing(doc, at=at))
+            # Arrivals, not changes: a renewal says only "hold this longer",
+            # as a duration the backend resolves against its own clock. An
+            # instant computed here could arrive already stale, which reads as
+            # a release.
+            #
+            # The sets are named, not their members: a set's lock is what the
+            # claim took, and naming it is what lets a set with no docs in it
+            # be renewed at all.
+            ops: list = [Modification.arriving(state.task, lease_s)]
+            for group in state.sets:
+                ops.append(Modification.arriving(group, lease_s))
             try:
                 result = await client.modify(Modification(*ops))
                 if result.tasks_changed:
                     state.task = result.tasks_changed[0]
-                if result.docs_changed:
-                    updated = {(d.namespace, d.id): d for d in result.docs_changed}
-                    state.docs = [updated.get((d.namespace, d.id), d) for d in state.docs]
+                # A lease change answers with the sets it named, each at its
+                # new lock, among the changed docs. Real docs have IDs; sets
+                # do not, so there is nothing to confuse them with.
+                renewed = {(d.namespace, d.key): d
+                           for d in result.docs_changed if d.is_set_ref()}
+                if renewed:
+                    state.sets = [renewed.get((g.namespace, g.key), g)
+                                  for g in state.sets]
             except DependencyError as e:
                 # The claim is gone. Work done from here cannot be committed,
                 # and may duplicate whatever the new claimant is doing, so stop
@@ -264,8 +309,22 @@ async def _renewing(
 # Internal: version fix-up
 # ---------------------------------------------------------------------------
 
-def _fix_versions(mod: Modification, task: Task, docs: list[Doc]) -> None:
-    """Mutate mod in place to use the latest task/doc versions from renewal."""
+def _fix_versions(mod: Modification, task: Task, docs: list[Doc],
+                  sets: list[Doc]) -> None:
+    """Mutate mod in place so every version it names is the current one.
+
+    This is the one place a renewal's effect on versions is applied, so
+    nothing else has to be kept in step with it. The task's version comes
+    from the last renewal of the task. A doc has no version of its own --
+    it carries its set's, the only one it has -- so the claimed sets are the
+    authority for docs, and each one named is resolved to its set and given
+    that set's current version.
+
+    A doc names itself by ID, which does not say which set holds it, so the
+    claimed members supply that mapping. A client whose claim could not report
+    its sets falls back to the versions its members were claimed at, which is
+    all it knows.
+    """
     task_ver = {task.id: task.version}
     for tc in mod.task_changes:
         if tc.id in task_ver:
@@ -277,19 +336,90 @@ def _fix_versions(mod: Modification, task: Task, docs: list[Doc]) -> None:
         if td.id in task_ver:
             td.version = task_ver[td.id]
 
-    doc_ver = {(d.namespace, d.id): d.version for d in docs}
+    set_of = {(d.namespace, d.id): (d.namespace, d.key) for d in docs}
+    set_version = {(g.namespace, g.key): g.version for g in sets}
+    claimed_at = {(d.namespace, d.id): d.version for d in docs}
+
+    def current(namespace: str, id: str) -> int | None:
+        group = set_of.get((namespace, id))
+        if group is not None and group in set_version:
+            return set_version[group]
+        return claimed_at.get((namespace, id))
+
     for dc in mod.doc_changes:
-        k = (dc.namespace, dc.id)
-        if k in doc_ver:
-            dc.version = doc_ver[k]
+        version = current(dc.namespace, dc.id)
+        if version is not None:
+            dc.version = version
     for dd in mod.doc_deletes:
-        k = (dd.namespace, dd.id)
-        if k in doc_ver:
-            dd.version = doc_ver[k]
+        version = current(dd.namespace, dd.id)
+        if version is not None:
+            dd.version = version
     for dd in mod.doc_depends:
-        k = (dd.namespace, dd.id)
-        if k in doc_ver:
-            dd.version = doc_ver[k]
+        version = current(dd.namespace, dd.id)
+        if version is not None:
+            dd.version = version
+
+
+def _reset_claims(mod: Modification, task_id: str) -> None:
+    """Mark the task's own changes in mod as resetting its claim count.
+
+    The worker changed the task on purpose, so the claims before this one no
+    longer point at a poison pill.
+    """
+    for tc in mod.task_changes:
+        if tc.id == task_id:
+            tc.reset_claims = True
+
+
+def _writes_task(mod: Modification, task_id: str) -> bool:
+    """True when mod changes, deletes, or gives an arrival to the task."""
+    return (any(tc.id == task_id for tc in mod.task_changes)
+            or any(td.id == task_id for td in mod.task_deletes)
+            or any(a.id == task_id for a in mod.task_arrivals))
+
+
+def _untouched(mod: Modification, sets: list[Doc], docs: list[Doc]) -> list[Doc]:
+    """Return those of the claimed sets that mod has not already written.
+
+    The result is always a subset of sets, and must stay one: releasing a set
+    moves its version, so naming one this worker holds no lease on would
+    disturb a set that is somebody else's or nobody's. A modification may
+    mention sets that were never claimed here, so the leasehold decides what
+    may be released and mod only decides what to leave out of it.
+
+    Written means a member inserted, changed, or deleted, or the set given an
+    arrival: then the modification has already decided its arrival and must
+    not be second-guessed. Depending on a doc only watches its set, which
+    leaves it eligible for release.
+    """
+    set_of = {(d.namespace, d.id): (d.namespace, d.key) for d in docs}
+    written = set()
+    for ins in mod.doc_inserts:
+        written.add((ins.namespace, ins.key))
+    for dc in mod.doc_changes:
+        written.add((dc.namespace, dc.key))
+    for dd in mod.doc_deletes:
+        k = set_of.get((dd.namespace, dd.id))
+        if k is not None:
+            written.add(k)
+    for a in mod.doc_arrivals:
+        written.add((a.namespace, a.key))
+    return [g for g in sets if (g.namespace, g.key) not in written]
+
+
+async def _release_sets(client: EntroQBase, sets: list[Doc]) -> None:
+    """Make sets ready again now, after a commit that let go of the task.
+
+    Best-effort: a set this cannot release waits out its lease, as it would
+    have without the call.
+    """
+    if not sets:
+        return
+    try:
+        await client.modify(Modification(
+            *[Modification.arriving(g, 0.0) for g in sets]))
+    except Exception as e:
+        logging.warning("Releasing doc sets after commit: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -317,7 +447,7 @@ class EntroQWorker:
         self,
         client: EntroQBase,
         *queues: str,
-        claim_duration_s: float = 30.0,
+        claim_duration_s: float = DEFAULT_CLAIM_DURATION_S,
         err_queue: str = '',
         err_q_map: Callable[[str], str] | None = None,
         retry_delay_s: float = 30.0,
@@ -400,24 +530,24 @@ class EntroQWorker:
         """
         return _FnHandler(fn)
 
-    async def _claim_docs(self, task: Task, handler: Handler) -> list[Doc]:
+    async def _claim_docs(self, task: Task, handler: Handler) -> ClaimedDocs:
         doc_claims = await handler._select(task)
         if not doc_claims:
-            return []
-        # Sort to avoid dining-philosopher livelock when multiple workers
-        # race to claim overlapping doc sets.
-        sorted_claims = sorted(doc_claims, key=lambda d: (d.namespace, d.key))
-        docs: list[Doc] = []
-        for dc in sorted_claims:
-            claimed = await self._client.claim_docs(
-                dc.namespace, dc.key, duration_ms=int(dc.duration_s * 1000)
-            )
-            docs.extend(claimed)
-        return docs
+            return ClaimedDocs()
+        # One all-or-nothing claim of every set. Claiming them one at a time
+        # would let two workers each hold part of what both need, so an
+        # ordering was required to break the deadlock; taking them together
+        # leaves nothing to order.
+        #
+        # The sets are held until the task arrives rather than for a duration
+        # of their own, so they expire exactly with it, from one reading of
+        # one clock. The claim fails if the task is no longer at this version,
+        # which means this worker no longer holds it.
+        return await self._client.claim_doc_sets(doc_claims, task_to_match=task)
 
-    async def _dispose(self, task: Task, docs: list[Doc],
-                       exc: RetryError | MoveError) -> None:
-        """Apply a sentinel's disposition to a claimed task, releasing its docs.
+    async def _dispose(self, task: Task, exc: RetryError | MoveError, *,
+                       sets: Sequence[Doc] = ()) -> None:
+        """Apply a sentinel's disposition to a claimed task, releasing its sets.
 
         Retry and quarantine are one decision, taken here at the moment of
         failure, as the Go client's ``RetryOrQuarantine`` does. Deferring the
@@ -445,8 +575,8 @@ class EntroQWorker:
             change = Modification.changing(task, at=at, attempt=attempt, err=str(exc))
 
         ops = [change]
-        for doc in docs:
-            ops.append(Modification.changing(doc, at=None))
+        for group in sets:
+            ops.append(Modification.arriving(group, 0.0))
         await self._client.modify(Modification(*ops))
 
     async def _process(self, task: Task, handler: Handler) -> bool:
@@ -469,15 +599,15 @@ class EntroQWorker:
             # transient and deserves a backoff. Either way the reason is
             # recorded on the task instead of vanishing into a log line.
             if e.has_missing_docs():
-                await self._dispose(task, [], MoveError(f"required doc missing: {e}"))
+                await self._dispose(task, MoveError(f"required doc missing: {e}"))
             else:
-                await self._dispose(task, [], RetryError(f"doc contention: {e}"))
+                await self._dispose(task, RetryError(f"doc contention: {e}"))
             return True
 
         do_work_exc: Exception | None = None
         result: Modification | None = None
 
-        async with _renewing(self._client, task, docs, self._claim_duration_s) as state:
+        async with _renewing(self._client, task, docs) as state:
             work = asyncio.ensure_future(handler.do_work(task, docs))
             state.work = work
             try:
@@ -498,16 +628,26 @@ class EntroQWorker:
             return False  # claim expires naturally
 
         if isinstance(do_work_exc, (RetryError, MoveError)):
-            await self._dispose(state.task, state.docs, do_work_exc)
+            await self._dispose(state.task, do_work_exc, sets=state.sets)
             return True
 
+        release: list[Doc] = []
         if result is not None:
-            _fix_versions(result, state.task, state.docs)
+            _fix_versions(result, state.task, state.docs, state.sets)
+            _reset_claims(result, state.task.id)
             await self._client.modify(result)
+            # The sets follow the task: once the commit lets go of it, the
+            # sets the commit did not write are released too -- but after
+            # finish, which may still read them.
+            if _writes_task(result, state.task.id):
+                release = _untouched(result, state.sets, state.docs)
+
         try:
             await handler._do_finish(state.task, state.docs)
         except StopWorker:
             return False
+        finally:
+            await _release_sets(self._client, release)
 
         return True
 

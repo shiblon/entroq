@@ -11,7 +11,7 @@ import pytest
 from entroq.base import EntroQBase
 from entroq.types import (
     Task, TaskID, TaskChange,
-    Doc, DocID,
+    ClaimedDocs, Doc, DocID, DocClaim,
     DependencyError, Modification, ModifyResult, TransportError,
 )
 from entroq.worker import (
@@ -25,10 +25,18 @@ from entroq.worker import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _task(id='t1', version=1, queue='q', attempt=0, claims=0, err='') -> Task:
+def _task(id='t1', version=1, queue='q', attempt=0, claims=0, err='',
+          lease_s=None) -> Task:
+    """Build a task. lease_s is the lease it was granted: at minus modified.
+
+    Leaving it None leaves modified unset, which is what a task built by hand
+    looks like; the worker then falls back to its default claim duration.
+    """
+    now = datetime.now(tz=timezone.utc)
     return Task(
         id=id, version=version, queue=queue,
-        at=datetime.now(tz=timezone.utc),
+        at=now if lease_s is None else now + timedelta(seconds=lease_s),
+        modified=None if lease_s is None else now,
         claimant='claimant', value=None,
         attempt=attempt, claims=claims, err=err,
     )
@@ -51,8 +59,20 @@ class FakeClient(EntroQBase):
         self._docs = list(docs)
         self.modify_calls: list[Modification] = []
         self.modify_raises: Exception | None = None
+        # A doc set holds its own lock, versioned apart from its members.
+        self._set_versions: dict[tuple[str, str], int] = {}
+        self.claim_set_calls: list[tuple[list[DocClaim], Task | None]] = []
         for t in tasks:
             self._task_q.put_nowait(t)
+
+    def _set_ref(self, namespace, key) -> Doc:
+        """Return a set's lock as the service reports it: a doc with no id."""
+        now = datetime.now(tz=timezone.utc)
+        return Doc(
+            namespace=namespace, id='', version=self._set_versions.setdefault(
+                (namespace, key), 1),
+            key=key, secondary_key='', content=None, claimant='claimant',
+            at=now, modified=now)
 
     async def time(self) -> datetime:
         return datetime.now(tz=timezone.utc)
@@ -76,53 +96,77 @@ class FakeClient(EntroQBase):
         if self.modify_raises is not None:
             raise self.modify_raises
         self.modify_calls.append(modification)
+        now = datetime.now(tz=timezone.utc)
         tasks_changed = [
             Task(id=tc.id, version=tc.version + 1, queue=tc.queue,
-                 at=tc.at or datetime.now(tz=timezone.utc),
+                 at=tc.at or now,
                  claimant='claimant', value=tc.value,
                  attempt=tc.attempt, err=tc.err or '')
             for tc in modification.task_changes
         ]
+        # An arrival moves its item one version and sets only when the item is
+        # ready again, resolved here against this client's clock as a backend
+        # resolves it against its own.
+        tasks_changed.extend(
+            Task(id=a.id, version=a.version + 1, queue=a.queue,
+                 at=now + timedelta(seconds=a.by_s), modified=now,
+                 claimant='claimant', value=None)
+            for a in modification.task_arrivals
+        )
         docs_changed = [
             Doc(namespace=dc.namespace, id=dc.id, version=dc.version + 1,
                 key=dc.key, secondary_key=dc.secondary_key,
                 content=dc.content, claimant='claimant',
-                at=dc.at or datetime.now(tz=timezone.utc))
+                at=dc.at or now)
             for dc in modification.doc_changes
         ]
+        for a in modification.doc_arrivals:
+            version = self._set_versions.get((a.namespace, a.key), a.version) + 1
+            self._set_versions[(a.namespace, a.key)] = version
+            docs_changed.append(Doc(
+                namespace=a.namespace, id='', version=version, key=a.key,
+                secondary_key='', content=None, claimant='claimant',
+                at=now + timedelta(seconds=a.by_s), modified=now))
         return ModifyResult(tasks_changed=tasks_changed, docs_changed=docs_changed)
 
     async def docs(self, namespace='', key_start='', key_end='', limit=0, omit_values=False):
         return list(self._docs)
 
     async def claim_docs(self, namespace, key, duration_ms=30000):
-        return [d for d in self._docs if d.namespace == namespace and d.key == key]
+        return await self.claim_doc_sets(
+            [DocClaim(namespace, key)], duration_ms=duration_ms)
+
+    async def claim_doc_sets(self, sets, *, duration_ms=30000, task_to_match=None):
+        sets = list(sets)
+        self.claim_set_calls.append((sets, task_to_match))
+        members, refs = [], []
+        for c in sets:
+            members.extend(d for d in self._docs
+                           if d.namespace == c.namespace and d.key == c.key)
+            refs.append(self._set_ref(c.namespace, c.key))
+        return ClaimedDocs(members, refs)
 
 
 class DocFailClient(FakeClient):
-    """Fails claim_docs with a prescribed DependencyError."""
+    """Fails a doc claim with a prescribed DependencyError."""
 
     def __init__(self, tasks=(), error=None):
         super().__init__(tasks=tasks)
         self._doc_error = error
 
-    async def claim_docs(self, namespace, key, duration_ms=30000):
+    async def claim_doc_sets(self, sets, *, duration_ms=30000, task_to_match=None):
         raise self._doc_error
 
 
 class RenewFailClient(FakeClient):
-    """Fails only renewal modifies (those that just push `at` forward)."""
+    """Fails only renewal modifies: those carrying a task arrival."""
 
     def __init__(self, tasks=(), error=None):
         super().__init__(tasks=tasks)
         self._renew_error = error
 
     async def modify(self, modification, *, unsafe_claimant_id=None):
-        changes = modification.task_changes
-        is_renewal = bool(changes) and all(
-            c.at is not None and c.queue == c.from_queue for c in changes
-        )
-        if is_renewal and self._renew_error is not None:
+        if modification.task_arrivals and self._renew_error is not None:
             raise self._renew_error
         return await super().modify(modification)
 
@@ -150,39 +194,81 @@ def test_fix_versions_task_change():
     tc = TaskChange(id='t1', version=1, queue='q', at=task.at)
     mod = Modification()
     mod.task_changes.append(tc)
-    _fix_versions(mod, task, [])
+    _fix_versions(mod, task, [], [])
     assert mod.task_changes[0].version == 5
 
 
 def test_fix_versions_task_delete():
     task = _task(id='t1', version=5)
     mod = Modification(Modification.deleting(TaskID(id='t1', version=1, queue='q')))
-    _fix_versions(mod, task, [])
+    _fix_versions(mod, task, [], [])
     assert mod.task_deletes[0].version == 5
 
 
 def test_fix_versions_task_depend():
     task = _task(id='t1', version=5)
     mod = Modification(Modification.depending(TaskID(id='t1', version=1, queue='q')))
-    _fix_versions(mod, task, [])
+    _fix_versions(mod, task, [], [])
     assert mod.task_depends[0].version == 5
 
 
 def test_fix_versions_doc_change():
+    """With no sets reported, a member falls back to the version it was claimed at."""
     doc = _doc(namespace='ns', id='d1', version=7)
     mod = Modification()
     dc = doc.as_change()
     dc.version = 2
     mod.doc_changes.append(dc)
-    _fix_versions(mod, _task(), [doc])
+    _fix_versions(mod, _task(), [doc], [])
     assert mod.doc_changes[0].version == 7
 
 
 def test_fix_versions_doc_delete():
     doc = _doc(namespace='ns', id='d1', version=7)
     mod = Modification(Modification.deleting(DocID(namespace='ns', id='d1', version=2)))
-    _fix_versions(mod, _task(), [doc])
+    _fix_versions(mod, _task(), [doc], [])
     assert mod.doc_deletes[0].version == 7
+
+
+def test_fix_versions_imposes_the_sets_version_on_its_members():
+    """A member named by ID takes its set's current version, not its own.
+
+    A doc carries its set's version and no other, so a renewal that moved the
+    set's lock has moved every member with it. The members are left as they
+    were claimed and the set is the one authority, applied here.
+    """
+    doc = _doc(namespace='ns', id='d1', key='k', version=7)
+    group = _doc(namespace='ns', id='', key='k', version=9)  # renewed twice
+    mod = Modification(
+        Modification.deleting(DocID(namespace='ns', id='d1', version=7)),
+        Modification.depending(DocID(namespace='ns', id='d1', version=7)),
+    )
+    change = doc.as_change()
+    change.version = 7
+    mod.doc_changes.append(change)
+
+    _fix_versions(mod, _task(), [doc], [group])
+
+    assert mod.doc_deletes[0].version == 9, "delete takes the set's version"
+    assert mod.doc_depends[0].version == 9, "so does a depend"
+    assert mod.doc_changes[0].version == 9, "and a change"
+
+
+def test_fix_versions_leaves_docs_of_unclaimed_sets_alone():
+    """A doc whose set was not claimed here keeps what the caller named.
+
+    The leasehold decides what may be corrected; a set this worker never held
+    could have moved for any reason, and guessing at its version would turn a
+    dependency check into a blind write.
+    """
+    mine = _doc(namespace='ns', id='d1', key='k', version=7)
+    group = _doc(namespace='ns', id='', key='k', version=9)
+    mod = Modification(
+        Modification.deleting(DocID(namespace='ns', id='elsewhere', version=3)))
+
+    _fix_versions(mod, _task(), [mine], [group])
+
+    assert mod.doc_deletes[0].version == 3, "untouched: not a member of a claimed set"
 
 
 def test_fix_versions_skips_unknown_ids():
@@ -190,7 +276,7 @@ def test_fix_versions_skips_unknown_ids():
     tc = TaskChange(id='t-other', version=3, queue='q', at=task.at)
     mod = Modification()
     mod.task_changes.append(tc)
-    _fix_versions(mod, task, [])
+    _fix_versions(mod, task, [], [])
     assert mod.task_changes[0].version == 3  # unchanged
 
 
@@ -891,7 +977,10 @@ def test_worker_cancels_handler_when_claim_is_lost():
     timeout, so `reached_end` staying empty means the work was genuinely
     cancelled rather than merely outlived by the test.
     """
-    task = _task(id='t1', version=1, queue='q')
+    # The lease the claim granted sets the renewal cadence, so a short one is
+    # what brings the failing renewal forward; the worker's requested duration
+    # has no say in it.
+    task = _task(id='t1', version=1, queue='q', lease_s=0.02)
     client = RenewFailClient(tasks=[task], error=DependencyError("claim lost"))
     worker = EntroQWorker(client, 'q', claim_duration_s=0.02)
 
@@ -964,22 +1053,18 @@ def test_worker_claims_docs_for_task():
     assert received_docs[0].id == 'd1'
 
 
-def test_worker_doc_claims_sorted_by_namespace_key():
-    """Docs must be claimed in (namespace, key) order to avoid livelock."""
+def test_worker_claims_every_set_in_one_call():
+    """Every named set is claimed together, or none is.
+
+    Claiming them one at a time lets two workers each hold part of what both
+    need, which an ordering can only mitigate. One all-or-nothing claim leaves
+    nothing to order.
+    """
     task = _task(id='t1', version=1)
     doc_a = _doc(namespace='ns', id='da', version=1, key='aaa')
     doc_b = _doc(namespace='ns', id='db', version=1, key='bbb')
     client = FakeClient(tasks=[task], docs=[doc_a, doc_b])
     worker = EntroQWorker(client, 'q', claim_duration_s=60.0)
-
-    claim_order = []
-    original_claim_docs = client.claim_docs
-
-    async def tracking_claim_docs(namespace, key, duration_ms=30000):
-        claim_order.append((namespace, key))
-        return await original_claim_docs(namespace, key, duration_ms)
-
-    client.claim_docs = tracking_claim_docs
 
     async def run():
         @EntroQWorker.handler
@@ -988,12 +1073,16 @@ def test_worker_doc_claims_sorted_by_namespace_key():
 
         @process.selector
         async def process(task):
-            return [DocClaim('ns', 'bbb'), DocClaim('ns', 'aaa')]  # reversed
+            return [DocClaim('ns', 'bbb'), DocClaim('ns', 'aaa')]
 
         await worker._process(task, process)
 
     asyncio.run(run())
-    assert claim_order == [('ns', 'aaa'), ('ns', 'bbb')]
+    assert len(client.claim_set_calls) == 1, client.claim_set_calls
+    sets, matched = client.claim_set_calls[0]
+    assert [(c.namespace, c.key) for c in sets] == [('ns', 'bbb'), ('ns', 'aaa')]
+    assert matched is task, (
+        "the sets must be held until the task arrives, so they expire with it")
 
 
 # ---------------------------------------------------------------------------
@@ -1001,11 +1090,12 @@ def test_worker_doc_claims_sorted_by_namespace_key():
 # ---------------------------------------------------------------------------
 
 def test_renewing_updates_state_task():
-    task = _task(id='t1', version=1)
+    # A 0.15s lease renews every 0.1s, so 0.25s covers two renewals.
+    task = _task(id='t1', version=1, lease_s=0.15)
     client = FakeClient()
 
     async def run():
-        async with _renewing(client, task, [], duration_s=0.1) as state:
+        async with _renewing(client, task, ClaimedDocs()) as state:
             await asyncio.sleep(0.25)
         return state.task.version
 
@@ -1013,13 +1103,104 @@ def test_renewing_updates_state_task():
 
 
 def test_renewing_dep_error_sets_state_error():
-    task = _task(id='t1', version=1)
+    task = _task(id='t1', version=1, lease_s=0.15)
     client = FakeClient()
     client.modify_raises = DependencyError("lease lost")
 
     async def run():
-        async with _renewing(client, task, [], duration_s=0.1) as state:
+        async with _renewing(client, task, ClaimedDocs()) as state:
             await asyncio.sleep(0.2)
         return state.error
 
     assert isinstance(asyncio.run(run()), DependencyError)
+
+
+def test_renewing_renews_the_lease_it_was_granted():
+    """A renewal asks for at - modified, never for what the claim requested.
+
+    The granted lease is the only number both sides agree on: a service may
+    clamp a requested one, and renewing for the request would leave the task
+    free between renewals.
+    """
+    task = _task(id='t1', version=1, lease_s=0.15)
+    client = FakeClient()
+
+    async def run():
+        async with _renewing(client, task, ClaimedDocs()):
+            await asyncio.sleep(0.15)
+
+    asyncio.run(run())
+    arrivals = [a for m in client.modify_calls for a in m.task_arrivals]
+    assert arrivals, "the renewer must send an arrival, not a change"
+    assert all(abs(a.by_s - 0.15) < 1e-9 for a in arrivals), arrivals
+    assert not any(m.task_changes for m in client.modify_calls), (
+        "a renewal must carry no value, queue, or attempt")
+
+
+def test_renewing_renews_an_empty_doc_set():
+    """A set with no docs still holds a lock, and still has to be renewed.
+
+    The arrival names the set, so there is nothing to iterate and come up
+    empty: this is the case a per-doc renewal silently dropped.
+    """
+    task = _task(id='t1', version=1, lease_s=0.15)
+    client = FakeClient()  # no docs at all
+
+    async def run():
+        docs = await client.claim_doc_sets([DocClaim('ns', 'empty')],
+                                           task_to_match=task)
+        assert list(docs) == [], "the set has no members"
+        async with _renewing(client, task, docs):
+            await asyncio.sleep(0.15)
+
+    asyncio.run(run())
+    arrivals = [a for m in client.modify_calls for a in m.doc_arrivals]
+    assert arrivals, "an empty set must still be renewed"
+    assert all((a.namespace, a.key) == ('ns', 'empty') for a in arrivals)
+
+
+def test_renewal_reaches_the_commit_through_the_set():
+    """What a renewal moves has to reach the committed modification.
+
+    A doc carries its set's version, so renewing the set invalidates every
+    version the handler is holding. The members are deliberately left as they
+    were claimed -- keeping two copies in step is what went wrong before --
+    and _fix_versions imposes the set's current version at commit, which is
+    the only place that correction lives.
+    """
+    task = _task(id='t1', version=1, lease_s=0.15)
+    doc = _doc(namespace='ns', id='d1', key='k')
+    client = FakeClient(docs=[doc])
+
+    async def run():
+        docs = await client.claim_doc_sets([DocClaim('ns', 'k')], task_to_match=task)
+        claimed_at = docs[0].version
+        async with _renewing(client, task, docs) as state:
+            await asyncio.sleep(0.25)  # two renewals at a 0.1s cadence
+        mod = Modification(Modification.deleting(state.docs[0]))
+        _fix_versions(mod, state.task, state.docs, state.sets)
+        return claimed_at, state.sets[0].version, mod.doc_deletes[0].version
+
+    claimed_at, set_version, deleted_at = asyncio.run(run())
+    assert set_version > claimed_at, "the renewals moved the set"
+    assert deleted_at == set_version, (
+        f"commit named v{deleted_at}, set is at v{set_version}")
+
+
+def test_renewing_advances_set_versions():
+    """Each renewal names the set at the version the last one returned."""
+    task = _task(id='t1', version=1, lease_s=0.15)
+    client = FakeClient(docs=[_doc(namespace='ns', id='d1', key='k')])
+
+    async def run():
+        docs = await client.claim_doc_sets([DocClaim('ns', 'k')],
+                                           task_to_match=task)
+        async with _renewing(client, task, docs) as state:
+            await asyncio.sleep(0.25)
+        return [g.version for g in state.sets]
+
+    final = asyncio.run(run())
+    versions = [a.version for m in client.modify_calls for a in m.doc_arrivals]
+    assert versions == sorted(set(versions)), (
+        "a renewal must not reuse a version the last one moved: %r" % versions)
+    assert final == [max(versions) + 1]

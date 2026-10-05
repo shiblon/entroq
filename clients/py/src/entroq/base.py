@@ -3,7 +3,9 @@ from datetime import datetime
 from types import TracebackType
 from typing import List, Optional, Sequence, TypeVar, Union
 
-from .types import Task, Doc, Modification, ModifyResult
+from .types import (
+    ClaimedDocs, Doc, DocClaim, Modification, ModifyResult, Task,
+)
 
 
 _EntroQ = TypeVar('_EntroQ', bound='EntroQBase')
@@ -91,3 +93,31 @@ class EntroQBase(ABC):
         duration_ms: int = 30000,
     ) -> List[Doc]:
         """Atomically claim all docs sharing key in namespace."""
+
+    async def claim_doc_sets(
+        self,
+        sets: Sequence[DocClaim],
+        *,
+        duration_ms: int = 30000,
+        task_to_match: Optional[Task] = None,
+    ) -> ClaimedDocs:
+        """Claim several doc sets at once, all or none, and return their docs.
+
+        task_to_match holds the sets until that task arrives instead of for
+        duration_ms, so they expire in step with it. The task is named, not its
+        arrival time: the store reads it, so both expiries come from one
+        reading of one clock. The claim fails if the task is not there at that
+        version, which means the caller no longer holds it.
+
+        The result's ``sets`` carries each claimed set at its lock version,
+        which is what renewing or releasing names.
+
+        This default claims one set per call and cannot report the sets, so a
+        claim of several is not atomic and an empty set cannot be renewed. A
+        client that speaks protocol 2 overrides it with the single atomic call
+        the service provides.
+        """
+        docs: List[Doc] = []
+        for s in sorted(sets, key=lambda c: (c.namespace, c.key)):
+            docs.extend(await self.claim_docs(s.namespace, s.key, duration_ms=duration_ms))
+        return ClaimedDocs(docs)

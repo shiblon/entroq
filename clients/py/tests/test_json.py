@@ -200,6 +200,30 @@ async def test_dependency_error_decodes_doc_ids():
     assert err.missing == []
 
 
+async def test_dependency_error_decodes_a_contended_doc_set():
+    """A set is named by key with no `id`, and must still decode as a claim.
+
+    This is the shape a contended set claim really sends. Requiring an `id`
+    raises past the decoder and the caller sees an HTTP error instead, which
+    costs the worker its one way to tell contention from a poison pill.
+    """
+    err = await _modify_dep_error([
+        {"type": "DETAIL", "msg": 'doc set "cfg" is claimed by someone else'},
+        {"type": "CLAIM", "docId": {"namespace": "ns", "key": "cfg", "version": 1}},
+        {"type": "CLAIM", "docId": {"namespace": "ns", "id": "d1", "version": 1}},
+    ])
+    assert err.doc_claims == [
+        DocID(namespace="ns", id="", version=1, key="cfg"),
+        DocID(namespace="ns", id="d1", version=1),
+    ]
+    assert err.doc_claims[0].is_set_ref()
+    assert not err.doc_claims[1].is_set_ref()
+    assert err.has_claimed_docs(), "contention, so the worker backs off"
+    assert not err.has_missing_docs(), "not a poison pill"
+    assert "claimed by someone else" in str(err)
+    assert "ns/[cfg]:v1" in str(err), "a set must print as a set"
+
+
 async def test_dependency_error_keeps_task_ids_separate():
     err = await _modify_dep_error([
         {"type": "CLAIM", "id": {"id": "t1", "version": 2, "queue": "q"}},
