@@ -957,8 +957,10 @@ func DocSets(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix s
 			t.Fatalf("Claim of an empty set returned %d docs", len(set.Docs))
 		}
 		// With no docs to carry them, the set itself reports its version
-		// and claim.
-		if set.Namespace != ns || set.Key != "empty" || set.Version < 0 ||
+		// and claim. Version 1: the claim is a write to the empty set that
+		// was already there at version 0, so it moves the version like any
+		// other. Only an insert creates a set, at version 0.
+		if set.Namespace != ns || set.Key != "empty" || set.Version != 1 ||
 			set.Claimant != client.ClientID || !set.At.After(before) {
 			t.Errorf("Claimed empty set: got %+v, want %s/empty held by %s past %v", set, ns, client.ClientID, before)
 		}

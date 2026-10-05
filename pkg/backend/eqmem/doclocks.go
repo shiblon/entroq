@@ -34,7 +34,7 @@ type journalLock struct {
 }
 
 func (l journalLock) lock() docset.Lock {
-	return docset.Lock{Version: l.Version, Claimant: l.Claimant, At: l.At}
+	return docset.Lock{Stored: true, Version: l.Version, Claimant: l.Claimant, At: l.At}
 }
 
 func newJournalLock(g docset.Set, l docset.Lock) journalLock {
@@ -177,7 +177,7 @@ func (m *EQMem) finishDocReplay() {
 		for key, v := range highest {
 			l := ns.Lock(key)
 			if l == docset.Absent {
-				l = docset.Lock{Version: v + 1}
+				l = docset.Lock{Stored: true, Version: v + 1}
 			}
 			l.NumDocs = count[key]
 			ns.SetLock(key, l)

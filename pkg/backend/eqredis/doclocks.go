@@ -58,7 +58,7 @@ func parseLock(vals map[string]string) (docset.Lock, error) {
 	if err != nil {
 		return docset.Lock{}, fmt.Errorf("parse doc lock at: %w", err)
 	}
-	return docset.Lock{Version: int32(version), Claimant: vals["claimant"], At: time.UnixMilli(at).UTC()}, nil
+	return docset.Lock{Stored: true, Version: int32(version), Claimant: vals["claimant"], At: time.UnixMilli(at).UTC()}, nil
 }
 
 // readLocks reads the locks of sets; a set with none maps to
@@ -187,7 +187,7 @@ func migrateDocLocks(ctx context.Context, client *redis.Client) error {
 			} else if n == 1 {
 				continue
 			}
-			writeLock(ctx, pipe, g, docset.Lock{Version: v + 1, At: now}, now)
+			writeLock(ctx, pipe, g, docset.Lock{Stored: true, Version: v + 1, At: now}, now)
 		}
 		pipe.Del(ctx, nsclaimedKey(ns))
 		if _, err := pipe.Exec(ctx); err != nil {

@@ -445,7 +445,7 @@ func loadDocLocks(ctx context.Context, q queryer, sets []docset.Set) (map[docset
 			if err := rows.Scan(&g.Namespace, &g.Key, &l.Version, &l.Claimant, &at, &l.NumDocs); err != nil {
 				return fmt.Errorf("scan doc lock: %w", err)
 			}
-			l.At = time.UnixMilli(at).UTC()
+			l.At, l.Stored = time.UnixMilli(at).UTC(), true
 			locks[g] = l
 		}
 		return rows.Err()

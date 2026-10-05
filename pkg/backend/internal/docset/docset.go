@@ -27,18 +27,25 @@ type Set struct {
 	Key       string
 }
 
-// Lock is a set's version and claim, and how many docs it has.
+// Lock is a set's version and claim, and how many docs it has. Stored says
+// the set has a lock of its own; see Absent.
 type Lock struct {
+	Stored   bool
 	Version  int32
 	Claimant string
 	At       time.Time
 	NumDocs  int
 }
 
-// Absent is the lock of a set nothing has written or claimed yet. Its first
-// write or claim moves it to version 0, so a new doc starts at version 0 as a
-// new task does. Backends return it for a set they have no lock for.
-var Absent = Lock{Version: -1}
+// Absent is the lock of a set nothing has stored: version 0, no docs, no
+// claim. Backends return it for a set they have no lock for.
+//
+// An empty set and an absent one are the same state, so version 0 is the
+// version an empty set has: the set that was, in effect, inserted empty.
+// Stored is what tells them apart, and only an insert needs to know, because
+// only an insert can bring a set into being. Nothing reads Version to decide
+// whether a set exists -- 0 is a real version a stored set holds.
+var Absent = Lock{}
 
 // Held reports whether anyone holds the lock at now.
 func (l Lock) Held(now time.Time) bool {
@@ -63,11 +70,27 @@ func Overlay(member *entroq.Doc, l Lock) *entroq.Doc {
 
 // Claim returns lock l claimed by claimant until until, or false if someone
 // else holds it at now.
+//
+// A claim moves the version like any other write, an absent set included: the
+// set it claims is the empty one that was already there at version 0, so
+// claiming it reads as the modification it is and lands at version 1. Only an
+// insert creates a set, and only an insert starts one at version 0.
 func Claim(l Lock, claimant string, now, until time.Time) (Lock, bool) {
 	if l.HeldByOther(claimant, now) {
 		return l, false
 	}
-	return Lock{Version: l.Version + 1, Claimant: claimant, At: until, NumDocs: l.NumDocs}, true
+	return Lock{Stored: true, Version: l.Version + 1, Claimant: claimant, At: until, NumDocs: l.NumDocs}, true
+}
+
+// written returns the version a write to a set holding lock l produces: a
+// write to a set nothing has stored creates it at version 0, as inserting a
+// task creates it at version 0, and a write to one already there moves it on
+// by one.
+func written(l Lock) int32 {
+	if !l.Stored {
+		return 0
+	}
+	return l.Version + 1
 }
 
 // SetsOf returns the sets cq names, in the order named.
@@ -330,7 +353,7 @@ func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string
 		g := Set{Namespace: a.Namespace, Key: a.Key}
 		l := lock(g)
 		switch {
-		case l.Version < 0 || l.Version != a.Version:
+		case !l.Stored || l.Version != a.Version:
 			depErr.DocArrives = append(depErr.DocArrives, Ref(g, l))
 		case claimed(g):
 		default:
@@ -344,7 +367,7 @@ func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string
 		return plan
 	}
 	for g, at := range held {
-		next := Lock{Version: lock(g).Version + 1, At: now, NumDocs: lock(g).NumDocs + added[g]}
+		next := Lock{Stored: true, Version: written(lock(g)), At: now, NumDocs: lock(g).NumDocs + added[g]}
 		if !at.IsZero() {
 			next.Claimant = mod.Claimant
 			next.At = at

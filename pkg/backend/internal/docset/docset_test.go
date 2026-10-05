@@ -27,9 +27,9 @@ func (s store) evaluate(claimant string, args ...entroq.ModifyArg) Plan {
 	return Evaluate(entroq.NewModification(claimant, args...), now, s.member, s.lock)
 }
 
-// newStore holds one set, ns/k, with members a and b at version 5.
+// newStore holds one stored set, ns/k, with members a and b at version 5.
 func newStore(l Lock) store {
-	l.Version, l.NumDocs = 5, 2
+	l.Stored, l.Version, l.NumDocs = true, 5, 2
 	return store{
 		members: map[string]*entroq.Doc{
 			entroq.DocKey("ns", "a"): {Namespace: "ns", ID: "a", Key: "k"},
@@ -165,14 +165,18 @@ func TestEvaluateExpiredClaimProtectsNothing(t *testing.T) {
 	}
 }
 
-func TestClaimNewGroupStartsAtZero(t *testing.T) {
-	if l, ok := Claim(Absent, "me", now, now.Add(time.Minute)); !ok || l.Version != 0 {
-		t.Errorf("First claim of a new set: want version 0, got %+v, %v", l, ok)
+func TestClaimNewGroupStartsAtOne(t *testing.T) {
+	// Claiming a set nothing has stored claims the empty set that was in
+	// effect already there at version 0, so it moves the version as any
+	// other write does. Only an insert creates a set, at version 0; see
+	// TestEvaluateInsertIntoNewGroup.
+	if l, ok := Claim(Absent, "me", now, now.Add(time.Minute)); !ok || l.Version != 1 || !l.Stored {
+		t.Errorf("First claim of a new set: want version 1, stored, got %+v, %v", l, ok)
 	}
 }
 
 func TestClaim(t *testing.T) {
-	l, ok := Claim(Lock{Version: 2}, "me", now, now.Add(time.Minute))
+	l, ok := Claim(Lock{Stored: true, Version: 2}, "me", now, now.Add(time.Minute))
 	if !ok || l.Version != 3 || l.Claimant != "me" || !l.At.Equal(now.Add(time.Minute)) {
 		t.Fatalf("Claim of an unheld set: got %+v, %v", l, ok)
 	}
@@ -291,8 +295,11 @@ func TestEvaluateDocArrives(t *testing.T) {
 	if p := s.evaluate("other", entroq.Arriving(entroq.ReadyNow().Docs(renew))); p.Err == nil || len(p.Err.DocClaims) != 1 || !p.Err.DocClaims[0].IsSetRef() {
 		t.Errorf("Set held by someone else: want a set claim failure, got %v", p.Err)
 	}
-	absent := &entroq.DocSet{Namespace: "ns", Key: "none", Version: -1}
-	if p := s.evaluate("me", entroq.Arriving(entroq.ReadyAt(now.Add(time.Minute)).Docs(absent))); p.Err == nil {
-		t.Error("Absent set: want a failure, even named at the absent version")
+	// Version 0 is what an absent set reports, and a real stored set can hold
+	// it too, so the version alone cannot carry this: an arrival naming a set
+	// nothing has stored has to fail on the set not being there.
+	absent := &entroq.DocSet{Namespace: "ns", Key: "none", Version: 0}
+	if p := s.evaluate("me", entroq.Arriving(entroq.ReadyAt(now.Add(time.Minute)).Docs(absent))); p.Err == nil || len(p.Err.DocArrives) != 1 {
+		t.Errorf("Absent set named at version 0: want an arrival failure, got %v", p.Err)
 	}
 }

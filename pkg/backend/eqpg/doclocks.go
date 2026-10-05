@@ -77,9 +77,9 @@ func lockMembers(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (map
 // Rows are locked in (namespace, key) order, a run of same-mode sets per
 // statement, so modifications locking the same sets cannot deadlock.
 //
-// A written set with no lock row gets one at docset.Absent's version; if
-// the modification fails, the row rolls back with it. A shared set always
-// has one, as a depend names a stored member.
+// A written set with no lock row gets one at placeholderVersion; if the
+// modification fails, the row rolls back with it. A shared set always has
+// one, as a depend names a stored member.
 func lockSets(ctx context.Context, tx *sql.Tx, sets []docset.Set, exclusive map[docset.Set]bool) (map[docset.Set]docset.Lock, time.Time, error) {
 	locks := make(map[docset.Set]docset.Lock, len(sets))
 	if len(sets) == 0 {
@@ -117,7 +117,7 @@ func upsertSets(ctx context.Context, tx *sql.Tx, sets []docset.Set, locks map[do
 		ORDER BY n, k
 		ON CONFLICT (namespace, key_primary) DO UPDATE SET namespace = l.namespace
 		RETURNING l.namespace, l.key_primary, l.version, l.claimant, l.at, l.num_docs, now()`,
-		pq.Array(ns), pq.Array(keys), docset.Absent.Version)
+		pq.Array(ns), pq.Array(keys), placeholderVersion)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("lock doc sets: %w", err)
 	}
@@ -150,6 +150,13 @@ func setArrays(sets []docset.Set) (ns, keys []string) {
 	return ns, keys
 }
 
+// placeholderVersion marks a lock row upsertSets created to lock a set that
+// has none of its own. It is out of the range of real versions, so scanLocks
+// reads such a row back as docset.Absent rather than as a set stored at a
+// version -- which is what keeps an insert into that set a creation, at
+// version 0, instead of a modification of something already there.
+const placeholderVersion = -1
+
 // scanLocks reads lock rows (namespace, key, version, claimant, at, num_docs,
 // now) into locks, closing rows, and returns the database's time. The time is
 // zero if there were no rows.
@@ -162,6 +169,11 @@ func scanLocks(rows *sql.Rows, locks map[docset.Set]docset.Lock) (time.Time, err
 		if err := rows.Scan(&g.Namespace, &g.Key, &l.Version, &l.Claimant, &l.At, &l.NumDocs, &now); err != nil {
 			return time.Time{}, fmt.Errorf("scan doc lock: %w", err)
 		}
+		if l.Version == placeholderVersion {
+			locks[g] = docset.Absent
+			continue
+		}
+		l.Stored = true
 		locks[g] = l
 	}
 	return now, rows.Err()
