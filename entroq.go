@@ -254,15 +254,8 @@ type ListenerCounter interface {
 // NotifyModified takes inserted and changed tasks and notifies once per unique
 // queue/ID pair, for those that are available rather than held.
 //
-// Availability is read as At at or before Modified, not against a clock. Every
-// task here was just written by one backend transaction, which stamped both
-// fields from its own now, so the two are comparable exactly and the question
-// needs no third reading of any clock: a held task arrives after it was
-// written, an available one does not.
-//
-// Do not reach for a clock here. These stamps may come from a store with its
-// own, as eqpg's do from Postgres, and a reading taken in this process is not
-// comparable to them.
+// Availability is read as At at or before Modified, both of which are set in
+// reference to the backend clock.
 func NotifyModified(n Notifier, inserted, changed []*Task) {
 	qs := make(map[string]string)
 	for _, t := range inserted {

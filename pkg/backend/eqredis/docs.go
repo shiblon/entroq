@@ -313,16 +313,16 @@ func (e *EQRedis) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq
 			until := now.Add(cq.Duration)
 			if cq.TaskToMatch != nil {
 				// Read, but deliberately NOT watched: see
-				// docset.TaskNotHeldErrorf. Watching the task would make this
+				// docset.MissingTaskErrorf. Watching the task would make this
 				// claim abort and retry whenever the task is touched,
 				// including by its own holder renewing it.
 				vals, err := tx.HGetAll(ctx, taskKey(cq.TaskToMatch.ID)).Result()
 				if err != nil || len(vals) == 0 {
-					return docset.TaskNotHeldErrorf(cq.TaskToMatch, "eqredis claim docs")
+					return docset.MissingTaskErrorf(cq.TaskToMatch, "eqredis claim docs")
 				}
 				f, err := parseTaskFields(vals)
 				if err != nil || f.Version != cq.TaskToMatch.Version || f.Queue != cq.TaskToMatch.Queue {
-					return docset.TaskNotHeldErrorf(cq.TaskToMatch, "eqredis claim docs")
+					return docset.MissingTaskErrorf(cq.TaskToMatch, "eqredis claim docs")
 				}
 				until = time.UnixMilli(f.AtMs).UTC()
 			}

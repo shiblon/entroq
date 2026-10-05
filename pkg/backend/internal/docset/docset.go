@@ -79,47 +79,19 @@ func SetsOf(cq *entroq.DocClaim) []Set {
 	return sets
 }
 
-// TaskNotHeldErrorf is what a backend returns when a claim matching a task
-// (entroq.MatchingLeaseOf) cannot find that task at the version named. Every
-// backend returns this one error for it, so that a holder inspecting the
-// failure reads the same thing whichever store is behind it -- the worker does
-// exactly that when acquiring its doc sets.
+// MissingTaskErrorf reports that a claim matching a task
+// (entroq.MatchingLeaseOf) could not find it at the version named. The claim
+// depends on that task, so this is an ordinary failed depend: a
+// DependencyError with the task among Depends, where Error renders it under
+// "missing depends".
 //
-// The origin goes in the message rather than around it, because wrapping does
-// not survive the wire: a service turns a dependency error into a gRPC status
-// whose own message is a fixed string, and only DependencyError.Message is
-// carried across, in the details. A fmt.Errorf wrap would therefore name the
-// backend for an in-process caller and tell a remote one nothing.
-//
-// The version is the whole test. It moved because someone claimed, changed or
-// finished the task, so the caller does not hold it any more, and locking sets
-// to it would hold them for a lease nobody owns. A match proves holding,
-// because claiming a task moves its version.
-//
-// A backend may read the task OPTIMISTICALLY, and should: it need not hold the
-// task still to decide the hold. What naming a task buys is the exactness of
-// the VALUE -- the backend reads its own stored arrival, so the hold and the
-// task's expiry are the same number whatever the clocks between the holder and
-// the store are doing. That wants the arrival read rather than handed in; it
-// does not want atomicity.
-//
-// A task that changes between the read and the write leaves the hold wrong by
-// at most one lease, in a direction the dance already tolerates: renewed, and
-// the sets expire before the task, which the holder's next renewal corrects,
-// since it renews both and fires at two thirds of the lease; taken or deleted,
-// and the sets lapse at an arrival whose task is gone, which is what happens
-// when any holder dies. Mutual exclusion is untouched either way, because what
-// excludes another claimant from a set is that set's own lock, not the task's.
-//
-// Holding the task still therefore costs contention for nothing, and in a
-// WATCH-based store it is worse than nothing: watching the task makes a doc
-// claim abort and retry whenever the task is touched, including by its own
-// holder renewing it.
-func TaskNotHeldErrorf(id *entroq.TaskID, format string, args ...any) error {
-	depErr := new(entroq.DependencyError)
+// The origin goes in the message rather than wrapping it: only
+// DependencyError.Message crosses the wire, so a fmt.Errorf wrap would name
+// the backend for a local caller and tell a remote one nothing.
+func MissingTaskErrorf(id *entroq.TaskID, format string, args ...any) error {
+	depErr := entroq.DependencyErrorf("%s: doc claim depends on a missing task",
+		fmt.Sprintf(format, args...))
 	depErr.Depends = append(depErr.Depends, id)
-	depErr.Message = fmt.Sprintf("%s: doc claim matches task %v, which is not held at that version",
-		fmt.Sprintf(format, args...), id)
 	return depErr
 }
 
@@ -131,9 +103,13 @@ func TaskNotHeldErrorf(id *entroq.TaskID, format string, args ...any) error {
 //
 // until is passed in rather than read from cq because a claim may name a task
 // to match instead of a duration (see entroq.MatchingLeaseOf), and only the
-// backend can resolve that: it reads the task, under whatever lock or
-// transaction holds its own writes, so the hold and the task's expiry come
-// from one reading.
+// backend can resolve that, by reading the task's own stored arrival.
+//
+// Read that task optimistically; do not lock or WATCH it. A stale read leaves
+// the hold wrong by at most one lease, which the holder's next renewal
+// corrects, and watching it makes the claim retry whenever the task is
+// touched, including by its own holder. If it is missing at the version named,
+// fail with MissingTaskErrorf.
 func ClaimAll(cq *entroq.DocClaim, now, until time.Time, lock func(Set) Lock, members func(Set) ([]*entroq.Doc, error)) ([]Lock, error) {
 	if !until.After(now) {
 		return nil, entroq.InvalidArgumentf("doc claim until %v, which is not after now (%v)", until, now)

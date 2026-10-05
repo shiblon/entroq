@@ -53,13 +53,13 @@ func (b *EQSQLite) ClaimDocs(ctx context.Context, q *entroq.DocClaim) ([]*entroq
 		until := now.Add(q.Duration)
 		if q.TaskToMatch != nil {
 			// Read in this transaction, so the hold is the task's own stored
-			// arrival. See docset.TaskNotHeldErrorf for why the read need not
+			// arrival. See docset.MissingTaskErrorf for why the read need not
 			// hold the task still.
 			var atMs int64
 			if err := tx.QueryRowContext(ctx,
 				`SELECT at_ms FROM tasks WHERE id = ? AND version = ? AND queue = ?`,
 				q.TaskToMatch.ID, q.TaskToMatch.Version, q.TaskToMatch.Queue).Scan(&atMs); err != nil {
-				return nil, docset.TaskNotHeldErrorf(q.TaskToMatch, "sqlite claim docs")
+				return nil, docset.MissingTaskErrorf(q.TaskToMatch, "sqlite claim docs")
 			}
 			until = time.UnixMilli(atMs).UTC()
 		}

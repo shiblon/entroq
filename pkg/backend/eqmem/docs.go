@@ -120,18 +120,18 @@ func (m *EQMem) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.D
 		// Read without the queue lock, before any namespace lock is taken, so
 		// this adds nothing to eqmem's lock ordering. The read is safe because
 		// queues are a sync.Map and a writer replaces a task rather than
-		// mutating it in place; see docset.TaskNotHeldErrorf for why reading it
+		// mutating it in place; see docset.MissingTaskErrorf for why reading it
 		// optimistically is enough.
 		tq := func() *taskQueue {
 			defer un(lock(m))
 			return m.queues[cq.TaskToMatch.Queue]
 		}()
 		if tq == nil {
-			return nil, docset.TaskNotHeldErrorf(cq.TaskToMatch, "eqmem claim docs")
+			return nil, docset.MissingTaskErrorf(cq.TaskToMatch, "eqmem claim docs")
 		}
 		t, ok := tq.Get(cq.TaskToMatch.ID)
 		if !ok || t.Version != cq.TaskToMatch.Version {
-			return nil, docset.TaskNotHeldErrorf(cq.TaskToMatch, "eqmem claim docs")
+			return nil, docset.MissingTaskErrorf(cq.TaskToMatch, "eqmem claim docs")
 		}
 		until = t.At
 	}

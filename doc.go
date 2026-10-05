@@ -403,16 +403,13 @@ type DocClaim struct {
 	Claimant string         `json:"claimant"`
 	Duration time.Duration  `json:"duration"`
 
-	// Task, if set, holds the sets until the named task arrives instead of for
-	// Duration, so that they expire in step with it. The backend reads the
-	// task to find out when that is, so the two come from one clock and are
-	// exactly simultaneous rather than approximately so; it fails the claim if
-	// the task is not there at that version, which means the caller no longer
-	// holds it and the lockstep would be meaningless. See MatchingLeaseOf.
+	// TaskToMatch, if set, holds the sets until the named task arrives instead
+	// of for Duration, so they expire in step with it. The claim depends on
+	// that task at that version, and fails if it is missing: its lease is then
+	// no longer one to depend on. See MatchingLeaseOf.
 	//
 	// The queue is part of the reference because a backend needs it to find
-	// the task at all: eqmem keeps tasks under their queue's lock, so without
-	// it there is nothing to look under.
+	// the task: eqmem keeps tasks under their queue's lock.
 	TaskToMatch *TaskID `json:"task_to_match,omitempty"`
 
 	leases int // lease arguments given, of which there may be one
@@ -443,20 +440,16 @@ func ClaimingSetsFor(d time.Duration) DocClaimArg {
 	})
 }
 
-// MatchingLeaseOf holds a claim's sets until the given task arrives, so that
-// they expire in step with it: a worker that dies lets go of its task and its
-// sets at the same moment.
+// MatchingLeaseOf holds a claim's sets until the given task arrives, so they
+// expire in step with it: a worker that dies lets go of its task and its sets
+// at the same moment.
 //
-// It names the task rather than its arrival time. The backend reads the task
-// to find out when that is, so the hold and the task's own expiry come from
-// one clock reading and are exactly simultaneous; passing the instant instead
-// would carry it across however many clocks lie between the holder and the
-// store, and make them only approximately so.
+// It names the task rather than its arrival time, and the backend reads that
+// arrival, so the two come from one clock reading and are exactly rather than
+// approximately simultaneous.
 //
 // The claim fails if the task is not present at this version, which means the
-// caller no longer holds it: locking sets to a task someone else has taken,
-// or that has been handled, is not a hold anyone wants. A version match is
-// proof enough, since claiming a task moves its version.
+// implied dependency no longer holds; the task's lease is no longer reliable.
 func MatchingLeaseOf(task *Task) DocClaimArg {
 	return docClaimOption(func(c *DocClaim) {
 		c.Duration, c.TaskToMatch = 0, task.IDVersion()

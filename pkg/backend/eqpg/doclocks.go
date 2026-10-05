@@ -380,12 +380,12 @@ func claimDocs(ctx context.Context, tx *sql.Tx, cq *entroq.DocClaim) ([]*entroq.
 	until := now.Add(cq.Duration)
 	if cq.TaskToMatch != nil {
 		// Read in this transaction, so the hold is the task's own stored
-		// arrival. See docset.TaskNotHeldErrorf for why the read need not hold
+		// arrival. See docset.MissingTaskErrorf for why the read need not hold
 		// the task still.
 		if err := tx.QueryRowContext(ctx,
 			`SELECT at FROM entroq.tasks WHERE id = $1 AND version = $2 AND queue = $3`,
 			cq.TaskToMatch.ID, cq.TaskToMatch.Version, cq.TaskToMatch.Queue).Scan(&until); err != nil {
-			return nil, docset.TaskNotHeldErrorf(cq.TaskToMatch, "pg claim docs")
+			return nil, docset.MissingTaskErrorf(cq.TaskToMatch, "pg claim docs")
 		}
 	}
 	claimed, err := docset.ClaimAll(cq, now, until, lock, members)
