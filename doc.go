@@ -402,8 +402,18 @@ type DocClaim struct {
 	Sets     []*DocSetClaim `json:"sets"`
 	Claimant string         `json:"claimant"`
 	Duration time.Duration  `json:"duration"`
-	// At, if set, holds the sets until then instead of for Duration.
-	At time.Time `json:"at"`
+
+	// Task, if set, holds the sets until the named task arrives instead of for
+	// Duration, so that they expire in step with it. The backend reads the
+	// task to find out when that is, so the two come from one clock and are
+	// exactly simultaneous rather than approximately so; it fails the claim if
+	// the task is not there at that version, which means the caller no longer
+	// holds it and the lockstep would be meaningless. See MatchingLeaseOf.
+	//
+	// The queue is part of the reference because a backend needs it to find
+	// the task at all: eqmem keeps tasks under their queue's lock, so without
+	// it there is nothing to look under.
+	TaskToMatch *TaskID `json:"task_to_match,omitempty"`
 
 	leases int // lease arguments given, of which there may be one
 }
@@ -428,17 +438,28 @@ func (o docClaimOption) applyDocClaim(c *DocClaim) {
 // lease argument a claim lasts DefaultClaimDuration.
 func ClaimingSetsFor(d time.Duration) DocClaimArg {
 	return docClaimOption(func(c *DocClaim) {
-		c.Duration, c.At = d, time.Time{}
+		c.Duration, c.TaskToMatch = d, nil
 		c.leases++
 	})
 }
 
-// ClaimingSetsUntil holds a claim's sets until t, which must be in the future:
-// a worker claims its task's sets until its task's arrival time, so that they
-// expire together.
-func ClaimingSetsUntil(t time.Time) DocClaimArg {
+// MatchingLeaseOf holds a claim's sets until the given task arrives, so that
+// they expire in step with it: a worker that dies lets go of its task and its
+// sets at the same moment.
+//
+// It names the task rather than its arrival time. The backend reads the task
+// to find out when that is, so the hold and the task's own expiry come from
+// one clock reading and are exactly simultaneous; passing the instant instead
+// would carry it across however many clocks lie between the holder and the
+// store, and make them only approximately so.
+//
+// The claim fails if the task is not present at this version, which means the
+// caller no longer holds it: locking sets to a task someone else has taken,
+// or that has been handled, is not a hold anyone wants. A version match is
+// proof enough, since claiming a task moves its version.
+func MatchingLeaseOf(task *Task) DocClaimArg {
 	return docClaimOption(func(c *DocClaim) {
-		c.Duration, c.At = 0, t
+		c.Duration, c.TaskToMatch = 0, task.IDVersion()
 		c.leases++
 	})
 }
@@ -496,17 +517,13 @@ func (q *DocClaim) Validate() error {
 	if q.Duration > MaxClaimDuration {
 		return InvalidArgumentf("doc claim duration is %v, limit is %v (a unit error?)", q.Duration, MaxClaimDuration)
 	}
-	if q.Duration > 0 && !q.At.IsZero() {
-		return InvalidArgumentf("doc claim gives both a duration and a time")
+	if q.Duration > 0 && q.TaskToMatch != nil {
+		return InvalidArgumentf("doc claim gives both a duration and a task to match")
+	}
+	if q.TaskToMatch != nil {
+		if q.TaskToMatch.ID == "" || q.TaskToMatch.Queue == "" {
+			return InvalidArgumentf("doc claim matches a task with no ID or no queue: %v", q.TaskToMatch)
+		}
 	}
 	return nil
-}
-
-// Until returns when the claim's sets are held until, for a claim made at
-// now.
-func (q *DocClaim) Until(now time.Time) time.Time {
-	if !q.At.IsZero() {
-		return q.At
-	}
-	return now.Add(q.Duration)
 }

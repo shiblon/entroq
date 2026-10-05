@@ -306,7 +306,27 @@ func (e *EQRedis) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq
 			}
 			lock := func(g docset.Set) docset.Lock { return locks[g] }
 			members := func(g docset.Set) ([]*entroq.Doc, error) { return setMembers(ctx, tx, g) }
-			if claimed, err = docset.ClaimAll(cq, now, lock, members); err != nil {
+			// Read optimistically, and deliberately NOT watched: see
+			// docset.HoldUntil. Watching the task would make this claim abort
+			// and retry whenever the task is touched, including by its own
+			// holder renewing it, and buy nothing for the cost.
+			until := now.Add(cq.Duration)
+			if cq.TaskToMatch != nil {
+				// Read, but deliberately NOT watched: see
+				// docset.TaskNotHeldErrorf. Watching the task would make this
+				// claim abort and retry whenever the task is touched,
+				// including by its own holder renewing it.
+				vals, err := tx.HGetAll(ctx, taskKey(cq.TaskToMatch.ID)).Result()
+				if err != nil || len(vals) == 0 {
+					return docset.TaskNotHeldErrorf(cq.TaskToMatch, "eqredis claim docs")
+				}
+				f, err := parseTaskFields(vals)
+				if err != nil || f.Version != cq.TaskToMatch.Version || f.Queue != cq.TaskToMatch.Queue {
+					return docset.TaskNotHeldErrorf(cq.TaskToMatch, "eqredis claim docs")
+				}
+				until = time.UnixMilli(f.AtMs).UTC()
+			}
+			if claimed, err = docset.ClaimAll(cq, now, until, lock, members); err != nil {
 				return err
 			}
 			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {

@@ -104,6 +104,38 @@ func (m *EQMem) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.D
 			names = append(names, g.Namespace)
 		}
 	}
+
+	// Resolve the hold BEFORE taking any namespace lock, so no lock is held
+	// while another is taken and this adds nothing to eqmem's lock ordering.
+	//
+	// The task is read optimistically and without its queue lock, which
+	// docset.HoldUntil explains is sufficient: a task that changes between
+	// this read and the write below leaves the hold wrong by at most one
+	// lease, which the holder's next renewal corrects. The read is safe
+	// because queues are a sync.Map and a writer replaces a task rather than
+	// mutating it in place, so the task this returns cannot change underneath.
+	now, _ := m.Time(ctx)
+	until := now.Add(cq.Duration)
+	if cq.TaskToMatch != nil {
+		// Read without the queue lock, before any namespace lock is taken, so
+		// this adds nothing to eqmem's lock ordering. The read is safe because
+		// queues are a sync.Map and a writer replaces a task rather than
+		// mutating it in place; see docset.TaskNotHeldErrorf for why reading it
+		// optimistically is enough.
+		tq := func() *taskQueue {
+			defer un(lock(m))
+			return m.queues[cq.TaskToMatch.Queue]
+		}()
+		if tq == nil {
+			return nil, docset.TaskNotHeldErrorf(cq.TaskToMatch, "eqmem claim docs")
+		}
+		t, ok := tq.Get(cq.TaskToMatch.ID)
+		if !ok || t.Version != cq.TaskToMatch.Version {
+			return nil, docset.TaskNotHeldErrorf(cq.TaskToMatch, "eqmem claim docs")
+		}
+		until = t.At
+	}
+
 	nls, unlock := m.lockNamespaces(names)
 	defer unlock()
 	byNS := make(map[string]*docNamespace, len(nls))
@@ -111,10 +143,9 @@ func (m *EQMem) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.D
 		byNS[nl.namespace] = nl.docs
 	}
 
-	now, _ := m.Time(ctx)
-	lock := func(g docset.Set) docset.Lock { return byNS[g.Namespace].Lock(g.Key) }
+	lockOf := func(g docset.Set) docset.Lock { return byNS[g.Namespace].Lock(g.Key) }
 	members := func(g docset.Set) ([]*entroq.Doc, error) { return byNS[g.Namespace].Members(g.Key), nil }
-	claimed, err := docset.ClaimAll(cq, now, lock, members)
+	claimed, err := docset.ClaimAll(cq, now, until, lockOf, members)
 	if err != nil {
 		return nil, fmt.Errorf("eqmem claim docs: %w", err)
 	}

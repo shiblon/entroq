@@ -882,7 +882,11 @@ func acquireDocs(ctx context.Context, eqc *entroq.EntroQ, task *entroq.Task, tr 
 	for _, s := range sets {
 		args = append(args, s)
 	}
-	args = append(args, entroq.ClaimingSetsUntil(task.At))
+	// The sets are held until the task itself arrives, named rather than
+	// timed: the backend reads the task, so the two expire at exactly one
+	// instant instead of approximately, and a task this worker no longer holds
+	// fails the claim rather than locking sets to a lease nobody owns.
+	args = append(args, entroq.MatchingLeaseOf(task))
 	return eqc.ClaimDocs(ctx, args...) // caller inspects DependencyError
 }
 

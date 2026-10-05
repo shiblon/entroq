@@ -28,8 +28,8 @@ func TasksClaimantFilter(ctx context.Context, t *testing.T, client *entroq.Entro
 		return resp.InsertedTasks[0].ID
 	}
 	want := []string{
-		insert(other, 0), // available, last written by someone else
-		insert(me, later),          // held by me
+		insert(other, 0),  // available, last written by someone else
+		insert(me, later), // held by me
 	}
 	insert(other, later) // held by someone else
 	insert("", later)    // not yet available, written by no one
@@ -59,8 +59,8 @@ func QueueStatsCounts(ctx context.Context, t *testing.T, client *entroq.EntroQ, 
 
 	resp, err := client.Modify(ctx,
 		entroq.InsertingInto(queue, entroq.WithArrivalTimeIn(later)), // future: inserted that way
-		entroq.InsertingInto(queue),                                // future by a change
-		entroq.InsertingInto(queue),                                // claimed three times, then held
+		entroq.InsertingInto(queue),                                  // future by a change
+		entroq.InsertingInto(queue),                                  // claimed three times, then held
 	)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)

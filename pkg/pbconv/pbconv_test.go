@@ -168,11 +168,11 @@ func TestModifyArgsFromProtoLeases(t *testing.T) {
 	// still sends, is converted against the server's now, so the assertions
 	// are on how far ahead it lands, not on the instant itself.
 	if len(mod.Arrives) != 1 || mod.Arrives[0].TaskID != (entroq.TaskID{ID: "t", Version: 3, Queue: "q"}) ||
-		(mod.Arrives[0].By - ahead).Abs() > time.Second {
+		(mod.Arrives[0].By-ahead).Abs() > time.Second {
 		t.Errorf("Task lease: got %+v, want ready in %v", mod.Arrives, ahead)
 	}
 	if len(mod.DocArrives) != 1 || mod.DocArrives[0].DocID != *entroq.NewDocSetRef("ns", "k", 5) ||
-		(mod.DocArrives[0].By - ahead).Abs() > time.Second {
+		(mod.DocArrives[0].By-ahead).Abs() > time.Second {
 		t.Errorf("Doc set lease: got %+v, want ready in %v", mod.DocArrives, ahead)
 	}
 }

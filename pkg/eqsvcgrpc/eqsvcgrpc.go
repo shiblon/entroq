@@ -761,44 +761,34 @@ func (s *QSvc) countLeaseClamp(ctx context.Context, kind, reason string) {
 	))
 }
 
-// resolveSetLease decides how long a doc claim holds its sets, given the
-// duration and the absolute time a request may each name. Protocol 2 allows
-// both, which protocol 1 refused; an absolute time wins when one is given, and
-// the duration is what a request falls back on when it names no time.
+// resolveSetLease decides how long a doc claim holds its sets.
 //
-// Either way the answer is clamped, because a lease too short churns storage
-// for every other client and one too long strands what a dead holder was
-// holding. A duration is clamped into the service's bounds whole; a time is
-// clamped into the same ceiling but to two thirds of the floor.
+// A duration is clamped into the service's bounds, because a lease too short
+// churns storage for every other client and one too long strands what a dead
+// holder was holding.
 //
-// A time in the past cannot be honored at all and is refused, because it is
-// always the caller's mistake and never a race.
+// A claim that matches a task passes through, and there is nothing here to
+// clamp: it names the task rather than a length, and the backend reads that
+// task's own arrival. The task's lease was bounded when it was claimed, so the
+// hold inherits those bounds instead of needing its own.
 //
 // A nil result means the request named no lease worth passing on, and
 // entroq.ClaimDocs fills in DefaultClaimDuration.
-func (s *QSvc) resolveSetLease(ctx context.Context, now time.Time, duration time.Duration, at time.Time) (entroq.DocClaimArg, error) {
-	if at.IsZero() {
-		if duration = s.clampLease(ctx, "doc", duration); duration <= 0 {
-			return nil, nil
+func (s *QSvc) resolveSetLease(ctx context.Context, match *pb.TaskID, duration time.Duration) (entroq.DocClaimArg, error) {
+	if match != nil {
+		if match.GetId() == "" || match.GetQueue() == "" {
+			return nil, codeErrorf(codes.InvalidArgument, "claim docs: task_to_match needs an ID and a queue, got %v", match)
 		}
-		return entroq.ClaimingSetsFor(duration), nil
+		return entroq.MatchingLeaseOf(&entroq.Task{
+			ID:      match.GetId(),
+			Version: match.GetVersion(),
+			Queue:   match.GetQueue(),
+		}), nil
 	}
-	if !at.After(now) {
-		return nil, codeErrorf(codes.InvalidArgument, "claim docs: at_ms names %v, which is not in the future", at)
+	if duration = s.clampLease(ctx, "doc", duration); duration <= 0 {
+		return nil, nil
 	}
-	// A named time may reach below the lease floor, down to one renewal's worth
-	// of it, which is what lets a claim expire in step with a task whose lease
-	// is part spent -- the reason to name a time rather than a duration.
-	minHold := entroq.RenewalDurationFor(s.leaseFloor)
-	switch {
-	case at.Before(now.Add(minHold)):
-		s.countLeaseClamp(ctx, "doc", "below_floor")
-		return entroq.ClaimingSetsUntil(now.Add(minHold)), nil
-	case at.After(now.Add(s.leaseCeiling)):
-		s.countLeaseClamp(ctx, "doc", "above_ceiling")
-		return entroq.ClaimingSetsUntil(now.Add(s.leaseCeiling)), nil
-	}
-	return entroq.ClaimingSetsUntil(at), nil
+	return entroq.ClaimingSetsFor(duration), nil
 }
 
 // Modify attempts to make the specified modification from the given
@@ -1138,12 +1128,11 @@ func (s *QSvc) ClaimDocs(ctx context.Context, req *pb.ClaimDocsRequest) (*pb.Cla
 	} else {
 		args = append(args, entroq.ClaimKey(cq.GetNamespace(), cq.GetKey()))
 	}
-	if cq.GetAtMs() != 0 && protocol < 2 {
-		return nil, codeErrorf(codes.InvalidArgument, "claim docs: at_ms is protocol 2, and the request declares protocol %d", protocol)
+	if cq.GetTaskToMatch() != nil && protocol < 2 {
+		return nil, codeErrorf(codes.InvalidArgument, "claim docs: task_to_match is protocol 2, and the request declares protocol %d", protocol)
 	}
-	lease, err := s.resolveSetLease(ctx, entroq.ProcessTime(),
+	lease, err := s.resolveSetLease(ctx, cq.GetTaskToMatch(),
 		time.Duration(cq.GetDurationMs())*time.Millisecond,
-		pbconv.FromMSOrUnset(cq.GetAtMs()),
 	)
 	if err != nil {
 		return nil, err

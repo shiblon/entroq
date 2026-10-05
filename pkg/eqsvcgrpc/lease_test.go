@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
+	pb "github.com/shiblon/entroq/api"
 	"go.opentelemetry.io/otel/metric/noop"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -23,33 +24,27 @@ func leaseSvc(t *testing.T, floor, ceiling time.Duration) *QSvc {
 	return &QSvc{leaseFloor: floor, leaseCeiling: ceiling, leaseClamped: counter}
 }
 
-// until reports the lease arg's resolved hold time, for a claim made at now.
-// It goes through DocClaim so the test reads the value the way a backend will,
-// rather than reaching into the arg.
-func until(arg entroq.DocClaimArg, now time.Time) time.Time {
+// claimOf builds the claim a lease arg describes, the way the backend will see
+// it. A nil arg means the request named no lease, which entroq.ClaimDocs fills
+// in with the default.
+func claimOf(arg entroq.DocClaimArg) *entroq.DocClaim {
 	if arg == nil {
-		return now.Add(entroq.DefaultClaimDuration)
+		return &entroq.DocClaim{Duration: entroq.DefaultClaimDuration}
 	}
-	return entroq.NewDocClaim(arg).Until(now)
+	return entroq.NewDocClaim(arg)
 }
 
-func TestResolveSetLease(t *testing.T) {
+func TestResolveSetLeaseClampsDurations(t *testing.T) {
 	const (
 		floor   = 30 * time.Second
 		ceiling = time.Hour
 	)
-	// The shortest hold a named time can produce. Taken from the function the
-	// service itself uses, so these cases cannot drift from it.
-	minHold := entroq.RenewalDurationFor(floor)
-	now := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
-
 	for _, tc := range []struct {
 		name     string
 		duration time.Duration
-		at       time.Time
-		want     time.Duration // hold time from now; 0 means the default
+		want     time.Duration
 	}{{
-		name: "neither given takes the default",
+		name: "nothing given takes the default",
 		want: entroq.DefaultClaimDuration,
 	}, {
 		name:     "a duration in bounds is honored",
@@ -63,72 +58,67 @@ func TestResolveSetLease(t *testing.T) {
 		name:     "a duration above the ceiling is clamped down",
 		duration: 24 * time.Hour,
 		want:     ceiling,
-	}, {
-		// The whole point of allowing both: hold until the task's arrival.
-		name:     "a time far enough out wins over the duration",
-		duration: time.Minute,
-		at:       now.Add(10 * time.Minute),
-		want:     10 * time.Minute,
-	}, {
-		// A time wins outright: the two are never weighed against each other,
-		// so naming a duration as well changes nothing.
-		name:     "a duration is ignored when a time is given",
-		duration: time.Minute,
-		at:       now.Add(25 * time.Second),
-		want:     25 * time.Second,
-	}, {
-		// Deliberate: a time may reach below the floor, which is what lets a
-		// claim expire in step with a part-spent task.
-		name: "a time above the minimum hold is honored below the lease floor",
-		at:   now.Add(25 * time.Second),
-		want: 25 * time.Second,
-	}, {
-		// The boundary is inclusive: pins the comparison, not just the clamp.
-		name: "a time exactly at the minimum hold is honored",
-		at:   now.Add(minHold),
-		want: minHold,
-	}, {
-		name:     "a time beyond the ceiling is clamped down",
-		duration: time.Minute,
-		at:       now.Add(48 * time.Hour),
-		want:     ceiling,
-	}, {
-		// Clamped up to the minimum hold, not down to the absurd duration beside
-		// it: a time is bounded on its own terms.
-		name:     "a time below the minimum hold is clamped up",
-		duration: time.Millisecond,
-		at:       now.Add(10 * time.Second),
-		want:     minHold,
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := leaseSvc(t, floor, ceiling)
-			arg, err := s.resolveSetLease(context.Background(), now, tc.duration, tc.at)
+			arg, err := s.resolveSetLease(context.Background(), nil, tc.duration)
 			if err != nil {
 				t.Fatalf("resolveSetLease: %v", err)
 			}
-			if got, want := until(arg, now), now.Add(tc.want); !got.Equal(want) {
-				t.Errorf("hold until %v, want %v (%v from now)", got, want, tc.want)
+			cq := claimOf(arg)
+			if cq.TaskToMatch != nil {
+				t.Fatalf("resolved to a match of task %v, want a duration", cq.TaskToMatch)
+			}
+			if cq.Duration != tc.want {
+				t.Errorf("hold for %v, want %v", cq.Duration, tc.want)
 			}
 		})
 	}
 }
 
-func TestResolveSetLeaseRefusesPastTime(t *testing.T) {
-	now := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
+// TestResolveSetLeaseMatchPassesThrough pins that a matched claim reaches the
+// backend untouched, carrying the task and no duration.
+//
+// The service has no length to clamp here: the request names a task, and the
+// hold comes from that task's own arrival, which was bounded when the task was
+// claimed. A duration sent alongside is not consulted, so the case below
+// passes one that would be clamped on its own and expects it ignored.
+func TestResolveSetLeaseMatchPassesThrough(t *testing.T) {
 	s := leaseSvc(t, 30*time.Second, time.Hour)
+	match := &pb.TaskID{Id: "t", Version: 7, Queue: "/q"}
 
-	for _, tc := range []struct {
-		name string
-		at   time.Time
-	}{
-		{name: "in the past", at: now.Add(-time.Minute)},
-		{name: "exactly now", at: now},
+	// A duration alongside it would have been clamped on its own; with a match
+	// present it is not consulted at all.
+	arg, err := s.resolveSetLease(context.Background(), match, time.Millisecond)
+	if err != nil {
+		t.Fatalf("resolveSetLease: %v", err)
+	}
+	cq := entroq.NewDocClaim(arg)
+	if cq.Duration != 0 {
+		t.Errorf("a matched claim carries duration %v, want it to carry the task alone", cq.Duration)
+	}
+	if cq.TaskToMatch == nil {
+		t.Fatal("a matched claim carries no task")
+	}
+	if got, want := *cq.TaskToMatch, (entroq.TaskID{ID: "t", Version: 7, Queue: "/q"}); got != want {
+		t.Errorf("matched task is %v, want %v: the version and queue must survive, since the backend needs both", got, want)
+	}
+}
+
+func TestResolveSetLeaseRefusesUnusableMatch(t *testing.T) {
+	s := leaseSvc(t, 30*time.Second, time.Hour)
+	for name, match := range map[string]*pb.TaskID{
+		"no ID":    {Version: 3, Queue: "/q"},
+		"no queue": {Id: "t", Version: 3},
+		"neither":  {Version: 3},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			// A past time cannot be honored at all, so it is refused rather than
-			// quietly replaced by the duration: it is always a caller's mistake.
-			if _, err := s.resolveSetLease(context.Background(), now, time.Minute, tc.at); err == nil {
-				t.Fatal("resolveSetLease accepted a non-future time, want InvalidArgument")
+		t.Run(name, func(t *testing.T) {
+			// A backend needs the queue to find the task at all, so an
+			// unusable reference is refused here rather than failing later as
+			// a missing task, which would read as a lost claim instead of a
+			// malformed request.
+			if _, err := s.resolveSetLease(context.Background(), match, time.Minute); err == nil {
+				t.Fatal("resolveSetLease accepted an unusable match, want InvalidArgument")
 			} else if code := status.Code(err); code != codes.InvalidArgument {
 				t.Errorf("resolveSetLease code = %v, want %v", code, codes.InvalidArgument)
 			}

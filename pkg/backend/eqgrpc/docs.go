@@ -44,8 +44,8 @@ func (b *backend) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq
 		Claimant:   cq.Claimant,
 		DurationMs: int64(cq.Duration / time.Millisecond),
 	}
-	if !cq.At.IsZero() {
-		claim.AtMs = pbconv.ToMS(cq.At)
+	if cq.TaskToMatch != nil {
+		claim.TaskToMatch = pbconv.TaskIDToProto(cq.TaskToMatch)
 	}
 	for _, s := range cq.Sets {
 		claim.Sets = append(claim.Sets, &pb.DocSetClaim{

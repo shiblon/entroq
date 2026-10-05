@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/backend/internal/docset"
@@ -47,7 +48,22 @@ func (b *EQSQLite) ClaimDocs(ctx context.Context, q *entroq.DocClaim) ([]*entroq
 			}
 			return docs, rows.Err()
 		}
-		claimed, err := docset.ClaimAll(q, now, lock, members)
+		// A claim matching a task reads it in this same transaction, so the
+		// hold and the task's own arrival come from one reading of one clock.
+		until := now.Add(q.Duration)
+		if q.TaskToMatch != nil {
+			// Read in this transaction, so the hold is the task's own stored
+			// arrival. See docset.TaskNotHeldErrorf for why the read need not
+			// hold the task still.
+			var atMs int64
+			if err := tx.QueryRowContext(ctx,
+				`SELECT at_ms FROM tasks WHERE id = ? AND version = ? AND queue = ?`,
+				q.TaskToMatch.ID, q.TaskToMatch.Version, q.TaskToMatch.Queue).Scan(&atMs); err != nil {
+				return nil, docset.TaskNotHeldErrorf(q.TaskToMatch, "sqlite claim docs")
+			}
+			until = time.UnixMilli(atMs).UTC()
+		}
+		claimed, err := docset.ClaimAll(q, now, until, lock, members)
 		if err != nil {
 			return nil, err
 		}

@@ -996,14 +996,14 @@ func (c *EntroQ) Docs(ctx context.Context, rq *DocQuery) ([]*Doc, error) {
 //		entroq.ClaimingSetsFor(time.Minute),
 //	)
 //
-// The claim lasts DefaultClaimDuration unless ClaimingSetsFor or
-// ClaimingSetsUntil says otherwise.
+// The claim lasts DefaultClaimDuration unless ClaimingSetsFor says otherwise,
+// or MatchingLeaseOf ties it to a task's own arrival.
 func (c *EntroQ) ClaimDocs(ctx context.Context, args ...DocClaimArg) ([]*DocSet, error) {
 	cq := NewDocClaim(args...)
 	if cq.Claimant == "" {
 		cq.Claimant = c.ClientID
 	}
-	if cq.Duration == 0 && cq.At.IsZero() {
+	if cq.Duration == 0 && cq.TaskToMatch == nil {
 		cq.Duration = DefaultClaimDuration
 	}
 	if err := cq.Validate(); err != nil {

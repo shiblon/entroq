@@ -279,10 +279,18 @@ message DocClaim {
 
   int64 duration_ms = 4;
 
-  // Protocol 2: hold the sets until this time instead of for duration_ms,
-  // for example to expire in step with a task. It must be in the future; 0
-  // means unset.
-  int64 at_ms = 6;
+  // Protocol 2: hold the sets until this task arrives, instead of for
+  // duration_ms, so they expire in step with it.
+  //
+  // The task is NAMED rather than its arrival time being sent. The server
+  // reads it, so the hold and the task's own expiry come from one clock
+  // reading and are exactly simultaneous; an instant would instead be wrong
+  // by however much the clocks between the holder and the store disagree.
+  //
+  // The claim fails if the task is not present at this version, which means
+  // the caller no longer holds it. The queue is required: a backend needs it
+  // to find the task.
+  TaskID task_to_match = 6;
 
   string claimant = 2;
 

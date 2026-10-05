@@ -1228,28 +1228,62 @@ func DocClaimSets(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 		}
 	})
 
-	t.Run("a claim until a time holds every set until then", func(t *testing.T) {
-		until := time.Now().Add(time.Hour).Truncate(time.Millisecond)
+	t.Run("a claim matching a task holds every set until that task arrives", func(t *testing.T) {
+		queue := path.Join(qPrefix, "doc_claim_lockstep")
+		if _, err := client.Modify(ctx, entroq.InsertingInto(queue)); err != nil {
+			t.Fatalf("Insert task: %v", err)
+		}
+		task, err := client.Claim(ctx, entroq.From(queue), entroq.ClaimFor(time.Hour))
+		if err != nil {
+			t.Fatalf("Claim task: %v", err)
+		}
 		sets, err := client.ClaimDocs(ctx,
-			entroq.ClaimKey(other, "until-1"), entroq.ClaimKey(other, "until-2"),
-			entroq.ClaimingSetsUntil(until),
+			entroq.ClaimKey(other, "lockstep-1"), entroq.ClaimKey(other, "lockstep-2"),
+			entroq.MatchingLeaseOf(task),
 		)
 		if err != nil {
-			t.Fatalf("Claim: %v", err)
+			t.Fatalf("Claim sets: %v", err)
 		}
+		// Exactly equal, not approximately: the backend read the task's own
+		// arrival rather than being handed an instant computed somewhere else,
+		// so the task and its sets go out of hold at one moment.
 		for _, g := range sets {
-			if !g.At.Equal(until) {
-				t.Errorf("Set %s: want it held until %v, got %v", g.Key, until, g.At)
+			if !g.At.Equal(task.At) {
+				t.Errorf("Set %s is held until %v, want the task's own arrival %v", g.Key, g.At, task.At)
 			}
 		}
 	})
 
-	t.Run("a claim must name its sets once, with one lease, not in the past", func(t *testing.T) {
+	t.Run("a claim matching a task nobody holds at that version fails", func(t *testing.T) {
+		queue := path.Join(qPrefix, "doc_claim_lockstep_stale")
+		if _, err := client.Modify(ctx, entroq.InsertingInto(queue)); err != nil {
+			t.Fatalf("Insert task: %v", err)
+		}
+		task, err := client.Claim(ctx, entroq.From(queue), entroq.ClaimFor(time.Hour))
+		if err != nil {
+			t.Fatalf("Claim task: %v", err)
+		}
+		// Move the task on, so the version the claim names is no longer the
+		// stored one. The caller does not hold it any more, and locking sets
+		// to it would hold them for a lease nobody owns.
+		if _, err := client.Modify(ctx, task.Delete()); err != nil {
+			t.Fatalf("Delete task: %v", err)
+		}
+		if _, err := client.ClaimDocs(ctx,
+			entroq.ClaimKey(other, "stale-match"),
+			entroq.MatchingLeaseOf(task),
+		); !entroq.IsDependency(err) {
+			t.Errorf("Claim matching a task that moved: want a dependency error, got %v", err)
+		}
+	})
+
+	t.Run("a claim must name its sets once, with one usable lease", func(t *testing.T) {
 		for name, args := range map[string][]entroq.DocClaimArg{
-			"no sets":     {entroq.ClaimingSetsFor(time.Minute)},
-			"a set twice": {entroq.ClaimKey(other, "twice"), entroq.ClaimKey(other, "twice")},
-			"two leases":  {entroq.ClaimKey(other, "leases"), entroq.ClaimingSetsFor(time.Minute), entroq.ClaimingSetsFor(time.Hour)},
-			"a past time": {entroq.ClaimKey(other, "past"), entroq.ClaimingSetsUntil(time.Now().Add(-time.Minute))},
+			"no sets":                {entroq.ClaimingSetsFor(time.Minute)},
+			"a set twice":            {entroq.ClaimKey(other, "twice"), entroq.ClaimKey(other, "twice")},
+			"two leases":             {entroq.ClaimKey(other, "leases"), entroq.ClaimingSetsFor(time.Minute), entroq.ClaimingSetsFor(time.Hour)},
+			"a duration and a task":  {entroq.ClaimKey(other, "both"), entroq.ClaimingSetsFor(time.Minute), entroq.MatchingLeaseOf(&entroq.Task{ID: "t", Queue: "q"})},
+			"a matched task's queue": {entroq.ClaimKey(other, "noqueue"), entroq.MatchingLeaseOf(&entroq.Task{ID: "t"})},
 		} {
 			if _, err := client.ClaimDocs(ctx, args...); !entroq.IsInvalidArgument(err) {
 				t.Errorf("%s: want an invalid argument, got %v", name, err)

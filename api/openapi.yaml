@@ -494,12 +494,21 @@ components:
                     description: Protocol 2.
                 durationMs:
                     type: string
-                atMs:
-                    type: string
+                taskToMatch:
+                    allOf:
+                        - $ref: '#/components/schemas/TaskID'
                     description: |-
-                        Protocol 2: hold the sets until this time instead of for duration_ms,
-                         for example to expire in step with a task. It must be in the future; 0
-                         means unset.
+                        Protocol 2: hold the sets until this task arrives, instead of for
+                         duration_ms, so they expire in step with it.
+
+                         The task is NAMED rather than its arrival time being sent. The server
+                         reads it, so the hold and the task's own expiry come from one clock
+                         reading and are exactly simultaneous; an instant would instead be wrong
+                         by however much the clocks between the holder and the store disagree.
+
+                         The claim fails if the task is not present at this version, which means
+                         the caller no longer holds it. The queue is required: a backend needs it
+                         to find the task.
                 claimant:
                     type: string
                 namespace:

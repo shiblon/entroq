@@ -140,6 +140,16 @@ func DocSetIDToProto(ns, key string, version int32) *pb.DocID {
 	return &pb.DocID{Namespace: ns, Ref: &pb.DocID_Key{Key: key}, Version: version}
 }
 
+// TaskIDToProto converts an entroq.TaskID to the wire, carrying the queue
+// because it is part of a task's identity and a backend needs it to find the
+// task at all. A nil ID converts to nil, so an absent reference stays absent.
+func TaskIDToProto(tid *entroq.TaskID) *pb.TaskID {
+	if tid == nil {
+		return nil
+	}
+	return &pb.TaskID{Id: tid.ID, Version: tid.Version, Queue: tid.Queue}
+}
+
 // TaskIDFromProto converts a wire TaskID to an entroq.TaskID. It cannot fail, so
 // it returns no error (see the XFromProto family for the ones that can).
 func TaskIDFromProto(tid *pb.TaskID) *entroq.TaskID {
