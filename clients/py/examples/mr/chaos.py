@@ -17,13 +17,21 @@ class ChaosWorker:
     def __init__(self, eq: EntroQBase):
         self.client = eq
 
-    async def work(self, queues: Union[str, List[str]], hold_s: float = 5.0):
+    async def work(self, queues: Union[str, List[str]], hold_s: float = 2.0,
+                   breather_s: float = 5.0):
+        """Claim tasks and drop them, leaving a real window for other workers.
+
+        The lease is only as long as the hold, so it expires as the task is
+        dropped rather than some way after, and the breather is what keeps this
+        from immediately reclaiming what it just let go. Claiming for longer
+        than the hold puts the expiry and the next attempt at the same instant,
+        and a queue down to its last task never gets past this worker.
+        """
         logging.info("Starting ChaosWorker on queues: %s", queues)
         while True:
             try:
-                # Short lease: hold the task briefly, then drop it on the floor.
-                # With no modify, the claim expires and the task comes back.
-                task = await self.client.try_claim(queues, duration_ms=int(hold_s * 2 * 1000))
+                task = await self.client.try_claim(
+                    queues, duration_ms=int(hold_s * 1000))
                 if task is None:
                     await asyncio.sleep(1)
                     continue
@@ -31,7 +39,7 @@ class ChaosWorker:
                                 task.id[:16], task.queue)
                 await asyncio.sleep(hold_s)
                 logging.warning("CHAOS: dropping %s on the floor.", task.id[:16])
-                await asyncio.sleep(1)  # breathe, let real workers in
+                await asyncio.sleep(breather_s)  # let real workers have it
             except Exception as e:
                 print(f"FATAL: ChaosWorker crashed: {e}", file=sys.stderr)
                 logging.exception("ChaosWorker error")
