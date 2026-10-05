@@ -258,9 +258,11 @@ type ListenerCounter interface {
 // task here was just written by one backend transaction, which stamped both
 // fields from its own now, so the two are comparable exactly and the question
 // needs no third reading of any clock: a held task arrives after it was
-// written, an available one does not. Reading an ambient time.Now() here was
-// wrong for eqpg, whose Modified and At come from Postgres while this process
-// has a clock of its own.
+// written, an available one does not.
+//
+// Do not reach for a clock here. These stamps may come from a store with its
+// own, as eqpg's do from Postgres, and a reading taken in this process is not
+// comparable to them.
 func NotifyModified(n Notifier, inserted, changed []*Task) {
 	qs := make(map[string]string)
 	for _, t := range inserted {

@@ -90,9 +90,9 @@ func TestDocIDIsSetRef(t *testing.T) {
 }
 
 // TestWithModificationCopiesEveryList checks that WithModification carries
-// every operation list of a Modification, so one added later cannot be
-// dropped without notice: a modification of only arrivals once became an
-// empty one.
+// every operation list of a Modification. It walks the lists reflectively, so
+// a list added to Modification later and not carried fails here rather than
+// silently producing an emptier modification than the caller built.
 func TestWithModificationCopiesEveryList(t *testing.T) {
 	src := new(Modification)
 	v := reflect.ValueOf(src).Elem()

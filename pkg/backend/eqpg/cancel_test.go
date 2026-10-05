@@ -17,11 +17,10 @@ import (
 // so interrupted wraps the context's reason around it: without that, a
 // cancellation would read to the caller as a database failure.
 //
-// This replaces an integration test that got a ten-second query into the
-// modification's transaction through eqpg.RunningInTx, which is gone. The
-// claim was never about the query -- interrupted wraps whatever error it is
-// handed once the context is done -- so the mapping is the behavior, and it is
-// worth asserting directly rather than through a pg_sleep and a timer.
+// The behavior under test is the mapping, not a query: interrupted wraps
+// whatever error it is handed once the context is done. So this asserts it
+// directly, with no database, rather than arranging a slow query and a timer
+// to provoke it.
 //
 // IsCanceled and IsTimeout are deliberately separate: a caller that gave up
 // on a deadline is distinguishable from one that was told to stop. The
