@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/eqsvcgrpc"
 	"github.com/shiblon/entroq/pkg/version"
 	"github.com/spf13/pflag"
 	"go.opentelemetry.io/otel/metric"
@@ -36,6 +37,24 @@ func TestBindFlagsDefaults(t *testing.T) {
 	}
 	if cfg.MeshPolicyFile != "" || cfg.MeshUpdateSubject != "" {
 		t.Fatalf("unexpected mesh authorization defaults: %+v", cfg)
+	}
+	// The bounds default to the service's own, so binding the flags does not
+	// change how a claim's lease is clamped.
+	if cfg.ClaimLeaseFloor != eqsvcgrpc.DefaultClaimLeaseFloor ||
+		cfg.ClaimLeaseCeiling != eqsvcgrpc.DefaultClaimLeaseCeiling {
+		t.Fatalf("unexpected claim lease bound defaults: %+v", cfg)
+	}
+}
+
+func TestClaimLeaseBoundsAreConfigurable(t *testing.T) {
+	var cfg Config
+	flags := pflag.NewFlagSet("serve", pflag.ContinueOnError)
+	cfg.BindFlags(flags)
+	if err := flags.Parse([]string{"--claim_lease_floor=1s", "--claim_lease_ceiling=2m"}); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ClaimLeaseFloor != time.Second || cfg.ClaimLeaseCeiling != 2*time.Minute {
+		t.Fatalf("claim lease bounds = %v/%v, want 1s/2m", cfg.ClaimLeaseFloor, cfg.ClaimLeaseCeiling)
 	}
 }
 

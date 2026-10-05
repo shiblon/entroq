@@ -60,6 +60,9 @@ type Config struct {
 	MeshUpdateSubject string
 
 	MetricInterval time.Duration
+
+	ClaimLeaseFloor   time.Duration
+	ClaimLeaseCeiling time.Duration
 }
 
 // BindFlags adds the common service flags to f.
@@ -84,6 +87,14 @@ func (c *Config) BindFlags(f *pflag.FlagSet) {
 	f.StringVar(&c.OPAPath, "opa_path", "", fmt.Sprintf("OPA API path. Default: %s.", opahttp.DefaultAPIPath))
 	f.StringVar(&c.MeshPolicyFile, "mesh_policy_file", "", "Initial mesh policy document; typically a projected ConfigMap file.")
 	f.StringVar(&c.MeshUpdateSubject, "mesh_update_subject", "", "Authenticated subject permitted to replace native mesh policy.")
+	f.DurationVar(&c.ClaimLeaseFloor, "claim_lease_floor", eqsvcgrpc.DefaultClaimLeaseFloor,
+		"Shortest lease a claim may hold what it took; a shorter request is clamped up to this. "+
+			"The server sets lease length because a lease too short to survive its own first renewal "+
+			"churns storage for every client, not just the one that asked.")
+	f.DurationVar(&c.ClaimLeaseCeiling, "claim_lease_ceiling", eqsvcgrpc.DefaultClaimLeaseCeiling,
+		"Longest lease a claim's FIRST hold may take; a longer request is clamped down to this. "+
+			"Renewal is a lease change rather than a claim and is not clamped, so a holder that keeps "+
+			"renewing is not bounded by it.")
 }
 
 // OpenFunc constructs a backend opener after telemetry has been initialized.
@@ -112,6 +123,11 @@ func Run(ctx context.Context, cfg Config, open OpenFunc, backendDescription stri
 	svcOpts := append(security.serviceOptions, eqsvcgrpc.WithMeterProvider(mp))
 	if cfg.MetricInterval > 0 {
 		svcOpts = append(svcOpts, eqsvcgrpc.WithMetricInterval(cfg.MetricInterval))
+	}
+	// Zero means the flags were never bound -- Run is called directly in
+	// tests -- so leave the service's own defaults in place.
+	if cfg.ClaimLeaseFloor > 0 || cfg.ClaimLeaseCeiling > 0 {
+		svcOpts = append(svcOpts, eqsvcgrpc.WithClaimLeaseBounds(cfg.ClaimLeaseFloor, cfg.ClaimLeaseCeiling))
 	}
 
 	svc, err := eqsvcgrpc.New(ctx, open(mp), svcOpts...)
