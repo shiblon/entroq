@@ -1,8 +1,13 @@
 // Package docset holds the claim and version rules for doc sets, which
 // every backend applies the same way.
 //
-// A doc set is the set of docs sharing a primary key in a namespace. It
-// behaves like a task whose members share one lifecycle: the set has a
+// A doc set is the docs sharing a primary key in a namespace, keyed within it
+// by secondary key: a set is a MAP from secondary key to doc, so no two of its
+// docs share a secondary key. An empty secondary key is a value like any other,
+// so a set holds at most one doc that has none -- which is the ordinary shape
+// for a set holding a single document.
+//
+// A set behaves like a task whose members share one lifecycle: the set has a
 // single lock carrying the only version, claimant, and arrival time its
 // members have. Claiming, renewing, and changing or deleting a member move
 // that version, and while one claimant holds the set nobody else may write
@@ -258,7 +263,7 @@ type Plan struct {
 // carries a future arrival time, the set ends held by mod.Claimant until the
 // latest one; otherwise the write releases it, as committing a task releases
 // its claim.
-func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string) *entroq.Doc, lock func(Set) Lock) Plan {
+func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string) *entroq.Doc, occupant func(g Set, secondary string) *entroq.Doc, lock func(Set) Lock) Plan {
 	depErr := new(entroq.DependencyError)
 	held := make(map[Set]time.Time) // written sets, with the latest future arrival
 	added := make(map[Set]int)      // docs inserted less docs deleted, per set
@@ -303,6 +308,12 @@ func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string
 		return g, lock(g).Version == version
 	}
 
+	// An insert collides on either identity a doc has: its own ID, and the place
+	// it takes in its set. Both report the same way, as a failed insert.
+	//
+	// The second is what makes a set a map. A set with no docs cannot have an
+	// occupant, so the first write to a key needs no lookup -- the common case
+	// of creating a set costs nothing.
 	for _, ins := range mod.DocInserts {
 		id := entroq.NewDocID(ins.Namespace, ins.ID, 0)
 		if ins.ID != "" && member(ins.Namespace, ins.ID) != nil {
@@ -310,6 +321,15 @@ func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string
 			continue
 		}
 		g := Set{Namespace: ins.Namespace, Key: ins.Key}
+		if lock(g).NumDocs > 0 {
+			if held := occupant(g, ins.SecondaryKey); held != nil {
+				// Name the doc already there: a caller that collided wants to
+				// know what it collided WITH.
+				depErr.DocInserts = append(depErr.DocInserts,
+					entroq.NewDocID(held.Namespace, held.ID, lock(g).Version))
+				continue
+			}
+		}
 		if claimed(g) {
 			id.Version = lock(g).Version
 			depErr.DocClaims = append(depErr.DocClaims, id)

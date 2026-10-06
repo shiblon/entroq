@@ -47,7 +47,14 @@ func modifyTx(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (*entro
 	if err != nil {
 		return nil, err
 	}
+	occupants, err := loadDocOccupants(ctx, tx, mod)
+	if err != nil {
+		return nil, err
+	}
 	docPlan := docset.Evaluate(mod, now, member,
+		func(g docset.Set, secondary string) *entroq.Doc {
+			return occupants[occupantKey(g.Namespace, g.Key, secondary)]
+		},
 		func(g docset.Set) docset.Lock { return lockOf(locks, g) },
 	)
 	if depErr := checkDependencies(mod, foundTasks, now).Merge(docPlan.Err); depErr != nil {
@@ -451,6 +458,50 @@ func loadDocLocks(ctx context.Context, q queryer, sets []docset.Set) (map[docset
 		return rows.Err()
 	})
 	return locks, err
+}
+
+// occupantKey indexes a doc by the place it holds in its set.
+func occupantKey(ns, key, secondary string) string {
+	return ns + "\x00" + key + "\x00" + secondary
+}
+
+// loadDocOccupants reads the docs already holding the secondary keys mod's
+// inserts want, batched the way loadDependencies reads the docs mod names by ID.
+// A set is a map from secondary key to doc, so an insert onto an occupied
+// secondary key is a collision; see docset.Evaluate.
+//
+// Only inserts need this: keys are immutable after creation, so nothing else can
+// move a doc onto an occupied key. Writers to one set are serialized by the
+// set's own lock, so a check here cannot be overtaken.
+func loadDocOccupants(ctx context.Context, q queryer, mod *entroq.Modification) (map[string]*entroq.Doc, error) {
+	occupants := make(map[string]*entroq.Doc, len(mod.DocInserts))
+	if len(mod.DocInserts) == 0 {
+		return occupants, nil
+	}
+	inserts := mod.DocInserts
+	err := batchRanges(len(inserts), 3, func(start, end int) error {
+		args := make([]any, 0, 3*(end-start))
+		for _, ins := range inserts[start:end] {
+			args = append(args, ins.Namespace, ins.Key, ins.SecondaryKey)
+		}
+		query := "SELECT " + docColumns + " FROM " + docsWithLocks +
+			" WHERE (d.namespace, d.key_primary, d.key_secondary) IN (VALUES " +
+			rowPlaceholders(end-start, 3) + ")"
+		rows, err := q.QueryContext(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("load doc occupants: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			doc, err := scanDoc(rows)
+			if err != nil {
+				return fmt.Errorf("scan doc occupant: %w", err)
+			}
+			occupants[occupantKey(doc.Namespace, doc.Key, doc.SecondaryKey)] = doc
+		}
+		return rows.Err()
+	})
+	return occupants, err
 }
 
 // lockOf returns g's lock from locks, or docset.Absent.

@@ -135,6 +135,24 @@ func (s *docNamespace) DeleteLock(key string) {
 
 // Members returns the docs of the set with the given primary key, in
 // secondary key order.
+// Occupant returns the doc holding the given secondary key in the set with this
+// primary key, or nil. A set is a map from secondary key to doc, so there is at
+// most one.
+func (s *docNamespace) Occupant(key, secondary string) *entroq.Doc {
+	var found *entroq.Doc
+	s.AscendFrom(docKeyEntry{Key: key}, func(d *entroq.Doc) bool {
+		if d.Key != key {
+			return false
+		}
+		if d.SecondaryKey == secondary {
+			found = d
+			return false
+		}
+		return true
+	})
+	return found
+}
+
 func (s *docNamespace) Members(key string) []*entroq.Doc {
 	var docs []*entroq.Doc
 	s.AscendFrom(docKeyEntry{Key: key}, func(d *entroq.Doc) bool {

@@ -59,6 +59,12 @@ class FakeClient(EntroQBase):
         self._docs = list(docs)
         self.modify_calls: list[Modification] = []
         self.modify_raises: Exception | None = None
+        # A set is a map from secondary key to doc, so a fixture that seeds two
+        # docs at one place describes a set the service would refuse. Caught
+        # here so a unit test cannot pass on state that cannot exist.
+        places = [(d.namespace, d.key, d.secondary_key) for d in self._docs]
+        if len(set(places)) != len(places):
+            raise ValueError(f"seeded docs share a place in their set: {places}")
         # A doc set holds its own lock, versioned apart from its members.
         self._set_versions: dict[tuple[str, str], int] = {}
         self.claim_set_calls: list[tuple[list[DocClaim], Task | None]] = []

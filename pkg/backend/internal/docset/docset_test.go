@@ -16,6 +16,18 @@ type store struct {
 }
 
 func (s store) member(ns, id string) *entroq.Doc { return s.members[entroq.DocKey(ns, id)] }
+
+// occupant finds the member holding a secondary key in a set, as a backend's
+// own lookup does.
+func (s store) occupant(g Set, secondary string) *entroq.Doc {
+	for _, d := range s.members {
+		if d.Namespace == g.Namespace && d.Key == g.Key && d.SecondaryKey == secondary {
+			return d
+		}
+	}
+	return nil
+}
+
 func (s store) lock(g Set) Lock {
 	if l, ok := s.locks[g]; ok {
 		return l
@@ -24,16 +36,18 @@ func (s store) lock(g Set) Lock {
 }
 
 func (s store) evaluate(claimant string, args ...entroq.ModifyArg) Plan {
-	return Evaluate(entroq.NewModification(claimant, args...), now, s.member, s.lock)
+	return Evaluate(entroq.NewModification(claimant, args...), now, s.member, s.occupant, s.lock)
 }
 
-// newStore holds one stored set, ns/k, with members a and b at version 5.
+// newStore holds one stored set, ns/k, with members a and b at version 5. A set
+// is a map from secondary key to doc, so its members hold distinct secondary
+// keys -- here their own IDs -- and the empty secondary key is free.
 func newStore(l Lock) store {
 	l.Stored, l.Version, l.NumDocs = true, 5, 2
 	return store{
 		members: map[string]*entroq.Doc{
-			entroq.DocKey("ns", "a"): {Namespace: "ns", ID: "a", Key: "k"},
-			entroq.DocKey("ns", "b"): {Namespace: "ns", ID: "b", Key: "k"},
+			entroq.DocKey("ns", "a"): {Namespace: "ns", ID: "a", Key: "k", SecondaryKey: "a"},
+			entroq.DocKey("ns", "b"): {Namespace: "ns", ID: "b", Key: "k", SecondaryKey: "b"},
 		},
 		locks: map[Set]Lock{{Namespace: "ns", Key: "k"}: l},
 	}

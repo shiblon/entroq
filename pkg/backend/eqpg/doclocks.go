@@ -67,6 +67,50 @@ func lockMembers(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (map
 	return members, nil
 }
 
+// occupantKey indexes a doc by the place it holds in its set.
+func occupantKey(ns, key, secondary string) string {
+	return ns + "\x00" + key + "\x00" + secondary
+}
+
+// lockOccupants reads the docs already holding the secondary keys mod's inserts
+// want, batched the way lockMembers reads the docs mod names by ID. A set is a
+// map from secondary key to doc, so an insert onto an occupied secondary key is
+// a collision; see docset.Evaluate.
+//
+// Only inserts need this: keys are immutable after creation, so nothing else can
+// move a doc onto an occupied key. The rows are locked FOR UPDATE because a
+// concurrent insert of the same pair would otherwise slip in behind the check --
+// though in practice the set's own lock (lockSets, exclusive for a written set)
+// already serializes writers to one set.
+func lockOccupants(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (map[string]*entroq.Doc, error) {
+	var ns, keys, secondaries []string
+	for _, d := range mod.DocInserts {
+		ns = append(ns, d.Namespace)
+		keys = append(keys, d.Key)
+		secondaries = append(secondaries, d.SecondaryKey)
+	}
+	occupants := make(map[string]*entroq.Doc, len(ns))
+	if len(ns) == 0 {
+		return occupants, nil
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT `+docColumns+` FROM `+docsWithLocks+`
+		WHERE (d.namespace, d.key_primary, d.key_secondary) IN (SELECT * FROM unnest($1::text[], $2::text[], $3::text[]))
+		ORDER BY d.namespace, d.key_primary, d.key_secondary
+		FOR UPDATE OF d`, pq.Array(ns), pq.Array(keys), pq.Array(secondaries))
+	if err != nil {
+		return nil, fmt.Errorf("lock doc occupants: %w", err)
+	}
+	defer rows.Close()
+	docs, err := scanDocRows(rows)
+	if err != nil {
+		return nil, err
+	}
+	for _, d := range docs {
+		occupants[occupantKey(d.Namespace, d.Key, d.SecondaryKey)] = d
+	}
+	return occupants, nil
+}
+
 // lockSets locks the lock rows of sets and returns them with the
 // database's time. The lock row is the set's mutex for the length of the
 // transaction, apart from any claim on it: sets in exclusive, which the
@@ -203,12 +247,19 @@ func modifyDocs(ctx context.Context, tx *sql.Tx, mod *entroq.Modification, resp 
 	if err != nil {
 		return err
 	}
+	occupants, err := lockOccupants(ctx, tx, mod)
+	if err != nil {
+		return err
+	}
 	member := func(ns, id string) *entroq.Doc { return stored[entroq.DocKey(ns, id)] }
+	occupant := func(g docset.Set, secondary string) *entroq.Doc {
+		return occupants[occupantKey(g.Namespace, g.Key, secondary)]
+	}
 	locks, now, err := lockSets(ctx, tx, docset.Sets(mod, member), docset.Exclusive(mod, member))
 	if err != nil {
 		return err
 	}
-	plan := docset.Evaluate(mod, now, member, func(g docset.Set) docset.Lock {
+	plan := docset.Evaluate(mod, now, member, occupant, func(g docset.Set) docset.Lock {
 		if l, ok := locks[g]; ok {
 			return l
 		}

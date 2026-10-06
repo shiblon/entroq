@@ -46,6 +46,15 @@ func setMembersRange(key string) (min, max string) {
 	return "[" + key + docIndexSep, "(" + key + "\x01"
 }
 
+// occupantRange bounds the single index entry a doc would have at this place in
+// its set. Index members are "{primary}{sep}{secondary}{sep}{id}", so bounding
+// the complete "{primary}{sep}{secondary}{sep}" prefix matches every id at that
+// pair -- of which a map allows at most one.
+func occupantRange(key, secondary string) (min, max string) {
+	prefix := key + docIndexSep + secondary + docIndexSep
+	return "[" + prefix, "(" + key + docIndexSep + secondary + "\x01"
+}
+
 func parseLock(vals map[string]string) (docset.Lock, error) {
 	if len(vals) == 0 {
 		return docset.Absent, nil
@@ -106,6 +115,70 @@ func writeLock(ctx context.Context, pipe redis.Pipeliner, g docset.Set, l docset
 	} else {
 		pipe.ZRem(ctx, heldGroupsKey(g.Namespace), g.Key)
 	}
+}
+
+// occupantKey indexes a doc by the place it holds in its set.
+func occupantKey(ns, key, secondary string) string {
+	return ns + docIndexSep + key + docIndexSep + secondary
+}
+
+// readOccupants reads the docs already holding the secondary keys mod's inserts
+// want. A set is a map from secondary key to doc, so an insert onto an occupied
+// secondary key is a collision; see docset.Evaluate.
+//
+// Only inserts need this: keys are immutable after creation, so nothing else can
+// move a doc onto an occupied key. One ZRANGEBYLEX per insert finds the single
+// index entry that pair can have, and the ids found are read in one pipeline.
+func readOccupants(ctx context.Context, c redis.Cmdable, mod *entroq.Modification) (map[string]*entroq.Doc, error) {
+	occupants := make(map[string]*entroq.Doc, len(mod.DocInserts))
+	if len(mod.DocInserts) == 0 {
+		return occupants, nil
+	}
+	pipe := c.Pipeline()
+	ranges := make([]*redis.StringSliceCmd, len(mod.DocInserts))
+	for i, ins := range mod.DocInserts {
+		min, max := occupantRange(ins.Key, ins.SecondaryKey)
+		ranges[i] = pipe.ZRangeArgs(ctx, redis.ZRangeArgs{
+			Key: docNSIndexKey(ins.Namespace), Start: min, Stop: max, ByLex: true})
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("find doc occupants: %w", err)
+	}
+	type want struct{ ns, id string }
+	var wants []want
+	for i, cmd := range ranges {
+		members, err := cmd.Result()
+		if err != nil && !errors.Is(err, redis.Nil) {
+			return nil, fmt.Errorf("find doc occupants: %w", err)
+		}
+		for _, m := range members {
+			_, _, id := parseDocIndexMember(m)
+			wants = append(wants, want{mod.DocInserts[i].Namespace, id})
+		}
+	}
+	if len(wants) == 0 {
+		return occupants, nil
+	}
+	read := c.Pipeline()
+	cmds := make([]*redis.MapStringStringCmd, len(wants))
+	for i, w := range wants {
+		cmds[i] = read.HGetAll(ctx, docKey(w.ns, w.id))
+	}
+	if _, err := read.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("read doc occupants: %w", err)
+	}
+	for _, cmd := range cmds {
+		vals, err := cmd.Result()
+		if err != nil || len(vals) == 0 {
+			continue
+		}
+		f, err := parseDocFields(vals)
+		if err != nil {
+			return nil, fmt.Errorf("parse doc occupant: %w", err)
+		}
+		occupants[occupantKey(f.Namespace, f.KeyPrimary, f.KeySecondary)] = f.toDoc()
+	}
+	return occupants, nil
 }
 
 // setMembers reads the docs of the set g.

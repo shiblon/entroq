@@ -584,6 +584,10 @@ func TestEQMemWorkerHoldsEmptyGroup(t *testing.T) {
 	RunQTest(t, eqtest.WorkerHoldsEmptyGroup)
 }
 
+func TestEQMemDocSecondaryKeysAreUnique(t *testing.T) {
+	RunQTest(t, eqtest.DocSecondaryKeysAreUnique)
+}
+
 func TestEQMemDocSetDepends(t *testing.T) {
 	RunQTest(t, eqtest.DocSetDepends)
 }

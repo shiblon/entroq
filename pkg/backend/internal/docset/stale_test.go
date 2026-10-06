@@ -32,7 +32,7 @@ func TestStaleRenewalStillHolds(t *testing.T) {
 		t.Errorf("arrival in flight is %v, want %v unchanged", got, lease)
 	}
 
-	p := Evaluate(mod, late, s.member, s.lock)
+	p := Evaluate(mod, late, s.member, s.occupant, s.lock)
 	if p.Err != nil {
 		t.Fatalf("Evaluate: %v", p.Err)
 	}

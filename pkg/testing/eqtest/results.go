@@ -161,8 +161,13 @@ func QueueStatsMatching(ctx context.Context, t *testing.T, client *entroq.EntroQ
 func DocsOrderAndLimits(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	ns := path.Join(qPrefix, "docs_order")
 	var args []entroq.ModifyArg
+	// Listing orders by (primary key, secondary key). A set holds one doc per
+	// secondary key, so that pair is already a total order within a namespace
+	// and no tiebreak is reachable -- the ids here are deliberately in a
+	// different order from the keys, so an implementation that sorted by id
+	// would fail.
 	for _, d := range []struct{ id, key, secondary string }{
-		{"c", "k", "s"}, {"a", "k", "s"}, {"b", "k", "s"}, {"d", "k", "r"}, {"e", "l", ""},
+		{"c", "k", "u"}, {"a", "k", "s"}, {"b", "k", "t"}, {"d", "k", "r"}, {"e", "l", ""},
 	} {
 		args = append(args, entroq.PuttingDocInto(ns, entroq.WithIDKeys(d.id, d.key, d.secondary)))
 	}

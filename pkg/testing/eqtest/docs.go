@@ -261,10 +261,17 @@ func DocConcurrencyStress(ctx context.Context, t *testing.T, client *entroq.Entr
 	)
 
 	// Setup: Create docs with an initial counter value of 0.
+	//
+	// All of them share ONE set, which is the point: a set has a single lock and
+	// a single version, so every writer contends with every other and each
+	// read-modify-write races the rest. They take distinct secondary keys
+	// because a set is a map -- what makes them many docs in one set rather
+	// than one doc written repeatedly.
 	var setupArgs []entroq.ModifyArg
 	for i := range numDocs {
+		id := fmt.Sprintf("doc-%d", i)
 		setupArgs = append(setupArgs, entroq.PuttingDocInto(ns,
-			entroq.WithIDKeys(fmt.Sprintf("doc-%d", i), "", ""),
+			entroq.WithIDKeys(id, "counters", id),
 			entroq.WithContent(0),
 		))
 	}
@@ -369,7 +376,9 @@ func MixedAtomicStress(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		if _, err := client.Modify(ctx,
 			entroq.InsertingInto(q, entroq.WithID(id), entroq.WithValue(0)),
 			entroq.PuttingDocInto(ns,
-				entroq.WithIDKeys(id, "", ""),
+				// One set, so every writer contends; distinct secondary keys,
+				// because a set holds one doc per secondary key.
+				entroq.WithIDKeys(id, "counters", id),
 				entroq.WithContent(0),
 			),
 		); err != nil {
@@ -1377,6 +1386,86 @@ func DocSetDepends(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPr
 			entroq.PuttingDocInto(ns, entroq.WithKeys("config", "third"), entroq.WithContent("v3")),
 			entroq.ModifyAs("intruder")); err != nil {
 			t.Errorf("Intruder write after a depend: want it allowed, got %v", err)
+		}
+	})
+}
+
+// DocSecondaryKeysAreUnique covers the rule that makes a doc set a MAP: within
+// one set, no two docs share a secondary key.
+//
+// That is what lets a key pair address a doc. Without it, (primary, secondary)
+// names an unknown number of docs and only an opaque ID can name one, so the
+// common case -- "give me the one doc" -- costs more than the rare one.
+//
+// An empty secondary key is a value like any other, so a set holds at most one
+// doc without one. That is the ordinary shape for a set holding a single
+// document, and it still works; what it cannot do is hold two.
+func DocSecondaryKeysAreUnique(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	ns := path.Join(qPrefix, "doc_unique_secondary")
+
+	t.Run("a set holds one doc with no secondary key", func(t *testing.T) {
+		if _, err := client.Modify(ctx, entroq.PuttingDocInto(ns,
+			entroq.WithKeys("solo", ""), entroq.WithContent("first"))); err != nil {
+			t.Fatalf("Insert the only doc: %v", err)
+		}
+		_, err := client.Modify(ctx, entroq.PuttingDocInto(ns,
+			entroq.WithKeys("solo", ""), entroq.WithContent("second")))
+		if !entroq.IsDependency(err) {
+			t.Errorf("Second doc with no secondary key: want a collision, got %v", err)
+		}
+	})
+
+	t.Run("distinct secondary keys share a set", func(t *testing.T) {
+		if _, err := client.Modify(ctx,
+			entroq.PuttingDocInto(ns, entroq.WithKeys("many", "a"), entroq.WithContent(1)),
+			entroq.PuttingDocInto(ns, entroq.WithKeys("many", "b"), entroq.WithContent(2)),
+		); err != nil {
+			t.Fatalf("Insert two members with distinct secondary keys: %v", err)
+		}
+		// The empty secondary key is free: it is a value, not an absence.
+		if _, err := client.Modify(ctx, entroq.PuttingDocInto(ns,
+			entroq.WithKeys("many", ""), entroq.WithContent(3))); err != nil {
+			t.Errorf("Insert a member with no secondary key beside named ones: %v", err)
+		}
+	})
+
+	t.Run("a collision in one modification is refused", func(t *testing.T) {
+		_, err := client.Modify(ctx,
+			entroq.PuttingDocInto(ns, entroq.WithKeys("together", "dup"), entroq.WithContent(1)),
+			entroq.PuttingDocInto(ns, entroq.WithKeys("together", "dup"), entroq.WithContent(2)),
+		)
+		if err == nil {
+			t.Error("Two inserts at one secondary key in one modification: want a refusal")
+		}
+		if docs, derr := client.Docs(ctx, &entroq.DocQuery{Namespace: ns, KeyExact: "together"}); derr != nil {
+			t.Fatalf("Read: %v", derr)
+		} else if len(docs) != 0 {
+			t.Errorf("A refused modification left %d docs behind, want none", len(docs))
+		}
+	})
+
+	t.Run("the same secondary key in another set is fine", func(t *testing.T) {
+		// Uniqueness is within a set, not across a namespace.
+		if _, err := client.Modify(ctx,
+			entroq.PuttingDocInto(ns, entroq.WithKeys("left", "shared"), entroq.WithContent(1)),
+			entroq.PuttingDocInto(ns, entroq.WithKeys("right", "shared"), entroq.WithContent(2)),
+		); err != nil {
+			t.Errorf("One secondary key in two different sets: %v", err)
+		}
+	})
+
+	t.Run("a deleted place can be filled again", func(t *testing.T) {
+		res, err := client.Modify(ctx, entroq.PuttingDocInto(ns,
+			entroq.WithKeys("reuse", "slot"), entroq.WithContent("first")))
+		if err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+		if _, err := client.Modify(ctx, res.InsertedDocs[0].Delete()); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		if _, err := client.Modify(ctx, entroq.PuttingDocInto(ns,
+			entroq.WithKeys("reuse", "slot"), entroq.WithContent("second"))); err != nil {
+			t.Errorf("Insert into a place its occupant left: %v", err)
 		}
 	})
 }

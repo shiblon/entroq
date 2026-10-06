@@ -301,7 +301,14 @@ func (e *EQRedis) modifyOnce(ctx context.Context, mod *entroq.Modification) (*en
 		if err != nil {
 			return err
 		}
+		occupants, err := readOccupants(ctx, tx, mod)
+		if err != nil {
+			return err
+		}
 		docPlan := docset.Evaluate(mod, now, member,
+			func(g docset.Set, secondary string) *entroq.Doc {
+				return occupants[occupantKey(g.Namespace, g.Key, secondary)]
+			},
 			func(g docset.Set) docset.Lock { return locks[g] },
 		)
 		if merged := depErr.Merge(docPlan.Err); merged != nil {

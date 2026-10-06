@@ -834,6 +834,9 @@ func (m *EQMem) modifyImpl(ctx context.Context, mod *entroq.Modification, replay
 	if !replay {
 		docPlan = docset.Evaluate(mod, now,
 			func(ns, id string) *entroq.Doc { return foundDocs[entroq.DocKey(ns, id)] },
+			func(g docset.Set, secondary string) *entroq.Doc {
+				return byNS[g.Namespace].docs.Occupant(g.Key, secondary)
+			},
 			func(g docset.Set) docset.Lock { return byNS[g.Namespace].docs.Lock(g.Key) },
 		)
 		if docPlan.Err != nil {

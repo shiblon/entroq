@@ -162,6 +162,13 @@ func docDepend(d *pb.DocID, protocol int32) (*entroq.DocID, error) {
 		if protocol < 2 {
 			return nil, invalidf("doc depend naming a set by key is protocol 2, and the request declares protocol %d", protocol)
 		}
+		// A key names the whole SET, never one doc in it: secondary keys are
+		// not unique within a set, so no (key, secondary key) pair identifies a
+		// single doc. Carrying one would suggest otherwise, so it is refused
+		// rather than dropped -- name a doc by its ID.
+		if sk := d.GetSecondaryKey(); sk != "" {
+			return nil, invalidf("doc depend on set %q names secondary key %q: a key names the whole set, so name a doc by its ID instead", d.GetKey(), sk)
+		}
 		return entroq.NewDocSetRef(d.GetNamespace(), d.GetKey(), d.GetVersion()), nil
 	default:
 		return nil, invalidf("doc depend names no doc")

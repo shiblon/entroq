@@ -229,6 +229,10 @@ func TestWorkerHoldsEmptyGroup(t *testing.T) {
 	RunQTest(t, eqtest.WorkerHoldsEmptyGroup)
 }
 
+func TestDocSecondaryKeysAreUnique(t *testing.T) {
+	RunQTest(t, eqtest.DocSecondaryKeysAreUnique)
+}
+
 func TestDocSetDepends(t *testing.T) {
 	RunQTest(t, eqtest.DocSetDepends)
 }

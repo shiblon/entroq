@@ -87,6 +87,9 @@ func Modification(mod *entroq.Modification) error {
 	if err := docRefs(mod); err != nil {
 		return err
 	}
+	if err := docPlaces(mod); err != nil {
+		return err
+	}
 	if _, _, err := mod.AllDependencies(); err != nil {
 		return err
 	}
@@ -122,6 +125,31 @@ func docRefs(mod *entroq.Modification) error {
 		if err := both("doc depend", d); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// docPlaces checks that no two inserts take the same place in a set. A set is a
+// map from secondary key to doc, so two inserts naming one secondary key in one
+// set cannot both be right.
+//
+// This is a caller mistake rather than a condition of the stored world, so it
+// reports as an invalid argument, the way an ID appearing in two operations does
+// (see Modification.AllDependencies). The stored case -- a place another doc
+// already holds -- is a collision and belongs to docset.Evaluate, which can see
+// what is there. Neither check can do the other's job: two inserts in one
+// modification are not stored yet, so no lookup finds them.
+func docPlaces(mod *entroq.Modification) error {
+	type place struct{ ns, key, secondary string }
+	seen := make(map[place]bool, len(mod.DocInserts))
+	for _, d := range mod.DocInserts {
+		p := place{d.Namespace, d.Key, d.SecondaryKey}
+		if seen[p] {
+			return entroq.InvalidArgumentf(
+				"two inserts name secondary key %q in set %q of namespace %q; a set holds one doc per secondary key",
+				d.SecondaryKey, d.Key, d.Namespace)
+		}
+		seen[p] = true
 	}
 	return nil
 }
