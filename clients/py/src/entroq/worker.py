@@ -371,55 +371,40 @@ def _reset_claims(mod: Modification, task_id: str) -> None:
             tc.reset_claims = True
 
 
-def _writes_task(mod: Modification, task_id: str) -> bool:
-    """True when mod changes, deletes, or gives an arrival to the task."""
-    return (any(tc.id == task_id for tc in mod.task_changes)
-            or any(td.id == task_id for td in mod.task_deletes)
-            or any(a.id == task_id for a in mod.task_arrivals))
+def _releasing(mod: Modification, sets: Sequence[Doc]) -> None:
+    """Add to mod a release for every claimed set whose arrival it has not
+    already decided, so the sets go back in the very modification that ends the
+    worker body.
 
+    A doc claim is a transaction scoped to that body: the sets were taken for
+    the work, the work is over, so they are no longer in it. They go back
+    whatever else mod does -- the task need not be in it at all, and a body that
+    mutated docs and left the task alone still frees them. Doc sets are shared,
+    so an early release unblocks consumers with nothing to do with this task,
+    and the task's own arrival says nothing about them.
 
-def _untouched(mod: Modification, sets: list[Doc], docs: list[Doc]) -> list[Doc]:
-    """Return those of the claimed sets that mod has not already written.
+    Decided means mod names the set in an arrival, or a member write names an
+    arrival of its own (at is not None, which is how a write asks to hold its
+    set; at=None means ready now). Explicit intent wins: a body that holds a set
+    keeps it. Doing nothing releases everything, which is the useful default.
 
-    The result is always a subset of sets, and must stay one: releasing a set
-    moves its version, so naming one this worker holds no lease on would
-    disturb a set that is somebody else's or nobody's. A modification may
-    mention sets that were never claimed here, so the leasehold decides what
-    may be released and mod only decides what to leave out of it.
+    The result only ever names sets claimed here, and must stay that way:
+    releasing moves a set's version, so naming one this worker holds no lease on
+    would disturb a set belonging to somebody else or to nobody. The leasehold
+    decides what may be released and mod only decides what to leave out.
 
-    Written means a member inserted, changed, or deleted, or the set given an
-    arrival: then the modification has already decided its arrival and must
-    not be second-guessed. Depending on a doc only watches its set, which
-    leaves it eligible for release.
-    """
-    set_of = {(d.namespace, d.id): (d.namespace, d.key) for d in docs}
-    written = set()
-    for ins in mod.doc_inserts:
-        written.add((ins.namespace, ins.key))
-    for dc in mod.doc_changes:
-        written.add((dc.namespace, dc.key))
-    for dd in mod.doc_deletes:
-        k = set_of.get((dd.namespace, dd.id))
-        if k is not None:
-            written.add(k)
-    for a in mod.doc_arrivals:
-        written.add((a.namespace, a.key))
-    return [g for g in sets if (g.namespace, g.key) not in written]
-
-
-async def _release_sets(client: EntroQBase, sets: list[Doc]) -> None:
-    """Make sets ready again now, after a commit that let go of the task.
-
-    Best-effort: a set this cannot release waits out its lease, as it would
-    have without the call.
+    Nothing releases on a path where the body failed. A set claimed for a task
+    took that task's own arrival, and renewal keeps the two equal, so when
+    nothing moved they lapse together and no cleanup could beat the lease.
     """
     if not sets:
         return
-    try:
-        await client.modify(Modification(
-            *[Modification.arriving(g, 0.0) for g in sets]))
-    except Exception as e:
-        logging.warning("Releasing doc sets after commit: %s", e)
+    decided = {(a.namespace, a.key) for a in mod.doc_arrivals}
+    decided |= {(d.namespace, d.key) for d in mod.doc_inserts if d.at is not None}
+    decided |= {(c.namespace, c.key) for c in mod.doc_changes if c.at is not None}
+    for group in sets:
+        if (group.namespace, group.key) not in decided:
+            Modification.arriving(group, 0.0)._apply(mod)
 
 
 # ---------------------------------------------------------------------------
@@ -631,23 +616,23 @@ class EntroQWorker:
             await self._dispose(state.task, do_work_exc, sets=state.sets)
             return True
 
-        release: list[Doc] = []
-        if result is not None:
-            _fix_versions(result, state.task, state.docs, state.sets)
-            _reset_claims(result, state.task.id)
-            await self._client.modify(result)
-            # The sets follow the task: once the commit lets go of it, the
-            # sets the commit did not write are released too -- but after
-            # finish, which may still read them.
-            if _writes_task(result, state.task.id):
-                release = _untouched(result, state.sets, state.docs)
+        # The modification that ends the body carries the releases. A body
+        # that decided nothing still ended, and its sets still go back, in a
+        # modification of their own.
+        mod = result if result is not None else Modification()
+        _fix_versions(mod, state.task, state.docs, state.sets)
+        _reset_claims(mod, state.task.id)
+        _releasing(mod, state.sets)
+        # A backend refuses a modification naming no operation, so a body that
+        # claimed nothing and decided nothing writes nothing.
+        if not mod.is_empty():
+            await self._client.modify(mod)
 
+        # finish holds no doc claim: the transaction ended with the commit.
         try:
             await handler._do_finish(state.task, state.docs)
         except StopWorker:
             return False
-        finally:
-            await _release_sets(self._client, release)
 
         return True
 

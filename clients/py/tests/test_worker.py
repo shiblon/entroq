@@ -11,7 +11,7 @@ import pytest
 from entroq.base import EntroQBase
 from entroq.types import (
     Task, TaskID, TaskChange,
-    ClaimedDocs, Doc, DocID, DocClaim,
+    ClaimedDocs, Doc, DocData, DocID, DocClaim,
     DependencyError, Modification, ModifyResult, TransportError,
 )
 from entroq.worker import (
@@ -1204,3 +1204,104 @@ def test_renewing_advances_set_versions():
     assert versions == sorted(set(versions)), (
         "a renewal must not reuse a version the last one moved: %r" % versions)
     assert final == [max(versions) + 1]
+
+
+# ---------------------------------------------------------------------------
+# Releasing claimed sets
+# ---------------------------------------------------------------------------
+
+def _released(client) -> list[tuple[str, str]]:
+    """Return the sets released (arrival of zero) across every modify made."""
+    return [(a.namespace, a.key)
+            for m in client.modify_calls for a in m.doc_arrivals if a.by_s <= 0]
+
+
+def _run_with_sets(client, task, claims, body):
+    """Process task with a handler claiming claims and returning body(task, docs)."""
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0)
+
+    @EntroQWorker.handler
+    async def process(t, docs):
+        return body(t, docs)
+
+    @process.selector
+    async def process(t):
+        return claims
+
+    asyncio.run(worker._process(task, process))
+    return worker
+
+
+def test_commit_releases_the_sets_it_did_not_hold():
+    """Claimed sets go back in the committing modification, not afterwards."""
+    task = _task(id='t1', version=1, queue='q')
+    client = FakeClient(docs=[_doc(namespace='ns', id='d1', key='watched')])
+
+    _run_with_sets(client, task,
+                   [DocClaim('ns', 'watched'), DocClaim('ns', 'empty')],
+                   lambda t, docs: Modification(Modification.deleting(t)))
+
+    assert sorted(_released(client)) == [('ns', 'empty'), ('ns', 'watched')]
+    # One modification, not two: the releases ride with the commit so no window
+    # opens where the task is gone and its docs are still held.
+    committed = [m for m in client.modify_calls if m.task_deletes]
+    assert len(committed) == 1
+    assert len(client.modify_calls) == 1, "a second modify means a separate release"
+
+
+def test_a_body_that_commits_nothing_still_releases():
+    """Returning None ends the body, so the sets still go back."""
+    task = _task(id='t1', version=1, queue='q')
+    client = FakeClient(docs=[_doc(namespace='ns', id='d1', key='held')])
+
+    _run_with_sets(client, task, [DocClaim('ns', 'held')], lambda t, docs: None)
+
+    assert _released(client) == [('ns', 'held')]
+    assert not client.modify_calls[0].task_changes, "the task was left alone"
+    assert not client.modify_calls[0].task_deletes
+
+
+def test_a_body_that_leaves_the_task_alone_still_releases():
+    """The sets belong to the body, not to the task."""
+    task = _task(id='t1', version=1, queue='q')
+    doc = _doc(namespace='ns', id='d1', key='written')
+    client = FakeClient(docs=[doc])
+
+    _run_with_sets(client, task, [DocClaim('ns', 'written')],
+                   lambda t, docs: Modification(
+                       Modification.changing(docs[0], content='done')))
+
+    assert _released(client) == [('ns', 'written')]
+
+
+def test_a_set_held_into_the_future_is_kept():
+    """A body naming an arrival of its own decided, so nothing overrides it."""
+    task = _task(id='t1', version=1, queue='q')
+    doc = _doc(namespace='ns', id='d1', key='kept')
+    client = FakeClient(docs=[doc, _doc(namespace='ns', id='d2', key='freed')])
+    later = datetime.now(tz=timezone.utc) + timedelta(minutes=1)
+
+    _run_with_sets(client, task, [DocClaim('ns', 'kept'), DocClaim('ns', 'freed')],
+                   lambda t, docs: Modification(
+                       Modification.deleting(t),
+                       Modification.changing(
+                           [d for d in docs if d.key == 'kept'][0], at=later)))
+
+    assert _released(client) == [('ns', 'freed')], (
+        "the set written with a future arrival must keep it")
+
+
+def test_releasing_never_names_an_unclaimed_set():
+    """The leasehold bounds the release, whatever the modification mentions."""
+    task = _task(id='t1', version=1, queue='q')
+    client = FakeClient(docs=[_doc(namespace='ns', id='d1', key='held')])
+
+    _run_with_sets(client, task, [DocClaim('ns', 'held')],
+                   lambda t, docs: Modification(
+                       Modification.deleting(t),
+                       # Names a set this worker never claimed.
+                       Modification.inserting(DocData(
+                           namespace='ns', key='elsewhere', content=1))))
+
+    assert _released(client) == [('ns', 'held')], (
+        "releasing moves a version, so it may only name what was claimed here")

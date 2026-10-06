@@ -425,6 +425,17 @@ class Modification:
         for op in ops:
             op._apply(self)
 
+    def is_empty(self) -> bool:
+        """True when this names no operation at all.
+
+        A backend refuses such a modification: one that does nothing is a
+        mistake, most often a list its builder forgot to carry.
+        """
+        return not (self.task_inserts or self.task_changes or self.task_deletes
+                    or self.task_depends or self.task_arrivals
+                    or self.doc_inserts or self.doc_changes or self.doc_deletes
+                    or self.doc_depends or self.doc_arrivals)
+
     @classmethod
     def inserting(cls, item: Union[TaskData, DocData]) -> _Op:
         """Return an insert op for a TaskData or DocData."""
