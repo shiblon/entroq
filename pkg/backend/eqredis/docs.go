@@ -134,6 +134,11 @@ func parseDocFields(vals map[string]string) (*docFields, error) {
 	}, nil
 }
 
+// maxDocsRetries bounds rereads of a doc that moved between sets. Each
+// reread knows where every doc that moved went, so one is enough unless the
+// docs keep moving.
+const maxDocsRetries = 10
+
 // Docs returns docs in a namespace, optionally filtered by key range or IDs.
 func (e *EQRedis) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, error) {
 	if err := rq.Validate(); err != nil {
@@ -205,21 +210,29 @@ func (e *EQRedis) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc,
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	for {
+	for attempt := range maxDocsRetries {
 		docs, ok, err := e.readDocsWithLocks(ctx, rq, ids, keys)
 		if err != nil || ok {
 			return docs, err
 		}
+		if err := waitToRetry(ctx, attempt); err != nil {
+			return nil, fmt.Errorf("eqredis docs: %w", err)
+		}
 	}
+	return nil, fmt.Errorf("eqredis docs: %d docs in %q kept moving between sets", len(ids), rq.Namespace)
 }
 
 // readDocsWithLocks reads docs and their sets' locks in one transaction, so
 // each doc's content and its set's version come from the same moment. Read
 // apart, a write landing between them would pair old content with the new
 // version, and a read-modify-write of that content would pass its version
-// check and overwrite the newer content. keys gives each doc's primary key,
-// read beforehand; it returns false if a doc turned out to belong to another
-// set, deleted and inserted again meanwhile, and the caller reads again.
+// check and overwrite the newer content.
+//
+// keys gives each doc's primary key, read beforehand, and names which sets to
+// read locks for. A doc found in a set keys does not name has no version here,
+// so this records where that doc actually is and returns false for the caller
+// to read again. Every such doc is corrected in one pass, so the next read
+// covers all of them.
 func (e *EQRedis) readDocsWithLocks(ctx context.Context, rq *entroq.DocQuery, ids []string, keys map[string]string) ([]*entroq.Doc, bool, error) {
 	var sets []docset.Set
 	for _, id := range ids {
@@ -252,6 +265,7 @@ func (e *EQRedis) readDocsWithLocks(ctx context.Context, rq *entroq.DocQuery, id
 	}
 
 	var docs []*entroq.Doc
+	moved := false
 	for i, cmd := range docCmds {
 		vals := cmd.Val()
 		if len(vals) == 0 {
@@ -267,13 +281,18 @@ func (e *EQRedis) readDocsWithLocks(ctx context.Context, rq *entroq.DocQuery, id
 		}
 		l, ok := locks[docset.Set{Namespace: d.Namespace, Key: d.Key}]
 		if !ok {
-			return nil, false, nil
+			keys[ids[i]] = d.Key
+			moved = true
+			continue
 		}
 		// Each doc carries its set's version and claim, the only ones it has.
 		if l != docset.Absent {
 			d = docset.Overlay(d, l)
 		}
 		docs = append(docs, d)
+	}
+	if moved {
+		return nil, false, nil
 	}
 	return docs, true, nil
 }
