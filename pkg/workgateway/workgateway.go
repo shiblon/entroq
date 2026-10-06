@@ -601,7 +601,13 @@ func (b *Bridge) doWork(ctx context.Context, task *entroq.Task, _ json.RawMessag
 	// Go DoModify that returns no mods.
 	var args []entroq.ModifyArg
 	if res.Modification != nil {
-		args, err = pbconv.ModifyArgsFromProto(res.Modification.ModifyRequest, version.Protocol)
+		// Protocol, not version.Protocol: this is the protocol the GATEWAY
+		// speaks to its workers, which its hello advertises, and not the one
+		// this build's own clients speak to a service. Decoding a worker's reply
+		// as anything else judges it against rules it was never told about --
+		// and a worker that echoes the task it was handed does carry the at_ms
+		// the gateway sent it, which protocol 2 refuses.
+		args, err = pbconv.ModifyArgsFromProto(res.Modification.ModifyRequest, Protocol)
 		if err != nil {
 			// A malformed modification is a client bug, not a transient fault:
 			// retrying would only replay the same bad message, so stop the worker.
