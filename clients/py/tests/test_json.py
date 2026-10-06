@@ -1,6 +1,6 @@
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -244,10 +244,43 @@ async def test_dependency_error_contended_doc_is_not_missing():
     assert not err.has_missing_docs()
 
 
-def test_doc_insert_encodes_future_arrival():
-    at = datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+def test_doc_insert_encodes_an_arrival_as_a_duration():
+    """An arrival goes out as a duration, never as an instant.
 
-    assert _doc_insert_json(DocData(namespace="status", key="session", at=at))["atMs"] == 1893553445000
+    The service resolves a duration against its own clock, so the offset between
+    the two clocks cancels. An instant does not cancel -- it is wrong by that
+    offset, and it can also go stale in flight, where a renewal that merely
+    arrived late reads as a deliberate release. The conversion happens in the
+    client because only this process knows its own now; the service converting an
+    instant would be using the wrong clock to do it.
+    """
+    at = datetime.now(tz=timezone.utc) + timedelta(minutes=5)
+
+    got = _doc_insert_json(DocData(namespace="status", key="session", at=at))
+
+    assert "atMs" not in got, "an instant must not ride along"
+    assert abs(got["byMs"] - 5 * 60 * 1000) < 2000, got["byMs"]
+
+
+def test_doc_insert_with_no_arrival_sends_no_duration():
+    """No arrival means ready now, which the wire says by omission."""
+    got = _doc_insert_json(DocData(namespace="status", key="session"))
+
+    assert "byMs" not in got and "atMs" not in got, got
+
+
+def test_doc_insert_encodes_a_past_arrival_as_a_negative_duration():
+    """A past instant is a negative duration, which means the same thing.
+
+    Zero and absent both mean now, so a negative value is the only way to say
+    "already past" distinctly -- and it survives the omit-falsy encoding that
+    drops a zero.
+    """
+    at = datetime.now(tz=timezone.utc) - timedelta(minutes=5)
+
+    got = _doc_insert_json(DocData(namespace="status", key="session", at=at))
+
+    assert got["byMs"] < 0, got
 
 
 async def _refused(**response) -> InvalidArgumentError:

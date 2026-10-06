@@ -40,8 +40,22 @@ def _parse_ms(ms: int | str) -> datetime:
     return datetime.fromtimestamp(int(ms) / 1000.0, tz=timezone.utc)
 
 
-def _to_ms(dt: datetime | None) -> int:
-    return 0 if dt is None else int(dt.timestamp() * 1000)
+def _by_ms(at: datetime | None) -> int:
+    """Return how long from now an arrival is, in millis, for the wire.
+
+    An arrival travels as a DURATION. The offset between this clock and the
+    service's cancels out of a duration and does not out of an instant, and a
+    duration delayed in flight postpones an arrival where an instant delayed in
+    flight can turn into a release. The service converts an instant using ITS
+    clock, so it cannot recover what the caller meant; only the caller knows its
+    own now, which is why the conversion happens here, at the edge.
+
+    None is zero: ready now, releasing any claim. An instant already past is a
+    negative duration, which means the same thing and says so.
+    """
+    if at is None:
+        return 0
+    return int((at - datetime.now(tz=timezone.utc)).total_seconds() * 1000)
 
 
 def _task_from_json(obj: dict) -> Task:
@@ -86,7 +100,7 @@ def _doc_id_json(d: Doc | DocID) -> dict:
 def _task_insert_json(i: TaskData) -> dict:
     return {k: v for k, v in {
         "queue": i.queue,
-        "atMs": _to_ms(i.at) or None,
+        "byMs": _by_ms(i.at) or None,
         "value": i.value,
         "id": i.id or None,
         "attempt": i.attempt or None,
@@ -101,7 +115,7 @@ def _task_change_json(c: TaskChange) -> dict:
         "oldId": {"id": c.id, "version": c.version, "queue": c.from_queue},
         "newData": {
             "queue": c.queue,
-            "atMs": _to_ms(c.at),
+            "byMs": _by_ms(c.at),
             "value": c.value,
             "attempt": c.attempt,
             "err": c.err,
@@ -138,7 +152,7 @@ def _doc_insert_json(d: DocData) -> dict:
         "key": d.key,
         "secondaryKey": d.secondary_key or None,
         "content": d.content,
-        "atMs": _to_ms(d.at) or None,
+        "byMs": _by_ms(d.at) or None,
     }.items() if v is not None}
 
 
@@ -150,7 +164,7 @@ def _doc_change_json(c: DocChange) -> dict:
             "key": c.key,
             "secondaryKey": c.secondary_key,
             "content": c.content,
-            "atMs": _to_ms(c.at),
+            "byMs": _by_ms(c.at),
         },
     }
 
