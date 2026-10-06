@@ -552,6 +552,10 @@ func TestWorkerHoldsEmptyGroup(t *testing.T) {
 	RunQTest(t, eqtest.WorkerHoldsEmptyGroup)
 }
 
+func TestDocSecondaryKeyRaceHasOneWinner(t *testing.T) {
+	RunQTest(t, eqtest.DocSecondaryKeyRaceHasOneWinner)
+}
+
 func TestDocMemberVersionFromSet(t *testing.T) {
 	RunQTest(t, eqtest.DocMemberVersionFromSet)
 }

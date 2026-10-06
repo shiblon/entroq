@@ -1572,3 +1572,70 @@ func DocMemberVersionFromSet(ctx context.Context, t *testing.T, client *entroq.E
 		}
 	})
 }
+
+// DocSecondaryKeyRaceHasOneWinner covers uniqueness under concurrency, which the
+// sequential cases cannot: a backend that checks for an occupant BEFORE taking
+// the set's lock sees an empty place in every racer, and they all insert.
+//
+// That is a real shape rather than a hypothetical. A row that does not exist yet
+// cannot be locked, so a check made before the set's lock is a read of state that
+// the writer ahead of you has not committed. The lock is what orders the writers;
+// the check has to happen inside it.
+func DocSecondaryKeyRaceHasOneWinner(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	ns := path.Join(qPrefix, "doc_secondary_race")
+	const racers = 8
+
+	for _, key := range []string{"fresh", "occupied"} {
+		t.Run(key, func(t *testing.T) {
+			if key == "occupied" {
+				// A set that already holds a doc elsewhere, so the racers meet a
+				// non-empty set: the path where a count-based shortcut defers to
+				// the occupant lookup, and a stale lookup lets everyone through.
+				if _, err := client.Modify(ctx, entroq.PuttingDocInto(ns,
+					entroq.WithKeys(key, "other"), entroq.WithContent("sibling"))); err != nil {
+					t.Fatalf("Seed a sibling: %v", err)
+				}
+			}
+			var g errgroup.Group
+			var mu sync.Mutex
+			won := 0
+			for i := range racers {
+				g.Go(func() error {
+					_, err := client.Modify(ctx, entroq.PuttingDocInto(ns,
+						entroq.WithKeys(key, "contested"), entroq.WithContent(i)))
+					if err == nil {
+						mu.Lock()
+						won++
+						mu.Unlock()
+						return nil
+					}
+					// Losing is a collision, or a claim error if another racer
+					// held the set as it wrote. Anything else is a real failure.
+					if entroq.IsDependency(err) {
+						return nil
+					}
+					return fmt.Errorf("racer %d: %w", i, err)
+				})
+			}
+			if err := g.Wait(); err != nil {
+				t.Fatalf("Racing inserts: %v", err)
+			}
+			if won != 1 {
+				t.Errorf("%d racers reported success, want exactly 1", won)
+			}
+			docs, err := client.Docs(ctx, &entroq.DocQuery{Namespace: ns, KeyExact: key})
+			if err != nil {
+				t.Fatalf("Read %q: %v", key, err)
+			}
+			var contested int
+			for _, d := range docs {
+				if d.SecondaryKey == "contested" {
+					contested++
+				}
+			}
+			if contested != 1 {
+				t.Errorf("set %q holds %d docs at one secondary key, want 1: a set is a map", key, contested)
+			}
+		})
+	}
+}
