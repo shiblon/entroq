@@ -291,22 +291,39 @@ def test_fix_versions_task_depend():
     assert mod.task_depends[0].version == 5
 
 
-def test_fix_versions_doc_change():
-    """With no sets reported, a member falls back to the version it was claimed at."""
-    doc = _doc(namespace='ns', id='d1', version=7)
+def test_fix_versions_claimed_member_with_no_set_is_a_bug():
+    """A claimed member whose set is not held has no version we can name.
+
+    The only candidates are the set's version and a wrong one -- the
+    claim-time version being exactly what a renewal moves past -- so this is
+    the worker library disagreeing with itself, not a case to guess at.
+    """
+    doc = _doc(namespace='ns', id='d1', key='k', version=7)
     mod = Modification()
     dc = doc.as_change()
     dc.version = 2
     mod.doc_changes.append(dc)
-    _fix_versions(mod, _task(), [doc], [])
-    assert mod.doc_changes[0].version == 7
+    with pytest.raises(FatalWorker, match="no lock for that set"):
+        _fix_versions(mod, _task(), [doc], [])
 
 
-def test_fix_versions_doc_delete():
-    doc = _doc(namespace='ns', id='d1', version=7)
+def test_fix_versions_doc_delete_takes_its_sets_version():
+    doc = _doc(namespace='ns', id='d1', key='k', version=7)
+    group = _doc(namespace='ns', id='', key='k', version=9)
     mod = Modification(Modification.deleting(DocID(namespace='ns', id='d1', version=2)))
-    _fix_versions(mod, _task(), [doc], [])
-    assert mod.doc_deletes[0].version == 7
+    _fix_versions(mod, _task(), [doc], [group])
+    assert mod.doc_deletes[0].version == 9
+
+
+def test_fix_versions_leaves_an_unclaimed_doc_alone():
+    """A doc this worker did not claim keeps the version its caller chose.
+
+    Its version is not ours to decide: we hold no lock on it and know nothing
+    about what it is at.
+    """
+    mod = Modification(Modification.deleting(DocID(namespace='ns', id='other', version=4)))
+    _fix_versions(mod, _task(), [], [])
+    assert mod.doc_deletes[0].version == 4
 
 
 def test_fix_versions_imposes_the_sets_version_on_its_members():
@@ -404,7 +421,7 @@ def test_handler_finisher_chaining():
     async def process(task, docs):
         finished.append(task.id)
 
-    asyncio.run(process._do_finish(_task(), []))
+    asyncio.run(process._on_success(_task(), []))
     assert finished == ['t1']
 
 
@@ -792,6 +809,61 @@ def test_worker_rejects_invalid_transport_backoff():
             transport_retry_base_s=2,
             transport_retry_max_s=1,
         )
+
+
+def test_either_post_commit_hook_name_works():
+    """on_success is the name; finish is what it used to be called.
+
+    Code written against finish must keep working on an upgrade with no
+    edits, so on_success calls it by default and either override is enough.
+    """
+    task = _task(id='t1', version=1)
+
+    for hook in ('on_success', 'finish'):
+        client = FakeClient(tasks=[task])
+        worker = EntroQWorker(client, 'q', claim_duration_s=60.0)
+        ran = []
+
+        async def run():
+            async def hook_fn(self, t, docs):
+                ran.append(t.id)
+
+            handler = type('H', (Handler,), {
+                'do_work': lambda self, t, docs: _returns(None),
+                hook: hook_fn,
+            })()
+            await worker._process(task, handler)
+
+        asyncio.run(run())
+        assert ran == ['t1'], f"overriding {hook} did not run it"
+
+
+def test_overriding_both_hooks_runs_only_on_success():
+    """on_success is the one the worker calls, so it decides."""
+    task = _task(id='t1', version=1)
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0)
+    ran = []
+
+    async def run():
+        class MyHandler(Handler):
+            async def do_work(self, t, docs):
+                return None
+
+            async def on_success(self, t, docs):
+                ran.append('on_success')
+
+            async def finish(self, t, docs):
+                ran.append('finish')
+
+        await worker._process(task, MyHandler())
+
+    asyncio.run(run())
+    assert ran == ['on_success'], ran
+
+
+async def _returns(value):
+    return value
 
 
 def test_worker_finisher_called_when_do_work_returns_none():

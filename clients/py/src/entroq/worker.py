@@ -152,7 +152,7 @@ class Handler(ABC):
         ``MoveError`` to send the task to an error queue.
         """
 
-    async def finish(self, task: Task, docs: list[Doc]) -> None:
+    async def on_success(self, task: Task, docs: list[Doc]) -> None:
         """Called after the body's commit, whatever do_work returned.
 
         The commit has already landed and the doc claim ended with it, so this
@@ -160,6 +160,19 @@ class Handler(ABC):
         for part of handling it. An error here is logged rather than raised,
         since it cannot undo a commit that succeeded; raise ``FatalWorker`` to
         stop the worker anyway, or ``StopWorker`` to exit cleanly.
+
+        This is the Go worker's ``OnSuccess``, and shares its contract. Go's
+        ``Handler.Finish`` is a different hook: it owns the commit, and nothing
+        implicit happens around it. There is no equivalent of that here.
+        """
+        await self.finish(task, docs)
+
+    async def finish(self, task: Task, docs: list[Doc]) -> None:
+        """The former name of :meth:`on_success`, which calls this by default.
+
+        Overriding it still works and always will. New code should override
+        ``on_success``, whose name says when it runs; overriding both runs only
+        ``on_success``.
         """
 
     # ------------------------------------------------------------------
@@ -170,8 +183,8 @@ class Handler(ABC):
     async def _select(self, task: Task) -> list[DocClaim]:
         return await self.select(task)
 
-    async def _do_finish(self, task: Task, docs: list[Doc]) -> None:
-        await self.finish(task, docs)
+    async def _on_success(self, task: Task, docs: list[Doc]) -> None:
+        await self.on_success(task, docs)
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +211,7 @@ class _FnHandler(Handler):
     async def _select(self, task: Task) -> list[DocClaim]:
         return await self._selector_fn(task) if self._selector_fn is not None else []
 
-    async def _do_finish(self, task: Task, docs: list[Doc]) -> None:
+    async def _on_success(self, task: Task, docs: list[Doc]) -> None:
         if self._finisher_fn is not None:
             await self._finisher_fn(task, docs)
 
@@ -220,7 +233,9 @@ class _FnHandler(Handler):
         self,
         fn: Callable[[Task, list[Doc]], Awaitable[None]],
     ) -> _FnHandler:
-        """Decorator: register the async finalization function.
+        """Decorator: register the function to run after the body's commit.
+
+        It fills the same role as overriding :meth:`Handler.on_success`.
 
         Use the same name as the handler (property-style)::
 
@@ -427,10 +442,17 @@ def _fix_versions(mod: Modification, task: Task, docs: list[Doc],
 
     The task's version comes from the last renewal of the task. A doc has no
     version of its own -- it carries its set's, the only one it has -- so a
-    claimed member takes the version of the set holding it. A client whose
-    claim could not report its sets falls back to the versions its members
-    were claimed at, which is all it knows. Anything mod names that was not
-    claimed here is left alone: its version is not ours to decide.
+    claimed member takes the version of the set holding it, and every version
+    this worker can name is written out rather than left for the service to
+    infer.
+
+    Anything mod names that this worker did not claim is left alone: its
+    version is not ours to decide. But a doc this worker DID claim must
+    resolve, because the only answers are the set's version and a wrong one;
+    the claim-time version in particular is exactly what a renewal moves past.
+    A member whose set is missing means the claim and the renewal disagree
+    about what is held, which is a bug here rather than a condition to paper
+    over, so it stops the worker.
     """
     for op in (*mod.task_changes, *mod.task_deletes, *mod.task_depends,
                *mod.task_arrivals):
@@ -441,13 +463,16 @@ def _fix_versions(mod: Modification, task: Task, docs: list[Doc],
     # A member names itself by ID, which does not say which set holds it, so
     # the claimed members supply that mapping.
     set_of = {(d.namespace, d.id): (d.namespace, d.key) for d in docs}
-    claimed_at = {(d.namespace, d.id): d.version for d in docs}
 
     def current(namespace: str, id: str) -> int | None:
         group = set_of.get((namespace, id))
-        if group in set_version:
-            return set_version[group]
-        return claimed_at.get((namespace, id))
+        if group is None:
+            return None  # not claimed here; the caller owns its version
+        if group not in set_version:
+            raise FatalWorker(
+                f"doc {namespace}/{id} was claimed in set {group[1]!r} but no "
+                "lock for that set is held: the claim and the renewal disagree")
+        return set_version[group]
 
     for op in (*mod.doc_changes, *mod.doc_deletes, *mod.doc_depends):
         version = current(op.namespace, op.id)
@@ -818,13 +843,13 @@ class EntroQWorker:
         if not mod.is_empty():
             await self._client.modify(mod)
 
-        # finish holds no doc claim: the transaction ended with the commit.
+        # on_success holds no doc claim: the transaction ended with the commit.
         #
         # Its failure is optimistic, as the Go worker's OnSuccess is: the task is
         # already committed, so an error here cannot undo that and must not
         # discard it either. Logged and carried on, unless it is fatal.
         try:
-            await handler._do_finish(state.task, state.docs)
+            await handler._on_success(state.task, state.docs)
         except StopWorker:
             return False
         except FatalWorker:

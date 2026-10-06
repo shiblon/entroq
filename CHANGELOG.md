@@ -21,6 +21,15 @@ runs, so plan a short maintenance window on large doc tables.
 
 ### Added
 
+- **`Handler.on_success` in the Python client.** The post-commit hook now
+  carries the name of the Go hook whose contract it shares: it runs after the
+  body's commit, holds no doc claim, and its error is logged rather than
+  raised. `finish` is what it used to be called, still works, and will:
+  `on_success` calls it by default, so code written against `finish` upgrades
+  with no edits. Overriding both runs only `on_success`. (Go's
+  `Handler.Finish` is a different hook, which owns the commit; the Python
+  client has no equivalent.)
+
 - **`eqgrpc.ServerKeepalive`.** The server option every server for EntroQ
   clients needs: it accepts the client's keepalive pings while a claim is
   open. A server built without it, as the package documentation's examples
@@ -413,6 +422,15 @@ runs, so plan a short maintenance window on large doc tables.
   versions.
 
 ### Fixed
+
+- **A claimed doc's version comes from its set, with no second answer.** The
+  Python worker fell back to the version a doc was claimed at when it could
+  not tell which set held it -- which is exactly the version a renewal moves
+  past, so it was right only when nothing had been renewed. A claimed member
+  now always takes its set's version, and a member whose set is not held stops
+  the worker: the claim and the renewal disagreeing about what is held is a
+  bug in the client, not a case to guess at. A doc the worker did not claim is
+  left alone, since its version was never ours to decide.
 
 - **A renewal that cannot be read is a lost claim, in Go too.** `held.renewed`
   returned a plain error when a renewal reply did not name everything it
