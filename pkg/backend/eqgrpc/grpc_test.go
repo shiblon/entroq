@@ -131,6 +131,10 @@ func TestGRPCDocSets(t *testing.T) {
 	RunQTest(t, eqtest.DocSets)
 }
 
+func TestGRPCDocMemberVersionFromSet(t *testing.T) {
+	RunQTest(t, eqtest.DocMemberVersionFromSet)
+}
+
 func TestGRPCDocSecondaryKeysAreUnique(t *testing.T) {
 	RunQTest(t, eqtest.DocSecondaryKeysAreUnique)
 }

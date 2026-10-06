@@ -297,14 +297,37 @@ func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string
 		}
 		return true
 	}
-	// stored returns the member's set and lock, or false if it does not
-	// exist at version.
+	// provided holds the version mod asserts for a set directly: an arrival, or
+	// a depend naming the set by key. Both are checked on their own, so a member
+	// version inferred from one is only ever as good as that check.
+	provided := make(map[Set]bool)
+	for _, a := range mod.DocArrives {
+		provided[Set{Namespace: a.Namespace, Key: a.Key}] = true
+	}
+	for _, dep := range mod.DocDepends {
+		if dep.IsSetRef() {
+			provided[Set{Namespace: dep.Namespace, Key: dep.Key}] = true
+		}
+	}
+	// stored returns the member's set and lock, or false if it does not exist at
+	// version.
+	//
+	// A doc carries its set's version and no other, so naming one on a member is
+	// restating the set's. A version must be asserted -- except where mod also
+	// names the set, and then a member may say ZERO and take the set's instead.
+	// That is the only place zero can mean "infer": elsewhere zero is a real
+	// version, held by a set created by an insert and not written since, so it
+	// has to match like any other. A non-zero version always has to match, so
+	// saying it and meaning it stay the same thing.
 	stored := func(ns, id string, version int32) (Set, bool) {
 		d := member(ns, id)
 		if d == nil {
 			return Set{}, false
 		}
 		g := Set{Namespace: d.Namespace, Key: d.Key}
+		if version == 0 && provided[g] {
+			return g, true
+		}
 		return g, lock(g).Version == version
 	}
 

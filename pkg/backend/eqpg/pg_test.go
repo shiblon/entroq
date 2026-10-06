@@ -552,6 +552,10 @@ func TestWorkerHoldsEmptyGroup(t *testing.T) {
 	RunQTest(t, eqtest.WorkerHoldsEmptyGroup)
 }
 
+func TestDocMemberVersionFromSet(t *testing.T) {
+	RunQTest(t, eqtest.DocMemberVersionFromSet)
+}
+
 func TestDocSecondaryKeysAreUnique(t *testing.T) {
 	RunQTest(t, eqtest.DocSecondaryKeysAreUnique)
 }

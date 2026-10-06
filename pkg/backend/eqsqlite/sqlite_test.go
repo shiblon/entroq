@@ -33,6 +33,7 @@ func TestBackendContract(t *testing.T) {
 		{"DocSets", eqtest.DocSets},
 		{"DocSetDepends", eqtest.DocSetDepends},
 		{"DocSecondaryKeysAreUnique", eqtest.DocSecondaryKeysAreUnique},
+		{"DocMemberVersionFromSet", eqtest.DocMemberVersionFromSet},
 		{"UpdateArrival", eqtest.UpdateArrival},
 		{"ClaimStampsLease", eqtest.ClaimStampsLease},
 		{"ArrivalResolvesOnBackendClock", eqtest.ArrivalResolvesOnBackendClock},

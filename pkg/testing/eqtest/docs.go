@@ -1469,3 +1469,106 @@ func DocSecondaryKeysAreUnique(ctx context.Context, t *testing.T, client *entroq
 		}
 	})
 }
+
+// DocMemberVersionFromSet covers the one place a doc version may be left out: a
+// member may say ZERO when the modification also names its set, and takes the
+// set's version instead.
+//
+// A doc carries its set's version and no other, so naming one on a member
+// restates the set's. Where the modification already asserts the set -- an
+// arrival, or a depend naming it by key -- the member has nothing to add, and a
+// caller should not have to carry a number it cannot choose.
+//
+// Zero is NOT a blanket escape. Elsewhere it is a real version, held by a set an
+// insert created and nothing has written since, so it has to match like any
+// other. That is what keeps "absent" from quietly becoming "unchecked".
+func DocMemberVersionFromSet(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	ns := path.Join(qPrefix, "member_version")
+
+	// put returns a doc in its own set, and the set's version, after enough
+	// writes that the version is not zero.
+	put := func(t *testing.T, key string) *entroq.Doc {
+		t.Helper()
+		res, err := client.Modify(ctx, entroq.PuttingDocInto(ns,
+			entroq.WithKeys(key, "one"), entroq.WithContent("first")))
+		if err != nil {
+			t.Fatalf("Insert %q: %v", key, err)
+		}
+		doc := res.InsertedDocs[0]
+		res, err = client.Modify(ctx, doc.Change(entroq.WithContent("second")))
+		if err != nil {
+			t.Fatalf("Move %q off version zero: %v", key, err)
+		}
+		moved := res.ChangedDocs[0]
+		if moved.Version == 0 {
+			t.Fatalf("Set %q still at version 0 after a write", key)
+		}
+		return moved
+	}
+
+	t.Run("a member says zero when the modification names its set", func(t *testing.T) {
+		doc := put(t, "with-arrival")
+		blank := doc.Copy()
+		blank.Version = 0
+		if _, err := client.Modify(ctx,
+			blank.Change(entroq.WithContent("by inference")),
+			entroq.Arriving(entroq.ReadyNow().Docs(
+				&entroq.DocSet{Namespace: ns, Key: "with-arrival", Version: doc.Version})),
+		); err != nil {
+			t.Errorf("Member at version 0 beside an arrival naming its set: %v", err)
+		}
+	})
+
+	t.Run("a depend naming the set serves as well", func(t *testing.T) {
+		doc := put(t, "with-depend")
+		blank := doc.Copy()
+		blank.Version = 0
+		if _, err := client.Modify(ctx,
+			blank.Change(entroq.WithContent("by inference")),
+			entroq.NewDocSetRef(ns, "with-depend", doc.Version).Depend(),
+		); err != nil {
+			t.Errorf("Member at version 0 beside a depend naming its set: %v", err)
+		}
+	})
+
+	t.Run("a member says zero with no set named and fails", func(t *testing.T) {
+		doc := put(t, "alone")
+		blank := doc.Copy()
+		blank.Version = 0
+		_, err := client.Modify(ctx, blank.Change(entroq.WithContent("unchecked?")))
+		if !entroq.IsDependency(err) {
+			t.Errorf("Member at version 0 with nothing naming its set: want a dependency error, got %v", err)
+		}
+	})
+
+	t.Run("a wrong version still fails beside a named set", func(t *testing.T) {
+		doc := put(t, "wrong")
+		stale := doc.Copy()
+		stale.Version = doc.Version + 7
+		_, err := client.Modify(ctx,
+			stale.Change(entroq.WithContent("stale")),
+			entroq.Arriving(entroq.ReadyNow().Docs(
+				&entroq.DocSet{Namespace: ns, Key: "wrong", Version: doc.Version})),
+		)
+		if !entroq.IsDependency(err) {
+			t.Errorf("Member at a wrong version beside its set: want a dependency error, got %v", err)
+		}
+	})
+
+	t.Run("zero is a real version where a set holds it", func(t *testing.T) {
+		// An insert creates a set at version 0, so a member naming 0 there is
+		// asserting, not inferring, and it matches.
+		res, err := client.Modify(ctx, entroq.PuttingDocInto(ns,
+			entroq.WithKeys("fresh", "one"), entroq.WithContent(1)))
+		if err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+		doc := res.InsertedDocs[0]
+		if doc.Version != 0 {
+			t.Fatalf("A created set is at version %d, want 0", doc.Version)
+		}
+		if _, err := client.Modify(ctx, doc.Change(entroq.WithContent(2))); err != nil {
+			t.Errorf("Member at version 0 of a set that really is at 0: %v", err)
+		}
+	})
+}
