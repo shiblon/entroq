@@ -14,6 +14,7 @@ import (
 	"github.com/shiblon/entroq/api/apiconnect"
 	"github.com/shiblon/entroq/pkg/eqsvcgrpc"
 	"github.com/shiblon/entroq/pkg/version"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -218,11 +219,19 @@ func (h *Handler) NamespaceStats(ctx context.Context, req *connect.Request[pb.Na
 	return connect.NewResponse(resp), nil
 }
 
-// streamAdapter wraps a Connect server stream so it implements the grpc.ServerStream expected by eqsvcgrpc.
+// streamAdapter wraps a Connect server stream so it implements the
+// grpc.ServerStream the gRPC service expects.
+//
+// It implements every method explicitly rather than embedding
+// pb.EntroQ_StreamTasksServer. Embedding it left a nil interface in the struct,
+// so any method the service called that this type did not define was a nil
+// dereference rather than a compile error -- and SetHeader, added when the
+// service began advertising its protocol on the stream, panicked on the first
+// statement of every streaming call over this route. Spelling them out means the
+// compiler reports the next addition instead of production doing it.
 type streamAdapter struct {
 	ctx    context.Context
 	stream *connect.ServerStream[pb.TasksResponse]
-	pb.EntroQ_StreamTasksServer
 }
 
 func (s *streamAdapter) Context() context.Context {
@@ -231,6 +240,49 @@ func (s *streamAdapter) Context() context.Context {
 
 func (s *streamAdapter) Send(msg *pb.TasksResponse) error {
 	return s.stream.Send(msg)
+}
+
+// SetHeader adds metadata to the response headers. Connect sends them with the
+// first message, so this is also what SendHeader does -- there is nothing to
+// flush separately.
+func (s *streamAdapter) SetHeader(md metadata.MD) error {
+	addMD(s.stream.ResponseHeader(), md)
+	return nil
+}
+
+func (s *streamAdapter) SendHeader(md metadata.MD) error {
+	return s.SetHeader(md)
+}
+
+func (s *streamAdapter) SetTrailer(md metadata.MD) {
+	addMD(s.stream.ResponseTrailer(), md)
+}
+
+// SendMsg is the untyped form of Send, which the gRPC machinery uses for
+// interceptors. Only a TasksResponse can travel on this stream.
+func (s *streamAdapter) SendMsg(m any) error {
+	msg, ok := m.(*pb.TasksResponse)
+	if !ok {
+		return status.Errorf(codes.Internal, "stream tasks: cannot send %T", m)
+	}
+	return s.stream.Send(msg)
+}
+
+// RecvMsg never succeeds: StreamTasks is server-streaming, so the client sends
+// one request and nothing after it.
+func (s *streamAdapter) RecvMsg(any) error {
+	return status.Error(codes.Unimplemented, "stream tasks: the client sends no messages")
+}
+
+// addMD copies gRPC metadata into Connect's header map. Both are
+// map[string][]string, but the keys differ in case convention, so each is added
+// through Header.Add to be canonicalized.
+func addMD(h http.Header, md metadata.MD) {
+	for k, vals := range md {
+		for _, v := range vals {
+			h.Add(k, v)
+		}
+	}
 }
 
 func (h *Handler) StreamTasks(ctx context.Context, req *connect.Request[pb.TasksRequest], stream *connect.ServerStream[pb.TasksResponse]) error {

@@ -11,6 +11,9 @@ import (
 	"strings"
 	"testing"
 
+	"connectrpc.com/connect"
+	pb "github.com/shiblon/entroq/api"
+	"github.com/shiblon/entroq/api/apiconnect"
 	"github.com/shiblon/entroq/pkg/backend/eqmem"
 	"github.com/shiblon/entroq/pkg/eqsvcgrpc"
 	"github.com/shiblon/entroq/pkg/eqsvcjson"
@@ -236,5 +239,51 @@ func TestUnknownJSONFieldsRefused(t *testing.T) {
 	resp.Body.Close()
 	if strings.Contains(string(b), `"queue":"/strict"`) {
 		t.Errorf("After the refused requests: want nothing inserted, got %s", b)
+	}
+}
+
+// TestStreamTasksOverConnect covers the streaming route, which nothing else does.
+//
+// streamAdapter satisfies the gRPC service's stream interface by EMBEDDING it and
+// leaving it nil, so every method the service calls that the adapter does not
+// define itself is a nil dereference. QSvc.StreamTasks opens by setting the
+// protocol header on the stream, which is such a method -- so this route panicked
+// on its first statement and dropped the connection. The gRPC-side test fake was
+// given that method; the production adapter was not, and nothing covered it.
+func TestStreamTasksOverConnect(t *testing.T) {
+	ts, cleanup := newTestServer(t)
+	defer cleanup()
+
+	if code, _ := postJSON(t, ts.URL+"/api/v0/modify", map[string]any{
+		"claimantId": "test",
+		"inserts":    []any{map[string]any{"queue": "/stream/q", "value": "x"}},
+	}); code != http.StatusOK {
+		t.Fatalf("seed insert: status %d", code)
+	}
+
+	client := apiconnect.NewEntroQClient(http.DefaultClient, ts.URL)
+	stream, err := client.StreamTasks(context.Background(),
+		connect.NewRequest(&pb.TasksRequest{Queue: "/stream/q"}))
+	if err != nil {
+		t.Fatalf("StreamTasks: %v", err)
+	}
+	defer stream.Close()
+
+	var queues []string
+	for stream.Receive() {
+		for _, task := range stream.Msg().GetTasks() {
+			queues = append(queues, task.GetQueue())
+		}
+	}
+	if err := stream.Err(); err != nil {
+		t.Fatalf("receiving: %v", err)
+	}
+	if len(queues) == 0 {
+		t.Fatal("stream delivered no tasks")
+	}
+	for _, q := range queues {
+		if q != "/stream/q" {
+			t.Errorf("streamed a task from %q, want /stream/q", q)
+		}
 	}
 }
