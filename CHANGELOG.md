@@ -414,6 +414,15 @@ runs, so plan a short maintenance window on large doc tables.
 
 ### Fixed
 
+- **A renewal that cannot be read is a lost claim, in Go too.** `held.renewed`
+  returned a plain error when a renewal reply did not name everything it
+  renewed, so `Run` stopped the worker over a reply it could not interpret.
+  A version the reply leaves out is one the worker cannot name again, which is
+  the same verdict a refused renewal reaches: it is now a dependency error
+  naming the task, so the task goes back and the worker takes another. The
+  Python client reaches the same verdict the same way. `pkg/workgateway` hosts
+  foreign workers on this loop, so it inherits the change.
+
 - **A Python doc-contention retry spreads the workers that lost.** Every
   worker that loses one race for a doc set fails at the same instant, and all
   of them waited exactly `retry_delay_s`, came back together, and all but one

@@ -322,12 +322,27 @@ func TestHeldRenewed(t *testing.T) {
 		t.Error("renewed changed the sets it was given")
 	}
 
-	missingSet := &entroq.ModifyResponse{ChangedTasks: resp.ChangedTasks, ChangedSets: resp.ChangedSets[:1]}
-	if _, err := h.renewed(missingSet); err == nil {
-		t.Error("Response missing a set: want an error")
-	}
-	if _, err := h.renewed(&entroq.ModifyResponse{ChangedSets: resp.ChangedSets}); err == nil {
-		t.Error("Response missing the task: want an error")
+	// A reply that leaves out something it renewed leaves a version the worker
+	// cannot name again, so the hold is gone: the same verdict a refused
+	// renewal reaches, and the same error, so the run loop drops this task and
+	// takes another instead of ending the process.
+	for name, bad := range map[string]*entroq.ModifyResponse{
+		"missing a set":    {ChangedTasks: resp.ChangedTasks, ChangedSets: resp.ChangedSets[:1]},
+		"missing the task": {ChangedSets: resp.ChangedSets},
+		"naming another task": {
+			ChangedTasks: []*entroq.Task{{ID: "other", Version: 4}},
+			ChangedSets:  resp.ChangedSets,
+		},
+	} {
+		_, err := h.renewed(bad)
+		depErr, ok := entroq.AsDependency(err)
+		if !ok {
+			t.Errorf("Response %s: want a dependency error, got %v", name, err)
+			continue
+		}
+		if len(depErr.Depends) != 1 || depErr.Depends[0].ID != task.ID {
+			t.Errorf("Response %s: want task %q among the depends, got %v", name, task.ID, depErr.Depends)
+		}
 	}
 }
 

@@ -1043,10 +1043,14 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 
 	// Once renewal has stopped, that is why the work ended, whatever the
 	// handler returned, except that a handler's FatalError still stops the
-	// worker: handlers keep that control. A lost claim ends this task, not the
-	// worker: the task is someone else's now, and there is nothing to commit,
-	// so a retry or move could not land either. Anything else that stops
-	// renewal is the deployment's to fix.
+	// worker: handlers keep that control.
+	//
+	// Renewal stopping is a lost claim, however it happened -- refused, or
+	// answered in a way that leaves the hold unnameable (held.lostf). That
+	// ends this task, not the worker: the task is someone else's now, and
+	// there is nothing to commit, so a retry or move could not land either.
+	// What remains here is a transport or context failure, which is the
+	// deployment's to fix.
 	if renewErr != nil {
 		if fe, ok := AsFatal(sentinelErr); ok {
 			return fe
@@ -1510,7 +1514,7 @@ type held struct {
 // new version, and each set, and its docs, at the set's new lock.
 func (h held) renewed(resp *entroq.ModifyResponse) (held, error) {
 	if len(resp.ChangedTasks) != 1 || resp.ChangedTasks[0].ID != h.task.ID {
-		return held{}, fmt.Errorf("renewal of task %s returned tasks %v", h.task.ID, resp.ChangedTasks)
+		return held{}, h.lostf("renewal of task %s answered with tasks %v", h.task.ID, resp.ChangedTasks)
 	}
 	locks := make(map[setKey]*entroq.DocSet, len(resp.ChangedSets))
 	for _, l := range resp.ChangedSets {
@@ -1520,11 +1524,24 @@ func (h held) renewed(resp *entroq.ModifyResponse) (held, error) {
 	for _, g := range h.sets {
 		l, ok := locks[setKey{g.Namespace, g.Key}]
 		if !ok {
-			return held{}, fmt.Errorf("renewal did not return doc set %q in %q", g.Key, g.Namespace)
+			return held{}, h.lostf("renewal of task %s did not answer with doc set %q in %q", h.task.ID, g.Key, g.Namespace)
 		}
 		out.sets = append(out.sets, relocked(g, l))
 	}
 	return out, nil
+}
+
+// lostf reports that the hold is gone, as a failed depend on the task.
+//
+// A renewal answering without naming everything it renewed leaves a version
+// the worker cannot name again, and a worker that cannot name its hold does
+// not have one. That is the same verdict a refused renewal reaches, so it is
+// the same error: the task goes back and this worker takes another, rather
+// than the process ending over a reply it could not read.
+func (h held) lostf(format string, args ...any) error {
+	depErr := entroq.DependencyErrorf("%s", fmt.Sprintf(format, args...))
+	depErr.Depends = append(depErr.Depends, h.task.IDVersion())
+	return depErr
 }
 
 // grantedLease returns the lease a claim or renewal actually GRANTED, which a
