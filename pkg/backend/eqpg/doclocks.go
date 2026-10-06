@@ -72,21 +72,21 @@ func occupantKey(ns, key, secondary string) string {
 	return ns + "\x00" + key + "\x00" + secondary
 }
 
-// lockOccupants reads the docs already holding the secondary keys mod's inserts
-// want, batched the way lockMembers reads the docs mod names by ID. A set is a
-// map from secondary key to doc, so an insert onto an occupied secondary key is
-// a collision; see docset.Evaluate.
+// lockOccupants reads the docs already holding the secondary keys inserts want,
+// batched the way lockMembers reads the docs a modification names by ID. A set
+// is a map from secondary key to doc, so an insert onto an occupied secondary
+// key is a collision; see docset.Evaluate.
 //
-// Only inserts need this: keys are immutable after creation, so nothing else can
-// move a doc onto an occupied key.
+// Only inserts need this: keys are immutable after creation, so nothing else
+// can move a doc onto an occupied key.
 //
-// Call it only while already holding the sets' locks, which is what makes the
-// answer trustworthy -- see the ordering note in modifyDocs. FOR UPDATE here
-// guards the rows it does find; it cannot guard a row that does not exist yet,
-// which is why the lock has to come first rather than this.
-func lockOccupants(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (map[string]*entroq.Doc, error) {
+// Reached only through lockSets, which has the sets' locks by then. FOR UPDATE
+// here guards the rows it does find and cannot guard one that does not exist
+// yet, which is why the lock has to come first and why this is not something a
+// caller can ask for on its own.
+func lockOccupants(ctx context.Context, tx *sql.Tx, inserts []*entroq.DocData) (map[string]*entroq.Doc, error) {
 	var ns, keys, secondaries []string
-	for _, d := range mod.DocInserts {
+	for _, d := range inserts {
 		ns = append(ns, d.Namespace)
 		keys = append(keys, d.Key)
 		secondaries = append(secondaries, d.SecondaryKey)
@@ -113,12 +113,42 @@ func lockOccupants(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (m
 	return occupants, nil
 }
 
-// lockSets locks the lock rows of sets and returns them with the
-// database's time. The lock row is the set's mutex for the length of the
-// transaction, apart from any claim on it: sets in exclusive, which the
-// modification writes, are locked FOR UPDATE, and the rest, which it only
-// depends on, FOR SHARE, so concurrent depends proceed together while a
-// writer waits for them (see docset.Exclusive).
+// lockedSets is what a transaction holds once lockSets returns: every set's
+// lock, the database's time read with them, and the doc occupying each
+// secondary key an insert names.
+//
+// The occupants belong here rather than to a call of their own because the
+// lock is what makes them true. FOR UPDATE cannot lock a row no transaction
+// has inserted yet, so a probe made before the lock reads a set the writer
+// ahead of it has not committed to, and two inserts at one secondary key both
+// find the place empty. Returning them together is the ordering: there is no
+// way to hold the answer without holding the locks.
+type lockedSets struct {
+	locks     map[docset.Set]docset.Lock
+	occupants map[string]*entroq.Doc
+	now       time.Time
+}
+
+// lock gives a set's lock, docset.Absent for a set that has none.
+func (s *lockedSets) lock(g docset.Set) docset.Lock {
+	if l, ok := s.locks[g]; ok {
+		return l
+	}
+	return docset.Absent
+}
+
+// occupant gives the doc holding a secondary key in a set, nil if the place is
+// free.
+func (s *lockedSets) occupant(g docset.Set, secondary string) *entroq.Doc {
+	return s.occupants[occupantKey(g.Namespace, g.Key, secondary)]
+}
+
+// lockSets locks the lock rows of sets and reads what they then guard. The
+// lock row is the set's mutex for the length of the transaction, apart from any
+// claim on it: sets in exclusive, which the modification writes, are locked FOR
+// UPDATE, and the rest, which it only depends on, FOR SHARE, so concurrent
+// depends proceed together while a writer waits for them (see
+// docset.Exclusive).
 //
 // Rows are locked in (namespace, key) order, a run of same-mode sets per
 // statement, so modifications locking the same sets cannot deadlock.
@@ -126,11 +156,14 @@ func lockOccupants(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (m
 // A written set with no lock row gets one at placeholderVersion; if the
 // modification fails, the row rolls back with it. A shared set always has
 // one, as a depend names a stored member.
-func lockSets(ctx context.Context, tx *sql.Tx, sets []docset.Set, exclusive map[docset.Set]bool) (map[docset.Set]docset.Lock, time.Time, error) {
+//
+// inserts are the docs the modification inserts, whose secondary keys decide
+// which occupants to read; a caller with no inserts passes nil.
+func lockSets(ctx context.Context, tx *sql.Tx, sets []docset.Set, exclusive map[docset.Set]bool, inserts []*entroq.DocData) (*lockedSets, error) {
 	locks := make(map[docset.Set]docset.Lock, len(sets))
 	if len(sets) == 0 {
 		now, err := txNow(ctx, tx)
-		return locks, now, err
+		return &lockedSets{locks: locks, now: now}, err
 	}
 	sorted := slices.SortedFunc(slices.Values(sets), func(a, b docset.Set) int {
 		return cmp.Or(cmp.Compare(a.Namespace, b.Namespace), cmp.Compare(a.Key, b.Key))
@@ -147,11 +180,15 @@ func lockSets(ctx context.Context, tx *sql.Tx, sets []docset.Set, exclusive map[
 		}
 		var err error
 		if now, err = lock(ctx, tx, sorted[:n], locks); err != nil {
-			return nil, time.Time{}, err
+			return nil, err
 		}
 		sorted = sorted[n:]
 	}
-	return locks, now, nil
+	occupants, err := lockOccupants(ctx, tx, inserts)
+	if err != nil {
+		return nil, err
+	}
+	return &lockedSets{locks: locks, occupants: occupants, now: now}, nil
 }
 
 // upsertSets locks the lock rows of sets FOR UPDATE, creating any that
@@ -250,30 +287,12 @@ func modifyDocs(ctx context.Context, tx *sql.Tx, mod *entroq.Modification, resp 
 		return err
 	}
 	member := func(ns, id string) *entroq.Doc { return stored[entroq.DocKey(ns, id)] }
-	locks, now, err := lockSets(ctx, tx, docset.Sets(mod, member), docset.Exclusive(mod, member))
+	held, err := lockSets(ctx, tx, docset.Sets(mod, member), docset.Exclusive(mod, member), mod.DocInserts)
 	if err != nil {
 		return err
 	}
-	// AFTER lockSets, and it has to be. A set's lock is what serializes writers
-	// to it, but FOR UPDATE cannot lock a row another transaction has not
-	// inserted yet, so a probe run before the lock sees nothing and locks
-	// nothing. Two inserts at one secondary key would then both find the place
-	// empty: the first commits, the second takes the lock it was waiting for and
-	// consults a map read before that commit. Probing while holding the lock
-	// means whatever the previous writer did is already visible.
-	occupants, err := lockOccupants(ctx, tx, mod)
-	if err != nil {
-		return err
-	}
-	occupant := func(g docset.Set, secondary string) *entroq.Doc {
-		return occupants[occupantKey(g.Namespace, g.Key, secondary)]
-	}
-	plan := docset.Evaluate(mod, now, member, occupant, func(g docset.Set) docset.Lock {
-		if l, ok := locks[g]; ok {
-			return l
-		}
-		return docset.Absent
-	})
+	now := held.now
+	plan := docset.Evaluate(mod, now, member, held.occupant, held.lock)
 	if plan.Err != nil {
 		return plan.Err
 	}
@@ -283,7 +302,7 @@ func modifyDocs(ctx context.Context, tx *sql.Tx, mod *entroq.Modification, resp 
 		g := docset.Set{Namespace: d.Namespace, Key: d.Key}
 		l, ok := plan.Locks[g]
 		if !ok {
-			l = locks[g]
+			l = held.lock(g)
 		}
 		return docset.Overlay(d, l)
 	}
@@ -432,11 +451,11 @@ func claimDocs(ctx context.Context, tx *sql.Tx, cq *entroq.DocClaim) ([]*entroq.
 	for _, g := range sets {
 		exclusive[g] = true
 	}
-	locks, now, err := lockSets(ctx, tx, sets, exclusive)
+	held, err := lockSets(ctx, tx, sets, exclusive, nil)
 	if err != nil {
 		return nil, err
 	}
-	lock := func(g docset.Set) docset.Lock { return locks[g] }
+	now := held.now
 	members := func(g docset.Set) ([]*entroq.Doc, error) {
 		rows, err := tx.QueryContext(ctx, `SELECT `+docColumns+` FROM `+docsWithLocks+`
 			WHERE d.namespace = $1 AND d.key_primary = $2
@@ -460,7 +479,7 @@ func claimDocs(ctx context.Context, tx *sql.Tx, cq *entroq.DocClaim) ([]*entroq.
 			return nil, docset.MissingTaskErrorf(cq.TaskToMatch, "pg claim docs")
 		}
 	}
-	claimed, err := docset.ClaimAll(cq, now, until, lock, members)
+	claimed, err := docset.ClaimAll(cq, now, until, held.lock, members)
 	if err != nil {
 		return nil, err
 	}
