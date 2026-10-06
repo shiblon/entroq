@@ -340,13 +340,13 @@ func (h *doModifyHandler[T]) DoWork(ctx context.Context, task *entroq.Task, val 
 func (h *doModifyHandler[T]) Finish(ctx context.Context, mod Modifier, finalTask *entroq.Task, val T, finalSets []*entroq.DocSet) error {
 	// initialTask is set unconditionally by TakeDocs, which always runs before
 	// Finish, so it is non-nil here by construction.
-	if h.result == nil {
-		// Handler returned no Result: nothing to commit, nothing to run.
-		return nil
-	}
-
-	var release []*entroq.DocSet
-	if len(h.result.mods) > 0 {
+	//
+	// A doc claim is a transaction scoped to this body (see releasing), so the
+	// modification that ends the body carries the releases. A body with nothing
+	// to commit still ended, and its sets still go back, in a modification of
+	// their own.
+	modification := entroq.NewModification("")
+	if h.result != nil && len(h.result.mods) > 0 {
 		if finalTask == nil {
 			return FatalErrorf("doModify finish: nil finalized task with modifications to apply")
 		}
@@ -354,7 +354,7 @@ func (h *doModifyHandler[T]) Finish(ctx context.Context, mod Modifier, finalTask
 			return fmt.Errorf("task updated inside worker body, expected version <= %v, got %v", finalTask.Version, h.initialTask.Version)
 		}
 
-		modification := entroq.NewModification("", h.result.mods...)
+		modification = entroq.NewModification("", h.result.mods...)
 		fixVersions(modification, finalTask, finalSets)
 		// The worker changed the task on purpose, so the claims before this
 		// one no longer point at a poison pill.
@@ -363,21 +363,28 @@ func (h *doModifyHandler[T]) Finish(ctx context.Context, mod Modifier, finalTask
 				modification.ResetClaims(c.ID)
 			}
 		}
+	}
+	releasing(modification, finalSets)
+	// Modify refuses a modification that names no operation, so a body that
+	// decided nothing and held nothing writes nothing.
+	if !modification.IsEmpty() {
 		if _, err := mod.Modify(ctx, entroq.WithModification(modification)); err != nil {
 			return h.commitFailed(ctx, err)
 		}
-		// The sets follow the task: once the commit lets go of it, the sets
-		// the commit did not write are released too, after OnSuccess, which
-		// may still use them.
-		if writesTask(modification, finalTask.ID) {
-			release = untouched(modification, finalSets)
+		if finalTask != nil {
+			h.released = onlyArrives(modification, finalTask.ID)
 		}
-		h.released = onlyArrives(modification, finalTask.ID)
+	}
+
+	if h.result == nil {
+		// No Result, so nothing to run after the release.
+		return nil
 	}
 
 	// The task was handled successfully (no error; any modifications committed).
 	// OnSuccess is the optimistic post-success step: best-effort (its error is
-	// logged), unless it returns a FatalError, which stops the worker.
+	// logged), unless it returns a FatalError, which stops the worker. It holds
+	// no doc claim: the transaction ended with the commit above.
 	var fatal error
 	if h.result.onSuccess != nil {
 		if err := h.result.onSuccess(ctx); err != nil {
@@ -388,15 +395,25 @@ func (h *doModifyHandler[T]) Finish(ctx context.Context, mod Modifier, finalTask
 			}
 		}
 	}
-	releaseSets(ctx, mod, release)
 	return fatal
+}
+
+// resultOnDependency returns the handler's dependency hook, or nil when there
+// is no Result to hold one.
+func (h *doModifyHandler[T]) resultOnDependency() func(context.Context, *entroq.DependencyError) error {
+	if h.result == nil {
+		return nil
+	}
+	return h.result.onDependency
 }
 
 // commitFailed handles a commit of the handler's result that did not apply.
 func (h *doModifyHandler[T]) commitFailed(ctx context.Context, err error) error {
 	if depErr, ok := entroq.AsDependency(err); ok {
 		log.Printf("Worker ack failed: %v", err)
-		if fn := h.result.onDependency; fn != nil {
+		// h.result is nil when the commit carried only releases, and there is
+		// then no hook to consult.
+		if fn := h.resultOnDependency(); fn != nil {
 			// A returned Retry/Move/Fatal sentinel is honored by runOne
 			// via handleSentinelErrors, exactly like a work-phase sentinel;
 			// any other non-nil error stops the worker. A nil return falls
@@ -473,12 +490,6 @@ type (
 	docKey struct{ ns, id string }
 )
 
-// writesTask reports whether m changes, deletes, or makes arrive the task
-// with the given ID, rather than only depending on it.
-func writesTask(m *entroq.Modification, id string) bool {
-	return rewritesTask(m, id) || arrives(m, id)
-}
-
 // rewritesTask reports whether m changes or deletes the task with the given
 // ID.
 func rewritesTask(m *entroq.Modification, id string) bool {
@@ -511,60 +522,59 @@ func onlyArrives(m *entroq.Modification, id string) bool {
 	return arrives(m, id) && !rewritesTask(m, id)
 }
 
-// untouched returns, of the doc sets claimed here, those m has not already
-// modified.
+// releasing adds to m a release for every doc set claimed here whose arrival m
+// has not already decided, so the sets go back in the very transaction that
+// ends the worker body.
 //
-// Its result is always a subset of sets, and must stay one: releasing a set
-// moves its version, so naming one this worker holds no lease on would
-// disturb a set that is somebody else's or nobody's. A modification may
-// mention sets that were never claimed here, so the leasehold decides what
-// may be released and m only decides what to leave out of it.
+// A doc claim is a transaction scoped to that body: the sets were taken for the
+// work, the work is over, so they are no longer in it. They go back whatever
+// else m does -- the task need not be in m at all, and a body that mutated docs
+// and left the task alone still frees them. Doc sets are shared, so an early
+// release unblocks consumers with nothing to do with this task, and the task's
+// own arrival says nothing about them.
 //
-// Modified means a member inserted, changed, or deleted, or the set given an
-// arrival: then the modification has already decided its arrival and must not
-// be second-guessed. Depending on a doc only watches its set, which leaves it
-// eligible for release.
-func untouched(m *entroq.Modification, sets []*entroq.DocSet) []*entroq.DocSet {
-	memberOf := make(map[docKey]setKey)
-	for _, g := range sets {
-		for _, d := range g.Docs {
-			memberOf[docKey{d.Namespace, d.ID}] = setKey{g.Namespace, g.Key}
-		}
-	}
-	written := make(map[setKey]bool)
-	for _, ins := range m.DocInserts {
-		written[setKey{ins.Namespace, ins.Key}] = true
-	}
-	for _, dc := range m.DocChanges {
-		written[setKey{dc.Namespace, dc.Key}] = true
-	}
-	for _, dd := range m.DocDeletes {
-		if k, ok := memberOf[docKey{dd.Namespace, dd.ID}]; ok {
-			written[k] = true
-		}
-	}
-	for _, a := range m.DocArrives {
-		written[setKey{a.Namespace, a.Key}] = true
-	}
-	var out []*entroq.DocSet
-	for _, g := range sets {
-		if !written[setKey{g.Namespace, g.Key}] {
-			out = append(out, g)
-		}
-	}
-	return out
-}
-
-// releaseSets makes sets ready again now, after a commit that let go of the
-// task holding them. It is best-effort: a set it cannot release waits out its
-// lease, as it would have without it.
-func releaseSets(ctx context.Context, mod Modifier, sets []*entroq.DocSet) {
+// DECIDED means m names the set in an arrival, or a member write asks to hold it
+// past now (By above zero, which is docset's own rule for what holds a set).
+// Explicit intent wins: a handler that pushes a set into the future keeps it.
+// Expected to be rare -- doing nothing releases everything, which is the useful
+// default. A delete never holds a set, and depending on a doc only watches it,
+// so neither keeps one.
+//
+// The result only ever names sets claimed here, and must stay that way:
+// releasing moves a set's version, so naming one this worker holds no lease on
+// would disturb a set that is somebody else's or nobody's. The leasehold
+// decides what MAY be released and m only decides what to leave out.
+//
+// Nothing releases on a path where the body FAILED -- a dependency error on the
+// commit, a fatal error, a panic. There is nothing to clean up: a set claimed
+// with MatchingLeaseOf took the task's own arrival, read in one transaction, and
+// renewal keeps the two equal, so when nothing moved the task and its sets lapse
+// together and no cleanup could beat the lease.
+func releasing(m *entroq.Modification, sets []*entroq.DocSet) {
 	if len(sets) == 0 {
 		return
 	}
-	if _, err := mod.Modify(ctx, entroq.Arriving(entroq.ReadyNow().Docs(sets...))); err != nil {
-		log.Printf("worker: release doc sets after commit: %v", err)
+	decided := make(map[setKey]bool)
+	for _, a := range m.DocArrives {
+		decided[setKey{a.Namespace, a.Key}] = true
 	}
+	for _, ins := range m.DocInserts {
+		if ins.By() > 0 {
+			decided[setKey{ins.Namespace, ins.Key}] = true
+		}
+	}
+	for _, d := range m.DocChanges {
+		if d.By() > 0 {
+			decided[setKey{d.Namespace, d.Key}] = true
+		}
+	}
+	var free []*entroq.DocSet
+	for _, g := range sets {
+		if !decided[setKey{g.Namespace, g.Key}] {
+			free = append(free, g)
+		}
+	}
+	entroq.Arriving(entroq.ReadyNow().Docs(free...))(m)
 }
 
 // Worker[T] defines a looping protocol that processes tasks in a queue. It
@@ -805,7 +815,14 @@ func WithErrQMap[T any](f ErrQMap) Option[T] {
 
 // handleSentinelErrors commits the disposition a sentinel error asks for. A
 // retry or move lets go of the task, so the doc sets it held, in sets, are
-// released after it commits.
+// released in that same modification -- see releasing. Riding along rather than
+// following it leaves no window where the task is available again and its docs
+// are not, which a worker claiming the retried task would otherwise lose a
+// backoff to.
+//
+// This applies to both handler paths. A sentinel skips Finish entirely, so the
+// worker is the one writing this modification whichever handler asked for it,
+// and nothing here second-guesses a hand-written Finish.
 func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, task *entroq.Task, sets []*entroq.DocSet, errQ string, opts *runOpt) (isSentinel bool, err error) {
 	if re, ok := AsRetry(sentinel); ok {
 		delay := opts.baseRetryDelay
@@ -816,7 +833,9 @@ func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, ta
 		if re.moveTo != "" {
 			q = re.moveTo
 		}
-		if _, err := w.eqc.Modify(ctx, task.RetryOrQuarantine(re.Error(), q, opts.maxAttempts, entroq.ArrivalTimeBy(delay))); err != nil {
+		if _, err := w.eqc.Modify(ctx,
+			task.RetryOrQuarantine(re.Error(), q, opts.maxAttempts, entroq.ArrivalTimeBy(delay)),
+			entroq.Arriving(entroq.ReadyNow().Docs(sets...))); err != nil {
 			if _, ok := entroq.AsDependency(err); ok {
 				// Optimistic: the task moved out from under us (already reclaimed
 				// or handled elsewhere). Known state, not fatal -- log and continue.
@@ -825,7 +844,6 @@ func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, ta
 			}
 			return true, fmt.Errorf("retry or quarantine modify: %w", err)
 		}
-		releaseSets(ctx, w.eqc, sets)
 		return true, nil
 	}
 	if me, ok := AsMove(sentinel); ok {
@@ -833,7 +851,8 @@ func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, ta
 		if me.to != "" {
 			q = me.to
 		}
-		if _, err := w.eqc.Modify(ctx, task.Quarantine(me.Error(), q)); err != nil {
+		if _, err := w.eqc.Modify(ctx, task.Quarantine(me.Error(), q),
+			entroq.Arriving(entroq.ReadyNow().Docs(sets...))); err != nil {
 			if _, ok := entroq.AsDependency(err); ok {
 				// Optimistic: the task moved out from under us (already reclaimed
 				// or handled elsewhere). Known state, not fatal -- log and continue.
@@ -842,7 +861,6 @@ func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, ta
 			}
 			return true, fmt.Errorf("quarantine modify: %w", err)
 		}
-		releaseSets(ctx, w.eqc, sets)
 		return true, nil
 	}
 	if fe, ok := AsFatal(sentinel); ok {

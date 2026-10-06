@@ -779,21 +779,27 @@ func WorkerHoldsEmptyGroup(ctx context.Context, t *testing.T, client *entroq.Ent
 	}
 }
 
-// WorkerReleasesSets verifies that a worker's doc sets follow its task: once
-// a commit lets go of the task, the sets it held and did not write are freed
-// promptly rather than left to their leases.
+// WorkerReleasesSets verifies the worker's doc-claim contract: a claim is a
+// transaction scoped to the handler body, so every set the body held goes back
+// when the body ends, in the very modification that ends it.
 //
-// The freeing is NOT part of the commit, and cannot be. A set the modify only
-// DEPENDS on is watched, not mutated: its version is checked and nothing is
-// written to it. A set the modify never names is not there to free. Only a
-// set the modify IMPLICATES -- inserted into, changed, deleted from, or given
-// an arrival -- is mutated, and then under its own version check, inside the
-// one transaction.
+// Only one thing keeps a set: an arrival the body puts in the FUTURE, whether
+// as a set arrival or a member write asking to hold it. Depending on a doc only
+// watches it. A member written with no arrival is a set the body is done with.
+// And the task need not be in the modification at all -- the sets belong to the
+// body, not to the task, so a body that touches only docs still frees them.
 //
-// So the worker issues a second, best-effort modification afterwards for the
-// sets it still holds and did not implicate, and a set it fails to free
-// simply waits out its lease. These subtests therefore await the release
-// rather than asserting it the instant the commit lands.
+// Where the body commits something, the release rides along, so these subtests
+// assert it the INSTANT the commit lands. Polling there would be weaker: it
+// would pass just as well if the release were still a second call afterwards.
+//
+// Where the body commits nothing of its own, there is no commit to synchronize
+// on, so those subtests must await the release -- and the deadline is half a
+// lease, shared across the sets. The sets were claimed until the task's own
+// arrival, so nothing can pass by merely lapsing within that bound, which is
+// what keeps "released" distinct from "expired on its own". One deadline for
+// all of them, not one each: waiting per key would let the total run past a
+// lease, and a set freed by lapsing would then be mistaken for one released.
 func WorkerReleasesSets(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	// The lease is long, so a set that is free soon after the task was
 	// handled was released, not expired.
@@ -842,7 +848,7 @@ func WorkerReleasesSets(ctx context.Context, t *testing.T, client *entroq.EntroQ
 		}
 	}
 
-	t.Run("a commit is followed by releasing the sets it did not write", func(t *testing.T) {
+	t.Run("a commit releases the sets it did not hold into the future", func(t *testing.T) {
 		queue := path.Join(qPrefix, "worker_releases_commit")
 		ns := path.Join(qPrefix, "worker_releases_commit_docs")
 		if _, err := client.Modify(ctx,
@@ -868,42 +874,26 @@ func WorkerReleasesSets(ctx context.Context, t *testing.T, client *entroq.EntroQ
 		defer stop()
 		gone(t, queue)
 
-		// Three separate things are in play here, and only the third frees a
-		// set:
+		// Three things are in play, and two of them are freed BY the commit:
 		//
-		//   - "depended" is named in the modify's Depends. It is WATCHED: its
-		//     version is checked and it is never mutated.
-		//   - "written" is IMPLICATED by the modify. Its version is checked
-		//     and it is mutated under that check, in the one transaction.
-		//   - "empty" is not in the modify at all.
+		//   - "depended" is named in Depends. Watching a doc says nothing
+		//     about wanting to keep its set, so it is released.
+		//   - "empty" is not in the modify at all, so nothing decided its
+		//     arrival and it is released.
+		//   - "written" is changed with an arrival a lease away. That is
+		//     explicit intent to keep holding it, and the only thing that
+		//     keeps a set.
 		//
-		// So the commit frees nothing. The sets it did not implicate are freed
-		// AFTERWARDS, by a separate best-effort modification, which is why
-		// these are awaited rather than checked the instant the commit lands.
-		//
-		// The deadline is half a lease on purpose. The sets were claimed until
-		// the task's own arrival, so nothing here can pass by merely lapsing;
-		// it passes only if the release actually ran, which is what keeps
-		// "released promptly" distinct from "expired on its own".
-		// ONE deadline for all of them, not one each: waiting per key would let
-		// the total run past a lease, and a set that came free by lapsing
-		// would then be mistaken for one that was released.
-		deadline := time.Now().Add(lease / 2)
+		// Asserted with no polling. The releases are in the same transaction
+		// as the task's deletion, so the moment the task is gone they have
+		// landed; awaiting them here would pass even if they had not.
 		for _, key := range []string{"depended", "empty"} {
-			for !free(t, ns, key) {
-				if time.Now().After(deadline) {
-					t.Errorf("A set the commit did not write (%q): want it released within %v of the commit", key, lease/2)
-					break
-				}
-				time.Sleep(20 * time.Millisecond)
+			if !free(t, ns, key) {
+				t.Errorf("A set the commit did not hold into the future (%q): want it released by the commit itself", key)
 			}
 		}
-		// Checked last, after the releases have been awaited: by now a release
-		// that wrongly swept up a written set has had its chance to land, so
-		// this is a stronger statement here than it would be straight after
-		// the commit.
 		if free(t, ns, "written") {
-			t.Error("A set the commit wrote: want it to keep the arrival the commit gave it")
+			t.Error("A set the commit held into the future: want it to keep the arrival the commit gave it")
 		}
 	})
 
@@ -928,9 +918,96 @@ func WorkerReleasesSets(ctx context.Context, t *testing.T, client *entroq.EntroQ
 		)
 		defer stop()
 		<-retried
-		for deadline := time.Now().Add(lease / 2); !free(t, ns, "held"); time.Sleep(20 * time.Millisecond) {
+		// The retry's own modification carries the release, so the set is free
+		// the moment the retry has landed -- no window in which the task could
+		// be claimed again while its docs were still held. The retry is visible
+		// as the attempt it counted; a retried task keeps its claimant and
+		// simply arrives later, so neither of those says it has landed.
+		for deadline := time.Now().Add(lease / 2); ; time.Sleep(20 * time.Millisecond) {
+			tasks, err := client.Tasks(ctx, queue)
+			if err != nil {
+				t.Fatalf("Tasks: %v", err)
+			}
+			if len(tasks) > 0 && tasks[0].Attempt > 0 {
+				break
+			}
 			if time.Now().After(deadline) {
-				t.Fatal("A set held by a retried task: want it released")
+				t.Fatal("Retry did not land in time")
+			}
+		}
+		if !free(t, ns, "held") {
+			t.Error("A set held by a retried task: want it released by the retry itself")
+		}
+	})
+
+	t.Run("a body that commits nothing still releases its sets", func(t *testing.T) {
+		queue := path.Join(qPrefix, "worker_releases_nothing")
+		ns := path.Join(qPrefix, "worker_releases_nothing_docs")
+		if _, err := client.Modify(ctx, entroq.InsertingInto(queue)); err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+		done := make(chan bool, 1)
+		stop := run(t, queue,
+			worker.WithTakeDocs(func(context.Context, *entroq.Task, json.RawMessage) (*worker.TakeResult, error) {
+				return worker.Take(entroq.ClaimKey(ns, "held"), entroq.ClaimKey(ns, "empty")), nil
+			}),
+			worker.WithDoModify(func(context.Context, *entroq.Task, json.RawMessage, []*entroq.DocSet) (*worker.Result, error) {
+				select {
+				case done <- true:
+				default:
+				}
+				// Nothing to commit. The body still ended, so the sets still
+				// go back -- in a modification of their own, since there is no
+				// other. The task is left alone and keeps its lease.
+				return nil, nil
+			}),
+		)
+		defer stop()
+		<-done
+		// Awaited, not immediate: nothing was committed, so there is no
+		// observable event to synchronize on. One deadline across both sets.
+		deadline := time.Now().Add(lease / 2)
+		for _, key := range []string{"held", "empty"} {
+			for !free(t, ns, key) {
+				if time.Now().After(deadline) {
+					t.Errorf("A set held by a body that committed nothing (%q): want it released anyway", key)
+					break
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+		}
+	})
+
+	t.Run("a body that leaves the task alone still releases its sets", func(t *testing.T) {
+		queue := path.Join(qPrefix, "worker_releases_docs_only")
+		ns := path.Join(qPrefix, "worker_releases_docs_only_docs")
+		if _, err := client.Modify(ctx,
+			entroq.InsertingInto(queue),
+			entroq.PuttingDocInto(ns, entroq.WithKeys("written", "")),
+		); err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+		done := make(chan bool, 1)
+		stop := run(t, queue,
+			worker.WithTakeDocs(func(context.Context, *entroq.Task, json.RawMessage) (*worker.TakeResult, error) {
+				return worker.Take(entroq.ClaimKey(ns, "written")), nil
+			}),
+			worker.WithDoModify(func(_ context.Context, _ *entroq.Task, _ json.RawMessage, sets []*entroq.DocSet) (*worker.Result, error) {
+				select {
+				case done <- true:
+				default:
+				}
+				// Writes a doc and says nothing about the task, so the task
+				// keeps its lease. The set is still the body's to give back,
+				// and the write asks for no future arrival.
+				return worker.Modify(sets[0].Docs[0].Change(entroq.WithContent("done"))), nil
+			}),
+		)
+		defer stop()
+		<-done
+		for deadline := time.Now().Add(lease / 2); !free(t, ns, "written"); time.Sleep(20 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatal("A set written by a body that left the task alone: want it released anyway")
 			}
 		}
 	})
