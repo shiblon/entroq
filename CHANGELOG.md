@@ -37,11 +37,10 @@ runs, so plan a short maintenance window on large doc tables.
 
 - **Renewal retries are reported.** `entroq.worker.renewal_retries_total`
   counts renewals retried after a transient failure, by queue and claimant,
-  and the Python worker exposes the same count as `EntroQWorker.renewal_retries`
-  (that client has no metrics stack, so it is a plain counter to read or
-  export). A lost claim is visible on its own; a renewal that failed and then
-  succeeded leaves no other trace, and a rising rate is the lease margin being
-  spent -- the margin being what absorbs the next problem.
+  A lost claim is visible on its own; a renewal that failed and then succeeded
+  leaves no other trace, and a rising rate is the lease margin being spent --
+  the margin being what absorbs the next problem. The Python client has no
+  metrics surface, so there it is a log line.
 
 - **`Handler.on_success` in the Python client.** The post-commit hook now
   carries the name of the Go hook whose contract it shares: it runs after the

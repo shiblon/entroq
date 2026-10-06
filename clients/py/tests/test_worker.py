@@ -1832,15 +1832,15 @@ def test_a_transient_renewal_failure_retries_inside_the_margin():
     client = FlakyRenewClient(tasks=[task], failures=1)
 
     async def run():
-        async with _renewing(client, task, ClaimedDocs()) as state:
+        async with _renewing(client, task, ClaimedDocs()):
             # Long enough for the first renewal, its failure, and the retry.
             await asyncio.sleep(0.35)
-            assert state.renewal_retries == 1, state.renewal_retries
 
     asyncio.run(run())
 
     gaps = client.gaps()
     assert gaps, f"only {len(client.attempts)} renewal attempts; the retry never happened"
+    assert len(client.attempts) >= 2, client.attempts
     # The first retry is due at margin/8 = 12.5ms, jitter adding a quarter.
     # The full interval would be 200ms.
     assert gaps[0] < 0.1, f"retry came {gaps[0]:.3f}s later, a cadence not a retry: {gaps}"

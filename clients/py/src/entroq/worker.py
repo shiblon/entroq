@@ -269,11 +269,6 @@ class _RenewState:
         # than a cancellation because a renewal already in flight may have
         # been applied: see _renewing.
         self.stop = asyncio.Event()
-        # Renewals that failed transiently and were retried. A lost claim is
-        # visible on its own; these leave no other trace, and a rising count
-        # is the lease margin being spent -- the margin being what absorbs the
-        # next problem.
-        self.renewal_retries = 0
 
     def stop_work(self, err: Exception) -> None:
         """Record that the hold is gone and cancel the handler.
@@ -444,7 +439,10 @@ async def _renewing(
                 # failed every worker's at once.
                 retry_s = next_renewal_retry_s(retry_s, margin_s, interval_s)
                 next_s = retry_s + random.uniform(0, retry_s / 4)
-                state.renewal_retries += 1
+                # The log line is the only record this client keeps: a renewal
+                # that failed and then succeeded leaves no other trace, and it
+                # is the lease margin being spent. The Go worker counts it as
+                # entroq.worker.renewal_retries_total.
                 logging.warning("Renewal error for task %s, retrying in %.3fs: %s",
                                 task.id, next_s, e)
                 continue
@@ -659,16 +657,6 @@ class EntroQWorker:
             raise ValueError("err_queue and err_q_map are mutually exclusive")
         self._client = client
         self._queues = list(queues)
-        #: Renewals this worker retried after a transient failure.
-        #:
-        #: A lost claim is visible on its own -- the run loop logs it and the
-        #: task comes back -- but a renewal that failed and then succeeded
-        #: leaves no other trace, and a rising count is the lease margin being
-        #: spent. The margin is what absorbs the next problem, so a spike is
-        #: worth looking into even when nothing was lost. The Go worker reports
-        #: the same thing as entroq.worker.renewal_retries_total; this client
-        #: has no metrics stack, so it is a plain counter to read or export.
-        self.renewal_retries = 0
         self._claim_duration_s = claim_duration_s
         if err_queue:
             self._err_q_map: Callable[[str], str] = lambda inbox: err_queue
@@ -901,8 +889,6 @@ class EntroQWorker:
                     raise
             except Exception as e:
                 do_work_exc = e
-
-        self.renewal_retries += state.renewal_retries
 
         # Three outcomes in Go's order. A fatal keeps the handler's control
         # whatever else happened. Then a stopped renewal is why the work
