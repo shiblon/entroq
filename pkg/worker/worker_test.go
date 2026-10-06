@@ -457,15 +457,17 @@ func TestDocsExpireWithTheirTask(t *testing.T) {
 	)
 	runCtx, runCancel := context.WithCancel(ctx)
 	errCh := make(chan error, 1)
-	go func() { errCh <- w.Run(runCtx, Watching("q"), WithLease(time.Minute)) }()
+	go func() { errCh <- w.Run(runCtx, Watching("q"), AsClaimant(holder), WithLease(time.Minute)) }()
 
 	s := <-got
 	if !s.a.Equal(s.task) || !s.b.Equal(s.task) {
 		t.Errorf("Sets held until %v and %v, want both until the task's arrival %v", s.a, s.b, s.task)
 	}
+	// Held by the RUN, which is its own consumer: the connection's claimant is
+	// a different one, and a set held by the Run excludes it like any other.
 	for _, h := range s.holders {
-		if h != client.ClientID {
-			t.Errorf("Set held by %q, want the worker's own claimant %q", h, client.ClientID)
+		if h != holder {
+			t.Errorf("Set held by %q, want the Run's own claimant %q", h, holder)
 		}
 	}
 	runCancel()
@@ -682,13 +684,19 @@ func TestLostClaimGoesOn(t *testing.T) {
 			runCtx, runCancel := context.WithCancel(ctx)
 			errCh := make(chan error, 1)
 			go func() {
-				errCh <- w.Run(runCtx, Watching("q"), WithLease(200*time.Millisecond), WithMaxClaims(1))
+				errCh <- w.Run(runCtx, Watching("q"), AsClaimant(holder), WithLease(200*time.Millisecond), WithMaxClaims(1))
 			}()
 
 			task := <-working
 			// The task changes underneath the worker: the version it holds is
 			// gone, so its next renewal finds the claim lost.
-			if _, err := client.Modify(ctx, task.Change(entroq.ValueTo("taken"), entroq.ArrivalTimeBy(time.Hour))); err != nil {
+			//
+			// The change comes from the consumer HOLDING the task, which is
+			// the Run and not the connection. Every Run is its own consumer
+			// now, so the connection's own claimant is a different one and is
+			// excluded from a held task -- which is the point of that, and
+			// means this has to name the holder to move the task at all.
+			if _, err := client.As(holder).Modify(ctx, task.Change(entroq.ValueTo("taken"), entroq.ArrivalTimeBy(time.Hour))); err != nil {
 				t.Fatalf("Change underneath: %v", err)
 			}
 			if _, err := client.Modify(ctx, entroq.InsertingInto("q", entroq.WithValue("next"))); err != nil {
@@ -715,6 +723,11 @@ func TestLostClaimGoesOn(t *testing.T) {
 	}
 }
 
+// holder names the consumer a Run holds its task as, where a test has to act
+// as that consumer to move the task. A Run would otherwise pick its own name
+// and nothing outside it could say what that was.
+const holder = "test-holder"
+
 // TestLostClaimFatalStops checks that a handler's FatalError still stops the
 // worker when its claim was lost: handlers keep that control.
 func TestLostClaimFatalStops(t *testing.T) {
@@ -735,9 +748,13 @@ func TestLostClaimFatalStops(t *testing.T) {
 		return FatalErrorf("cannot go on")
 	}))
 	errCh := make(chan error, 1)
-	go func() { errCh <- w.Run(ctx, Watching("q"), WithLease(200*time.Millisecond)) }()
+	go func() {
+		errCh <- w.Run(ctx, Watching("q"), AsClaimant(holder), WithLease(200*time.Millisecond))
+	}()
 	task := <-working
-	if _, err := client.Modify(ctx, task.Change(entroq.ArrivalTimeBy(time.Hour))); err != nil {
+	// As the holder: a Run is its own consumer, so the connection cannot
+	// touch a task the Run holds.
+	if _, err := client.As(holder).Modify(ctx, task.Change(entroq.ArrivalTimeBy(time.Hour))); err != nil {
 		t.Fatalf("Change underneath: %v", err)
 	}
 	if _, ok := AsFatal(<-errCh); !ok {

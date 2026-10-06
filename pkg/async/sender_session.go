@@ -46,6 +46,14 @@ type senderSession struct {
 	responseErr     error
 }
 
+// claimant is the consumer a session's workers hold things as: the connection
+// itself, for the reasons on Receiver.claimant. A session hands one exchange
+// between its workers and also touches those tasks through the sender's client
+// directly, so splitting the two would split the consumer.
+func (s *senderSession) claimant() string {
+	return s.sender.eq.ID()
+}
+
 func newSenderSession(sender *Sender, writer http.ResponseWriter, request *http.Request, session string, requestAck, responseData *receiveLane, bootstrapTask *entroq.Task, startedAt time.Time) *senderSession {
 	return &senderSession{
 		sender:        sender,
@@ -139,7 +147,8 @@ func (s *senderSession) runRequestWorkers(ctx context.Context) error {
 			worker.WithDoModify(s.handleRequestAck),
 			worker.WithMeterProvider[Envelope](s.sender.mp),
 		)
-		err := requestWorker.Run(workerCtx, worker.Watching(s.requestLanes.local.queue))
+		err := requestWorker.Run(workerCtx, worker.Watching(s.requestLanes.local.queue),
+			worker.AsClaimant(s.claimant()))
 		workerErr := workerCtx.Err()
 		stopWorker()
 		if err != nil {
@@ -265,7 +274,8 @@ func (s *senderSession) runResponseWorkers(ctx context.Context) error {
 			worker.WithDoModify(s.handleResponse),
 			worker.WithMeterProvider[Response](s.sender.mp),
 		)
-		err := responseWorker.Run(workerCtx, worker.Watching(s.responseLanes.local.queue))
+		err := responseWorker.Run(workerCtx, worker.Watching(s.responseLanes.local.queue),
+			worker.AsClaimant(s.claimant()))
 		workerErr := workerCtx.Err()
 		stopWorker()
 		if err != nil {

@@ -484,8 +484,10 @@ func TestBridge_DocInsert(t *testing.T) {
 	if got := string(docs[0].Content); got != `"docval"` {
 		t.Errorf("doc content = %s, want %q", got, `"docval"`)
 	}
-	if docs[0].Claimant != eq.ClientID {
-		t.Errorf("doc claimant = %q, want gateway claimant %q", docs[0].Claimant, eq.ClientID)
+	// Held by the BRIDGE's consumer, not the connection's. One connection can
+	// carry many bridges, and they must not claim as one another.
+	if got, want := docs[0].Claimant, s.bridge.Claimant(); got != want {
+		t.Errorf("doc claimant = %q, want this bridge's %q", got, want)
 	}
 	if docs[0].At.Before(claimUntil.Add(-time.Second)) {
 		t.Errorf("doc at = %v, want approximately %v", docs[0].At, claimUntil)

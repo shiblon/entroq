@@ -593,7 +593,11 @@ func releasing(m *entroq.Modification, sets []*entroq.DocSet) {
 // If WithTakeDocs is set, a resource acquisition phase runs between
 // claiming the task and starting work. See WithTakeDocs for details.
 type Worker[T any] struct {
-	eqc *entroq.EntroQ
+	// eqc is the connection, whose own claimant no Run uses: Run scopes it
+	// (entroq.Client.As) so each consumer holds what it claims as itself.
+	// Nothing in the per-task path may reach for this -- it has the wrong
+	// claimant -- so it appears only in Run, and runs carry the scoped client.
+	eqc entroq.Client
 
 	errQMap ErrQMap
 
@@ -609,12 +613,18 @@ type Worker[T any] struct {
 	closed bool
 	runs   map[*activeRun]struct{}
 	wg     sync.WaitGroup
+	// runSeq names consumers apart within this worker, under mu.
+	runSeq int
 }
 
-// activeRun holds what Shutdown needs to stop one Run.
+// activeRun holds what Shutdown needs to stop one Run, and the consumer that
+// Run holds everything as.
 type activeRun struct {
 	cancel      context.CancelFunc // ends the Run, canceling its handler
 	cancelClaim context.CancelFunc // ends its claim; nil when not claiming
+	// eqc is this Run's consumer: the client scoped to a claimant no other Run
+	// shares. Everything in the per-task path goes through it.
+	eqc entroq.Client
 }
 
 // ErrShutdown is returned by Run on a worker that Shutdown has been called on.
@@ -643,7 +653,7 @@ type workerOpts[T any] struct {
 // specified, or WithMakeHandler if you have advanced needs (such as variable
 // sharing between handler functions, which is not safe if specifying them as
 // closures).
-func New[T any](eq *entroq.EntroQ, opts ...Option[T]) *Worker[T] {
+func New[T any](eq entroq.Client, opts ...Option[T]) *Worker[T] {
 	wOpts := new(workerOpts[T])
 	for _, opt := range opts {
 		opt(wOpts)
@@ -823,7 +833,7 @@ func WithErrQMap[T any](f ErrQMap) Option[T] {
 // This applies to both handler paths. A sentinel skips Finish entirely, so the
 // worker is the one writing this modification whichever handler asked for it,
 // and nothing here second-guesses a hand-written Finish.
-func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, task *entroq.Task, sets []*entroq.DocSet, errQ string, opts *runOpt) (isSentinel bool, err error) {
+func (w *Worker[T]) handleSentinelErrors(ctx context.Context, eqc entroq.Client, sentinel error, task *entroq.Task, sets []*entroq.DocSet, errQ string, opts *runOpt) (isSentinel bool, err error) {
 	if re, ok := AsRetry(sentinel); ok {
 		delay := opts.baseRetryDelay
 		if re.hasAfter {
@@ -833,7 +843,7 @@ func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, ta
 		if re.moveTo != "" {
 			q = re.moveTo
 		}
-		if _, err := w.eqc.Modify(ctx,
+		if _, err := eqc.Modify(ctx,
 			task.RetryOrQuarantine(re.Error(), q, opts.maxAttempts, entroq.ArrivalTimeBy(delay)),
 			entroq.Arriving(entroq.ReadyNow().Docs(sets...))); err != nil {
 			if _, ok := entroq.AsDependency(err); ok {
@@ -851,7 +861,7 @@ func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, ta
 		if me.to != "" {
 			q = me.to
 		}
-		if _, err := w.eqc.Modify(ctx, task.Quarantine(me.Error(), q),
+		if _, err := eqc.Modify(ctx, task.Quarantine(me.Error(), q),
 			entroq.Arriving(entroq.ReadyNow().Docs(sets...))); err != nil {
 			if _, ok := entroq.AsDependency(err); ok {
 				// Optimistic: the task moved out from under us (already reclaimed
@@ -878,7 +888,7 @@ func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, ta
 // also when this worker's own lease on the task has already run out, since the
 // hold comes from the task. The caller retries the task with backoff either
 // way; the error says which it was.
-func acquireDocs(ctx context.Context, eqc *entroq.EntroQ, task *entroq.Task, tr *TakeResult) ([]*entroq.DocSet, error) {
+func acquireDocs(ctx context.Context, eqc entroq.Client, task *entroq.Task, tr *TakeResult) ([]*entroq.DocSet, error) {
 	if tr == nil {
 		return []*entroq.DocSet{}, nil
 	}
@@ -926,7 +936,7 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 	if err != nil {
 		return err
 	}
-	task, err := w.eqc.Claim(claimCtx, entroq.From(opts.qs...), entroq.ClaimFor(opts.lease))
+	task, err := run.eqc.Claim(claimCtx, entroq.From(opts.qs...), entroq.ClaimFor(opts.lease))
 	claimed := time.Now()
 	endClaim()
 	if err != nil {
@@ -939,11 +949,11 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 	// is where that history lives. Default to "failed" so an exit path added
 	// later is counted pessimistically rather than silently dropped.
 	outcome := outcomeFailed
-	defer func() { w.metrics.recordTask(ctx, task.Queue, w.eqc.ID(), outcome) }()
+	defer func() { w.metrics.recordTask(ctx, task.Queue, run.eqc.ID(), outcome) }()
 
 	if opts.maxClaims > 0 && task.Claims > opts.maxClaims {
 		errQ := w.ErrorQueueFor(task.Queue)
-		if _, err := w.handleSentinelErrors(ctx,
+		if _, err := w.handleSentinelErrors(ctx, run.eqc,
 			MoveErrorf("maximum claims exceeded: %d claims without modification (limit %d, lease %v)",
 				task.Claims, opts.maxClaims, opts.lease), task, nil, errQ, opts,
 		); err != nil {
@@ -963,7 +973,7 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 		// do better. Move it to the error queue, saying why, and go on.
 		outcome = outcomeMoved
 		move := MoveErrorf("value does not decode as %T: %v", value, err)
-		if _, herr := w.handleSentinelErrors(ctx, move, task, nil, w.ErrorQueueFor(task.Queue), opts); herr != nil {
+		if _, herr := w.handleSentinelErrors(ctx, run.eqc, move, task, nil, w.ErrorQueueFor(task.Queue), opts); herr != nil {
 			return fmt.Errorf("worker (%q) move undecodable task: %w", opts.qs, herr)
 		}
 		return nil
@@ -978,15 +988,15 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 		// claimed yet.
 		if isSentinelError(err) {
 			outcome = sentinelOutcome(err)
-			_, serr := w.handleSentinelErrors(ctx, err, task, nil, w.ErrorQueueFor(task.Queue), opts)
+			_, serr := w.handleSentinelErrors(ctx, run.eqc, err, task, nil, w.ErrorQueueFor(task.Queue), opts)
 			return serr
 		}
-		if w.quarantineAtLimit(ctx, task, nil, err, opts) {
+		if w.quarantineAtLimit(ctx, run.eqc, task, nil, err, opts) {
 			outcome = outcomeMoved
 		}
 		return fmt.Errorf("take docs: %w", err)
 	}
-	sets, err := acquireDocs(rCtx, w.eqc, task, tr)
+	sets, err := acquireDocs(rCtx, run.eqc, task, tr)
 	if err != nil {
 		// Two transient failures, one outcome: the task goes back with a
 		// delay. The claim is all or none, so nothing is held either way.
@@ -1004,7 +1014,7 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 				retry = RetryErrorf("task lease lapsed while taking docs: %v", depErr)
 			}
 			errQ := w.ErrorQueueFor(task.Queue)
-			if _, herr := w.handleSentinelErrors(ctx, retry.After(opts.contentionDelay()), task, nil, errQ, opts); herr != nil {
+			if _, herr := w.handleSentinelErrors(ctx, run.eqc, retry.After(opts.contentionDelay()), task, nil, errQ, opts); herr != nil {
 				return fmt.Errorf("handle sentinel error: %w", herr)
 			}
 			return nil
@@ -1034,8 +1044,8 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 	// already been running locally. It derives both the hold it renews for and
 	// the cadence from the task, so opts.lease -- what the claim ASKED for --
 	// does not follow it in and cannot be renewed on by mistake.
-	renewErr, handleErr := doWhileRenewing(workCtx, w.eqc, time.Since(claimed), held{task: task, sets: sets},
-		func() { w.metrics.recordRenewalRetry(ctx, task.Queue, w.eqc.ID()) },
+	renewErr, handleErr := doWhileRenewing(workCtx, run.eqc, time.Since(claimed), held{task: task, sets: sets},
+		func() { w.metrics.recordRenewalRetry(ctx, task.Queue, run.eqc.ID()) },
 		func(ctx context.Context, stop finalizeRenew) error {
 			defer func() {
 				final := stop()
@@ -1077,7 +1087,7 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 	if sentinelErr != nil {
 		outcome = sentinelOutcome(sentinelErr)
 		errQ := w.ErrorQueueFor(task.Queue)
-		if _, err := w.handleSentinelErrors(ctx, sentinelErr, finalTask, finalSets, errQ, opts); err != nil {
+		if _, err := w.handleSentinelErrors(ctx, run.eqc, sentinelErr, finalTask, finalSets, errQ, opts); err != nil {
 			return fmt.Errorf("handle sentinel error: %w", err)
 		}
 		return nil
@@ -1096,24 +1106,24 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 			outcome = outcomeRetried
 			errQ := w.ErrorQueueFor(task.Queue)
 			retry := RetryErrorf("work did not finish within %v: %v", opts.workTimeout, handleErr)
-			if _, err := w.handleSentinelErrors(ctx, retry, finalTask, finalSets, errQ, opts); err != nil {
+			if _, err := w.handleSentinelErrors(ctx, run.eqc, retry, finalTask, finalSets, errQ, opts); err != nil {
 				return fmt.Errorf("handle work timeout: %w", err)
 			}
 			return nil
 		}
-		if workErr != nil && w.quarantineAtLimit(ctx, finalTask, finalSets, workErr, opts) {
+		if workErr != nil && w.quarantineAtLimit(ctx, run.eqc, finalTask, finalSets, workErr, opts) {
 			outcome = outcomeMoved
 		}
 		return fmt.Errorf("worker (%q): %w", opts.qs, handleErr)
 	}
 
 	// Phase 4: Finish with stable versions — renewal has stopped.
-	if err := handler.Finish(ctx, w.eqc, finalTask, value, finalSets); err != nil {
+	if err := handler.Finish(ctx, run.eqc, finalTask, value, finalSets); err != nil {
 		// A post-commit hook (OnDependency) may return a Retry/Move/Fatal
 		// sentinel; route it through the same machinery as a work-phase sentinel
 		// before falling back to the default dependency reclaim.
 		errQ := w.ErrorQueueFor(task.Queue)
-		if isSentinel, serr := w.handleSentinelErrors(ctx, err, finalTask, finalSets, errQ, opts); isSentinel {
+		if isSentinel, serr := w.handleSentinelErrors(ctx, run.eqc, err, finalTask, finalSets, errQ, opts); isSentinel {
 			return serr
 		}
 		if de, ok := entroq.AsDependency(err); ok {
@@ -1148,14 +1158,14 @@ const atLimitTimeout = 5 * time.Second
 // The attempt is best-effort, with its own short timeout, apart from a
 // shutdown in progress, and the worker stops afterward exactly as it would
 // have without it: nothing is swallowed. It reports whether the task moved.
-func (w *Worker[T]) quarantineAtLimit(ctx context.Context, task *entroq.Task, sets []*entroq.DocSet, err error, opts *runOpt) bool {
+func (w *Worker[T]) quarantineAtLimit(ctx context.Context, eqc entroq.Client, task *entroq.Task, sets []*entroq.DocSet, err error, opts *runOpt) bool {
 	if opts.maxClaims <= 0 || task == nil || task.Claims < opts.maxClaims {
 		return false
 	}
 	qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), atLimitTimeout)
 	defer cancel()
 	move := MoveErrorf("handler failed at the claim limit (%d claims, limit %d): %v", task.Claims, opts.maxClaims, err)
-	if _, qerr := w.handleSentinelErrors(qctx, move, task, sets, w.ErrorQueueFor(task.Queue), opts); qerr != nil {
+	if _, qerr := w.handleSentinelErrors(qctx, eqc, move, task, sets, w.ErrorQueueFor(task.Queue), opts); qerr != nil {
 		log.Printf("worker: quarantine of task %s at its claim limit: %v", task.ID, qerr)
 		return false
 	}
@@ -1183,6 +1193,7 @@ type runOpt struct {
 	maxAttempts        int32
 	maxClaims          int32
 	workTimeout        time.Duration
+	claimant           string
 	lease              time.Duration
 }
 
@@ -1212,6 +1223,20 @@ func WithLease(d time.Duration) RunOption {
 func WithMaxAttempts(m int32) RunOption {
 	return func(ro *runOpt) {
 		ro.maxAttempts = m
+	}
+}
+
+// AsClaimant names the consumer this Run holds everything as, instead of the
+// "<connection ID>/<n>" it would pick.
+//
+// Every Run is its own consumer either way; this only chooses the name. Use it
+// for a name that survives a restart, so metrics series and anything reading
+// claimants off stored tasks stay recognizable -- a pod name, say. Two
+// concurrent Runs given the SAME name are one consumer again, with the doc-set
+// exclusion that implies, so a name has to be as distinct as the Run is.
+func AsClaimant(id string) RunOption {
+	return func(ro *runOpt) {
+		ro.claimant = id
 	}
 }
 
@@ -1331,13 +1356,15 @@ func isSentinelError(err error) bool {
 //     the error first. Classify the failures you understand as
 //     Retry/Move so only genuine surprises bring the worker down.
 //
-// A claimant is a consumer, not a process. Run claims as the worker's client
-// ID, so concurrent Runs of one worker, or of workers sharing a client, are
-// one claimant to EntroQ: it cannot tell them apart. Two of them can then
-// hold the same doc set at once, and each invalidates the versions the other
-// holds whenever it renews, commits, or releases the set. Give Runs that
-// claim doc sets their own clients (see entroq.WithClaimantID), or keep the
-// sets they claim apart.
+// A claimant is a consumer, not a process, so every Run is its own consumer.
+// Run scopes the worker's client to a claimant of its own (entroq.Client.As),
+// which is what lets concurrent Runs -- of one worker, or of workers sharing a
+// connection -- hold doc sets without claiming each other's. Nothing has to be
+// arranged for that; AsClaimant only renames it.
+//
+// The claimant is "<connection ID>/<n>" by default, which is stable for the
+// Run's life and visibly its connection's. A deployment wanting durable names
+// across restarts, for metrics series that survive one, passes AsClaimant.
 func (w *Worker[T]) Run(ctx context.Context, opts ...RunOption) error {
 	ro := &runOpt{
 		lease:          entroq.DefaultClaimDuration,
@@ -1353,7 +1380,7 @@ func (w *Worker[T]) Run(ctx context.Context, opts ...RunOption) error {
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	run := &activeRun{cancel: cancel}
+	run := &activeRun{cancel: cancel, eqc: w.scope(ro.claimant)}
 	if err := w.join(run); err != nil {
 		return err
 	}
@@ -1373,6 +1400,23 @@ func (w *Worker[T]) Run(ctx context.Context, opts ...RunOption) error {
 			return fmt.Errorf("worker (%q): %w", ro.qs, err)
 		}
 	}
+}
+
+// scope returns the consumer one Run holds everything as: the connection
+// scoped to claimant, or to a name of this worker's making when claimant is
+// empty.
+//
+// The default is derived rather than random so it reads as what it is -- one
+// consumer of a known connection -- and stays put for the Run's life. The
+// counter runs under mu, which already serializes Run's bookkeeping.
+func (w *Worker[T]) scope(claimant string) entroq.Client {
+	if claimant == "" {
+		w.mu.Lock()
+		w.runSeq++
+		claimant = fmt.Sprintf("%s/%d", w.eqc.ID(), w.runSeq)
+		w.mu.Unlock()
+	}
+	return w.eqc.As(claimant)
 }
 
 // join registers run for Shutdown, or refuses once Shutdown has been called.
@@ -1693,7 +1737,7 @@ type workFn func(ctx context.Context, stop finalizeRenew) error
 // nothing at all if claiming the sets outlasted a whole interval. It arrives
 // as a duration rather than an instant on purpose, so that no clock reading
 // crosses into here and the local and server clocks never meet.
-func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, sinceClaim time.Duration, h held, onRetry func(), work workFn) (renewErr, err error) {
+func doWhileRenewing(ctx context.Context, c entroq.Client, sinceClaim time.Duration, h held, onRetry func(), work workFn) (renewErr, err error) {
 	if h.task == nil {
 		return nil, fmt.Errorf("do while renewing: nothing to renew")
 	}

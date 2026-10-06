@@ -465,7 +465,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		defer cancel()
 		g, gctx := errgroup.WithContext(ctx)
 		g.Go(func() error {
-			if err := w.Run(gctx, worker.Watching(c.input.Queue), worker.WithLease(leaseTime)); err != nil && !entroq.IsCanceled(err) {
+			if err := w.Run(gctx, worker.Watching(c.input.Queue), worker.AsClaimant(dieHolder), worker.WithLease(leaseTime)); err != nil && !entroq.IsCanceled(err) {
 				// Log quickly so we can see it before waits fail below.
 				log.Printf("Worker Run error: %v", err)
 				return err
@@ -486,8 +486,13 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 			}
 			// Delete the dead task, will always be version 1.
 			// Note: don't overwrite like this in real use.
+			//
+			// As the Run's own claimant: a worker that died still HOLDS its
+			// task until the lease lapses, and every Run is its own consumer,
+			// so the connection cannot touch it. Naming the holder is what
+			// lets this clean up without waiting out a lease.
 			c.input.Version = 1
-			if _, err := client.Modify(ctx, c.input.Delete()); err != nil {
+			if _, err := client.As(dieHolder).Modify(ctx, c.input.Delete()); err != nil {
 				t.Fatalf("Test %q tried to clean up dead task: %v", c.name, err)
 			}
 			return
@@ -543,6 +548,11 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		}
 	}
 }
+
+// dieHolder names the consumer the worker in WorkerMoveOnError holds its task
+// as, so the "die" case can clean up a task its dead worker still holds. A Run
+// otherwise picks its own name and nothing outside it could say what that was.
+const dieHolder = "eqtest-move-on-error"
 
 // WorkerCompactDependencyHandler tests that the bubble-up logic works for WithDoModify.
 func WorkerCompactDependencyHandler(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {

@@ -35,6 +35,27 @@ type receiverConfig struct {
 
 // Receiver accepts request frames from a service inbox and supervises the
 // ephemeral workers that own active HTTP sessions.
+// claimant is the consumer every one of a receiver's workers holds things as:
+// the connection itself.
+//
+// A Run is its own consumer by default, which keeps competing workers from
+// claiming each other's doc sets. An eqlink peer is one consumer instead, for
+// two reasons that both come down to handing things off rather than competing.
+//
+// Its workers HAND OFF a held doc set. The bootstrap worker inserts the
+// session doc with a future arrival, which starts it held, and the response
+// worker claims that same set through TakeDocs. Holding it in between is what
+// keeps anyone else from taking it, so only one claimant can do the handoff --
+// see eqtest.DocClaimantBehavior, which documents the pattern as requiring the
+// same identity.
+//
+// And it mixes worker claims with DIRECT client modifications of the same
+// tasks (Sender.Modify, senderSession's bootstrap delete), which hold as the
+// connection. A sub-name for the workers would split the peer in two.
+func (r *Receiver) claimant() string {
+	return r.eq.ID()
+}
+
 type Receiver struct {
 	eq       *entroq.EntroQ
 	upstream string
@@ -178,7 +199,7 @@ func (r *Receiver) Run(ctx context.Context, inbox string) error {
 	)
 	for range r.cfg.concurrency {
 		g.Go(func() error {
-			if err := bootstrap.Run(gctx, worker.Watching(inbox)); err != nil {
+			if err := bootstrap.Run(gctx, worker.Watching(inbox), worker.AsClaimant(r.claimant())); err != nil {
 				return fmt.Errorf("receiver bootstrap: %w", err)
 			}
 			return nil
@@ -319,7 +340,8 @@ func (r *Receiver) runRequestWorkers(ctx context.Context, state *receiverSession
 			worker.WithDoModify(r.requestHandler(state, socket)),
 			worker.WithMeterProvider[Envelope](r.cfg.mp),
 		)
-		err := requestWorker.Run(workerCtx, worker.Watching(state.requestLanes.local.queue))
+		err := requestWorker.Run(workerCtx, worker.Watching(state.requestLanes.local.queue),
+			worker.AsClaimant(r.claimant()))
 		workerErr := workerCtx.Err()
 		stopWorker()
 		if err != nil {
@@ -466,6 +488,9 @@ func (r *Receiver) runResponseWorkers(ctx context.Context, start sessionStart, s
 		)
 		err := responseWorker.Run(workerCtx,
 			worker.Watching(state.responseLanes.local.queue),
+			// The same consumer the bootstrap worker held the session doc as,
+			// so this can take it; see Receiver.claimant.
+			worker.AsClaimant(r.claimant()),
 			worker.WithLease(r.cfg.heartbeat.timeout),
 		)
 		workerErr := workerCtx.Err()

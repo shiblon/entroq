@@ -124,8 +124,8 @@ func (c *Controller) Cleanup(ctx context.Context) error {
 		for _, d := range docs {
 			args = append(args, d.Delete())
 		}
-		if _, err := c.client.Modify(ctx, args...); err != nil {
-			return fmt.Errorf("eqmr cleanup: delete docs (a claimed doc means the run is still live): %w", err)
+		if _, err := c.client.As(c.runClaimant()).Modify(ctx, args...); err != nil {
+			return fmt.Errorf("eqmr cleanup: delete docs (a doc claimed by anyone but this run means it is still live): %w", err)
 		}
 	}
 
@@ -142,8 +142,11 @@ func (c *Controller) Cleanup(ctx context.Context) error {
 			for _, t := range tasks {
 				args = append(args, t.Delete())
 			}
-			if _, err := c.client.Modify(ctx, args...); err != nil {
-				return fmt.Errorf("eqmr cleanup: delete tasks in %q (a claimed task means the run is still live): %w", q, err)
+			// As the run's own consumer: Run cancels its workers rather
+			// than draining them, so a task in hand is abandoned still
+			// claimed, and only its holder may delete it. See runClaimant.
+			if _, err := c.client.As(c.runClaimant()).Modify(ctx, args...); err != nil {
+				return fmt.Errorf("eqmr cleanup: delete tasks in %q (a task claimed by anyone but this run means it is still live): %w", q, err)
 			}
 		}
 	}

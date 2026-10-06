@@ -174,7 +174,9 @@ func TestWorkerTaskCounterAttributesOutcomes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	client, err := entroq.New(ctx, eqmem.Opener(), entroq.WithClaimantID("worker-a"))
+	// The claimant attribute is the RUN's, not the connection's, so the Run
+	// names itself to keep this test about outcomes rather than naming.
+	client, err := entroq.New(ctx, eqmem.Opener(), entroq.WithClaimantID("connection-a"))
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
@@ -210,7 +212,7 @@ func TestWorkerTaskCounterAttributesOutcomes(t *testing.T) {
 	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
 	go func() {
-		_ = w.Run(runCtx, Watching(queue), WithLease(time.Second), WithBaseRetryDelay(time.Millisecond))
+		_ = w.Run(runCtx, Watching(queue), AsClaimant("worker-a"), WithLease(time.Second), WithBaseRetryDelay(time.Millisecond))
 	}()
 
 	// Wait until every outcome we expect has been observed at least once.

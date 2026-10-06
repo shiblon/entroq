@@ -92,7 +92,12 @@ type Bridge struct {
 
 	// eq and w are set by Run, under mu, before the reader starts, and fixed
 	// after.
-	eq *entroq.EntroQ
+	//
+	// eq is the connection scoped to this connection's own claimant, which is
+	// also what its worker Run holds tasks as. It must be: a Run is its own
+	// consumer, so a release or a commit sent through the connection's own
+	// claimant is refused for a task the Run holds.
+	eq entroq.Client
 	w  *worker.Worker[json.RawMessage]
 
 	// wmu makes the connection's writes one at a time. mu guards the state
@@ -334,7 +339,7 @@ func (b *Bridge) drain() {
 // connection is still alive, and returns. It returns nil for a clean stop
 // (graceful shutdown, or the client hanging up) and an *ExitError otherwise, so
 // the transport can map the class onto an exit or close code.
-func (b *Bridge) Run(ctx context.Context, eq *entroq.EntroQ) error {
+func (b *Bridge) Run(ctx context.Context, eq entroq.Client) error {
 	// The hello comes first, before anything can fail, so a client can always
 	// check the protocol, and can tell a registration it got wrong from a
 	// gateway it cannot talk to.
@@ -414,7 +419,7 @@ func (b *Bridge) Run(ctx context.Context, eq *entroq.EntroQ) error {
 }
 
 // newWorker builds a worker for exactly the registered phases.
-func (b *Bridge) newWorker(eq *entroq.EntroQ) *worker.Worker[json.RawMessage] {
+func (b *Bridge) newWorker(eq entroq.Client) *worker.Worker[json.RawMessage] {
 	opts := []worker.Option[json.RawMessage]{}
 	if b.cfg.TakeDocs {
 		opts = append(opts, worker.WithTakeDocs[json.RawMessage](b.takeDocs))
@@ -425,6 +430,23 @@ func (b *Bridge) newWorker(eq *entroq.EntroQ) *worker.Worker[json.RawMessage] {
 	}
 
 	return worker.New(eq, opts...)
+}
+
+// Claimant is who this connection holds its tasks and doc sets as, or "" before
+// Run has started.
+//
+// One connection is one consumer, named after itself rather than after the
+// EntroQ connection it shares with other bridges: several bridges claiming as
+// one would stop excluding each other from the doc sets they claim. A worker
+// client is told this in the handshake, because it is what identifies the
+// holder in stored tasks and in the gateway's metrics.
+func (b *Bridge) Claimant() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.eq == nil {
+		return ""
+	}
+	return b.eq.ID()
 }
 
 // Shutdown drains the session, as worker.Shutdown does: the gateway stops
@@ -439,13 +461,18 @@ func (b *Bridge) Shutdown(ctx context.Context) error {
 }
 
 // start builds the session's worker, unless Shutdown came first.
-func (b *Bridge) start(eq *entroq.EntroQ) bool {
+func (b *Bridge) start(eq entroq.Client) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.closed {
 		return false
 	}
-	b.eq, b.w = eq, b.newWorker(eq)
+	// One claimant per connection, named after it, so concurrent bridges on
+	// one connection are the separate consumers they are -- a gateway serving
+	// many workers would otherwise have them all claiming as one, and doc sets
+	// would stop excluding between them.
+	b.eq = eq.As(fmt.Sprintf("workgateway/%s", eq.GenID()))
+	b.w = b.newWorker(b.eq)
 	return true
 }
 
@@ -464,6 +491,11 @@ func (b *Bridge) close() *worker.Worker[json.RawMessage] {
 func (b *Bridge) runWorker(ctx context.Context) error {
 	runOpts := []worker.RunOption{
 		worker.Watching(b.cfg.Queues...),
+		// The Run holds tasks as the same consumer the bridge's client is
+		// scoped to, so a release the bridge sends is sent by the holder.
+		// Without this the Run would scope itself again, one name deeper, and
+		// the bridge could not touch what its own worker holds.
+		worker.AsClaimant(b.eq.ID()),
 		worker.WithLease(b.lease),
 		worker.WithMaxAttempts(b.cfg.MaxAttempts),
 		worker.WithMaxClaims(b.cfg.MaxClaims),

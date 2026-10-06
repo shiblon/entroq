@@ -444,9 +444,28 @@ func (c *Controller) RunController(ctx context.Context) error {
 }
 
 // workerRunOptions is the run configuration shared by mappers and reducers.
+// runClaimant is the consumer every Run of this controller holds its tasks as,
+// the controller included.
+//
+// A Run is its own consumer by default, which is what keeps concurrent workers
+// from claiming each other's doc sets. A run of this controller is ONE
+// consumer on purpose: it claims no doc sets at all, and its Cleanup deletes
+// tasks that its own workers may still hold, which only one claimant can do.
+//
+// That second reason is a wart rather than a design. Run stops its workers by
+// canceling them, so a task in hand is abandoned still claimed and waits out
+// its lease, and Cleanup then has to delete a task someone holds. Draining
+// them instead (worker.Shutdown) would leave nothing claimed and let each Run
+// be its own consumer here too. Until then, sharing is explicit rather than an
+// accident of sharing one connection's ID.
+func (c *Controller) runClaimant() string {
+	return "eqmr/" + c.prefix
+}
+
 func (c *Controller) workerRunOptions(queue string) []worker.RunOption {
 	opts := []worker.RunOption{
 		worker.Watching(queue),
+		worker.AsClaimant(c.runClaimant()),
 		worker.WithLease(c.cfg.Lease),
 	}
 	if c.cfg.MaxClaims > 0 {
@@ -462,6 +481,7 @@ func (c *Controller) workerRunOptions(queue string) []worker.RunOption {
 func (c *Controller) controlRunOptions() []worker.RunOption {
 	return []worker.RunOption{
 		worker.Watching(c.ControlQ()),
+		worker.AsClaimant(c.runClaimant()),
 		worker.WithLease(c.cfg.Lease),
 	}
 }
