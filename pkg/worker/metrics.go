@@ -36,9 +36,10 @@ const (
 
 type workerMetrics struct {
 	sync.Mutex
-	next  uint64
-	slots map[uint64]workerSlotState
-	tasks metric.Int64Counter
+	next           uint64
+	slots          map[uint64]workerSlotState
+	tasks          metric.Int64Counter
+	renewalRetries metric.Int64Counter
 }
 
 type workerSlot struct {
@@ -77,7 +78,23 @@ func newWorkerMetrics(mp metric.MeterProvider) (*workerMetrics, error) {
 		return nil, fmt.Errorf("worker tasks counter: %w", err)
 	}
 
-	metrics := &workerMetrics{slots: make(map[uint64]workerSlotState), tasks: tasks}
+	// Renewals that failed transiently and were retried. A worker that loses a
+	// claim shows up on tasks_total as an outcome; this counts the failures it
+	// recovered from, which leave no other trace. A rising rate here is worth
+	// looking into whether or not any claim was lost: it is the lease margin
+	// being spent, and the margin is what absorbs the next problem.
+	renewalRetries, err := meter.Int64Counter("entroq.worker.renewal_retries_total",
+		metric.WithDescription("Renewals retried after a transient failure, by queue and claimant."),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("worker renewal retries counter: %w", err)
+	}
+
+	metrics := &workerMetrics{
+		slots:          make(map[uint64]workerSlotState),
+		tasks:          tasks,
+		renewalRetries: renewalRetries,
+	}
 	_, err = meter.RegisterCallback(func(_ context.Context, observer metric.Observer) error {
 		counts, maxima := metrics.snapshot(time.Now())
 		for _, state := range []workerState{workerIdle, workerBusy} {
@@ -138,6 +155,18 @@ func (m *workerMetrics) snapshot(now time.Time) (map[workerState]int64, map[work
 		}
 	}
 	return counts, maxima
+}
+
+// recordRenewalRetry counts one renewal that failed transiently and will be
+// retried. It is a no-op when metrics are not configured.
+func (m *workerMetrics) recordRenewalRetry(ctx context.Context, queue, claimant string) {
+	if m == nil || m.renewalRetries == nil {
+		return
+	}
+	m.renewalRetries.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("queue", queue),
+		attribute.String("claimant", claimant),
+	))
 }
 
 // recordTask counts one finished task attempt. It is a no-op when metrics are

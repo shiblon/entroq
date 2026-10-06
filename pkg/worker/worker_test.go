@@ -149,7 +149,7 @@ func TestWorkerRenewal(t *testing.T) {
 	if wantRenewals < 2 {
 		t.Fatalf("test needs at least two renewals in %v, got %d (interval %v)", working, wantRenewals, renewInterval(task))
 	}
-	if renewErr, err := doWhileRenewing(ctx, client, 0, held{task: task}, func(ctx context.Context, stop finalizeRenew) error {
+	if renewErr, err := doWhileRenewing(ctx, client, 0, held{task: task}, nil, func(ctx context.Context, stop finalizeRenew) error {
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("doWhileRenewing: %w", ctx.Err())
@@ -193,7 +193,7 @@ func TestDoWhileRenewing_ImmediateCancellationOnLeaseLoss(t *testing.T) {
 
 	errChan := make(chan error, 1)
 	go func() {
-		renewErr, _ := doWhileRenewing(ctx, client, 0, held{task: claimed}, func(ctx context.Context, _ finalizeRenew) error {
+		renewErr, _ := doWhileRenewing(ctx, client, 0, held{task: claimed}, nil, func(ctx context.Context, _ finalizeRenew) error {
 			<-ctx.Done()
 			return ctx.Err()
 		})
@@ -873,7 +873,7 @@ func TestRenewalHoldsTheGrantedLease(t *testing.T) {
 	// Long enough for several renewals, and far longer than the lease the
 	// claim asked for.
 	working := 3 * renewInterval(task)
-	renewErr, err := doWhileRenewing(ctx, client, 0, held{task: task}, func(ctx context.Context, stop finalizeRenew) error {
+	renewErr, err := doWhileRenewing(ctx, client, 0, held{task: task}, nil, func(ctx context.Context, stop finalizeRenew) error {
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("work: %w", ctx.Err())

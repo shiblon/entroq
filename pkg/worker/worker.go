@@ -1025,6 +1025,7 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 	// the cadence from the task, so opts.lease -- what the claim ASKED for --
 	// does not follow it in and cannot be renewed on by mistake.
 	renewErr, handleErr := doWhileRenewing(rCtx, w.eqc, time.Since(claimed), held{task: task, sets: sets},
+		func() { w.metrics.recordRenewalRetry(ctx, task.Queue, w.eqc.ID()) },
 		func(ctx context.Context, stop finalizeRenew) error {
 			defer func() {
 				final := stop()
@@ -1046,7 +1047,7 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 	// worker: handlers keep that control.
 	//
 	// Renewal stopping is a lost claim, however it happened -- refused, or
-	// answered in a way that leaves the hold unnameable (held.lostf). That
+	// answered in a way that leaves the hold unnameable (held.lostClaimErrorf). That
 	// ends this task, not the worker: the task is someone else's now, and
 	// there is nothing to commit, so a retry or move could not land either.
 	// What remains here is a transport or context failure, which is the
@@ -1514,7 +1515,7 @@ type held struct {
 // new version, and each set, and its docs, at the set's new lock.
 func (h held) renewed(resp *entroq.ModifyResponse) (held, error) {
 	if len(resp.ChangedTasks) != 1 || resp.ChangedTasks[0].ID != h.task.ID {
-		return held{}, h.lostf("renewal of task %s answered with tasks %v", h.task.ID, resp.ChangedTasks)
+		return held{}, h.lostClaimErrorf("renewal of task %s answered with tasks %v", h.task.ID, resp.ChangedTasks)
 	}
 	locks := make(map[setKey]*entroq.DocSet, len(resp.ChangedSets))
 	for _, l := range resp.ChangedSets {
@@ -1524,21 +1525,21 @@ func (h held) renewed(resp *entroq.ModifyResponse) (held, error) {
 	for _, g := range h.sets {
 		l, ok := locks[setKey{g.Namespace, g.Key}]
 		if !ok {
-			return held{}, h.lostf("renewal of task %s did not answer with doc set %q in %q", h.task.ID, g.Key, g.Namespace)
+			return held{}, h.lostClaimErrorf("renewal of task %s did not answer with doc set %q in %q", h.task.ID, g.Key, g.Namespace)
 		}
 		out.sets = append(out.sets, relocked(g, l))
 	}
 	return out, nil
 }
 
-// lostf reports that the hold is gone, as a failed depend on the task.
+// lostClaimErrorf reports that the hold is gone, as a failed depend on the task.
 //
 // A renewal answering without naming everything it renewed leaves a version
 // the worker cannot name again, and a worker that cannot name its hold does
 // not have one. That is the same verdict a refused renewal reaches, so it is
 // the same error: the task goes back and this worker takes another, rather
 // than the process ending over a reply it could not read.
-func (h held) lostf(format string, args ...any) error {
+func (h held) lostClaimErrorf(format string, args ...any) error {
 	depErr := entroq.DependencyErrorf("%s", fmt.Sprintf(format, args...))
 	depErr.Depends = append(depErr.Depends, h.task.IDVersion())
 	return depErr
@@ -1563,6 +1564,40 @@ func grantedLease(t *entroq.Task) time.Duration {
 // after a clamped hold had already expired.
 func renewInterval(t *entroq.Task) time.Duration {
 	return entroq.RenewalDurationFor(grantedLease(t))
+}
+
+// renewalMargin returns how long a renewal has to complete in: the part of the
+// granted lease the cadence deliberately leaves unused. A renewal that fails
+// transiently has this long to succeed on a later try before the lease it is
+// extending runs out.
+func renewalMargin(t *entroq.Task) time.Duration {
+	return grantedLease(t) - renewInterval(t)
+}
+
+// nextRenewalRetry returns how long to wait before retrying a renewal that
+// failed transiently, given the wait before it (zero when the last renewal
+// succeeded).
+//
+// Waiting the ordinary interval would spend the whole margin on one more
+// attempt, so a single dropped packet costs the claim. The first retry comes
+// at an eighth of the margin instead, and each consecutive failure doubles it:
+// a blip is recovered from quickly, and three attempts still fit inside the
+// margin at any lease length, without a tuned constant to pick.
+//
+// It stops growing at the ordinary interval, because past that a retry is no
+// faster than simply renewing, and an outage lasting minutes should cost
+// renewals at the ordinary rate rather than several times it. A margin that is
+// not positive leaves nothing to retry inside, so the interval is all there
+// is.
+func nextRenewalRetry(last, margin, interval time.Duration) time.Duration {
+	if margin <= 0 {
+		return interval
+	}
+	next := margin / 8
+	if last > 0 {
+		next = last * 2
+	}
+	return min(next, interval)
 }
 
 // relocked returns g, and each of its docs, at lock l.
@@ -1610,12 +1645,13 @@ type workFn func(ctx context.Context, stop finalizeRenew) error
 // nothing at all if claiming the sets outlasted a whole interval. It arrives
 // as a duration rather than an instant on purpose, so that no clock reading
 // crosses into here and the local and server clocks never meet.
-func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, sinceClaim time.Duration, h held, work workFn) (renewErr, err error) {
+func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, sinceClaim time.Duration, h held, onRetry func(), work workFn) (renewErr, err error) {
 	if h.task == nil {
 		return nil, fmt.Errorf("do while renewing: nothing to renew")
 	}
 	granted := grantedLease(h.task)
 	interval := renewInterval(h.task)
+	margin := renewalMargin(h.task)
 	type outVal struct {
 		held held
 		err  error
@@ -1634,6 +1670,9 @@ func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, sinceClaim time.Dura
 	g.Go(func() error {
 		cur := h
 		next := max(0, interval-sinceClaim)
+		// retryDelay is the wait before the last retry of a failed renewal,
+		// zero while renewals are succeeding.
+		var retryDelay time.Duration
 		var out chan<- outVal
 		stop := func(err error) {
 			fcancel(err)
@@ -1642,6 +1681,14 @@ func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, sinceClaim time.Dura
 		}
 		doneCh := ctx.Done()
 		for {
+			// A task whose arrival is not after its modification was never
+			// held, so there is no lease to extend and no cadence to do it on.
+			// A nil channel never fires, which parks the renewal rather than
+			// waking it continuously on a zero timer.
+			var tick <-chan time.Time
+			if interval > 0 {
+				tick = time.After(next)
+			}
 			select {
 			case <-stopRenew:
 				out = taskCh
@@ -1649,7 +1696,7 @@ func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, sinceClaim time.Dura
 			case <-doneCh:
 				out = taskCh
 				doneCh = nil
-			case <-time.After(next):
+			case <-tick:
 				// Leave the first interval behind, which may have been short or
 				// zero because the claim's lease had already run, and settle
 				// onto the steady cadence.
@@ -1667,6 +1714,7 @@ func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, sinceClaim time.Dura
 						break
 					}
 					cur = renewedHeld
+					retryDelay = 0
 				case entroq.IsCanceled(err):
 					out = taskCh
 				case lost || entroq.IsUnsupported(err):
@@ -1674,7 +1722,16 @@ func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, sinceClaim time.Dura
 					// nothing holds the work any longer.
 					stop(err)
 				default:
-					log.Printf("Transient renewal error: %v", err)
+					// Retry inside the margin instead of after another full
+					// interval, which would spend the whole margin on one
+					// attempt. Jittered later because a server that failed
+					// this renewal failed every worker's at once.
+					retryDelay = nextRenewalRetry(retryDelay, margin, interval)
+					next = jitterLater(retryDelay, retryDelay/4)
+					if onRetry != nil {
+						onRetry()
+					}
+					log.Printf("Transient renewal error, retrying in %v: %v", next, err)
 				}
 			case out <- outVal{cur, stopErr}:
 				return nil

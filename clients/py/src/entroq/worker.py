@@ -269,6 +269,11 @@ class _RenewState:
         # than a cancellation because a renewal already in flight may have
         # been applied: see _renewing.
         self.stop = asyncio.Event()
+        # Renewals that failed transiently and were retried. A lost claim is
+        # visible on its own; these leave no other trace, and a rising count
+        # is the lease margin being spent -- the margin being what absorbs the
+        # next problem.
+        self.renewal_retries = 0
 
     def stop_work(self, err: Exception) -> None:
         """Record that the hold is gone and cancel the handler.
@@ -302,6 +307,38 @@ def renewal_interval_s(task: Task) -> float:
     lease it was granted, leaving the rest as margin for a renewal to complete
     in. Matches the Go worker, which derives both from one fraction."""
     return granted_lease_s(task) * 2.0 / 3.0
+
+
+def renewal_margin_s(task: Task) -> float:
+    """Return how long a renewal has to complete in: the part of the granted
+    lease the cadence deliberately leaves unused. A renewal that fails
+    transiently has this long to succeed on a later try before the lease it is
+    extending runs out."""
+    return granted_lease_s(task) - renewal_interval_s(task)
+
+
+def next_renewal_retry_s(last_s: float, margin_s: float, interval_s: float) -> float:
+    """Return how long to wait before retrying a renewal that failed
+    transiently, given the wait before it (zero when the last one succeeded).
+
+    Waiting the ordinary interval would spend the whole margin on one more
+    attempt, so a single dropped packet costs the claim. The first retry comes
+    at an eighth of the margin instead, and each consecutive failure doubles
+    it: a blip is recovered from quickly, and three attempts still fit inside
+    the margin at any lease length, without a tuned constant to pick.
+
+    It stops growing at the ordinary interval, because past that a retry is no
+    faster than simply renewing, and an outage lasting minutes should cost
+    renewals at the ordinary rate rather than several times it. A margin that
+    is not positive leaves nothing to retry inside, so the interval is all
+    there is.
+
+    Matches the Go worker's nextRenewalRetry.
+    """
+    if margin_s <= 0:
+        return interval_s
+    nxt = margin_s / 8 if last_s <= 0 else last_s * 2
+    return min(nxt, interval_s)
 
 
 def _renewed(task: Task, sets: Sequence[Doc],
@@ -355,6 +392,10 @@ async def _renewing(
         # grant equal the last.
         lease_s = granted_lease_s(task)
         interval_s = renewal_interval_s(task)
+        margin_s = renewal_margin_s(task)
+        # The wait before the last retry of a failed renewal, zero while they
+        # are succeeding.
+        retry_s = 0.0
         # The lease began at the claim, not here, so whatever reaching the body
         # cost is already gone from it -- claiming doc sets most of all, since
         # that is an all-or-nothing claim against other workers. A first wait
@@ -370,7 +411,6 @@ async def _renewing(
                     pass
                 except asyncio.CancelledError:
                     return
-            next_s = interval_s
             if state.stop.is_set():
                 return
             # Past here the renewal runs to completion even if the body ends:
@@ -385,6 +425,7 @@ async def _renewing(
             # The sets are named, not their members: a set's lock is what the
             # claim took, and naming it is what lets a set with no docs in it
             # be renewed at all.
+            next_s = interval_s
             ops: list = [Modification.arriving(state.task, lease_s)]
             for group in state.sets:
                 ops.append(Modification.arriving(group, lease_s))
@@ -397,13 +438,22 @@ async def _renewing(
                 state.stop_work(e)
                 return
             except Exception as e:
-                logging.warning("Renewal error for task %s (will retry): %s", task.id, e)
+                # Retry inside the margin instead of after another full
+                # interval, which would spend the whole margin on one attempt.
+                # Jittered later because a server that failed this renewal
+                # failed every worker's at once.
+                retry_s = next_renewal_retry_s(retry_s, margin_s, interval_s)
+                next_s = retry_s + random.uniform(0, retry_s / 4)
+                state.renewal_retries += 1
+                logging.warning("Renewal error for task %s, retrying in %.3fs: %s",
+                                task.id, next_s, e)
                 continue
             try:
                 state.task, state.sets = _renewed(state.task, state.sets, result)
             except DependencyError as e:
                 state.stop_work(e)
                 return
+            retry_s = 0.0
 
     renew_task = asyncio.create_task(_renewer())
     try:
@@ -597,6 +647,16 @@ class EntroQWorker:
             raise ValueError("err_queue and err_q_map are mutually exclusive")
         self._client = client
         self._queues = list(queues)
+        #: Renewals this worker retried after a transient failure.
+        #:
+        #: A lost claim is visible on its own -- the run loop logs it and the
+        #: task comes back -- but a renewal that failed and then succeeded
+        #: leaves no other trace, and a rising count is the lease margin being
+        #: spent. The margin is what absorbs the next problem, so a spike is
+        #: worth looking into even when nothing was lost. The Go worker reports
+        #: the same thing as entroq.worker.renewal_retries_total; this client
+        #: has no metrics stack, so it is a plain counter to read or export.
+        self.renewal_retries = 0
         self._claim_duration_s = claim_duration_s
         if err_queue:
             self._err_q_map: Callable[[str], str] = lambda inbox: err_queue
@@ -817,6 +877,8 @@ class EntroQWorker:
                     raise
             except Exception as e:
                 do_work_exc = e
+
+        self.renewal_retries += state.renewal_retries
 
         # Three outcomes in Go's order. A fatal keeps the handler's control
         # whatever else happened. Then a stopped renewal is why the work

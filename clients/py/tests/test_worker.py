@@ -15,6 +15,8 @@ from entroq.types import (
     DependencyError, Modification, ModifyResult, TransportError,
 )
 from entroq.worker import (
+    next_renewal_retry_s, renewal_margin_s, renewal_interval_s,
+    granted_lease_s,
     StopWorker, FatalWorker, RetryError, MoveError,
     DocClaim, Handler, EntroQWorker, default_err_q_map,
     _fix_versions, _renewing,
@@ -235,6 +237,30 @@ class SlowClaimClient(FakeClient):
             self.renewed_at.append(
                 asyncio.get_running_loop().time() - self._body_start)
         return await super().modify(modification)
+
+
+class FlakyRenewClient(FakeClient):
+    """Fails the first `failures` renewals transiently, recording when each
+    attempt was made. Everything else passes through."""
+
+    def __init__(self, tasks=(), docs=(), failures=1):
+        super().__init__(tasks=tasks, docs=docs)
+        self._failures = failures
+        self.attempts: list[float] = []
+
+    async def modify(self, modification, *, unsafe_claimant_id=None):
+        if not modification.task_arrivals:
+            return await super().modify(modification)
+        self.attempts.append(asyncio.get_running_loop().time())
+        if self._failures > 0:
+            self._failures -= 1
+            # Not a DependencyError: a lost claim stops the work, and this is
+            # the transient kind that must be retried instead.
+            raise RuntimeError("renewal is having a bad day")
+        return await super().modify(modification)
+
+    def gaps(self) -> list[float]:
+        return [b - a for a, b in zip(self.attempts, self.attempts[1:])]
 
 
 class RenewFailClient(FakeClient):
@@ -1659,6 +1685,70 @@ def test_the_first_renewal_counts_time_already_spent():
     assert client.renewed_at[0] < 0.1, (
         f"first renewal {client.renewed_at[0]:.3f}s into a body that began "
         "with the interval already spent")
+
+
+def test_next_renewal_retry_fits_inside_the_margin():
+    """The margin is the whole budget for recovering from a failed renewal.
+
+    Waiting the ordinary interval spends it on one attempt, so one dropped
+    packet costs the claim. Mirrors Go's TestNextRenewalRetryFitsInsideTheMargin.
+    """
+    task = _task(id='t1', version=1, lease_s=60.0)
+    interval = renewal_interval_s(task)
+    margin = renewal_margin_s(task)
+    assert (interval, margin) == (40.0, 20.0), (interval, margin)
+
+    delays, last = [], 0.0
+    for _ in range(6):
+        last = next_renewal_retry_s(last, margin, interval)
+        delays.append(last)
+    assert delays == [2.5, 5.0, 10.0, 20.0, 40.0, 40.0], delays
+
+    # Three attempts land inside the margin, which is the point.
+    elapsed, inside = 0.0, 0
+    for d in delays:
+        elapsed += d
+        if elapsed < margin:
+            inside += 1
+    assert inside == 3, (inside, delays)
+
+    # A success returns to the ordinary cadence.
+    assert next_renewal_retry_s(0.0, margin, interval) == margin / 8
+
+
+def test_next_renewal_retry_with_no_margin():
+    """A lease leaving nothing to retry inside has only the ordinary cadence,
+    and in particular the wait is never zero, which would spin."""
+    for margin, interval in ((0.0, 40.0), (-1.0, 40.0), (0.0, 0.0)):
+        assert next_renewal_retry_s(0.0, margin, interval) == interval
+
+
+def test_renewal_margin_is_what_the_cadence_leaves():
+    task = _task(id='t1', version=1, lease_s=90.0)
+    assert (renewal_margin_s(task) + renewal_interval_s(task)
+            == pytest.approx(granted_lease_s(task)))
+    assert renewal_margin_s(task) > 0
+
+
+def test_a_transient_renewal_failure_retries_inside_the_margin():
+    """The loop has to USE the policy, which is the part that was wrong: a
+    transient failure waited the full interval and spent the whole margin."""
+    task = _task(id='t1', version=1, lease_s=0.3)  # interval 0.2, margin 0.1
+    client = FlakyRenewClient(tasks=[task], failures=1)
+
+    async def run():
+        async with _renewing(client, task, ClaimedDocs()) as state:
+            # Long enough for the first renewal, its failure, and the retry.
+            await asyncio.sleep(0.35)
+            assert state.renewal_retries == 1, state.renewal_retries
+
+    asyncio.run(run())
+
+    gaps = client.gaps()
+    assert gaps, f"only {len(client.attempts)} renewal attempts; the retry never happened"
+    # The first retry is due at margin/8 = 12.5ms, jitter adding a quarter.
+    # The full interval would be 200ms.
+    assert gaps[0] < 0.1, f"retry came {gaps[0]:.3f}s later, a cadence not a retry: {gaps}"
 
 
 def test_renewing_advances_set_versions():

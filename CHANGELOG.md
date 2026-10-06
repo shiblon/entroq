@@ -21,6 +21,14 @@ runs, so plan a short maintenance window on large doc tables.
 
 ### Added
 
+- **Renewal retries are reported.** `entroq.worker.renewal_retries_total`
+  counts renewals retried after a transient failure, by queue and claimant,
+  and the Python worker exposes the same count as `EntroQWorker.renewal_retries`
+  (that client has no metrics stack, so it is a plain counter to read or
+  export). A lost claim is visible on its own; a renewal that failed and then
+  succeeded leaves no other trace, and a rising rate is the lease margin being
+  spent -- the margin being what absorbs the next problem.
+
 - **`Handler.on_success` in the Python client.** The post-commit hook now
   carries the name of the Go hook whose contract it shares: it runs after the
   body's commit, holds no doc claim, and its error is logged rather than
@@ -422,6 +430,18 @@ runs, so plan a short maintenance window on large doc tables.
   versions.
 
 ### Fixed
+
+- **A renewal that fails transiently retries inside the lease margin.** Both
+  workers waited the full renewal interval after a transient failure, which
+  spends the entire margin on one more attempt: a single dropped packet cost
+  the claim, whatever the lease length. The retry now starts at an eighth of
+  the margin (the part of the lease the cadence deliberately leaves unused)
+  and doubles on each consecutive failure, stopping at the ordinary interval,
+  so three attempts fit inside the margin and an outage lasting minutes still
+  renews at the ordinary rate. Jittered later, since a server that failed one
+  worker's renewal failed every worker's at once. A task with no lease to
+  renew -- its arrival not after its modification -- no longer wakes the
+  renewal loop continuously.
 
 - **A claimed doc's version comes from its set, with no second answer.** The
   Python worker fell back to the version a doc was claimed at when it could
