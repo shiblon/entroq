@@ -142,19 +142,19 @@ func TestModifyArgsFromProtoRefusesMissingParts(t *testing.T) {
 }
 
 func TestModifyArgsFromProtoLeases(t *testing.T) {
-	// A lease renews into the future, and at_ms carries milliseconds, so the
-	// instant is truncated to what the wire can represent exactly.
+	// A lease renews for a duration. It cannot carry an instant: CHANGE_LEASE is
+	// protocol 2 and at_ms is protocol 1, so the two never appear together --
+	// see "lease naming an instant" in TestModifyArgsFromProtoModes.
 	const ahead = time.Minute
-	at := time.Now().Add(ahead).Truncate(time.Millisecond)
 	mod, err := modification(t, &pb.ModifyRequest{
 		Changes: []*pb.TaskChange{{
 			OldId:   &pb.TaskID{Id: "t", Version: 3, Queue: "q"},
-			NewData: &pb.TaskData{AtMs: ToMS(at)},
+			NewData: &pb.TaskData{ByMs: ahead.Milliseconds()},
 			Mode:    pb.ChangeMode_CHANGE_LEASE,
 		}},
 		DocChanges: []*pb.DocChange{{
 			OldId:   DocSetIDToProto("ns", "k", 5),
-			NewData: &pb.DocData{AtMs: ToMS(at)},
+			NewData: &pb.DocData{ByMs: ahead.Milliseconds()},
 			Mode:    pb.ChangeMode_CHANGE_LEASE,
 		}},
 	})
@@ -164,16 +164,15 @@ func TestModifyArgsFromProtoLeases(t *testing.T) {
 	if len(mod.Changes) != 0 || len(mod.DocChanges) != 0 {
 		t.Errorf("Leases became changes: %v", mod)
 	}
-	// A lease arrives as a duration: at_ms, which only a protocol-1 client
-	// still sends, is converted against the server's now, so the assertions
-	// are on how far ahead it lands, not on the instant itself.
+	// The duration passes through exactly: no clock is involved on either side,
+	// which is the whole reason a lease carries one.
 	if len(mod.Arrives) != 1 || mod.Arrives[0].TaskID != (entroq.TaskID{ID: "t", Version: 3, Queue: "q"}) ||
-		(mod.Arrives[0].By-ahead).Abs() > time.Second {
-		t.Errorf("Task lease: got %+v, want ready in %v", mod.Arrives, ahead)
+		mod.Arrives[0].By != ahead {
+		t.Errorf("Task lease: got %+v, want ready in exactly %v", mod.Arrives, ahead)
 	}
 	if len(mod.DocArrives) != 1 || mod.DocArrives[0].DocID != *entroq.NewDocSetRef("ns", "k", 5) ||
-		(mod.DocArrives[0].By-ahead).Abs() > time.Second {
-		t.Errorf("Doc set lease: got %+v, want ready in %v", mod.DocArrives, ahead)
+		mod.DocArrives[0].By != ahead {
+		t.Errorf("Doc set lease: got %+v, want ready in exactly %v", mod.DocArrives, ahead)
 	}
 }
 
@@ -186,15 +185,21 @@ func TestModifyArgsFromProtoModes(t *testing.T) {
 		protocol int32
 		req      *pb.ModifyRequest
 	}{
-		"task lease with a value":    {2, &pb.ModifyRequest{Changes: []*pb.TaskChange{{OldId: old, NewData: &pb.TaskData{Value: structpb.NewStringValue("x")}, Mode: lease}}}},
-		"task lease moving it":       {2, &pb.ModifyRequest{Changes: []*pb.TaskChange{{OldId: old, NewData: &pb.TaskData{Queue: "elsewhere"}, Mode: lease}}}},
-		"doc lease with content":     {2, &pb.ModifyRequest{DocChanges: []*pb.DocChange{{OldId: DocSetIDToProto("ns", "k", 0), NewData: &pb.DocData{Content: structpb.NewStringValue("x")}, Mode: lease}}}},
-		"doc lease of another key":   {2, &pb.ModifyRequest{DocChanges: []*pb.DocChange{{OldId: DocSetIDToProto("ns", "k", 0), NewData: &pb.DocData{Key: "other"}, Mode: lease}}}},
-		"doc claims reset":           {2, &pb.ModifyRequest{DocChanges: []*pb.DocChange{{OldId: DocIDToProto("ns", "d", 0), NewData: &pb.DocData{}, Mode: pb.ChangeMode_CHANGE_RESET_CLAIMS}}}},
-		"task lease at protocol 1":   {1, &pb.ModifyRequest{Changes: []*pb.TaskChange{{OldId: old, NewData: &pb.TaskData{}, Mode: lease}}}},
-		"claims reset at protocol 1": {1, &pb.ModifyRequest{Changes: []*pb.TaskChange{{OldId: old, NewData: &pb.TaskData{}, Mode: pb.ChangeMode_CHANGE_RESET_CLAIMS}}}},
-		"doc lease by ID":            {2, &pb.ModifyRequest{DocChanges: []*pb.DocChange{{OldId: DocIDToProto("ns", "d", 0), NewData: &pb.DocData{}, Mode: lease}}}},
-		"doc lease at protocol 1":    {1, &pb.ModifyRequest{DocChanges: []*pb.DocChange{{OldId: DocSetIDToProto("ns", "k", 0), NewData: &pb.DocData{}, Mode: lease}}}},
+		"task lease with a value":       {2, &pb.ModifyRequest{Changes: []*pb.TaskChange{{OldId: old, NewData: &pb.TaskData{Value: structpb.NewStringValue("x")}, Mode: lease}}}},
+		"task lease moving it":          {2, &pb.ModifyRequest{Changes: []*pb.TaskChange{{OldId: old, NewData: &pb.TaskData{Queue: "elsewhere"}, Mode: lease}}}},
+		"doc lease with content":        {2, &pb.ModifyRequest{DocChanges: []*pb.DocChange{{OldId: DocSetIDToProto("ns", "k", 0), NewData: &pb.DocData{Content: structpb.NewStringValue("x")}, Mode: lease}}}},
+		"doc lease of another key":      {2, &pb.ModifyRequest{DocChanges: []*pb.DocChange{{OldId: DocSetIDToProto("ns", "k", 0), NewData: &pb.DocData{Key: "other"}, Mode: lease}}}},
+		"doc claims reset":              {2, &pb.ModifyRequest{DocChanges: []*pb.DocChange{{OldId: DocIDToProto("ns", "d", 0), NewData: &pb.DocData{}, Mode: pb.ChangeMode_CHANGE_RESET_CLAIMS}}}},
+		"task lease naming an instant":  {2, &pb.ModifyRequest{Changes: []*pb.TaskChange{{OldId: old, NewData: &pb.TaskData{AtMs: 1}, Mode: lease}}}},
+		"doc lease naming an instant":   {2, &pb.ModifyRequest{DocChanges: []*pb.DocChange{{OldId: DocSetIDToProto("ns", "k", 0), NewData: &pb.DocData{AtMs: 1}, Mode: lease}}}},
+		"task insert naming an instant": {2, &pb.ModifyRequest{Inserts: []*pb.TaskData{{Queue: "q", AtMs: 1}}}},
+		"task change naming an instant": {2, &pb.ModifyRequest{Changes: []*pb.TaskChange{{OldId: old, NewData: &pb.TaskData{Queue: "q", AtMs: 1}}}}},
+		"doc insert naming an instant":  {2, &pb.ModifyRequest{DocInserts: []*pb.DocData{{Namespace: "ns", Key: "k", AtMs: 1}}}},
+		"doc change naming an instant":  {2, &pb.ModifyRequest{DocChanges: []*pb.DocChange{{OldId: DocIDToProto("ns", "d", 0), NewData: &pb.DocData{AtMs: 1}}}}},
+		"task lease at protocol 1":      {1, &pb.ModifyRequest{Changes: []*pb.TaskChange{{OldId: old, NewData: &pb.TaskData{}, Mode: lease}}}},
+		"claims reset at protocol 1":    {1, &pb.ModifyRequest{Changes: []*pb.TaskChange{{OldId: old, NewData: &pb.TaskData{}, Mode: pb.ChangeMode_CHANGE_RESET_CLAIMS}}}},
+		"doc lease by ID":               {2, &pb.ModifyRequest{DocChanges: []*pb.DocChange{{OldId: DocIDToProto("ns", "d", 0), NewData: &pb.DocData{}, Mode: lease}}}},
+		"doc lease at protocol 1":       {1, &pb.ModifyRequest{DocChanges: []*pb.DocChange{{OldId: DocSetIDToProto("ns", "k", 0), NewData: &pb.DocData{}, Mode: lease}}}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var inv *InvalidRequestError

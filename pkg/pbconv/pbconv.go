@@ -44,15 +44,18 @@ func FromMS(ms int64) time.Time {
 //
 // Zero needs no distinguishing from absent in either field, because both mean
 // now.
-func arrivalBy(atMs, byMs int64, now time.Time) time.Duration {
-	if byMs != 0 {
-		return time.Duration(byMs) * time.Millisecond
-	}
+func arrivalBy(atMs, byMs int64, protocol int32, now time.Time, what string) (time.Duration, error) {
 	at := FromMSOrUnset(atMs)
-	if at.IsZero() || at.Before(now.Add(-entroq.ArrivalPastWindow)) {
-		return 0
+	if !at.IsZero() && protocol >= 2 {
+		return 0, invalidf("%s names an arrival instant in at_ms: protocol 2 sends by_ms, a duration the server resolves on its own clock", what)
 	}
-	return at.Sub(now)
+	if byMs != 0 {
+		return time.Duration(byMs) * time.Millisecond, nil
+	}
+	if at.IsZero() || at.Before(now.Add(-entroq.ArrivalPastWindow)) {
+		return 0, nil
+	}
+	return at.Sub(now), nil
 }
 
 // FromMSOrUnset is FromMS for optional timestamps: a non-positive value means
@@ -178,14 +181,18 @@ func docDepend(d *pb.DocID, protocol int32) (*entroq.DocID, error) {
 // taskLease converts a lease-only task change, which renews or releases the
 // task old names. Only the arrival time is used; a queue, if given, must be
 // the task's own, and no value, attempt, error, or ID may be.
-func taskLease(old *pb.TaskID, lease *pb.TaskData, now time.Time) (entroq.ModifyArg, error) {
+func taskLease(old *pb.TaskID, lease *pb.TaskData, protocol int32, now time.Time) (entroq.ModifyArg, error) {
 	if q := lease.GetQueue(); q != "" && q != old.GetQueue() {
 		return nil, invalidf("lease of task %s cannot move it: %q -> %q", old.GetId(), old.GetQueue(), q)
 	}
 	if lease.GetValue() != nil || lease.GetAttempt() != 0 || lease.GetErr() != "" || lease.GetId() != "" {
 		return nil, invalidf("lease of task %s may set only its arrival time", old.GetId())
 	}
-	return entroq.Arriving(entroq.ReadyIn(arrivalBy(lease.GetAtMs(), lease.GetByMs(), now)).Tasks(
+	by, err := arrivalBy(lease.GetAtMs(), lease.GetByMs(), protocol, now, "lease of task "+old.GetId())
+	if err != nil {
+		return nil, err
+	}
+	return entroq.Arriving(entroq.ReadyIn(by).Tasks(
 		&entroq.Task{ID: old.GetId(), Version: old.GetVersion(), Queue: old.GetQueue()},
 	)), nil
 }
@@ -193,7 +200,7 @@ func taskLease(old *pb.TaskID, lease *pb.TaskData, now time.Time) (entroq.Modify
 // docLease converts a lease-only doc change, which renews or releases the doc
 // set old names by its key. Only the arrival time is used; a namespace, key,
 // or secondary key, if given, must match old, and no content may be.
-func docLease(old *pb.DocID, lease *pb.DocData, now time.Time) (entroq.ModifyArg, error) {
+func docLease(old *pb.DocID, lease *pb.DocData, protocol int32, now time.Time) (entroq.ModifyArg, error) {
 	key, ok := old.GetRef().(*pb.DocID_Key)
 	switch {
 	case old.GetRef() == nil:
@@ -213,7 +220,11 @@ func docLease(old *pb.DocID, lease *pb.DocData, now time.Time) (entroq.ModifyArg
 	if lease.GetContent() != nil || lease.GetId() != "" {
 		return nil, invalidf("doc lease of set %q may set only its arrival time", key.Key)
 	}
-	return entroq.Arriving(entroq.ReadyIn(arrivalBy(lease.GetAtMs(), lease.GetByMs(), now)).Docs(
+	by, err := arrivalBy(lease.GetAtMs(), lease.GetByMs(), protocol, now, "lease of doc set "+key.Key)
+	if err != nil {
+		return nil, err
+	}
+	return entroq.Arriving(entroq.ReadyIn(by).Docs(
 		&entroq.DocSet{Namespace: old.GetNamespace(), Key: key.Key, Version: old.GetVersion()},
 	)), nil
 }
@@ -252,9 +263,13 @@ func ModifyArgsFromProto(req *pb.ModifyRequest, protocol int32) ([]entroq.Modify
 		if err != nil {
 			return nil, fmt.Errorf("insert value: %w", err)
 		}
+		by, err := arrivalBy(insert.AtMs, insert.ByMs, protocol, now, "insert into "+insert.Queue)
+		if err != nil {
+			return nil, err
+		}
 		modArgs = append(modArgs,
 			entroq.InsertingInto(insert.Queue,
-				entroq.WithArrivalTimeIn(arrivalBy(insert.AtMs, insert.ByMs, now)),
+				entroq.WithArrivalTimeIn(by),
 				entroq.WithRawValue(val),
 				entroq.WithAttempt(insert.Attempt),
 				entroq.WithErr(insert.Err),
@@ -272,7 +287,7 @@ func ModifyArgsFromProto(req *pb.ModifyRequest, protocol int32) ([]entroq.Modify
 			return nil, err
 		}
 		if change.GetMode() == pb.ChangeMode_CHANGE_LEASE {
-			arg, err := taskLease(change.GetOldId(), nd, now)
+			arg, err := taskLease(change.GetOldId(), nd, protocol, now)
 			if err != nil {
 				return nil, err
 			}
@@ -313,7 +328,11 @@ func ModifyArgsFromProto(req *pb.ModifyRequest, protocol int32) ([]entroq.Modify
 		if newQueue != oldQueue {
 			changeArgs = append(changeArgs, entroq.QueueTo(newQueue))
 		}
-		changeArgs = append(changeArgs, entroq.ArrivalTimeBy(arrivalBy(nd.GetAtMs(), nd.GetByMs(), now)))
+		by, err := arrivalBy(nd.GetAtMs(), nd.GetByMs(), protocol, now, "change of task "+change.GetOldId().GetId())
+		if err != nil {
+			return nil, err
+		}
+		changeArgs = append(changeArgs, entroq.ArrivalTimeBy(by))
 		if reset {
 			changeArgs = append(changeArgs, entroq.ResettingClaims())
 		}
@@ -335,10 +354,14 @@ func ModifyArgsFromProto(req *pb.ModifyRequest, protocol int32) ([]entroq.Modify
 		// created_ms and modified_ms are deliberately not carried: they exist
 		// for journal replay, which is backend-local, and a task insert has
 		// never honored a client's copy of them either.
+		by, err := arrivalBy(di.AtMs, di.ByMs, protocol, now, "insert into namespace "+di.Namespace)
+		if err != nil {
+			return nil, err
+		}
 		modArgs = append(modArgs, entroq.PuttingDocInto(di.Namespace,
 			entroq.WithIDKeys(di.Id, di.Key, di.SecondaryKey),
 			entroq.WithRawContent(val),
-			entroq.WithDocArrivalTimeBy(arrivalBy(di.AtMs, di.ByMs, now))))
+			entroq.WithDocArrivalTimeBy(by)))
 	}
 	for _, dc := range req.DocChanges {
 		old := dc.GetOldId()
@@ -355,7 +378,7 @@ func ModifyArgsFromProto(req *pb.ModifyRequest, protocol int32) ([]entroq.Modify
 		}
 		switch dc.GetMode() {
 		case pb.ChangeMode_CHANGE_LEASE:
-			arg, err := docLease(old, nd, now)
+			arg, err := docLease(old, nd, protocol, now)
 			if err != nil {
 				return nil, err
 			}
@@ -391,7 +414,11 @@ func ModifyArgsFromProto(req *pb.ModifyRequest, protocol int32) ([]entroq.Modify
 		// arrival must come through the option to survive. See arrivalBy for
 		// how a protocol-1 at_ms becomes the duration everything downstream
 		// speaks.
-		modArgs = append(modArgs, d.Change(entroq.WithDocArrivalTimeBy(arrivalBy(nd.GetAtMs(), nd.GetByMs(), now))))
+		by, err := arrivalBy(nd.GetAtMs(), nd.GetByMs(), protocol, now, "change of doc "+dc.GetOldId().GetId())
+		if err != nil {
+			return nil, err
+		}
+		modArgs = append(modArgs, d.Change(entroq.WithDocArrivalTimeBy(by)))
 	}
 	for _, dd := range req.DocDeletes {
 		id, err := docByID(dd, "doc delete")
