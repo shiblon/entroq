@@ -94,6 +94,10 @@ def default_err_q_map(inbox: str) -> str:
 # small clock disagreement on every renewal.
 DEFAULT_CLAIM_DURATION_S = 45.0
 
+# Bounds the quarantine EntroQWorker._quarantine_at_limit attempts, which must
+# not hold up a worker that is already stopping.
+AT_LIMIT_TIMEOUT_S = 5.0
+
 
 # ---------------------------------------------------------------------------
 # Handler ABC
@@ -127,7 +131,13 @@ class Handler(ABC):
     """
 
     async def select(self, task: Task) -> list[DocClaim]:
-        """Return the doc claims needed for this task. Override in subclasses."""
+        """Return the doc claims needed for this task. Override in subclasses.
+
+        Sentinels act on the task here as they do from ``do_work``: raise
+        ``StopWorker`` to exit cleanly, ``RetryError`` to re-queue, or
+        ``MoveError`` to send the task to an error queue. Nothing is claimed
+        yet, so there are no sets to release.
+        """
         return []
 
     @abstractmethod
@@ -562,6 +572,32 @@ class EntroQWorker:
         # which means this worker no longer holds it.
         return await self._client.claim_doc_sets(doc_claims, task_to_match=task)
 
+    async def _quarantine_at_limit(self, task: Task | None, sets: Sequence[Doc],
+                                   exc: BaseException) -> bool:
+        """Move task to its error queue now if this was its last allowed claim.
+
+        A handler failure below the claim limit records nothing: a record is a
+        modification, and a modification resets the claim count, so the task
+        waits out its lease as it did before. At the limit the next claim would
+        move it anyway without saying why, so the reason is written down while
+        it is still known.
+
+        Best-effort, with its own short timeout, since the caller is stopping
+        either way: a failure here is logged and the caller's exception still
+        propagates. Returns whether the task moved.
+        """
+        if self._max_claims <= 0 or task is None or task.claims < self._max_claims:
+            return False
+        reason = MoveError(f"handler failed at the claim limit ({task.claims} claims, "
+                           f"limit {self._max_claims}): {exc}")
+        try:
+            await asyncio.wait_for(self._dispose(task, reason, sets=sets),
+                                   timeout=AT_LIMIT_TIMEOUT_S)
+        except Exception as e:
+            logging.warning("Quarantine of task %s at its claim limit: %s", task.id, e)
+            return False
+        return True
+
     async def _dispose(self, task: Task, exc: RetryError | MoveError, *,
                        sets: Sequence[Doc] = ()) -> None:
         """Apply a sentinel's disposition to a claimed task, releasing its sets.
@@ -624,6 +660,15 @@ class EntroQWorker:
 
         try:
             docs = await self._claim_docs(task, handler)
+        except StopWorker:
+            return False  # claim expires naturally
+        except (RetryError, MoveError) as e:
+            # A sentinel from the selector acts on the task as one from do_work
+            # does. Nothing is claimed yet, so no sets go back.
+            await self._dispose(task, e)
+            return True
+        except FatalWorker:
+            raise
         except DependencyError as e:
             # Classify rather than swallow, and record the reason on the task
             # instead of letting it vanish into a log line. A missing doc can
@@ -640,24 +685,40 @@ class EntroQWorker:
             else:
                 await self._dispose(task, RetryError(f"doc contention: {e}"))
             return True
+        except Exception as e:
+            await self._quarantine_at_limit(task, (), e)
+            raise
 
         do_work_exc: Exception | None = None
         result: Modification | None = None
+        state = None
 
-        async with _renewing(self._client, task, docs) as state:
-            work = asyncio.ensure_future(handler.do_work(task, docs))
-            state.work = work
-            try:
-                result = await work
-            except (StopWorker, RetryError, MoveError) as e:
-                do_work_exc = e
-            except asyncio.CancelledError:
-                # Only swallow a cancellation the renewer caused; anything else
-                # is the caller stopping us and must keep propagating.
-                if not state.claim_lost:
-                    raise
-            # Other exceptions propagate; the renewer is still cleaned up.
+        # A handler failure that is not a sentinel stops the worker, here as in
+        # Go. The task is quarantined on the way out if this was its last
+        # allowed claim, so the reason survives; the exception still
+        # propagates, and a failure of the quarantine changes nothing.
+        try:
+            async with _renewing(self._client, task, docs) as state:
+                work = asyncio.ensure_future(handler.do_work(task, docs))
+                state.work = work
+                try:
+                    result = await work
+                except (StopWorker, RetryError, MoveError) as e:
+                    do_work_exc = e
+                except asyncio.CancelledError:
+                    # Only swallow a cancellation the renewer caused; anything
+                    # else is the caller stopping us and must keep propagating.
+                    if not state.claim_lost:
+                        raise
+                # Other exceptions propagate; the renewer is still cleaned up.
+        except FatalWorker:
+            raise
+        except Exception as e:
+            await self._quarantine_at_limit(task, getattr(state, "sets", ()), e)
+            raise
 
+        # A renewal failure is the worker's, not the handler's, so it is not
+        # quarantined: nothing about the task has been learned.
         if state.error:
             raise state.error
 

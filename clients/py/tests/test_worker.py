@@ -976,6 +976,154 @@ def test_worker_lapsed_task_lease_retries_and_says_so():
     assert tc.attempt == 1
 
 
+def _selector_raises(error, *, claims=0, max_claims=0):
+    """Fail the selector with `error` and return (client, task, work_called)."""
+    task = _task(id='t1', version=1, queue='q', claims=claims)
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0,
+                          max_claims=max_claims, err_queue='err')
+    work_called = []
+    stop = []
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            work_called.append(t.id)
+            return None
+
+        @process.selector
+        async def process(t):
+            raise error
+
+        stop.append(await worker._process(task, process))
+
+    asyncio.run(run())
+    assert work_called == [], "the handler must not run when the selector failed"
+    return client, task, stop
+
+
+def test_worker_selector_move_quarantines_the_task():
+    """A sentinel from the selector acts on the task, as one from do_work does.
+
+    The Go worker routes a TakeDocs sentinel through the same machinery; this
+    raised out of the worker loop instead, stopping the worker over a task the
+    selector had already decided what to do with."""
+    client, _, stop = _selector_raises(MoveError("no docs for this one"))
+    assert stop == [True], "the worker keeps running"
+    tc = client.modify_calls[0].task_changes[0]
+    assert tc.queue == 'err'
+    assert 'no docs for this one' in tc.err
+    assert tc.attempt == 1
+    assert tc.reset_claims
+
+
+def test_worker_selector_retry_requeues_the_task():
+    client, _, stop = _selector_raises(RetryError("not yet"))
+    assert stop == [True]
+    tc = client.modify_calls[0].task_changes[0]
+    assert tc.queue == 'q'
+    assert tc.at is not None
+    assert 'not yet' in tc.err
+
+
+def test_worker_selector_stop_exits_without_writing():
+    """StopWorker leaves the claim to expire, as it does from do_work."""
+    client, _, stop = _selector_raises(StopWorker())
+    assert stop == [False]
+    assert client.modify_calls == []
+
+
+def test_worker_selector_failure_at_the_claim_limit_is_recorded():
+    """A non-sentinel failure on the last allowed claim is written down.
+
+    The next claim would move the task anyway without saying why, so the
+    reason is recorded while it is still known. The worker still stops."""
+    task = _task(id='t1', version=1, queue='q', claims=3)
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0, max_claims=3, err_queue='err')
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            return None
+
+        @process.selector
+        async def process(t):
+            raise RuntimeError("selector blew up")
+
+        await worker._process(task, process)
+
+    with pytest.raises(RuntimeError, match="selector blew up"):
+        asyncio.run(run())
+
+    tc = client.modify_calls[0].task_changes[0]
+    assert tc.queue == 'err'
+    assert 'claim limit' in tc.err
+    assert 'selector blew up' in tc.err
+    assert tc.attempt == 1
+    assert tc.reset_claims
+
+
+def test_worker_handler_failure_at_the_claim_limit_is_recorded():
+    """The same for the work phase, which is where Go's second check lives."""
+    task = _task(id='t1', version=1, queue='q', claims=3)
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0, max_claims=3, err_queue='err')
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            raise RuntimeError("handler blew up")
+
+        await worker._process(task, process)
+
+    with pytest.raises(RuntimeError, match="handler blew up"):
+        asyncio.run(run())
+
+    tc = client.modify_calls[0].task_changes[0]
+    assert tc.queue == 'err'
+    assert 'claim limit' in tc.err
+    assert 'handler blew up' in tc.err
+
+
+def test_worker_handler_failure_below_the_claim_limit_records_nothing():
+    """A record is a modification, and a modification resets the claim count,
+    so recording below the limit would keep the task from ever reaching it."""
+    task = _task(id='t1', version=1, queue='q', claims=1)
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0, max_claims=3, err_queue='err')
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            raise RuntimeError("handler blew up")
+
+        await worker._process(task, process)
+
+    with pytest.raises(RuntimeError, match="handler blew up"):
+        asyncio.run(run())
+
+    assert client.modify_calls == [], "the task waits out its lease"
+
+
+def test_worker_handler_failure_without_a_claim_limit_records_nothing():
+    task = _task(id='t1', version=1, queue='q', claims=1000)
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0, err_queue='err')
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            raise RuntimeError("handler blew up")
+
+        await worker._process(task, process)
+
+    with pytest.raises(RuntimeError, match="handler blew up"):
+        asyncio.run(run())
+
+    assert client.modify_calls == []
+
+
 def test_worker_missing_doc_wins_over_contention():
     """Mixed failure: an absent doc cannot be waited out, so it dominates."""
     tc = _doc_dispose(DependencyError(
