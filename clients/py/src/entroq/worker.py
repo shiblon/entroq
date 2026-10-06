@@ -28,6 +28,24 @@ class StopWorker(Exception):
     """Raise from do_work to stop the worker loop cleanly after the current task."""
 
 
+class FatalWorker(Exception):
+    """Raise from do_work or a finisher to stop the worker with this error.
+
+    The task is left alone -- not retried, not quarantined -- so it comes back
+    when its lease lapses, for a worker that may be able to do better. Use it for
+    something no retry can fix in this process: configuration that cannot be
+    read, a dependency that is gone for good.
+
+    It derives from Exception rather than BaseException on purpose. Stopping the
+    worker is a decision about this program, not an interruption of it, so code
+    that means to catch broad failures should be able to catch this one too.
+
+    Mirrors the Go worker's FatalError. The contrast is StopWorker, which ends
+    the loop as a success, and RetryError or MoveError, which dispose of the task
+    and carry on.
+    """
+
+
 class RetryError(Exception):
     """Raise from do_work to re-queue the task for retry after a delay.
 
@@ -629,10 +647,19 @@ class EntroQWorker:
             await self._client.modify(mod)
 
         # finish holds no doc claim: the transaction ended with the commit.
+        #
+        # Its failure is optimistic, as the Go worker's OnSuccess is: the task is
+        # already committed, so an error here cannot undo that and must not
+        # discard it either. Logged and carried on, unless it is fatal.
         try:
             await handler._do_finish(state.task, state.docs)
         except StopWorker:
             return False
+        except FatalWorker:
+            raise
+        except Exception as e:
+            logging.warning("Finisher for task %s failed after the commit: %s",
+                            state.task.id, e)
 
         return True
 

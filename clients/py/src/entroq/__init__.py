@@ -5,7 +5,7 @@ from .types import (
     DependencyError, InvalidArgumentError, TransportError,
 )
 from .worker import (
-    EntroQWorker, Handler, StopWorker, RetryError, MoveError,
+    EntroQWorker, Handler, StopWorker, FatalWorker, RetryError, MoveError,
     default_err_q_map,
 )
 from .base import EntroQBase

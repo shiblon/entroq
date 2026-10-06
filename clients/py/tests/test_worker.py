@@ -15,7 +15,7 @@ from entroq.types import (
     DependencyError, Modification, ModifyResult, TransportError,
 )
 from entroq.worker import (
-    StopWorker, RetryError, MoveError,
+    StopWorker, FatalWorker, RetryError, MoveError,
     DocClaim, Handler, EntroQWorker, default_err_q_map,
     _fix_versions, _renewing,
 )
@@ -1311,3 +1311,92 @@ def test_releasing_never_names_an_unclaimed_set():
 
     assert _released(client) == [('ns', 'held')], (
         "releasing moves a version, so it may only name what was claimed here")
+
+
+# ---------------------------------------------------------------------------
+# FatalWorker
+# ---------------------------------------------------------------------------
+
+def test_fatal_worker_stops_the_worker_and_leaves_the_task():
+    """A fatal handler error stops the loop and disposes of nothing.
+
+    The task is neither retried nor quarantined, so it comes back when its lease
+    lapses -- for a worker that may do better. Mirrors Go's FatalError.
+    """
+    task = _task(id='t1', version=1, queue='q')
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0)
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            raise FatalWorker("configuration is unreadable")
+
+        with pytest.raises(FatalWorker, match="unreadable"):
+            await worker._process(task, process)
+
+    asyncio.run(run())
+    assert client.modify_calls == [], (
+        "a fatal error must not retry, quarantine, or otherwise write")
+
+
+def test_fatal_worker_is_an_ordinary_exception():
+    """It derives from Exception, so broad handlers can still catch it.
+
+    Stopping the worker is a decision about the program, not an interruption of
+    it, which is why this is not a BaseException like KeyboardInterrupt.
+    """
+    assert issubclass(FatalWorker, Exception)
+    try:
+        raise FatalWorker("x")
+    except Exception:
+        pass
+    else:
+        raise AssertionError("FatalWorker escaped 'except Exception'")
+
+
+def test_a_finisher_failure_is_logged_not_fatal():
+    """The commit already landed, so a finisher error must not discard it.
+
+    Matches the Go worker, where OnSuccess is optimistic: its error is logged and
+    the task stays handled. Python used to let any finisher error kill the worker,
+    which was stricter than the reference.
+    """
+    task = _task(id='t1', version=1, queue='q')
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0)
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            return Modification(Modification.deleting(t))
+
+        @process.finisher
+        async def process(t, docs):
+            raise RuntimeError("the webhook is down")
+
+        return await worker._process(task, process)
+
+    assert asyncio.run(run()) is True, "the worker keeps going"
+    assert client.modify_calls[0].task_deletes, "the commit still happened"
+
+
+def test_a_fatal_finisher_does_stop_the_worker():
+    """The one finisher error that is not swallowed."""
+    task = _task(id='t1', version=1, queue='q')
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0)
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            return Modification(Modification.deleting(t))
+
+        @process.finisher
+        async def process(t, docs):
+            raise FatalWorker("unrecoverable after commit")
+
+        with pytest.raises(FatalWorker):
+            await worker._process(task, process)
+
+    asyncio.run(run())
