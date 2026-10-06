@@ -414,6 +414,13 @@ runs, so plan a short maintenance window on large doc tables.
 
 ### Fixed
 
+- **A Python doc-contention retry spreads the workers that lost.** Every
+  worker that loses one race for a doc set fails at the same instant, and all
+  of them waited exactly `retry_delay_s`, came back together, and all but one
+  lost again. The retry now waits up to a quarter longer at random, as the Go
+  worker's `contentionDelay` does -- and only there, since a handler asking
+  for a retry is asking for the delay it named.
+
 - **The Python worker's renewal keeps what it was told, and starts on time.**
   Three ways a renewal could leave the worker holding a version the server had
   moved past, each of which fails the body's commit as a dependency error and
@@ -422,9 +429,10 @@ runs, so plan a short maintenance window on large doc tables.
   hands the renewal goroutine's state over instead of cancelling it, and
   Python now asks the renewer to stand down and waits (bounded by
   `RENEWAL_HANDOFF_S`). A reply that did not report the task, or a set, left
-  that version silently stale; it now raises the new `entroq.worker`
-  `RenewalError`, which stops the worker where the reason is known rather than
-  failing the commit later. And the first renewal waited a full interval from
+  that version silently stale; a renewal that does not come back with what the
+  worker holds now says the hold is gone, which is the lost claim it already
+  handles, instead of carrying a stale version into a commit that is refused.
+  And the first renewal waited a full interval from
   the start of the handler body, ignoring the lease already spent claiming the
   task's doc sets -- an all-or-nothing claim against other workers, so not
   quick -- which meant a body shorter than the interval never renewed at all,

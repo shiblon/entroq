@@ -1017,6 +1017,45 @@ def _doc_dispose(error):
     return client.modify_calls[0].task_changes[0]
 
 
+def _retry_delays(*, jitter: bool, n: int = 20, delay_s: float = 10.0) -> list[float]:
+    """Dispose of n retries and return how long each asked to wait."""
+    out = []
+    for _ in range(n):
+        task = _task(id='t1', version=1, queue='q')
+        client = FakeClient(tasks=[task])
+        worker = EntroQWorker(client, 'q', claim_duration_s=60.0,
+                              retry_delay_s=delay_s)
+
+        async def run():
+            await worker._dispose(task, RetryError("lost a race"), jitter=jitter)
+
+        asyncio.run(run())
+        tc = client.modify_calls[0].task_changes[0]
+        out.append((tc.at - datetime.now(tz=timezone.utc)).total_seconds())
+    return out
+
+
+def test_a_contention_retry_spreads_the_workers_that_lost():
+    """Every worker that loses one race fails at the same instant.
+
+    An unjittered delay brings them all back together to lose again, so a
+    contention retry waits up to a quarter longer at random. Go's
+    contentionDelay does the same.
+    """
+    delays = _retry_delays(jitter=True)
+    assert len({round(d, 3) for d in delays}) > 1, (
+        f"every retry waited the same: {delays}")
+    assert all(9.0 <= d <= 13.0 for d in delays), (
+        f"a spread retry must stay within a quarter of the delay: {delays}")
+
+
+def test_an_ordinary_retry_is_not_spread():
+    """Only a failure shared by every loser of a race needs spreading; a
+    handler asking for a retry is asking for the delay it named."""
+    delays = _retry_delays(jitter=False, n=5)
+    assert all(abs(d - 10.0) < 0.5 for d in delays), delays
+
+
 def test_worker_missing_doc_is_a_poison_pill():
     """A required doc that no longer exists can never be claimed: quarantine."""
     tc = _doc_dispose(DependencyError(
@@ -1461,11 +1500,12 @@ def test_a_renewal_already_committed_is_not_abandoned():
 
 
 def test_a_renewal_that_does_not_report_the_task_stops_the_work():
-    """A reply naming no task leaves the caller without the version it holds.
+    """If a renewal does not come back with what we hold, we do not hold it.
 
-    Carrying on would commit against a version the server has moved past,
-    which fails as a dependency error and throws the work away. Better to stop
-    where the reason is known. The Go worker's renewed() errors here.
+    A reply naming no task leaves the caller unable to name its version again,
+    so there is nothing to go on with: the same lost claim a failed renewal
+    raises, and dropped the same way, rather than carried on into a commit
+    that would be refused.
     """
     task = _task(id='t1', version=1, queue='q', lease_s=0.12)
     client = SilentRenewClient(tasks=[task], omit='task')
@@ -1481,10 +1521,9 @@ def test_a_renewal_that_does_not_report_the_task_stops_the_work():
         worker = EntroQWorker(client, 'q', claim_duration_s=60.0)
         await worker._process(task, process)
 
-    with pytest.raises(Exception) as caught:
+    # A lost claim: the run loop logs it and takes the next task.
+    with pytest.raises(DependencyError):
         asyncio.run(run())
-    assert not isinstance(caught.value, DependencyError), (
-        "a malformed reply is not a lost claim: the worker must not carry on")
     assert client.renewals >= 1
     assert committed == [], "the handler must not run to completion"
 
@@ -1510,9 +1549,8 @@ def test_a_renewal_that_does_not_report_a_set_stops_the_work():
         worker = EntroQWorker(client, 'q', claim_duration_s=60.0)
         await worker._process(task, process)
 
-    with pytest.raises(Exception) as caught:
+    with pytest.raises(DependencyError):
         asyncio.run(run())
-    assert not isinstance(caught.value, DependencyError)
     assert committed == [], "the handler must not run to completion"
 
 

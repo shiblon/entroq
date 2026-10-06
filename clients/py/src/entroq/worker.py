@@ -28,20 +28,6 @@ class StopWorker(Exception):
     """Raise from do_work to stop the worker loop cleanly after the current task."""
 
 
-class RenewalError(Exception):
-    """Raised when a renewal answered in a way that leaves the hold unknown.
-
-    Every version a renewal moves has to come back in its reply, since a
-    commit built on a version the server has moved past fails as a dependency
-    error and throws the body's work away. A reply that does not account for
-    what it was asked to renew is reported here, where the reason is known,
-    rather than as a stale version later.
-
-    Not a :class:`DependencyError`: the claim may well still be held, so this
-    is not a task to drop and go on from.
-    """
-
-
 class FatalWorker(Exception):
     """Raise from do_work or a finisher to stop the worker with this error.
 
@@ -255,9 +241,8 @@ class _RenewState:
         self.docs = list(docs)
         # The claimed sets, at their lock versions: what a renewal or release
         # names. Separate from docs because a set holds its own lock and may
-        # have no members at all. A client whose claim_doc_sets does not
-        # report its sets renews the task alone, as it did before it could.
-        self.sets: list[Doc] = list(getattr(docs, 'sets', ()))
+        # have no members at all.
+        self.sets: list[Doc] = list(docs.sets)
         self.error: Exception | None = None
         # Set when the renewer cancelled the work itself, so _process can tell
         # that cancellation apart from one arriving from outside the worker.
@@ -271,11 +256,11 @@ class _RenewState:
         self.stop = asyncio.Event()
 
     def stop_work(self, err: Exception) -> None:
-        """Record why the hold is no longer usable and cancel the handler.
+        """Record that the hold is gone and cancel the handler.
 
-        Either the claim is gone or a renewal answered unusably. Both mean
-        nothing this body produces can be committed, so the work stops now
-        rather than running to completion against a hold it does not have.
+        Nothing this body produces can be committed against a hold it does not
+        have, and it may duplicate whatever the new claimant is doing, so the
+        work stops now rather than running to completion.
         """
         self.error = err
         self.work_cancelled = True
@@ -308,13 +293,17 @@ def _renewed(task: Task, sets: Sequence[Doc],
              result: ModifyResult) -> tuple[Task, list[Doc]]:
     """Return the task and sets at the versions a renewal reply reports.
 
-    Everything the renewal named has to come back, or the caller does not know
-    what it holds; see :class:`RenewalError`. Real docs have IDs and sets do
-    not, so a set's lock is picked out of the changed docs by that.
+    If a renewal does not come back with what we hold, we do not hold it: a
+    version the reply leaves out is a version the caller cannot name again, so
+    there is nothing to go on with. That is the lost claim a failed renewal
+    already raises, and it is raised the same way here.
+
+    Real docs have IDs and sets do not, so a set's lock is picked out of the
+    changed docs by that.
     """
     renewed = [t for t in result.tasks_changed if t.id == task.id]
     if len(renewed) != 1:
-        raise RenewalError(
+        raise DependencyError(
             f"renewal of task {task.id} answered with tasks {result.tasks_changed}")
     locks = {(d.namespace, d.key): d
              for d in result.docs_changed if d.is_set_ref()}
@@ -322,7 +311,7 @@ def _renewed(task: Task, sets: Sequence[Doc],
     for group in sets:
         lock = locks.get((group.namespace, group.key))
         if lock is None:
-            raise RenewalError(
+            raise DependencyError(
                 f"renewal of task {task.id} did not answer with doc set "
                 f"{group.key!r} in {group.namespace!r}")
         out.append(lock)
@@ -397,7 +386,7 @@ async def _renewing(
                 continue
             try:
                 state.task, state.sets = _renewed(state.task, state.sets, result)
-            except RenewalError as e:
+            except DependencyError as e:
                 state.stop_work(e)
                 return
 
@@ -434,64 +423,45 @@ def _fix_versions(mod: Modification, task: Task, docs: list[Doc],
     """Mutate mod in place so every version it names is the current one.
 
     This is the one place a renewal's effect on versions is applied, so
-    nothing else has to be kept in step with it. The task's version comes
-    from the last renewal of the task. A doc has no version of its own --
-    it carries its set's, the only one it has -- so the claimed sets are the
-    authority for docs, and each one named is resolved to its set and given
-    that set's current version.
+    nothing else has to be kept in step with it.
 
-    A doc names itself by ID, which does not say which set holds it, so the
-    claimed members supply that mapping. A client whose claim could not report
-    its sets falls back to the versions its members were claimed at, which is
-    all it knows.
+    The task's version comes from the last renewal of the task. A doc has no
+    version of its own -- it carries its set's, the only one it has -- so a
+    claimed member takes the version of the set holding it. A client whose
+    claim could not report its sets falls back to the versions its members
+    were claimed at, which is all it knows. Anything mod names that was not
+    claimed here is left alone: its version is not ours to decide.
     """
-    task_ver = {task.id: task.version}
-    for tc in mod.task_changes:
-        if tc.id in task_ver:
-            tc.version = task_ver[tc.id]
-    for td in mod.task_deletes:
-        if td.id in task_ver:
-            td.version = task_ver[td.id]
-    for td in mod.task_depends:
-        if td.id in task_ver:
-            td.version = task_ver[td.id]
-    # An arrival names its task at a version too, so a handler deferring or
-    # renewing the task it was given needs the same correction. Go's fixVersions
-    # covers m.Arrives for exactly this reason.
-    for ta in mod.task_arrivals:
-        if ta.id in task_ver:
-            ta.version = task_ver[ta.id]
+    for op in (*mod.task_changes, *mod.task_deletes, *mod.task_depends,
+               *mod.task_arrivals):
+        if op.id == task.id:
+            op.version = task.version
 
-    set_of = {(d.namespace, d.id): (d.namespace, d.key) for d in docs}
     set_version = {(g.namespace, g.key): g.version for g in sets}
+    # A member names itself by ID, which does not say which set holds it, so
+    # the claimed members supply that mapping.
+    set_of = {(d.namespace, d.id): (d.namespace, d.key) for d in docs}
     claimed_at = {(d.namespace, d.id): d.version for d in docs}
 
     def current(namespace: str, id: str) -> int | None:
         group = set_of.get((namespace, id))
-        if group is not None and group in set_version:
+        if group in set_version:
             return set_version[group]
         return claimed_at.get((namespace, id))
 
-    for dc in mod.doc_changes:
-        version = current(dc.namespace, dc.id)
+    for op in (*mod.doc_changes, *mod.doc_deletes, *mod.doc_depends):
+        version = current(op.namespace, op.id)
         if version is not None:
-            dc.version = version
-    for dd in mod.doc_deletes:
-        version = current(dd.namespace, dd.id)
-        if version is not None:
-            dd.version = version
-    for dd in mod.doc_depends:
-        version = current(dd.namespace, dd.id)
-        if version is not None:
-            dd.version = version
+            op.version = version
+
     # An arrival names its SET directly, so it takes the set's version without
-    # going through a member. This is the documented way for a handler to hold a
-    # set past the body (see _releasing), so leaving it pinned at the claim-time
-    # version would reject the whole commit after the first renewal.
-    for da in mod.doc_arrivals:
-        version = set_version.get((da.namespace, da.key))
-        if version is not None:
-            da.version = version
+    # going through a member. This is how a handler holds a set past the body
+    # (see _releasing), so leaving it at the claim-time version would reject
+    # the whole commit after the first renewal.
+    for op in mod.doc_arrivals:
+        group = (op.namespace, op.key)
+        if group in set_version:
+            op.version = set_version[group]
 
 
 def _reset_claims(mod: Modification, task_id: str) -> None:
@@ -664,6 +634,26 @@ class EntroQWorker:
         # which means this worker no longer holds it.
         return await self._client.claim_doc_sets(doc_claims, task_to_match=task)
 
+    async def _failed(self, task: Task, exc: BaseException, *,
+                      sets: Sequence[Doc] = ()) -> bool:
+        """Dispose of a failure from a handler phase, and say what to do next.
+
+        One ladder for every phase, the selector's and the body's, so they
+        cannot drift: a sentinel acts on the task, and anything else stops the
+        worker -- quarantining the task first if this was its last allowed
+        claim, so the reason survives. The return value is what ``_process``
+        returns: ``False`` to stop the worker loop, ``True`` to go on.
+        """
+        if isinstance(exc, StopWorker):
+            return False  # the claim expires naturally
+        if isinstance(exc, (RetryError, MoveError)):
+            await self._dispose(task, exc, sets=sets)
+            return True
+        if isinstance(exc, FatalWorker):
+            raise exc
+        await self._quarantine_at_limit(task, sets, exc)
+        raise exc
+
     async def _quarantine_at_limit(self, task: Task | None, sets: Sequence[Doc],
                                    exc: BaseException) -> bool:
         """Move task to its error queue now if this was its last allowed claim.
@@ -691,13 +681,18 @@ class EntroQWorker:
         return True
 
     async def _dispose(self, task: Task, exc: RetryError | MoveError, *,
-                       sets: Sequence[Doc] = ()) -> None:
+                       sets: Sequence[Doc] = (), jitter: bool = False) -> None:
         """Apply a sentinel's disposition to a claimed task, releasing its sets.
 
         Retry and quarantine are one decision, taken here at the moment of
         failure, as the Go client's ``RetryOrQuarantine`` does. Deferring the
         ceiling check to the next claim would mean an exhausted task is only
         quarantined if a worker happens to come back for it, and none may.
+
+        ``jitter`` spreads a retry's delay by up to a quarter, for a failure
+        every loser of one race suffers at the same instant. Without it they
+        all come back together and all but one lose again. Go's
+        contentionDelay does the same, and only there.
         """
         attempt = task.attempt + 1
 
@@ -722,6 +717,8 @@ class EntroQWorker:
             change = quarantine(exc.or_move_to or self.error_queue_for(task.queue))
         else:
             delay = exc.delay_s if exc.delay_s is not None else self._retry_delay_s
+            if jitter:
+                delay += random.uniform(0, delay / 4)
             at = datetime.now(tz=timezone.utc) + timedelta(seconds=delay)
             change = Modification.changing(task, at=at, attempt=attempt,
                                            err=str(exc), reset_claims=True)
@@ -757,15 +754,6 @@ class EntroQWorker:
 
         try:
             docs = await self._claim_docs(task, handler)
-        except StopWorker:
-            return False  # claim expires naturally
-        except (RetryError, MoveError) as e:
-            # A sentinel from the selector acts on the task as one from do_work
-            # does. Nothing is claimed yet, so no sets go back.
-            await self._dispose(task, e)
-            return True
-        except FatalWorker:
-            raise
         except DependencyError as e:
             # Classify rather than swallow, and record the reason on the task
             # instead of letting it vanish into a log line. A missing doc can
@@ -778,56 +766,45 @@ class EntroQWorker:
             if e.has_missing_docs():
                 await self._dispose(task, MoveError(f"required doc missing: {e}"))
             elif e.has_missing():
-                await self._dispose(task, RetryError(f"task lease lapsed while taking docs: {e}"))
+                await self._dispose(task, RetryError(f"task lease lapsed while taking docs: {e}"),
+                                    jitter=True)
             else:
-                await self._dispose(task, RetryError(f"doc contention: {e}"))
+                await self._dispose(task, RetryError(f"doc contention: {e}"),
+                                    jitter=True)
             return True
         except Exception as e:
-            await self._quarantine_at_limit(task, (), e)
-            raise
+            # Nothing is claimed yet, so there are no sets to release.
+            return await self._failed(task, e)
 
-        do_work_exc: Exception | None = None
+        do_work_exc: BaseException | None = None
         result: Modification | None = None
-        state = None
 
-        # A handler failure that is not a sentinel stops the worker, here as in
-        # Go. The task is quarantined on the way out if this was its last
-        # allowed claim, so the reason survives; the exception still
-        # propagates, and a failure of the quarantine changes nothing.
-        try:
-            since_claim_s = asyncio.get_running_loop().time() - claimed_at
-            async with _renewing(self._client, task, docs, since_claim_s) as state:
-                work = asyncio.ensure_future(handler.do_work(task, docs))
-                state.work = work
-                try:
-                    result = await work
-                except (StopWorker, RetryError, MoveError) as e:
-                    do_work_exc = e
-                except asyncio.CancelledError:
-                    # Only swallow a cancellation the renewer caused; anything
-                    # else is the caller stopping us and must keep propagating.
-                    if not state.work_cancelled:
-                        raise
-                # Other exceptions propagate; the renewer is still cleaned up.
-        except FatalWorker:
-            raise
-        except Exception as e:
-            await self._quarantine_at_limit(task, getattr(state, "sets", ()), e)
-            raise
+        since_claim_s = asyncio.get_running_loop().time() - claimed_at
+        async with _renewing(self._client, task, docs, since_claim_s) as state:
+            work = asyncio.ensure_future(handler.do_work(task, docs))
+            state.work = work
+            try:
+                result = await work
+            except asyncio.CancelledError:
+                # Only swallow a cancellation the renewer caused; anything
+                # else is the caller stopping us and must keep propagating.
+                if not state.work_cancelled:
+                    raise
+            except Exception as e:
+                do_work_exc = e
 
-        # A renewal failure is the worker's, not the handler's, so it is not
-        # quarantined: nothing about the task has been learned. A lost claim is
-        # a DependencyError, which the run loop logs and goes on from; a
-        # RenewalError is not, and stops the worker, as it does in Go.
+        # Three outcomes in Go's order. A fatal keeps the handler's control
+        # whatever else happened. Then a stopped renewal is why the work
+        # ended, whatever the handler returned: it is a lost claim, which the
+        # run loop logs and goes on from, and not the handler's failure, so
+        # nothing is quarantined for it. Only then does the handler's own
+        # failure decide.
+        if isinstance(do_work_exc, FatalWorker):
+            raise do_work_exc
         if state.error:
             raise state.error
-
-        if isinstance(do_work_exc, StopWorker):
-            return False  # claim expires naturally
-
-        if isinstance(do_work_exc, (RetryError, MoveError)):
-            await self._dispose(state.task, do_work_exc, sets=state.sets)
-            return True
+        if do_work_exc is not None:
+            return await self._failed(state.task, do_work_exc, sets=state.sets)
 
         # The modification that ends the body carries the releases. A body
         # that decided nothing still ended, and its sets still go back, in a
