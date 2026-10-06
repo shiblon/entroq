@@ -32,6 +32,7 @@ func TestBackendContract(t *testing.T) {
 		{"TasksWithIDStaysInQueue", eqtest.TasksWithIDStaysInQueue},
 		{"DocSets", eqtest.DocSets},
 		{"DocSetDepends", eqtest.DocSetDepends},
+		{"DocAndTaskDependenciesFailTogether", eqtest.DocAndTaskDependenciesFailTogether},
 		{"DocSecondaryKeysAreUnique", eqtest.DocSecondaryKeysAreUnique},
 		{"DocMemberVersionFromSet", eqtest.DocMemberVersionFromSet},
 		{"DocSecondaryKeyRaceHasOneWinner", eqtest.DocSecondaryKeyRaceHasOneWinner},

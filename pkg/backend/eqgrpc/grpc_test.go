@@ -143,6 +143,10 @@ func TestGRPCDocSetDepends(t *testing.T) {
 	RunQTest(t, eqtest.DocSetDepends)
 }
 
+func TestGRPCDocAndTaskDependenciesFailTogether(t *testing.T) {
+	RunQTest(t, eqtest.DocAndTaskDependenciesFailTogether)
+}
+
 func TestGRPCUpdateArrival(t *testing.T) {
 	RunQTest(t, eqtest.UpdateArrival)
 }

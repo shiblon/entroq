@@ -600,6 +600,10 @@ func TestEQMemDocSetDepends(t *testing.T) {
 	RunQTest(t, eqtest.DocSetDepends)
 }
 
+func TestEQMemDocAndTaskDependenciesFailTogether(t *testing.T) {
+	RunQTest(t, eqtest.DocAndTaskDependenciesFailTogether)
+}
+
 func TestEQMemWorkerReleasesSets(t *testing.T) {
 	RunQTest(t, eqtest.WorkerReleasesSets)
 }

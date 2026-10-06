@@ -283,16 +283,127 @@ BEGIN
 END;
 $$;
 
+-- entroq._check_task_deps raises SQLSTATE EQ001 if any task dependency the
+-- modification names is unsatisfied, and does nothing otherwise. It writes
+-- nothing, so a caller can ask what would fail without applying anything --
+-- which is how a modification whose DOC rules already failed still reports its
+-- task failures, instead of the caller seeing one kind and then the other.
+--
+-- The detail is the JSON object _modify_arrays documents:
+--   'missing':    must-exist deps not found at all
+--   'mismatched': must-exist deps found at wrong version
+--   'claimed':    deps a writing op names that another claimant holds
+--   'collisions': explicit insert IDs that already exist
+-- All four are gathered before raising, so one call reports everything.
+--
+-- It takes FOR UPDATE on the rows it finds, as the check has to: a version
+-- that could change after being read is not checked.
+DROP FUNCTION IF EXISTS entroq._check_task_deps(
+    text,
+    text[], integer[], text[],
+    text[], integer[], text[],
+    text[], integer[], text[],
+    text[]
+);
+CREATE OR REPLACE FUNCTION entroq._check_task_deps(
+    p_claimant        text,
+    p_dep_ids         text[],
+    p_dep_vers        integer[],
+    p_dep_queues      text[],
+    p_del_ids         text[],
+    p_del_vers        integer[],
+    p_del_queues      text[],
+    p_chg_ids         text[],
+    p_chg_vers        integer[],
+    p_chg_from_queues text[],
+    p_ins_ids         text[]
+) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+    v_now          timestamptz := now();
+    v_missing      jsonb;
+    v_mismatched   jsonb;
+    v_claimed      jsonb;
+    v_collisions   jsonb;
+BEGIN
+    -- Lock all must-exist dependency rows and check their versions.
+    -- all_deps covers depends, deletes, and changes.
+    -- locked acquires FOR UPDATE on matching rows.
+    -- The LEFT JOIN finds missing rows (l.lck_id IS NULL) and version
+    -- mismatches (l.lck_ver != d.dep_ver). Deletes and changes, but not
+    -- depends, also fail on a task someone else holds: an unexpired claim by a
+    -- claimant other than p_claimant.
+    --
+    -- all_deps carries the claimed queue per op: the task's current queue for
+    -- depends/deletes, the source (from) queue for changes. The queue is part of
+    -- the key, so the LEFT JOIN matches on (id, queue); a queue mismatch fails to
+    -- join and surfaces as missing, indistinguishable from an absent task.
+    WITH all_deps(dep_id, dep_ver, dep_queue, dep_writes) AS (
+        SELECT *, false FROM unnest(coalesce(p_dep_ids, '{}'::text[]), coalesce(p_dep_vers, '{}'::integer[]), coalesce(p_dep_queues, '{}'::text[]))
+        UNION ALL
+        SELECT *, true FROM unnest(coalesce(p_del_ids, '{}'::text[]), coalesce(p_del_vers, '{}'::integer[]), coalesce(p_del_queues, '{}'::text[]))
+        UNION ALL
+        SELECT *, true FROM unnest(coalesce(p_chg_ids, '{}'::text[]), coalesce(p_chg_vers, '{}'::integer[]), coalesce(p_chg_from_queues, '{}'::text[]))
+    ),
+    locked AS (
+        SELECT t.id AS lck_id, t.version AS lck_ver, t.queue AS lck_queue,
+               t.claimant AS lck_claimant, t.at AS lck_at
+        FROM entroq.tasks t
+        WHERE t.id = ANY(ARRAY(SELECT dep_id FROM all_deps))
+        FOR UPDATE
+    )
+    SELECT
+        coalesce(
+            jsonb_agg(jsonb_build_object('id', d.dep_id, 'version', d.dep_ver))
+                FILTER (WHERE l.lck_id IS NULL),
+            '[]'::jsonb
+        ),
+        coalesce(
+            jsonb_agg(jsonb_build_object('id', d.dep_id, 'version', d.dep_ver))
+                FILTER (WHERE l.lck_id IS NOT NULL AND l.lck_ver != d.dep_ver),
+            '[]'::jsonb
+        ),
+        coalesce(
+            jsonb_agg(jsonb_build_object('id', d.dep_id, 'version', d.dep_ver))
+                FILTER (WHERE l.lck_id IS NOT NULL AND l.lck_ver = d.dep_ver AND d.dep_writes
+                        AND l.lck_claimant != '' AND l.lck_claimant != p_claimant AND l.lck_at > v_now),
+            '[]'::jsonb
+        )
+    INTO v_missing, v_mismatched, v_claimed
+    FROM all_deps d
+    LEFT JOIN locked l ON l.lck_id = d.dep_id AND l.lck_queue = d.dep_queue;
+
+    -- Check explicit insert ID conflicts: these must not already exist.
+    -- No locking needed; the INSERT's PRIMARY KEY constraint handles races.
+    SELECT coalesce(
+        jsonb_agg(jsonb_build_object('id', i.chk_id, 'version', t.version)),
+        '[]'::jsonb
+    )
+    INTO v_collisions
+    FROM unnest(coalesce(p_ins_ids, '{}'::text[])) AS i(chk_id)
+    JOIN entroq.tasks t ON t.id = i.chk_id
+    WHERE i.chk_id != '';
+
+    -- Report all problems at once.
+    IF v_missing != '[]'::jsonb OR v_mismatched != '[]'::jsonb OR v_claimed != '[]'::jsonb OR v_collisions != '[]'::jsonb THEN
+        RAISE EXCEPTION 'entroq dependency error'
+            USING ERRCODE = 'EQ001',
+                  DETAIL  = jsonb_build_object(
+                      'missing',    v_missing,
+                      'mismatched', v_mismatched,
+                      'claimed',    v_claimed,
+                      'collisions', v_collisions
+                  )::text;
+    END IF;
+
+END;
+$$;
+
 -- entroq._modify_arrays atomically applies inserts, changes, deletes, and
 -- dependency checks. Uses parallel arrays for efficiency from the Go caller,
 -- which avoids composite literal encoding complexity (especially bytea).
 --
--- Raises SQLSTATE EQ001 with a JSON detail on any dependency problem.
--- The detail has three arrays:
---   'missing':    must-exist deps not found at all
---   'mismatched': must-exist deps found at wrong version
---   'collisions': explicit insert IDs that already exist
--- All three are checked before raising, so the caller sees all problems at once.
+-- Raises SQLSTATE EQ001 with a JSON detail on any dependency problem; see
+-- entroq._check_task_deps, which it calls first and which owns that detail.
 --
 -- Returns tagged rows: kind='inserted' or kind='changed'.
 -- Deleted tasks produce no output rows.
@@ -391,84 +502,18 @@ DECLARE
     -- 365::bigint, not 365: the product overflows integer before it is
     -- assigned, and Postgres raises 22003 rather than widening.
     v_past_ms      bigint := 365::bigint * 24 * 60 * 60 * 1000;
-    v_missing      jsonb;
-    v_mismatched   jsonb;
-    v_claimed      jsonb;
-    v_collisions   jsonb;
     v_qset         text[];
 BEGIN
-    -- Lock all must-exist dependency rows and check their versions.
-    -- all_deps covers depends, deletes, and changes.
-    -- locked acquires FOR UPDATE on matching rows.
-    -- The LEFT JOIN finds missing rows (l.lck_id IS NULL) and version
-    -- mismatches (l.lck_ver != d.dep_ver). Deletes and changes, but not
-    -- depends, also fail on a task someone else holds: an unexpired claim by a
-    -- claimant other than p_claimant.
-    --
-    -- All CTE column aliases use prefixed names (dep_*, lck_*, etc.) to avoid
-    -- ambiguity with the RETURNS TABLE OUT parameters (id, version, queue, ...)
-    -- that PL/pgSQL puts in scope for the entire function body.
-    -- all_deps carries the claimed queue per op: the task's current queue for
-    -- depends/deletes, the source (from) queue for changes. The queue is part of
-    -- the key, so the LEFT JOIN matches on (id, queue); a queue mismatch fails to
-    -- join and surfaces as missing, indistinguishable from an absent task.
-    WITH all_deps(dep_id, dep_ver, dep_queue, dep_writes) AS (
-        SELECT *, false FROM unnest(coalesce(p_dep_ids, '{}'::text[]), coalesce(p_dep_vers, '{}'::integer[]), coalesce(p_dep_queues, '{}'::text[]))
-        UNION ALL
-        SELECT *, true FROM unnest(coalesce(p_del_ids, '{}'::text[]), coalesce(p_del_vers, '{}'::integer[]), coalesce(p_del_queues, '{}'::text[]))
-        UNION ALL
-        SELECT *, true FROM unnest(coalesce(p_chg_ids, '{}'::text[]), coalesce(p_chg_vers, '{}'::integer[]), coalesce(p_chg_from_queues, '{}'::text[]))
-    ),
-    locked AS (
-        SELECT t.id AS lck_id, t.version AS lck_ver, t.queue AS lck_queue,
-               t.claimant AS lck_claimant, t.at AS lck_at
-        FROM entroq.tasks t
-        WHERE t.id = ANY(ARRAY(SELECT dep_id FROM all_deps))
-        FOR UPDATE
-    )
-    SELECT
-        coalesce(
-            jsonb_agg(jsonb_build_object('id', d.dep_id, 'version', d.dep_ver))
-                FILTER (WHERE l.lck_id IS NULL),
-            '[]'::jsonb
-        ),
-        coalesce(
-            jsonb_agg(jsonb_build_object('id', d.dep_id, 'version', d.dep_ver))
-                FILTER (WHERE l.lck_id IS NOT NULL AND l.lck_ver != d.dep_ver),
-            '[]'::jsonb
-        ),
-        coalesce(
-            jsonb_agg(jsonb_build_object('id', d.dep_id, 'version', d.dep_ver))
-                FILTER (WHERE l.lck_id IS NOT NULL AND l.lck_ver = d.dep_ver AND d.dep_writes
-                        AND l.lck_claimant != '' AND l.lck_claimant != p_claimant AND l.lck_at > v_now),
-            '[]'::jsonb
-        )
-    INTO v_missing, v_mismatched, v_claimed
-    FROM all_deps d
-    LEFT JOIN locked l ON l.lck_id = d.dep_id AND l.lck_queue = d.dep_queue;
-
-    -- Check explicit insert ID conflicts: these must not already exist.
-    -- No locking needed; the INSERT's PRIMARY KEY constraint handles races.
-    SELECT coalesce(
-        jsonb_agg(jsonb_build_object('id', i.chk_id, 'version', t.version)),
-        '[]'::jsonb
-    )
-    INTO v_collisions
-    FROM unnest(coalesce(p_ins_ids, '{}'::text[])) AS i(chk_id)
-    JOIN entroq.tasks t ON t.id = i.chk_id
-    WHERE i.chk_id != '';
-
-    -- Report all problems at once.
-    IF v_missing != '[]'::jsonb OR v_mismatched != '[]'::jsonb OR v_claimed != '[]'::jsonb OR v_collisions != '[]'::jsonb THEN
-        RAISE EXCEPTION 'entroq dependency error'
-            USING ERRCODE = 'EQ001',
-                  DETAIL  = jsonb_build_object(
-                      'missing',    v_missing,
-                      'mismatched', v_mismatched,
-                      'claimed',    v_claimed,
-                      'collisions', v_collisions
-                  )::text;
-    END IF;
+    -- Task dependencies, by the rules in entroq._check_task_deps, which raises
+    -- EQ001 and so ends this function here. It is a function of its own
+    -- because a caller also asks it directly, for a modification whose doc
+    -- rules already failed.
+    PERFORM entroq._check_task_deps(
+        p_claimant,
+        p_dep_ids, p_dep_vers, p_dep_queues,
+        p_del_ids, p_del_vers, p_del_queues,
+        p_chg_ids, p_chg_vers, p_chg_from_queues,
+        p_ins_ids);
 
     -- Deletes: versions already verified; delete by id+version for safety.
     DELETE FROM entroq.tasks

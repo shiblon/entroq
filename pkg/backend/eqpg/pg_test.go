@@ -568,6 +568,10 @@ func TestDocSetDepends(t *testing.T) {
 	RunQTest(t, eqtest.DocSetDepends)
 }
 
+func TestDocAndTaskDependenciesFailTogether(t *testing.T) {
+	RunQTest(t, eqtest.DocAndTaskDependenciesFailTogether)
+}
+
 func TestWorkerReleasesSets(t *testing.T) {
 	RunQTest(t, eqtest.WorkerReleasesSets)
 }

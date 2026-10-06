@@ -1345,6 +1345,58 @@ func DocClaimSets(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 	})
 }
 
+// DocAndTaskDependenciesFailTogether covers what a modification reports when
+// both its task rules and its doc rules fail: everything, in one error.
+//
+// A caller fixes what an error names. Told only about its docs, it fixes those,
+// calls again, and is told about its tasks -- two round trips to learn one
+// answer, and the second one's state may have moved on again. The rules are
+// decided in two places, which is an implementation detail and not something
+// a caller should be able to see.
+func DocAndTaskDependenciesFailTogether(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	ns := path.Join(qPrefix, "both_deps")
+	queue := path.Join(qPrefix, "both_deps")
+
+	res, err := client.Modify(ctx,
+		entroq.InsertingInto(queue),
+		entroq.PuttingDocInto(ns, entroq.WithKeys("config", ""), entroq.WithContent("v1")))
+	if err != nil {
+		t.Fatalf("Insert task and doc: %v", err)
+	}
+	task, doc := res.InsertedTasks[0], res.InsertedDocs[0]
+
+	// Both at versions they are not at, in one call.
+	staleTask := entroq.TaskID{ID: task.ID, Version: task.Version + 7, Queue: task.Queue}
+	staleSet := entroq.NewDocSetRef(ns, doc.Key, doc.Version+7)
+	_, err = client.Modify(ctx, staleTask.Depend(), staleSet.Depend())
+	depErr, ok := entroq.AsDependency(err)
+	if !ok {
+		t.Fatalf("Modify with a stale task depend and a stale set depend: want a dependency error, got %v", err)
+	}
+	if len(depErr.Depends) != 1 || depErr.Depends[0].ID != task.ID {
+		t.Errorf("Failed task depends: got %v, want task %q", depErr.Depends, task.ID)
+	}
+	if len(depErr.DocDepends) != 1 || depErr.DocDepends[0].Key != doc.Key {
+		t.Errorf("Failed doc depends: got %v, want set %q", depErr.DocDepends, doc.Key)
+	}
+
+	// The other way round, so neither order of evaluation can hide one.
+	_, err = client.Modify(ctx, staleSet.Depend(), staleTask.Depend())
+	depErr, ok = entroq.AsDependency(err)
+	if !ok {
+		t.Fatalf("Modify with the depends named the other way round: want a dependency error, got %v", err)
+	}
+	if len(depErr.Depends) != 1 || len(depErr.DocDepends) != 1 {
+		t.Errorf("Failed depends named the other way round: got %d task and %d doc, want 1 of each", len(depErr.Depends), len(depErr.DocDepends))
+	}
+
+	// Nothing was written: a failed modification is all or none, and asking
+	// about both kinds of failure does not change that.
+	if _, err := client.Modify(ctx, task.Depend(), entroq.NewDocSetRef(ns, doc.Key, doc.Version).Depend()); err != nil {
+		t.Errorf("Depend on both at their stored versions after the failures: %v", err)
+	}
+}
+
 // DocSetDepends covers a dependency that names a whole doc set by key rather
 // than one of its members.
 //

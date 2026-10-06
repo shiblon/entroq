@@ -787,7 +787,7 @@ func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification) (resp *entr
 
 	// Doc modifications, by the rules in docset.
 	if err := modifyDocs(ctx, tx, mod, resp); err != nil {
-		return nil, err
+		return nil, withTaskDeps(ctx, tx, mod, err)
 	}
 
 	// Task modifications, as parallel arrays per operation.
@@ -839,6 +839,49 @@ func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification) (resp *entr
 // parseModifyError converts an EQ001 PostgreSQL error into a DependencyError,
 // categorizing each affected task ID by which operation set it belongs to.
 // Other errors are returned unchanged.
+// withTaskDeps returns docErr with this modification's failed task
+// dependencies merged in, so one failed call reports every dependency that
+// failed rather than the doc rules this time and the task rules next time.
+//
+// The doc rules are decided in Go (docset.Evaluate), so a failure there leaves
+// the transaction usable and the task dependencies one query away --
+// entroq._check_task_deps, the same check _modify_arrays makes first, asked on
+// its own because it writes nothing. The transaction is about to roll back
+// either way, so the row locks it takes and the abort its RAISE causes cost
+// nothing.
+//
+// Anything other than a dependency failure leaves docErr alone: it is the
+// answer, and a diagnostic query is not the place to replace it.
+func withTaskDeps(ctx context.Context, tx *sql.Tx, mod *entroq.Modification, docErr error) error {
+	docDep, ok := entroq.AsDependency(docErr)
+	if !ok {
+		return docErr
+	}
+	depIDs, depVers, depQueues := taskIDArrays(mod.Depends)
+	delIDs, delVers, delQueues := taskIDArrays(mod.Deletes)
+	chgIDs, chgVers, chgFromQueues, _, _, _, _, _, _ := changeArrays(mod)
+	insIDs, _, _, _, _, _ := insertArrays(mod.Inserts)
+	_, err := tx.ExecContext(ctx, `
+		SELECT entroq._check_task_deps(
+			$1,
+			$2::text[], $3::integer[], $4::text[],
+			$5::text[], $6::integer[], $7::text[],
+			$8::text[], $9::integer[], $10::text[],
+			$11::text[]
+		)`,
+		mod.Claimant,
+		pq.Array(depIDs), pq.Array(depVers), pq.Array(depQueues),
+		pq.Array(delIDs), pq.Array(delVers), pq.Array(delQueues),
+		pq.Array(chgIDs), pq.Array(chgVers), pq.Array(chgFromQueues),
+		pq.Array(insIDs),
+	)
+	taskDep, ok := entroq.AsDependency(parseModifyError(err, mod))
+	if !ok {
+		return docErr
+	}
+	return taskDep.Merge(docDep)
+}
+
 func parseModifyError(err error, mod *entroq.Modification) error {
 	if err == nil {
 		return nil
