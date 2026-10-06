@@ -31,6 +31,7 @@ func TestBackendContract(t *testing.T) {
 		{"ModifyRespectsTaskClaims", eqtest.ModifyRespectsTaskClaims},
 		{"TasksWithIDStaysInQueue", eqtest.TasksWithIDStaysInQueue},
 		{"DocSets", eqtest.DocSets},
+		{"DocSetDepends", eqtest.DocSetDepends},
 		{"UpdateArrival", eqtest.UpdateArrival},
 		{"ClaimStampsLease", eqtest.ClaimStampsLease},
 		{"ArrivalResolvesOnBackendClock", eqtest.ArrivalResolvesOnBackendClock},

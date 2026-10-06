@@ -342,7 +342,24 @@ func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string
 			added[g]--
 		}
 	}
+	// A depend naming a SET rather than a member watches the set itself at its
+	// own version: the only version its members have. This is how to depend on
+	// something you do NOT hold -- a shared config set read and acted on, where
+	// the commit must fail if it moved underneath -- since there is no claim to
+	// lean on there.
+	//
+	// The set must be stored. Version 0 is a real version a stored set holds,
+	// so it cannot stand for "not there"; and a set with no lock row is one no
+	// shared lock can hold still, so a depend on it could not be enforced
+	// against a concurrent insert even if it were allowed to pass.
 	for _, dep := range mod.DocDepends {
+		if dep.IsSetRef() {
+			l := lock(Set{Namespace: dep.Namespace, Key: dep.Key})
+			if !l.Stored || l.Version != dep.Version {
+				depErr.DocDepends = append(depErr.DocDepends, dep)
+			}
+			continue
+		}
 		if _, ok := stored(dep.Namespace, dep.ID, dep.Version); !ok {
 			depErr.DocDepends = append(depErr.DocDepends, dep)
 		}
@@ -381,9 +398,10 @@ func Evaluate(mod *entroq.Modification, now time.Time, member func(ns, id string
 	return plan
 }
 
-// Sets lists the doc sets mod's doc operations name, each once: an
-// insert's and an arrival's by its key, and every other operation's by its
-// stored member's key. member returns the stored doc with the given namespace and ID, or nil.
+// Sets lists the doc sets mod's doc operations name, each once: an insert's, an
+// arrival's, and a depend naming a set by its key, and every other operation's
+// by its stored member's key. member returns the stored doc with the given
+// namespace and ID, or nil.
 // A backend locks or reads these sets before calling Evaluate; see
 // Exclusive for which need an exclusive lock.
 func Sets(mod *entroq.Modification, member func(ns, id string) *entroq.Doc) []Set {
@@ -410,6 +428,10 @@ func Sets(mod *entroq.Modification, member func(ns, id string) *entroq.Doc) []Se
 		stored(del.Namespace, del.ID)
 	}
 	for _, dep := range mod.DocDepends {
+		if dep.IsSetRef() {
+			add(Set{Namespace: dep.Namespace, Key: dep.Key})
+			continue
+		}
 		stored(dep.Namespace, dep.ID)
 	}
 	for _, a := range mod.DocArrives {
@@ -418,11 +440,15 @@ func Sets(mod *entroq.Modification, member func(ns, id string) *entroq.Doc) []Se
 	return sets
 }
 
-// Exclusive reports which of mod's sets a backend must lock exclusively
-// before calling Evaluate: those it writes, by inserting into them, changing
-// or deleting a member, or changing their arrival. mod only depends on the
-// rest, so they may be locked
-// shared, and since a depend names a stored member, they already exist.
+// Exclusive reports which of mod's sets a backend must lock exclusively before
+// calling Evaluate: those it writes, by inserting into them, changing or
+// deleting a member, or changing their arrival. mod only depends on the rest, so
+// those may be locked shared.
+//
+// A depend never appears here, however it names its set. A set it names by a
+// stored member exists by definition; one it names by key may not, and Evaluate
+// fails such a depend rather than creating a row to lock, so a shared lock over
+// what is there is sufficient either way.
 func Exclusive(mod *entroq.Modification, member func(ns, id string) *entroq.Doc) map[Set]bool {
 	exclusive := make(map[Set]bool)
 	for _, ins := range mod.DocInserts {

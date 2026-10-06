@@ -84,10 +84,46 @@ func Modification(mod *entroq.Modification) error {
 	if err := mod.EnsureModifyKeys(); err != nil {
 		return err
 	}
+	if err := docRefs(mod); err != nil {
+		return err
+	}
 	if _, _, err := mod.AllDependencies(); err != nil {
 		return err
 	}
 	return lengths(mod)
+}
+
+// docRefs checks that every doc reference names ONE thing. A DocID carries an ID
+// for a doc and a key for a whole set, and the wire makes them exclusive (a
+// protobuf oneof), so only a reference built in Go can carry both. Refusing it
+// here means nothing downstream has to decide which one wins.
+//
+// A delete must name a doc. Deleting a whole set by key is a different
+// operation, and silently deleting its single named member instead would be
+// worse than refusing.
+func docRefs(mod *entroq.Modification) error {
+	both := func(what string, r *entroq.DocID) error {
+		if r.ID != "" && r.Key != "" {
+			return entroq.InvalidArgumentf("%s names both doc %q and set %q in namespace %q; name one",
+				what, r.ID, r.Key, r.Namespace)
+		}
+		return nil
+	}
+	for _, d := range mod.DocDeletes {
+		if err := both("doc delete", d); err != nil {
+			return err
+		}
+		if d.IsSetRef() {
+			return entroq.InvalidArgumentf("doc delete names set %q in namespace %q; a delete names a doc",
+				d.Key, d.Namespace)
+		}
+	}
+	for _, d := range mod.DocDepends {
+		if err := both("doc depend", d); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // lengths checks every value mod would store. Deletes and depends only

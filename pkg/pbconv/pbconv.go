@@ -151,6 +151,23 @@ func docByID(d *pb.DocID, what string) (string, error) {
 	}
 }
 
+// docDepend converts a wire doc depend, which may watch one doc by ID or a whole
+// set by key. Naming a set is protocol 2: it is how to depend on something the
+// caller does not hold, where the set's own version is the only thing to check.
+func docDepend(d *pb.DocID, protocol int32) (*entroq.DocID, error) {
+	switch d.GetRef().(type) {
+	case *pb.DocID_Id:
+		return entroq.NewDocID(d.GetNamespace(), d.GetId(), d.GetVersion()), nil
+	case *pb.DocID_Key:
+		if protocol < 2 {
+			return nil, invalidf("doc depend naming a set by key is protocol 2, and the request declares protocol %d", protocol)
+		}
+		return entroq.NewDocSetRef(d.GetNamespace(), d.GetKey(), d.GetVersion()), nil
+	default:
+		return nil, invalidf("doc depend names no doc")
+	}
+}
+
 // taskLease converts a lease-only task change, which renews or releases the
 // task old names. Only the arrival time is used; a queue, if given, must be
 // the task's own, and no value, attempt, error, or ID may be.
@@ -377,11 +394,11 @@ func ModifyArgsFromProto(req *pb.ModifyRequest, protocol int32) ([]entroq.Modify
 		modArgs = append(modArgs, entroq.NewDocID(dd.GetNamespace(), id, dd.GetVersion()).Delete())
 	}
 	for _, ddep := range req.DocDepends {
-		id, err := docByID(ddep, "doc depend")
+		ref, err := docDepend(ddep, protocol)
 		if err != nil {
 			return nil, err
 		}
-		modArgs = append(modArgs, entroq.NewDocID(ddep.GetNamespace(), id, ddep.GetVersion()).Depend())
+		modArgs = append(modArgs, ref.Depend())
 	}
 	return modArgs, nil
 }

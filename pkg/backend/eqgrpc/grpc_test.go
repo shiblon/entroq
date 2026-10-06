@@ -131,6 +131,10 @@ func TestGRPCDocSets(t *testing.T) {
 	RunQTest(t, eqtest.DocSets)
 }
 
+func TestGRPCDocSetDepends(t *testing.T) {
+	RunQTest(t, eqtest.DocSetDepends)
+}
+
 func TestGRPCUpdateArrival(t *testing.T) {
 	RunQTest(t, eqtest.UpdateArrival)
 }

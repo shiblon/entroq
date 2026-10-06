@@ -1293,3 +1293,90 @@ func DocClaimSets(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 		}
 	})
 }
+
+// DocSetDepends covers a dependency that names a whole doc set by key rather
+// than one of its members.
+//
+// This is how to depend on something the caller does not hold. A claimed set
+// needs no depend: its own arrival in the modification asserts its version. An
+// UNHELD set -- a shared config read and acted on -- has no claim to lean on, so
+// its version is the only thing that can make the commit fail when it moved
+// underneath. That is what makes versions indispensable here rather than merely
+// retained.
+func DocSetDepends(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	ns := path.Join(qPrefix, "doc_set_depends")
+
+	res, err := client.Modify(ctx, entroq.PuttingDocInto(ns, entroq.WithKeys("config", ""), entroq.WithContent("v1")))
+	if err != nil {
+		t.Fatalf("Insert config: %v", err)
+	}
+	config := res.InsertedDocs[0]
+	set := entroq.NewDocSetRef(ns, "config", config.Version)
+
+	t.Run("a depend on the set at its version succeeds", func(t *testing.T) {
+		if _, err := client.Modify(ctx, set.Depend(),
+			entroq.PuttingDocInto(ns, entroq.WithKeys("out-ok", ""), entroq.WithContent(1))); err != nil {
+			t.Errorf("Depend on the set at v%d: %v", config.Version, err)
+		}
+	})
+
+	t.Run("a depend at the wrong version fails", func(t *testing.T) {
+		stale := entroq.NewDocSetRef(ns, "config", config.Version+7)
+		_, err := client.Modify(ctx, stale.Depend(),
+			entroq.PuttingDocInto(ns, entroq.WithKeys("out-stale", ""), entroq.WithContent(1)))
+		if !entroq.IsDependency(err) {
+			t.Errorf("Depend at a version the set is not at: want a dependency error, got %v", err)
+		}
+	})
+
+	t.Run("a depend on a set nothing has stored fails", func(t *testing.T) {
+		// Version 0 is a real version a stored set holds, so it cannot stand in
+		// for "not there": a set with no lock row is one nothing can hold still,
+		// and a depend on it could not be enforced against a concurrent insert.
+		absent := entroq.NewDocSetRef(ns, "never-written", 0)
+		_, err := client.Modify(ctx, absent.Depend(),
+			entroq.PuttingDocInto(ns, entroq.WithKeys("out-absent", ""), entroq.WithContent(1)))
+		if !entroq.IsDependency(err) {
+			t.Errorf("Depend on an unstored set: want a dependency error, got %v", err)
+		}
+	})
+
+	t.Run("a write to the set moves what a depend must name", func(t *testing.T) {
+		// Writing a member moves the SET's version, which is the only version
+		// its members have, so a depend pinned to the old one stops matching.
+		res, err := client.Modify(ctx, entroq.PuttingDocInto(ns, entroq.WithKeys("config", "second"), entroq.WithContent("v2")))
+		if err != nil {
+			t.Fatalf("Insert a second member: %v", err)
+		}
+		moved := res.InsertedDocs[0].Version
+		if moved == config.Version {
+			t.Fatalf("Writing a member left the set at v%d", moved)
+		}
+		if _, err := client.Modify(ctx, set.Depend(),
+			entroq.PuttingDocInto(ns, entroq.WithKeys("out-moved", ""), entroq.WithContent(1))); !entroq.IsDependency(err) {
+			t.Errorf("Depend at the pre-write version: want a dependency error, got %v", err)
+		}
+		if _, err := client.Modify(ctx, entroq.NewDocSetRef(ns, "config", moved).Depend(),
+			entroq.PuttingDocInto(ns, entroq.WithKeys("out-current", ""), entroq.WithContent(1))); err != nil {
+			t.Errorf("Depend at the version the write produced: %v", err)
+		}
+	})
+
+	t.Run("a depend never claims, so it does not block another writer", func(t *testing.T) {
+		// A depend only reads. Nothing is held afterwards, so an intruder may
+		// write the set it watched.
+		current, err := client.Docs(ctx, &entroq.DocQuery{Namespace: ns, KeyExact: "config"})
+		if err != nil {
+			t.Fatalf("Read config: %v", err)
+		}
+		ref := entroq.NewDocSetRef(ns, "config", current[0].Version)
+		if _, err := client.Modify(ctx, ref.Depend()); err != nil {
+			t.Fatalf("Depend alone: %v", err)
+		}
+		if _, err := client.Modify(ctx,
+			entroq.PuttingDocInto(ns, entroq.WithKeys("config", "third"), entroq.WithContent("v3")),
+			entroq.ModifyAs("intruder")); err != nil {
+			t.Errorf("Intruder write after a depend: want it allowed, got %v", err)
+		}
+	})
+}

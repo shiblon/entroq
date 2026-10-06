@@ -525,6 +525,8 @@ func depErrorFromStat(stat *status.Status) error {
 				depErr.DocClaims = append(depErr.DocClaims, ref)
 			case pb.ActionType_CHANGE:
 				depErr.DocArrives = append(depErr.DocArrives, ref)
+			case pb.ActionType_DEPEND:
+				depErr.DocDepends = append(depErr.DocDepends, ref)
 			default:
 				return fmt.Errorf("grpc doc set dependency unknown type %v in detail %v", detail.Type, detail)
 			}
@@ -725,7 +727,9 @@ func (b *backend) modifyRequest(mod *entroq.Modification) (*pb.ModifyRequest, er
 		req.DocDeletes = append(req.DocDeletes, pbconv.DocIDToProto(dd.Namespace, dd.ID, dd.Version))
 	}
 	for _, ddep := range mod.DocDepends {
-		req.DocDepends = append(req.DocDepends, pbconv.DocIDToProto(ddep.Namespace, ddep.ID, ddep.Version))
+		// DocRefToProto, not DocIDToProto: a depend may watch a whole set by
+		// key, and naming that by ID would send an empty one.
+		req.DocDepends = append(req.DocDepends, pbconv.DocRefToProto(ddep))
 	}
 	return req, nil
 }

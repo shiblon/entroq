@@ -229,6 +229,10 @@ func TestWorkerHoldsEmptyGroup(t *testing.T) {
 	RunQTest(t, eqtest.WorkerHoldsEmptyGroup)
 }
 
+func TestDocSetDepends(t *testing.T) {
+	RunQTest(t, eqtest.DocSetDepends)
+}
+
 func TestWorkerReleasesSets(t *testing.T) {
 	RunQTest(t, eqtest.WorkerReleasesSets)
 }
