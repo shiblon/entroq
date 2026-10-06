@@ -21,6 +21,20 @@ runs, so plan a short maintenance window on large doc tables.
 
 ### Added
 
+- **A bound on how long a handler body may run.** `worker.WithWorkTimeout(d)`
+  in Go, `work_timeout_s` in Python. Zero, the default, means a body may run as
+  long as it likes: a long-lived mostly-idle body is an ordinary thing to
+  write, and renewal exists so one can. Set it when you know roughly how long
+  the work should take. A body that runs past it is asked to stop -- a canceled
+  context in Go, a cancelled task in Python, so a body that never yields cannot
+  be made to -- and renewal stops with it, rather than holding a task the
+  worker has given up on. The task is then **retried**, with its attempt
+  counted, so a hang that was bad luck comes back and succeeds while a task
+  that hangs every time exhausts `WithMaxAttempts` / `max_attempts` and is
+  quarantined for inspection instead of wedging a worker on every claim. A body
+  that returns a sentinel on its way out is still taken at its word, and a body
+  that finished in time is never second-guessed.
+
 - **Renewal retries are reported.** `entroq.worker.renewal_retries_total`
   counts renewals retried after a transient failure, by queue and claimant,
   and the Python worker exposes the same count as `EntroQWorker.renewal_retries`

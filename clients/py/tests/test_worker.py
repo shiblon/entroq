@@ -1154,6 +1154,101 @@ def test_an_ordinary_retry_is_not_spread():
     assert all(abs(d - 10.0) < 0.5 for d in delays), delays
 
 
+def _work_timeout_change(*, work_timeout_s, body, max_attempts=0, attempt=0):
+    """Run one task through a worker with work_timeout_s and return the
+    TaskChange it emitted, or None if it emitted none."""
+    task = _task(id='t1', version=1, queue='q', attempt=attempt, lease_s=60.0)
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0,
+                          work_timeout_s=work_timeout_s,
+                          max_attempts=max_attempts, err_queue='err')
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            return await body(t, docs)
+
+        await worker._process(task, process)
+
+    asyncio.run(run())
+    changes = [tc for m in client.modify_calls for tc in m.task_changes]
+    return changes[-1] if changes else None
+
+
+def test_work_timeout_retries_the_task():
+    """A body that runs too long costs the task once, not the worker.
+
+    A hang that was bad luck comes back and succeeds, so the disposition is a
+    retry with the attempt counted -- not a quarantine.
+    """
+    entered = []
+
+    async def slow(t, docs):
+        entered.append(t.id)
+        await asyncio.sleep(5.0)  # cancelled well before this
+        return None
+
+    tc = _work_timeout_change(work_timeout_s=0.05, body=slow)
+    assert entered == ['t1'], "the body must have been entered"
+    assert tc is not None, "a timed-out body must leave a disposition"
+    assert tc.queue == 'q', "retried, not quarantined"
+    assert tc.at is not None, "a retry defers the task"
+    assert 'did not finish within' in tc.err
+    assert tc.attempt == 1, "a timeout counts against max_attempts"
+
+
+def test_work_timeout_quarantines_once_attempts_run_out():
+    """A task that hangs every time is for a person to look at."""
+    async def slow(t, docs):
+        await asyncio.sleep(5.0)
+        return None
+
+    tc = _work_timeout_change(work_timeout_s=0.05, body=slow,
+                              max_attempts=2, attempt=1)
+    assert tc is not None
+    assert tc.queue == 'err', "the last attempt quarantines"
+    assert 'did not finish within' in tc.err
+
+
+def test_work_timeout_zero_means_never():
+    """The default, and the reason for it: a body may idle on purpose."""
+    finished = []
+
+    async def idle_then_finish(t, docs):
+        await asyncio.sleep(0.1)
+        finished.append(t.id)
+        return None
+
+    tc = _work_timeout_change(work_timeout_s=0.0, body=idle_then_finish)
+    assert finished == ['t1'], "a body with no timeout must run to completion"
+    assert tc is None, "nothing to dispose of: the body succeeded"
+
+
+def test_work_timeout_leaves_a_body_that_finished_in_time_alone():
+    """The deadline only decides why a body that failed did so."""
+    finished = []
+
+    async def quick(t, docs):
+        finished.append(t.id)
+        return None
+
+    tc = _work_timeout_change(work_timeout_s=5.0, body=quick)
+    assert finished == ['t1']
+    assert tc is None
+
+
+def test_work_timeout_does_not_override_a_sentinel():
+    """A body that says what it wants on its way out is taken at its word."""
+    async def moves(t, docs):
+        raise MoveError("I know where this goes")
+
+    tc = _work_timeout_change(work_timeout_s=5.0, body=moves)
+    assert tc is not None
+    assert tc.queue == 'err'
+    assert 'I know where this goes' in tc.err
+    assert 'did not finish within' not in tc.err
+
+
 def test_worker_missing_doc_is_a_poison_pill():
     """A required doc that no longer exists can never be claimed: quarantine."""
     tc = _doc_dispose(DependencyError(

@@ -615,6 +615,7 @@ class EntroQWorker:
         err_queue: str = '',
         err_q_map: Callable[[str], str] | None = None,
         retry_delay_s: float = 30.0,
+        work_timeout_s: float = 0.0,
         max_attempts: int = 0,
         max_claims: int = 0,
         retry_transport_errors: bool = True,
@@ -628,6 +629,17 @@ class EntroQWorker:
         fixed queue, or ``err_q_map`` to compute it per inbox (the Go worker's
         ``WithErrQMap``); they are mutually exclusive. With neither,
         :func:`default_err_q_map` appends ``/err`` to the task's own queue.
+
+        ``work_timeout_s`` bounds how long a handler body may run. 0, the
+        default, means it may run as long as it likes: a long-lived mostly-idle
+        body is an ordinary thing to write, and renewal exists so one can. Set
+        it when you know roughly how long the work should take. A body that
+        runs past it is cancelled, and the task is RETRIED rather than
+        quarantined, with its attempt counted -- so a hang that was bad luck
+        comes back and succeeds, while a task that always hangs exhausts
+        ``max_attempts`` and is quarantined for inspection instead of wedging a
+        worker on every claim. Renewal stops with the body, so an abandoned one
+        is not holding the task past the moment the worker gave up on it.
 
         ``max_claims`` bounds how many times a task may be claimed before it
         is moved to the error queue without invoking the handler; it catches
@@ -663,6 +675,7 @@ class EntroQWorker:
         else:
             self._err_q_map = err_q_map if err_q_map is not None else default_err_q_map
         self._retry_delay_s = retry_delay_s
+        self._work_timeout_s = work_timeout_s
         self._max_attempts = max_attempts
         self._max_claims = max_claims
         self._retry_transport_errors = retry_transport_errors
@@ -863,13 +876,24 @@ class EntroQWorker:
 
         do_work_exc: BaseException | None = None
         result: Modification | None = None
+        timed_out = False
 
         since_claim_s = asyncio.get_running_loop().time() - claimed_at
         async with _renewing(self._client, task, docs, since_claim_s) as state:
             work = asyncio.ensure_future(handler.do_work(task, docs))
             state.work = work
             try:
-                result = await work
+                if self._work_timeout_s > 0:
+                    # wait_for cancels the body on expiry, so a body that
+                    # swallows cancellation cannot be made to stop -- the same
+                    # limit the Go worker's context has.
+                    result = await asyncio.wait_for(work, self._work_timeout_s)
+                else:
+                    result = await work
+            except asyncio.TimeoutError:
+                # Before the Exception clause: a timeout is an Exception too,
+                # and it is not the handler's failure.
+                timed_out = True
             except asyncio.CancelledError:
                 # Only swallow a cancellation the renewer caused; anything
                 # else is the caller stopping us and must keep propagating.
@@ -890,6 +914,14 @@ class EntroQWorker:
             raise do_work_exc
         if state.error:
             raise state.error
+        if timed_out:
+            # Neither the handler's failure nor the deployment's: the task goes
+            # back with its attempt counted, so max_attempts governs a task
+            # that hangs every time.
+            await self._dispose(state.task, RetryError(
+                f"work did not finish within {self._work_timeout_s}s"),
+                sets=state.sets)
+            return True
         if do_work_exc is not None:
             return await self._failed(state.task, do_work_exc, sets=state.sets)
 

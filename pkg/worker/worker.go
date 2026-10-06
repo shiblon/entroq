@@ -1020,11 +1020,21 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 		finalSets   []*entroq.DocSet
 	)
 
+	// WithWorkTimeout bounds the body by bounding the context it and the
+	// renewal share: the body is asked to stop, and renewal stops with it
+	// rather than holding a task the worker has given up on. The commit path
+	// below uses ctx, not this one, so a disposition can still be written.
+	workCtx, cancelWork := rCtx, context.CancelFunc(func() {})
+	if opts.workTimeout > 0 {
+		workCtx, cancelWork = context.WithTimeout(rCtx, opts.workTimeout)
+	}
+	defer cancelWork()
+
 	// Only a duration crosses into doWhileRenewing: how long the claim has
 	// already been running locally. It derives both the hold it renews for and
 	// the cadence from the task, so opts.lease -- what the claim ASKED for --
 	// does not follow it in and cannot be renewed on by mistake.
-	renewErr, handleErr := doWhileRenewing(rCtx, w.eqc, time.Since(claimed), held{task: task, sets: sets},
+	renewErr, handleErr := doWhileRenewing(workCtx, w.eqc, time.Since(claimed), held{task: task, sets: sets},
 		func() { w.metrics.recordRenewalRetry(ctx, task.Queue, w.eqc.ID()) },
 		func(ctx context.Context, stop finalizeRenew) error {
 			defer func() {
@@ -1074,6 +1084,23 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 	}
 
 	if handleErr != nil {
+		// A body that ran past WithWorkTimeout failed for a reason that is
+		// neither the handler's nor the deployment's, so the task goes back
+		// with its attempt counted rather than stopping the worker. Checked
+		// after sentinelErr, so a body that returns a sentinel on its way out
+		// is still taken at its word.
+		//
+		// A body that finished in time is not second-guessed: the deadline
+		// only decides why a body that FAILED did so.
+		if opts.workTimeout > 0 && errors.Is(workCtx.Err(), context.DeadlineExceeded) {
+			outcome = outcomeRetried
+			errQ := w.ErrorQueueFor(task.Queue)
+			retry := RetryErrorf("work did not finish within %v: %v", opts.workTimeout, handleErr)
+			if _, err := w.handleSentinelErrors(ctx, retry, finalTask, finalSets, errQ, opts); err != nil {
+				return fmt.Errorf("handle work timeout: %w", err)
+			}
+			return nil
+		}
 		if workErr != nil && w.quarantineAtLimit(ctx, finalTask, finalSets, workErr, opts) {
 			outcome = outcomeMoved
 		}
@@ -1155,6 +1182,7 @@ type runOpt struct {
 	docContentionDelay time.Duration // 0: baseRetryDelay
 	maxAttempts        int32
 	maxClaims          int32
+	workTimeout        time.Duration
 	lease              time.Duration
 }
 
@@ -1184,6 +1212,26 @@ func WithLease(d time.Duration) RunOption {
 func WithMaxAttempts(m int32) RunOption {
 	return func(ro *runOpt) {
 		ro.maxAttempts = m
+	}
+}
+
+// WithWorkTimeout bounds how long a handler body may run. Zero, the default,
+// means it may run as long as it likes: a long-lived mostly-idle body is an
+// ordinary thing to write, and renewal exists so one can.
+//
+// Set it when you know roughly how long the work should take. A body that runs
+// past it has its context canceled -- which is how it is asked to stop, so a
+// body that never checks its context cannot be made to -- and the task is
+// RETRIED rather than quarantined, with its attempt counted. A hang that was
+// bad luck comes back and succeeds; a task that always hangs exhausts
+// WithMaxAttempts and is quarantined for inspection, instead of wedging a
+// worker on every claim.
+//
+// Renewal stops at the deadline too, so an abandoned body is not holding the
+// task past the moment the worker gave up on it.
+func WithWorkTimeout(d time.Duration) RunOption {
+	return func(ro *runOpt) {
+		ro.workTimeout = d
 	}
 }
 
