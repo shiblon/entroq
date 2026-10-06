@@ -322,12 +322,15 @@ func Example() {
 	go func() { time.Sleep(2 * time.Second); cancel() }()
 
 	w := worker.New(client,
-		worker.WithDoWork(func(ctx context.Context, claimed *entroq.Task, s string, _ []*entroq.DocSet) error {
+		worker.WithDoWork(func(ctx context.Context, _ entroq.Reader, tRun *worker.TaskRun[string]) error {
+			s := tRun.Value
 			// Do work with the task.
 			fmt.Println(s)
 			return nil
 		}),
-		worker.WithFinish(func(ctx context.Context, mod worker.Modifier, final *entroq.Task, _ string, _ []*entroq.DocSet) error {
+		worker.WithFinish(func(ctx context.Context, eqc entroq.Client, tRun *worker.TaskRun[string]) error {
+			mod := eqc
+			final := tRun.Task
 			// Delete the task to "commit" the work.
 			// At this point, you can also call directly into eqpg.ModifyOpts and
 			// hand it a function to call that has a transaction. That transaction

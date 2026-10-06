@@ -59,7 +59,8 @@ func (cw *ConfigWorker) reloadConfig(ctx context.Context) error {
 }
 
 // doWork processes a single numeric task using the current local multiplier.
-func (cw *ConfigWorker) doWork(ctx context.Context, t *entroq.Task, val int, _ []*entroq.DocSet) (*worker.Result, error) {
+func (cw *ConfigWorker) doWork(ctx context.Context, _ entroq.Reader, tRun *worker.TaskRun[int]) (*worker.Result, error) {
+	t, val := tRun.Task, tRun.Value
 	// We use the LOCAL state here. Even if another worker instance refreshed
 	// their own config, ours stays what it was when it was read.
 	multiplier := cw.config.Multiplier

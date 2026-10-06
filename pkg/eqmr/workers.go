@@ -197,7 +197,8 @@ func (c *Controller) MapperWorker(mapFn Mapper, opts ...MapperOption) *worker.Wo
 
 	return worker.New[docRef](c.client,
 		worker.WithErrQMap[docRef](c.errQMap),
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, ref docRef, _ []*entroq.DocSet) (*worker.Result, error) {
+		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, tRun *worker.TaskRun[docRef]) (*worker.Result, error) {
+			task, ref := tRun.Task, tRun.Value
 			// Read the split WITHOUT claiming it. Claiming would be mutual
 			// exclusion at start time, which is exactly what makes a duplicate
 			// task pointless: a second worker would block on the claim instead
@@ -366,7 +367,8 @@ func sortValues(vals []string) { sort.Strings(vals) }
 func (c *Controller) ReducerWorker(reduceFn Reducer) *worker.Worker[reduceClaim] {
 	return worker.New[reduceClaim](c.client,
 		worker.WithErrQMap[reduceClaim](c.errQMap),
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, rc reduceClaim, _ []*entroq.DocSet) (*worker.Result, error) {
+		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, tRun *worker.TaskRun[reduceClaim]) (*worker.Result, error) {
+			task, rc := tRun.Task, tRun.Value
 			// Read the partition's map outputs WITHOUT claiming them, for the same
 			// reason the mapper does: a claim would block a duplicate worker
 			// rather than race it. Exclusion is at commit time.

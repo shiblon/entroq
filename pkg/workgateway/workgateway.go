@@ -560,7 +560,8 @@ func (b *Bridge) notify(ctx context.Context, class ExitClass, cause error) {
 // takeDocs runs the TakeDocs phase: ask the client which docs the task needs and
 // return them for the gateway to claim. Wired only when the client registered
 // takeDocs.
-func (b *Bridge) takeDocs(ctx context.Context, task *entroq.Task, _ json.RawMessage) (*worker.TakeResult, error) {
+func (b *Bridge) takeDocs(ctx context.Context, _ entroq.Reader, tRun *worker.TaskRun[json.RawMessage]) (*worker.TakeResult, error) {
+	task := tRun.Task
 	taskPB, err := pbconv.TaskToProto(task)
 	if err != nil {
 		return nil, fmt.Errorf("convert task for takeDocs: %w", err)
@@ -590,7 +591,8 @@ func (b *Bridge) takeDocs(ctx context.Context, task *entroq.Task, _ json.RawMess
 // error. It chains the post-commit phases the worker registered: OnSuccess runs
 // the success phase after a good commit, OnDependency the dependency phase when
 // the commit loses a dependency race.
-func (b *Bridge) doWork(ctx context.Context, task *entroq.Task, _ json.RawMessage, sets []*entroq.DocSet) (*worker.Result, error) {
+func (b *Bridge) doWork(ctx context.Context, _ entroq.Reader, tRun *worker.TaskRun[json.RawMessage]) (*worker.Result, error) {
+	task, sets := tRun.Task, tRun.Sets
 	taskPB, err := pbconv.TaskToProto(task)
 	if err != nil {
 		return nil, fmt.Errorf("convert task for doWork: %w", err)

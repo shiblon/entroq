@@ -94,7 +94,8 @@ func TestWorkerMetricsTrackConcurrentRunSlots(t *testing.T) {
 	release := make(chan struct{})
 	w := New(client,
 		WithMeterProvider[string](mp),
-		WithDoModify(func(_ context.Context, task *entroq.Task, _ string, _ []*entroq.DocSet) (*Result, error) {
+		WithDoModify(func(_ context.Context, _ entroq.Reader, tRun *TaskRun[string]) (*Result, error) {
+			task := tRun.Task
 			started <- struct{}{}
 			<-release
 			return Modify(task.Delete()), nil
@@ -197,7 +198,8 @@ func TestWorkerTaskCounterAttributesOutcomes(t *testing.T) {
 
 	w := New(client,
 		WithMeterProvider[string](mp),
-		WithDoModify(func(_ context.Context, task *entroq.Task, v string, _ []*entroq.DocSet) (*Result, error) {
+		WithDoModify(func(_ context.Context, _ entroq.Reader, tRun *TaskRun[string]) (*Result, error) {
+			task, v := tRun.Task, tRun.Value
 			switch v {
 			case "move":
 				return nil, MoveErrorf("sent to quarantine")

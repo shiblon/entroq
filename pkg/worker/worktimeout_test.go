@@ -31,7 +31,7 @@ func TestWorkTimeoutRetriesTheTask(t *testing.T) {
 
 	started := make(chan struct{}, 4)
 	stopped := make(chan error, 4)
-	w := New[string](client, WithDoWork(func(ctx context.Context, task *entroq.Task, v string, _ []*entroq.DocSet) error {
+	w := New[string](client, WithDoWork(func(ctx context.Context, _ entroq.Reader, tRun *TaskRun[string]) error {
 		started <- struct{}{}
 		// A cooperative body: it is asked to stop, and it does.
 		<-ctx.Done()
@@ -112,7 +112,7 @@ func TestWorkTimeoutExhaustsAttemptsThenQuarantines(t *testing.T) {
 		t.Fatalf("Insert: %v", err)
 	}
 
-	w := New[string](client, WithDoWork(func(ctx context.Context, task *entroq.Task, v string, _ []*entroq.DocSet) error {
+	w := New[string](client, WithDoWork(func(ctx context.Context, _ entroq.Reader, tRun *TaskRun[string]) error {
 		<-ctx.Done()
 		return ctx.Err()
 	}))
@@ -169,7 +169,7 @@ func TestWorkTimeoutZeroMeansNever(t *testing.T) {
 	}
 
 	done := make(chan struct{})
-	w := New[string](client, WithDoWork(func(ctx context.Context, task *entroq.Task, v string, _ []*entroq.DocSet) error {
+	w := New[string](client, WithDoWork(func(ctx context.Context, _ entroq.Reader, tRun *TaskRun[string]) error {
 		// Longer than any timeout this test could have set by accident, and
 		// longer than the lease, so renewal carries it.
 		select {

@@ -60,14 +60,17 @@ func simpleWorkerOnce(ctx context.Context, t *testing.T, client *entroq.EntroQ, 
 	var consumed []*entroq.Task
 	g.Go(func() error {
 		return worker.New(client,
-			worker.WithDoWork(func(ctx context.Context, task *entroq.Task, _ json.RawMessage, _ []*entroq.DocSet) error {
+			worker.WithDoWork(func(ctx context.Context, _ entroq.Reader, tRun *worker.TaskRun[json.RawMessage]) error {
+				task := tRun.Task
 				if task.Claims != 1 {
 					return fmt.Errorf("worker claim expected claims to be 1, got %d", task.Claims)
 				}
 				consumed = append(consumed, task)
 				return nil
 			}),
-			worker.WithFinish(func(ctx context.Context, mod worker.Modifier, task *entroq.Task, _ json.RawMessage, _ []*entroq.DocSet) error {
+			worker.WithFinish(func(ctx context.Context, eqc entroq.Client, tRun *worker.TaskRun[json.RawMessage]) error {
+				mod := eqc
+				task := tRun.Task
 				_, err := mod.Modify(ctx, task.Delete())
 				return err
 			}),
@@ -163,7 +166,8 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 		g.Go(func() error {
 			ti := 0
 			w := worker.New(client,
-				worker.WithDoWork(func(ctx context.Context, task *entroq.Task, _ json.RawMessage, _ []*entroq.DocSet) error {
+				worker.WithDoWork(func(ctx context.Context, _ entroq.Reader, tRun *worker.TaskRun[json.RawMessage]) error {
+					task := tRun.Task
 					ti++
 					if task.Claims != 1 {
 						return fmt.Errorf("worker claim expected to be 1, was %d", task.Claims)
@@ -171,7 +175,9 @@ func MultiWorker(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 					consumedCh <- task
 					return nil
 				}),
-				worker.WithFinish(func(ctx context.Context, mod worker.Modifier, task *entroq.Task, _ json.RawMessage, _ []*entroq.DocSet) error {
+				worker.WithFinish(func(ctx context.Context, eqc entroq.Client, tRun *worker.TaskRun[json.RawMessage]) error {
+					mod := eqc
+					task := tRun.Task
 					_, err := mod.Modify(ctx, task.Delete())
 					return err
 				}),
@@ -311,7 +317,8 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 		retriedTaskCh := make(chan *entroq.Task, 1)
 
 		w := worker.New(client,
-			worker.WithDoWork(func(ctx context.Context, task *entroq.Task, s string, _ []*entroq.DocSet) error {
+			worker.WithDoWork(func(ctx context.Context, _ entroq.Reader, tRun *worker.TaskRun[string]) error {
+				task, s := tRun.Task, tRun.Value
 				// Only attempt this again if it's the first time.
 				if task.Attempt == 0 {
 					return worker.RetryErrorf("worker error (%q)", s)
@@ -320,7 +327,9 @@ func WorkerRetryOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ
 				retriedTaskCh <- task
 				return nil
 			}),
-			worker.WithFinish(func(ctx context.Context, mod worker.Modifier, task *entroq.Task, _ string, _ []*entroq.DocSet) error {
+			worker.WithFinish(func(ctx context.Context, eqc entroq.Client, tRun *worker.TaskRun[string]) error {
+				mod := eqc
+				task := tRun.Task
 				_, err := mod.Modify(ctx, task.Delete())
 				return err
 			}),
@@ -437,7 +446,8 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		const leaseTime = 2 * time.Second
 
 		w := worker.New(client,
-			worker.WithDoWork(func(ctx context.Context, task *entroq.Task, cmd string, _ []*entroq.DocSet) error {
+			worker.WithDoWork(func(ctx context.Context, _ entroq.Reader, tRun *worker.TaskRun[string]) error {
+				cmd := tRun.Value
 				switch cmd {
 				case "die":
 					return worker.FatalErrorf("task asked to die")
@@ -453,7 +463,9 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 				}
 				return nil
 			}),
-			worker.WithFinish(func(ctx context.Context, mod worker.Modifier, task *entroq.Task, _ string, _ []*entroq.DocSet) error {
+			worker.WithFinish(func(ctx context.Context, eqc entroq.Client, tRun *worker.TaskRun[string]) error {
+				mod := eqc
+				task := tRun.Task
 				if _, err := mod.Modify(ctx, task.Delete()); err != nil {
 					return fmt.Errorf("task deletion failed: %w", err)
 				}
@@ -575,7 +587,8 @@ func WorkerCompactDependencyHandler(ctx context.Context, t *testing.T, client *e
 	handlerCalled := make(chan bool, 1)
 
 	w := worker.New(client,
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, val string, _ []*entroq.DocSet) (*worker.Result, error) {
+		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, tRun *worker.TaskRun[string]) (*worker.Result, error) {
+			task := tRun.Task
 			inWork <- true
 			<-letFinish
 			return worker.
@@ -646,7 +659,8 @@ func WorkerDependencyMove(ctx context.Context, t *testing.T, client *entroq.Entr
 	letFinish := make(chan bool)
 
 	w := worker.New(client,
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, val string, _ []*entroq.DocSet) (*worker.Result, error) {
+		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, tRun *worker.TaskRun[string]) (*worker.Result, error) {
+			task := tRun.Task
 			inWork <- true
 			<-letFinish
 			return worker.
@@ -722,10 +736,11 @@ func WorkerHoldsEmptyGroup(ctx context.Context, t *testing.T, client *entroq.Ent
 	inWork := make(chan int, 1)
 	letFinish := make(chan bool)
 	w := worker.New(client,
-		worker.WithTakeDocs(func(context.Context, *entroq.Task, json.RawMessage) (*worker.TakeResult, error) {
+		worker.WithTakeDocs(func(context.Context, entroq.Reader, *worker.TaskRun[json.RawMessage]) (*worker.TakeResult, error) {
 			return worker.Take(entroq.ClaimKey(ns, "empty")), nil
 		}),
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, _ json.RawMessage, sets []*entroq.DocSet) (*worker.Result, error) {
+		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, tRun *worker.TaskRun[json.RawMessage]) (*worker.Result, error) {
+			task, sets := tRun.Task, tRun.Sets
 			inWork <- len(sets[0].Docs)
 			<-letFinish
 			return worker.Modify(task.Delete()), nil
@@ -869,10 +884,11 @@ func WorkerReleasesSets(ctx context.Context, t *testing.T, client *entroq.EntroQ
 			t.Fatalf("Insert: %v", err)
 		}
 		stop := run(t, queue,
-			worker.WithTakeDocs(func(context.Context, *entroq.Task, json.RawMessage) (*worker.TakeResult, error) {
+			worker.WithTakeDocs(func(context.Context, entroq.Reader, *worker.TaskRun[json.RawMessage]) (*worker.TakeResult, error) {
 				return worker.Take(entroq.ClaimKey(ns, "written"), entroq.ClaimKey(ns, "depended"), entroq.ClaimKey(ns, "empty")), nil
 			}),
-			worker.WithDoModify(func(_ context.Context, task *entroq.Task, _ json.RawMessage, sets []*entroq.DocSet) (*worker.Result, error) {
+			worker.WithDoModify(func(_ context.Context, _ entroq.Reader, tRun *worker.TaskRun[json.RawMessage]) (*worker.Result, error) {
+				task, sets := tRun.Task, tRun.Sets
 				written, depended := sets[2].Docs[0], sets[0].Docs[0] // sorted by key
 				return worker.Modify(
 					task.Delete(),
@@ -915,10 +931,10 @@ func WorkerReleasesSets(ctx context.Context, t *testing.T, client *entroq.EntroQ
 		}
 		retried := make(chan bool, 1)
 		stop := run(t, queue,
-			worker.WithTakeDocs(func(context.Context, *entroq.Task, json.RawMessage) (*worker.TakeResult, error) {
+			worker.WithTakeDocs(func(context.Context, entroq.Reader, *worker.TaskRun[json.RawMessage]) (*worker.TakeResult, error) {
 				return worker.Take(entroq.ClaimKey(ns, "held")), nil
 			}),
-			worker.WithDoModify(func(context.Context, *entroq.Task, json.RawMessage, []*entroq.DocSet) (*worker.Result, error) {
+			worker.WithDoModify(func(context.Context, entroq.Reader, *worker.TaskRun[json.RawMessage]) (*worker.Result, error) {
 				select {
 				case retried <- true:
 				default:
@@ -958,10 +974,10 @@ func WorkerReleasesSets(ctx context.Context, t *testing.T, client *entroq.EntroQ
 		}
 		done := make(chan bool, 1)
 		stop := run(t, queue,
-			worker.WithTakeDocs(func(context.Context, *entroq.Task, json.RawMessage) (*worker.TakeResult, error) {
+			worker.WithTakeDocs(func(context.Context, entroq.Reader, *worker.TaskRun[json.RawMessage]) (*worker.TakeResult, error) {
 				return worker.Take(entroq.ClaimKey(ns, "held"), entroq.ClaimKey(ns, "empty")), nil
 			}),
-			worker.WithDoModify(func(context.Context, *entroq.Task, json.RawMessage, []*entroq.DocSet) (*worker.Result, error) {
+			worker.WithDoModify(func(context.Context, entroq.Reader, *worker.TaskRun[json.RawMessage]) (*worker.Result, error) {
 				select {
 				case done <- true:
 				default:
@@ -999,10 +1015,11 @@ func WorkerReleasesSets(ctx context.Context, t *testing.T, client *entroq.EntroQ
 		}
 		done := make(chan bool, 1)
 		stop := run(t, queue,
-			worker.WithTakeDocs(func(context.Context, *entroq.Task, json.RawMessage) (*worker.TakeResult, error) {
+			worker.WithTakeDocs(func(context.Context, entroq.Reader, *worker.TaskRun[json.RawMessage]) (*worker.TakeResult, error) {
 				return worker.Take(entroq.ClaimKey(ns, "written")), nil
 			}),
-			worker.WithDoModify(func(_ context.Context, _ *entroq.Task, _ json.RawMessage, sets []*entroq.DocSet) (*worker.Result, error) {
+			worker.WithDoModify(func(_ context.Context, _ entroq.Reader, tRun *worker.TaskRun[json.RawMessage]) (*worker.Result, error) {
+				sets := tRun.Sets
 				select {
 				case done <- true:
 				default:
@@ -1031,10 +1048,11 @@ func WorkerReleasesSets(ctx context.Context, t *testing.T, client *entroq.EntroQ
 		calls := make(chan time.Time, 2)
 		first := true
 		stop := run(t, queue,
-			worker.WithTakeDocs(func(context.Context, *entroq.Task, json.RawMessage) (*worker.TakeResult, error) {
+			worker.WithTakeDocs(func(context.Context, entroq.Reader, *worker.TaskRun[json.RawMessage]) (*worker.TakeResult, error) {
 				return worker.Take(entroq.ClaimKey(ns, "held")), nil
 			}),
-			worker.WithDoModify(func(_ context.Context, task *entroq.Task, _ json.RawMessage, sets []*entroq.DocSet) (*worker.Result, error) {
+			worker.WithDoModify(func(_ context.Context, _ entroq.Reader, tRun *worker.TaskRun[json.RawMessage]) (*worker.Result, error) {
+				task, sets := tRun.Task, tRun.Sets
 				calls <- time.Now()
 				if first {
 					first = false

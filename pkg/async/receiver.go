@@ -209,7 +209,8 @@ func (r *Receiver) Run(ctx context.Context, inbox string) error {
 }
 
 func (r *Receiver) bootstrapHandler(runCtx context.Context, starts chan<- sessionStart) worker.DoModifyRun[Envelope] {
-	return func(_ context.Context, task *entroq.Task, env Envelope, _ []*entroq.DocSet) (*worker.Result, error) {
+	return func(_ context.Context, _ entroq.Reader, tRun *worker.TaskRun[Envelope]) (*worker.Result, error) {
+		task, env := tRun.Task, tRun.Value
 		if env.Session == "" {
 			return nil, worker.MoveErrorf("eqlink frame has no session")
 		}
@@ -362,7 +363,8 @@ func (r *Receiver) runRequestWorkers(ctx context.Context, state *receiverSession
 }
 
 func (r *Receiver) requestHandler(state *receiverSessionState, socket *responseSocket) worker.DoModifyRun[Envelope] {
-	return func(ctx context.Context, task *entroq.Task, env Envelope, _ []*entroq.DocSet) (*worker.Result, error) {
+	return func(ctx context.Context, _ entroq.Reader, tRun *worker.TaskRun[Envelope]) (*worker.Result, error) {
+		task, env := tRun.Task, tRun.Value
 		if env.Session != state.session {
 			return nil, worker.FatalErrorf("request session mismatch: got %q, want %q", env.Session, state.session)
 		}
@@ -477,7 +479,8 @@ func (r *Receiver) runResponseWorkers(ctx context.Context, start sessionStart, s
 			// Letting both concurrent workers claim it under the same claimant
 			// ID would remove mutual exclusion and create version races between
 			// doc renewals.
-			worker.WithTakeDocs(func(_ context.Context, _ *entroq.Task, ack Response) (*worker.TakeResult, error) {
+			worker.WithTakeDocs(func(_ context.Context, _ entroq.Reader, tRun *worker.TaskRun[Response]) (*worker.TakeResult, error) {
+				ack := tRun.Value
 				if ack.Session != start.session {
 					return nil, worker.FatalErrorf("session mismatch: ACK %q, worker %q", ack.Session, start.session)
 				}
@@ -514,7 +517,8 @@ func (r *Receiver) runResponseWorkers(ctx context.Context, start sessionStart, s
 }
 
 func (r *Receiver) responseHandler(start sessionStart, state *receiverSessionState, socket *responseSocket, complete func()) worker.DoModifyRun[Response] {
-	return func(ctx context.Context, task *entroq.Task, ack Response, sets []*entroq.DocSet) (*worker.Result, error) {
+	return func(ctx context.Context, _ entroq.Reader, tRun *worker.TaskRun[Response]) (*worker.Result, error) {
+		task, ack, sets := tRun.Task, tRun.Value, tRun.Sets
 		if len(sets) != 1 || len(sets[0].Docs) != 1 {
 			return nil, worker.FatalErrorf("session %q claimed %d receiver session doc sets, want one holding one doc", ack.Session, len(sets))
 		}

@@ -51,7 +51,8 @@ func Example() {
 	w := worker.New(eq,
 		// Workers claim a task and pass it to your handler functions. In the
 		// background, the task's lease is renewed while the first function runs.
-		worker.WithDoWork(func(ctx context.Context, initial *entroq.Task, v string, _ []*entroq.DocSet) error {
+		worker.WithDoWork(func(ctx context.Context, _ entroq.Reader, tRun *worker.TaskRun[string]) error {
+			v := tRun.Value
 			fmt.Printf("Worker handling task %q\n", v)
 			// Do work with it here.
 			return nil
@@ -59,7 +60,9 @@ func Example() {
 		// When ready to commit changes to the task (including deletion), the second
 		// function passes the version-stable task after the renewer is stopped,
 		// making it safe to use it in modification transactions.
-		worker.WithFinish(func(ctx context.Context, mod worker.Modifier, final *entroq.Task, v string, _ []*entroq.DocSet) error {
+		worker.WithFinish(func(ctx context.Context, eqc entroq.Client, tRun *worker.TaskRun[string]) error {
+			mod := eqc
+			final, v := tRun.Task, tRun.Value
 			fmt.Printf("Deleting task %q\n", v)
 			_, err := mod.Modify(ctx, final.Delete())
 			if err != nil {
@@ -107,7 +110,7 @@ func Example_dependencies() {
 	var config *entroq.Task
 
 	w := worker.New(eq,
-		worker.WithDoWork(func(ctx context.Context, initial *entroq.Task, _ json.RawMessage, _ []*entroq.DocSet) error {
+		worker.WithDoWork(func(ctx context.Context, _ entroq.Reader, tRun *worker.TaskRun[json.RawMessage]) error {
 			if config == nil {
 				tasks, err := eq.Tasks(ctx, "config")
 				if err != nil || len(tasks) == 0 {
@@ -118,7 +121,9 @@ func Example_dependencies() {
 			// ... do work with initial and config ...
 			return nil
 		}),
-		worker.WithFinish(func(ctx context.Context, mod worker.Modifier, final *entroq.Task, _ json.RawMessage, _ []*entroq.DocSet) error {
+		worker.WithFinish(func(ctx context.Context, eqc entroq.Client, tRun *worker.TaskRun[json.RawMessage]) error {
+			mod := eqc
+			final := tRun.Task
 			if config == nil {
 				return fmt.Errorf("config missing during finalize")
 			}

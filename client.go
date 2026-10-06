@@ -33,6 +33,9 @@ import (
 // which predates arrivals; UpdateArrival says how much LONGER to hold and lets
 // the backend resolve that against its own clock.
 type Client interface {
+	// Everything a Reader does, which is everything that records no holder.
+	Reader
+
 	// Claiming and holding. Each of these records this client's claimant as
 	// the holder, which is the whole reason this interface exists.
 	Claim(ctx context.Context, opts ...ClaimOpt) (*Task, error)
@@ -41,25 +44,42 @@ type Client interface {
 	Modify(ctx context.Context, args ...ModifyArg) (*ModifyResponse, error)
 	UpdateArrival(ctx context.Context, entries ...*ArrivalEntry) (*ModifyResponse, error)
 
-	// Reading. None of these records a holder, so a claimant does not come
-	// into them.
-	Docs(ctx context.Context, rq *DocQuery) ([]*Doc, error)
-	Tasks(ctx context.Context, queue string, opts ...TasksOpt) ([]*Task, error)
-	Queues(ctx context.Context, opts ...QueuesOpt) (map[string]int, error)
-	Time(ctx context.Context) (time.Time, error)
-
-	// ID is the claimant this client holds things as.
-	ID() string
-	// GenID returns a fresh random ID, for naming a task or doc.
-	GenID() string
 	// As returns another client over the same connection, holding what it
 	// claims as claimant.
 	As(claimant string) Client
 }
 
+// Reader is the part of a Client that records no holder: it asks questions and
+// changes nothing.
+//
+// It exists so a caller can be HANDED the ability to read without the ability
+// to write. The worker uses it for that: a handler body runs under background
+// renewal, where writing the claimed task would move the version the renewer is
+// renewing and cost the claim, so a body is given a Reader and returns what it
+// wants committed instead. The commit phase, which runs after renewal has
+// stopped, gets a full Client.
+//
+// A Reader is as small as Client for the same reason: handing an interface out
+// means every method added breaks a caller's fakes.
+type Reader interface {
+	Docs(ctx context.Context, rq *DocQuery) ([]*Doc, error)
+	Tasks(ctx context.Context, queue string, opts ...TasksOpt) ([]*Task, error)
+	Queues(ctx context.Context, opts ...QueuesOpt) (map[string]int, error)
+	Time(ctx context.Context) (time.Time, error)
+
+	// ID is the claimant the client behind this reader holds things as. It
+	// records nothing, but it says who the holder would be.
+	ID() string
+	// GenID returns a fresh random ID, for naming a task or doc.
+	GenID() string
+}
+
 // Compile-time proof that the real client is one, so a caller can pass
-// *EntroQ wherever a Client is wanted.
-var _ Client = (*EntroQ)(nil)
+// *EntroQ wherever a Client or a Reader is wanted.
+var (
+	_ Client = (*EntroQ)(nil)
+	_ Reader = (*EntroQ)(nil)
+)
 
 // As returns a client over this connection that holds what it claims as
 // claimant, leaving this one's own ID untouched.

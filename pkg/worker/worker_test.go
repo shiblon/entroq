@@ -32,13 +32,16 @@ func TestWorker_Basic(t *testing.T) {
 
 	go func() {
 		w := New(client,
-			WithDoWork(func(ctx context.Context, task *entroq.Task, s string, _ []*entroq.DocSet) error {
+			WithDoWork(func(ctx context.Context, _ entroq.Reader, tRun *TaskRun[string]) error {
+				s := tRun.Value
 				if s != "hi" {
 					return errors.New("wrong value")
 				}
 				return nil
 			}),
-			WithFinish(func(ctx context.Context, mod Modifier, task *entroq.Task, _ string, _ []*entroq.DocSet) error {
+			WithFinish(func(ctx context.Context, eqc entroq.Client, tRun *TaskRun[string]) error {
+				mod := eqc
+				task := tRun.Task
 				if _, err := mod.Modify(ctx, task.Delete()); err != nil {
 					return err
 				}
@@ -244,10 +247,11 @@ func TestDoModify_DocVersionFixedAfterRenewal(t *testing.T) {
 
 	go func() {
 		err := New(client,
-			WithTakeDocs(func(_ context.Context, _ *entroq.Task, _ string) (*TakeResult, error) {
+			WithTakeDocs(func(_ context.Context, _ entroq.Reader, tRun *TaskRun[string]) (*TakeResult, error) {
 				return Take(entroq.ClaimKey("ns", "k")), nil
 			}),
-			WithDoModify(func(_ context.Context, task *entroq.Task, _ string, sets []*entroq.DocSet) (*Result, error) {
+			WithDoModify(func(_ context.Context, _ entroq.Reader, tRun *TaskRun[string]) (*Result, error) {
+				task, sets := tRun.Task, tRun.Sets
 				docs := entroq.DocsIn(sets)
 				if len(docs) == 0 {
 					return nil, FatalErrorf("expected claimed doc")
@@ -391,11 +395,12 @@ func TestSlowTakeDocsRenewsAtOnce(t *testing.T) {
 	working := make(chan time.Time, 1)
 	finish := make(chan bool)
 	w := New[string](client,
-		WithTakeDocs(func(context.Context, *entroq.Task, string) (*TakeResult, error) {
+		WithTakeDocs(func(context.Context, entroq.Reader, *TaskRun[string]) (*TakeResult, error) {
 			time.Sleep(lease * 7 / 10)
 			return Take(entroq.ClaimKey("ns", "k")), nil
 		}),
-		WithDoModify(func(_ context.Context, task *entroq.Task, _ string, _ []*entroq.DocSet) (*Result, error) {
+		WithDoModify(func(_ context.Context, _ entroq.Reader, tRun *TaskRun[string]) (*Result, error) {
+			task := tRun.Task
 			working <- time.Now()
 			<-finish
 			return Modify(task.Delete()), nil
@@ -445,12 +450,13 @@ func TestDocsExpireWithTheirTask(t *testing.T) {
 	}
 	got := make(chan seen, 1)
 	w := New[string](client,
-		WithTakeDocs(func(context.Context, *entroq.Task, string) (*TakeResult, error) {
+		WithTakeDocs(func(context.Context, entroq.Reader, *TaskRun[string]) (*TakeResult, error) {
 			// The lease and claimant are the worker's: these are ignored.
 			return Take(entroq.ClaimKey("ns", "a"), entroq.ClaimKey("ns", "b").WithoutMembers(),
 				entroq.ClaimingSetsFor(time.Hour), entroq.ClaimingSetsAs("someone else")), nil
 		}),
-		WithDoModify(func(_ context.Context, task *entroq.Task, _ string, sets []*entroq.DocSet) (*Result, error) {
+		WithDoModify(func(_ context.Context, _ entroq.Reader, tRun *TaskRun[string]) (*Result, error) {
+			task, sets := tRun.Task, tRun.Sets
 			got <- seen{task.At, sets[0].At, sets[1].At, []string{sets[0].Claimant, sets[1].Claimant}}
 			return Modify(task.Delete()), nil
 		}),
@@ -505,13 +511,13 @@ func TestQuarantineAtClaimLimit(t *testing.T) {
 			}
 
 			w := New[string](client,
-				WithTakeDocs(func(context.Context, *entroq.Task, string) (*TakeResult, error) {
+				WithTakeDocs(func(context.Context, entroq.Reader, *TaskRun[string]) (*TakeResult, error) {
 					if tc.takeFails {
 						return nil, boom
 					}
 					return Take(entroq.ClaimKey("ns", "k")), nil
 				}),
-				WithDoWork(func(context.Context, *entroq.Task, string, []*entroq.DocSet) error {
+				WithDoWork(func(context.Context, entroq.Reader, *TaskRun[string]) error {
 					return boom
 				}),
 			)
@@ -554,10 +560,10 @@ func TestTakeDocsSentinel(t *testing.T) {
 		t.Fatalf("Insert: %v", err)
 	}
 	w := New[string](client,
-		WithTakeDocs(func(context.Context, *entroq.Task, string) (*TakeResult, error) {
+		WithTakeDocs(func(context.Context, entroq.Reader, *TaskRun[string]) (*TakeResult, error) {
 			return nil, MoveErrorf("no docs for this one")
 		}),
-		WithDoWork(func(context.Context, *entroq.Task, string, []*entroq.DocSet) error {
+		WithDoWork(func(context.Context, entroq.Reader, *TaskRun[string]) error {
 			t.Error("DoWork ran for a task TakeDocs moved")
 			return nil
 		}),
@@ -592,10 +598,10 @@ func TestDocContentionDelay(t *testing.T) {
 	}
 
 	w := New[string](client,
-		WithTakeDocs(func(context.Context, *entroq.Task, string) (*TakeResult, error) {
+		WithTakeDocs(func(context.Context, entroq.Reader, *TaskRun[string]) (*TakeResult, error) {
 			return Take(entroq.ClaimKey("ns", "busy")), nil
 		}),
-		WithDoWork(func(context.Context, *entroq.Task, string, []*entroq.DocSet) error {
+		WithDoWork(func(context.Context, entroq.Reader, *TaskRun[string]) error {
 			t.Error("DoWork ran without its doc set")
 			return nil
 		}),
@@ -672,7 +678,8 @@ func TestLostClaimGoesOn(t *testing.T) {
 
 			working := make(chan *entroq.Task, 1)
 			second := make(chan bool, 1)
-			w := New[string](client, WithDoWork(func(ctx context.Context, task *entroq.Task, v string, _ []*entroq.DocSet) error {
+			w := New[string](client, WithDoWork(func(ctx context.Context, _ entroq.Reader, tRun *TaskRun[string]) error {
+				task, v := tRun.Task, tRun.Value
 				if v != "lost" {
 					second <- true
 					return nil
@@ -742,7 +749,8 @@ func TestLostClaimFatalStops(t *testing.T) {
 		t.Fatalf("Insert: %v", err)
 	}
 	working := make(chan *entroq.Task, 1)
-	w := New[string](client, WithDoWork(func(ctx context.Context, task *entroq.Task, _ string, _ []*entroq.DocSet) error {
+	w := New[string](client, WithDoWork(func(ctx context.Context, _ entroq.Reader, tRun *TaskRun[string]) error {
+		task := tRun.Task
 		working <- task
 		<-ctx.Done()
 		return FatalErrorf("cannot go on")
@@ -779,7 +787,8 @@ func TestUndecodableValueMoves(t *testing.T) {
 	}
 
 	done := make(chan int, 1)
-	w := New[job](client, WithDoModify(func(_ context.Context, task *entroq.Task, v job, _ []*entroq.DocSet) (*Result, error) {
+	w := New[job](client, WithDoModify(func(_ context.Context, _ entroq.Reader, tRun *TaskRun[job]) (*Result, error) {
+		task, v := tRun.Task, tRun.Value
 		done <- v.N
 		return Modify(task.Delete()), nil
 	}))

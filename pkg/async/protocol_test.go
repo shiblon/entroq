@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/worker"
 )
 
 func TestHeartbeatTimingUsesThirdOfPeerTimeout(t *testing.T) {
@@ -21,13 +22,15 @@ func TestHeartbeatTimingUsesThirdOfPeerTimeout(t *testing.T) {
 
 func TestRequestAcknowledgementRejectsApplicationData(t *testing.T) {
 	session := &senderSession{session: "session-1"}
-	_, err := session.handleRequestAck(context.Background(), nil, Envelope{
-		FrameControl: FrameControl{
-			Session:    "session-1",
-			ReplyQueue: "/service/request-data",
+	_, err := session.handleRequestAck(context.Background(), nil, &worker.TaskRun[Envelope]{
+		Value: Envelope{
+			FrameControl: FrameControl{
+				Session:    "session-1",
+				ReplyQueue: "/service/request-data",
+			},
+			Body: []byte("not an acknowledgement"),
 		},
-		Body: []byte("not an acknowledgement"),
-	}, nil)
+	})
 	if err == nil || !strings.Contains(err.Error(), "where an ACK was expected") {
 		t.Fatalf("error: got %v, want ACK-shape protocol error", err)
 	}
@@ -36,13 +39,16 @@ func TestRequestAcknowledgementRejectsApplicationData(t *testing.T) {
 func TestResponseAcknowledgementRejectsApplicationData(t *testing.T) {
 	receiver := &Receiver{}
 	handler := receiver.responseHandler(sessionStart{}, &receiverSessionState{}, newResponseSocket(), func() {})
-	_, err := handler(context.Background(), nil, Response{
-		FrameControl: FrameControl{
-			Session:    "session-1",
-			ReplyQueue: "/service/response-data",
+	_, err := handler(context.Background(), nil, &worker.TaskRun[Response]{
+		Value: Response{
+			FrameControl: FrameControl{
+				Session:    "session-1",
+				ReplyQueue: "/service/response-data",
+			},
+			Body: []byte("not an acknowledgement"),
 		},
-		Body: []byte("not an acknowledgement"),
-	}, []*entroq.DocSet{{Docs: []*entroq.Doc{{}}}})
+		Sets: []*entroq.DocSet{{Docs: []*entroq.Doc{{}}}},
+	})
 	if err == nil || !strings.Contains(err.Error(), "where an ACK was expected") {
 		t.Fatalf("error: got %v, want ACK-shape protocol error", err)
 	}

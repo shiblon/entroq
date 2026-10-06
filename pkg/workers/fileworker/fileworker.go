@@ -84,7 +84,8 @@ func (fw *Worker) Run(ctx context.Context, eq *entroq.EntroQ, opts ...Option) er
 		return fmt.Errorf("fileworker: failed to create directory: %w", err)
 	}
 
-	handler := func(ctx context.Context, task *entroq.Task, value json.RawMessage, _ []*entroq.DocSet) (*worker.Result, error) {
+	handler := func(ctx context.Context, _ entroq.Reader, tRun *worker.TaskRun[json.RawMessage]) (*worker.Result, error) {
+		task, value := tRun.Task, tRun.Value
 		// Create a unique filename with timestamp to handle potential crashes/retries unambiguously.
 		ts := strings.ReplaceAll(time.Now().UTC().Format("20060102-150405.000"), ".", "")
 		fname := fmt.Sprintf("%s%s-%s.json", ro.prefix, task.ID, ts)
