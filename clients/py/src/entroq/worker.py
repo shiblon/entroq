@@ -353,6 +353,12 @@ def _fix_versions(mod: Modification, task: Task, docs: list[Doc],
     for td in mod.task_depends:
         if td.id in task_ver:
             td.version = task_ver[td.id]
+    # An arrival names its task at a version too, so a handler deferring or
+    # renewing the task it was given needs the same correction. Go's fixVersions
+    # covers m.Arrives for exactly this reason.
+    for ta in mod.task_arrivals:
+        if ta.id in task_ver:
+            ta.version = task_ver[ta.id]
 
     set_of = {(d.namespace, d.id): (d.namespace, d.key) for d in docs}
     set_version = {(g.namespace, g.key): g.version for g in sets}
@@ -376,6 +382,14 @@ def _fix_versions(mod: Modification, task: Task, docs: list[Doc],
         version = current(dd.namespace, dd.id)
         if version is not None:
             dd.version = version
+    # An arrival names its SET directly, so it takes the set's version without
+    # going through a member. This is the documented way for a handler to hold a
+    # set past the body (see _releasing), so leaving it pinned at the claim-time
+    # version would reject the whole commit after the first renewal.
+    for da in mod.doc_arrivals:
+        version = set_version.get((da.namespace, da.key))
+        if version is not None:
+            da.version = version
 
 
 def _reset_claims(mod: Modification, task_id: str) -> None:
@@ -562,8 +576,14 @@ class EntroQWorker:
         def quarantine(dest: str) -> Modification:
             # at=None releases the task immediately: a quarantined task is for
             # inspection, so a retry delay must not leak into its arrival time.
+            #
+            # reset_claims because this failure was HANDLED: the claims before
+            # it do not point at a poison pill, so they must not count toward
+            # the claim limit. Go's RetryOrQuarantine resets on every
+            # disposition for the same reason.
             return Modification.changing(task, queue=dest, at=None,
-                                         attempt=attempt, err=str(exc))
+                                         attempt=attempt, err=str(exc),
+                                         reset_claims=True)
 
         if isinstance(exc, MoveError):
             dest = exc.queue or self.error_queue_for(task.queue)
@@ -575,7 +595,8 @@ class EntroQWorker:
         else:
             delay = exc.delay_s if exc.delay_s is not None else self._retry_delay_s
             at = datetime.now(tz=timezone.utc) + timedelta(seconds=delay)
-            change = Modification.changing(task, at=at, attempt=attempt, err=str(exc))
+            change = Modification.changing(task, at=at, attempt=attempt,
+                                           err=str(exc), reset_claims=True)
 
         ops = [change]
         for group in sets:
@@ -588,9 +609,16 @@ class EntroQWorker:
         # wedging workers, so it must not reach the handler at all.
         if self._max_claims > 0 and task.claims > self._max_claims:
             dest = self.error_queue_for(task.queue)
+            # The same disposition Go applies here: the attempt counts, the
+            # reason is recorded, and the claim count resets, so a task that is
+            # inspected and re-queued starts its budget over rather than
+            # tripping the limit again on its first claim.
             await self._client.modify(Modification(
-                Modification.changing(task, queue=dest,
-                                      err=f"maximum claims exceeded ({self._max_claims})"),
+                Modification.changing(
+                    task, queue=dest, at=None,
+                    attempt=task.attempt + 1,
+                    err=f"maximum claims exceeded ({self._max_claims})",
+                    reset_claims=True),
             ))
             return True
 

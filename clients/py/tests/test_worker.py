@@ -1400,3 +1400,89 @@ def test_a_fatal_finisher_does_stop_the_worker():
             await worker._process(task, process)
 
     asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Dispositions reset the claim count, as Go's RetryOrQuarantine does
+# ---------------------------------------------------------------------------
+
+def _disposed(exc, **worker_kwargs):
+    """Return the task change a disposition of exc produces."""
+    task = _task(id='t1', version=1, queue='q')
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0, **worker_kwargs)
+    asyncio.run(worker._dispose(task, exc))
+    return client.modify_calls[0].task_changes[0]
+
+
+def test_a_retry_resets_the_claim_count():
+    """A handled failure must not leave its claims counting toward the limit.
+
+    Go's RetryOrQuarantine always resets: the claims before a handled failure do
+    not point at a poison pill. Without this, a worker with both max_claims and
+    max_attempts set accumulates a claim per retry and is quarantined as
+    "maximum claims exceeded" long before it exhausts its attempts.
+    """
+    change = _disposed(RetryError("transient"))
+    assert change.reset_claims is True
+    assert change.attempt == 1
+    assert change.queue == 'q', "a retry stays in its own queue"
+
+
+def test_a_quarantine_resets_the_claim_count():
+    change = _disposed(MoveError("poison"), err_queue='err')
+    assert change.reset_claims is True
+    assert change.queue == 'err'
+    assert change.at is None, "a quarantined task is for inspection, available now"
+
+
+def test_the_claim_limit_move_records_an_attempt_and_resets():
+    """The claim-limit move is a disposition too, so it looks like one.
+
+    Go routes this through the same Quarantine path, which counts the attempt,
+    records the reason, and resets the claims -- so an inspected task re-queued
+    by hand starts its budget over instead of tripping the limit immediately.
+    """
+    task = _task(id='t1', version=1, queue='q', claims=9)
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0, max_claims=3,
+                          err_queue='err')
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            raise AssertionError("the handler must not run past the claim limit")
+
+        return await worker._process(task, process)
+
+    assert asyncio.run(run()) is True
+    change = client.modify_calls[0].task_changes[0]
+    assert change.queue == 'err'
+    assert change.reset_claims is True
+    assert change.attempt == 1
+    assert 'maximum claims exceeded' in change.err
+
+
+def test_fix_versions_corrects_arrivals():
+    """An arrival names a version too, so renewal has to reach it.
+
+    A handler may defer its task or hold a set past the body with an arrival --
+    the documented way to do the latter. Left uncorrected, both are pinned at
+    the version they were claimed at, so the first renewal makes the whole
+    commit fail and the completed work is thrown away.
+    """
+    task = _task(id='t1', version=9)
+    group = _doc(namespace='ns', id='', key='k', version=4)
+    doc = _doc(namespace='ns', id='d1', key='k', version=1)
+    mod = Modification(
+        Modification.arriving(task, 30.0),
+        Modification.arriving(group, 30.0),
+    )
+    # As a handler would have them: stale, from claim time.
+    mod.task_arrivals[0].version = 1
+    mod.doc_arrivals[0].version = 1
+
+    _fix_versions(mod, task, [doc], [group])
+
+    assert mod.task_arrivals[0].version == 9, "the task arrival takes the renewed version"
+    assert mod.doc_arrivals[0].version == 4, "the set arrival takes the set's version"
