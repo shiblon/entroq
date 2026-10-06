@@ -1097,6 +1097,42 @@ func (s *QSvc) NamespaceStats(ctx context.Context, req *pb.NamespacesRequest) (*
 	return resp, nil
 }
 
+// claimDocsAuthz builds the authorization request for a doc claim: Claim on
+// every namespace a set is in, Read as well where the claim discloses
+// something, and Read on a matched task's queue.
+//
+// A claim takes ownership, which Claim is for, and it also hands back the
+// set's docs, which is a read of their contents. WithoutMembers is how a
+// caller asks for the lock alone, so a set claimed that way needs no Read:
+// what a request needs is what it actually does.
+//
+// A claim matching a task reads that task. The hold it grants is the task's
+// own arrival, returned on every set the claim produces, and whether the claim
+// succeeds at all says whether that task is in that queue at that version.
+func (s *QSvc) claimDocsAuthz(ctx context.Context, cq *pb.DocClaim, dc *entroq.DocClaim) *authz.Request {
+	authReq := s.newAuthzRequest(ctx)
+	authReq.ClaimantId = cq.GetClaimant()
+	byNS := make(map[string]*authz.Namespace, len(dc.Sets))
+	for _, set := range dc.Sets {
+		ns, ok := byNS[set.Namespace]
+		if !ok {
+			ns = &authz.Namespace{Exact: set.Namespace, Actions: []authz.Action{authz.Claim}}
+			byNS[set.Namespace] = ns
+			authReq.Namespaces = append(authReq.Namespaces, ns)
+		}
+		if !set.OmitMembers && !slices.Contains(ns.Actions, authz.Read) {
+			ns.Actions = append(ns.Actions, authz.Read)
+		}
+	}
+	if match := cq.GetTaskToMatch(); match != nil {
+		authReq.Queues = append(authReq.Queues, &authz.Queue{
+			Exact:   match.GetQueue(),
+			Actions: []authz.Action{authz.Read},
+		})
+	}
+	return authReq
+}
+
 // ClaimDocs atomically claims a set of docs matching the given query.
 // Returns a NotFound status with ModifyDep details if any docs are missing or
 // already claimed.
@@ -1144,23 +1180,9 @@ func (s *QSvc) ClaimDocs(ctx context.Context, req *pb.ClaimDocsRequest) (*pb.Cla
 	if err := dc.Validate(); err != nil {
 		return nil, autoCodeErrorf("claim docs: %w", err)
 	}
-	// Claiming a doc set is gated on Claim for its namespace. Enforced only
-	// when an authorizer is set.
+	// Enforced only when an authorizer is set.
 	if s.az != nil {
-		authReq := s.newAuthzRequest(ctx)
-		authReq.ClaimantId = cq.GetClaimant()
-		var named []string
-		for _, set := range dc.Sets {
-			if slices.Contains(named, set.Namespace) {
-				continue
-			}
-			named = append(named, set.Namespace)
-			authReq.Namespaces = append(authReq.Namespaces, &authz.Namespace{
-				Exact:   set.Namespace,
-				Actions: []authz.Action{authz.Claim},
-			})
-		}
-		if err := s.Authorize(ctx, authReq); err != nil {
+		if err := s.Authorize(ctx, s.claimDocsAuthz(ctx, cq, dc)); err != nil {
 			return nil, err // don't wrap, has status codes
 		}
 	}

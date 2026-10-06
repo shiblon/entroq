@@ -67,6 +67,15 @@ runs, so plan a short maintenance window on large doc tables.
 
 ### Changed
 
+- **A doc claim asks for what it does.** Claiming a doc set still needs
+  `CLAIM` on its namespace, and now also `READ` there when the claim returns
+  the set's docs, since that discloses their contents; a set claimed
+  `WithoutMembers` needs `CLAIM` alone. A claim that matches a task
+  (`MatchingLeaseOf`) additionally needs `READ` on that task's queue: the
+  hold it grants is the task's own arrival, and whether the claim succeeds
+  says whether the task is in that queue at that version. A policy granting
+  workers `CLAIM` on a namespace without `READ` must add it.
+
 - **The worker renews and releases doc sets directly.** Renewal is one
   `UpdateArrival` per half lease for the task and every set it holds, sets
   with no docs included, rather than a rewrite of every task and doc plus a
@@ -404,6 +413,30 @@ runs, so plan a short maintenance window on large doc tables.
   versions.
 
 ### Fixed
+
+- **A doc claim matching a task whose lease ran out is a dependency error.**
+  A claim with `MatchingLeaseOf` holds its sets until the task arrives, so a
+  worker that ran past its own lease asked for an instant already behind it
+  and got an invalid argument -- which stopped the Go worker's `Run`. It is
+  now a failed depend naming the task, so a lease overrun costs a worker one
+  task rather than its process. A caller's own non-positive duration is still
+  an invalid argument. The Python worker records it as a lapsed lease rather
+  than as doc contention.
+
+- **PostgreSQL reports a modification's task dependencies with its doc ones.**
+  `eqpg` decides doc rules in Go and task rules in SQL, and returned the doc
+  failure without running the task check, so a modification that got both
+  wrong learned about its docs on one call and its tasks on the next. The
+  other three backends already merged the two. The task check is now
+  `entroq._check_task_deps`, which writes nothing, so it can be asked on its
+  own; `_modify_arrays` calls the same function.
+
+- **A doc read no longer spins when a doc moved between sets.** `eqredis`
+  read each doc's primary key, then the docs and their sets' locks together,
+  and reread when a doc turned out to be in a set the key map did not name --
+  with the same map, so the reread reached the same answer, in a loop with no
+  backoff, bound, or context check. The read now records where each moved doc
+  went, so one reread resolves, and the loop is bounded like `ClaimDocs`'.
 
 - **A sentinel from `TakeDocs` acts on the task.** `WithTakeDocs` said a
   `TakeDocs` may return a `MoveError`, but any error from it stopped the
