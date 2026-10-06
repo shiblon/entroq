@@ -15,8 +15,8 @@ from datetime import datetime, timezone, timedelta
 from typing import AsyncIterator, Awaitable, Callable, Sequence
 
 from .types import (
-    ClaimedDocs, DependencyError, Doc, DocClaim, Modification, Task,
-    TransportError,
+    ClaimedDocs, DependencyError, Doc, DocClaim, Modification, ModifyResult,
+    Task, TransportError,
 )
 from .base import EntroQBase
 
@@ -26,6 +26,20 @@ from .base import EntroQBase
 
 class StopWorker(Exception):
     """Raise from do_work to stop the worker loop cleanly after the current task."""
+
+
+class RenewalError(Exception):
+    """Raised when a renewal answered in a way that leaves the hold unknown.
+
+    Every version a renewal moves has to come back in its reply, since a
+    commit built on a version the server has moved past fails as a dependency
+    error and throws the body's work away. A reply that does not account for
+    what it was asked to renew is reported here, where the reason is known,
+    rather than as a stale version later.
+
+    Not a :class:`DependencyError`: the claim may well still be held, so this
+    is not a task to drop and go on from.
+    """
 
 
 class FatalWorker(Exception):
@@ -145,14 +159,22 @@ class Handler(ABC):
         """Process the task.
 
         Return a ``Modification`` to apply atomically (versions are fixed up
-        to the latest renewal), or ``None`` to delegate to ``finish()``.
+        to the latest renewal), or ``None`` to commit nothing but the release
+        of the claimed sets. ``finish()`` runs after the commit either way.
 
         Raise ``StopWorker`` to exit cleanly, ``RetryError`` to re-queue, or
         ``MoveError`` to send the task to an error queue.
         """
 
     async def finish(self, task: Task, docs: list[Doc]) -> None:
-        """Called when do_work returns None. Override in subclasses to finalize."""
+        """Called after the body's commit, whatever do_work returned.
+
+        The commit has already landed and the doc claim ended with it, so this
+        holds nothing: it is for work that follows the task being handled, not
+        for part of handling it. An error here is logged rather than raised,
+        since it cannot undo a commit that succeeded; raise ``FatalWorker`` to
+        stop the worker anyway, or ``StopWorker`` to exit cleanly.
+        """
 
     # ------------------------------------------------------------------
     # Private worker protocol.  EntroQWorker calls these; _FnHandler
@@ -237,17 +259,26 @@ class _RenewState:
         # report its sets renews the task alone, as it did before it could.
         self.sets: list[Doc] = list(getattr(docs, 'sets', ()))
         self.error: Exception | None = None
-        # Set by the renewer when the claim is lost, so _process can tell its
-        # own cancellation apart from one arriving from outside the worker.
-        self.claim_lost = False
+        # Set when the renewer cancelled the work itself, so _process can tell
+        # that cancellation apart from one arriving from outside the worker.
+        self.work_cancelled = False
         # The in-flight handler task, registered by _process so the renewer can
-        # abort work the moment the claim stops being ours.
+        # abort work the moment the hold stops being usable.
         self.work: asyncio.Task | None = None
+        # Asks the renewer to finish and stand down. It is a request rather
+        # than a cancellation because a renewal already in flight may have
+        # been applied: see _renewing.
+        self.stop = asyncio.Event()
 
-    def lose_claim(self, err: Exception) -> None:
-        """Record claim loss and cancel the handler if one is running."""
+    def stop_work(self, err: Exception) -> None:
+        """Record why the hold is no longer usable and cancel the handler.
+
+        Either the claim is gone or a renewal answered unusably. Both mean
+        nothing this body produces can be committed, so the work stops now
+        rather than running to completion against a hold it does not have.
+        """
         self.error = err
-        self.claim_lost = True
+        self.work_cancelled = True
         if self.work is not None and not self.work.done():
             self.work.cancel()
 
@@ -273,11 +304,43 @@ def renewal_interval_s(task: Task) -> float:
     return granted_lease_s(task) * 2.0 / 3.0
 
 
+def _renewed(task: Task, sets: Sequence[Doc],
+             result: ModifyResult) -> tuple[Task, list[Doc]]:
+    """Return the task and sets at the versions a renewal reply reports.
+
+    Everything the renewal named has to come back, or the caller does not know
+    what it holds; see :class:`RenewalError`. Real docs have IDs and sets do
+    not, so a set's lock is picked out of the changed docs by that.
+    """
+    renewed = [t for t in result.tasks_changed if t.id == task.id]
+    if len(renewed) != 1:
+        raise RenewalError(
+            f"renewal of task {task.id} answered with tasks {result.tasks_changed}")
+    locks = {(d.namespace, d.key): d
+             for d in result.docs_changed if d.is_set_ref()}
+    out: list[Doc] = []
+    for group in sets:
+        lock = locks.get((group.namespace, group.key))
+        if lock is None:
+            raise RenewalError(
+                f"renewal of task {task.id} did not answer with doc set "
+                f"{group.key!r} in {group.namespace!r}")
+        out.append(lock)
+    return renewed[0], out
+
+
+# How long to let a renewal already in flight finish once the body has ended.
+# It bounds the handoff below, so a wedged server costs a worker this much
+# rather than the rest of its life.
+RENEWAL_HANDOFF_S = 10.0
+
+
 @asynccontextmanager
 async def _renewing(
     client: EntroQBase,
     task: Task,
     docs: ClaimedDocs,
+    since_claim_s: float = 0.0,
 ) -> AsyncIterator[_RenewState]:
     state = _RenewState(task, docs)
 
@@ -288,11 +351,28 @@ async def _renewing(
         # grant equal the last.
         lease_s = granted_lease_s(task)
         interval_s = renewal_interval_s(task)
+        # The lease began at the claim, not here, so whatever reaching the body
+        # cost is already gone from it -- claiming doc sets most of all, since
+        # that is an all-or-nothing claim against other workers. A first wait
+        # of zero renews at once, which is what a claim longer than an interval
+        # needs.
+        next_s = max(0.0, interval_s - since_claim_s)
         while True:
-            try:
-                await asyncio.sleep(interval_s)
-            except asyncio.CancelledError:
+            if next_s > 0:
+                try:
+                    await asyncio.wait_for(state.stop.wait(), timeout=next_s)
+                    return  # asked to stand down between renewals
+                except asyncio.TimeoutError:
+                    pass
+                except asyncio.CancelledError:
+                    return
+            next_s = interval_s
+            if state.stop.is_set():
                 return
+            # Past here the renewal runs to completion even if the body ends:
+            # a reply in flight may name versions the server has already
+            # written, and dropping it loses the only record of them.
+            #
             # Arrivals, not changes: a renewal says only "hold this longer",
             # as a duration the backend resolves against its own clock. An
             # instant computed here could arrive already stale, which reads as
@@ -306,31 +386,43 @@ async def _renewing(
                 ops.append(Modification.arriving(group, lease_s))
             try:
                 result = await client.modify(Modification(*ops))
-                if result.tasks_changed:
-                    state.task = result.tasks_changed[0]
-                # A lease change answers with the sets it named, each at its
-                # new lock, among the changed docs. Real docs have IDs; sets
-                # do not, so there is nothing to confuse them with.
-                renewed = {(d.namespace, d.key): d
-                           for d in result.docs_changed if d.is_set_ref()}
-                if renewed:
-                    state.sets = [renewed.get((g.namespace, g.key), g)
-                                  for g in state.sets]
             except DependencyError as e:
                 # The claim is gone. Work done from here cannot be committed,
                 # and may duplicate whatever the new claimant is doing, so stop
                 # the handler now rather than letting it run to completion.
-                state.lose_claim(e)
+                state.stop_work(e)
                 return
             except Exception as e:
                 logging.warning("Renewal error for task %s (will retry): %s", task.id, e)
+                continue
+            try:
+                state.task, state.sets = _renewed(state.task, state.sets, result)
+            except RenewalError as e:
+                state.stop_work(e)
+                return
 
     renew_task = asyncio.create_task(_renewer())
     try:
         yield state
     finally:
-        renew_task.cancel()
-        await asyncio.gather(renew_task, return_exceptions=True)
+        # Ask the renewer to stand down and wait for it, rather than cancelling
+        # it: a renewal in flight may already have been applied, and cancelling
+        # there throws away the versions it was about to report. The commit
+        # that follows would then name the versions from before it and be
+        # refused, discarding work that succeeded. A wedged server is bounded
+        # by RENEWAL_HANDOFF_S, after which there is nothing to do but cancel.
+        state.stop.set()
+        try:
+            await asyncio.wait_for(renew_task, timeout=RENEWAL_HANDOFF_S)
+        except Exception:
+            # The handoff timed out, or the renewal failed on its way out.
+            # Either way the hold is as good as it is going to get, and the
+            # error the renewer recorded is what says so.
+            pass
+        finally:
+            if not renew_task.done():
+                renew_task.cancel()
+            await asyncio.gather(renew_task, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------
@@ -641,6 +733,11 @@ class EntroQWorker:
 
     async def _process(self, task: Task, handler: Handler) -> bool:
         """Process one already-claimed task. Returns False if the worker should stop."""
+        # The task's lease is already running: it started when the claim
+        # stamped it, which is just before this call. What the ceiling check,
+        # the selector and the doc claim spend comes out of the lease, so the
+        # renewer is told how much of it is gone.
+        claimed_at = asyncio.get_running_loop().time()
         # Claim count is checked first: a task over the claim ceiling has been
         # wedging workers, so it must not reach the handler at all.
         if self._max_claims > 0 and task.claims > self._max_claims:
@@ -698,7 +795,8 @@ class EntroQWorker:
         # allowed claim, so the reason survives; the exception still
         # propagates, and a failure of the quarantine changes nothing.
         try:
-            async with _renewing(self._client, task, docs) as state:
+            since_claim_s = asyncio.get_running_loop().time() - claimed_at
+            async with _renewing(self._client, task, docs, since_claim_s) as state:
                 work = asyncio.ensure_future(handler.do_work(task, docs))
                 state.work = work
                 try:
@@ -708,7 +806,7 @@ class EntroQWorker:
                 except asyncio.CancelledError:
                     # Only swallow a cancellation the renewer caused; anything
                     # else is the caller stopping us and must keep propagating.
-                    if not state.claim_lost:
+                    if not state.work_cancelled:
                         raise
                 # Other exceptions propagate; the renewer is still cleaned up.
         except FatalWorker:
@@ -718,7 +816,9 @@ class EntroQWorker:
             raise
 
         # A renewal failure is the worker's, not the handler's, so it is not
-        # quarantined: nothing about the task has been learned.
+        # quarantined: nothing about the task has been learned. A lost claim is
+        # a DependencyError, which the run loop logs and goes on from; a
+        # RenewalError is not, and stops the worker, as it does in Go.
         if state.error:
             raise state.error
 

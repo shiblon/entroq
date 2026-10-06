@@ -164,6 +164,79 @@ class DocFailClient(FakeClient):
         raise self._doc_error
 
 
+class ParkedRenewClient(FakeClient):
+    """Applies a renewal, then takes time to answer.
+
+    A server that has already committed while its reply is still on the wire.
+    renewal_applied fires the moment the write lands, so a caller waiting on it
+    is guaranteed to be inside the reply's flight.
+    """
+
+    IN_FLIGHT_S = 0.05
+
+    def __init__(self, tasks=(), docs=()):
+        super().__init__(tasks=tasks, docs=docs)
+        self.renewal_applied = asyncio.Event()
+        self.renewed: ModifyResult | None = None
+
+    async def modify(self, modification, *, unsafe_claimant_id=None):
+        if not modification.task_arrivals:
+            return await super().modify(modification)
+        result = await super().modify(modification)
+        self.renewed = result
+        self.renewal_applied.set()
+        await asyncio.sleep(self.IN_FLIGHT_S)
+        return result
+
+
+class SilentRenewClient(FakeClient):
+    """Answers a renewal without reporting what it changed.
+
+    Whatever it did, the caller cannot know the versions it now holds.
+    """
+
+    def __init__(self, tasks=(), docs=(), omit='task'):
+        super().__init__(tasks=tasks, docs=docs)
+        self._omit = omit
+        self.renewals = 0
+
+    async def modify(self, modification, *, unsafe_claimant_id=None):
+        if not modification.task_arrivals:
+            return await super().modify(modification)
+        self.renewals += 1
+        result = await super().modify(modification)
+        if self._omit == 'task':
+            return ModifyResult(tasks_changed=[], docs_changed=result.docs_changed)
+        return ModifyResult(tasks_changed=result.tasks_changed, docs_changed=[])
+
+
+class SlowClaimClient(FakeClient):
+    """Takes time to claim doc sets, as a contended claim does.
+
+    claim_elapsed_s is how long the claim took, which is lease time already
+    spent when the handler body finally starts.
+    """
+
+    def __init__(self, tasks=(), docs=(), claim_delay_s=0.0):
+        super().__init__(tasks=tasks, docs=docs)
+        self._claim_delay_s = claim_delay_s
+        self.renewed_at: list[float] = []
+        self._body_start: float | None = None
+
+    async def claim_doc_sets(self, sets, *, duration_ms=30000, task_to_match=None):
+        await asyncio.sleep(self._claim_delay_s)
+        result = await super().claim_doc_sets(
+            sets, duration_ms=duration_ms, task_to_match=task_to_match)
+        self._body_start = asyncio.get_running_loop().time()
+        return result
+
+    async def modify(self, modification, *, unsafe_claimant_id=None):
+        if modification.task_arrivals and self._body_start is not None:
+            self.renewed_at.append(
+                asyncio.get_running_loop().time() - self._body_start)
+        return await super().modify(modification)
+
+
 class RenewFailClient(FakeClient):
     """Fails only renewal modifies: those carrying a task arrival."""
 
@@ -1352,6 +1425,130 @@ def test_renewal_reaches_the_commit_through_the_set():
     assert set_version > claimed_at, "the renewals moved the set"
     assert deleted_at == set_version, (
         f"commit named v{deleted_at}, set is at v{set_version}")
+
+
+def test_a_renewal_already_committed_is_not_abandoned():
+    """A renewal the server applied must reach the commit that follows it.
+
+    The body ends while the reply is in flight. Dropping it there loses the
+    only record of the version the server now holds, and the commit is then
+    built on the version before it -- which the server rejects, discarding
+    work that succeeded. The window is one reply per renewal, so the chance of
+    hitting it grows with how long the handler runs.
+    """
+    task = _task(id='t1', version=1, queue='q', lease_s=0.12)
+    client = ParkedRenewClient(tasks=[task])
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            # Inside the reply's flight, by construction.
+            await client.renewal_applied.wait()
+            return Modification(Modification.changing(t, value={'done': True}))
+
+        worker = EntroQWorker(client, 'q', claim_duration_s=60.0)
+        await worker._process(task, process)
+
+    asyncio.run(run())
+
+    assert client.renewed is not None, "the renewal never landed"
+    granted = client.renewed.tasks_changed[0]
+    commits = [m for m in client.modify_calls if m.task_changes]
+    assert commits, "the body's commit was never sent"
+    assert commits[-1].task_changes[0].version == granted.version, (
+        "the commit names the version from before the renewal the server "
+        "already applied")
+
+
+def test_a_renewal_that_does_not_report_the_task_stops_the_work():
+    """A reply naming no task leaves the caller without the version it holds.
+
+    Carrying on would commit against a version the server has moved past,
+    which fails as a dependency error and throws the work away. Better to stop
+    where the reason is known. The Go worker's renewed() errors here.
+    """
+    task = _task(id='t1', version=1, queue='q', lease_s=0.12)
+    client = SilentRenewClient(tasks=[task], omit='task')
+    committed = []
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            await asyncio.sleep(0.3)
+            committed.append(t.id)
+            return Modification(Modification.changing(t, value={'done': True}))
+
+        worker = EntroQWorker(client, 'q', claim_duration_s=60.0)
+        await worker._process(task, process)
+
+    with pytest.raises(Exception) as caught:
+        asyncio.run(run())
+    assert not isinstance(caught.value, DependencyError), (
+        "a malformed reply is not a lost claim: the worker must not carry on")
+    assert client.renewals >= 1
+    assert committed == [], "the handler must not run to completion"
+
+
+def test_a_renewal_that_does_not_report_a_set_stops_the_work():
+    """The same for a set: a doc carries its set's version and nothing else."""
+    doc = _doc(namespace='ns', id='d1', key='k')
+    task = _task(id='t1', version=1, queue='q', lease_s=0.12)
+    client = SilentRenewClient(tasks=[task], docs=[doc], omit='sets')
+    committed = []
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            await asyncio.sleep(0.3)
+            committed.append(t.id)
+            return None
+
+        @process.selector
+        async def process(t):
+            return [DocClaim('ns', 'k')]
+
+        worker = EntroQWorker(client, 'q', claim_duration_s=60.0)
+        await worker._process(task, process)
+
+    with pytest.raises(Exception) as caught:
+        asyncio.run(run())
+    assert not isinstance(caught.value, DependencyError)
+    assert committed == [], "the handler must not run to completion"
+
+
+def test_the_first_renewal_counts_time_already_spent():
+    """The lease starts at the claim, not at the body.
+
+    Claiming doc sets is an all-or-nothing claim against other workers, so it
+    can take a real part of the lease. Waiting a full interval after it means
+    the first renewal can arrive after the task has already come free. Go
+    passes time.Since(claimed) in for exactly this.
+    """
+    doc = _doc(namespace='ns', id='d1', key='k')
+    task = _task(id='t1', version=1, queue='q', lease_s=0.3)  # interval 0.2
+    client = SlowClaimClient(tasks=[task], docs=[doc], claim_delay_s=0.25)
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            await asyncio.sleep(0.1)
+            return None
+
+        @process.selector
+        async def process(t):
+            return [DocClaim('ns', 'k')]
+
+        worker = EntroQWorker(client, 'q', claim_duration_s=60.0)
+        await worker._process(task, process)
+
+    asyncio.run(run())
+
+    assert client.renewed_at, "the lease was never renewed"
+    # The claim spent 0.25s of a 0.2s interval, so the renewal was already due
+    # when the body started and must not wait another interval for it.
+    assert client.renewed_at[0] < 0.1, (
+        f"first renewal {client.renewed_at[0]:.3f}s into a body that began "
+        "with the interval already spent")
 
 
 def test_renewing_advances_set_versions():

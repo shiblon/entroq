@@ -414,6 +414,27 @@ runs, so plan a short maintenance window on large doc tables.
 
 ### Fixed
 
+- **The Python worker's renewal keeps what it was told, and starts on time.**
+  Three ways a renewal could leave the worker holding a version the server had
+  moved past, each of which fails the body's commit as a dependency error and
+  throws away work that succeeded. The body ending cancelled a renewal still
+  in flight, discarding a reply the server had already applied; the Go worker
+  hands the renewal goroutine's state over instead of cancelling it, and
+  Python now asks the renewer to stand down and waits (bounded by
+  `RENEWAL_HANDOFF_S`). A reply that did not report the task, or a set, left
+  that version silently stale; it now raises the new `entroq.worker`
+  `RenewalError`, which stops the worker where the reason is known rather than
+  failing the commit later. And the first renewal waited a full interval from
+  the start of the handler body, ignoring the lease already spent claiming the
+  task's doc sets -- an all-or-nothing claim against other workers, so not
+  quick -- which meant a body shorter than the interval never renewed at all,
+  however little lease was left. It now counts that time, renewing at once
+  when the interval is already gone.
+
+- **`Handler.finish` documents when it runs.** It said "called when do_work
+  returns None"; it is called after the body's commit whatever `do_work`
+  returned, as the Go worker's `Finish` is, and as its own test asserts.
+
 - **A doc claim matching a task whose lease ran out is a dependency error.**
   A claim with `MatchingLeaseOf` holds its sets until the task arrives, so a
   worker that ran past its own lease asked for an instant already behind it
