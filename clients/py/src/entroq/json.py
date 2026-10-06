@@ -10,7 +10,8 @@ import httpx
 from .types import (
     Task, TaskData, TaskChange, TaskID, TaskArrival,
     Doc, DocData, DocChange, DocID, DocArrival, DocClaim, ClaimedDocs,
-    DependencyError, Modification, ModifyResult, TransportError,
+    DependencyError, InvalidArgumentError, Modification, ModifyResult,
+    TransportError,
 )
 from .base import EntroQBase
 
@@ -22,6 +23,17 @@ from .base import EntroQBase
 # works against a protocol 2 server, which is the compatibility that matters.
 PROTOCOL = 2
 _PROTOCOL_HEADERS = {"entroq-protocol": str(PROTOCOL)}
+
+
+def _service_message(resp: httpx.Response) -> str:
+    """Return the service's own explanation for a refusal, or the status line."""
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    if isinstance(body, dict) and body.get("message"):
+        return str(body["message"])
+    return f"{resp.status_code} {resp.reason_phrase}"
 
 
 def _parse_ms(ms: int | str) -> datetime:
@@ -208,6 +220,12 @@ class EntroQJSON(EntroQBase):
         return resp.json()
 
     def _raise_for_error(self, resp: httpx.Response) -> None:
+        # A refused request arrives as 400, carrying the service's own reason.
+        # Raised as an EntroQ error rather than left as the transport's, so a
+        # caller never has to know which HTTP library is underneath to tell a
+        # malformed request from a lost connection.
+        if resp.status_code == 400:
+            raise InvalidArgumentError(_service_message(resp))
         # Dependency errors arrive as 409 Conflict (Aborted). 404 is also
         # accepted for tolerance; the dependency-detail check below keeps an
         # ordinary 404 from being misread as a dependency error.

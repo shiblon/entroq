@@ -310,6 +310,21 @@ class DependencyError(Exception):
         })
 
 
+class InvalidArgumentError(Exception):
+    """Raised when the service refuses a request as malformed.
+
+    The request could not be valid for anyone: a required field missing, a
+    duration outside the permitted bounds, a change mode this protocol does not
+    allow. Retrying it unchanged cannot help, which is what separates it from
+    :class:`DependencyError` -- that one says the world moved, this one says the
+    request was wrong.
+    """
+
+    def __init__(self, message: str = "") -> None:
+        super().__init__(message)
+        self.message = message
+
+
 class TransportError(Exception):
     """Raised when a client could not complete an exchange with its backend.
 

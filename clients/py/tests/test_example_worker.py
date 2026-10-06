@@ -12,7 +12,8 @@ import pytest
 
 from entroq.json import EntroQJSON
 from entroq.types import (
-    DependencyError, DocClaim, DocData, Modification, TaskData,
+    DependencyError, DocClaim, DocData, InvalidArgumentError, Modification,
+    TaskData,
 )
 from entroq.worker import EntroQWorker
 
@@ -98,7 +99,11 @@ async def test_json_docs_filters_against_live_server(eqmem_url):
         ]))
         assert len(res.docs_inserted) == 4
 
-        await eq.docs()  # An unfiltered request must reach the server.
+        # The probe for arrival: a query naming no namespace is refused, which
+        # proves the request was read rather than silently emptied by a wrong
+        # field path. See test_docs_no_filter_reaches_the_server.
+        with pytest.raises(InvalidArgumentError):
+            await eq.docs()
         listed = await eq.docs(namespace=ns)
         exact = await eq.docs(namespace=ns, key_exact='b')
         by_id = await eq.docs(namespace=ns, ids=[listed[0].id, listed[3].id])

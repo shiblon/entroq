@@ -2,7 +2,7 @@ from .types import (
     Task, TaskID, TaskData, TaskChange, TaskArrival,
     Doc, DocID, DocData, DocChange, DocArrival, DocClaim, ClaimedDocs,
     Modification, ModifyResult,
-    DependencyError, TransportError,
+    DependencyError, InvalidArgumentError, TransportError,
 )
 from .worker import (
     EntroQWorker, Handler, StopWorker, RetryError, MoveError,

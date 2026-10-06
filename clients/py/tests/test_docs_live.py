@@ -11,7 +11,9 @@ import uuid
 import pytest
 
 from entroq.json import EntroQJSON
-from entroq.types import DocClaim, DocData, Modification, TaskData
+from entroq.types import (
+    DocClaim, DocData, InvalidArgumentError, Modification, TaskData,
+)
 
 
 @pytest.fixture
@@ -41,16 +43,24 @@ async def test_docs_lists_whole_namespace(seeded):
     assert [(d.key, d.secondary_key) for d in got] == [("a", "1"), ("b", "1"), ("b", "2"), ("c", "1")]
 
 
-async def test_docs_no_filter_is_a_valid_request(seeded):
-    """A bare docs() call must reach the server, not fail as an unknown field.
+async def test_docs_no_filter_reaches_the_server(seeded):
+    """A bare docs() call must be answered by the server, not vanish.
 
-    What an empty namespace *selects* is backend-specific and deliberately not
-    asserted here: eqmem reads it as no namespace, while the PostgreSQL backend
-    reads it as every namespace.
+    This is the probe for "did my request arrive at all". Every DocQuery filter
+    is transcoded under the "query." field path, and a wrong or missing nested
+    name yields an EMPTY filter rather than an error -- so from here, a request
+    that never arrived and one that arrived carrying nothing look identical.
+
+    A query naming no namespace is refused, which is the clearest possible proof
+    of arrival: the server read it, understood it, and said what was wrong with
+    it. A silent empty result would prove nothing.
     """
     eq, _ = seeded
 
-    await eq.docs()  # must not raise
+    with pytest.raises(InvalidArgumentError) as raised:
+        await eq.docs()
+    assert "namespace" in str(raised.value), (
+        f"want the service's own reason, got {raised.value!r}")
 
 
 async def test_docs_key_range_is_half_open(seeded):

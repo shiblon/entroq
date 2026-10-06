@@ -7,7 +7,8 @@ import pytest
 
 from entroq.json import EntroQJSON, _doc_insert_json
 from entroq.types import (
-    DependencyError, DocData, DocID, Modification, TaskID, TransportError,
+    DependencyError, DocData, DocID, InvalidArgumentError, Modification, TaskID,
+    TransportError,
 )
 
 
@@ -247,3 +248,34 @@ def test_doc_insert_encodes_future_arrival():
     at = datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
 
     assert _doc_insert_json(DocData(namespace="status", key="session", at=at))["atMs"] == 1893553445000
+
+
+async def _refused(**response) -> InvalidArgumentError:
+    """Return the error the client raises for a 400 shaped like this."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, **response)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        eq = EntroQJSON("http://entroq.example", http_client=http)
+        with pytest.raises(InvalidArgumentError) as raised:
+            await eq.docs(namespace="ns")
+        return raised.value
+    finally:
+        await http.aclose()
+
+
+async def test_a_refused_request_carries_the_services_own_reason():
+    """A 400 is the service saying the request was wrong, so say what it said.
+
+    Leaving it as the transport's exception would make a caller import httpx to
+    tell a malformed request from a lost connection.
+    """
+    err = await _refused(json={"code": 3, "message": "docs: docs query must name a namespace"})
+    assert "must name a namespace" in str(err)
+
+
+async def test_a_refused_request_without_a_reason_falls_back_to_the_status():
+    """A body that carries no message still has to produce a usable error."""
+    err = await _refused(text="not json at all")
+    assert "400" in str(err)
