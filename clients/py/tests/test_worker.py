@@ -963,6 +963,19 @@ def test_worker_contended_doc_retries_with_backoff():
     assert tc.attempt == 1
 
 
+def test_worker_lapsed_task_lease_retries_and_says_so():
+    """The sets are held until the task arrives, so a worker that ran past its
+    own lease fails the claim on the task rather than on any doc. Transient
+    like contention, and recorded apart from it: nothing was contended."""
+    tc = _doc_dispose(DependencyError(
+        "lapsed", depends=[TaskID(id='t1', version=1, queue='q')]))
+    assert tc.queue == 'q'
+    assert tc.at is not None
+    assert 'task lease lapsed' in tc.err
+    assert 'doc contention' not in tc.err
+    assert tc.attempt == 1
+
+
 def test_worker_missing_doc_wins_over_contention():
     """Mixed failure: an absent doc cannot be waited out, so it dominates."""
     tc = _doc_dispose(DependencyError(

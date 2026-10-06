@@ -117,8 +117,24 @@ func SetsOf(cq *entroq.DocClaim) []Set {
 // DependencyError.Message crosses the wire, so a fmt.Errorf wrap would name
 // the backend for a local caller and tell a remote one nothing.
 func MissingTaskErrorf(id *entroq.TaskID, format string, args ...any) error {
-	depErr := entroq.DependencyErrorf("%s: doc claim depends on a missing task",
-		fmt.Sprintf(format, args...))
+	return taskDepErrorf(id, "missing task", format, args...)
+}
+
+// LapsedTaskErrorf reports that a claim matching a task
+// (entroq.MatchingLeaseOf) found the task but not the lease: the arrival it
+// would hold the sets until has already passed, so the caller does not hold
+// the task it is claiming docs for.
+//
+// This is a failed depend like MissingTaskErrorf, not an invalid argument. A
+// caller that ran past its lease asked for something that is no longer there,
+// which costs it this task and not its process.
+func LapsedTaskErrorf(id *entroq.TaskID, format string, args ...any) error {
+	return taskDepErrorf(id, "task whose lease lapsed", format, args...)
+}
+
+func taskDepErrorf(id *entroq.TaskID, what, format string, args ...any) error {
+	depErr := entroq.DependencyErrorf("%s: doc claim depends on a %s",
+		fmt.Sprintf(format, args...), what)
 	depErr.Depends = append(depErr.Depends, id)
 	return depErr
 }
@@ -126,8 +142,12 @@ func MissingTaskErrorf(id *entroq.TaskID, format string, args ...any) error {
 // ClaimAll claims every set cq names, all or none, at now, holding them until
 // until, and returns each set's new lock in the order named. lock gives each
 // set's current lock; members gives a set's docs, and is asked only for sets
-// held by someone else, which the error names along with their members. A
-// hold that does not reach past now is an invalid argument.
+// held by someone else, which the error names along with their members.
+//
+// A hold that does not reach past now fails. How it fails depends on where
+// until came from: a caller's own non-positive duration is an invalid
+// argument, while a matched task whose lease has already passed is a failed
+// depend on that task (LapsedTaskErrorf).
 //
 // until is passed in rather than read from cq because a claim may name a task
 // to match instead of a duration (see entroq.MatchingLeaseOf), and only the
@@ -140,6 +160,10 @@ func MissingTaskErrorf(id *entroq.TaskID, format string, args ...any) error {
 // fail with MissingTaskErrorf.
 func ClaimAll(cq *entroq.DocClaim, now, until time.Time, lock func(Set) Lock, members func(Set) ([]*entroq.Doc, error)) ([]Lock, error) {
 	if !until.After(now) {
+		if cq.TaskToMatch != nil {
+			return nil, LapsedTaskErrorf(cq.TaskToMatch, "doc claim matching task %s, whose lease ran out at %v (now %v)",
+				cq.TaskToMatch.ID, until, now)
+		}
 		return nil, entroq.InvalidArgumentf("doc claim until %v, which is not after now (%v)", until, now)
 	}
 	sets := SetsOf(cq)

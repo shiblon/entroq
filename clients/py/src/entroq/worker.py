@@ -625,12 +625,18 @@ class EntroQWorker:
         try:
             docs = await self._claim_docs(task, handler)
         except DependencyError as e:
-            # Classify rather than swallow: a missing doc can never be claimed,
-            # so the task is a poison pill; a doc held by someone else is
-            # transient and deserves a backoff. Either way the reason is
-            # recorded on the task instead of vanishing into a log line.
+            # Classify rather than swallow, and record the reason on the task
+            # instead of letting it vanish into a log line. A missing doc can
+            # never be claimed, so the task is a poison pill. A doc held by
+            # someone else is transient. A failed depend on the task itself
+            # means this worker ran past its own lease while taking docs --
+            # the sets are held until the task arrives, so the hold it asked
+            # for was already behind it -- which is transient too, and worth
+            # saying apart from contention.
             if e.has_missing_docs():
                 await self._dispose(task, MoveError(f"required doc missing: {e}"))
+            elif e.has_missing():
+                await self._dispose(task, RetryError(f"task lease lapsed while taking docs: {e}"))
             else:
                 await self._dispose(task, RetryError(f"doc contention: {e}"))
             return True

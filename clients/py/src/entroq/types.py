@@ -257,9 +257,10 @@ class DependencyError(Exception):
 
     Task-scoped and doc-scoped failures are kept apart. The ``doc_*`` lists
     hold :class:`DocID` values; the rest hold :class:`TaskID` values. Workers
-    use :meth:`has_missing_docs` and :meth:`has_claimed_docs` to tell a poison
-    pill (a required doc is gone) from transient contention (another claimant
-    holds it), mirroring the Go client.
+    use :meth:`has_missing_docs`, :meth:`has_claimed_docs` and
+    :meth:`has_missing` to tell a poison pill (a required doc is gone) from
+    transient contention (another claimant holds it) from a task that is no
+    longer theirs, mirroring the Go client.
     """
     def __init__(self, message="", missing=(), mismatched=(), collisions=(), inserts=(), depends=(), deletes=(), changes=(), claims=(),
                  doc_inserts=(), doc_depends=(), doc_deletes=(), doc_changes=(), doc_claims=()):
@@ -278,6 +279,14 @@ class DependencyError(Exception):
         self.doc_deletes = list(doc_deletes)
         self.doc_changes = list(doc_changes)
         self.doc_claims = list(doc_claims)
+
+    def has_missing(self) -> bool:
+        """True when a task the operation named was absent or not at its version.
+
+        Arrivals ride the wire as changes, so a failed task arrival lands in
+        ``changes`` and counts here, as it does in Go's ``HasMissing``.
+        """
+        return bool(self.depends or self.deletes or self.changes)
 
     def has_missing_docs(self) -> bool:
         """True when a required doc is absent, not merely claimed elsewhere.

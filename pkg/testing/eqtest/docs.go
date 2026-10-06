@@ -1288,6 +1288,48 @@ func DocClaimSets(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 		}
 	})
 
+	t.Run("a claim matching a task whose lease ran out fails as a depend", func(t *testing.T) {
+		queue := path.Join(qPrefix, "doc_claim_lockstep_lapsed")
+		if _, err := client.Modify(ctx, entroq.InsertingInto(queue)); err != nil {
+			t.Fatalf("Insert task: %v", err)
+		}
+		task, err := client.Claim(ctx, entroq.From(queue), entroq.ClaimFor(time.Hour))
+		if err != nil {
+			t.Fatalf("Claim task: %v", err)
+		}
+		// Put the task's arrival behind us, which is where a worker that ran
+		// long finds it, and keep the task the change returns so the claim
+		// still names the stored version: the lease is what is gone, not the
+		// task.
+		res, err := client.Modify(ctx, task.Change(entroq.ArrivalTimeBy(-time.Minute)))
+		if err != nil {
+			t.Fatalf("Move the task's arrival into the past: %v", err)
+		}
+		lapsed := res.ChangedTasks[0]
+		_, err = client.ClaimDocs(ctx,
+			entroq.ClaimKey(other, "lapsed-match"),
+			entroq.MatchingLeaseOf(lapsed),
+		)
+		// A dependency error, not an invalid argument: the caller asked for
+		// the task's own lease, and the task is what was not there to give
+		// it. An invalid argument costs a worker its process; this costs it
+		// one task.
+		depErr, ok := entroq.AsDependency(err)
+		if !ok {
+			t.Fatalf("Claim matching a lapsed lease: want a dependency error, got %v", err)
+		}
+		if !depErr.HasMissing() {
+			t.Errorf("Claim matching a lapsed lease: want the task among the missing depends, got %v", depErr)
+		}
+		if len(depErr.Depends) != 1 || depErr.Depends[0].ID != lapsed.ID {
+			t.Errorf("Claim matching a lapsed lease: want task %q among the depends, got %v", lapsed.ID, depErr.Depends)
+		}
+		// Nothing was held, so the set is still free.
+		if _, err := client.ClaimDocs(ctx, entroq.ClaimKey(other, "lapsed-match"), entroq.ClaimingSetsFor(time.Minute)); err != nil {
+			t.Errorf("Set after a claim that failed on the lease: want it unclaimed, got %v", err)
+		}
+	})
+
 	t.Run("a claim must name its sets once, with one usable lease", func(t *testing.T) {
 		for name, args := range map[string][]entroq.DocClaimArg{
 			"no sets":                {entroq.ClaimingSetsFor(time.Minute)},

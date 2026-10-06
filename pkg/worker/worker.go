@@ -874,8 +874,10 @@ func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, ta
 //
 // It returns the claimed sets in claim order, sets with no docs included.
 //
-// Returns a *entroq.DependencyError while another claimant holds a set; the
-// caller retries the task with backoff.
+// Returns a *entroq.DependencyError while another claimant holds a set, and
+// also when this worker's own lease on the task has already run out, since the
+// hold comes from the task. The caller retries the task with backoff either
+// way; the error says which it was.
 func acquireDocs(ctx context.Context, eqc *entroq.EntroQ, task *entroq.Task, tr *TakeResult) ([]*entroq.DocSet, error) {
 	if tr == nil {
 		return []*entroq.DocSet{}, nil
@@ -986,13 +988,23 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 	}
 	sets, err := acquireDocs(rCtx, w.eqc, task, tr)
 	if err != nil {
-		// A claim fails only while someone else holds a set, which is
-		// transient: retry with backoff. The claim is all or none, so
-		// nothing is held.
-		if _, ok := entroq.AsDependency(err); ok {
+		// Two transient failures, one outcome: the task goes back with a
+		// delay. The claim is all or none, so nothing is held either way.
+		//
+		// They are recorded apart because they blame different things. A set
+		// held by someone else is contention, and the error names the sets. A
+		// failed depend on the task itself means this worker ran past its own
+		// lease while taking docs, so the hold it asked for was already
+		// behind it -- and the retry below may well find the task gone, which
+		// handleSentinelErrors treats as the known state it is.
+		if depErr, ok := entroq.AsDependency(err); ok {
 			outcome = outcomeRetried
+			retry := RetryErrorf("doc contention: %v", depErr)
+			if depErr.HasMissing() {
+				retry = RetryErrorf("task lease lapsed while taking docs: %v", depErr)
+			}
 			errQ := w.ErrorQueueFor(task.Queue)
-			if _, herr := w.handleSentinelErrors(ctx, RetryErrorf("doc contention").After(opts.contentionDelay()), task, nil, errQ, opts); herr != nil {
+			if _, herr := w.handleSentinelErrors(ctx, retry.After(opts.contentionDelay()), task, nil, errQ, opts); herr != nil {
 				return fmt.Errorf("handle sentinel error: %w", herr)
 			}
 			return nil
