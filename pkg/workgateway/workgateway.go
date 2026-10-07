@@ -471,7 +471,7 @@ func (b *Bridge) start(eq entroq.Client) bool {
 	// one connection are the separate consumers they are -- a gateway serving
 	// many workers would otherwise have them all claiming as one, and doc sets
 	// would stop excluding between them.
-	b.eq = eq.As(fmt.Sprintf("workgateway/%s", eq.GenID()))
+	b.eq = eq.As("workgateway/" + entroq.GenHex16())
 	b.w = b.newWorker(b.eq)
 	return true
 }

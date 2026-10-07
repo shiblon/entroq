@@ -70,8 +70,6 @@ type Reader interface {
 	// ID is the claimant the client behind this reader holds things as. It
 	// records nothing, but it says who the holder would be.
 	ID() string
-	// GenID returns a fresh random ID, for naming a task or doc.
-	GenID() string
 }
 
 // Compile-time proof that the real client is one, so a caller can pass
@@ -114,8 +112,6 @@ func (c *scopedClient) As(claimant string) Client {
 
 // ID is the claimant, which is what this client holds things as.
 func (c *scopedClient) ID() string { return c.claimant }
-
-func (c *scopedClient) GenID() string { return c.eq.GenID() }
 
 // Modify applies a modification as this client's claimant.
 //
