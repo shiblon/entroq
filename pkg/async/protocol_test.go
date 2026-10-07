@@ -22,7 +22,7 @@ func TestHeartbeatTimingUsesThirdOfPeerTimeout(t *testing.T) {
 
 func TestRequestAcknowledgementRejectsApplicationData(t *testing.T) {
 	session := &senderSession{session: "session-1"}
-	_, err := session.handleRequestAck(context.Background(), nil, &worker.TaskRun[Envelope]{
+	_, err := session.handleRequestAck(context.Background(), nil, &worker.Work[Envelope]{
 		Value: Envelope{
 			FrameControl: FrameControl{
 				Session:    "session-1",
@@ -39,7 +39,7 @@ func TestRequestAcknowledgementRejectsApplicationData(t *testing.T) {
 func TestResponseAcknowledgementRejectsApplicationData(t *testing.T) {
 	receiver := &Receiver{}
 	handler := receiver.responseHandler(sessionStart{}, &receiverSessionState{}, newResponseSocket(), func() {})
-	_, err := handler(context.Background(), nil, &worker.TaskRun[Response]{
+	_, err := handler(context.Background(), nil, &worker.Work[Response]{
 		Value: Response{
 			FrameControl: FrameControl{
 				Session:    "session-1",

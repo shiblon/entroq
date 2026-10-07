@@ -438,8 +438,8 @@ func TestSenderCancellationNotifiesLastRequestDataQueue(t *testing.T) {
 
 	workerCtx, stopWorker := context.WithCancel(ctx)
 	var got Envelope
-	w := worker.New(eq, worker.WithDoModify(func(_ context.Context, _ entroq.Reader, tRun *worker.TaskRun[Envelope]) (*worker.Result, error) {
-		task, env := tRun.Task, tRun.Value
+	w := worker.New(eq, worker.WithDoModify(func(_ context.Context, _ entroq.Reader, work *worker.Work[Envelope]) (*worker.Result, error) {
+		task, env := work.Task, work.Value
 		got = env
 		return worker.Modify(task.Delete()).OnSuccess(func(context.Context) error {
 			stopWorker()

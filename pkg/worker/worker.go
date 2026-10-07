@@ -73,7 +73,7 @@ type Handler[T any] interface {
 	// the sets are claimed, so a slow TakeDocs spends the task's first lease. In
 	// natural use, where TakeDocs just returns Take of some ClaimKey sets without
 	// doing I/O, this is negligible.
-	TakeDocs(context.Context, entroq.Reader, *TaskRun[T]) (*TakeResult, error)
+	TakeDocs(context.Context, entroq.Reader, *Work[T]) (*TakeResult, error)
 
 	// DoWork is called by Worker.Run for each claimed task. The task and its
 	// doc sets, empty ones included, are renewed together in the background
@@ -95,17 +95,17 @@ type Handler[T any] interface {
 	// restart are the responsibility of the process orchestrator (e.g.
 	// Kubernetes, systemd). To retry or quarantine the task instead, return a
 	// RetryError or MoveError (see RetryErrorf and MoveErrorf).
-	DoWork(context.Context, entroq.Reader, *TaskRun[T]) error
+	DoWork(context.Context, entroq.Reader, *Work[T]) error
 
 	// Finish is called after DoWork returns nil and renewal has stopped. Its
-	// TaskRun carries the stable (final renewed) task and the doc sets at their
+	// Work carries the stable (final renewed) task and the doc sets at their
 	// final versions. Use it to apply task modifications -- deletion,
 	// requeueing, doc changes. Finish is skipped when DoWork returns a non-nil
 	// error of any kind.
-	Finish(context.Context, entroq.Client, *TaskRun[T]) error
+	Finish(context.Context, entroq.Client, *Work[T]) error
 }
 
-// TaskRun[T] is what a handler phase is told about the task in hand: data, and
+// Work[T] is what a handler phase is told about the task in hand: data, and
 // only data. The behavior a phase needs -- reading state, committing -- arrives
 // as the entroq.Client beside it, which is what keeps this from growing
 // methods and keeps the two separable for a test.
@@ -116,7 +116,7 @@ type Handler[T any] interface {
 //
 // The worker takes its own final task and sets from the renewal handoff rather
 // than from here, so a handler that overwrites a field confuses only itself.
-type TaskRun[T any] struct {
+type Work[T any] struct {
 	// Task is the claimed task, at the version the phase begins with. Under
 	// renewal that version moves, which is why a commit's versions are fixed
 	// by the worker rather than by the handler.
@@ -148,7 +148,7 @@ type MakeHandler[T any] func() (Handler[T], error)
 // it return a MoveError (MoveErrorf). Any other non-nil error causes the worker
 // to exit -- backoff and restart are the responsibility of the process
 // orchestrator.
-type DoModifyRun[T any] func(context.Context, entroq.Reader, *TaskRun[T]) (*Result, error)
+type DoModifyRun[T any] func(context.Context, entroq.Reader, *Work[T]) (*Result, error)
 
 // Result is what a DoModifyRun returns: the modifications the worker applies
 // after work completes, plus optional work to run when the task is handled
@@ -246,7 +246,7 @@ func (r *Result) OnDependency(fn func(context.Context, *entroq.DependencyError) 
 // own claimant and until the task's own arrival time, so the task and its
 // sets expire together; a set someone else holds leaves nothing claimed, and
 // the task is retried with backoff.
-type TakeRun[T any] func(context.Context, entroq.Reader, *TaskRun[T]) (*TakeResult, error)
+type TakeRun[T any] func(context.Context, entroq.Reader, *Work[T]) (*TakeResult, error)
 
 // TakeResult is what a TakeRun returns: the doc sets the worker claims for
 // the task before work begins. Build it with Take.
@@ -267,12 +267,12 @@ func Take(args ...entroq.DocClaimArg) *TakeResult {
 // task, its typed value, and any claimed doc sets, but no client -- it runs under
 // renewal, so it must not modify the claimed task (see Handler.Finish). Return a
 // RetryError/MoveError to retry/move, or any other error to exit.
-type DoRun[T any] func(context.Context, entroq.Reader, *TaskRun[T]) error
+type DoRun[T any] func(context.Context, entroq.Reader, *Work[T]) error
 
 // FinishRun[T] is the WithFinish function shape: the commit phase. It runs after
 // renewal has stopped and is handed its client, so committing the (now stable)
 // task is safe. It receives the same value and doc sets as DoRun.
-type FinishRun[T any] func(context.Context, entroq.Client, *TaskRun[T]) error
+type FinishRun[T any] func(context.Context, entroq.Client, *Work[T]) error
 
 // funcHandler[T] is a Handler[T] backed by plain functions.
 type funcHandler[T any] struct {
@@ -282,7 +282,7 @@ type funcHandler[T any] struct {
 }
 
 // TakeDocs runs the specified take function if set, otherwise returns nil.
-func (h *funcHandler[T]) TakeDocs(ctx context.Context, eqc entroq.Reader, r *TaskRun[T]) (*TakeResult, error) {
+func (h *funcHandler[T]) TakeDocs(ctx context.Context, eqc entroq.Reader, r *Work[T]) (*TakeResult, error) {
 	if h.take == nil {
 		return nil, nil
 	}
@@ -290,7 +290,7 @@ func (h *funcHandler[T]) TakeDocs(ctx context.Context, eqc entroq.Reader, r *Tas
 }
 
 // DoWork runs the specified "do" function.
-func (h *funcHandler[T]) DoWork(ctx context.Context, eqc entroq.Reader, r *TaskRun[T]) error {
+func (h *funcHandler[T]) DoWork(ctx context.Context, eqc entroq.Reader, r *Work[T]) error {
 	if h.do == nil {
 		return FatalErrorf("no work function specified")
 	}
@@ -298,7 +298,7 @@ func (h *funcHandler[T]) DoWork(ctx context.Context, eqc entroq.Reader, r *TaskR
 }
 
 // Finish runs the specified "finish" function if it has been defined.
-func (h *funcHandler[T]) Finish(ctx context.Context, eqc entroq.Client, r *TaskRun[T]) error {
+func (h *funcHandler[T]) Finish(ctx context.Context, eqc entroq.Client, r *Work[T]) error {
 	if h.finish == nil {
 		return nil
 	}
@@ -322,7 +322,7 @@ type doModifyHandler[T any] struct {
 	released    bool // the commit only made the task arrive
 }
 
-func (h *doModifyHandler[T]) TakeDocs(ctx context.Context, eqc entroq.Reader, r *TaskRun[T]) (*TakeResult, error) {
+func (h *doModifyHandler[T]) TakeDocs(ctx context.Context, eqc entroq.Reader, r *Work[T]) (*TakeResult, error) {
 	h.initialTask = r.Task
 	if h.take == nil {
 		return nil, nil
@@ -330,7 +330,7 @@ func (h *doModifyHandler[T]) TakeDocs(ctx context.Context, eqc entroq.Reader, r 
 	return h.take(ctx, eqc, r)
 }
 
-func (h *doModifyHandler[T]) DoWork(ctx context.Context, eqc entroq.Reader, r *TaskRun[T]) error {
+func (h *doModifyHandler[T]) DoWork(ctx context.Context, eqc entroq.Reader, r *Work[T]) error {
 	if h.doModify == nil {
 		return FatalErrorf("no work function specified")
 	}
@@ -342,7 +342,7 @@ func (h *doModifyHandler[T]) DoWork(ctx context.Context, eqc entroq.Reader, r *T
 	return nil
 }
 
-func (h *doModifyHandler[T]) Finish(ctx context.Context, eqc entroq.Client, r *TaskRun[T]) error {
+func (h *doModifyHandler[T]) Finish(ctx context.Context, eqc entroq.Client, r *Work[T]) error {
 	finalTask, finalSets := r.Task, r.Sets
 	// initialTask is set unconditionally by TakeDocs, which always runs before
 	// Finish, so it is non-nil here by construction.
@@ -988,11 +988,11 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 	// Phase 2: Acquire docs before renewal starts. Doc claims are sorted by
 	// (namespace, key) to prevent dining-philosopher livelock when multiple
 	// doc sets are acquired.
-	// One TaskRun for the whole task, so a phase sees what the last one left:
+	// One Work for the whole task, so a phase sees what the last one left:
 	// Sets is filled in after the claim, and the renewal handoff replaces both
 	// the task and the sets before the commit phase.
-	tRun := &TaskRun[T]{Task: task, Value: value}
-	tr, err := handler.TakeDocs(rCtx, run.eqc, tRun)
+	work := &Work[T]{Task: task, Value: value}
+	tr, err := handler.TakeDocs(rCtx, run.eqc, work)
 	if err != nil {
 		// A sentinel acts on the task as it does from DoWork; nothing is
 		// claimed yet.
@@ -1061,8 +1061,8 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 				final := stop()
 				finalTask, finalSets = final.task, final.sets
 			}()
-			tRun.Sets = sets
-			if err := handler.DoWork(ctx, run.eqc, tRun); err != nil {
+			work.Sets = sets
+			if err := handler.DoWork(ctx, run.eqc, work); err != nil {
 				if !isSentinelError(err) {
 					workErr = err
 					return fmt.Errorf("task do: %w", err)
@@ -1129,8 +1129,8 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 	}
 
 	// Phase 4: Finish with stable versions — renewal has stopped.
-	tRun.Task, tRun.Sets = finalTask, finalSets
-	if err := handler.Finish(ctx, run.eqc, tRun); err != nil {
+	work.Task, work.Sets = finalTask, finalSets
+	if err := handler.Finish(ctx, run.eqc, work); err != nil {
 		// A post-commit hook (OnDependency) may return a Retry/Move/Fatal
 		// sentinel; route it through the same machinery as a work-phase sentinel
 		// before falling back to the default dependency reclaim.

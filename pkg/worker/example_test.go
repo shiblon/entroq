@@ -34,8 +34,8 @@ func Example_simpleWorker() {
 	done := make(chan struct{})
 
 	w := worker.New[json.RawMessage](eq,
-		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, tRun *worker.TaskRun[json.RawMessage]) (*worker.Result, error) {
-			task, value := tRun.Task, tRun.Value
+		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, work *worker.Work[json.RawMessage]) (*worker.Result, error) {
+			task, value := work.Task, work.Value
 			fmt.Printf("processing task with value %s\n", value)
 			// Return the modifications to apply atomically after work completes.
 			return worker.Modify(task.Delete()), nil
@@ -107,13 +107,13 @@ func Example_workerWithDocs() {
 	done := make(chan struct{})
 
 	w := worker.New[jobValue](eq,
-		worker.WithTakeDocs(func(_ context.Context, _ entroq.Reader, tRun *worker.TaskRun[jobValue]) (*worker.TakeResult, error) {
-			val := tRun.Value
+		worker.WithTakeDocs(func(_ context.Context, _ entroq.Reader, work *worker.Work[jobValue]) (*worker.TakeResult, error) {
+			val := work.Value
 			// Declare which doc sets to claim before work begins.
 			return worker.Take(entroq.ClaimKey(val.NS, val.Key)), nil
 		}),
-		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, tRun *worker.TaskRun[jobValue]) (*worker.Result, error) {
-			task, sets := tRun.Task, tRun.Sets
+		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, work *worker.Work[jobValue]) (*worker.Result, error) {
+			task, sets := work.Task, work.Sets
 			// One claim, one set; its docs are sorted by secondary key.
 			docs := sets[0].Docs
 			for _, d := range docs {

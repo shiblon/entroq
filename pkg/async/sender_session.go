@@ -166,8 +166,8 @@ func (s *senderSession) runRequestWorkers(ctx context.Context) error {
 	}
 }
 
-func (s *senderSession) handleRequestAck(ctx context.Context, _ entroq.Reader, tRun *worker.TaskRun[Envelope]) (*worker.Result, error) {
-	task, ack := tRun.Task, tRun.Value
+func (s *senderSession) handleRequestAck(ctx context.Context, _ entroq.Reader, work *worker.Work[Envelope]) (*worker.Result, error) {
+	task, ack := work.Task, work.Value
 	if ack.Session != s.session {
 		return nil, worker.FatalErrorf("request ACK session mismatch: got %q, want %q", ack.Session, s.session)
 	}
@@ -294,8 +294,8 @@ func (s *senderSession) runResponseWorkers(ctx context.Context) error {
 	}
 }
 
-func (s *senderSession) handleResponse(ctx context.Context, _ entroq.Reader, tRun *worker.TaskRun[Response]) (*worker.Result, error) {
-	task, resp := tRun.Task, tRun.Value
+func (s *senderSession) handleResponse(ctx context.Context, _ entroq.Reader, work *worker.Work[Response]) (*worker.Result, error) {
+	task, resp := work.Task, work.Value
 	if resp.Session != s.session {
 		return nil, worker.FatalErrorf("response session mismatch: got %q, want %q", resp.Session, s.session)
 	}

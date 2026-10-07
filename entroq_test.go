@@ -51,8 +51,8 @@ func Example() {
 	w := worker.New(eq,
 		// Workers claim a task and pass it to your handler functions. In the
 		// background, the task's lease is renewed while the first function runs.
-		worker.WithDoWork(func(ctx context.Context, _ entroq.Reader, tRun *worker.TaskRun[string]) error {
-			v := tRun.Value
+		worker.WithDoWork(func(ctx context.Context, _ entroq.Reader, work *worker.Work[string]) error {
+			v := work.Value
 			fmt.Printf("Worker handling task %q\n", v)
 			// Do work with it here.
 			return nil
@@ -60,9 +60,9 @@ func Example() {
 		// When ready to commit changes to the task (including deletion), the second
 		// function passes the version-stable task after the renewer is stopped,
 		// making it safe to use it in modification transactions.
-		worker.WithFinish(func(ctx context.Context, eqc entroq.Client, tRun *worker.TaskRun[string]) error {
+		worker.WithFinish(func(ctx context.Context, eqc entroq.Client, work *worker.Work[string]) error {
 			mod := eqc
-			final, v := tRun.Task, tRun.Value
+			final, v := work.Task, work.Value
 			fmt.Printf("Deleting task %q\n", v)
 			_, err := mod.Modify(ctx, final.Delete())
 			if err != nil {
@@ -110,7 +110,7 @@ func Example_dependencies() {
 	var config *entroq.Task
 
 	w := worker.New(eq,
-		worker.WithDoWork(func(ctx context.Context, _ entroq.Reader, tRun *worker.TaskRun[json.RawMessage]) error {
+		worker.WithDoWork(func(ctx context.Context, _ entroq.Reader, work *worker.Work[json.RawMessage]) error {
 			if config == nil {
 				tasks, err := eq.Tasks(ctx, "config")
 				if err != nil || len(tasks) == 0 {
@@ -121,9 +121,9 @@ func Example_dependencies() {
 			// ... do work with initial and config ...
 			return nil
 		}),
-		worker.WithFinish(func(ctx context.Context, eqc entroq.Client, tRun *worker.TaskRun[json.RawMessage]) error {
+		worker.WithFinish(func(ctx context.Context, eqc entroq.Client, work *worker.Work[json.RawMessage]) error {
 			mod := eqc
-			final := tRun.Task
+			final := work.Task
 			if config == nil {
 				return fmt.Errorf("config missing during finalize")
 			}

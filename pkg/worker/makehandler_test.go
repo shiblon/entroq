@@ -21,18 +21,18 @@ type countingHandler struct {
 	uses     int
 }
 
-func (h *countingHandler) TakeDocs(context.Context, entroq.Reader, *TaskRun[string]) (*TakeResult, error) {
+func (h *countingHandler) TakeDocs(context.Context, entroq.Reader, *Work[string]) (*TakeResult, error) {
 	return nil, nil
 }
 
-func (h *countingHandler) DoWork(ctx context.Context, _ entroq.Reader, tRun *TaskRun[string]) error {
+func (h *countingHandler) DoWork(ctx context.Context, _ entroq.Reader, work *Work[string]) error {
 	h.uses++
 	h.observed <- h.uses
 	return nil
 }
 
-func (h *countingHandler) Finish(ctx context.Context, eqc entroq.Client, tRun *TaskRun[string]) error {
-	_, err := eqc.Modify(ctx, tRun.Task.Delete())
+func (h *countingHandler) Finish(ctx context.Context, eqc entroq.Client, work *Work[string]) error {
+	_, err := eqc.Modify(ctx, work.Task.Delete())
 	return err
 }
 

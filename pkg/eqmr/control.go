@@ -23,8 +23,8 @@ import (
 func (c *Controller) ControlWorker() *worker.Worker[controlState] {
 	return worker.New[controlState](c.client,
 		worker.WithErrQMap[controlState](c.errQMap),
-		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, tRun *worker.TaskRun[controlState]) (*worker.Result, error) {
-			task, state := tRun.Task, tRun.Value
+		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, work *worker.Work[controlState]) (*worker.Result, error) {
+			task, state := work.Task, work.Value
 			// Check the barrier FIRST, and pace only when it did not move.
 			// Sleeping before looking would add a full ControlInterval to every
 			// phase, since a phase that is already complete would still wait out

@@ -50,11 +50,11 @@ func TestConcurrentRunsHoldSetsApart(t *testing.T) {
 	release := make(chan struct{})
 
 	w := New[string](client,
-		WithTakeDocs[string](func(ctx context.Context, _ entroq.Reader, tRun *TaskRun[string]) (*TakeResult, error) {
+		WithTakeDocs[string](func(ctx context.Context, _ entroq.Reader, work *Work[string]) (*TakeResult, error) {
 			return Take(entroq.ClaimKey(ns, key)), nil
 		}),
-		WithDoModify[string](func(ctx context.Context, _ entroq.Reader, tRun *TaskRun[string]) (*Result, error) {
-			task, sets := tRun.Task, tRun.Sets
+		WithDoModify[string](func(ctx context.Context, _ entroq.Reader, work *Work[string]) (*Result, error) {
+			task, sets := work.Task, work.Sets
 			mu.Lock()
 			for _, g := range sets {
 				holders[g.Claimant]++
@@ -134,8 +134,8 @@ func TestRunClaimantDefaultsToItsConnectionAndSequence(t *testing.T) {
 
 	seen := make(chan string, 1)
 	w := New[string](client, WithDoModify[string](
-		func(ctx context.Context, _ entroq.Reader, tRun *TaskRun[string]) (*Result, error) {
-			task := tRun.Task
+		func(ctx context.Context, _ entroq.Reader, work *Work[string]) (*Result, error) {
+			task := work.Task
 			seen <- task.Claimant
 			return Modify(task.Delete()), nil
 		}))
