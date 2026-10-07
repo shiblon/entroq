@@ -1392,7 +1392,7 @@ func (w *Worker[T]) Run(ctx context.Context, opts ...RunOption) error {
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	run := &activeRun{cancel: cancel, eqc: w.scope(ro.claimant)}
+	run := &activeRun{cancel: cancel, eqc: w.newClient(ro.claimant)}
 	if err := w.join(run); err != nil {
 		return err
 	}
@@ -1414,14 +1414,10 @@ func (w *Worker[T]) Run(ctx context.Context, opts ...RunOption) error {
 	}
 }
 
-// scope returns the consumer one Run holds everything as: the connection
-// scoped to claimant, or to a name of this worker's making when claimant is
-// empty.
-//
-// The default is derived rather than random so it reads as what it is -- one
-// consumer of a known connection -- and stays put for the Run's life. The
-// counter runs under mu, which already serializes Run's bookkeeping.
-func (w *Worker[T]) scope(claimant string) entroq.Client {
+// newClient returns a view on the "real" EntroQ client that operates with a
+// new claimant ID so it's safe to use in a Run function without colliding with
+// other Runs on the same worker.
+func (w *Worker[T]) newClient(claimant string) entroq.Client {
 	if claimant == "" {
 		w.mu.Lock()
 		w.runSeq++
