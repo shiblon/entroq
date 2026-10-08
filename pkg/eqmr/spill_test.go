@@ -24,22 +24,14 @@ func TestSpilledIntermediateRunsPreserveResults(t *testing.T) {
 			if err != nil {
 				t.Fatalf("new controller: %v", err)
 			}
-			if err := ctrl.Run(ctx, input, eqmr.WordCountMapper, eqmr.SumReducer, eqmr.RunOptions{
-				Mappers:              2,
-				Reducers:             2,
-				Combiner:             combiner,
-				IntermediateRunBytes: 512,
-			}); err != nil {
-				t.Fatalf("run: %v", err)
+			if err := ctrl.Setup(ctx, input); err != nil {
+				t.Fatalf("setup: %v", err)
 			}
-
-			results, err := ctrl.Results(ctx)
-			if err != nil {
-				t.Fatalf("results: %v", err)
+			opts := []eqmr.MapperOption{eqmr.WithIntermediateRunBytes(512)}
+			if combiner != nil {
+				opts = append(opts, eqmr.WithCombiner(combiner))
 			}
-			if err := eqmrtest.VerifyHistogram(results, histogram); err != nil {
-				t.Fatal(err)
-			}
+			mapOnly(ctx, t, eq, ctrl, opts...)
 
 			runs, err := eq.Docs(ctx, &entroq.DocQuery{
 				Namespace:  ctrl.DocNS(),
@@ -51,8 +43,26 @@ func TestSpilledIntermediateRunsPreserveResults(t *testing.T) {
 				t.Fatalf("list intermediate runs: %v", err)
 			}
 			if len(runs) <= ctrl.Config().MapShards {
-				t.Errorf("got %d durable runs, want more than %d to prove spilling occurred", len(runs), ctrl.Config().MapShards)
+				t.Errorf("got %d durable run chunks, want more than %d to prove spilling occurred", len(runs), ctrl.Config().MapShards)
 			}
+
+			runCtx, stop := context.WithCancel(ctx)
+			defer stop()
+			go func() { _ = ctrl.RunController(runCtx) }()
+			for range 2 {
+				go func() { _ = ctrl.RunReducer(runCtx, eqmr.SumReducer) }()
+			}
+			if err := ctrl.Wait(runCtx); err != nil {
+				t.Fatalf("wait: %v", err)
+			}
+			results, err := ctrl.Results(ctx)
+			if err != nil {
+				t.Fatalf("results: %v", err)
+			}
+			if err := eqmrtest.VerifyHistogram(results, histogram); err != nil {
+				t.Fatal(err)
+			}
+			requireCollected(ctx, t, eq, ctrl)
 		})
 	}
 }

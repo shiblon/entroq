@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/backend/eqmem"
@@ -13,17 +14,17 @@ import (
 )
 
 func TestStoreDescriptorValidate(t *testing.T) {
-	good := storeDescriptor{Name: "scratch", Driver: "fs/1", Identity: "host-a:/var/eqmr"}
+	good := Descriptor{Name: "scratch", Driver: "fs/1", Identity: "host-a:/var/eqmr"}
 	if err := good.validate(); err != nil {
 		t.Fatalf("valid descriptor rejected: %v", err)
 	}
-	cases := map[string]storeDescriptor{
+	cases := map[string]Descriptor{
 		"no name":     {Driver: "fs/1", Identity: "x"},
 		"no driver":   {Name: "scratch", Identity: "x"},
 		"no identity": {Name: "scratch", Driver: "fs/1"},
 		"NUL":         {Name: "scr\x00atch", Driver: "fs/1", Identity: "x"},
 		"invalid":     {Name: "scratch", Driver: "fs/1", Identity: "\xff"},
-		"too long":    {Name: "scratch", Driver: "fs/1", Identity: strings.Repeat("x", maxStoreDescriptorFieldBytes+1)},
+		"too long":    {Name: "scratch", Driver: "fs/1", Identity: strings.Repeat("x", maxDescriptorFieldBytes+1)},
 	}
 	for name, d := range cases {
 		if err := d.validate(); err == nil {
@@ -35,13 +36,13 @@ func TestStoreDescriptorValidate(t *testing.T) {
 // describedStore is a testRunStore with a chosen descriptor.
 type describedStore struct {
 	testRunStore
-	desc storeDescriptor
+	desc Descriptor
 }
 
-func (s *describedStore) descriptor() storeDescriptor { return s.desc }
+func (s *describedStore) descriptor() Descriptor { return s.desc }
 
 func TestIntermediateStoresResolve(t *testing.T) {
-	here := &describedStore{desc: storeDescriptor{Name: "scratch", Driver: "fs/1", Identity: "host-a"}}
+	here := &describedStore{desc: Descriptor{Name: "scratch", Driver: "fs/1", Identity: "host-a"}}
 	stores, err := newIntermediateStores(here)
 	if err != nil {
 		t.Fatalf("new stores: %v", err)
@@ -51,7 +52,7 @@ func TestIntermediateStoresResolve(t *testing.T) {
 	if err != nil || got != here {
 		t.Fatalf("resolve exact descriptor: got %v, %v", got, err)
 	}
-	for name, d := range map[string]storeDescriptor{
+	for name, d := range map[string]Descriptor{
 		"unknown name":   {Name: "other", Driver: "fs/1", Identity: "host-a"},
 		"other identity": {Name: "scratch", Driver: "fs/1", Identity: "host-b"},
 		"other driver":   {Name: "scratch", Driver: "fs/2", Identity: "host-a"},
@@ -64,15 +65,15 @@ func TestIntermediateStoresResolve(t *testing.T) {
 	if _, err := newIntermediateStores(here, &describedStore{desc: here.desc}); err == nil {
 		t.Error("duplicate store name accepted")
 	}
-	if _, err := newIntermediateStores(&describedStore{desc: storeDescriptor{Name: "bare"}}); err == nil {
+	if _, err := newIntermediateStores(&describedStore{desc: Descriptor{Name: "bare"}}); err == nil {
 		t.Error("invalid store descriptor accepted")
 	}
 }
 
 func TestOpenMergedRejectsForeignStore(t *testing.T) {
 	ctx := context.Background()
-	store := &describedStore{desc: storeDescriptor{Name: "scratch", Driver: "fs/1", Identity: "host-a"}}
-	ref, err := store.put(ctx, []intermediateRecord{{Primary: "k", Value: "v"}})
+	store := &describedStore{desc: Descriptor{Name: "scratch", Driver: "fs/1", Identity: "host-a"}}
+	ref, err := store.put(ctx, "/descriptor-test", []intermediateRecord{{Primary: "k", Value: "v"}})
 	if err != nil {
 		t.Fatalf("put: %v", err)
 	}
@@ -133,28 +134,37 @@ func runOneMapper(ctx context.Context, ctrl *Controller) error {
 		worker.Watching(ctrl.MapQ()), worker.WithLease(10*time.Second))
 }
 
-func TestMapperExitsOnUnreachableStore(t *testing.T) {
-	ctx := context.Background()
+// TestUnreachableStoreFailsRun pins what happens when a mapper cannot reach
+// the store its run names: the run cannot be completed as deployed, so the
+// task is consumed and the run fails with a reason naming the store, for its
+// submitter to fix and submit again.
+func TestUnreachableStoreFailsRun(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
 	eq, ctrl := newDescriptorTestRun(ctx, t)
 	rewriteMapTask(ctx, t, eq, ctrl, func(ref *docRef) { ref.Store.Identity = "/some/other/run" })
 
-	err := runOneMapper(ctx, ctrl)
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go func() { _ = ctrl.RunController(runCtx) }()
+	go func() { _ = ctrl.RunMapper(runCtx, WordCountMapper) }()
+
+	err := ctrl.Wait(ctx)
 	if err == nil || !strings.Contains(err.Error(), "/some/other/run") {
-		t.Fatalf("mapper on an unreachable store: got %v, want an exit naming the store", err)
+		t.Fatalf("run on an unreachable store: got %v, want a failure naming the store", err)
 	}
-	// The task is left for a worker that can reach the store, not quarantined.
-	if quarantined, err := eq.Tasks(ctx, ctrl.ErrQ()); err != nil || len(quarantined) != 0 {
-		t.Fatalf("error queue: got %d tasks, %v; want none", len(quarantined), err)
+	if left, err := eq.Tasks(ctx, ctrl.MapQ()); err != nil || len(left) != 0 {
+		t.Fatalf("map queue: got %d tasks, %v; want the task consumed", len(left), err)
 	}
-	if left, err := eq.Tasks(ctx, ctrl.MapQ()); err != nil || len(left) != 1 {
-		t.Fatalf("map queue: got %d tasks, %v; want the task left in place", len(left), err)
+	if kept, err := eq.Tasks(ctx, ctrl.QuarantineQ()); err != nil || len(kept) != 1 {
+		t.Fatalf("quarantine queue: got %d tasks, %v; want the failed task kept", len(kept), err)
 	}
 }
 
 func TestMapperQuarantinesTaskWithoutStore(t *testing.T) {
 	ctx := context.Background()
 	eq, ctrl := newDescriptorTestRun(ctx, t)
-	rewriteMapTask(ctx, t, eq, ctrl, func(ref *docRef) { ref.Store = storeDescriptor{} })
+	rewriteMapTask(ctx, t, eq, ctrl, func(ref *docRef) { ref.Store = Descriptor{} })
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -163,7 +173,7 @@ func TestMapperQuarantinesTaskWithoutStore(t *testing.T) {
 
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		quarantined, err := eq.Tasks(ctx, ctrl.ErrQ())
+		quarantined, err := eq.Tasks(ctx, ctrl.MapQ()+errQSuffix)
 		if err != nil {
 			t.Fatalf("list error queue: %v", err)
 		}
@@ -178,5 +188,40 @@ func TestMapperQuarantinesTaskWithoutStore(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil && runCtx.Err() == nil {
 		t.Fatalf("mapper: %v", err)
+	}
+}
+
+func TestFitTextKeepsLongNamesReadable(t *testing.T) {
+	short := "/wordcount/run-1"
+	if got := fitText(short, 64); got != short {
+		t.Errorf("short name changed to %q", got)
+	}
+	a := "/jobs/" + strings.Repeat("a", 300) + "/run-1"
+	b := "/jobs/" + strings.Repeat("a", 299) + "b/run-1"
+	fa, fb := fitText(a, 64), fitText(b, 64)
+	for _, f := range []string{fa, fb} {
+		if len(f) > 64 || !strings.HasPrefix(f, "/jobs/") || !strings.HasSuffix(f, "/run-1") {
+			t.Errorf("fitted %q: want at most 64 bytes keeping head and tail", f)
+		}
+	}
+	if fa == fb {
+		t.Errorf("distinct long names fitted to the same %q", fa)
+	}
+	multi := strings.Repeat("雪", 100)
+	if f := fitText(multi, 64); len(f) > 64 || !utf8.ValidString(f) {
+		t.Errorf("fitted multibyte name %q is %d bytes or invalid UTF-8", f, len(f))
+	}
+}
+
+func TestLongPrefixMakesAValidRun(t *testing.T) {
+	ctx := context.Background()
+	eq, err := entroq.New(ctx, eqmem.Opener())
+	if err != nil {
+		t.Fatalf("open client: %v", err)
+	}
+	defer eq.Close()
+	prefix := "/" + strings.Repeat("p", MaxNamespaceBytes-1)
+	if _, err := New(eq, prefix); err != nil {
+		t.Fatalf("New with a %d-byte prefix: %v", len(prefix), err)
 	}
 }

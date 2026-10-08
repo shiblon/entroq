@@ -13,11 +13,11 @@ import (
 )
 
 type objectIntermediateStore struct {
-	desc    storeDescriptor
+	desc    Descriptor
 	objects objectStore
 }
 
-func newObjectIntermediateStore(desc storeDescriptor, objects objectStore) (*objectIntermediateStore, error) {
+func newObjectIntermediateStore(desc Descriptor, objects objectStore) (*objectIntermediateStore, error) {
 	if err := desc.validate(); err != nil {
 		return nil, fmt.Errorf("eqmr intermediate object store: %w", err)
 	}
@@ -27,14 +27,14 @@ func newObjectIntermediateStore(desc storeDescriptor, objects objectStore) (*obj
 	return &objectIntermediateStore{desc: desc, objects: objects}, nil
 }
 
-func (s *objectIntermediateStore) descriptor() storeDescriptor { return s.desc }
+func (s *objectIntermediateStore) descriptor() Descriptor { return s.desc }
 
 type objectIntermediateRunRef struct {
 	Object  json.RawMessage `json:"object"`
 	Records int             `json:"records"`
 }
 
-func (s *objectIntermediateStore) put(ctx context.Context, records []intermediateRecord) (json.RawMessage, error) {
+func (s *objectIntermediateStore) put(ctx context.Context, run string, records []intermediateRecord) (json.RawMessage, error) {
 	if len(records) == 0 {
 		return nil, fmt.Errorf("put object run: no records")
 	}
@@ -48,7 +48,7 @@ func (s *objectIntermediateStore) put(ctx context.Context, records []intermediat
 		encoded <- err
 	}()
 
-	objectRef, putErr := s.objects.put(ctx, objectID, reader)
+	objectRef, putErr := s.objects.put(ctx, run, objectID, reader)
 	_ = reader.CloseWithError(putErr)
 	encodeErr := <-encoded
 	if encodeErr != nil {
@@ -101,6 +101,13 @@ func (s *objectIntermediateStore) delete(ctx context.Context, raw json.RawMessag
 	}
 	if err := s.objects.delete(ctx, ref.Object); err != nil {
 		return fmt.Errorf("delete object run: %w", err)
+	}
+	return nil
+}
+
+func (s *objectIntermediateStore) sweep(ctx context.Context, run string) error {
+	if err := s.objects.sweep(ctx, run); err != nil {
+		return fmt.Errorf("sweep object runs: %w", err)
 	}
 	return nil
 }

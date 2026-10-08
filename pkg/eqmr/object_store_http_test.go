@@ -33,7 +33,7 @@ func TestHTTPObjectStoreLifecycle(t *testing.T) {
 	}
 
 	content := "a streamed immutable run"
-	ref, err := store.put(ctx, "run-000001", struct{ io.Reader }{strings.NewReader(content)})
+	ref, err := store.put(ctx, "/http-test", "run-000001", struct{ io.Reader }{strings.NewReader(content)})
 	if err != nil {
 		t.Fatalf("put: %v", err)
 	}
@@ -46,7 +46,7 @@ func TestHTTPObjectStoreLifecycle(t *testing.T) {
 	}
 
 	// Repeating the same PUT is an idempotent success and returns the same ref.
-	retryRef, err := store.put(ctx, "run-000001", strings.NewReader(content))
+	retryRef, err := store.put(ctx, "/http-test", "run-000001", strings.NewReader(content))
 	if err != nil {
 		t.Fatalf("repeat put: %v", err)
 	}
@@ -93,10 +93,10 @@ func TestHTTPObjectStoreRejectsConflictingPut(t *testing.T) {
 		t.Fatalf("new store: %v", err)
 	}
 
-	if _, err := store.put(context.Background(), "same-id", strings.NewReader("first")); err != nil {
+	if _, err := store.put(context.Background(), "/http-test", "same-id", strings.NewReader("first")); err != nil {
 		t.Fatalf("first put: %v", err)
 	}
-	_, err = store.put(context.Background(), "same-id", strings.NewReader("different"))
+	_, err = store.put(context.Background(), "/http-test", "same-id", strings.NewReader("different"))
 	var httpErr *httpObjectStoreError
 	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusConflict || httpErr.Retryable() {
 		t.Fatalf("conflicting put error = %v", err)
@@ -131,11 +131,12 @@ type testHTTPObjectDriver struct {
 	t             *testing.T
 	mu            sync.Mutex
 	objects       map[string][]byte
+	runs          map[string]string // object ID -> run that put it
 	sawChunkedPut bool
 }
 
 func newTestHTTPObjectDriver(t *testing.T) *testHTTPObjectDriver {
-	return &testHTTPObjectDriver{t: t, objects: make(map[string][]byte)}
+	return &testHTTPObjectDriver{t: t, objects: make(map[string][]byte), runs: make(map[string]string)}
 }
 
 func (d *testHTTPObjectDriver) sawChunked() bool {
@@ -161,6 +162,9 @@ func (d *testHTTPObjectDriver) ServeHTTP(w http.ResponseWriter, r *http.Request)
 
 	case r.Method == http.MethodPost && r.URL.Path == httpObjectStoreDeletePath:
 		d.delete(w, r)
+
+	case r.Method == http.MethodPost && r.URL.Path == httpObjectStoreSweepPath:
+		d.sweep(w, r)
 
 	default:
 		writeTestJSON(d.t, w, http.StatusNotFound, map[string]string{"code": "not_found", "message": "unknown operation"})
@@ -189,7 +193,27 @@ func (d *testHTTPObjectDriver) put(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	d.objects[id] = append([]byte(nil), b...)
+	d.runs[id] = r.URL.Query().Get("run")
 	writeTestJSON(d.t, w, http.StatusCreated, map[string]any{"ref": map[string]string{"object_id": id}})
+}
+
+func (d *testHTTPObjectDriver) sweep(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Run string `json:"run"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeTestJSON(d.t, w, http.StatusBadRequest, map[string]string{"code": "bad_request", "message": err.Error()})
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for id, run := range d.runs {
+		if run == req.Run {
+			delete(d.objects, id)
+			delete(d.runs, id)
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (d *testHTTPObjectDriver) open(w http.ResponseWriter, r *http.Request) {
@@ -241,5 +265,42 @@ func writeTestJSON(t *testing.T, w http.ResponseWriter, status int, value any) {
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(value); err != nil {
 		t.Errorf("encode response: %v", err)
+	}
+}
+
+// TestHTTPObjectStoreSweepsOneRun pins that put names its run and sweep tells
+// the driver a run has ended: the driver drops that run's objects, however it
+// keeps them, and leaves every other run's alone.
+func TestHTTPObjectStoreSweepsOneRun(t *testing.T) {
+	ctx := context.Background()
+	driver := newTestHTTPObjectDriver(t)
+	server := httptest.NewServer(driver)
+	t.Cleanup(server.Close)
+	store, err := newHTTPObjectStore(server.Client(), server.URL)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	gone, err := store.put(ctx, "/run/ended", "obj-1", strings.NewReader("x"))
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	kept, err := store.put(ctx, "/run/live", "obj-2", strings.NewReader("y"))
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	for i := range 2 {
+		if err := store.sweep(ctx, "/run/ended"); err != nil {
+			t.Fatalf("sweep %d: %v", i, err)
+		}
+	}
+	if _, err := store.open(ctx, gone); err == nil {
+		t.Error("swept run's object survived")
+	}
+	r, err := store.open(ctx, kept)
+	if err != nil {
+		t.Fatalf("another run's object was swept: %v", err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("close: %v", err)
 	}
 }

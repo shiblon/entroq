@@ -8,17 +8,30 @@
 // A run has three roles, each of which may be its own process or pod, and each
 // with its own scaling property:
 //
-//   - Mappers (RunMapper) claim one input split, run the Mapper over every pair
-//     in it, optionally apply a Combiner, assign each emitted key to a
-//     partition, and write bounded immutable runs plus map-output pointers.
-//     Scale them freely.
+//   - Mappers (RunMapper) claim one map task, run the Mapper over every pair
+//     in its split, optionally apply a Combiner, assign each emitted key to a
+//     partition, write bounded immutable runs, and commit a finish task naming
+//     them. Scale them freely.
 //   - Reducers (RunReducer) open every published run for one partition, merge
-//     their record streams by key, run the Reducer once per key, and write the
-//     partition's result. There is one unit per partition, so scale to the
-//     partition count.
-//   - Controllers (RunController) drive the phase machine. The control queue
-//     holds exactly one task, so a claim makes exactly one controller act at a
-//     time; run as many replicas as you like for failover.
+//     their record streams by key, run the Reducer once per key, stream each
+//     result into a staged attempt at the run's Sink, and commit a finish task
+//     naming the attempt. There is one unit per partition with data, so scale
+//     to the partition count.
+//   - Controllers (RunController) are a set of workers reacting to finish
+//     tasks. They alone write run state: they accept the first finish for each
+//     unit, publish its runs or commit its output, collect what losers and
+//     consumed partitions leave behind, tell the Sink when the output is
+//     complete, sweep a run once it has ended, and judge quarantined tasks.
+//     Run as many replicas as you like.
+//
+// # Output
+//
+// Output goes to a Sink, which owns its format, naming, and readiness. The run
+// only hands it values: a reducer stages an attempt at a partition, the
+// controller commits exactly one attempt per partition, and when every
+// partition is committed the controller calls Sink.Finish before the run is
+// done. Without WithSink, output goes to the run's own document sink, meant
+// for small jobs, which Results reads back.
 //
 // # Getting started
 //
@@ -49,21 +62,31 @@
 //
 // # Completion
 //
-// Each mapper makes its immutable runs durable, then deletes its input document
-// in the same Modify that publishes their pointer documents. No split documents
-// remain exactly when every map output is durable and reachable. Every reduce
-// partition writes a result, empty ones included, so counting results measures
-// the reduce phase. Progress reports both; no queue is consulted to decide
-// completion.
+// Workers never write documents. Each commits a finish task in the same Modify
+// that deletes its own task, so a finish exists exactly when the work it
+// describes is done. A controller worker accepts the first finish for each
+// unit while holding a claim on that unit's input alone, deleting the input in
+// the Modify that records the acceptance, so acceptances of different units
+// never wait on one another.
+//
+// That Modify also commits a check task. A check reads, cheaply and without a
+// claim, whether its phase's inputs are all gone; usually they are not, and it
+// simply retires. One that finds them gone claims the run's state doc, checks
+// again under the claim, and moves the run on: to the reduce phase, fanning
+// out a reduce task per partition that received data, or to done. Because each
+// check is created by the commit it follows, the check committed by whichever
+// acceptance is truly last is certain to see its phase complete, and the run
+// as a whole is serialized only at phase boundaries.
 //
 // # Text
 //
 // Keys and values are strings, and must be valid UTF-8 with no NUL. Content is
 // JSONB in PostgreSQL, which rejects NUL, and a JSON string cannot represent
-// invalid UTF-8. ValidateText states the rule, and Setup and every emit apply
-// it, so a violation fails where it was produced. Encode binary keys in the job
-// that needs them. Document keys are readable text: "split/000007",
-// "run/<timestamp>-<nonce>/000000", "mapout/000003", "result/000003".
+// invalid UTF-8. ValidateText states the rule, and Setup, every emit, every
+// combine, and the document sink apply it, so a violation fails where it was
+// produced. Encode binary keys in the job that needs them. Document keys are
+// readable text: "state", "split/000007", "mapout/000003", "result/000003",
+// and, for the document store and sink, "run/..." and "output/...".
 package eqmr
 
 import (
@@ -93,9 +116,7 @@ const (
 // counts are deliberately absent: they change the on-doc layout and cannot be
 // altered once a run has started, so they must always be stated.
 const (
-	DefaultLease           = 30 * time.Second
-	DefaultControlInterval = time.Second
-	DefaultStallTimeout    = 5 * time.Minute
+	DefaultLease = 30 * time.Second
 
 	// DefaultMaxClaims bounds how many times a unit may be claimed before it is
 	// quarantined, which fails the run.
@@ -130,16 +151,19 @@ type Config struct {
 	// Lease is the task claim duration for every worker in the run.
 	Lease time.Duration
 
-	// ControlInterval paces the control loop.
-	ControlInterval time.Duration
-
-	// StallTimeout fails a run whose phase stops making progress. Negative
-	// disables stall detection.
-	StallTimeout time.Duration
-
 	// MaxClaims bounds how many times a unit may be claimed before it is
 	// quarantined. Negative means unlimited.
 	MaxClaims int32
+
+	// IntermediateStore holds the run's intermediate data. Setup records it in
+	// the run, and every process that maps, reduces, or controls the run must be
+	// configured with it. Nil means the run's own document store.
+	IntermediateStore IntermediateStore
+
+	// Sink receives the run's output. Setup records it in the run, and every
+	// process that reduces or controls the run must be configured with it.
+	// Nil means the run's own document sink, which Results can read back.
+	Sink Sink
 }
 
 // Option configures a Controller. See New.
@@ -158,14 +182,14 @@ func WithConfig(cfg Config) Option {
 		if cfg.Lease != 0 {
 			c.Lease = cfg.Lease
 		}
-		if cfg.ControlInterval != 0 {
-			c.ControlInterval = cfg.ControlInterval
-		}
-		if cfg.StallTimeout != 0 {
-			c.StallTimeout = cfg.StallTimeout
-		}
 		if cfg.MaxClaims != 0 {
 			c.MaxClaims = cfg.MaxClaims
+		}
+		if cfg.IntermediateStore != nil {
+			c.IntermediateStore = cfg.IntermediateStore
+		}
+		if cfg.Sink != nil {
+			c.Sink = cfg.Sink
 		}
 	}
 }
@@ -198,17 +222,25 @@ func WithLease(d time.Duration) Option {
 	return func(c *Config) { c.Lease = d }
 }
 
-// WithControlInterval paces the control loop: how long the controller waits
-// between phase-barrier checks while holding its claim. It is a loop cadence
-// rather than a task schedule, so a human-scale interval suits it.
-func WithControlInterval(d time.Duration) Option {
-	return func(c *Config) { c.ControlInterval = d }
+// WithIntermediateStore keeps the run's intermediate data in store instead of
+// the run's document store. See NewFileStore.
+//
+// Setup records the store's descriptor in the run, so every process that maps,
+// reduces, or controls the run needs this option too, with a store that
+// reports the same descriptor; one that cannot resolve it exits rather than
+// read or write elsewhere.
+func WithIntermediateStore(store IntermediateStore) Option {
+	return func(c *Config) { c.IntermediateStore = store }
 }
 
-// WithStallTimeout fails a run whose current phase reports no progress for this
-// long. A negative duration disables stall detection.
-func WithStallTimeout(d time.Duration) Option {
-	return func(c *Config) { c.StallTimeout = d }
+// WithSink sends the run's output to sink instead of the run's document sink.
+//
+// Setup records the sink's Descriptor in the run, so every process that
+// reduces or controls the run needs this option too, with a sink that reports
+// the same descriptor; one that cannot resolve it exits rather than write
+// elsewhere. Mapper processes do not need it.
+func WithSink(sink Sink) Option {
+	return func(c *Config) { c.Sink = sink }
 }
 
 // WithMaxClaims bounds how many times a unit may be claimed before it is
@@ -223,12 +255,6 @@ func (c *Config) withDefaults() Config {
 	out := *c
 	if out.Lease == 0 {
 		out.Lease = DefaultLease
-	}
-	if out.ControlInterval == 0 {
-		out.ControlInterval = DefaultControlInterval
-	}
-	if out.StallTimeout == 0 {
-		out.StallTimeout = DefaultStallTimeout
 	}
 	if out.MaxClaims == 0 {
 		out.MaxClaims = DefaultMaxClaims
@@ -282,6 +308,13 @@ type Controller struct {
 	client *entroq.EntroQ
 	cfg    Config
 	prefix string
+
+	// stores and sinks are what this process can reach, by descriptor.
+	stores intermediateStores
+	sinks  sinks
+	// store and sink are the ones Setup records for a new run.
+	store IntermediateStore
+	sink  Sink
 }
 
 // New creates a Controller for the run under prefix.
@@ -310,7 +343,36 @@ func New(eq *entroq.EntroQ, prefix string, opts ...Option) (*Controller, error) 
 	for _, opt := range opts {
 		opt(cfg)
 	}
-	return &Controller{client: eq, cfg: cfg.withDefaults(), prefix: prefix}, nil
+	c := &Controller{client: eq, cfg: cfg.withDefaults(), prefix: prefix}
+
+	docStore := c.documentStore()
+	storeList := []IntermediateStore{docStore}
+	c.store = docStore
+	if cfg.IntermediateStore != nil {
+		c.store = cfg.IntermediateStore
+		if cfg.IntermediateStore.descriptor() != docStore.descriptor() {
+			storeList = append(storeList, cfg.IntermediateStore)
+		}
+	}
+	stores, err := newIntermediateStores(storeList...)
+	if err != nil {
+		return nil, err
+	}
+	docSink := newDocumentSink(eq, c.DocNS())
+	registered := []Sink{docSink}
+	c.sink = docSink
+	if cfg.Sink != nil {
+		c.sink = cfg.Sink
+		if cfg.Sink.Descriptor() != docSink.Descriptor() {
+			registered = append(registered, cfg.Sink)
+		}
+	}
+	sinks, err := newSinks(registered...)
+	if err != nil {
+		return nil, err
+	}
+	c.stores, c.sinks = stores, sinks
+	return c, nil
 }
 
 // validateForSetup checks the fields only Setup requires. A Controller built for
@@ -332,7 +394,10 @@ func (c *Controller) Config() Config { return c.cfg }
 // Prefix returns the document namespace and queue root for this run.
 func (c *Controller) Prefix() string { return c.prefix }
 
-// DocNS is the doc namespace holding every split, map output, and result doc.
+// DocNS is the doc namespace holding the run's coordination state: the state
+// doc and every split, map-output pointer, and result marker, plus whatever the
+// document-backed store and sink keep there when they are in use. Only
+// controller workers write coordination state, apart from Setup.
 func (c *Controller) DocNS() string { return c.prefix }
 
 // MapQ is the queue of input-split tasks, watched by mapper workers.
@@ -341,31 +406,69 @@ func (c *Controller) MapQ() string { return c.prefix + "/map" }
 // ReduceQ is the queue of partition tasks, watched by reducer workers.
 func (c *Controller) ReduceQ() string { return c.prefix + "/reduce" }
 
-// ControlQ holds the single self-requeueing control task.
-func (c *Controller) ControlQ() string { return c.prefix + "/control" }
+// MapDoneQ holds mapper finish tasks, watched by the controller.
+func (c *Controller) MapDoneQ() string { return c.prefix + "/map-done" }
 
-// ErrQ is the quarantine queue for tasks that exhausted their attempts. A
-// non-empty ErrQ fails the run: a MapReduce whose parts did not all succeed
-// cannot make any claim about the correctness of its output.
-func (c *Controller) ErrQ() string { return c.prefix + "/err" }
+// MapCheckQ holds checks for the end of the map phase, one committed with each
+// accepted map finish, watched by the controller.
+func (c *Controller) MapCheckQ() string { return c.prefix + "/map-check" }
 
-// errQMap sends every worker's failures to the single run quarantine queue, so
-// the controller has exactly one place to look.
-func (c *Controller) errQMap(string) string { return c.ErrQ() }
+// ReduceCheckQ holds checks for the end of the reduce phase, one committed
+// with each accepted reduce finish, watched by the controller.
+func (c *Controller) ReduceCheckQ() string { return c.prefix + "/reduce-check" }
+
+// ReduceDoneQ holds reducer finish tasks, watched by the controller.
+func (c *Controller) ReduceDoneQ() string { return c.prefix + "/reduce-done" }
+
+// GCQ holds requests to delete intermediate runs, watched by the controller.
+func (c *Controller) GCQ() string { return c.prefix + "/gc" }
+
+// QuarantineQ holds tasks the controller judged to be genuine failures. They
+// are kept, with their errors, for inspection.
+func (c *Controller) QuarantineQ() string { return c.prefix + "/quarantine" }
+
+// errQSuffix is appended to a queue name to get its error queue, matching
+// worker.DefaultErrQMap. Every worker in a run quarantines to its own inbox's
+// error queue, so the controller can tell from the queue alone what failed.
+const errQSuffix = "/err"
+
+// errQueues lists the error queue of every queue in the run that a worker
+// watches, except the error worker's own: it quarantines to QuarantineQ.
+func (c *Controller) errQueues() []string {
+	inboxes := []string{c.MapQ(), c.ReduceQ(), c.MapDoneQ(), c.MapCheckQ(), c.ReduceDoneQ(), c.ReduceCheckQ(), c.GCQ()}
+	qs := make([]string, len(inboxes))
+	for i, q := range inboxes {
+		qs[i] = q + errQSuffix
+	}
+	return qs
+}
 
 // Doc key layout. These are readable on purpose: they are what shows up in psql
 // and in `eqc` output when a run needs debugging.
-func splitDocKey(n int) string  { return fmt.Sprintf("split/%06d", n) }
-func mapOutDocKey(p int) string { return fmt.Sprintf("mapout/%06d", p) }
-func resultDocKey(p int) string { return fmt.Sprintf("result/%06d", p) }
+func splitDocKey(n int) string { return fmt.Sprintf("%s%06d", splitPrefix, n) }
 
-// resultDocID is a deterministic document id for a partition's output.
+// splitDocID is a deterministic id for a split doc, so that a retried Setup
+// recognizes the splits an earlier attempt already staged.
+func splitDocID(n int) string   { return fmt.Sprintf("split-%06d", n) }
+func mapOutDocKey(p int) string { return fmt.Sprintf("%s%06d", mapOutPrefix, p) }
+func resultDocKey(p int) string { return fmt.Sprintf("%s%06d", resultPrefix, p) }
+
+// mapOutSecondaryKey tells apart the pointers that share a partition's key:
+// run i of the split keyed splitKey. Every pointer for a partition shares its
+// primary key, so claiming that key takes the whole partition, and the
+// secondary key keeps each (key, secondary) pair unique. A split is accepted
+// once, so its runs' secondary keys never collide.
+func mapOutSecondaryKey(splitKey string, i int) string {
+	return fmt.Sprintf("%s/%04d", splitKey, i)
+}
+
+// resultDocID is a deterministic document id for the marker that a partition's
+// output is committed. The output itself lives in the sink.
 //
-// It exists so that two workers racing the same partition cannot both write a
-// result. An insert carrying an explicit id is rejected when that id already
-// exists, which gives the empty-partition case the exclusion that a non-empty
-// one gets from deleting its map output documents. Ids are capped at 64 bytes; this
-// is 13.
+// The controller already accepts exactly one finish per partition, by claiming
+// its pointer docs and deleting them as it records the acceptance. The explicit id
+// makes a second marker for the same partition an error rather than a silent
+// duplicate should that ever fail. Ids are capped at 64 bytes; this is 13.
 func resultDocID(p int) string { return fmt.Sprintf("result-%06d", p) }
 
 // Key range prefixes, and the exclusive upper bounds for scanning them. Every
@@ -388,7 +491,7 @@ func prefixEnd(prefix string) string {
 }
 
 // docRef identifies a doc by namespace and primary key. It is the value of a
-// map task, and it is what lets a worker claim its input before working.
+// map task: the split the mapper reads.
 type docRef struct {
 	NS  string `json:"ns"`
 	Key string `json:"key"`
@@ -400,7 +503,7 @@ type docRef struct {
 	// Store is the intermediate store for the run, also stamped by Setup, so
 	// every mapper writes where the run's reducers will read. A process that
 	// cannot resolve it exits rather than write somewhere else.
-	Store storeDescriptor `json:"store,omitzero"`
+	Store Descriptor `json:"store,omitzero"`
 }
 
 // asQuery reads the doc group by primary key without claiming it. Reading
@@ -428,15 +531,6 @@ func (c *Controller) RunReducer(ctx context.Context, reduceFn Reducer) error {
 	return c.ReducerWorker(reduceFn).Run(ctx, c.workerRunOptions(c.ReduceQ())...)
 }
 
-// RunController runs the phase machine for this run.
-//
-// Run as many as you like. The control queue holds exactly one task, so EntroQ's
-// claim guarantees a single controller acts at a time, and a replica that dies
-// is replaced once its claim is released.
-func (c *Controller) RunController(ctx context.Context) error {
-	return c.ControlWorker().Run(ctx, c.controlRunOptions()...)
-}
-
 // workerRunOptions is the run configuration shared by mappers and reducers.
 func (c *Controller) workerRunOptions(queue string) []worker.RunOption {
 	opts := []worker.RunOption{
@@ -447,48 +541,4 @@ func (c *Controller) workerRunOptions(queue string) []worker.RunOption {
 		opts = append(opts, worker.WithMaxClaims(c.cfg.MaxClaims))
 	}
 	return opts
-}
-
-// controlRunOptions deliberately carries no claim ceiling. The control task is
-// claimed once per tick for the life of a run, so any ceiling would quarantine
-// the controller after seconds of healthy operation and leave the run with
-// nothing driving it.
-func (c *Controller) controlRunOptions() []worker.RunOption {
-	return []worker.RunOption{
-		worker.Watching(c.ControlQ()),
-		worker.WithLease(c.cfg.Lease),
-	}
-}
-
-// countDocs counts the docs under a key prefix. It lists metadata only, so the
-// cost is one scan of the key range with no content transferred; a run with a
-// very large MapShards pays for that scan on every control tick, which is the
-// price of a doc-based barrier that also reports progress.
-func (c *Controller) countDocs(ctx context.Context, prefix string) (int, error) {
-	docs, err := c.client.Docs(ctx, &entroq.DocQuery{
-		Namespace:  c.DocNS(),
-		KeyStart:   prefix,
-		KeyEnd:     prefixEnd(prefix),
-		OmitValues: true,
-	})
-	if err != nil {
-		return 0, fmt.Errorf("count %q docs: %w", prefix, err)
-	}
-	return len(docs), nil
-}
-
-// claimedTasks counts the tasks currently claimed across the run's work queues.
-// It is how "slow" is told apart from "stalled": documents are no longer
-// claimed by workers, so a held task is the only evidence that something is
-// actively being worked on.
-func (c *Controller) claimedTasks(ctx context.Context) (int, error) {
-	stats, err := c.client.QueueStats(ctx, entroq.MatchExact(c.MapQ(), c.ReduceQ()))
-	if err != nil {
-		return 0, fmt.Errorf("claimed task check: %w", err)
-	}
-	n := 0
-	for _, s := range stats {
-		n += s.Claimed
-	}
-	return n, nil
 }

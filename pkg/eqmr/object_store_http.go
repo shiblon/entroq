@@ -17,6 +17,7 @@ const (
 	httpObjectStoreInfoPath        = "/v1/info"
 	httpObjectStoreOpenPath        = "/v1/open"
 	httpObjectStoreDeletePath      = "/v1/delete"
+	httpObjectStoreSweepPath       = "/v1/sweep"
 	httpObjectStoreObjectPath      = "/v1/objects/"
 	httpObjectStoreMaxControlBytes = 64 << 10
 )
@@ -77,7 +78,9 @@ func (s *httpObjectStore) info(ctx context.Context) (httpObjectStoreInfo, error)
 	return info, nil
 }
 
-func (s *httpObjectStore) put(ctx context.Context, objectID string, body io.Reader) (json.RawMessage, error) {
+// put stores one object, naming the run it belongs to so the driver can keep a
+// run's objects together and sweep them when the run ends.
+func (s *httpObjectStore) put(ctx context.Context, run, objectID string, body io.Reader) (json.RawMessage, error) {
 	if objectID == "" {
 		return nil, fmt.Errorf("eqmr object store put: object ID is required")
 	}
@@ -88,6 +91,7 @@ func (s *httpObjectStore) put(ctx context.Context, objectID string, body io.Read
 	if err != nil {
 		return nil, err
 	}
+	req.URL.RawQuery = url.Values{"run": {run}}.Encode()
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/octet-stream")
 	resp, err := s.client.Do(req)
@@ -130,6 +134,31 @@ func (s *httpObjectStore) delete(ctx context.Context, ref json.RawMessage) error
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
 		return httpObjectStoreResponseError("delete", resp)
+	}
+	return nil
+}
+
+// sweep tells the driver that run has ended, so it may delete whatever it
+// holds for the run, however it knows how.
+func (s *httpObjectStore) sweep(ctx context.Context, run string) error {
+	body, err := json.Marshal(struct {
+		Run string `json:"run"`
+	}{Run: run})
+	if err != nil {
+		return fmt.Errorf("eqmr object store sweep: encode run: %w", err)
+	}
+	req, err := s.request(ctx, http.MethodPost, httpObjectStoreSweepPath, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("eqmr object store sweep: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		return httpObjectStoreResponseError("sweep", resp)
 	}
 	return nil
 }

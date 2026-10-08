@@ -33,10 +33,10 @@ func (r *testRunReader) Next(context.Context) (intermediateRecord, error) {
 }
 func (r *testRunReader) Close() error { return nil }
 
-func (s *testRunStore) descriptor() storeDescriptor {
-	return storeDescriptor{Name: "test", Driver: "test/1", Identity: "memory"}
+func (s *testRunStore) descriptor() Descriptor {
+	return Descriptor{Name: "test", Driver: "test/1", Identity: "memory"}
 }
-func (s *testRunStore) put(_ context.Context, records []intermediateRecord) (json.RawMessage, error) {
+func (s *testRunStore) put(_ context.Context, _ string, records []intermediateRecord) (json.RawMessage, error) {
 	id := len(s.runs)
 	s.runs = append(s.runs, append([]intermediateRecord(nil), records...))
 	return json.Marshal(id)
@@ -53,11 +53,11 @@ func (s *testRunStore) open(_ context.Context, raw json.RawMessage) (intermediat
 	return &testRunReader{records: records}, nil
 }
 
-func TestIntermediateSinkDoesNotPublishEmptyCombinedRun(t *testing.T) {
+func TestIntermediateWriterDoesNotPublishEmptyCombinedRun(t *testing.T) {
 	ctx := context.Background()
 	store := new(testRunStore)
 	drop := func(context.Context, string, []string) ([]string, error) { return nil, nil }
-	sink := newIntermediateSink(store, 1, 100, drop)
+	sink := newIntermediateWriter(store, "/test", 1, 100, drop)
 	if err := sink.write(ctx, "key", "", "value"); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestIntermediateSinkDoesNotPublishEmptyCombinedRun(t *testing.T) {
 	}
 }
 
-func TestIntermediateSinkRecutsExpandedCombinerOutput(t *testing.T) {
+func TestIntermediateWriterRecutsExpandedCombinerOutput(t *testing.T) {
 	ctx := context.Background()
 	store := new(testRunStore)
 	expand := func(context.Context, string, []string) ([]string, error) {
@@ -80,7 +80,7 @@ func TestIntermediateSinkRecutsExpandedCombinerOutput(t *testing.T) {
 			strings.Repeat("c", 100),
 		}, nil
 	}
-	sink := newIntermediateSink(store, 1, 200, expand)
+	sink := newIntermediateWriter(store, "/test", 1, 200, expand)
 	if err := sink.write(ctx, "key", "", "value"); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -101,11 +101,12 @@ func TestIntermediateSinkRecutsExpandedCombinerOutput(t *testing.T) {
 	}
 }
 func (s *testRunStore) delete(context.Context, json.RawMessage) error { return nil }
+func (s *testRunStore) sweep(context.Context, string) error           { return nil }
 
-func TestIntermediateSinkCutsSortedRuns(t *testing.T) {
+func TestIntermediateWriterCutsSortedRuns(t *testing.T) {
 	ctx := context.Background()
 	store := new(testRunStore)
-	sink := newIntermediateSink(store, 1, 100, nil)
+	sink := newIntermediateWriter(store, "/test", 1, 100, nil)
 
 	input := []intermediateRecord{
 		{Primary: "gamma", Value: "3"},
@@ -149,6 +150,18 @@ func isSortedRun(run []intermediateRecord) bool {
 	return true
 }
 
+// collectingWriter is a SinkWriter that keeps what it is given.
+type collectingWriter []*KV
+
+func (w *collectingWriter) Write(_ context.Context, key, value string) error {
+	*w = append(*w, NewKV(key, value))
+	return nil
+}
+
+func (w *collectingWriter) Close(context.Context) (json.RawMessage, error) {
+	return json.RawMessage("null"), nil
+}
+
 func TestReduceIntermediateDrainsUnreadValues(t *testing.T) {
 	ctx := context.Background()
 	store := &testRunStore{runs: [][]intermediateRecord{
@@ -173,8 +186,8 @@ func TestReduceIntermediateDrainsUnreadValues(t *testing.T) {
 		}
 	}()
 
-	out, err := reduceIntermediate(ctx, merged, EmptyReducer)
-	if err != nil {
+	var out collectingWriter
+	if err := reduceIntermediate(ctx, merged, EmptyReducer, &out); err != nil {
 		t.Fatalf("reduce: %v", err)
 	}
 	if len(out) != 2 {
@@ -202,7 +215,7 @@ func TestDocumentIntermediateReaderLoadsOneChunkAtATime(t *testing.T) {
 			Value:   strings.Repeat("x", 100),
 		}
 	}
-	raw, err := store.put(ctx, records)
+	raw, err := store.put(ctx, "/intermediate-test", records)
 	if err != nil {
 		t.Fatalf("put: %v", err)
 	}

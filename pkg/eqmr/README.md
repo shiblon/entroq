@@ -1,249 +1,249 @@
 # eqmr: experimental MapReduce on EntroQ
 
-`eqmr` is an **experimental** package. Its Go API, doc layout, and queue layout
-may change or be removed without a migration path. Do not treat what it writes
-to a namespace as a stable interchange format.
+`eqmr` is **experimental**. Its Go API and its queue and document layouts may
+change without a migration path; do not treat what it writes as a stable
+interchange format.
 
-It runs a complete MapReduce with no storage outside EntroQ: input, shuffle
-map outputs, and output all live as docs, and every phase transition is a task.
+A run is coordinated entirely through EntroQ: work is tasks, run state is a
+doc. Data may live in EntroQ too, for small jobs, but nothing assumes it does:
+intermediate runs go through a store, and output goes to a `Sink`.
 
-## Deployed shape
-
-Nothing in a run needs to know about anything else except the queue names, so
-each role scales independently:
+## Shape
 
 ```
-                 {prefix}/map          {prefix}/reduce        {prefix}/control
-                      |                      |                       |
-              +---------------+      +---------------+       +---------------+
-              |  RunMapper    |      |  RunReducer   |       | RunController |
-              |  (scale N)    |      | (scale to R)  |       | (scale 1..k)  |
-              +---------------+      +---------------+       +---------------+
-                      |                      |                       |
-   docs:  split/NNNNNN  ->  run/... + mapout/NNNNNN  ->  result/NNNNNN
+        {prefix}/map              {prefix}/reduce
+             |                          |
+     +---------------+          +---------------+
+     |  RunMapper    |          |  RunReducer   |
+     |  (scale N)    |          | (scale to R)  |
+     +---------------+          +---------------+
+             |                          |
+   {prefix}/map-done          {prefix}/reduce-done
+             \                         /
+              +-----------------------+
+              |     RunController     |   also: {prefix}/map-check,
+              |     (scale 1..k)      |   /reduce-check, /gc, and
+              +-----------------------+   every {queue}/err
+                         |
+   docs:  state, split/NNNNNN, mapout/NNNNNN, result/NNNNNN
+          (document store and sink: run/..., output/...)
 ```
 
-One process does `Setup` to write the splits and create the control task. After
-that, mapper and reducer deployments can be scaled on queue depth, and any
-number of control pods may run: the control queue holds exactly one task, so
-EntroQ's claim guarantees exactly one controller is acting at any moment, and a
-controller that dies is replaced when its lease expires.
+Mappers and reducers consume a task and commit a finish task in the `Modify`
+that deletes it; they never write a doc. The controller is a set of workers
+that react to finish tasks and alone write run state: work goes out as tasks,
+comes back as finish tasks, and the controller decides what each one means.
+Every role scales on its own, any number of controller replicas may run, and a
+replica that dies is recoverable by simply restarting it: its tasks wait in
+their queues and are picked up again when the workers restart.
 
-`Controller.Run` does all of this in a single process. That is for tests,
-benchmarks, and small jobs, not for the deployed shape.
+`Controller.Run` does all of this in one process, for tests, benchmarks, and
+small jobs.
 
-## Phases
+## A run
 
-| phase | barrier | what ends it |
+**Setup** stages the input as split (sharded) docs. It then creates the run, its
+state doc and every map task, in one `Modify`. Setup is atomic and idempotent,
+so it's never half done and can always be safely retried.
+
+**Acceptance.** The controller accepts the first finish for each unit while
+claiming only that unit's input, the split doc or the partition's pointer docs,
+and deletes the input in the `Modify` that records the acceptance. Acceptances
+of different units never wait on one another; a later finish for the same unit
+finds its input gone.
+
+**Checks.** Each acceptance commits a check task in the same `Modify`, and the
+check decides whether the phase is over. Because check does no mutations, and
+always follows a mutation, it is guaranteed that at least one of the checks
+will see an empty docset and know to move the phase forward. Because moving
+forward also mutates state, any late checks will safely fail to commit.
+
+| phase | ends when | ended by |
 |---|---|---|
-| `map` | no `split/` docs remain | every mapper committed its map outputs |
-| `reduce` | every partition has a result doc | every reducer committed |
-| `done` / `failed` | terminal | control task parks, stays inspectable |
+| `map` | no split docs remain | a map check, which fans out reduce tasks |
+| `reduce` | no pointer docs remain | a reduce check, after finishing the sink |
+| `done` / `failed` | terminal | |
 
-Completion is read **purely from documents**. A split document disappears when
-its mapper commits; a result document appears when a partition commits, empty
-partitions included, which is why an empty partition still writes an empty result
-document rather than silently vanishing. No queue is consulted to decide whether
-a phase is finished.
+Reduce tasks exist only for partitions that received data, and a run whose
+input maps to nothing goes straight to `done`. Empty input is a `Setup` error.
+The state doc holds only the phase and what `Setup` fixed; progress within a
+phase is derived from the docs it consumes.
 
-## Progress
+## Configuration
 
-`Controller.Progress` reports per-phase counts (total, done, running, pending)
-plus the quarantine depth, enough to drive a status view.
-
-It deliberately does not break down by worker. Classic MapReduce could draw a
-progress bar per worker because input shards were statically preassigned, so
-"how far along is this mapper" had an answer. EntroQ is competing-consumer: a
-unit is claimed by whichever worker is free, so no worker owns a knowable share
-and there is no per-worker denominator to fill. Per-worker throughput and
-idleness are observability questions, answered by `entroq.worker.tasks_total`
-and `entroq.worker.slots` rather than by run state.
-
-Progress resolution is a function of `MapShards`. There is no sub-split
-reporting, because a mapper commits once at the end of its split, so finer
-granularity comes from cutting smaller splits rather than from progress
-messages.
-
-Mappers write immutable run payloads first, then delete the split doc in the
-*same* `Modify` that publishes map-output pointers. So "no split docs remain"
-atomically implies every map output is durable and reachable. No coordinator
-state is required, and a worker that dies mid-task simply loses its claim.
-
-## Shuffle
-
-Mappers assign each intermediate key to one of the run's reduce partitions by
-`ShardForKey`. They buffer up to `DefaultIntermediateRunBytes`, sort records by
-primary key, secondary key, and value, and write immutable runs. Document-backed
-runs are themselves split into bounded ordered chunks, so a reader holds only
-its current chunk. `WithIntermediateRunBytes` changes the mapper bound.
-
-Each durable run gets a small pointer document keyed `mapout/<partition>`. The
-pointer becomes visible in the same atomic modification that deletes the input
-split. Reducers read those pointers, open the runs, and use a heap merge to feed
-one primary-key group at a time through `ReducerInput`.
-
-The storage record is `(primary key, secondary key, value)`. The current Mapper
-API fills the secondary key with the empty string. It remains a real sort
-dimension in the storage format for a later source or mapper API that exposes
-secondary sort. EntroQ document secondary keys organize pointer documents and
-do not carry record secondary keys.
-
-An object-backed shuffle path is under development; controllers still use the
-document store by default today. Its versioned byte format and language-neutral
-subprocess contract are specified in the
-[object-store HTTP protocol](../../docs/storage-http.md). Drivers store opaque
-streams and never implement MapReduce record semantics.
-
-That makes reduce work proportional to the partition count, not to the number of
-distinct keys.
-
-Both shard counts are **required**, and required only by `Setup`, because that
-is the moment the layout gets fixed. A worker pod therefore constructs its
-controller from a prefix alone:
+Both shard counts are required. `Setup` fixes the layout. Worker pods construct
+their controller from the prefix, and mappers read the partition count from
+their task:
 
 ```go
 ctrl, err := eqmr.New(eq, prefix)                       // mapper or reducer pod
 ctrl, err := eqmr.New(eq, prefix,                        // the launcher
-    eqmr.WithMapShards(64), eqmr.WithReduceShards(8))
+    eqmr.WithMapShards(64),
+    eqmr.WithReduceShards(8))
 ```
 
-Mappers do need the partition count, to decide where each emitted key goes, but
-they read it from their own task rather than from configuration. Two deployments
-configured with different numbers would each be internally consistent and jointly
-wrong, silently; there is one writer instead, and no way to disagree.
+A store or sink is chosen with `WithIntermediateStore` or `WithSink` and
+recorded in the run by its `Descriptor`. Every process that maps, reduces, or
+controls the run must be configured with one that reports the same descriptor.
+A long name in a descriptor, such as a long run prefix, is shortened to its
+head, a short hash of the whole, and its tail.
 
-## Combiners
+## Shuffle
 
-A `Combiner` differs from a `Reducer` in the way that matters: its output has
-the same type as its input, so it is closed over its own output. A mapper applies
-it independently to each bounded run, which means it may run several times
-within one split. It must satisfy
+Mappers assign each key to a partition by `ShardForKey`, buffer up to
+`DefaultIntermediateRunBytes` (`WithIntermediateRunBytes`), sort records by
+primary key, secondary key, and value, and write immutable runs. The
+controller publishes one pointer doc per run, keyed `mapout/<partition>` with
+the split and run as its secondary key (`split/000003/0001`), so a split's
+absence means its output is durable and reachable. Reducers heap-merge a
+partition's runs and feed one key at a time through `ReducerInput`, so reduce
+work scales with partitions.
 
-```
-C(C(a) ++ C(b))  ==  C(a ++ b)
-```
+Records also carry a secondary key, which is a sort dimension. The Mapper API
+leaves it empty for now.
 
-Sum, min, max, count, and set-union qualify; mean and median do not unless
-carried as a richer intermediate. A Combiner is purely an optimization:
-`TestCombinerDoesNotChangeResults` pins that a run produces identical output
-with and without one.
+## Storage
 
-## Keys and values are text
+- The run's document store, the default, keeps runs as chunk docs in the run's
+  namespace, for small jobs.
+- `NewFileStore(name, root)` keeps runs as files under `root`, one directory per
+  run, each written once under a unique name and synced before its reference is
+  returned, so nothing refers to an unfinished file. Every process must see the
+  same files at the same path.
+- Stores on the [object-store HTTP protocol](../../docs/storage-http.md) are
+  under development; drivers store opaque streams.
 
-Everything in the pipeline is a string: document keys (`split/000007`), map keys,
-and values. All must be valid UTF-8 with no NUL.
+Runs are written in checksummed blocks, chained and closed by a counted footer,
+so damage is caught before any record of a damaged block is used, and
+truncation is caught at the end. Every write names its run, and when the run
+ends the controller tells the store to sweep it, however the store knows how.
 
-Both halves of that rule are load-bearing. Keys and values live inside document
-content, which is JSONB in PostgreSQL, and JSONB rejects `\u0000` outright
-("unsupported Unicode escape sequence"). A JSON string cannot represent invalid
-UTF-8 at all, and Go's `encoding/json` silently substitutes U+FFFD rather than
-failing, so an unvalidated value would corrupt in transit rather than erroring
-where the mistake was made.
+## Output
 
-A job whose keys or values are genuinely binary encodes them itself, with base64
-or anything else. That choice belongs to the job, which knows whether it needs
-it. The alternative, `[]byte` everywhere, charges every job for the few that
-need it: measured on a real run, base64 made map-output documents **22% larger**
-(18,550 bytes against 14,392) and left them unreadable:
+A `Sink` owns the output's format, naming, checksums, and readiness. The run
+hands it a value per key. Writes are staged and committed separately, so
+duplicate and failed attempts are never visible:
 
-```json
-[{"key":"dzAwMDAwMA==","values":["MQ==","Mw=="]}]     // []byte
-[{"key":"w000000","values":["1","3"]}]                // string
-```
+1. A reducer streams its results into a staged attempt. Its finish task carries
+   the sink's reference to the attempt.
+2. The controller commits the first accepted attempt per partition. Any later
+   commit, or a repeat after a crash, leaves the committed output alone.
+3. When every partition with data is committed, the controller calls `Finish`,
+   naming the partitions that received none, before marking the run done. A
+   consumer that sees the sink's readiness marker needs nothing from EntroQ.
+4. When the run ends, done or failed, the sink sweeps every uncommitted attempt.
 
-`ValidateText` is the rule, and it is enforced where violations happen: on input
-at `Setup`, and on every emitted pair. An invalid pair is a `MoveError`, since
-text that is not valid UTF-8 will never become valid on a retry, so the task is
-quarantined at once and the controller fails the run with a reason rather than
-killing a worker repeatedly over input that cannot succeed.
+Only the sink deletes staged attempts. A controller that commits and dies
+before recording it can leave a finish that looks like a loser whose output is
+in fact committed.
 
-## Backup tasks (speculative execution)
+The default document sink suits small jobs, and `Results` and
+`ResultsForPartition` read it. Other sinks are read with their own readers.
 
-Workers **read** their input document; they do not claim it. Exclusion happens
-when they commit, through a version-pinned delete of that document. So two
-workers may process the same unit at once, and the first to commit wins. Both
-may write immutable payloads, but only the winner publishes pointers. The loser
-deletes its unpublished payloads after the rejected commit.
+## Duplicates and backup tasks
 
-That makes the classic backup-task strategy available. Insert a second task for a
-unit that has been in flight too long and the two race, rather than the duplicate
-blocking on a claim the original still holds. `eqmr` deliberately ships **no
-straggler policy**: deciding when a task is late enough to duplicate is a
-scheduling question, and the mechanism is useful without an opinion about it.
+Workers read their input without claiming it, so two may process one unit at
+once; the controller accepts the first finish and collects the other's runs.
+That makes backup tasks possible: insert a second task for a straggling unit
+and the two race. `eqmr` ships no straggler policy; when to duplicate is a
+scheduling question.
 
-A loser leaves its task claimed until the lease expires, after which it is
-reclaimed, finds no input document, and retires. That is deliberately not a
-retry: a retry would increment the attempt count, and a worker that merely lost
-a race must never be quarantined, since quarantining anything fails the run.
-
-An empty reduce partition has no input document to serve as the exclusion token,
-so its result document carries an explicit id instead. A duplicate insert of the
-same id is rejected, which gives the empty case the same guarantee.
-
-Because `Running` can no longer be read from claimed documents, `Progress` counts
-claimed **tasks** and caps them at the number of units actually outstanding, so a
-duplicated unit shows as one running unit rather than two.
+A duplicate that starts after its unit was accepted finds no input and retires.
+A reducer whose inputs are collected mid-read cannot tell that from a store
+failure, so it retries, and then finds no pointers and retires. A duplicate
+that exhausts its claims anyway is recognized as a loser and retired.
+`Progress` caps running units at the number outstanding,
+so a duplicated unit counts once.
 
 ## Failure
 
-A `Mapper` or `Reducer` that returns an error kills its worker. That is the
-standard MapReduce contract: a run in which some map calls failed cannot support
-any claim about the correctness of its output. The task is reclaimed once the
-lease expires, so a transient failure costs one claim rather than the run.
+A `Mapper` or `Reducer` that returns an error kills its worker, the MapReduce
+contract: a run in which some calls failed cannot vouch for its output. The task
+is reclaimed when its lease expires. `MaxClaims` (default `DefaultMaxClaims`,
+10; negative for unlimited) bounds how often: past it the task is quarantined
+to its queue's error queue, `{prefix}/map/err` for example. (`pkg/worker`
+defaults to unlimited, since a claim count cannot tell crashes from ordinary
+churn. A batch run has an end and can afford to fail.)
 
-A fatal handler error does not mark the task, so without a bound a genuinely
-poisonous record is retried forever, killing a worker each time. `Config`
-therefore defaults `MaxClaims` to `DefaultMaxClaims` (10): the task is
-quarantined to `{prefix}/err` after ten claims and the controller fails the run
-with a reason. Set it negative for unlimited.
+The controller's error worker judges every quarantined task: a duplicate whose
+unit is already done is retired, and anything else fails the run with the
+task's own error and moves to `{prefix}/quarantine` for inspection.
 
-`pkg/worker` leaves this unlimited, and that difference is deliberate.
-`Task.Claims` conflates work that kills workers with ordinary infrastructure
-churn such as rolling deploys and evictions, and that conflation is forced
-rather than sloppy: a crashing worker is precisely the one that cannot reliably
-record why it died. A general worker cannot know a workload's ratio of the two.
-A batch run can take the position that a general worker cannot, because it has a
-defined end and failing loudly beats burning a pool forever.
+These fail the run at once, with a reason: text that is not valid NUL-free
+UTF-8, a corrupt intermediate run, a sink error marked with a
+`worker.MoveError`, and a store or sink a process cannot reach. The last is
+checked when a controller starts and when a worker takes a task; the task is
+consumed, and the submitter fixes the deployment and submits again. A backend
+that is temporarily unavailable is retried.
 
-Use `RunMapper`, `RunReducer` and `RunController` rather than wiring workers by
-hand: they watch the right queue with the run's lease and claim ceiling, so
-nothing about the wiring is yours to get right. `RunController` deliberately
-carries no claim ceiling, because the control task is claimed once per tick for
-the life of the run and any bound would quarantine the controller after seconds
-of healthy operation.
+Use `RunMapper`, `RunReducer`, and `RunController`: they watch the right queues
+with the run's lease and claim ceiling. Of the controller workers, the
+collector alone has a claim ceiling, so a store that stays unavailable cannot
+hold `Run` open.
 
-When a dead worker's task actually gets reclaimed is the backend's business, not
-this package's. Let the claim mechanism do its job and roll with a blocked
-claim.
+## Collection
 
-The controller also fails a run whose phase makes no progress for
-`Config.StallTimeout`, so a wedged run reports something rather than hanging.
+The controller's `gc` worker deletes intermediate data. It deletes at once only
+what a decision retired inside one EntroQ commit: a losing map finish's runs, a
+reduced partition's consumed runs. Anything whose fate was settled outside
+EntroQ, such as staged output, waits for the sweep that every run-ending commit
+queues, of both store and sink. The sweep also collects what crashed workers
+wrote and never reported. A failed sweep is logged; what it misses is garbage.
+Collection never fails a run, and a collection task that exhausts its retries
+is kept in quarantine.
+
+## Progress
+
+`Controller.Progress` reports per-phase counts (total, done, running, pending)
+and the quarantine depth. Counts are per phase: units go to whichever worker
+is free, so no worker has a share to report. Per-worker throughput is a
+metrics question (`entroq.worker.tasks_total`,
+`entroq.worker.slots`). A mapper commits once per split, so finer progress
+comes from smaller splits.
+
+## Combiners
+
+A `Combiner`'s output has the same type as its input, so it may run several
+times within one split. It must satisfy `C(C(a) ++ C(b)) == C(a ++ b)`: sum,
+min, max, count, and set union qualify; mean and median only as a richer
+intermediate. It is an optimization: `TestCombinerDoesNotChangeResults` pins
+that output is unchanged.
+
+## Keys and values are text
+
+Keys and values are strings and must be valid UTF-8 with no NUL, checked by
+`ValidateText` where they are produced: on input at `Setup`, on every emitted
+pair and combined value, and by the document sink on every result. Document
+content is JSONB in PostgreSQL, which rejects NUL, and a JSON string cannot
+represent invalid UTF-8; Go's `encoding/json` silently substitutes U+FFFD. A
+job with binary keys encodes them itself: measured,
+base64 everywhere made map output 22% larger and unreadable.
 
 ## Cleanup
 
-`Controller.Cleanup` removes every doc and task a run created. It refuses to
-tear down a live run, because a claimed doc or task cannot be deleted.
+There is no `Cleanup` yet. A finished run keeps its state doc, its result
+markers, its document-sink output if any, and its quarantined tasks if it
+failed; intermediates are collected as it goes. Once the sink has finished,
+nothing in EntroQ is needed to read the output.
 
-A run whose output should simply expire can instead put its namespace under
-EntroQ's `/gc=` convention. Note the activation timestamp is baked into the
-namespace string at insert time and collects any unclaimed doc group once it
-fires, which is right for output a consumer has a bounded window to read and
-wrong for intermediates.
+A namespace under EntroQ's `/gc=` convention expires its unclaimed doc groups
+at a time fixed when they are inserted: right for output with a bounded reading
+window, wrong for intermediates.
 
 ## Known limits
 
-- A split doc holds all of its input KVs in one value and must fit the backend
-  message-size limit (10MB by default for the gRPC service).
-- Mapper memory is bounded by `IntermediateRunBytes`, except for a single record.
-  The document store keeps each physical run chunk below 64KiB by the same
-  estimate. A single oversized record still has to fit the backend limit.
-- A reducer holds one current chunk per input run plus the whole result partition.
-  Many small runs increase heap and reader memory; a later map-phase merger can
-  reduce that fan-in. Result output remains one document per reduce partition.
-- A mapper publishes one pointer document per run in its final atomic `Modify`.
-  Extreme map expansion or an unusually small run limit can make that metadata
-  modification reach the backend message-size limit; a map-phase merger will
-  also reduce this fan-in.
-- A Combiner works within each mapper run. Values for one key emitted into
-  different runs or splits reach the reducer separately.
-- `Setup` is not idempotent; use a fresh `Prefix` per run.
+- A split doc holds its input inline and must fit the backend message limit
+  (10MB by default for the gRPC service).
+- Mapper memory is bounded by `IntermediateRunBytes`, except for a single
+  record. A reducer holds one block or chunk per input run; many small runs
+  raise that, which a later map-phase merger can reduce.
+- With the document store, a single record must fit the backend message limit,
+  and the document sink buffers a whole partition before staging it.
+- A map finish names every run its split produced, and `Setup` creates every
+  map task in one commit, so extreme map expansion and very many splits are
+  bounded by the backend message limit. Range tasks, one per batch of splits,
+  will lift the latter.
+- A Combiner works within one mapper run; values for a key from different runs
+  or splits reach the reducer separately.
+- `Setup` refuses a prefix that already holds a different run: use a fresh
+  prefix per run.

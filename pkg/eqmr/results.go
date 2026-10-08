@@ -2,7 +2,6 @@ package eqmr
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -13,27 +12,27 @@ import (
 
 // Results returns every output pair from a completed run, sorted by key.
 //
-// Output lives in one result doc per reduce partition, each already sorted by
-// key, so this is a k-way merge rather than a sort. It loads the whole output
-// into memory; a run whose output does not fit should read partitions
-// individually with ResultsForPartition instead.
+// It reads the run's document sink, the default when no WithSink is given.
+// Output sent to any other sink is read with that sink's own reader: the run
+// does not know its format.
+//
+// Each partition is already sorted by key, so this is a k-way merge rather than
+// a sort. It loads the whole output into memory; a run whose output does not
+// fit should read partitions individually with ResultsForPartition instead.
 func (c *Controller) Results(ctx context.Context) ([]*KV, error) {
-	if err := c.requireCompletedRun(ctx); err != nil {
-		return nil, fmt.Errorf("eqmr results: %w", err)
-	}
-	docs, err := c.client.Docs(ctx, &entroq.DocQuery{
-		Namespace: c.DocNS(),
-		KeyStart:  resultPrefix,
-		KeyEnd:    prefixEnd(resultPrefix),
-	})
+	sink, err := c.completedDocumentSink(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("eqmr results: %w", err)
 	}
-	runs := make([][]*KV, 0, len(docs))
-	for _, d := range docs {
-		var out []*KV
-		if err := json.Unmarshal(d.Content, &out); err != nil {
-			return nil, fmt.Errorf("eqmr results: parse %q: %w", d.Key, err)
+	m, err := sink.manifest(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("eqmr results: %w", err)
+	}
+	runs := make([][]*KV, 0, m.Partitions)
+	for p := range m.Partitions {
+		out, err := sink.readPartition(ctx, p)
+		if err != nil {
+			return nil, fmt.Errorf("eqmr results: %w", err)
 		}
 		if len(out) > 0 {
 			runs = append(runs, out)
@@ -43,7 +42,8 @@ func (c *Controller) Results(ctx context.Context) ([]*KV, error) {
 }
 
 // ResultsForPartition returns the output pairs for one reduce partition, sorted
-// by key. An empty slice means no mapper emitted a key belonging to it.
+// by key. An empty slice means no mapper emitted a key belonging to it. Like
+// Results, it reads the run's document sink.
 //
 // Prefer Results unless you are deliberately reading partition by partition;
 // this is the escape hatch for output too large to hold at once.
@@ -51,24 +51,35 @@ func (c *Controller) ResultsForPartition(ctx context.Context, p int) ([]*KV, err
 	if p < 0 {
 		return nil, fmt.Errorf("eqmr results: negative partition %d", p)
 	}
-	if err := c.requireCompletedRun(ctx); err != nil {
-		return nil, fmt.Errorf("eqmr results partition %d: %w", p, err)
-	}
-	docs, err := c.client.Docs(ctx, &entroq.DocQuery{
-		Namespace: c.DocNS(),
-		KeyExact:  resultDocKey(p),
-	})
+	sink, err := c.completedDocumentSink(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("eqmr results partition %d: %w", p, err)
 	}
-	if len(docs) == 0 {
-		return nil, nil
-	}
-	var out []*KV
-	if err := json.Unmarshal(docs[0].Content, &out); err != nil {
-		return nil, fmt.Errorf("eqmr results partition %d: parse: %w", p, err)
+	out, err := sink.readPartition(ctx, p)
+	if err != nil {
+		return nil, fmt.Errorf("eqmr results partition %d: %w", p, err)
 	}
 	return out, nil
+}
+
+// completedDocumentSink returns the run's document sink once the run is done.
+func (c *Controller) completedDocumentSink(ctx context.Context) (*documentSink, error) {
+	if err := c.requireCompletedRun(ctx); err != nil {
+		return nil, err
+	}
+	_, st, err := c.stateDoc(ctx)
+	if err != nil {
+		return nil, err
+	}
+	sink, err := c.sinks.resolve(st.Sink)
+	if err != nil {
+		return nil, err
+	}
+	docs, ok := sink.(*documentSink)
+	if !ok {
+		return nil, fmt.Errorf("output went to sink %s; read it with that sink", st.Sink)
+	}
+	return docs, nil
 }
 
 func (c *Controller) requireCompletedRun(ctx context.Context) error {
@@ -116,61 +127,6 @@ func mergeKVRuns(runs [][]*KV) []*KV {
 	return out
 }
 
-// Cleanup removes everything a run created: all of its docs and all of its
-// tasks, including the control task and anything quarantined.
-//
-// Call it on a finished or abandoned run. A live one returns an error, because
-// a claimed doc or task cannot be deleted.
-//
-// For output that should simply expire, put the run's namespace under EntroQ's
-// /gc= convention. Activation is fixed in the namespace string when documents
-// are inserted, and collects any unclaimed doc group once it fires, so it suits
-// output with a bounded reading window.
-func (c *Controller) Cleanup(ctx context.Context) error {
-	const batch = 250
-
-	for {
-		docs, err := c.client.Docs(ctx, &entroq.DocQuery{
-			Namespace:  c.DocNS(),
-			OmitValues: true,
-			Limit:      batch,
-		})
-		if err != nil {
-			return fmt.Errorf("eqmr cleanup: list docs: %w", err)
-		}
-		if len(docs) == 0 {
-			break
-		}
-		args := make([]entroq.ModifyArg, 0, len(docs))
-		for _, d := range docs {
-			args = append(args, d.Delete())
-		}
-		if _, err := c.client.Modify(ctx, args...); err != nil {
-			return fmt.Errorf("eqmr cleanup: delete docs (a claimed doc means the run is still live): %w", err)
-		}
-	}
-
-	for _, q := range []string{c.MapQ(), c.ReduceQ(), c.ControlQ(), c.ErrQ()} {
-		for {
-			tasks, err := c.client.Tasks(ctx, q)
-			if err != nil {
-				return fmt.Errorf("eqmr cleanup: list %q: %w", q, err)
-			}
-			if len(tasks) == 0 {
-				break
-			}
-			args := make([]entroq.ModifyArg, 0, len(tasks))
-			for _, t := range tasks {
-				args = append(args, t.Delete())
-			}
-			if _, err := c.client.Modify(ctx, args...); err != nil {
-				return fmt.Errorf("eqmr cleanup: delete tasks in %q (a claimed task means the run is still live): %w", q, err)
-			}
-		}
-	}
-	return nil
-}
-
 // RunOptions configures the single-process Run helper.
 type RunOptions struct {
 	// Mappers is the number of mapper workers to run in this process.
@@ -190,12 +146,12 @@ type RunOptions struct {
 }
 
 // Run performs a whole MapReduce in this process: Setup, then mapper, reducer,
-// and control workers, then Wait.
+// and controller workers, then Wait.
 //
 // It exists for tests, benchmarks, and small single-binary jobs. The deployed
-// shape is the opposite of this: Setup once, then run MapperWorker,
-// ReducerWorker, and ControlWorker as separate scalable deployments against the
-// same Prefix, each of which needs nothing from the others but the queue names.
+// shape is the opposite of this: Setup once, then run RunMapper, RunReducer,
+// and RunController as separate scalable deployments against the same Prefix,
+// each of which needs nothing from the others but the queue names.
 //
 // Unlike a naive supervisor, a worker that exits does not cancel the run.
 // Workers are restarted, because a mapper is expected to die on a bad input and
@@ -214,8 +170,8 @@ func (c *Controller) Run(ctx context.Context, input []*KV, mapFn Mapper, reduceF
 
 	g, gctx := errgroup.WithContext(runCtx)
 
-	// Work queues get the claim ceiling from Config; the control queue must not
-	// have one, which WorkerRunOptions and ControlRunOptions encode.
+	// Work queues get the claim ceiling from Config; controller queues must not
+	// have one, which workerRunOptions and controlRunOptions encode.
 	workOpts := func(q string) []worker.RunOption {
 		ro := c.workerRunOptions(q)
 		if opts.MaxAttempts > 0 {
@@ -223,8 +179,6 @@ func (c *Controller) Run(ctx context.Context, input []*KV, mapFn Mapper, reduceF
 		}
 		return ro
 	}
-	controlOpts := c.controlRunOptions()
-
 	var mapperOpts []MapperOption
 	if opts.Combiner != nil {
 		mapperOpts = append(mapperOpts, WithCombiner(opts.Combiner))
@@ -247,18 +201,48 @@ func (c *Controller) Run(ctx context.Context, input []*KV, mapFn Mapper, reduceF
 			})
 		})
 	}
-	g.Go(func() error {
-		return restarting(gctx, func(ctx context.Context) error {
-			return c.ControlWorker().Run(ctx, controlOpts...)
-		})
-	})
+	for _, role := range c.controllerRoles() {
+		g.Go(func() error { return restarting(gctx, role) })
+	}
 
 	waitErr := c.Wait(runCtx)
+	if waitErr == nil {
+		// The controller workers run in this process too, so they must stay up
+		// until they have collected what the run left behind: the last reduce
+		// finish hands its runs to the collector in the same commit that ends
+		// the run.
+		waitErr = c.awaitCollection(runCtx)
+	}
 	cancel()
 	if err := g.Wait(); err != nil && waitErr == nil {
 		waitErr = err
 	}
 	return waitErr
+}
+
+// awaitCollection waits until no finish or collection work is outstanding, so
+// every intermediate run the controller will ever delete has been deleted.
+func (c *Controller) awaitCollection(ctx context.Context) error {
+	ticker := time.NewTicker(maxWaitInterval)
+	defer ticker.Stop()
+	for {
+		stats, err := c.client.QueueStats(ctx, entroq.MatchExact(c.MapDoneQ(), c.MapCheckQ(), c.ReduceDoneQ(), c.ReduceCheckQ(), c.GCQ()))
+		if err != nil {
+			return fmt.Errorf("eqmr run: await collection: %w", err)
+		}
+		pending := 0
+		for _, s := range stats {
+			pending += s.Size
+		}
+		if pending == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("eqmr run: await collection: %w", ctx.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 // restartDelay paces worker restarts so a persistently failing handler cannot

@@ -4,191 +4,357 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
-	"hash"
 	"io"
 
 	"github.com/cespare/xxhash/v2"
 )
 
-var intermediateRunMagic = [8]byte{'E', 'Q', 'M', 'R', 'R', 'U', 'N', 1}
+// intermediateRunMagic opens every run: "EQMRRUN" and the format version.
+var intermediateRunMagic = [8]byte{'E', 'Q', 'M', 'R', 'R', 'U', 'N', 2}
+
+// errCorruptRun marks a run whose bytes are wrong: a checksum or count that
+// does not match, a format or frame no writer produces, data after the end, or
+// a run that is short although its source ended cleanly. Reading it again
+// reads the same wrong bytes, so it is permanent. A run that is missing, or
+// whose source broke off partway, is not marked: missing is how a losing
+// duplicate finds inputs already collected, and a broken source may read whole
+// next time.
+var errCorruptRun = errors.New("corrupt intermediate run")
+
+// corruptf reports a corrupt run.
+func corruptf(format string, args ...any) error {
+	return fmt.Errorf("%w: %s", errCorruptRun, fmt.Sprintf(format, args...))
+}
 
 const (
-	intermediateRecordTag    = byte(1)
-	intermediateFooterTag    = byte(0)
+	intermediateBlockTag  = byte(1)
+	intermediateFooterTag = byte(0)
+
+	// maxIntermediateRecordLen bounds the three fields of one record.
 	maxIntermediateRecordLen = 64 << 20
+
+	// intermediateBlockBytes is the size at which a writer closes a block. A
+	// reader holds one verified block at a time, so it is also the reader's
+	// memory per open run, except that a single record larger than this makes
+	// a block of its own.
+	intermediateBlockBytes = 64 << 10
+
+	// maxIntermediateBlockLen bounds a block's payload as a reader sees it: a
+	// full block plus one maximal record and its field lengths.
+	maxIntermediateBlockLen = intermediateBlockBytes + maxIntermediateRecordLen + 3*binary.MaxVarintLen64
 )
 
-// encodeIntermediateRun writes one canonical immutable run. The footer count
-// and checksum make a durable commit distinguishable from a truncated stream.
+// encodeIntermediateRun writes one canonical immutable run.
+//
+// Records are grouped into blocks, each carrying its record count and a
+// checksum, so a reader can verify a whole block before handing any of its
+// records on: damaged data is caught before anything uses it. Each checksum
+// covers the previous one as well as the block, chaining the blocks together,
+// so a block that is missing, repeated, reordered, or taken from another run
+// breaks the chain. The footer closes the chain with the run's record count,
+// which distinguishes a complete run from a truncated one.
 func encodeIntermediateRun(w io.Writer, records []intermediateRecord) error {
-	checksum := xxhash.New()
-	hashed := io.MultiWriter(w, checksum)
-	if _, err := hashed.Write(intermediateRunMagic[:]); err != nil {
+	if _, err := w.Write(intermediateRunMagic[:]); err != nil {
 		return fmt.Errorf("write header: %w", err)
 	}
+	prev := chainStart()
+	var (
+		payload []byte
+		count   int
+	)
+	flush := func() error {
+		if count == 0 {
+			return nil
+		}
+		head := binary.AppendUvarint([]byte{intermediateBlockTag}, uint64(count))
+		head = binary.AppendUvarint(head, uint64(len(payload)))
+		prev = chainSum(prev, head, payload)
+		for _, b := range [][]byte{head, payload, prev[:]} {
+			if _, err := w.Write(b); err != nil {
+				return fmt.Errorf("write block: %w", err)
+			}
+		}
+		payload, count = payload[:0], 0
+		return nil
+	}
 	for i, record := range records {
-		if err := encodeIntermediateRecord(hashed, record); err != nil {
-			return fmt.Errorf("write record %d: %w", i, err)
+		total := uint64(len(record.Primary)) + uint64(len(record.Secondary)) + uint64(len(record.Value))
+		if total > maxIntermediateRecordLen {
+			return fmt.Errorf("record %d is %d bytes, limit is %d", i, total, maxIntermediateRecordLen)
+		}
+		payload = appendIntermediateRecord(payload, record)
+		count++
+		if len(payload) >= intermediateBlockBytes {
+			if err := flush(); err != nil {
+				return err
+			}
 		}
 	}
-	if _, err := hashed.Write([]byte{intermediateFooterTag}); err != nil {
-		return fmt.Errorf("write footer: %w", err)
-	}
-	if err := writeUvarint(hashed, uint64(len(records))); err != nil {
-		return fmt.Errorf("write footer count: %w", err)
-	}
-	var sum [8]byte
-	binary.BigEndian.PutUint64(sum[:], checksum.Sum64())
-	if _, err := w.Write(sum[:]); err != nil {
-		return fmt.Errorf("write footer checksum: %w", err)
-	}
-	return nil
-}
-
-func encodeIntermediateRecord(w io.Writer, record intermediateRecord) error {
-	total := uint64(len(record.Primary)) + uint64(len(record.Secondary)) + uint64(len(record.Value))
-	if total > maxIntermediateRecordLen {
-		return fmt.Errorf("record is %d bytes, limit is %d", total, maxIntermediateRecordLen)
-	}
-	if _, err := w.Write([]byte{intermediateRecordTag}); err != nil {
+	if err := flush(); err != nil {
 		return err
 	}
-	for _, field := range []string{record.Primary, record.Secondary, record.Value} {
-		if err := writeUvarint(w, uint64(len(field))); err != nil {
-			return err
-		}
-	}
-	for _, field := range []string{record.Primary, record.Secondary, record.Value} {
-		if _, err := io.WriteString(w, field); err != nil {
-			return err
+	footer := binary.AppendUvarint([]byte{intermediateFooterTag}, uint64(len(records)))
+	sum := chainSum(prev, footer)
+	for _, b := range [][]byte{footer, sum[:]} {
+		if _, err := w.Write(b); err != nil {
+			return fmt.Errorf("write footer: %w", err)
 		}
 	}
 	return nil
 }
 
-func writeUvarint(w io.Writer, n uint64) error {
-	var b [binary.MaxVarintLen64]byte
-	size := binary.PutUvarint(b[:], n)
-	_, err := w.Write(b[:size])
-	return err
+// appendIntermediateRecord appends one record's field lengths and then its
+// fields.
+func appendIntermediateRecord(b []byte, record intermediateRecord) []byte {
+	for _, field := range []string{record.Primary, record.Secondary, record.Value} {
+		b = binary.AppendUvarint(b, uint64(len(field)))
+	}
+	for _, field := range []string{record.Primary, record.Secondary, record.Value} {
+		b = append(b, field...)
+	}
+	return b
 }
 
+// chainStart is the checksum the chain begins from, so a run's first block is
+// bound to the format it was written in.
+func chainStart() [8]byte {
+	var sum [8]byte
+	binary.BigEndian.PutUint64(sum[:], xxhash.Sum64(intermediateRunMagic[:]))
+	return sum
+}
+
+// chainSum is the checksum of parts, chained to the previous checksum prev.
+func chainSum(prev [8]byte, parts ...[]byte) [8]byte {
+	h := xxhash.New()
+	// Writes to an xxhash digest cannot fail.
+	_, _ = h.Write(prev[:])
+	for _, p := range parts {
+		_, _ = h.Write(p)
+	}
+	var sum [8]byte
+	binary.BigEndian.PutUint64(sum[:], h.Sum64())
+	return sum
+}
+
+// encodedIntermediateReader streams the records of one encoded run, verifying
+// each block before yielding any of its records.
 type encodedIntermediateReader struct {
 	body          io.ReadCloser
+	src           *sourceReader
 	raw           *bufio.Reader
-	hashed        *hashingReader
+	prev          [8]byte
 	expectedCount int
 	readCount     int
-	done          bool
-	closed        bool
+
+	// block is the unread remainder of the current verified block, and
+	// blockLeft how many of its records are still to come.
+	block     []byte
+	blockLeft int
+
+	done   bool
+	closed bool
+}
+
+// sourceReader records whether its source ended cleanly. A source that ends
+// cleanly says io.EOF: a file at its end, or a response body that arrived
+// whole. One that breaks off says something else, such as io.ErrUnexpectedEOF
+// for a connection dropped mid-body. A run that is short although its source
+// ended cleanly is short in storage, which is corruption; one whose source
+// broke off may read whole next time.
+type sourceReader struct {
+	r     io.Reader
+	ended bool
+}
+
+func (s *sourceReader) Read(p []byte) (int, error) {
+	n, err := s.r.Read(p)
+	if err == io.EOF {
+		s.ended = true
+	}
+	return n, err
+}
+
+// short reports a run that stopped before it should have. It is corrupt if
+// the source ended cleanly, and otherwise an ordinary, retryable read error.
+func (r *encodedIntermediateReader) short(err error, format string, args ...any) error {
+	what := fmt.Sprintf(format, args...)
+	if r.src.ended && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) {
+		return corruptf("%s: run ends early", what)
+	}
+	return fmt.Errorf("%s: %w", what, err)
 }
 
 func newEncodedIntermediateReader(body io.ReadCloser, expectedCount int) (*encodedIntermediateReader, error) {
 	if body == nil {
 		return nil, fmt.Errorf("nil run body")
 	}
-	raw := bufio.NewReader(body)
+	src := &sourceReader{r: body}
 	r := &encodedIntermediateReader{
 		body:          body,
-		raw:           raw,
-		hashed:        &hashingReader{r: raw, h: xxhash.New()},
+		src:           src,
+		raw:           bufio.NewReader(src),
+		prev:          chainStart(),
 		expectedCount: expectedCount,
 	}
 	var magic [len(intermediateRunMagic)]byte
-	if _, err := io.ReadFull(r.hashed, magic[:]); err != nil {
-		return nil, fmt.Errorf("read header: %w", err)
+	if _, err := io.ReadFull(r.raw, magic[:]); err != nil {
+		return nil, r.short(err, "read header")
 	}
 	if magic != intermediateRunMagic {
-		return nil, fmt.Errorf("unknown run format %q", magic)
+		return nil, corruptf("unknown run format %q", magic)
 	}
 	return r, nil
 }
 
 func (r *encodedIntermediateReader) Next(ctx context.Context) (intermediateRecord, error) {
-	if r.done {
-		return intermediateRecord{}, io.EOF
-	}
-	select {
-	case <-ctx.Done():
-		return intermediateRecord{}, ctx.Err()
-	default:
-	}
-	tag, err := r.hashed.ReadByte()
-	if err != nil {
-		return intermediateRecord{}, fmt.Errorf("read frame tag: %w", err)
-	}
-	switch tag {
-	case intermediateRecordTag:
-		record, err := r.readRecord()
-		if err != nil {
-			return intermediateRecord{}, fmt.Errorf("read record %d: %w", r.readCount, err)
+	for r.blockLeft == 0 {
+		if r.done {
+			return intermediateRecord{}, io.EOF
 		}
-		r.readCount++
-		return record, nil
-
-	case intermediateFooterTag:
-		if err := r.readFooter(); err != nil {
+		select {
+		case <-ctx.Done():
+			return intermediateRecord{}, ctx.Err()
+		default:
+		}
+		if err := r.readFrame(); err != nil {
 			return intermediateRecord{}, err
 		}
-		r.done = true
-		return intermediateRecord{}, io.EOF
+	}
+	record, err := r.decodeRecord()
+	if err != nil {
+		return intermediateRecord{}, err
+	}
+	r.readCount++
+	return record, nil
+}
 
+// readFrame reads and verifies the next block, or the footer.
+func (r *encodedIntermediateReader) readFrame() error {
+	tag, err := r.raw.ReadByte()
+	if err != nil {
+		return r.short(err, "read frame tag after %d records", r.readCount)
+	}
+	switch tag {
+	case intermediateBlockTag:
+		return r.readBlock()
+	case intermediateFooterTag:
+		return r.readFooter()
 	default:
-		return intermediateRecord{}, fmt.Errorf("read frame %d: unknown tag %d", r.readCount, tag)
+		return corruptf("unknown frame tag %d after %d records", tag, r.readCount)
 	}
 }
 
-func (r *encodedIntermediateReader) readRecord() (intermediateRecord, error) {
-	lengths := [3]int{}
-	total := 0
-	for i := range lengths {
-		n, err := readUvarint(r.hashed)
-		if err != nil {
-			return intermediateRecord{}, fmt.Errorf("read field %d length: %w", i, err)
-		}
-		if n > maxIntermediateRecordLen || total > maxIntermediateRecordLen-int(n) {
-			return intermediateRecord{}, fmt.Errorf("record exceeds %d bytes", maxIntermediateRecordLen)
-		}
-		lengths[i] = int(n)
-		total += int(n)
+func (r *encodedIntermediateReader) readBlock() error {
+	head := []byte{intermediateBlockTag}
+	count, head, err := r.readUvarint(head, "block record count")
+	if err != nil {
+		return err
 	}
-	fields := [3]string{}
-	for i, size := range lengths {
-		b := make([]byte, size)
-		if _, err := io.ReadFull(r.hashed, b); err != nil {
-			return intermediateRecord{}, fmt.Errorf("read field %d: %w", i, err)
-		}
-		fields[i] = string(b)
+	length, head, err := r.readUvarint(head, "block length")
+	if err != nil {
+		return err
 	}
-	return intermediateRecord{Primary: fields[0], Secondary: fields[1], Value: fields[2]}, nil
+	// Every record has at least three bytes of field lengths, so a count that
+	// would not fit is as wrong as a length beyond the limit.
+	if count == 0 || length > maxIntermediateBlockLen || count > length/3 {
+		return corruptf("block of %d records in %d bytes", count, length)
+	}
+	payload := make([]byte, length)
+	if _, err := io.ReadFull(r.raw, payload); err != nil {
+		return r.short(err, "read block")
+	}
+	if err := r.verify(head, payload); err != nil {
+		return err
+	}
+	r.block, r.blockLeft = payload, int(count)
+	return nil
 }
 
 func (r *encodedIntermediateReader) readFooter() error {
-	count, err := readUvarint(r.hashed)
+	count, footer, err := r.readUvarint([]byte{intermediateFooterTag}, "footer count")
 	if err != nil {
-		return fmt.Errorf("read footer count: %w", err)
+		return err
 	}
-	var wantBytes [8]byte
-	if _, err := io.ReadFull(r.raw, wantBytes[:]); err != nil {
-		return fmt.Errorf("read footer checksum: %w", err)
-	}
-	want := binary.BigEndian.Uint64(wantBytes[:])
-	if got := r.hashed.h.Sum64(); got != want {
-		return fmt.Errorf("run checksum is %016x, want %016x", got, want)
+	if err := r.verify(footer); err != nil {
+		return err
 	}
 	if count != uint64(r.readCount) {
-		return fmt.Errorf("run footer count is %d, read %d", count, r.readCount)
+		return corruptf("run footer count is %d, read %d", count, r.readCount)
 	}
 	if r.expectedCount >= 0 && count != uint64(r.expectedCount) {
-		return fmt.Errorf("run footer count is %d, pointer requires %d", count, r.expectedCount)
+		return corruptf("run footer count is %d, pointer requires %d", count, r.expectedCount)
 	}
 	if _, err := r.raw.ReadByte(); err == nil {
-		return fmt.Errorf("run has data after footer")
+		return corruptf("run has data after footer")
 	} else if err != io.EOF {
 		return fmt.Errorf("check run end: %w", err)
 	}
+	r.done = true
 	return nil
+}
+
+// verify reads the checksum that follows parts and checks it against the
+// chain, advancing the chain when it matches.
+func (r *encodedIntermediateReader) verify(parts ...[]byte) error {
+	var got [8]byte
+	if _, err := io.ReadFull(r.raw, got[:]); err != nil {
+		return r.short(err, "read checksum")
+	}
+	want := chainSum(r.prev, parts...)
+	if got != want {
+		return corruptf("checksum is %x, want %x, after %d records", got, want, r.readCount)
+	}
+	r.prev = got
+	return nil
+}
+
+// readUvarint reads one uvarint from the stream, returning it along with buf
+// extended by its encoded bytes, which the frame's checksum covers.
+func (r *encodedIntermediateReader) readUvarint(buf []byte, what string) (uint64, []byte, error) {
+	var n uint64
+	for i := 0; i < binary.MaxVarintLen64; i++ {
+		b, err := r.raw.ReadByte()
+		if err != nil {
+			return 0, buf, r.short(err, "read %s", what)
+		}
+		buf = append(buf, b)
+		if b < 0x80 {
+			if i == binary.MaxVarintLen64-1 && b > 1 {
+				return 0, buf, corruptf("%s overflows 64 bits", what)
+			}
+			return n | uint64(b)<<uint(7*i), buf, nil
+		}
+		n |= uint64(b&0x7f) << uint(7*i)
+	}
+	return 0, buf, corruptf("%s overflows 64 bits", what)
+}
+
+// decodeRecord takes the next record from the current verified block. A block
+// whose checksum matched but which does not decode was written wrong, which is
+// as permanent as damage.
+func (r *encodedIntermediateReader) decodeRecord() (intermediateRecord, error) {
+	var lengths [3]uint64
+	for i := range lengths {
+		n, size := binary.Uvarint(r.block)
+		if size <= 0 {
+			return intermediateRecord{}, corruptf("record %d: bad field %d length", r.readCount, i)
+		}
+		lengths[i], r.block = n, r.block[size:]
+	}
+	var fields [3]string
+	for i, n := range lengths {
+		if n > uint64(len(r.block)) {
+			return intermediateRecord{}, corruptf("record %d: field %d overruns its block", r.readCount, i)
+		}
+		fields[i], r.block = string(r.block[:n]), r.block[n:]
+	}
+	r.blockLeft--
+	if r.blockLeft == 0 && len(r.block) != 0 {
+		return intermediateRecord{}, corruptf("block ending at record %d has %d bytes left over", r.readCount, len(r.block))
+	}
+	return intermediateRecord{Primary: fields[0], Secondary: fields[1], Value: fields[2]}, nil
 }
 
 func (r *encodedIntermediateReader) Close() error {
@@ -197,44 +363,6 @@ func (r *encodedIntermediateReader) Close() error {
 	}
 	r.closed = true
 	r.done = true
+	r.block, r.blockLeft = nil, 0
 	return r.body.Close()
-}
-
-type hashingReader struct {
-	r io.Reader
-	h hash.Hash64
-}
-
-func (r *hashingReader) Read(p []byte) (int, error) {
-	n, err := r.r.Read(p)
-	if n > 0 {
-		_, _ = r.h.Write(p[:n])
-	}
-	return n, err
-}
-
-func (r *hashingReader) ReadByte() (byte, error) {
-	var b [1]byte
-	if _, err := io.ReadFull(r, b[:]); err != nil {
-		return 0, err
-	}
-	return b[0], nil
-}
-
-func readUvarint(r interface{ ReadByte() (byte, error) }) (uint64, error) {
-	var n uint64
-	for i := 0; i < binary.MaxVarintLen64; i++ {
-		b, err := r.ReadByte()
-		if err != nil {
-			return 0, err
-		}
-		if b < 0x80 {
-			if i == binary.MaxVarintLen64-1 && b > 1 {
-				return 0, fmt.Errorf("uvarint overflows 64 bits")
-			}
-			return n | uint64(b)<<uint(7*i), nil
-		}
-		n |= uint64(b&0x7f) << uint(7*i)
-	}
-	return 0, fmt.Errorf("uvarint overflows 64 bits")
 }

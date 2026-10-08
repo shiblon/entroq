@@ -33,7 +33,6 @@ func TestProgressAccounting(t *testing.T) {
 		eqmr.WithMapShards(mapShards),
 		eqmr.WithReduceShards(reduceShards),
 		eqmr.WithLease(5*time.Second),
-		eqmr.WithControlInterval(10*time.Millisecond),
 	)
 	if err != nil {
 		t.Fatalf("new controller: %v", err)
@@ -148,7 +147,6 @@ func TestProgressCountsEmptyPartitions(t *testing.T) {
 		eqmr.WithMapShards(2),
 		eqmr.WithReduceShards(reduceShards),
 		eqmr.WithLease(5*time.Second),
-		eqmr.WithControlInterval(10*time.Millisecond),
 	)
 	if err != nil {
 		t.Fatalf("new controller: %v", err)

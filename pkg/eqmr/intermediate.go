@@ -28,7 +28,7 @@ type intermediateRecord struct {
 // pointer names its store completely and runs from different stores can mix.
 type intermediateRun struct {
 	Partition int             `json:"partition"`
-	Store     storeDescriptor `json:"store"`
+	Store     Descriptor      `json:"store"`
 	Ref       json.RawMessage `json:"ref"`
 }
 
@@ -38,22 +38,30 @@ type intermediateReader interface {
 	Close() error
 }
 
-// intermediateStore persists and opens immutable sorted runs. put receives a
-// complete bounded run; readers expose records one at a time so file-backed
-// stores need not materialize the run when they are added.
-type intermediateStore interface {
-	descriptor() storeDescriptor
-	put(context.Context, []intermediateRecord) (json.RawMessage, error)
-	open(context.Context, json.RawMessage) (intermediateReader, error)
-	delete(context.Context, json.RawMessage) error
+// IntermediateStore holds a run's intermediate data: the sorted immutable runs
+// mappers write and reducers merge. Its methods are unexported, so the stores
+// are the ones this package provides: the run's document store (the default),
+// NewFileStore, and stores built on the object-store protocol.
+//
+// put receives a complete bounded run and names the run it belongs to, so a
+// store can keep each run's data together; readers expose records one at a
+// time so a store need not materialize a run to serve it. sweep deletes
+// everything a store holds for a run, referenced or not.
+type IntermediateStore interface {
+	descriptor() Descriptor
+	put(ctx context.Context, run string, records []intermediateRecord) (json.RawMessage, error)
+	open(ctx context.Context, ref json.RawMessage) (intermediateReader, error)
+	delete(ctx context.Context, ref json.RawMessage) error
+	sweep(ctx context.Context, run string) error
 }
 
-// intermediateSink owns partitioning, buffering, sorting, combining, and run
+// intermediateWriter owns partitioning, buffering, sorting, combining, and run
 // cutting for one map attempt. Runs are durable before finish returns, but are
 // invisible to reducers until the mapper publishes their pointers atomically
 // with its split deletion.
-type intermediateSink struct {
-	store      intermediateStore
+type intermediateWriter struct {
+	store      IntermediateStore
+	run        string
 	partitions int
 	maxBytes   int
 	combiner   Combiner
@@ -65,12 +73,13 @@ type intermediateSink struct {
 	err     error
 }
 
-func newIntermediateSink(store intermediateStore, partitions, maxBytes int, combiner Combiner) *intermediateSink {
+func newIntermediateWriter(store IntermediateStore, run string, partitions, maxBytes int, combiner Combiner) *intermediateWriter {
 	if maxBytes <= 0 {
 		maxBytes = DefaultIntermediateRunBytes
 	}
-	return &intermediateSink{
+	return &intermediateWriter{
 		store:      store,
+		run:        run,
 		partitions: partitions,
 		maxBytes:   maxBytes,
 		combiner:   combiner,
@@ -79,7 +88,7 @@ func newIntermediateSink(store intermediateStore, partitions, maxBytes int, comb
 	}
 }
 
-func (s *intermediateSink) write(ctx context.Context, primary, secondary, value string) error {
+func (s *intermediateWriter) write(ctx context.Context, primary, secondary, value string) error {
 	if s.err != nil {
 		return s.err
 	}
@@ -101,7 +110,7 @@ func intermediateRecordBytes(record intermediateRecord) int {
 	return len(record.Primary) + len(record.Secondary) + len(record.Value) + 64
 }
 
-func (s *intermediateSink) flushLargest(ctx context.Context) error {
+func (s *intermediateWriter) flushLargest(ctx context.Context) error {
 	partition := -1
 	for p, size := range s.sizes {
 		if size > 0 && (partition < 0 || size > s.sizes[partition]) {
@@ -114,7 +123,7 @@ func (s *intermediateSink) flushLargest(ctx context.Context) error {
 	return s.flush(ctx, partition)
 }
 
-func (s *intermediateSink) flush(ctx context.Context, partition int) error {
+func (s *intermediateWriter) flush(ctx context.Context, partition int) error {
 	records := s.buffers[partition]
 	if len(records) == 0 {
 		return nil
@@ -135,7 +144,7 @@ func (s *intermediateSink) flush(ctx context.Context, partition int) error {
 	}
 
 	for _, runRecords := range cutIntermediateRecords(records, s.maxBytes) {
-		ref, err := s.store.put(ctx, runRecords)
+		ref, err := s.store.put(ctx, s.run, runRecords)
 		if err != nil {
 			return fmt.Errorf("write intermediate run for partition %d: %w", partition, err)
 		}
@@ -149,7 +158,7 @@ func (s *intermediateSink) flush(ctx context.Context, partition int) error {
 	return nil
 }
 
-func (s *intermediateSink) clearBuffer(partition int) {
+func (s *intermediateWriter) clearBuffer(partition int) {
 	s.total -= s.sizes[partition]
 	s.buffers[partition] = nil
 	s.sizes[partition] = 0
@@ -215,7 +224,7 @@ func combineRun(ctx context.Context, records []intermediateRecord, combiner Comb
 	return out, nil
 }
 
-func (s *intermediateSink) finish(ctx context.Context) ([]intermediateRun, error) {
+func (s *intermediateWriter) finish(ctx context.Context) ([]intermediateRun, error) {
 	if s.err != nil {
 		return nil, s.err
 	}
@@ -228,7 +237,7 @@ func (s *intermediateSink) finish(ctx context.Context) ([]intermediateRun, error
 	return append([]intermediateRun(nil), s.runs...), nil
 }
 
-func (s *intermediateSink) abort(ctx context.Context) error {
+func (s *intermediateWriter) abort(ctx context.Context) error {
 	var errs []error
 	for _, run := range s.runs {
 		if err := s.store.delete(ctx, run.Ref); err != nil {

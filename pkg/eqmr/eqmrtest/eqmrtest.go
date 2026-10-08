@@ -94,33 +94,24 @@ type Config struct {
 	Combiner     eqmr.Combiner
 	Seed         int64
 
-	// Lease and ControlInterval are passed through to eqmr.Config. Zero uses
-	// the test defaults below rather than eqmr's, which are sized for a
-	// deployment: a one-second control tick makes even a trivial check take
-	// several seconds of pure waiting.
-	Lease           time.Duration
-	ControlInterval time.Duration
+	// Lease is passed through to eqmr.Config. Zero uses the test default below
+	// rather than eqmr's, which is sized for a deployment.
+	Lease time.Duration
 }
 
-// Intervals applied when a Config leaves them zero.
+// testLease applies when a Config leaves Lease zero.
 //
 // The lease has to outlast a single unit of work. A reduce unit is a whole
 // partition, so its duration grows with how much the map phase sent there; the
 // value here covers the largest partition these helpers produce under a process
 // running hundreds of workers.
-const (
-	testLease           = 30 * time.Second
-	testControlInterval = 25 * time.Millisecond
-)
+const testLease = 30 * time.Second
 
 // Check runs a word-count MapReduce over a generated corpus and verifies the
 // output against the histogram that produced it.
 func Check(ctx context.Context, eq *entroq.EntroQ, cfg Config) error {
 	if cfg.Lease == 0 {
 		cfg.Lease = testLease
-	}
-	if cfg.ControlInterval == 0 {
-		cfg.ControlInterval = testControlInterval
 	}
 	prefix := cfg.Prefix
 	if prefix == "" {
@@ -137,7 +128,6 @@ func Check(ctx context.Context, eq *entroq.EntroQ, cfg Config) error {
 		eqmr.WithMapShards(cfg.MapShards),
 		eqmr.WithReduceShards(cfg.ReduceShards),
 		eqmr.WithLease(cfg.Lease),
-		eqmr.WithControlInterval(cfg.ControlInterval),
 	)
 	if err != nil {
 		return fmt.Errorf("eqmrtest: %w", err)

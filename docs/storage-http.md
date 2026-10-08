@@ -19,20 +19,36 @@ unbounded streams with ordinary HTTP backpressure.
 
 Every object written by eqmr is one versioned immutable run:
 
-1. The eight-byte header `45 51 4d 52 52 55 4e 01` (`EQMRRUN` followed by
-   version byte 1).
-2. Zero or more record frames. A frame starts with tag byte `01`, followed by
-   unsigned varint lengths for primary key, secondary key, and value, followed
-   by those three byte strings in the same order.
+1. The eight-byte header `45 51 4d 52 52 55 4e 02` (`EQMRRUN` followed by
+   version byte 2).
+2. One or more block frames. A block starts with tag byte `01`, followed by the
+   unsigned varint number of records in the block, the unsigned varint length
+   of its payload in bytes, the payload, and an eight-byte big-endian xxHash64
+   checksum. The payload is the block's records back to back; each is the
+   unsigned varint lengths of its primary key, secondary key, and value,
+   followed by those three byte strings in the same order.
 3. One footer frame. It starts with tag byte `00`, followed by the unsigned
-   varint record count and an eight-byte big-endian xxHash64 checksum.
-4. End of stream. Bytes after the checksum are invalid.
+   varint record count of the whole run and an eight-byte big-endian xxHash64
+   checksum.
+4. End of stream. Bytes after the footer's checksum are invalid.
 
-The checksum covers every byte from the header through the encoded footer
-count; it does not cover the checksum itself. The pointer published in EntroQ
-also carries the record count, and readers require the pointer, footer, and
-number of decoded frames to agree. A record's three fields may total at most 64
-MiB. Empty fields are valid.
+Checksums are chained. Each covers the eight bytes of the previous checksum
+followed by its own frame from the tag through the end of its payload (for the
+footer, through its count). The first block's previous checksum is the
+xxHash64 of the eight header bytes. A missing, repeated, reordered, or foreign
+block therefore breaks the chain, as does any damage within a block.
+
+Writers close a block once its payload reaches 64 KiB, so a reader holds one
+block at a time and verifies it before yielding any of its records: damaged
+data is rejected before anything uses it. A record larger than that makes a
+block of its own. A record's three fields may total at most 64 MiB, and a block
+holds at least one record. Empty fields are valid.
+
+The pointer published in EntroQ also carries the record count, and readers
+require the pointer, the footer, and the number of decoded records to agree.
+A run whose bytes are wrong, or that is short although its source ended
+cleanly, is corrupt, and reading it again cannot help; one whose source broke
+off partway may read whole on a retry.
 
 Records are sorted by `(primary, secondary, value)` before encoding. The object
 driver treats this format as opaque and therefore needs no codec implementation.
@@ -56,9 +72,11 @@ run must observe the identity recorded when that run was created.
 
 ## Put
 
-`PUT /v1/objects/{object-id}` streams an `application/octet-stream` request
-body. Eqmr chooses a globally unique, URL-safe object ID before starting the
-request.
+`PUT /v1/objects/{object-id}?run={run}` streams an `application/octet-stream`
+request body. Eqmr chooses a globally unique, URL-safe object ID before starting
+the request. `run` names the run the object belongs to, so the driver can keep a
+run's objects together however suits its backend; it is opaque text, URL-encoded
+in the query.
 
 The driver must make the object visible atomically and durably by its backend's
 rules before responding. A successful first write returns `201 Created`; an
@@ -94,6 +112,22 @@ format, record count, and checksum while consuming the body.
 `POST /v1/delete` sends the same reference envelope. Deletion is idempotent:
 the driver returns `204 No Content` whether it removed the object now or it was
 already absent.
+
+## Sweep
+
+`POST /v1/sweep` tells the driver that a run has ended:
+
+```json
+{"run":"/wordcount/run-1"}
+```
+
+The driver may then delete everything it holds for that run, however it knows
+how: a prefix delete, a lifecycle rule, a directory removal. Eqmr sends it once
+the run is done or failed, and anything still referenced is no longer needed by
+then. Sweeping collects what nothing references, such as objects from workers
+that crashed after writing, so it is best effort: the driver returns
+`204 No Content` once it has deleted the run's objects or arranged for their
+deletion, and must accept a repeat for a run already swept.
 
 ## Errors
 

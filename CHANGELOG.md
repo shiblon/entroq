@@ -26,11 +26,15 @@ service.
   language-neutral child-process protocol and implements its internal client,
   canonical framed-run codec, and object-backed intermediate-store adapter.
   Idempotent put, open, and delete stream over locally selected HTTP transport
-  such as stdin/stdout or a Unix socket, while xxHash64 footers detect corrupt
-  or partial runs. Map tasks and run pointers record a credential-free store
+  such as stdin/stdout or a Unix socket. Runs are written in chained,
+  xxHash64-checksummed blocks closed by a counted footer, so a reader verifies
+  each block before using any of its records; a corrupt run fails its run at
+  once instead of being retried. Map tasks and run pointers record a credential-free store
   descriptor (logical name, versioned driver, store identity), and a worker
   refuses to read or write a run through a different store that shares its
-  name. Process launching and controller selection remain follow-up work.
+  name. Put names the run an object belongs to, and `POST /v1/sweep` tells a
+  driver a run has ended. Launching driver processes and a public constructor
+  for HTTP stores remain follow-up work.
 - **Readiness loops for SQLite and Redis.** Both backends now wake claims for
   tasks that become available with time, every `WithReadinessInterval`
   (default 5s; `--readiness_interval` on `eqsqlite serve` and `eqredis serve`),
@@ -60,6 +64,46 @@ service.
   the two runs that share its process-wide session doc claim, and the work
   gateway now claims under one claimant per connection, so foreign workers on
   different connections no longer share doc claims.
+- **Breaking (experimental): eqmr's controller reacts to finish tasks.** The
+  polling control loop is replaced by controller workers, and only they write
+  run state.
+  - Mappers and reducers commit a finish task atomically with deleting their
+    own task. The controller accepts the first finish for each unit while
+    claiming only that unit's input, and each acceptance commits a check task
+    that alone decides whether its phase is over, so the run's state doc is
+    claimed only at phase boundaries and acceptances never contend.
+  - `Setup` stages its splits and then creates the run and every map task in
+    one commit, so it can be retried with the same input; empty input is an
+    error. Reduce tasks are created only for partitions that received data,
+    and a run whose input maps to nothing goes straight to done.
+  - Output goes to a `Sink` (`WithSink`), which owns its format and readiness.
+    Reducers stream results into a staged attempt and their finish task
+    carries only a reference to it; the controller commits the first attempt
+    per partition and calls `Sink.Finish`, naming the partitions that received
+    no data, before the run is done. The default document sink keeps output in
+    the run's namespace for small jobs, `Results` reads it, and it refuses a
+    result that is not valid NUL-free UTF-8, which nothing checked before.
+    `Descriptor` is now exported, since sinks are user-provided.
+  - `NewFileStore` keeps intermediate runs as files, one directory per run,
+    each written once under a unique name and synced before it is referenced,
+    chosen with `WithIntermediateStore`; the document store remains the
+    default.
+  - Collection: a losing map finish's runs and a reduced partition's consumed
+    runs are deleted by a `gc` worker as soon as they are retired. Staged
+    output is never deleted that way; when a run ends, done or failed, its
+    store and sink are swept of everything nothing committed, which also
+    collects what crashed workers wrote and never reported.
+  - Failure: each worker quarantines to its own `<queue>/err`, and an error
+    worker retires quarantined duplicates whose unit is already complete,
+    failing the run with the task's reason otherwise and keeping the task in
+    `<prefix>/quarantine`. A corrupt intermediate run, a sink error marked
+    with a `worker.MoveError`, and a store or sink a process cannot reach all
+    fail the run at once with a reason; only a backend known to be
+    unavailable is retried.
+  - Removed: stall detection, with `WithControlInterval` and
+    `WithStallTimeout`; `ControlWorker`, `ControlQ`, `ErrQ`, and `Cleanup`.
+    `Progress` is derived from the run's docs, and `Run` returns only after the
+    run's intermediates are collected.
 - **Breaking: PostgreSQL no longer uses LISTEN/NOTIFY.** The service is the
   database's only client, so the backend now runs the same readiness loop as
   the other backends: a batched, read-only count of available tasks on the
