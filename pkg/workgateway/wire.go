@@ -147,3 +147,57 @@ func claimsFromWire(claims []wireClaim) ([]entroq.DocClaimArg, error) {
 	}
 	return args, nil
 }
+
+// The read request and response wrappers. A read is the same request and the
+// same response message the gRPC service uses, so a client that already
+// generated its types for one has them for the other, and neither side
+// invents a query language.
+type wireTasksReq struct{ *pb.TasksRequest }
+
+func (w wireTasksReq) MarshalJSON() ([]byte, error) { return protojson.Marshal(w.TasksRequest) }
+
+func (w *wireTasksReq) UnmarshalJSON(b []byte) error {
+	w.TasksRequest = new(pb.TasksRequest)
+	return protojson.Unmarshal(b, w.TasksRequest)
+}
+
+type wireDocsReq struct{ *pb.DocsRequest }
+
+func (w wireDocsReq) MarshalJSON() ([]byte, error) { return protojson.Marshal(w.DocsRequest) }
+
+func (w *wireDocsReq) UnmarshalJSON(b []byte) error {
+	w.DocsRequest = new(pb.DocsRequest)
+	return protojson.Unmarshal(b, w.DocsRequest)
+}
+
+// wireMatchReq is the query for both queues and namespaces, which ask the same
+// question of different things: match these prefixes, match these names, stop
+// at this many.
+type wireMatchReq struct{ *pb.QueuesRequest }
+
+func (w wireMatchReq) MarshalJSON() ([]byte, error) { return protojson.Marshal(w.QueuesRequest) }
+
+func (w *wireMatchReq) UnmarshalJSON(b []byte) error {
+	w.QueuesRequest = new(pb.QueuesRequest)
+	return protojson.Unmarshal(b, w.QueuesRequest)
+}
+
+type wireQueueStats struct{ *pb.QueueStats }
+
+func (w wireQueueStats) MarshalJSON() ([]byte, error) { return protojson.Marshal(w.QueueStats) }
+
+func (w *wireQueueStats) UnmarshalJSON(b []byte) error {
+	w.QueueStats = new(pb.QueueStats)
+	return protojson.Unmarshal(b, w.QueueStats)
+}
+
+type wireNamespaceStat struct{ *pb.NamespaceStat }
+
+func (w wireNamespaceStat) MarshalJSON() ([]byte, error) {
+	return protojson.Marshal(w.NamespaceStat)
+}
+
+func (w *wireNamespaceStat) UnmarshalJSON(b []byte) error {
+	w.NamespaceStat = new(pb.NamespaceStat)
+	return protojson.Unmarshal(b, w.NamespaceStat)
+}

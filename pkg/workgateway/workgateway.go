@@ -106,6 +106,11 @@ const (
 	SendQueues     SendType = "queues"
 	SendNamespaces SendType = "namespaces"
 	SendQuit       SendType = "quit"
+
+	// SendError answers a read that failed. It is the read failing, not the
+	// session: the client hears why and decides, and the task in hand is
+	// untouched.
+	SendError SendType = "error"
 )
 
 // SendMessage is the wire type for outbound messages from the gateway to the client.
@@ -136,9 +141,16 @@ type SendMessage struct {
 	Class   string `json:"class,omitempty"`
 	Message string `json:"message,omitempty"`
 
+	// A read answers in exactly one of these, named by Type, and each carries
+	// the content of the gRPC service response for the same read.
+	Tasks      []wireTask          `json:"tasks,omitempty"`
+	Docs       []wireDoc           `json:"docs,omitempty"`
+	Queues     []wireQueueStats    `json:"queues,omitempty"`
+	Namespaces []wireNamespaceStat `json:"namespaces,omitempty"`
+
 	// TimeMs answers a time read, in epoch millis, the way every other instant
 	// in EntroQ is carried.
-	TimeMs int64 `json:"time_ms"`
+	TimeMs int64 `json:"time_ms,omitempty"`
 }
 
 // RecvType is the type of message received from the client.
@@ -178,6 +190,13 @@ type RecvMessage struct {
 	// outcomes it accompanies are decisions the worker acts on, and a client
 	// should never have to encode one of those in prose.
 	Error *TaskError `json:"error,omitempty"`
+
+	// A read request carries exactly one of these, named by Type. They are the
+	// gRPC service request messages, so a client asks the question EntroQ
+	// already answers rather than learning a query language of this protocol.
+	TasksQuery *wireTasksReq `json:"tasks_query,omitempty"`
+	DocsQuery  *wireDocsReq  `json:"docs_query,omitempty"`
+	MatchQuery *wireMatchReq `json:"match_query,omitempty"`
 
 	// Quit asks the gateway to finish this task and then stop claiming.
 	//
@@ -396,23 +415,6 @@ func (g *Gateway) recv(ctx context.Context, expect RecvType) (*RecvMessage, erro
 		}
 		return msg, nil
 	}
-}
-
-func (g *Gateway) handleReadAndRespond(ctx context.Context, msg *RecvMessage) error {
-	switch msg.Type {
-	case RecvTime:
-		t, err := g.client.Time(ctx)
-		if err != nil {
-			return fmt.Errorf("recv time: %w", err)
-		}
-		reply := g.newSend(SendTime, "")
-		reply.TimeMs = t.UnixMilli()
-		if err := g.conn.Send(ctx, reply); err != nil {
-			return fmt.Errorf("send time: %w", err)
-		}
-		// TODO - other read cases, tasks, docs, queues, namespaces
-	}
-	return nil
 }
 
 // MakeDoModify makes a DoModify handler for this gateway that can be passed into a Run.

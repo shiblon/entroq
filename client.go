@@ -65,6 +65,7 @@ type Reader interface {
 	Docs(ctx context.Context, rq *DocQuery) ([]*Doc, error)
 	Tasks(ctx context.Context, queue string, opts ...TasksOpt) ([]*Task, error)
 	Queues(ctx context.Context, opts ...QueuesOpt) (map[string]int, error)
+	NamespaceStats(ctx context.Context, opts ...QueuesOpt) (map[string]*NamespaceStat, error)
 	Time(ctx context.Context) (time.Time, error)
 
 	// ID is the claimant the client behind this reader holds things as. It
@@ -155,6 +156,10 @@ func (c *scopedClient) Docs(ctx context.Context, rq *DocQuery) ([]*Doc, error) {
 
 func (c *scopedClient) Tasks(ctx context.Context, queue string, opts ...TasksOpt) ([]*Task, error) {
 	return c.eq.Tasks(ctx, queue, opts...)
+}
+
+func (c *scopedClient) NamespaceStats(ctx context.Context, opts ...QueuesOpt) (map[string]*NamespaceStat, error) {
+	return c.eq.NamespaceStats(ctx, opts...)
 }
 
 func (c *scopedClient) Queues(ctx context.Context, opts ...QueuesOpt) (map[string]int, error) {
