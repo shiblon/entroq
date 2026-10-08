@@ -69,6 +69,13 @@ type Bridge struct {
 	lease         time.Duration
 	entroqTimeout time.Duration
 	connLost      bool
+
+	// claimant is this connection's identity for every claim the gateway
+	// holds on its worker's behalf. It is fixed for the life of the Bridge, so
+	// a worker restarted on the same connection still holds what it held, and
+	// distinct from every other connection, so no two foreign workers can
+	// claim the same doc at once.
+	claimant string
 }
 
 // Option configures a Bridge at construction.
@@ -104,7 +111,12 @@ func WithEntroQTimeout(d time.Duration) Option {
 // entroq.DefaultClaimDuration and the EntroQ timeout to defaultEntroQTimeout;
 // supply WithConfig to register the worker.
 func NewBridge(conn Conn, opts ...Option) *Bridge {
-	b := &Bridge{conn: conn, lease: entroq.DefaultClaimDuration, entroqTimeout: defaultEntroQTimeout}
+	b := &Bridge{
+		conn:          conn,
+		lease:         entroq.DefaultClaimDuration,
+		entroqTimeout: defaultEntroQTimeout,
+		claimant:      entroq.GenHex16(),
+	}
 	for _, opt := range opts {
 		opt(b)
 	}
@@ -216,6 +228,7 @@ func (b *Bridge) runWorker(ctx context.Context, eq *entroq.EntroQ) error {
 		worker.WithLease(b.lease),
 		worker.WithMaxAttempts(b.cfg.MaxAttempts),
 		worker.WithMaxClaims(b.cfg.MaxClaims),
+		worker.WithClaimant(b.claimant),
 	)
 }
 

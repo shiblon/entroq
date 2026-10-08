@@ -176,7 +176,12 @@ func (r *Receiver) Run(ctx context.Context, inbox string) error {
 	)
 	for range r.cfg.concurrency {
 		g.Go(func() error {
-			if err := bootstrap.Run(gctx, worker.Watching(inbox)); err != nil {
+			// The session doc's claim belongs to this process, not to one
+			// run: bootstrap inserts it claimed, runSession claims it again
+			// through the client, and the response lane takes it over. All
+			// three must be the same claimant, so this run opts out of the
+			// per-run default and uses the client's.
+			if err := bootstrap.Run(gctx, worker.Watching(inbox), worker.WithClaimant("")); err != nil {
 				return fmt.Errorf("receiver bootstrap: %w", err)
 			}
 			return nil
@@ -467,6 +472,9 @@ func (r *Receiver) runResponseWorkers(ctx context.Context, start sessionStart, s
 		err := responseWorker.Run(workerCtx,
 			worker.Watching(state.responseLanes.local.queue),
 			worker.WithLease(r.cfg.heartbeat.timeout),
+			// This lane takes over the process's claim on the session doc;
+			// see the bootstrap run in Run.
+			worker.WithClaimant(""),
 		)
 		workerErr := workerCtx.Err()
 		stopWorker()

@@ -643,6 +643,9 @@ type RenewConfig struct {
 	Interval time.Duration
 	Tasks    []*Task
 	Docs     []*Doc
+	// Claimant renews as this claimant instead of the client's own. It must
+	// be the claimant that holds the tasks and docs.
+	Claimant string
 }
 
 // NewRenewConfig creates a RenewConfig from the given options.
@@ -693,6 +696,14 @@ func RenewingDoc(d *Doc) RenewOption {
 	}
 }
 
+// RenewingAs renews as the given claimant rather than the client's own. Empty
+// means the client's claimant.
+func RenewingAs(claimant string) RenewOption {
+	return func(rc *RenewConfig) {
+		rc.Claimant = claimant
+	}
+}
+
 // WithRenewInterval sets the lease time for renewed tasks.
 func WithRenewInterval(dt time.Duration) RenewOption {
 	return func(rc *RenewConfig) {
@@ -712,12 +723,12 @@ func (c *EntroQ) Renew(ctx context.Context, opts ...RenewOption) (*RenewResponse
 	if len(conf.Tasks) == 0 && len(conf.Docs) == 0 {
 		return nil, fmt.Errorf("renew: no docs or tasks specified")
 	}
-	// Note that we use the default claimant always in this situation. These
-	// functions are high-level user-friendly things and don't allow some of
-	// the other hocus pocus that might happen in a grpc proxy situation (where
-	// claimant IDs need to come from the request, not the client it uses to
-	// perform its work).
+	// The client's claimant is used unless RenewingAs names another, as a
+	// worker running under its own claimant must.
 	var modArgs []ModifyArg
+	if conf.Claimant != "" {
+		modArgs = append(modArgs, ModifyAs(conf.Claimant))
+	}
 	var taskIDs []string
 	var docIDs []string
 	for _, t := range conf.Tasks {

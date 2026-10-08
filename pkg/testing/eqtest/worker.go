@@ -57,6 +57,9 @@ func simpleWorkerOnce(ctx context.Context, t *testing.T, client *entroq.EntroQ, 
 
 	g, ctx := errgroup.WithContext(ctx)
 
+	// Run under a known claimant, so the comparison below checks that the
+	// worker really claimed as it rather than as the client.
+	claimant := entroq.GenHex16()
 	var consumed []*entroq.Task
 	g.Go(func() error {
 		return worker.New(client,
@@ -71,7 +74,7 @@ func simpleWorkerOnce(ctx context.Context, t *testing.T, client *entroq.EntroQ, 
 				_, err := mod.Modify(ctx, task.Delete())
 				return err
 			}),
-		).Run(ctx, worker.Watching(queue))
+		).Run(ctx, worker.Watching(queue), worker.WithClaimant(claimant))
 	})
 
 	// Brief pause to let the worker goroutine reach its Claim call before we
@@ -111,7 +114,7 @@ func simpleWorkerOnce(ctx context.Context, t *testing.T, client *entroq.EntroQ, 
 		t.Fatalf("Worker exit error: %v", err)
 	}
 
-	if diff := EqualAllTasksUnorderedSkipTimesAndCounters(inserted, consumed, expectVersionIncr(1)); diff != "" {
+	if diff := EqualAllTasksUnorderedSkipTimesAndCounters(inserted, consumed, expectVersionIncr(1), expectClaimant(claimant)); diff != "" {
 		showQueue()
 		t.Errorf("Tasks inserted not the same as tasks consumed (-want +got):\n%v", diff)
 	}
@@ -464,8 +467,11 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 		g, gctx := errgroup.WithContext(ctx)
+		// A known claimant, so a task the worker dies holding can be cleaned
+		// up below as the claimant that holds it.
+		claimant := entroq.GenHex16()
 		g.Go(func() error {
-			if err := w.Run(gctx, worker.Watching(c.input.Queue), worker.WithLease(leaseTime)); err != nil && !entroq.IsCanceled(err) {
+			if err := w.Run(gctx, worker.Watching(c.input.Queue), worker.WithLease(leaseTime), worker.WithClaimant(claimant)); err != nil && !entroq.IsCanceled(err) {
 				// Log quickly so we can see it before waits fail below.
 				log.Printf("Worker Run error: %v", err)
 				return err
@@ -487,7 +493,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 			// Delete the dead task, will always be version 1.
 			// Note: don't overwrite like this in real use.
 			c.input.Version = 1
-			if _, err := client.Modify(ctx, c.input.Delete()); err != nil {
+			if _, err := client.Modify(ctx, c.input.Delete(), entroq.ModifyAs(claimant)); err != nil {
 				t.Fatalf("Test %q tried to clean up dead task: %v", c.name, err)
 			}
 			return

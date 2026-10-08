@@ -118,6 +118,7 @@ func newTaskIDQueueVersionValue(t *entroq.Task) *taskIDQueueVersionValue {
 type cmpOpts struct {
 	versionIncr int
 	valueEmpty  bool
+	claimant    string
 }
 
 type cmpOpt func(*cmpOpts)
@@ -128,6 +129,14 @@ func expectVersionIncr(by int) cmpOpt {
 	}
 	return func(o *cmpOpts) {
 		o.versionIncr = by
+	}
+}
+
+// expectClaimant expects every task in got to be held by claimant, as a task
+// claimed by a worker running under that claimant is.
+func expectClaimant(claimant string) cmpOpt {
+	return func(o *cmpOpts) {
+		o.claimant = claimant
 	}
 }
 
@@ -153,6 +162,9 @@ func EqualAllTasksUnorderedSkipTimesAndCounters(want, got []*entroq.Task, opts .
 		}
 		if options.valueEmpty {
 			ws[i].Value = nil
+		}
+		if options.claimant != "" {
+			ws[i].Claimant = options.claimant
 		}
 	}
 	gs := make([]*taskIDQueueVersionValue, len(got))

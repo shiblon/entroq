@@ -603,7 +603,7 @@ func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, ta
 		if re.moveTo != "" {
 			q = re.moveTo
 		}
-		if _, err := w.eqc.Modify(ctx, task.RetryOrQuarantine(re.Error(), q, opts.maxAttempts, entroq.ArrivalTimeBy(delay))); err != nil {
+		if _, err := opts.modifier(w.eqc).Modify(ctx, task.RetryOrQuarantine(re.Error(), q, opts.maxAttempts, entroq.ArrivalTimeBy(delay))); err != nil {
 			if _, ok := entroq.AsDependency(err); ok {
 				// Optimistic: the task moved out from under us (already reclaimed
 				// or handled elsewhere). Known state, not fatal -- log and continue.
@@ -619,7 +619,7 @@ func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, ta
 		if me.to != "" {
 			q = me.to
 		}
-		if _, err := w.eqc.Modify(ctx, task.Quarantine(me.Error(), q)); err != nil {
+		if _, err := opts.modifier(w.eqc).Modify(ctx, task.Quarantine(me.Error(), q)); err != nil {
 			if _, ok := entroq.AsDependency(err); ok {
 				// Optimistic: the task moved out from under us (already reclaimed
 				// or handled elsewhere). Known state, not fatal -- log and continue.
@@ -643,7 +643,7 @@ func (w *Worker[T]) handleSentinelErrors(ctx context.Context, sentinel error, ta
 // Returns a *entroq.DependencyError if claiming failed; the caller inspects
 // HasMissingDocs vs HasClaimedDocs to decide whether to retry or move the
 // task to the error queue.
-func acquireDocs[T any](ctx context.Context, eqc *entroq.EntroQ, task *entroq.Task, value T, lease time.Duration, take TakeRun[T]) ([]*entroq.Doc, error) {
+func acquireDocs[T any](ctx context.Context, eqc *entroq.EntroQ, task *entroq.Task, value T, lease time.Duration, claimant string, take TakeRun[T]) ([]*entroq.Doc, error) {
 	if take == nil {
 		return nil, nil
 	}
@@ -667,6 +667,7 @@ func acquireDocs[T any](ctx context.Context, eqc *entroq.EntroQ, task *entroq.Ta
 
 	for _, cq := range req {
 		cq.Duration = lease
+		cq.Claimant = claimant
 		results, err := eqc.ClaimDocs(ctx, cq)
 		if err != nil {
 			return nil, err // caller inspects DependencyError
@@ -689,7 +690,11 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt, slot *workerSlot) 
 
 	// Phase 1: Claim task and unmarshal its value.
 	slot.set(workerIdle)
-	task, err := w.eqc.Claim(rCtx, entroq.From(opts.qs...), entroq.ClaimFor(opts.lease))
+	task, err := w.eqc.Claim(rCtx,
+		entroq.From(opts.qs...),
+		entroq.ClaimFor(opts.lease),
+		entroq.WithClaimant(opts.claimant),
+	)
 	if err != nil {
 		return fmt.Errorf("worker (%q) claim: %w", opts.qs, err)
 	}
@@ -725,7 +730,7 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt, slot *workerSlot) 
 	// Phase 2: Acquire docs before renewal starts. Doc claims are sorted by
 	// (namespace, key) to prevent dining-philosopher livelock when multiple
 	// doc groups are acquired.
-	docs, err := acquireDocs(rCtx, w.eqc, task, value, opts.lease, handler.TakeDocs)
+	docs, err := acquireDocs(rCtx, w.eqc, task, value, opts.lease, opts.claimant, handler.TakeDocs)
 	if err != nil {
 		if de, ok := entroq.AsDependency(err); ok {
 			var sentinelErr error
@@ -772,6 +777,7 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt, slot *workerSlot) 
 		entroq.RenewingTask(task),
 		entroq.RenewingDocs(docs),
 		entroq.WithRenewInterval(opts.lease),
+		entroq.RenewingAs(opts.claimant),
 	)
 
 	if sentinelErr != nil {
@@ -788,7 +794,7 @@ func (w *Worker[T]) runOne(ctx context.Context, opts *runOpt, slot *workerSlot) 
 	}
 
 	// Phase 4: Finish with stable versions — renewal has stopped.
-	if err := handler.Finish(ctx, w.eqc, finalTask, value, finalDocs); err != nil {
+	if err := handler.Finish(ctx, opts.modifier(w.eqc), finalTask, value, finalDocs); err != nil {
 		// A post-commit hook (OnDependency) may return a Retry/Move/Fatal
 		// sentinel; route it through the same machinery as a work-phase sentinel
 		// before falling back to the default dependency reclaim.
@@ -831,6 +837,7 @@ type runOpt struct {
 	maxAttempts    int32
 	maxClaims      int32
 	lease          time.Duration
+	claimant       string
 }
 
 // Watching specifies the queues Run will watch.
@@ -845,6 +852,37 @@ func WithLease(d time.Duration) RunOption {
 	return func(ro *runOpt) {
 		ro.lease = d
 	}
+}
+
+// WithClaimant runs as a specific claimant instead of the default, a fresh
+// random claimant for every Run. Everything the run does is done as that
+// claimant: claiming tasks and docs, renewing them, and committing. Empty means
+// the worker client's own claimant.
+//
+// Claims exclude other claimants only, so runs that share a claimant also share
+// doc claims: each would hold a TakeDocs doc while the others do. That is why
+// the default is per run, and why sharing is something to ask for explicitly.
+func WithClaimant(c string) RunOption {
+	return func(ro *runOpt) {
+		ro.claimant = c
+	}
+}
+
+// claimantModifier commits as a particular claimant.
+type claimantModifier struct {
+	eqc      *entroq.EntroQ
+	claimant string
+}
+
+// Modify commits args as the modifier's claimant.
+func (m claimantModifier) Modify(ctx context.Context, args ...entroq.ModifyArg) (*entroq.ModifyResponse, error) {
+	return m.eqc.Modify(ctx, append(args, entroq.ModifyAs(m.claimant))...)
+}
+
+// modifier returns the Modifier for this run: the client itself, committing as
+// the run's claimant.
+func (ro *runOpt) modifier(eqc *entroq.EntroQ) Modifier {
+	return claimantModifier{eqc: eqc, claimant: ro.claimant}
 }
 
 // WithMaxAttempts sets the maximum attempts allowed before a RetryError turns
@@ -906,9 +944,15 @@ func (w *Worker[T]) Run(ctx context.Context, opts ...RunOption) error {
 	ro := &runOpt{
 		lease:          entroq.DefaultClaimDuration,
 		baseRetryDelay: DefaultRetryDelay,
+		claimant:       entroq.GenHex16(), // default to per-run claimants
 	}
 	for _, opt := range opts {
 		opt(ro)
+	}
+	// Resolve the claimant once, so every operation below names it explicitly
+	// and none can fall back to the client's by omission.
+	if ro.claimant == "" {
+		ro.claimant = w.eqc.ID()
 	}
 
 	if len(ro.qs) == 0 {
@@ -1070,7 +1114,8 @@ func doWhileRenewing(ctx context.Context, c *entroq.EntroQ, work workFn, opts ..
 				resp, err := c.Renew(ctx,
 					entroq.RenewingTasks(renewed),
 					entroq.RenewingDocs(renewedDocs),
-					entroq.WithRenewInterval(conf.Interval))
+					entroq.WithRenewInterval(conf.Interval),
+					entroq.RenewingAs(conf.Claimant))
 				if err != nil {
 					if entroq.IsCanceled(err) {
 						out = taskCh

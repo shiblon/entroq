@@ -73,6 +73,7 @@ type session struct {
 	errc    chan error
 	clientR *io.PipeReader // client's read end; closing it breaks the bridge's Send
 	clientW *io.PipeWriter // client's write end; closing it gives the bridge's Recv EOF
+	bridge  *Bridge
 }
 
 func newSession(t *testing.T, ctx context.Context, eq *entroq.EntroQ, cfg Config, lease time.Duration, opts ...Option) *session {
@@ -93,6 +94,7 @@ func newSession(t *testing.T, ctx context.Context, eq *entroq.EntroQ, cfg Config
 		errc:    errc,
 		clientR: clientR,
 		clientW: clientW,
+		bridge:  bridge,
 	}
 }
 
@@ -474,8 +476,11 @@ func TestBridge_DocInsert(t *testing.T) {
 	if got := string(docs[0].Content); got != `"docval"` {
 		t.Errorf("doc content = %s, want %q", got, `"docval"`)
 	}
-	if docs[0].Claimant != eq.ClientID {
-		t.Errorf("doc claimant = %q, want gateway claimant %q", docs[0].Claimant, eq.ClientID)
+	if want := s.bridge.claimant; docs[0].Claimant != want {
+		t.Errorf("doc claimant = %q, want this connection's claimant %q", docs[0].Claimant, want)
+	}
+	if docs[0].Claimant == eq.ClientID {
+		t.Errorf("doc claimant is the shared client's %q; connections must not share claims", eq.ClientID)
 	}
 	if docs[0].At.Before(claimUntil.Add(-time.Second)) {
 		t.Errorf("doc at = %v, want approximately %v", docs[0].At, claimUntil)

@@ -18,6 +18,10 @@ service.
 
 ### Added
 
+- **Per-run claimants for workers.** `worker.WithClaimant` runs a worker under
+  a given claimant for everything the run does: claiming tasks and docs,
+  renewing them, and committing. `entroq.RenewingAs` renews as a given
+  claimant.
 - **Streaming HTTP object-store foundation for eqmr.** Defines the
   language-neutral child-process protocol and implements its internal client,
   canonical framed-run codec, and object-backed intermediate-store adapter.
@@ -48,6 +52,14 @@ service.
 
 ### Changed
 
+- **Workers run under a fresh claimant per `Run` by default.** A doc claim
+  excludes other claimants only, so runs sharing one client used to all hold
+  a `TakeDocs` doc at once. Each `Run` now claims, renews, and commits as its
+  own random claimant; `worker.WithClaimant("")` restores the client's
+  claimant for a run that needs to share it. The eqlink receiver does so for
+  the two runs that share its process-wide session doc claim, and the work
+  gateway now claims under one claimant per connection, so foreign workers on
+  different connections no longer share doc claims.
 - **Breaking: PostgreSQL no longer uses LISTEN/NOTIFY.** The service is the
   database's only client, so the backend now runs the same readiness loop as
   the other backends: a batched, read-only count of available tasks on the
