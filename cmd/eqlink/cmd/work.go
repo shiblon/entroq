@@ -1,13 +1,11 @@
 package cmd
 
 import (
-	"os"
+	"fmt"
 	"time"
 
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/pkg/workgateway"
 	"github.com/spf13/cobra"
-	"golang.org/x/sync/errgroup"
 )
 
 var (
@@ -91,44 +89,10 @@ WebSocket close codes (1013 transient, 1008 caller, 1011 gateway).`,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		// The first SIGINT or SIGTERM drains (see onSignal), so the
-		// connection to EntroQ outlives it: only the run's context ends early.
-		g, gctx := errgroup.WithContext(cmd.Context())
-
-		eq, err := localEQ(gctx, g)
-		if err != nil {
-			return err
-		}
-		defer eq.Close()
-
-		// WebSocket serve mode: many workers connect, each declaring its own
-		// registration via URL query params.
-		if workAddr != "" {
-			srv := workgateway.NewServer(eq, workLease, workEntroQTimeout)
-			ctx, cancel := onSignal(gctx, workLease, srv.Shutdown)
-			defer cancel()
-			return workgateway.Serve(ctx, workAddr, srv)
-		}
-
-		// stdio mode: one worker over this process's stdin/stdout, registered by
-		// this command's flags.
-		cfg := workgateway.Config{
-			Queues:      workQueues,
-			MaxAttempts: workMaxAttempts,
-			MaxClaims:   workMaxClaims,
-			TakeDocs:    workTakeDocs,
-			Work:        workWork,
-			Success:     workSuccess,
-			Dependency:  workDependency,
-			ErrorQueue:  workErrorQueue,
-			RetryDelay:  workRetryDelay,
-		}
-		bridge := workgateway.NewBridge(workgateway.NewPipeConn(os.Stdin, os.Stdout),
-			workgateway.WithConfig(cfg), workgateway.WithLease(workLease),
-			workgateway.WithEntroQTimeout(workEntroQTimeout))
-		ctx, cancel := onSignal(gctx, workLease, bridge.Shutdown)
-		defer cancel()
-		return bridge.Run(ctx, eq)
+		// TEMPORARY: pkg/workgateway is mid-rewrite for protocol 2, which the
+		// client drives. The flags and the description above are kept as the
+		// material for rewiring this command onto the new Gateway.
+		return fmt.Errorf("eqlink work is being rewired for work gateway protocol 2 and is temporarily unavailable")
 	},
 }
 
