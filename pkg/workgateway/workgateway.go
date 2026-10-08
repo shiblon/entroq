@@ -12,20 +12,31 @@ package workgateway
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"log"
 	"sync"
 
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/pbconv"
+	"github.com/shiblon/entroq/pkg/version"
 	"github.com/shiblon/entroq/pkg/worker"
 )
 
 // conn carries the turn-based protocol's JSON messages between the handler
 // implementation and the gateway. Send and Recv are from the perspective of
 // the gateway.
+// A transport reports a client that has gone away in its OWN idiom rather than
+// through anything this package invents: io.EOF when a pipe closes, a canceled
+// context when an HTTP request dies. classify treats both as a clean stop,
+// because hanging up is how a client says goodbye.
 type conn interface {
 	Send(context.Context, *SendMessage) error
 	Recv(context.Context) (*RecvMessage, error)
+
+	// Close ends the conversation, and means whatever ending it means for the
+	// transport: an HTTP service drops this connection and keeps serving
+	// everyone else, while a pipe gateway is its one session and exits.
+	Close() error
 }
 
 // Config is a worker's registration, supplied by the transport out-of-band at
@@ -82,19 +93,19 @@ var supportedVersions = []int32{1}
 // SendType is the type of a message sent to the client.
 type SendType string
 
-// Send consts indiate the type of message the gateway is sending.
+// Send consts indicate the type of message the gateway is sending.
 const (
-	SendAck                SendType = "ack"
-	SendDocs               SendType = "docs"
-	SendWork               SendType = "work"
-	SendSuccess            SendType = "success"
-	SendDependency         SendType = "dependency"
-	SendTime               SendType = "time"
-	SendDocsResponse       SendType = "docs_response"
-	SendTasksResponse      SendType = "tasks_response"
-	SendQueuesResponse     SendType = "queues_response"
-	SendNamespacesResponse SendType = "namespaces_response"
-	SendQuit               SendType = "quit"
+	SendCheck      SendType = "check"
+	SendTake       SendType = "take"
+	SendWork       SendType = "work"
+	SendSuccess    SendType = "success"
+	SendDependency SendType = "dependency"
+	SendTime       SendType = "time"
+	SendDocs       SendType = "docs"
+	SendTasks      SendType = "tasks"
+	SendQueues     SendType = "queues"
+	SendNamespaces SendType = "namespaces"
+	SendQuit       SendType = "quit"
 )
 
 // SendMessage is the wire type for outbound messages from the gateway to the client.
@@ -109,17 +120,25 @@ type SendMessage struct {
 	// Mostly informational to help clients that might have the protocol wrong.
 	Expect RecvType `json:"expect"`
 
-	Task    *entroq.Task     `json:"task"`
-	DocSets []*entroq.DocSet `json:"doc_sets"`
+	Task    *wireTask `json:"task,omitempty"`
+	DocSets []wireSet `json:"doc_sets,omitempty"`
 
-	DepErr *entroq.DependencyError `json:"dep_err"`
+	// Deps names the tasks and docs a commit depended on and did not find, so
+	// a client can tell which of them moved rather than parse a message.
+	Deps []wireDep `json:"deps,omitempty"`
+
+	// Class and Message say why the gateway will not go on. Class is an
+	// ExitClass token ("transient", "caller", "gateway"), so a client branches
+	// on whether reconnecting could help rather than reading the message.
+	//
+	// This is the SESSION failing, not a task: a task's fate travels the other
+	// way, as the Outcome a client reports.
+	Class   string `json:"class,omitempty"`
+	Message string `json:"message,omitempty"`
 
 	// TimeMs answers a time read, in epoch millis, the way every other instant
 	// in EntroQ is carried.
 	TimeMs int64 `json:"time_ms"`
-
-	// TODO: err needs to be structured
-	Err string
 }
 
 // RecvType is the type of message received from the client.
@@ -127,17 +146,17 @@ type RecvType string
 
 // Recv consts indicate the type of message the gateway has received.
 const (
-	RecvConfig         RecvType = "config"
-	RecvReady          RecvType = "ready"
-	RecvTake           RecvType = "take"
-	RecvModify         RecvType = "modify"
-	RecvTime           RecvType = "time"
-	RecvTaskQuery      RecvType = "tasks"
-	RecvDocQuery       RecvType = "docs"
-	RecvQueueQuery     RecvType = "queues"
-	RecvNamespaceQuery RecvType = "namespaces"
-	RecvError          RecvType = "error"
-	RecvQuit           RecvType = "quit"
+	RecvConfig     RecvType = "config"
+	RecvReady      RecvType = "ready"
+	RecvTake       RecvType = "take"
+	RecvModify     RecvType = "modify"
+	RecvTime       RecvType = "time"
+	RecvTasks      RecvType = "tasks"
+	RecvDocs       RecvType = "docs"
+	RecvQueues     RecvType = "queues"
+	RecvNamespaces RecvType = "namespaces"
+	RecvError      RecvType = "error"
+	RecvQuit       RecvType = "quit"
 )
 
 // RecvMessage is the wire type for inbound messages from the client to the gateway.
@@ -148,14 +167,33 @@ type RecvMessage struct {
 	// Type is the kind of message received.
 	Type RecvType `json:"type"`
 
-	DocSetClaims []*entroq.DocSetClaim `json:"doc_set_claims"`
+	// DocSetClaims names the doc sets this task needs. Valid for type "take".
+	DocSetClaims []wireClaim `json:"doc_set_claims,omitempty"`
+
+	// Outcome is the task's disposition, on a "modify" reply and on the
+	// post-commit replies. Empty means OutcomeOK.
+	Outcome Outcome `json:"outcome,omitempty"`
+
+	// Error says why, for any outcome but ok. It is structured because the
+	// outcomes it accompanies are decisions the worker acts on, and a client
+	// should never have to encode one of those in prose.
+	Error *TaskError `json:"error,omitempty"`
+
+	// Quit asks the gateway to finish this task and then stop claiming.
+	//
+	// It rides on a reply rather than arriving as a message of its own, so the
+	// result it accompanies commits before the session ends. A quit with
+	// nothing in hand would have nothing to drain.
+	Quit bool `json:"quit,omitempty"`
 
 	// Modification contains everything needed to modify tasks and docs.
 	// Valid for type "modify", always passed when work is done.
-	Modification *entroq.Modification `json:"modification"`
-
-	// TODO: err needs to be structured.
-	Err string
+	//
+	// Leave claimant_id empty: the gateway owns the claim and attributes the
+	// commit itself, and a modification that names a claimant is refused
+	// rather than silently overridden. Arrivals are durations (by_ms), never
+	// instants -- see pbconv.ModifyArgsFromProto, which validates this one.
+	Modification *wireModReq `json:"modification,omitempty"`
 }
 
 // Gateway handles all of the connections and protocol, passing data between
@@ -163,17 +201,15 @@ type RecvMessage struct {
 //
 // Protocol:
 //
-//	Client -> config        -> Gateway
-//	Client <- reject/accept -> Gateway
-//	Client -> Ready         -> Gateway
+//	Client -> Config   -> Gateway
+//	Client <- Check	   -> Gateway
+//	Client -> Ready    -> Gateway
 //	... (Gateway waits on a claim)
 //	Client <- TakeDocs      <- Gateway
-//	Client -> Docs Response -> Gateway
-//	Client <- Task, Docs    <- Gateway
-//	Client -> Modification  -> Gateway
+//	Client -> Doc Refs -> Gateway
+//	Client <- Do Work  <- Gateway
+//	Client -> Modify   -> Gateway
 //	... (Gateway waits on a claim)
-//
-//	TODO: we need to allow reading of data during work.
 //
 // One Gateway is one conn is one worker Run, and the phases talk to the conn
 // directly. They can, because they are strictly sequential: one task is in
@@ -182,6 +218,8 @@ type RecvMessage struct {
 // between tasks. Concurrency comes from more sessions, each with its own
 // Gateway and its own claimant.
 type Gateway struct {
+	sync.Mutex
+
 	conn            conn
 	protocolVersion int32
 	sessionID       string
@@ -190,16 +228,13 @@ type Gateway struct {
 	client          entroq.Client
 	config          *Config
 
-	// mu guards the session's cancellation, which Close reaches for and
-	// Handle installs. Close can arrive first, from a transport that lost its
-	// client before the worker ever started.
-	mu     sync.Mutex
-	cancel context.CancelFunc
-	closed bool
+	cancel   context.CancelFunc
+	closed   bool
+	quitting bool
 }
 
 // Start creates a new Gateway. An initial config request with a config should
-// create a new gateway with its own state and session ID, and it sends an ack.
+// create a new gateway with its own state and session ID, and it sends a check message.
 func Start(ctx context.Context, eq entroq.Client, conf *Config, conn conn) (*Gateway, error) {
 	if len(conf.ProtocolVersions) == 0 {
 		return nil, fmt.Errorf("no protocol versions requested in config: %v", conf)
@@ -239,13 +274,14 @@ func Start(ctx context.Context, eq entroq.Client, conf *Config, conn conn) (*Gat
 		g.worker = worker.New(eq, opts...)
 	}
 
-	sMsg := g.newSend(SendAck, RecvReady)
+	sMsg := g.newSend(SendCheck, RecvReady)
 	if versionErr != nil {
-		sMsg.Err = versionErr.Error()
+		sMsg.Class = ExitCaller.String()
+		sMsg.Message = versionErr.Error()
 	}
 	sMsg.Claimant = g.claimant
 	if err := g.conn.Send(ctx, sMsg); err != nil {
-		return nil, fmt.Errorf("failed ack: %w", err)
+		return nil, fmt.Errorf("send check: %w", err)
 	}
 
 	// Version failure happens after sending the version error.
@@ -276,34 +312,32 @@ func (g *Gateway) newSend(typ SendType, expect RecvType) *SendMessage {
 func (g *Gateway) Handle(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	g.mu.Lock()
+	g.Lock()
 	closed := g.closed
 	g.cancel = cancel
-	g.mu.Unlock()
+	g.Unlock()
 	if closed {
 		return fmt.Errorf("session %s was closed before it ran", g.sessionID)
 	}
 
 	msg, err := g.conn.Recv(ctx)
 	if err != nil {
-		return fmt.Errorf("handle recv: %w", err)
+		return g.exit(fmt.Errorf("handle recv: %w", err))
 	}
 	switch msg.Type {
 	case RecvQuit:
-		// TODO: structured error.
-		return fmt.Errorf("quit received")
+		// A client that quits before asking for anything has nothing in hand
+		// to drain, so this is simply goodbye.
+		return nil
 	case RecvReady:
-		if err := g.worker.Run(ctx,
+		return g.exit(g.worker.Run(ctx,
 			worker.AsClaimant(g.claimant),
 			worker.Watching(g.config.Queues...),
 			worker.WithMaxAttempts(g.config.MaxAttempts),
 			worker.WithMaxClaims(g.config.MaxClaims),
-		); err != nil {
-			return fmt.Errorf("worker run: %w", err)
-		}
-		return nil
+		))
 	default:
-		return fmt.Errorf("expected %q to begin the session, got %q", RecvReady, msg.Type)
+		return g.exit(worker.FatalErrorf("expected %q to begin the session, got %q", RecvReady, msg.Type))
 	}
 }
 
@@ -314,11 +348,22 @@ func (g *Gateway) Handle(ctx context.Context) error {
 // Whatever the worker was holding goes back the way an abandoned claim always
 // does: its lease lapses. Nothing is written on the way out.
 func (g *Gateway) Close() {
-	g.mu.Lock()
-	defer g.mu.Unlock()
+	g.Lock()
+	defer g.Unlock()
+	if g.closed {
+		return
+	}
 	g.closed = true
 	if g.cancel != nil {
 		g.cancel()
+	}
+	// Close is what a reaper calls, and what runs when something has already
+	// gone wrong, so it must not be the thing that panics: a session refused
+	// partway through Start never got a conn.
+	if g.conn != nil {
+		if err := g.conn.Close(); err != nil {
+			log.Printf("work gateway: closing session %s: %v", g.sessionID, err)
+		}
 	}
 }
 
@@ -335,7 +380,7 @@ func (g *Gateway) recv(ctx context.Context, expect RecvType) (*RecvMessage, erro
 			return nil, fmt.Errorf("gateway recv: %w", err)
 		}
 		switch msg.Type {
-		case RecvDocQuery, RecvTaskQuery, RecvNamespaceQuery, RecvQueueQuery, RecvTime:
+		case RecvDocs, RecvTasks, RecvNamespaces, RecvQueues, RecvTime:
 			if err := g.handleReadAndRespond(ctx, msg); err != nil {
 				return nil, fmt.Errorf("handle read: %w", err)
 			}
@@ -381,15 +426,68 @@ func (g *Gateway) MakeDoModify() worker.DoModifyRun[json.RawMessage] {
 		if err != nil {
 			return nil, fmt.Errorf("work: %w", err)
 		}
-		mod := worker.Modify(modifyingAll(received.Modification))
-		if g.config.SendDependency {
-			mod.OnDependency(g.MakeOnDependency())
+		// A disposition other than ok replaces the commit: the worker retries,
+		// moves or stops, and there is nothing to apply.
+		if d := g.disposition(received.Outcome, received.Error); d != nil {
+			return nil, d
 		}
-		if g.config.SendSuccess {
-			mod.OnSuccess(g.MakeOnSuccess())
+		args, err := g.modifyArgs(received.Modification)
+		if err != nil {
+			// A modification the gateway cannot make sense of is the client's
+			// fault and no retry will fix it, so the worker stops rather than
+			// claiming the task again to fail the same way.
+			return nil, worker.FatalErrorf("work modification: %v", err)
 		}
-		return mod, nil
+		if received.Quit {
+			g.quit()
+		}
+		// BOTH hooks are always registered, whatever the client asked for.
+		// They cost a wire trip only if it wants one, and the gateway needs
+		// them either way: between them they cover both outcomes of a commit,
+		// which is the only place a drain can act without losing anything.
+		return worker.Modify(args...).
+			OnSuccess(g.onSuccess()).
+			OnDependency(g.onDependency()), nil
 	}
+}
+
+// quit records that the client asked to stop. The session ends from a
+// post-commit hook rather than here, so whatever is in hand commits first.
+func (g *Gateway) quit() {
+	g.Lock()
+	defer g.Unlock()
+	g.quitting = true
+}
+
+// quitRequested reports whether a client has asked to stop.
+func (g *Gateway) quitRequested() bool {
+	g.Lock()
+	defer g.Unlock()
+	return g.quitting
+}
+
+// modifyArgs converts the modification a client asked for, through the same
+// validator the gRPC service uses: it checks what a modification must name,
+// refuses a namespace move, and resolves arrivals the one way protocol 2
+// allows -- as durations, which the server resolves on its own clock.
+//
+// A nil modification is no modification, which commits the task's own
+// disposition alone.
+func (g *Gateway) modifyArgs(mod *wireModReq) ([]entroq.ModifyArg, error) {
+	if mod == nil || mod.ModifyRequest == nil {
+		return nil, nil
+	}
+	// The claimant belongs to the run. The run's client appends its own last
+	// and would win anyway, so this refusal is not protecting the commit -- it
+	// is telling a client that believes otherwise that it is wrong.
+	if id := mod.GetClaimantId(); id != "" {
+		return nil, fmt.Errorf("modification names claimant %q: the gateway owns the claim and attributes the commit itself", id)
+	}
+	args, err := pbconv.ModifyArgsFromProto(mod.ModifyRequest, version.Protocol)
+	if err != nil {
+		return nil, err
+	}
+	return args, nil
 }
 
 // MakeCueWork makes a CueWork handler for this gateway that can be passed into
@@ -402,9 +500,17 @@ func (g *Gateway) MakeDoModify() worker.DoModifyRun[json.RawMessage] {
 // for as long as nobody collected it, and no other worker could ever have it.
 func (g *Gateway) MakeCueWork() worker.CueWorkRun[json.RawMessage] {
 	return func(ctx context.Context, _ entroq.Reader, w *worker.Work[json.RawMessage]) error {
+		task, err := taskToWire(w.Task)
+		if err != nil {
+			return worker.MoveErrorf("cue work: %v", err)
+		}
+		sets, err := setsToWire(w.Sets)
+		if err != nil {
+			return worker.MoveErrorf("cue work: %v", err)
+		}
 		msg := g.newSend(SendWork, RecvModify)
-		msg.Task = w.Task
-		msg.DocSets = w.Sets
+		msg.Task = task
+		msg.DocSets = sets
 		if err := g.conn.Send(ctx, msg); err != nil {
 			return fmt.Errorf("cue work: %w", err)
 		}
@@ -412,68 +518,69 @@ func (g *Gateway) MakeCueWork() worker.CueWorkRun[json.RawMessage] {
 	}
 }
 
-// modifyingAll adds everything the client asked for to the worker's
-// modification. A nil modification adds nothing, which commits the task's own
-// disposition alone.
+// onSuccess is the hook the worker runs after a commit lands. It tells the
+// client, if the client asked to be told, and ends the session if a quit has
+// been requested.
 //
-// The client's Claimant is deliberately not carried over: the claimant belongs
-// to the run, whose client appends its own last so that it wins regardless.
-func modifyingAll(src *entroq.Modification) entroq.ModifyArg {
-	return func(m *entroq.Modification) {
-		if src == nil {
-			return
-		}
-		m.Inserts = append(m.Inserts, src.Inserts...)
-		m.Changes = append(m.Changes, src.Changes...)
-		m.Deletes = append(m.Deletes, src.Deletes...)
-		m.Depends = append(m.Depends, src.Depends...)
-		m.Arrives = append(m.Arrives, src.Arrives...)
-		m.DocInserts = append(m.DocInserts, src.DocInserts...)
-		m.DocChanges = append(m.DocChanges, src.DocChanges...)
-		m.DocDeletes = append(m.DocDeletes, src.DocDeletes...)
-		m.DocDepends = append(m.DocDepends, src.DocDepends...)
-		m.DocArrives = append(m.DocArrives, src.DocArrives...)
-	}
-}
-
-// MakeOnSuccess makes an OnSuccess handler to be added to a modify result.
-//
-// The post-commit hooks send and receive in one phase, which costs nothing:
-// the commit has landed and renewal has stopped, so there is no claim left for
-// a slow client to hold open.
-func (g *Gateway) MakeOnSuccess() func(context.Context) error {
+// Closing here is safe in a way it would not be during work: the commit has
+// already landed, so there is nothing in flight to lose.
+func (g *Gateway) onSuccess() func(context.Context) error {
 	return func(ctx context.Context) error {
-		if err := g.conn.Send(ctx, g.newSend(SendSuccess, RecvError)); err != nil {
-			return fmt.Errorf("send success: %w", err)
+		var reported error
+		if g.config.SendSuccess {
+			reported = g.report(ctx, g.newSend(SendSuccess, RecvError))
 		}
-		received, err := g.recv(ctx, RecvError)
-		if err != nil {
-			return fmt.Errorf("success: %w", err)
+		if g.quitRequested() {
+			g.Close()
 		}
-		if received.Err != "" {
-			return errors.New(received.Err)
-		}
-		return nil
+		return reported
 	}
 }
 
-// MakeOnDependency makes an OnDependency handler to be added to a modify result.
-func (g *Gateway) MakeOnDependency() func(context.Context, *entroq.DependencyError) error {
+// onDependency is the hook the worker runs when a commit loses a dependency
+// race. The outcome the client reports picks the task fate, with the same
+// vocabulary the work phase uses -- optimistically, since the commit already
+// failed and the disposition lands only if this task was not itself what went
+// missing.
+//
+// A quit ends the session here too, and the disposition is given up to do it:
+// closing cancels the context the worker would write it on, so the task is
+// left to its lease instead, which is this hook default anyway. Nothing is
+// lost that was not already lost with the commit.
+func (g *Gateway) onDependency() func(context.Context, *entroq.DependencyError) error {
 	return func(ctx context.Context, depErr *entroq.DependencyError) error {
-		msg := g.newSend(SendDependency, RecvError)
-		msg.DepErr = depErr
-		if err := g.conn.Send(ctx, msg); err != nil {
-			return fmt.Errorf("send dependency: %w", err)
+		var reported error
+		if g.config.SendDependency {
+			msg := g.newSend(SendDependency, RecvError)
+			// Deps leads with a DETAIL entry carrying the message and then
+			// names each dependency that failed, so there is nothing a Message
+			// would add that a client is not better off reading from the list.
+			msg.Deps = depsToWire(depErr)
+			reported = g.report(ctx, msg)
 		}
-		received, err := g.recv(ctx, RecvError)
-		if err != nil {
-			return fmt.Errorf("dependency: %w", err)
+		if g.quitRequested() {
+			g.Close()
+			return nil
 		}
-		if received.Err != "" {
-			return errors.New(received.Err)
-		}
-		return nil
+		return reported
 	}
+}
+
+// report sends a post-commit message and turns the client answer into the
+// disposition the hook returns. Both hooks do the same thing with it, so they
+// say it once.
+func (g *Gateway) report(ctx context.Context, msg *SendMessage) error {
+	if err := g.conn.Send(ctx, msg); err != nil {
+		return fmt.Errorf("send %s: %w", msg.Type, err)
+	}
+	received, err := g.recv(ctx, RecvError)
+	if err != nil {
+		return fmt.Errorf("%s: %w", msg.Type, err)
+	}
+	if received.Quit {
+		g.quit()
+	}
+	return g.disposition(received.Outcome, received.Error)
 }
 
 // MakeTakeDocs makes a TakeDocs handler for this gateway that can be passed into a Run.
@@ -483,8 +590,12 @@ func (g *Gateway) MakeOnDependency() func(context.Context, *entroq.DependencyErr
 // there is nothing here for a client to say about how its docs are held.
 func (g *Gateway) MakeTakeDocs() worker.TakeRun[json.RawMessage] {
 	return func(ctx context.Context, _ entroq.Reader, w *worker.Work[json.RawMessage]) (*worker.TakeResult, error) {
-		msg := g.newSend(SendDocs, RecvTake)
-		msg.Task = w.Task
+		task, err := taskToWire(w.Task)
+		if err != nil {
+			return nil, worker.MoveErrorf("take docs: %v", err)
+		}
+		msg := g.newSend(SendTake, RecvTake)
+		msg.Task = task
 		if err := g.conn.Send(ctx, msg); err != nil {
 			return nil, fmt.Errorf("send take docs: %w", err)
 		}
@@ -492,9 +603,9 @@ func (g *Gateway) MakeTakeDocs() worker.TakeRun[json.RawMessage] {
 		if err != nil {
 			return nil, fmt.Errorf("take docs: %w", err)
 		}
-		args := make([]entroq.DocClaimArg, 0, len(received.DocSetClaims))
-		for _, c := range received.DocSetClaims {
-			args = append(args, c)
+		args, err := claimsFromWire(received.DocSetClaims)
+		if err != nil {
+			return nil, worker.FatalErrorf("take docs: %v", err)
 		}
 		return worker.Take(args...), nil
 	}
