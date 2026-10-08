@@ -45,10 +45,9 @@ type conn interface {
 // a WebSocket connection), never as a wire message. It is connection-scoped and
 // fixed for the session.
 //
-// The lease and the work timeout are deliberately NOT here. Both bound how long
-// a task can be held, so a client that could set either could pin a task for as
-// long as it liked; they are the operator's, and Start takes them as options.
-// Everything that is here only ever costs the client itself.
+// The lease is deliberately not here: there is no client knowledge in it, since
+// how fast a lost task is recovered is a property of the deployment and not of
+// the work. Start takes it as an option.
 type Config struct {
 	// Queues tells the the worker what to listen on. At least one required.
 	Queues []string `json:"queues"`
@@ -89,16 +88,26 @@ type Config struct {
 	// RetryDelayS is the base delay before a retried task is available again,
 	// in seconds. Leave at zero to use the default.
 	RetryDelayS int32 `json:"retry_delay_s"`
+
+	// WorkTimeoutS is how long this client expects to need for one task, in
+	// seconds, after which the gateway stops waiting and the task is retried
+	// with its attempt counted. Zero takes the operator's bound.
+	//
+	// The client asks because the client is what knows how long its work takes.
+	// The operator caps it with WithMaxWorkTimeout, because an unbounded wait
+	// holds a task under renewal where no other worker can reach it. A clamped
+	// request is reported back in the check, so a worker written against a
+	// budget it did not get does not merely look flaky.
+	WorkTimeoutS int32 `json:"work_timeout_s"`
 }
 
 // Option configures a gateway session at Start. These are the operator's
-// settings, as against a client's Config: each of them bounds how long a task
-// may be held, which is not a client's to decide.
+// settings, as against a client's Config.
 type Option func(*gatewayOpts)
 
 type gatewayOpts struct {
-	lease       time.Duration
-	workTimeout time.Duration
+	lease          time.Duration
+	maxWorkTimeout time.Duration
 }
 
 // WithLease sets how long a claim is held before it must be renewed, which is
@@ -110,18 +119,33 @@ func WithLease(d time.Duration) Option {
 	}
 }
 
-// WithWorkTimeout bounds how long a client may hold a task it has collected,
-// after which the task is retried with its attempt counted.
+// WithMaxWorkTimeout caps what a client may ask for in Config.WorkTimeoutS,
+// and is what a client that asks for nothing gets.
 //
-// This is what catches a client that took its work and then died: nothing on
-// the wire reports that, because a client in the middle of work owes nothing
-// but its answer, and that answer may legitimately be slow. Pass zero for no
-// bound, which leaves a hung client holding its task until the session is
-// reaped.
-func WithWorkTimeout(d time.Duration) Option {
+// Some bound is what catches a client that took its work and then died:
+// nothing on the wire reports that, because a client in the middle of work owes
+// nothing but its answer, and that answer may legitimately be slow. Pass zero
+// to let a client ask for whatever it likes, including no bound at all.
+func WithMaxWorkTimeout(d time.Duration) Option {
 	return func(o *gatewayOpts) {
-		o.workTimeout = d
+		o.maxWorkTimeout = d
 	}
+}
+
+// workTimeout is how long this session lets a client hold a task: what it
+// asked for, capped by what the operator allows, and the operator's own bound
+// when it asked for nothing.
+//
+// Zero means no bound, which only an operator can choose: a client's zero is
+// "no preference", not "forever".
+func workTimeout(want, ceiling time.Duration) time.Duration {
+	if want <= 0 {
+		return ceiling
+	}
+	if ceiling > 0 && want > ceiling {
+		return ceiling
+	}
+	return want
 }
 
 // supportedVersions indicate the gateway protocol supported by this service.
@@ -155,6 +179,11 @@ type SendMessage struct {
 	Version  int32  `json:"version"`
 	Session  string `json:"session"`
 	Claimant string `json:"claimant"`
+
+	// WorkTimeoutS, in a check, is how long this session will actually wait for
+	// a client's answer: what it asked for, or less if the operator caps it
+	// lower. Zero is no bound at all.
+	WorkTimeoutS int32 `json:"work_timeout_s,omitempty"`
 
 	Type SendType `json:"type"`
 
@@ -286,6 +315,10 @@ type Gateway struct {
 
 	opts gatewayOpts
 
+	// workTimeout is what this session settled on, which the check reports so
+	// a clamped client knows the budget it actually has.
+	workTimeout time.Duration
+
 	cancel   context.CancelFunc
 	closed   bool
 	quitting bool
@@ -313,8 +346,8 @@ func Start(ctx context.Context, eq entroq.Client, conf *Config, conn conn, optio
 	// The defaults are the worker's own, so an operator who sets nothing gets
 	// what a native worker would have done.
 	opts := gatewayOpts{
-		lease:       entroq.DefaultClaimDuration,
-		workTimeout: worker.DefaultWorkTimeout,
+		lease:          entroq.DefaultClaimDuration,
+		maxWorkTimeout: worker.DefaultWorkTimeout,
 	}
 	for _, o := range options {
 		o(&opts)
@@ -339,6 +372,8 @@ func Start(ctx context.Context, eq entroq.Client, conf *Config, conn conn, optio
 		client:          eq,
 		claimant:        claimant,
 		opts:            opts,
+		workTimeout: workTimeout(
+			time.Duration(conf.WorkTimeoutS)*time.Second, opts.maxWorkTimeout),
 	}
 	// The cue sends the work; DoModify waits for the answer. Splitting them is
 	// what keeps a client that never collects its task from pinning it: see
@@ -360,6 +395,7 @@ func Start(ctx context.Context, eq entroq.Client, conf *Config, conn conn, optio
 	// listening.
 	sMsg := g.newSend(SendCheck, RecvReady)
 	sMsg.Claimant = g.claimant
+	sMsg.WorkTimeoutS = int32(g.workTimeout / time.Second)
 	return g, sMsg, nil
 }
 
@@ -418,7 +454,7 @@ func (g *Gateway) Handle(ctx context.Context) error {
 			worker.WithMaxAttempts(g.config.MaxAttempts),
 			worker.WithMaxClaims(g.config.MaxClaims),
 			worker.WithLease(g.opts.lease),
-			worker.WithWorkTimeout(g.opts.workTimeout),
+			worker.WithWorkTimeout(g.workTimeout),
 		))
 	default:
 		return g.exit(worker.FatalErrorf("expected %q to begin the session, got %q", RecvReady, msg.Type))

@@ -91,27 +91,72 @@ func TestOperatorOptionsDefaultToTheWorkers(t *testing.T) {
 		if g.opts.lease != entroq.DefaultClaimDuration {
 			t.Errorf("lease = %v, want the client default %v", g.opts.lease, entroq.DefaultClaimDuration)
 		}
-		if g.opts.workTimeout != worker.DefaultWorkTimeout {
-			t.Errorf("workTimeout = %v, want the worker default %v", g.opts.workTimeout, worker.DefaultWorkTimeout)
+		if g.workTimeout != worker.DefaultWorkTimeout {
+			t.Errorf("workTimeout = %v, want the worker default %v", g.workTimeout, worker.DefaultWorkTimeout)
 		}
 	})
 
 	t.Run("overridden", func(t *testing.T) {
-		g, _ := startFixture(ctx, t, conf, WithLease(7*time.Second), WithWorkTimeout(time.Hour))
+		g, _ := startFixture(ctx, t, conf, WithLease(7*time.Second), WithMaxWorkTimeout(time.Hour))
 		if g.opts.lease != 7*time.Second {
 			t.Errorf("lease = %v, want 7s", g.opts.lease)
 		}
-		if g.opts.workTimeout != time.Hour {
-			t.Errorf("workTimeout = %v, want 1h", g.opts.workTimeout)
+		if g.workTimeout != time.Hour {
+			t.Errorf("workTimeout = %v, want 1h", g.workTimeout)
 		}
 	})
+}
 
-	t.Run("zero work timeout means no bound, not the default", func(t *testing.T) {
-		g, _ := startFixture(ctx, t, conf, WithWorkTimeout(0))
-		if g.opts.workTimeout != 0 {
-			t.Errorf("workTimeout = %v, want 0: an operator asking for no bound must get none", g.opts.workTimeout)
-		}
-	})
+// TestWorkTimeoutIsAskedForAndCapped covers the one setting both sides have a
+// say in: the client knows how long its work takes, and the operator knows that
+// an unbounded wait holds a task where no other worker can reach it.
+func TestWorkTimeoutIsAskedForAndCapped(t *testing.T) {
+	for name, tc := range map[string]struct {
+		want, ceiling, settled time.Duration
+	}{
+		"asking for nothing takes the cap": {0, 5 * time.Minute, 5 * time.Minute},
+		"asking for less than the cap":     {20 * time.Second, 5 * time.Minute, 20 * time.Second},
+		"asking for more than the cap":     {time.Hour, 5 * time.Minute, 5 * time.Minute},
+		"no cap honors whatever was asked": {time.Hour, 0, time.Hour},
+		"no cap and no ask is no bound":    {0, 0, 0},
+		"the cap is not a floor":           {time.Second, time.Hour, time.Second},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := workTimeout(tc.want, tc.ceiling); got != tc.settled {
+				t.Errorf("workTimeout(%v, %v) = %v, want %v", tc.want, tc.ceiling, got, tc.settled)
+			}
+		})
+	}
+}
+
+// TestTheCheckReportsTheSettledTimeout is why the clamp is visible: a worker
+// written against an hour that quietly got five minutes looks flaky rather than
+// capped, and the client is the only one who can tell the difference.
+func TestTheCheckReportsTheSettledTimeout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client, err := entroq.New(ctx, eqmem.Opener())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer client.Close()
+
+	g, check, err := Start(ctx, client, &Config{
+		Queues:           []string{"inbox"},
+		ProtocolVersions: []int32{1},
+		WorkTimeoutS:     3600,
+	}, &fakeConn{}, WithMaxWorkTimeout(90*time.Second))
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer g.Close()
+
+	if check.WorkTimeoutS != 90 {
+		t.Errorf("check reports %ds, want the 90s it was capped to", check.WorkTimeoutS)
+	}
+	if g.workTimeout != 90*time.Second {
+		t.Errorf("session holds %v, want 90s", g.workTimeout)
+	}
 }
 
 // TestStartReturnsTheCheckRatherThanSendingIt is the property an HTTP
