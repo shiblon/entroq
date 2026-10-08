@@ -14,8 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-
-	"golang.org/x/sync/errgroup"
+	"sync"
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/worker"
@@ -176,9 +175,10 @@ type RecvMessage struct {
 //
 //	TODO: we need to allow reading of data during work.
 //
-// One Gateway is one conn is one worker Run. The send and recv channels pair an
-// instruction with the phase waiting to answer it, which holds only while a
-// single task is in flight, so a second Run here would cross-wire replies
+// One Gateway is one conn is one worker Run, and the phases talk to the conn
+// directly. They can, because they are strictly sequential: one task is in
+// flight at a time, so whichever phase is running is the only thing that could
+// be speaking. A second Run here would break that and cross-wire replies
 // between tasks. Concurrency comes from more sessions, each with its own
 // Gateway and its own claimant.
 type Gateway struct {
@@ -188,11 +188,14 @@ type Gateway struct {
 	claimant        string
 	worker          *worker.Worker[json.RawMessage]
 	client          entroq.Client
+	config          *Config
 
-	config       *Config
-	workerSendCh chan *SendMessage
-	workerRecvCh chan *RecvMessage
-	cancel       context.CancelFunc
+	// mu guards the session's cancellation, which Close reaches for and
+	// Handle installs. Close can arrive first, from a transport that lost its
+	// client before the worker ever started.
+	mu     sync.Mutex
+	cancel context.CancelFunc
+	closed bool
 }
 
 // Start creates a new Gateway. An initial config request with a config should
@@ -215,9 +218,6 @@ func Start(ctx context.Context, eq entroq.Client, conf *Config, conn conn) (*Gat
 		sessionID:       session,
 		client:          eq,
 		claimant:        claimant,
-
-		workerSendCh: make(chan *SendMessage),
-		workerRecvCh: make(chan *RecvMessage),
 	}
 	var versionErr error
 	if version == 0 {
@@ -225,7 +225,11 @@ func Start(ctx context.Context, eq entroq.Client, conf *Config, conn conn) (*Gat
 	}
 
 	if versionErr == nil {
+		// The cue sends the work; DoModify waits for the answer. Splitting
+		// them is what keeps a client that never collects its task from
+		// pinning it: see worker.Handler.CueWork.
 		opts := []worker.Option[json.RawMessage]{
+			worker.WithCueWork(g.MakeCueWork()),
 			worker.WithDoModify(g.MakeDoModify()),
 		}
 		if conf.SendDocs {
@@ -262,37 +266,33 @@ func (g *Gateway) newSend(typ SendType, expect RecvType) *SendMessage {
 	}
 }
 
-// Handle does a single turn of Recv+Send. It handles all kinds of messages except configs.
+// Handle runs this session: it waits for the client to say it is ready, then
+// runs the worker loop until the client stops, the worker stops, or Close.
+//
+// It blocks for the life of the session, so a transport runs it in a goroutine
+// of its own -- and on a context of the transport's own lifetime, never one
+// request's, which would end the session as soon as the reply to config had
+// been written.
 func (g *Gateway) Handle(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	g.mu.Lock()
+	closed := g.closed
+	g.cancel = cancel
+	g.mu.Unlock()
+	if closed {
+		return fmt.Errorf("session %s was closed before it ran", g.sessionID)
+	}
+
 	msg, err := g.conn.Recv(ctx)
 	if err != nil {
 		return fmt.Errorf("handle recv: %w", err)
 	}
-
-	// TODO: this is a state machine - make sure we have the expected type *or* a read request.
 	switch msg.Type {
 	case RecvQuit:
 		// TODO: structured error.
 		return fmt.Errorf("quit received")
 	case RecvReady:
-		ctx, cancel := context.WithCancel(ctx)
-		g.cancel = cancel
-		defer cancel()
-		if err := g.runLoop(ctx); err != nil {
-			return fmt.Errorf("worker loop: %w", err)
-		}
-		return nil
-	}
-	return nil
-}
-
-// runLoop runs the worker loop.
-func (g *Gateway) runLoop(ctx context.Context) error {
-	// Start a worker. We already received "ready" from the client.
-	grp, ctx := errgroup.WithContext(ctx)
-
-	// TODO: figure out lifetimes
-	grp.Go(func() error {
 		if err := g.worker.Run(ctx,
 			worker.AsClaimant(g.claimant),
 			worker.Watching(g.config.Queues...),
@@ -302,69 +302,54 @@ func (g *Gateway) runLoop(ctx context.Context) error {
 			return fmt.Errorf("worker run: %w", err)
 		}
 		return nil
-	})
-
-	// Now listen on the worker channel.
-	// TODO: which context to use here?
-	grp.Go(func() error {
-		for {
-			// First send.
-			var sMsg *SendMessage
-			select {
-			case <-ctx.Done():
-				return fmt.Errorf("gateway send canceled (%v): %w", context.Cause(ctx), ctx.Err())
-			case sMsg = <-g.workerSendCh:
-				if err := g.conn.Send(ctx, sMsg); err != nil {
-					return fmt.Errorf("gateway hander send: %w", err)
-				}
-			}
-
-			// Then receive, possibly multiple times if they're all read requests.
-			if err := g.handleRecv(ctx, sMsg); err != nil {
-				return fmt.Errorf("gateway handle recv: %w", err)
-			}
-		}
-	})
-
-	if err := grp.Wait(); err != nil {
-		return fmt.Errorf("gateway run error: %w", err)
+	default:
+		return fmt.Errorf("expected %q to begin the session, got %q", RecvReady, msg.Type)
 	}
-	return nil
 }
 
-// handleRecv figures out what was wanted and attempts to honor it, checking expected against the sent type if not a read.
-func (g *Gateway) handleRecv(ctx context.Context, sent *SendMessage) error {
+// Close ends the session from outside it: a transport whose client has gone, or
+// a reaper that found the session idle. Safe to call more than once, and before
+// Handle has started.
+//
+// Whatever the worker was holding goes back the way an abandoned claim always
+// does: its lease lapses. Nothing is written on the way out.
+func (g *Gateway) Close() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.closed = true
+	if g.cancel != nil {
+		g.cancel()
+	}
+}
+
+// recv waits for the client's answer to the instruction a phase just sent,
+// answering any read requests that arrive first.
+//
+// Reads are interleaved WITHIN a turn rather than being turns of their own: a
+// client may ask as many questions as it likes while it decides, and the turn
+// ends only when the answer the phase is waiting for arrives.
+func (g *Gateway) recv(ctx context.Context, expect RecvType) (*RecvMessage, error) {
 	for {
-		rMsg, err := g.conn.Recv(ctx)
+		msg, err := g.conn.Recv(ctx)
 		if err != nil {
-			return fmt.Errorf("gateway handle recv: %w", err)
+			return nil, fmt.Errorf("gateway recv: %w", err)
 		}
-		switch rMsg.Type {
-		// If it's just a read, go ahead and handle it.
-		// Note that this leaves us needing to receive again, since the read
-		// handler also sends a reply.
+		switch msg.Type {
 		case RecvDocQuery, RecvTaskQuery, RecvNamespaceQuery, RecvQueueQuery, RecvTime:
-			if err := g.handleReadAndRespond(ctx, rMsg); err != nil {
-				return fmt.Errorf("handle read: %w", err)
+			if err := g.handleReadAndRespond(ctx, msg); err != nil {
+				return nil, fmt.Errorf("handle read: %w", err)
 			}
 			continue
 		case RecvQuit:
-			g.cancel()
-			return fmt.Errorf("asked to quit")
-		default:
-			if rMsg.Type != sent.Expect {
-				return fmt.Errorf("handle recv expected %v, got %v", sent.Expect, rMsg.Type)
-			}
+			// TODO: quit belongs on a work reply, so the result it carries can
+			// commit before the session ends. As a message of its own it can
+			// only arrive where an answer was due.
+			return nil, fmt.Errorf("client asked to quit while %q was due", expect)
 		}
-
-		// The phase waiting on this answer gets it, and the turn is over: the
-		// next receive waits for the next instruction to go out.
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("gateway send canceled (%v): %w", context.Cause(ctx), ctx.Err())
-		case g.workerRecvCh <- rMsg:
-			return nil
+		if msg.Type != expect {
+			return nil, fmt.Errorf("gateway recv expected %v, got %v", expect, msg.Type)
 		}
+		return msg, nil
 	}
 }
 
@@ -387,30 +372,43 @@ func (g *Gateway) handleReadAndRespond(ctx context.Context, msg *RecvMessage) er
 
 // MakeDoModify makes a DoModify handler for this gateway that can be passed into a Run.
 func (g *Gateway) MakeDoModify() worker.DoModifyRun[json.RawMessage] {
-	return func(ctx context.Context, reader entroq.Reader, w *worker.Work[json.RawMessage]) (*worker.Result, error) {
+	return func(ctx context.Context, _ entroq.Reader, _ *worker.Work[json.RawMessage]) (*worker.Result, error) {
+		// The cue already sent the work. This phase only collects the answer,
+		// and it is the half that runs under renewal -- which is the point of
+		// the split: the client has the task, so holding the claim open for it
+		// is right. Waiting for a client that never collected it would not be.
+		received, err := g.recv(ctx, RecvModify)
+		if err != nil {
+			return nil, fmt.Errorf("work: %w", err)
+		}
+		mod := worker.Modify(modifyingAll(received.Modification))
+		if g.config.SendDependency {
+			mod.OnDependency(g.MakeOnDependency())
+		}
+		if g.config.SendSuccess {
+			mod.OnSuccess(g.MakeOnSuccess())
+		}
+		return mod, nil
+	}
+}
+
+// MakeCueWork makes a CueWork handler for this gateway that can be passed into
+// a Run: it hands the task and its held doc sets to the client.
+//
+// Only the send lives here, and that placement is the whole reason it is a
+// phase of its own. Nothing renews the claim while a cue is in flight, so a
+// client that never collects its task costs this session and frees the task
+// for another worker. The same send from the work phase would renew the claim
+// for as long as nobody collected it, and no other worker could ever have it.
+func (g *Gateway) MakeCueWork() worker.CueWorkRun[json.RawMessage] {
+	return func(ctx context.Context, _ entroq.Reader, w *worker.Work[json.RawMessage]) error {
 		msg := g.newSend(SendWork, RecvModify)
 		msg.Task = w.Task
 		msg.DocSets = w.Sets
-
-		select {
-		case g.workerSendCh <- msg:
-		case <-ctx.Done():
-			return nil, fmt.Errorf("take docs send (%v): %w", context.Cause(ctx), ctx.Err())
+		if err := g.conn.Send(ctx, msg); err != nil {
+			return fmt.Errorf("cue work: %w", err)
 		}
-
-		select {
-		case received := <-g.workerRecvCh:
-			mod := worker.Modify(modifyingAll(received.Modification))
-			if g.config.SendDependency {
-				mod.OnDependency(g.MakeOnDependency())
-			}
-			if g.config.SendSuccess {
-				mod.OnSuccess(g.MakeOnSuccess())
-			}
-			return mod, nil
-		case <-ctx.Done():
-			return nil, fmt.Errorf("domodify recv canceled (%v): %w", context.Cause(ctx), ctx.Err())
-		}
+		return nil
 	}
 }
 
@@ -439,24 +437,23 @@ func modifyingAll(src *entroq.Modification) entroq.ModifyArg {
 }
 
 // MakeOnSuccess makes an OnSuccess handler to be added to a modify result.
+//
+// The post-commit hooks send and receive in one phase, which costs nothing:
+// the commit has landed and renewal has stopped, so there is no claim left for
+// a slow client to hold open.
 func (g *Gateway) MakeOnSuccess() func(context.Context) error {
 	return func(ctx context.Context) error {
-		msg := g.newSend(SendSuccess, RecvError)
-		select {
-		case g.workerSendCh <- msg:
-		case <-ctx.Done():
-			return fmt.Errorf("success recv (%v): %w", context.Cause(ctx), ctx.Err())
+		if err := g.conn.Send(ctx, g.newSend(SendSuccess, RecvError)); err != nil {
+			return fmt.Errorf("send success: %w", err)
 		}
-
-		select {
-		case received := <-g.workerRecvCh:
-			if received.Err != "" {
-				return errors.New(received.Err)
-			}
-			return nil
-		case <-ctx.Done():
-			return fmt.Errorf("recv dependency (%v): %w", context.Cause(ctx), ctx.Err())
+		received, err := g.recv(ctx, RecvError)
+		if err != nil {
+			return fmt.Errorf("success: %w", err)
 		}
+		if received.Err != "" {
+			return errors.New(received.Err)
+		}
+		return nil
 	}
 }
 
@@ -465,21 +462,17 @@ func (g *Gateway) MakeOnDependency() func(context.Context, *entroq.DependencyErr
 	return func(ctx context.Context, depErr *entroq.DependencyError) error {
 		msg := g.newSend(SendDependency, RecvError)
 		msg.DepErr = depErr
-		select {
-		case g.workerSendCh <- msg:
-		case <-ctx.Done():
-			return fmt.Errorf("send dependency (%v): %w", context.Cause(ctx), ctx.Err())
+		if err := g.conn.Send(ctx, msg); err != nil {
+			return fmt.Errorf("send dependency: %w", err)
 		}
-
-		select {
-		case received := <-g.workerRecvCh:
-			if received.Err != "" {
-				return errors.New(received.Err)
-			}
-			return nil
-		case <-ctx.Done():
-			return fmt.Errorf("recv dependency (%v): %w", context.Cause(ctx), ctx.Err())
+		received, err := g.recv(ctx, RecvError)
+		if err != nil {
+			return fmt.Errorf("dependency: %w", err)
 		}
+		if received.Err != "" {
+			return errors.New(received.Err)
+		}
+		return nil
 	}
 }
 
@@ -489,28 +482,21 @@ func (g *Gateway) MakeOnDependency() func(context.Context, *entroq.DependencyErr
 // the task's own arrival, and discards any lease or claimant in the args, so
 // there is nothing here for a client to say about how its docs are held.
 func (g *Gateway) MakeTakeDocs() worker.TakeRun[json.RawMessage] {
-	return func(ctx context.Context, reader entroq.Reader, w *worker.Work[json.RawMessage]) (*worker.TakeResult, error) {
+	return func(ctx context.Context, _ entroq.Reader, w *worker.Work[json.RawMessage]) (*worker.TakeResult, error) {
 		msg := g.newSend(SendDocs, RecvTake)
 		msg.Task = w.Task
-		select {
-		case g.workerSendCh <- msg:
-		case <-ctx.Done():
-			return nil, fmt.Errorf("take docs send (%v): %w", context.Cause(ctx), ctx.Err())
+		if err := g.conn.Send(ctx, msg); err != nil {
+			return nil, fmt.Errorf("send take docs: %w", err)
 		}
-
-		select {
-		case received := <-g.workerRecvCh:
-			if received.Type != RecvTake {
-				return nil, fmt.Errorf("invalid takedocs recv type %v", received.Type)
-			}
-			args := make([]entroq.DocClaimArg, 0, len(received.DocSetClaims))
-			for _, c := range received.DocSetClaims {
-				args = append(args, c)
-			}
-			return worker.Take(args...), nil
-		case <-ctx.Done():
-			return nil, fmt.Errorf("take docs recv (%v): %w", context.Cause(ctx), ctx.Err())
+		received, err := g.recv(ctx, RecvTake)
+		if err != nil {
+			return nil, fmt.Errorf("take docs: %w", err)
 		}
+		args := make([]entroq.DocClaimArg, 0, len(received.DocSetClaims))
+		for _, c := range received.DocSetClaims {
+			args = append(args, c)
+		}
+		return worker.Take(args...), nil
 	}
 }
 
