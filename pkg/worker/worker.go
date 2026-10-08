@@ -55,6 +55,21 @@ type ErrQMap func(inbox string) string
 // worker task errors out as retryable. This is an exponential backoff baseline.
 const DefaultRetryDelay = 30 * time.Second
 
+// DefaultWorkTimeout bounds a handler body unless WithWorkTimeout says
+// otherwise. A body that runs past it is asked to stop, and its task is
+// retried with its attempt counted.
+//
+// It is deliberately finite. An unbounded body that hangs holds its task under
+// renewal for as long as the worker lives, and no other worker can ever have
+// it, so the default that costs nothing when work is quick is the one that
+// catches that. Five minutes is long enough that ordinary work never notices
+// and short enough that a wedged worker is found the same day.
+//
+// Work that genuinely takes longer is either worth breaking into pieces, or
+// knows exactly why it is long -- a model occupying a GPU for a quarter of an
+// hour -- and says so with WithWorkTimeout, passing zero for no bound.
+const DefaultWorkTimeout = 5 * time.Minute
+
 // Handler[T] is an interface that can be implemented to define work to be done.
 // The value T is the pre-unmarshaled task value. Use T = json.RawMessage to
 // receive raw bytes without any type-level unmarshaling.
@@ -408,7 +423,8 @@ func (h *doModifyHandler[T]) DoWork(ctx context.Context, eqc entroq.Reader, r *W
 }
 
 func (h *doModifyHandler[T]) Finish(ctx context.Context, eqc entroq.Client, r *Work[T]) error {
-	finalTask, finalSets := r.Task, r.Sets
+	finalTask := r.Task
+	finalSets := r.Sets
 	// initialTask is set unconditionally by TakeDocs, which always runs before
 	// Finish, so it is non-nil here by construction.
 	//
@@ -1162,7 +1178,8 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 	// renewal share: the body is asked to stop, and renewal stops with it
 	// rather than holding a task the worker has given up on. The commit path
 	// below uses ctx, not this one, so a disposition can still be written.
-	workCtx, cancelWork := rCtx, context.CancelFunc(func() {})
+	workCtx := rCtx
+	cancelWork := context.CancelFunc(func() {})
 	if opts.workTimeout > 0 {
 		workCtx, cancelWork = context.WithTimeout(rCtx, opts.workTimeout)
 	}
@@ -1177,7 +1194,8 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 		func(ctx context.Context, stop finalizeRenew) error {
 			defer func() {
 				final := stop()
-				finalTask, finalSets = final.task, final.sets
+				finalTask = final.task
+				finalSets = final.sets
 			}()
 			if err := handler.DoWork(ctx, run.eqc, work); err != nil {
 				if !isSentinelError(err) {
@@ -1246,7 +1264,8 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 	}
 
 	// Phase 5: Finish with stable versions — renewal has stopped.
-	work.Task, work.Sets = finalTask, finalSets
+	work.Task = finalTask
+	work.Sets = finalSets
 	if err := handler.Finish(ctx, run.eqc, work); err != nil {
 		// A result that asked to be the last (Result.ThenStop) reports a clean
 		// end once its commit has landed, so the task counts as done and Run
@@ -1379,20 +1398,25 @@ func AsClaimant(id string) RunOption {
 	}
 }
 
-// WithWorkTimeout bounds how long a handler body may run. Zero, the default,
-// means it may run as long as it likes: a long-lived mostly-idle body is an
-// ordinary thing to write, and renewal exists so one can.
+// WithWorkTimeout bounds how long a handler body may run, overriding
+// DefaultWorkTimeout. Pass ZERO for no bound at all, which is the only way to
+// say that a body may run as long as it likes.
 //
-// Set it when you know roughly how long the work should take. A body that runs
-// past it has its context canceled -- which is how it is asked to stop, so a
-// body that never checks its context cannot be made to -- and the task is
-// RETRIED rather than quarantined, with its attempt counted. A hang that was
-// bad luck comes back and succeeds; a task that always hangs exhausts
-// WithMaxAttempts and is quarantined for inspection, instead of wedging a
-// worker on every claim.
+// A body that runs past the bound has its context canceled -- which is how it
+// is asked to stop, so a body that never checks its context cannot be made to
+// -- and the task is RETRIED rather than quarantined, with its attempt
+// counted. A hang that was bad luck comes back and succeeds; a task that always
+// hangs exhausts WithMaxAttempts and is quarantined for inspection, instead of
+// wedging a worker on every claim.
 //
 // Renewal stops at the deadline too, so an abandoned body is not holding the
 // task past the moment the worker gave up on it.
+//
+// The bound and the lease are separate on purpose. Before background renewal
+// existed they were one thing and a body simply had to fit inside a lease;
+// renewal untied them, and then the ability to say how long work should take
+// was lost with it. This is that knob back: the lease governs how quickly a
+// lost task is recovered, this governs how long work is allowed to take.
 func WithWorkTimeout(d time.Duration) RunOption {
 	return func(ro *runOpt) {
 		ro.workTimeout = d
@@ -1508,6 +1532,7 @@ func (w *Worker[T]) Run(ctx context.Context, opts ...RunOption) error {
 	ro := &runOpt{
 		lease:          entroq.DefaultClaimDuration,
 		baseRetryDelay: DefaultRetryDelay,
+		workTimeout:    DefaultWorkTimeout,
 	}
 	for _, opt := range opts {
 		opt(ro)
@@ -1660,7 +1685,8 @@ func RetryErrorf(format string, args ...any) *RetryError {
 // After overrides the delay before this task is retried, in place of the
 // worker's WithBaseRetryDelay. It is chainable.
 func (e *RetryError) After(d time.Duration) *RetryError {
-	e.after, e.hasAfter = d, true
+	e.after = d
+	e.hasAfter = true
 	return e
 }
 
@@ -1830,11 +1856,16 @@ func nextRenewalRetry(last, margin, interval time.Duration) time.Duration {
 // relocked returns g, and each of its docs, at lock l.
 func relocked(g, l *entroq.DocSet) *entroq.DocSet {
 	ng := *g
-	ng.Version, ng.Claimant, ng.At, ng.NumDocs = l.Version, l.Claimant, l.At, l.NumDocs
+	ng.Version = l.Version
+	ng.Claimant = l.Claimant
+	ng.At = l.At
+	ng.NumDocs = l.NumDocs
 	ng.Docs = make([]*entroq.Doc, 0, len(g.Docs))
 	for _, d := range g.Docs {
 		nd := *d
-		nd.Version, nd.Claimant, nd.At = l.Version, l.Claimant, l.At
+		nd.Version = l.Version
+		nd.Claimant = l.Claimant
+		nd.At = l.At
 		ng.Docs = append(ng.Docs, &nd)
 	}
 	return &ng
