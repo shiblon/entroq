@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/pbconv"
@@ -42,9 +43,12 @@ type conn interface {
 // Config is a worker's registration, supplied by the transport out-of-band at
 // connection time (flags/env for a spawned pipe gateway, URL params/headers for
 // a WebSocket connection), never as a wire message. It is connection-scoped and
-// fixed for the session. The lease is deliberately not here: it governs renewal
-// cadence and reclaim latency, operational concerns owned by whoever runs the
-// gateway, not by a connecting client.
+// fixed for the session.
+//
+// The lease and the work timeout are deliberately NOT here. Both bound how long
+// a task can be held, so a client that could set either could pin a task for as
+// long as it liked; they are the operator's, and Start takes them as options.
+// Everything that is here only ever costs the client itself.
 type Config struct {
 	// Queues tells the the worker what to listen on. At least one required.
 	Queues []string `json:"queues"`
@@ -85,6 +89,39 @@ type Config struct {
 	// RetryDelayS is the base delay before a retried task is available again,
 	// in seconds. Leave at zero to use the default.
 	RetryDelayS int32 `json:"retry_delay_s"`
+}
+
+// Option configures a gateway session at Start. These are the operator's
+// settings, as against a client's Config: each of them bounds how long a task
+// may be held, which is not a client's to decide.
+type Option func(*gatewayOpts)
+
+type gatewayOpts struct {
+	lease       time.Duration
+	workTimeout time.Duration
+}
+
+// WithLease sets how long a claim is held before it must be renewed, which is
+// also how long a task waits to be reclaimed when a worker dies. Shorter
+// recovers faster and renews more often.
+func WithLease(d time.Duration) Option {
+	return func(o *gatewayOpts) {
+		o.lease = d
+	}
+}
+
+// WithWorkTimeout bounds how long a client may hold a task it has collected,
+// after which the task is retried with its attempt counted.
+//
+// This is what catches a client that took its work and then died: nothing on
+// the wire reports that, because a client in the middle of work owes nothing
+// but its answer, and that answer may legitimately be slow. Pass zero for no
+// bound, which leaves a hung client holding its task until the session is
+// reaped.
+func WithWorkTimeout(d time.Duration) Option {
+	return func(o *gatewayOpts) {
+		o.workTimeout = d
+	}
 }
 
 // supportedVersions indicate the gateway protocol supported by this service.
@@ -247,19 +284,48 @@ type Gateway struct {
 	client          entroq.Client
 	config          *Config
 
+	opts gatewayOpts
+
 	cancel   context.CancelFunc
 	closed   bool
 	quitting bool
 }
 
-// Start creates a new Gateway. An initial config request with a config should
-// create a new gateway with its own state and session ID, and it sends a check message.
-func Start(ctx context.Context, eq entroq.Client, conf *Config, conn conn) (*Gateway, error) {
+// Start creates a Gateway for one client's session -- its own state, session ID
+// and claimant -- and the check that answers the config request.
+//
+// A refusal is a message rather than an error, so a nil Gateway with a non-nil
+// message means the config was refused and the message says why.
+func Start(ctx context.Context, eq entroq.Client, conf *Config, conn conn, options ...Option) (*Gateway, *SendMessage, error) {
+	if eq == nil || conn == nil || conf == nil {
+		return nil, nil, fmt.Errorf("work gateway needs a client, a config and a conn")
+	}
+	// Everything a client got wrong is answered rather than returned, and
+	// answered at config time: a registration that cannot work should not wait
+	// until the worker loop to say so.
 	if len(conf.ProtocolVersions) == 0 {
-		return nil, fmt.Errorf("no protocol versions requested in config: %v", conf)
+		return nil, refusal("config names no protocol versions; this gateway speaks %v", supportedVersions), nil
+	}
+	if len(conf.Queues) == 0 {
+		return nil, refusal("config names no queues to work on"), nil
 	}
 
-	version := highestOverlapping(conf.ProtocolVersions, supportedVersions)
+	// The defaults are the worker's own, so an operator who sets nothing gets
+	// what a native worker would have done.
+	opts := gatewayOpts{
+		lease:       entroq.DefaultClaimDuration,
+		workTimeout: worker.DefaultWorkTimeout,
+	}
+	for _, o := range options {
+		o(&opts)
+	}
+
+	speaking := highestOverlapping(conf.ProtocolVersions, supportedVersions)
+	if speaking == 0 {
+		return nil, refusal("config asks for protocols %v; this gateway speaks %v",
+			conf.ProtocolVersions, supportedVersions), nil
+	}
+
 	session := entroq.GenHex16()
 	claimant := conf.DangerousClaimantOverride
 	if claimant == "" {
@@ -268,47 +334,44 @@ func Start(ctx context.Context, eq entroq.Client, conf *Config, conn conn) (*Gat
 	g := &Gateway{
 		conn:            conn,
 		config:          conf,
-		protocolVersion: version,
+		protocolVersion: speaking,
 		sessionID:       session,
 		client:          eq,
 		claimant:        claimant,
+		opts:            opts,
 	}
-	var versionErr error
-	if version == 0 {
-		versionErr = fmt.Errorf("versions %v not supported by server, which speaks %v", conf.ProtocolVersions, supportedVersions)
+	// The cue sends the work; DoModify waits for the answer. Splitting them is
+	// what keeps a client that never collects its task from pinning it: see
+	// worker.Handler.CueWork.
+	wOpts := []worker.Option[json.RawMessage]{
+		worker.WithCueWork(g.makeCueWork()),
+		worker.WithDoModify(g.makeDoModify()),
+		// An empty template is DefaultErrQMap, so there is nothing to branch
+		// on: a client naming no error queue gets "{inbox}/err".
+		worker.WithErrQMap[json.RawMessage](worker.ErrQTemplate(conf.ErrorQueue)),
 	}
+	if conf.SendDocs {
+		wOpts = append(wOpts, worker.WithTakeDocs(g.makeTakeDocs()))
+	}
+	g.worker = worker.New(eq, wOpts...)
 
-	if versionErr == nil {
-		// The cue sends the work; DoModify waits for the answer. Splitting
-		// them is what keeps a client that never collects its task from
-		// pinning it: see worker.Handler.CueWork.
-		opts := []worker.Option[json.RawMessage]{
-			worker.WithCueWork(g.makeCueWork()),
-			worker.WithDoModify(g.makeDoModify()),
-		}
-		if conf.SendDocs {
-			opts = append(opts, worker.WithTakeDocs(g.makeTakeDocs()))
-		}
-		// TODO: ErrorQueue needs a worker.ErrQMap built from the template.
-		g.worker = worker.New(eq, opts...)
-	}
-
+	// Return the check instead of sending it: Start is blocking the caller,
+	// and this would block Start if it were sent before the other side starts
+	// listening.
 	sMsg := g.newSend(SendCheck, RecvReady)
-	if versionErr != nil {
-		sMsg.Class = ExitCaller.String()
-		sMsg.Message = versionErr.Error()
-	}
 	sMsg.Claimant = g.claimant
-	if err := g.conn.Send(ctx, sMsg); err != nil {
-		return nil, fmt.Errorf("send check: %w", err)
-	}
+	return g, sMsg, nil
+}
 
-	// Version failure happens after sending the version error.
-	if versionErr != nil {
-		return nil, versionErr
+// refusal is the answer to a registration this gateway will not serve. It
+// carries no session, because there is none, and the caller's fault class,
+// because retrying the same config would fail the same way.
+func refusal(format string, args ...any) *SendMessage {
+	return &SendMessage{
+		Type:    SendError,
+		Class:   ExitCaller.String(),
+		Message: fmt.Sprintf(format, args...),
 	}
-
-	return g, nil
 }
 
 // newSend makes a new SendMessage with standard parameters.
@@ -354,6 +417,8 @@ func (g *Gateway) Handle(ctx context.Context) error {
 			worker.Watching(g.config.Queues...),
 			worker.WithMaxAttempts(g.config.MaxAttempts),
 			worker.WithMaxClaims(g.config.MaxClaims),
+			worker.WithLease(g.opts.lease),
+			worker.WithWorkTimeout(g.opts.workTimeout),
 		))
 	default:
 		return g.exit(worker.FatalErrorf("expected %q to begin the session, got %q", RecvReady, msg.Type))
