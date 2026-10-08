@@ -59,10 +59,17 @@ const DefaultRetryDelay = 30 * time.Second
 // The value T is the pre-unmarshaled task value. Use T = json.RawMessage to
 // receive raw bytes without any type-level unmarshaling.
 //
-// The three methods correspond to the three phases of task processing:
+// The methods correspond to the phases of task processing, in this order:
 //   - TakeDocs: pre-work doc acquisition (optional; return nil to skip)
+//   - CueWork: tell whoever does the work that it is coming (optional)
 //   - DoWork: primary work, runs with background renewal
 //   - Finish: commit phase, runs after renewal stops with stable task version
+//
+// The first two run on the lease the claim GRANTED, which nothing is extending
+// yet; renewal starts with DoWork and stops before Finish. That one fact
+// explains every signature here: what a phase is handed, and what it is safe
+// for that phase to do, follow from whether anything is holding the claim open
+// while it runs.
 type Handler[T any] interface {
 	// TakeDocs is called after a task is claimed and before DoWork. It declares which
 	// doc sets the worker needs to claim ownership of before doing work. Return
@@ -74,6 +81,23 @@ type Handler[T any] interface {
 	// natural use, where TakeDocs just returns Take of some ClaimKey sets without
 	// doing I/O, this is negligible.
 	TakeDocs(context.Context, entroq.Reader, *Work[T]) (*TakeResult, error)
+
+	// CueWork is called once the task's doc sets are held and before renewal
+	// begins: the cue that work is about to start, given to whoever will do it
+	// so that it can be ready. Its Work carries the task, its value and the
+	// held sets. Return nil to skip it.
+	//
+	// NOTHING IS RENEWING THE CLAIM WHILE IT RUNS, which is the reason this
+	// phase exists apart from DoWork. A cue that never completes blocks this
+	// worker, and the task's lease simply runs out, so another worker takes
+	// it. The same wait inside DoWork would pin the task for as long as the
+	// worker lived, because renewal would keep extending a claim nobody was
+	// acting on. Reaching into another process to hand work over belongs
+	// here.
+	//
+	// A RetryError or MoveError acts on the task exactly as it does from
+	// TakeDocs; any other error stops the worker.
+	CueWork(context.Context, entroq.Reader, *Work[T]) error
 
 	// DoWork is called by Worker.Run for each claimed task. The task and its
 	// doc sets, empty ones included, are renewed together in the background
@@ -125,7 +149,8 @@ type Work[T any] struct {
 	Value T
 	// Sets are the doc sets claimed for this task, in claim order, sets with
 	// no docs included. It is nil in TakeDocs, which is where the claim is
-	// decided: nothing is held yet, so there is nothing to report.
+	// decided: nothing is held yet, so there is nothing to report. It is
+	// filled from CueWork onward.
 	Sets []*entroq.DocSet
 }
 
@@ -158,6 +183,7 @@ type Result struct {
 	mods         []entroq.ModifyArg
 	onSuccess    func(context.Context) error
 	onDependency func(context.Context, *entroq.DependencyError) error
+	stop         bool
 }
 
 // Modify begins a Result that applies args after work completes. The worker
@@ -203,6 +229,22 @@ func Modify(args ...entroq.ModifyArg) *Result {
 // handler returns, before the worker commits.
 func (r *Result) OnSuccess(fn func(context.Context) error) *Result {
 	r.onSuccess = fn
+	return r
+}
+
+// ThenStop says this is the last task: commit the result, run any OnSuccess,
+// and then end the Run cleanly, with Run returning nil.
+//
+// It belongs on the result rather than in a hook because the decision is
+// already made by the time work ends -- a drain request arrives with the work,
+// and a hook would be a callback asking a question whose answer is in hand.
+// OnSuccess could not do it in any case: a commit that loses a dependency
+// skips it, and a drain should stop either way.
+//
+// Nothing is abandoned. The modification commits first, so a drain never
+// costs the task in hand; cancelling the Run's context would.
+func (r *Result) ThenStop() *Result {
+	r.stop = true
 	return r
 }
 
@@ -263,6 +305,11 @@ func Take(args ...entroq.DocClaimArg) *TakeResult {
 	return &TakeResult{args: args}
 }
 
+// CueWorkRun[T] is the WithCueWork function shape: the cue phase. It is given
+// the task, its value and the held doc sets, on a context that expires with the
+// granted lease (see Handler.CueWork).
+type CueWorkRun[T any] func(context.Context, entroq.Reader, *Work[T]) error
+
 // DoRun[T] is the WithDoWork function shape: the work phase. It is given the
 // task, its typed value, and any claimed doc sets, but no client -- it runs under
 // renewal, so it must not modify the claimed task (see Handler.Finish). Return a
@@ -277,8 +324,17 @@ type FinishRun[T any] func(context.Context, entroq.Client, *Work[T]) error
 // funcHandler[T] is a Handler[T] backed by plain functions.
 type funcHandler[T any] struct {
 	take   TakeRun[T]
+	cue    CueWorkRun[T]
 	do     DoRun[T]
 	finish FinishRun[T]
+}
+
+// CueWork runs the specified cue function if set, otherwise does nothing.
+func (h *funcHandler[T]) CueWork(ctx context.Context, eqc entroq.Reader, r *Work[T]) error {
+	if h.cue == nil {
+		return nil
+	}
+	return h.cue(ctx, eqc, r)
 }
 
 // TakeDocs runs the specified take function if set, otherwise returns nil.
@@ -315,6 +371,7 @@ func (h *funcHandler[T]) Finish(ctx context.Context, eqc entroq.Client, r *Work[
 // little state handling to pass requested modifications to the finish function.
 type doModifyHandler[T any] struct {
 	take     TakeRun[T]
+	cue      CueWorkRun[T]
 	doModify DoModifyRun[T]
 
 	initialTask *entroq.Task
@@ -328,6 +385,14 @@ func (h *doModifyHandler[T]) TakeDocs(ctx context.Context, eqc entroq.Reader, r 
 		return nil, nil
 	}
 	return h.take(ctx, eqc, r)
+}
+
+// CueWork runs the specified cue function if set, otherwise does nothing.
+func (h *doModifyHandler[T]) CueWork(ctx context.Context, eqc entroq.Reader, r *Work[T]) error {
+	if h.cue == nil {
+		return nil
+	}
+	return h.cue(ctx, eqc, r)
 }
 
 func (h *doModifyHandler[T]) DoWork(ctx context.Context, eqc entroq.Reader, r *Work[T]) error {
@@ -400,6 +465,11 @@ func (h *doModifyHandler[T]) Finish(ctx context.Context, eqc entroq.Client, r *W
 				log.Printf("worker on-success: %v", err)
 			}
 		}
+	}
+	if fatal == nil && h.result.stop {
+		// Everything the result asked for has landed, so stopping now loses
+		// nothing. ErrShutdown is what Run already treats as a clean end.
+		return fmt.Errorf("stopping after a result that asked to be the last: %w", ErrShutdown)
 	}
 	return fatal
 }
@@ -643,6 +713,7 @@ type workerOpts[T any] struct {
 
 	// These are all potential inputs to create the default handler.
 	take     TakeRun[T]
+	cue      CueWorkRun[T]
 	doModify DoModifyRun[T]
 	do       DoRun[T]
 	finish   FinishRun[T]
@@ -685,11 +756,12 @@ func New[T any](eq entroq.Client, opts ...Option[T]) *Worker[T] {
 	}
 
 	// No makeHandler specified, build one from what we have.
-	// DoModify handlers win. TakeDocs is always used.
+	// DoModify handlers win. TakeDocs and CueWork are always used.
 	if wOpts.doModify != nil {
 		worker.makeHandler = func() (Handler[T], error) {
 			return &doModifyHandler[T]{
 				take:     wOpts.take,
+				cue:      wOpts.cue,
 				doModify: wOpts.doModify,
 			}, nil
 		}
@@ -697,6 +769,7 @@ func New[T any](eq entroq.Client, opts ...Option[T]) *Worker[T] {
 		worker.makeHandler = func() (Handler[T], error) {
 			return &funcHandler[T]{
 				take:   wOpts.take,
+				cue:    wOpts.cue,
 				do:     wOpts.do,
 				finish: wOpts.finish,
 			}, nil
@@ -790,6 +863,24 @@ func WithTakeDocs[T any](f TakeRun[T]) Option[T] {
 	}
 }
 
+// WithCueWork sets the cue function: once the task's doc sets are held and
+// before renewal begins, it tells whoever will do the work that work is
+// coming, so that it can be ready (see CueWorkRun and Handler.CueWork).
+//
+// Nothing renews the claim while it runs, so a cue that never completes blocks
+// this worker and lets the task's lease lapse into someone else's hands. That
+// is the point: reaching into another process to hand work over belongs here,
+// and not in DoWork, where renewal would pin the task for as long as nobody
+// answered.
+//
+// When used with WithMakeHandler, the handler's CueWork method takes
+// precedence and WithCueWork has no effect.
+func WithCueWork[T any](f CueWorkRun[T]) Option[T] {
+	return func(wo *workerOpts[T]) {
+		wo.cue = f
+	}
+}
+
 // WithMakeHandler sets a "new" function to create a handler.
 // Why use this instead of just setting a handler? If you are going to share
 // any variables between docs, work, and finish functions, you want them to be
@@ -807,6 +898,7 @@ func WithTakeDocs[T any](f TakeRun[T]) Option[T] {
 // Always available:
 //
 //   - WithTakeDocs - specifies how to identify documents for a particular task.
+//   - WithCueWork - tells whoever does the work that it is coming, before the renewal clock starts.
 //
 // Two approaches to defining work/finishing:
 //
@@ -1032,7 +1124,33 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 		return fmt.Errorf("acquire docs: %w", err)
 	}
 
-	// Phase 3: DoWork with background renewal of task + docs together.
+	// Phase 3: CueWork, the last phase before anything renews the claim. The
+	// sets are attached first, so the cue names what is held and the same Work
+	// carries them on into DoWork.
+	//
+	// A cue that never completes blocks this worker, and that is the
+	// deliberate shape: nothing is renewing, so the task's lease runs out and
+	// another worker picks it up. Giving up on a schedule instead would be
+	// worse than blocking -- each abandoned cue costs the task a claim, and a
+	// worker whose far end has gone away would walk the queue quarantining
+	// tasks at the claim limit for a fault that is not theirs.
+	work.Sets = sets
+	if err := handler.CueWork(rCtx, run.eqc, work); err != nil {
+		// Pre-renewal, exactly as TakeDocs: a sentinel acts on the task, and
+		// anything else stops the worker after a best-effort quarantine if
+		// this claim was the last the limit allows.
+		if isSentinelError(err) {
+			outcome = sentinelOutcome(err)
+			_, serr := w.handleSentinelErrors(ctx, run.eqc, err, task, sets, w.ErrorQueueFor(task.Queue), opts)
+			return serr
+		}
+		if w.quarantineAtLimit(ctx, run.eqc, task, sets, err, opts) {
+			outcome = outcomeMoved
+		}
+		return fmt.Errorf("cue work: %w", err)
+	}
+
+	// Phase 4: DoWork with background renewal of task + docs together.
 	var (
 		sentinelErr error
 		workErr     error // the handler's own error, other than a sentinel
@@ -1061,7 +1179,6 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 				final := stop()
 				finalTask, finalSets = final.task, final.sets
 			}()
-			work.Sets = sets
 			if err := handler.DoWork(ctx, run.eqc, work); err != nil {
 				if !isSentinelError(err) {
 					workErr = err
@@ -1128,9 +1245,19 @@ func (w *Worker[T]) runOne(ctx context.Context, run *activeRun, opts *runOpt, sl
 		return fmt.Errorf("worker (%q): %w", opts.qs, handleErr)
 	}
 
-	// Phase 4: Finish with stable versions — renewal has stopped.
+	// Phase 5: Finish with stable versions — renewal has stopped.
 	work.Task, work.Sets = finalTask, finalSets
 	if err := handler.Finish(ctx, run.eqc, work); err != nil {
+		// A result that asked to be the last (Result.ThenStop) reports a clean
+		// end once its commit has landed, so the task counts as done and Run
+		// returns nil. Checked before the ladder below, which is for failures.
+		if errors.Is(err, ErrShutdown) {
+			outcome = outcomeDone
+			if h, ok := handler.(*doModifyHandler[T]); ok && h.released {
+				outcome = outcomeReleased
+			}
+			return err
+		}
 		// A post-commit hook (OnDependency) may return a Retry/Move/Fatal
 		// sentinel; route it through the same machinery as a work-phase sentinel
 		// before falling back to the default dependency reclaim.

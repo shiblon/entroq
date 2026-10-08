@@ -25,6 +25,10 @@ func (h *countingHandler) TakeDocs(context.Context, entroq.Reader, *Work[string]
 	return nil, nil
 }
 
+func (h *countingHandler) CueWork(context.Context, entroq.Reader, *Work[string]) error {
+	return nil
+}
+
 func (h *countingHandler) DoWork(ctx context.Context, _ entroq.Reader, work *Work[string]) error {
 	h.uses++
 	h.observed <- h.uses
