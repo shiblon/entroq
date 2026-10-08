@@ -888,39 +888,33 @@ func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksRespon
 	if _, err := negotiate(ctx, req); err != nil {
 		return nil, err
 	}
-	if err := (&entroq.TasksQuery{Queue: req.Queue, IDs: req.TaskId}).Validate(); err != nil {
+	queue, opts, err := pbconv.TasksQueryFromProto(req)
+	if err != nil {
 		return nil, autoCodeErrorf("tasks: %w", err)
 	}
 	if err := s.Authorize(ctx, s.tasksAuthz(ctx, req)); err != nil {
 		return nil, err // don't wrap, has status codes
 	}
-
-	// Claimant will only really be a filter if it is nonzero.
-	// Task IDs will only be used as a filter if non-empty.
-	opts := []entroq.TasksOpt{
-		entroq.ClaimedBy(req.ClaimantId),
-		entroq.WithTaskID(req.TaskId...),
-		entroq.LimitTasks(int(req.Limit)),
-	}
-	if req.OmitValues {
-		opts = append(opts, entroq.OmitValues())
-	}
-	tasks, err := s.impl.Tasks(ctx, req.Queue, opts...)
+	tasks, err := s.impl.Tasks(ctx, queue, opts...)
 	if err != nil {
 		return nil, autoCodeErrorf("failed to get tasks: %w", err)
 	}
-	resp := new(pb.TasksResponse)
-	for _, task := range tasks {
-		// Backends already bind task IDs to their queue, but the service must
-		// not depend on that to keep a caller out of queues it cannot read.
-		if req.Queue != "" && task.Queue != req.Queue {
-			continue
+	// Backends already bind task IDs to their queue, but the service must not
+	// depend on that to keep a caller out of queues it cannot read. The filter
+	// is the service's because the reason for it is: it exists for
+	// authorization, which the conversion knows nothing about.
+	if queue != "" {
+		kept := tasks[:0]
+		for _, task := range tasks {
+			if task.Queue == queue {
+				kept = append(kept, task)
+			}
 		}
-		pt, err := pbconv.TaskToProto(task)
-		if err != nil {
-			return nil, autoCodeErrorf("tasks task proto: %w", err)
-		}
-		resp.Tasks = append(resp.Tasks, pt)
+		tasks = kept
+	}
+	resp, err := pbconv.TasksResponseFromTasks(tasks)
+	if err != nil {
+		return nil, autoCodeErrorf("tasks task proto: %w", err)
 	}
 	return resp, nil
 }
@@ -953,21 +947,11 @@ func (s *QSvc) Queues(ctx context.Context, req *pb.QueuesRequest) (*pb.QueuesRes
 	if _, err := negotiate(ctx, req); err != nil {
 		return nil, err
 	}
-	queueMap, err := s.impl.Queues(ctx,
-		entroq.MatchPrefix(req.MatchPrefix...),
-		entroq.MatchExact(req.MatchExact...),
-		entroq.LimitQueues(int(req.Limit)))
+	queueMap, err := s.impl.Queues(ctx, pbconv.MatchOptsFromProto(req)...)
 	if err != nil {
 		return nil, autoCodeErrorf("failed to get queues: %w", err)
 	}
-	resp := new(pb.QueuesResponse)
-	for name, count := range queueMap {
-		resp.Queues = append(resp.Queues, &pb.QueueStats{
-			Name:     name,
-			NumTasks: int32(count),
-		})
-	}
-	return resp, nil
+	return pbconv.QueuesResponseFromCounts(queueMap), nil
 }
 
 // QueueStats returns a mapping from queue names to queue stats.
@@ -978,25 +962,11 @@ func (s *QSvc) QueueStats(ctx context.Context, req *pb.QueuesRequest) (*pb.Queue
 	if _, err := negotiate(ctx, req); err != nil {
 		return nil, err
 	}
-	queueMap, err := s.impl.QueueStats(ctx,
-		entroq.MatchPrefix(req.MatchPrefix...),
-		entroq.MatchExact(req.MatchExact...),
-		entroq.LimitQueues(int(req.Limit)))
+	queueMap, err := s.impl.QueueStats(ctx, pbconv.MatchOptsFromProto(req)...)
 	if err != nil {
 		return nil, autoCodeErrorf("failed to get queues: %w", err)
 	}
-	resp := new(pb.QueuesResponse)
-	for _, stat := range queueMap {
-		resp.Queues = append(resp.Queues, &pb.QueueStats{
-			Name:         stat.Name,
-			NumTasks:     int32(stat.Size),
-			NumClaimed:   int32(stat.Claimed),
-			NumAvailable: int32(stat.Available),
-			NumFuture:    int32(stat.Future),
-			MaxClaims:    int32(stat.MaxClaims),
-		})
-	}
-	return resp, nil
+	return pbconv.QueuesResponseFromStats(queueMap), nil
 }
 
 // Time returns the current time in milliseconds since the Epoch.
@@ -1029,25 +999,19 @@ func (s *QSvc) Docs(ctx context.Context, req *pb.DocsRequest) (*pb.DocsResponse,
 	if _, err := negotiate(ctx, req); err != nil {
 		return nil, err
 	}
-	q := req.GetQuery()
-	dq := &entroq.DocQuery{
-		Namespace:  q.GetNamespace(),
-		IDs:        q.GetIds(),
-		KeyExact:   q.GetKeyExact(),
-		KeyStart:   q.GetKeyStart(),
-		KeyEnd:     q.GetKeyEnd(),
-		Limit:      int(q.GetLimit()),
-		OmitValues: q.GetOmitValues(),
-	}
-	if err := dq.Validate(); err != nil {
+	dq, err := pbconv.DocQueryFromProto(req)
+	if err != nil {
 		return nil, autoCodeErrorf("docs: %w", err)
 	}
 	// Reading doc content is gated on Read for the namespace (unlike queue/
 	// namespace metadata, which is open). Enforced only when an authorizer is set.
+	//
+	// The namespace comes from the CONVERTED query, so what is authorized and
+	// what is read cannot drift apart.
 	if s.az != nil {
 		authReq := s.newAuthzRequest(ctx)
 		authReq.Namespaces = append(authReq.Namespaces, &authz.Namespace{
-			Exact:   q.GetNamespace(),
+			Exact:   dq.Namespace,
 			Actions: []authz.Action{authz.Read},
 		})
 		if err := s.Authorize(ctx, authReq); err != nil {
@@ -1058,13 +1022,9 @@ func (s *QSvc) Docs(ctx context.Context, req *pb.DocsRequest) (*pb.DocsResponse,
 	if err != nil {
 		return nil, autoCodeErrorf("docs: %w", err)
 	}
-	resp := new(pb.DocsResponse)
-	for _, d := range docs {
-		pd, err := pbconv.DocToProto(d)
-		if err != nil {
-			return nil, autoCodeErrorf("docs doc proto: %w", err)
-		}
-		resp.Docs = append(resp.Docs, pd)
+	resp, err := pbconv.DocsResponseFromDocs(docs)
+	if err != nil {
+		return nil, autoCodeErrorf("docs doc proto: %w", err)
 	}
 	return resp, nil
 }
@@ -1079,22 +1039,11 @@ func (s *QSvc) NamespaceStats(ctx context.Context, req *pb.NamespacesRequest) (*
 	if _, err := negotiate(ctx, req); err != nil {
 		return nil, err
 	}
-	nsMap, err := s.impl.NamespaceStats(ctx,
-		entroq.MatchPrefix(req.MatchPrefix...),
-		entroq.MatchExact(req.MatchExact...),
-		entroq.WithLimit(int(req.Limit)))
+	nsMap, err := s.impl.NamespaceStats(ctx, pbconv.MatchOptsFromProto(req)...)
 	if err != nil {
 		return nil, autoCodeErrorf("namespace stats: %w", err)
 	}
-	resp := new(pb.NamespacesResponse)
-	for _, stat := range nsMap {
-		resp.Namespaces = append(resp.Namespaces, &pb.NamespaceStat{
-			Name:       stat.Name,
-			NumDocs:    int32(stat.Size),
-			NumClaimed: int32(stat.Claimed),
-		})
-	}
-	return resp, nil
+	return pbconv.NamespacesResponseFromStats(nsMap), nil
 }
 
 // claimDocsAuthz builds the authorization request for a doc claim: Claim on

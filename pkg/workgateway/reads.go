@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/shiblon/entroq"
-	pb "github.com/shiblon/entroq/api"
 	"github.com/shiblon/entroq/pkg/pbconv"
 )
 
@@ -71,113 +69,81 @@ func (g *Gateway) read(ctx context.Context, msg *RecvMessage) (*SendMessage, err
 }
 
 func (g *Gateway) readTasks(ctx context.Context, q *wireTasksReq) (*SendMessage, error) {
-	if q == nil || q.TasksRequest == nil {
+	if q == nil {
 		return nil, fmt.Errorf("a %q read carries no tasks_query", RecvTasks)
 	}
-	req := q.TasksRequest
-	// Validated the way the service validates it, so the same query is well
-	// formed or refused wherever it is asked.
-	if err := (&entroq.TasksQuery{Queue: req.GetQueue(), IDs: req.GetTaskId()}).Validate(); err != nil {
-		return nil, fmt.Errorf("tasks query: %w", err)
+	queue, opts, err := pbconv.TasksQueryFromProto(q.TasksRequest)
+	if err != nil {
+		return nil, err
 	}
-	// ClaimedBy and WithTaskID filter only when they are given something, so
-	// an empty query is every task in the queue.
-	opts := []entroq.TasksOpt{
-		entroq.ClaimedBy(req.GetClaimantId()),
-		entroq.WithTaskID(req.GetTaskId()...),
-		entroq.LimitTasks(int(req.GetLimit())),
+	tasks, err := g.client.Tasks(ctx, queue, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("read tasks: %w", err)
 	}
-	if req.GetOmitValues() {
-		opts = append(opts, entroq.OmitValues())
-	}
-	tasks, err := g.client.Tasks(ctx, req.GetQueue(), opts...)
+	resp, err := pbconv.TasksResponseFromTasks(tasks)
 	if err != nil {
 		return nil, fmt.Errorf("read tasks: %w", err)
 	}
 	reply := g.newSend(SendTasks, "")
-	for _, task := range tasks {
-		pt, err := pbconv.TaskToProto(task)
-		if err != nil {
-			return nil, fmt.Errorf("read tasks, task %s: %w", task.ID, err)
-		}
+	for _, pt := range resp.GetTasks() {
 		reply.Tasks = append(reply.Tasks, wireTask{pt})
 	}
 	return reply, nil
 }
 
 func (g *Gateway) readDocs(ctx context.Context, q *wireDocsReq) (*SendMessage, error) {
-	if q == nil || q.DocsRequest == nil {
+	if q == nil {
 		return nil, fmt.Errorf("a %q read carries no docs_query", RecvDocs)
 	}
-	dq := q.GetQuery()
-	query := &entroq.DocQuery{
-		Namespace:  dq.GetNamespace(),
-		IDs:        dq.GetIds(),
-		KeyExact:   dq.GetKeyExact(),
-		KeyStart:   dq.GetKeyStart(),
-		KeyEnd:     dq.GetKeyEnd(),
-		Limit:      int(dq.GetLimit()),
-		OmitValues: dq.GetOmitValues(),
-	}
-	if err := query.Validate(); err != nil {
-		return nil, fmt.Errorf("docs query: %w", err)
+	query, err := pbconv.DocQueryFromProto(q.DocsRequest)
+	if err != nil {
+		return nil, err
 	}
 	docs, err := g.client.Docs(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("read docs: %w", err)
 	}
+	resp, err := pbconv.DocsResponseFromDocs(docs)
+	if err != nil {
+		return nil, fmt.Errorf("read docs: %w", err)
+	}
 	reply := g.newSend(SendDocs, "")
-	for _, doc := range docs {
-		pd, err := pbconv.DocToProto(doc)
-		if err != nil {
-			return nil, fmt.Errorf("read docs, doc %s/%s: %w", doc.Namespace, doc.ID, err)
-		}
+	for _, pd := range resp.GetDocs() {
 		reply.Docs = append(reply.Docs, wireDoc{pd})
 	}
 	return reply, nil
 }
 
 func (g *Gateway) readQueues(ctx context.Context, q *wireMatchReq) (*SendMessage, error) {
-	counts, err := g.client.Queues(ctx, matchOpts(q)...)
+	counts, err := g.client.Queues(ctx, pbconv.MatchOptsFromProto(matchReq(q))...)
 	if err != nil {
 		return nil, fmt.Errorf("read queues: %w", err)
 	}
 	reply := g.newSend(SendQueues, "")
-	for name, count := range counts {
-		reply.Queues = append(reply.Queues, wireQueueStats{&pb.QueueStats{
-			Name:     name,
-			NumTasks: int32(count),
-		}})
+	for _, qs := range pbconv.QueuesResponseFromCounts(counts).GetQueues() {
+		reply.Queues = append(reply.Queues, wireQueueStats{qs})
 	}
 	return reply, nil
 }
 
 func (g *Gateway) readNamespaces(ctx context.Context, q *wireMatchReq) (*SendMessage, error) {
-	stats, err := g.client.NamespaceStats(ctx, matchOpts(q)...)
+	stats, err := g.client.NamespaceStats(ctx, pbconv.MatchOptsFromProto(matchReq(q))...)
 	if err != nil {
 		return nil, fmt.Errorf("read namespaces: %w", err)
 	}
 	reply := g.newSend(SendNamespaces, "")
-	for _, stat := range stats {
-		reply.Namespaces = append(reply.Namespaces, wireNamespaceStat{&pb.NamespaceStat{
-			Name:       stat.Name,
-			NumDocs:    int32(stat.Size),
-			NumClaimed: int32(stat.Claimed),
-		}})
+	for _, ns := range pbconv.NamespacesResponseFromStats(stats).GetNamespaces() {
+		reply.Namespaces = append(reply.Namespaces, wireNamespaceStat{ns})
 	}
 	return reply, nil
 }
 
-// matchOpts is the query queues and namespaces share: they ask the same
-// question of different things. A missing query is no filter at all, which
-// lists everything up to the backend's own limit.
-func matchOpts(q *wireMatchReq) []entroq.QueuesOpt {
+// matchReq unwraps a listing query, keeping nil nil: a wrapper holding no
+// message must not become a non-nil interface that then answers zero to
+// everything, which would read as a filter rather than as no filter.
+func matchReq(q *wireMatchReq) pbconv.MatchRequest {
 	if q == nil || q.QueuesRequest == nil {
 		return nil
 	}
-	return []entroq.QueuesOpt{
-		entroq.MatchPrefix(q.GetMatchPrefix()...),
-		entroq.MatchExact(q.GetMatchExact()...),
-		entroq.LimitQueues(int(q.GetLimit())),
-	}
+	return q.QueuesRequest
 }

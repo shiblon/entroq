@@ -283,11 +283,11 @@ func Start(ctx context.Context, eq entroq.Client, conf *Config, conn conn) (*Gat
 		// them is what keeps a client that never collects its task from
 		// pinning it: see worker.Handler.CueWork.
 		opts := []worker.Option[json.RawMessage]{
-			worker.WithCueWork(g.MakeCueWork()),
-			worker.WithDoModify(g.MakeDoModify()),
+			worker.WithCueWork(g.makeCueWork()),
+			worker.WithDoModify(g.makeDoModify()),
 		}
 		if conf.SendDocs {
-			opts = append(opts, worker.WithTakeDocs(g.MakeTakeDocs()))
+			opts = append(opts, worker.WithTakeDocs(g.makeTakeDocs()))
 		}
 		// TODO: ErrorQueue needs a worker.ErrQMap built from the template.
 		g.worker = worker.New(eq, opts...)
@@ -417,8 +417,8 @@ func (g *Gateway) recv(ctx context.Context, expect RecvType) (*RecvMessage, erro
 	}
 }
 
-// MakeDoModify makes a DoModify handler for this gateway that can be passed into a Run.
-func (g *Gateway) MakeDoModify() worker.DoModifyRun[json.RawMessage] {
+// makeDoModify makes a DoModify handler for this gateway that can be passed into a Run.
+func (g *Gateway) makeDoModify() worker.DoModifyRun[json.RawMessage] {
 	return func(ctx context.Context, _ entroq.Reader, _ *worker.Work[json.RawMessage]) (*worker.Result, error) {
 		// The cue already sent the work. This phase only collects the answer,
 		// and it is the half that runs under renewal -- which is the point of
@@ -448,8 +448,8 @@ func (g *Gateway) MakeDoModify() worker.DoModifyRun[json.RawMessage] {
 		// them either way: between them they cover both outcomes of a commit,
 		// which is the only place a drain can act without losing anything.
 		return worker.Modify(args...).
-			OnSuccess(g.onSuccess()).
-			OnDependency(g.onDependency()), nil
+			OnSuccess(g.makeOnSuccess()).
+			OnDependency(g.makeOnDependency()), nil
 	}
 }
 
@@ -492,7 +492,7 @@ func (g *Gateway) modifyArgs(mod *wireModReq) ([]entroq.ModifyArg, error) {
 	return args, nil
 }
 
-// MakeCueWork makes a CueWork handler for this gateway that can be passed into
+// makeCueWork makes a CueWork handler for this gateway that can be passed into
 // a Run: it hands the task and its held doc sets to the client.
 //
 // Only the send lives here, and that placement is the whole reason it is a
@@ -500,7 +500,7 @@ func (g *Gateway) modifyArgs(mod *wireModReq) ([]entroq.ModifyArg, error) {
 // client that never collects its task costs this session and frees the task
 // for another worker. The same send from the work phase would renew the claim
 // for as long as nobody collected it, and no other worker could ever have it.
-func (g *Gateway) MakeCueWork() worker.CueWorkRun[json.RawMessage] {
+func (g *Gateway) makeCueWork() worker.CueWorkRun[json.RawMessage] {
 	return func(ctx context.Context, _ entroq.Reader, w *worker.Work[json.RawMessage]) error {
 		task, err := taskToWire(w.Task)
 		if err != nil {
@@ -520,13 +520,13 @@ func (g *Gateway) MakeCueWork() worker.CueWorkRun[json.RawMessage] {
 	}
 }
 
-// onSuccess is the hook the worker runs after a commit lands. It tells the
+// makeOnSuccess is the hook the worker runs after a commit lands. It tells the
 // client, if the client asked to be told, and ends the session if a quit has
 // been requested.
 //
 // Closing here is safe in a way it would not be during work: the commit has
 // already landed, so there is nothing in flight to lose.
-func (g *Gateway) onSuccess() func(context.Context) error {
+func (g *Gateway) makeOnSuccess() func(context.Context) error {
 	return func(ctx context.Context) error {
 		var reported error
 		if g.config.SendSuccess {
@@ -539,7 +539,7 @@ func (g *Gateway) onSuccess() func(context.Context) error {
 	}
 }
 
-// onDependency is the hook the worker runs when a commit loses a dependency
+// makeOnDependency is the hook the worker runs when a commit loses a dependency
 // race. The outcome the client reports picks the task fate, with the same
 // vocabulary the work phase uses -- optimistically, since the commit already
 // failed and the disposition lands only if this task was not itself what went
@@ -549,7 +549,7 @@ func (g *Gateway) onSuccess() func(context.Context) error {
 // closing cancels the context the worker would write it on, so the task is
 // left to its lease instead, which is this hook default anyway. Nothing is
 // lost that was not already lost with the commit.
-func (g *Gateway) onDependency() func(context.Context, *entroq.DependencyError) error {
+func (g *Gateway) makeOnDependency() func(context.Context, *entroq.DependencyError) error {
 	return func(ctx context.Context, depErr *entroq.DependencyError) error {
 		var reported error
 		if g.config.SendDependency {
@@ -585,12 +585,12 @@ func (g *Gateway) report(ctx context.Context, msg *SendMessage) error {
 	return g.disposition(received.Outcome, received.Error)
 }
 
-// MakeTakeDocs makes a TakeDocs handler for this gateway that can be passed into a Run.
+// makeTakeDocs makes a TakeDocs handler for this gateway that can be passed into a Run.
 //
 // Only the sets a client names survive. The worker claims them as itself, until
 // the task's own arrival, and discards any lease or claimant in the args, so
 // there is nothing here for a client to say about how its docs are held.
-func (g *Gateway) MakeTakeDocs() worker.TakeRun[json.RawMessage] {
+func (g *Gateway) makeTakeDocs() worker.TakeRun[json.RawMessage] {
 	return func(ctx context.Context, _ entroq.Reader, w *worker.Work[json.RawMessage]) (*worker.TakeResult, error) {
 		task, err := taskToWire(w.Task)
 		if err != nil {
