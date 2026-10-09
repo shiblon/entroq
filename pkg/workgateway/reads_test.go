@@ -42,15 +42,15 @@ func TestReadTasks(t *testing.T) {
 	defer cancel()
 	g := readFixture(ctx, t)
 
-	reply, err := g.read(ctx, &RecvMessage{
-		Type:       RecvTasks,
+	reply, err := g.read(ctx, &Request{
+		Type:       ReqTasks,
 		TasksQuery: &wireTasksReq{&pb.TasksRequest{Queue: "inbox"}},
 	})
 	if err != nil {
 		t.Fatalf("read tasks: %v", err)
 	}
-	if reply.Type != SendTasks {
-		t.Errorf("reply type = %q, want %q", reply.Type, SendTasks)
+	if reply.Type != RespTasks {
+		t.Errorf("reply type = %q, want %q", reply.Type, RespTasks)
 	}
 	if len(reply.Tasks) != 2 {
 		t.Fatalf("got %d tasks, want the 2 in inbox", len(reply.Tasks))
@@ -66,8 +66,8 @@ func TestReadTasks(t *testing.T) {
 	}
 
 	t.Run("omit_values leaves the metadata", func(t *testing.T) {
-		reply, err := g.read(ctx, &RecvMessage{
-			Type:       RecvTasks,
+		reply, err := g.read(ctx, &Request{
+			Type:       ReqTasks,
 			TasksQuery: &wireTasksReq{&pb.TasksRequest{Queue: "inbox", OmitValues: true}},
 		})
 		if err != nil {
@@ -84,8 +84,8 @@ func TestReadTasks(t *testing.T) {
 	})
 
 	t.Run("limit", func(t *testing.T) {
-		reply, err := g.read(ctx, &RecvMessage{
-			Type:       RecvTasks,
+		reply, err := g.read(ctx, &Request{
+			Type:       ReqTasks,
 			TasksQuery: &wireTasksReq{&pb.TasksRequest{Queue: "inbox", Limit: 1}},
 		})
 		if err != nil {
@@ -104,23 +104,23 @@ func TestReadDocs(t *testing.T) {
 	defer cancel()
 	g := readFixture(ctx, t)
 
-	reply, err := g.read(ctx, &RecvMessage{
-		Type:      RecvDocs,
+	reply, err := g.read(ctx, &Request{
+		Type:      ReqDocs,
 		DocsQuery: &wireDocsReq{&pb.DocsRequest{Query: &pb.DocQuery{Namespace: "cfg"}}},
 	})
 	if err != nil {
 		t.Fatalf("read docs: %v", err)
 	}
-	if reply.Type != SendDocs {
-		t.Errorf("reply type = %q, want %q", reply.Type, SendDocs)
+	if reply.Type != RespDocs {
+		t.Errorf("reply type = %q, want %q", reply.Type, RespDocs)
 	}
 	if len(reply.Docs) != 2 {
 		t.Fatalf("got %d docs, want the 2 in cfg", len(reply.Docs))
 	}
 
 	t.Run("by key", func(t *testing.T) {
-		reply, err := g.read(ctx, &RecvMessage{
-			Type: RecvDocs,
+		reply, err := g.read(ctx, &Request{
+			Type: ReqDocs,
 			DocsQuery: &wireDocsReq{&pb.DocsRequest{Query: &pb.DocQuery{
 				Namespace: "cfg",
 				KeyExact:  "limits",
@@ -146,12 +146,12 @@ func TestReadQueuesAndNamespaces(t *testing.T) {
 	g := readFixture(ctx, t)
 
 	t.Run("queues", func(t *testing.T) {
-		reply, err := g.read(ctx, &RecvMessage{Type: RecvQueues})
+		reply, err := g.read(ctx, &Request{Type: ReqQueues})
 		if err != nil {
 			t.Fatalf("read queues: %v", err)
 		}
-		if reply.Type != SendQueues {
-			t.Errorf("reply type = %q, want %q", reply.Type, SendQueues)
+		if reply.Type != RespQueues {
+			t.Errorf("reply type = %q, want %q", reply.Type, RespQueues)
 		}
 		counts := map[string]int32{}
 		for _, q := range reply.Queues {
@@ -163,8 +163,8 @@ func TestReadQueuesAndNamespaces(t *testing.T) {
 	})
 
 	t.Run("queues filtered by exact name", func(t *testing.T) {
-		reply, err := g.read(ctx, &RecvMessage{
-			Type:       RecvQueues,
+		reply, err := g.read(ctx, &Request{
+			Type:       ReqQueues,
 			MatchQuery: &wireMatchReq{&pb.QueuesRequest{MatchExact: []string{"inbox"}}},
 		})
 		if err != nil {
@@ -178,12 +178,12 @@ func TestReadQueuesAndNamespaces(t *testing.T) {
 	t.Run("namespaces", func(t *testing.T) {
 		// NamespaceStats is on entroq.Reader for this: a gateway client holds
 		// the whole read surface a worker may ask about.
-		reply, err := g.read(ctx, &RecvMessage{Type: RecvNamespaces})
+		reply, err := g.read(ctx, &Request{Type: ReqNamespaces})
 		if err != nil {
 			t.Fatalf("read namespaces: %v", err)
 		}
-		if reply.Type != SendNamespaces {
-			t.Errorf("reply type = %q, want %q", reply.Type, SendNamespaces)
+		if reply.Type != RespNamespaces {
+			t.Errorf("reply type = %q, want %q", reply.Type, RespNamespaces)
 		}
 		found := false
 		for _, ns := range reply.Namespaces {
@@ -208,12 +208,12 @@ func TestReadTime(t *testing.T) {
 	g := readFixture(ctx, t)
 
 	before := time.Now().UnixMilli()
-	reply, err := g.read(ctx, &RecvMessage{Type: RecvTime})
+	reply, err := g.read(ctx, &Request{Type: ReqTime})
 	if err != nil {
 		t.Fatalf("read time: %v", err)
 	}
-	if reply.Type != SendTime {
-		t.Errorf("reply type = %q, want %q", reply.Type, SendTime)
+	if reply.Type != RespTime {
+		t.Errorf("reply type = %q, want %q", reply.Type, RespTime)
 	}
 	if reply.TimeMs < before {
 		t.Errorf("time_ms = %d, want at least %d", reply.TimeMs, before)
@@ -229,12 +229,12 @@ func TestReadRefusesWhatItCannotAnswer(t *testing.T) {
 	defer cancel()
 	g := readFixture(ctx, t)
 
-	for name, msg := range map[string]*RecvMessage{
-		"tasks with no query":       {Type: RecvTasks},
-		"docs with no query":        {Type: RecvDocs},
-		"tasks naming nothing":      {Type: RecvTasks, TasksQuery: &wireTasksReq{&pb.TasksRequest{}}},
-		"docs naming no namespace":  {Type: RecvDocs, DocsQuery: &wireDocsReq{&pb.DocsRequest{Query: &pb.DocQuery{}}}},
-		"a type that is not a read": {Type: RecvModify},
+	for name, msg := range map[string]*Request{
+		"tasks with no query":       {Type: ReqTasks},
+		"docs with no query":        {Type: ReqDocs},
+		"tasks naming nothing":      {Type: ReqTasks, TasksQuery: &wireTasksReq{&pb.TasksRequest{}}},
+		"docs naming no namespace":  {Type: ReqDocs, DocsQuery: &wireDocsReq{&pb.DocsRequest{Query: &pb.DocQuery{}}}},
+		"a type that is not a read": {Type: ReqModify},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if reply, err := g.read(ctx, msg); err == nil {
@@ -254,15 +254,15 @@ func TestReadFailureDoesNotEndTheSession(t *testing.T) {
 
 	sent := &fakeConn{}
 	g.conn = sent
-	if err := g.handleReadAndRespond(ctx, &RecvMessage{Type: RecvTasks}); err != nil {
+	if err := g.handleReadAndRespond(ctx, &Request{Type: ReqTasks}); err != nil {
 		t.Fatalf("handleReadAndRespond returned %v; a failed read must not fail the session", err)
 	}
 	if len(sent.sent) != 1 {
 		t.Fatalf("sent %d messages, want 1", len(sent.sent))
 	}
 	reply := sent.sent[0]
-	if reply.Type != SendError {
-		t.Errorf("reply type = %q, want %q", reply.Type, SendError)
+	if reply.Type != RespError {
+		t.Errorf("reply type = %q, want %q", reply.Type, RespError)
 	}
 	if reply.Message == "" {
 		t.Error("the refusal says nothing about why")
@@ -275,15 +275,15 @@ func TestReadFailureDoesNotEndTheSession(t *testing.T) {
 // fakeConn records what the gateway sends and answers nothing, which is all a
 // read needs: a read is not a turn, so nothing comes back.
 type fakeConn struct {
-	sent []*SendMessage
+	sent []*Response
 }
 
-func (c *fakeConn) Send(_ context.Context, msg *SendMessage) error {
+func (c *fakeConn) Send(_ context.Context, msg *Response) error {
 	c.sent = append(c.sent, msg)
 	return nil
 }
 
-func (c *fakeConn) Recv(ctx context.Context) (*RecvMessage, error) {
+func (c *fakeConn) Recv(ctx context.Context) (*Request, error) {
 	<-ctx.Done()
 	return nil, ctx.Err()
 }

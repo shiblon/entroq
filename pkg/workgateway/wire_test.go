@@ -259,3 +259,38 @@ func TestDepsToWireNamesWhatMoved(t *testing.T) {
 		t.Errorf("dep does not name the task it depended on:\n%s", raw)
 	}
 }
+
+// TestModifyArgsRequiresAQueue is the error a wire client gets most often, and
+// the reason it is worth catching here: a TaskID looks complete with an id and
+// a version, and the backend's answer for the omission reads like a WRONG
+// queue rather than a missing one.
+func TestModifyArgsRequiresAQueue(t *testing.T) {
+	g := &Gateway{}
+	for name, mod := range map[string]*pb.ModifyRequest{
+		"delete": {Deletes: []*pb.TaskID{{Id: "task-1", Version: 1}}},
+		"depend": {Depends: []*pb.TaskID{{Id: "task-1", Version: 1}}},
+		"insert": {Inserts: []*pb.TaskData{{}}},
+		"change": {Changes: []*pb.TaskChange{{
+			OldId:   &pb.TaskID{Id: "task-1", Version: 1},
+			NewData: &pb.TaskData{Queue: "inbox"},
+		}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := g.modifyArgs(&wireModReq{mod})
+			if err == nil {
+				t.Fatalf("a %s naming no queue was accepted", name)
+			}
+			if !strings.Contains(err.Error(), "no queue") {
+				t.Errorf("error does not say what is missing: %v", err)
+			}
+		})
+	}
+
+	// Naming it is all that is asked.
+	ok := &pb.ModifyRequest{
+		Deletes: []*pb.TaskID{{Queue: "inbox", Id: "task-1", Version: 1}},
+	}
+	if _, err := g.modifyArgs(&wireModReq{ok}); err != nil {
+		t.Errorf("a delete naming its queue was refused: %v", err)
+	}
+}

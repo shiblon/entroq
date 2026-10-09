@@ -10,10 +10,8 @@ import (
 	"github.com/shiblon/entroq/pkg/worker"
 )
 
-// startFixture stands a session up far enough to inspect what Start decided,
-// over a conn that answers nothing. Start must not need the conn for anything
-// but storing it: it RETURNS the check rather than sending it, or an HTTP
-// handler would have to read its own send.
+// startFixture builds a session from a registration, without serving it, so a
+// test can ask what the registration decided.
 func startFixture(ctx context.Context, t *testing.T, conf *Config, options ...Option) (*Gateway, *fakeConn) {
 	t.Helper()
 	client, err := entroq.New(ctx, eqmem.Opener())
@@ -23,12 +21,9 @@ func startFixture(ctx context.Context, t *testing.T, conf *Config, options ...Op
 	t.Cleanup(func() { client.Close() })
 
 	c := &fakeConn{}
-	g, check, err := Start(ctx, client, conf, c, options...)
+	g, err := newGateway(client, &Request{Type: ReqConfig, Config: conf}, c, options...)
 	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	if check == nil || check.Type != SendCheck {
-		t.Fatalf("Start returned check %+v, want one of type %q", check, SendCheck)
+		t.Fatalf("newGateway: %v", err)
 	}
 	t.Cleanup(g.Close)
 	return g, c
@@ -129,145 +124,185 @@ func TestWorkTimeoutIsAskedForAndCapped(t *testing.T) {
 	}
 }
 
-// TestTheCheckReportsTheSettledTimeout is why the clamp is visible: a worker
-// written against an hour that quietly got five minutes looks flaky rather than
-// capped, and the client is the only one who can tell the difference.
-func TestTheCheckReportsTheSettledTimeout(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	client, err := entroq.New(ctx, eqmem.Opener())
+// session is a transport's side of a ChannelConn: the two ends the gateway does
+// not hold, plus whatever Serve finally returned.
+type session struct {
+	t      *testing.T
+	req    chan *Request
+	resp   chan *Response
+	cancel context.CancelFunc
+
+	// done closes when Serve returns, and err is what it returned. A closed
+	// channel can be waited on any number of times, which a one-shot send
+	// cannot: a test that checks the outcome itself would leave the cleanup
+	// waiting forever.
+	done chan struct{}
+	err  error
+}
+
+// wait returns what Serve returned, once it has.
+func (s *session) wait() error {
+	s.t.Helper()
+	select {
+	case <-s.done:
+		return s.err
+	case <-time.After(10 * time.Second):
+		s.t.Fatal("Serve never returned")
+		return nil
+	}
+}
+
+// ask forwards one request and collects its response, which is one exchange of
+// whatever a real transport is carrying them over.
+func (s *session) ask(req *Request) *Response {
+	s.t.Helper()
+	select {
+	case s.req <- req:
+	case <-s.done:
+		s.t.Fatalf("session ended before it took %q: %v", req.Type, s.err)
+	case <-time.After(10 * time.Second):
+		s.t.Fatalf("nobody took the %q request", req.Type)
+	}
+	select {
+	case resp := <-s.resp:
+		return resp
+	case <-s.done:
+		s.t.Fatalf("session ended before answering %q: %v", req.Type, s.err)
+	case <-time.After(10 * time.Second):
+		s.t.Fatalf("no answer to the %q request", req.Type)
+	}
+	return nil
+}
+
+// serveChannels runs a session the way an HTTP service would: unbuffered
+// channels, Serve in a goroutine of its own, and the transport keeping only the
+// two ends and the cancel.
+func serveChannels(t *testing.T, eq entroq.Client, options ...Option) *session {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &session{
+		t:      t,
+		req:    make(chan *Request),
+		resp:   make(chan *Response),
+		cancel: cancel,
+		done:   make(chan struct{}),
+	}
+	conn := NewChannelConn(s.req, s.resp)
+	go func() {
+		defer close(s.done)
+		s.err = Serve(ctx, eq, conn, options...)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		s.wait()
+	})
+	return s
+}
+
+func testClient(ctx context.Context, t *testing.T) *entroq.EntroQ {
+	t.Helper()
+	eq, err := entroq.New(ctx, eqmem.Opener())
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer client.Close()
+	t.Cleanup(func() { eq.Close() })
+	return eq
+}
 
-	g, check, err := Start(ctx, client, &Config{
+// TestCheckAnswersTheConfig covers what a client cannot work out for itself and
+// so must be told: which session it is, which consumer holds its tasks, and how
+// long it actually gets for one of them.
+func TestCheckAnswersTheConfig(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	s := serveChannels(t, testClient(ctx, t))
+
+	check := s.ask(&Request{Type: ReqConfig, Config: &Config{
+		Queues:           []string{"inbox"},
+		ProtocolVersions: []int32{1},
+	}})
+	if check.Type != RespCheck {
+		t.Fatalf("answer to config = %q, want %q", check.Type, RespCheck)
+	}
+	if check.Session == "" {
+		t.Error("check names no session, so a transport cannot register one")
+	}
+	if check.Claimant == "" {
+		t.Error("check names no claimant, so a client cannot find its own work")
+	}
+}
+
+// TestTheCheckReportsTheSettledTimeout is why the clamp is visible: a worker
+// written against an hour that quietly got ninety seconds looks flaky rather
+// than capped, and the client is the only one who can tell those apart.
+func TestTheCheckReportsTheSettledTimeout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	s := serveChannels(t, testClient(ctx, t), WithMaxWorkTimeout(90*time.Second))
+
+	check := s.ask(&Request{Type: ReqConfig, Config: &Config{
 		Queues:           []string{"inbox"},
 		ProtocolVersions: []int32{1},
 		WorkTimeoutS:     3600,
-	}, &fakeConn{}, WithMaxWorkTimeout(90*time.Second))
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer g.Close()
-
+	}})
 	if check.WorkTimeoutS != 90 {
 		t.Errorf("check reports %ds, want the 90s it was capped to", check.WorkTimeoutS)
 	}
-	if g.workTimeout != 90*time.Second {
-		t.Errorf("session holds %v, want 90s", g.workTimeout)
-	}
 }
 
-// TestStartReturnsTheCheckRatherThanSendingIt is the property an HTTP
-// transport depends on. The handler that calls Start is the one that would
-// have to collect the send, so sending here would deadlock it on itself.
-func TestStartReturnsTheCheckRatherThanSendingIt(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+// TestSessionsDoNotShareAClaimant is the safety the override exists to let you
+// break deliberately: one session is one consumer, named after itself, so doc
+// set exclusion keeps working between sessions on one EntroQ client.
+func TestSessionsDoNotShareAClaimant(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-
-	g, c := startFixture(ctx, t, &Config{
-		Queues:           []string{"inbox"},
-		ProtocolVersions: []int32{1},
-	})
-	if len(c.sent) != 0 {
-		t.Errorf("Start sent %d messages through the conn; it must hand the check back instead", len(c.sent))
-	}
-	if g.sessionID == "" {
-		t.Error("Start minted no session id")
-	}
-	if g.claimant == "" {
-		t.Error("Start minted no claimant")
-	}
-}
-
-// TestStartNamesTheClaimantInTheCheck checks that the client is told which
-// consumer holds its tasks. It is what identifies the holder in a stored task
-// and in the gateway's metrics, so a client that cannot see it cannot find its
-// own work.
-func TestStartNamesTheClaimantInTheCheck(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	client, err := entroq.New(ctx, eqmem.Opener())
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	defer client.Close()
-
-	g, check, err := Start(ctx, client, &Config{
-		Queues:           []string{"inbox"},
-		ProtocolVersions: []int32{1},
-	}, &fakeConn{})
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer g.Close()
-	if check.Claimant != g.claimant {
-		t.Errorf("check names claimant %q, but the session holds as %q", check.Claimant, g.claimant)
-	}
-	if check.Session != g.sessionID {
-		t.Errorf("check names session %q, but the session is %q", check.Session, g.sessionID)
-	}
-}
-
-// TestStartMintsAClaimantUnlessTold covers the escape hatch and its default.
-// One session is one consumer, named after itself, so several sessions on one
-// EntroQ client never claim as each other.
-func TestStartMintsAClaimantUnlessTold(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
+	eq := testClient(ctx, t)
 	conf := &Config{Queues: []string{"inbox"}, ProtocolVersions: []int32{1}}
-	a, _ := startFixture(ctx, t, conf)
-	b, _ := startFixture(ctx, t, conf)
-	if a.claimant == b.claimant {
-		t.Errorf("two sessions share the claimant %q; doc set exclusion would stop working between them", a.claimant)
+
+	a := serveChannels(t, eq).ask(&Request{Type: ReqConfig, Config: conf})
+	b := serveChannels(t, eq).ask(&Request{Type: ReqConfig, Config: conf})
+	if a.Claimant == b.Claimant {
+		t.Errorf("two sessions share the claimant %q; doc set exclusion would stop working between them", a.Claimant)
+	}
+	if a.Session == b.Session {
+		t.Errorf("two sessions share the id %q", a.Session)
 	}
 
-	shared := &Config{
+	shared := serveChannels(t, eq).ask(&Request{Type: ReqConfig, Config: &Config{
 		Queues:                    []string{"inbox"},
 		ProtocolVersions:          []int32{1},
 		DangerousClaimantOverride: "eqmr/shared",
-	}
-	c, _ := startFixture(ctx, t, shared)
-	if c.claimant != "eqmr/shared" {
-		t.Errorf("claimant = %q, want the override", c.claimant)
+	}})
+	if shared.Claimant != "eqmr/shared" {
+		t.Errorf("claimant = %q, want the override", shared.Claimant)
 	}
 }
 
-// TestStartRefusesWithAMessage covers the registrations this gateway will not
+// TestServeRefusesWithAMessage covers the registrations this gateway will not
 // serve. Each is answered rather than returned: a client that needs to hear
 // something is owed an answer, not a dropped connection.
-func TestStartRefusesWithAMessage(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func TestServeRefusesWithAMessage(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	client, err := entroq.New(ctx, eqmem.Opener())
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	defer client.Close()
+	eq := testClient(ctx, t)
 
-	for name, conf := range map[string]*Config{
-		"no protocol versions": {Queues: []string{"inbox"}},
-		"a protocol nobody speaks": {
+	for name, req := range map[string]*Request{
+		"no protocol versions": {Type: ReqConfig, Config: &Config{Queues: []string{"inbox"}}},
+		"a protocol nobody speaks": {Type: ReqConfig, Config: &Config{
 			Queues:           []string{"inbox"},
 			ProtocolVersions: []int32{99},
-		},
+		}},
 		// Refused at config time rather than when the worker loop finds out,
 		// which is the difference between an answer and a puzzle.
-		"no queues": {ProtocolVersions: []int32{1}},
+		"no queues":  {Type: ReqConfig, Config: &Config{ProtocolVersions: []int32{1}}},
+		"no config":  {Type: ReqConfig},
+		"not config": {Type: ReqReady},
 	} {
 		t.Run(name, func(t *testing.T) {
-			g, msg, err := Start(ctx, client, conf, &fakeConn{})
-			if err != nil {
-				t.Fatalf("Start returned an error for %s; a refusal is a message: %v", name, err)
-			}
-			if g != nil {
-				g.Close()
-				t.Fatalf("Start built a session for a config naming %s", name)
-			}
-			if msg == nil {
-				t.Fatal("Start refused without saying why")
+			s := serveChannels(t, eq)
+			msg := s.ask(req)
+			if msg.Type != RespError {
+				t.Errorf("refusal type = %q, want %q", msg.Type, RespError)
 			}
 			if msg.Class != ExitCaller.String() {
 				t.Errorf("class = %q, want %q: a bad registration is the caller's fault", msg.Class, ExitCaller.String())
@@ -275,37 +310,26 @@ func TestStartRefusesWithAMessage(t *testing.T) {
 			if msg.Message == "" {
 				t.Error("the refusal carries no reason")
 			}
+			// And the session is over, with the refusal already delivered.
+			if err := s.wait(); err == nil {
+				t.Error("Serve returned nil for a refused config")
+			}
 		})
 	}
 }
 
-// TestStartErrorsOnlyWhenItCannotReply is the other half of that contract: an
+// TestServeErrorsOnlyWhenItCannotReply is the other half of that contract: an
 // error means no answer could be formed at all, which is the transport's own
 // bug rather than anything a client did.
-func TestStartErrorsOnlyWhenItCannotReply(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func TestServeErrorsOnlyWhenItCannotReply(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	client, err := entroq.New(ctx, eqmem.Opener())
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	defer client.Close()
+	eq := testClient(ctx, t)
 
-	conf := &Config{Queues: []string{"inbox"}, ProtocolVersions: []int32{1}}
-	for name, call := range map[string]func() (*Gateway, *SendMessage, error){
-		"no client": func() (*Gateway, *SendMessage, error) { return Start(ctx, nil, conf, &fakeConn{}) },
-		"no conn":   func() (*Gateway, *SendMessage, error) { return Start(ctx, client, conf, nil) },
-		"no config": func() (*Gateway, *SendMessage, error) { return Start(ctx, client, nil, &fakeConn{}) },
-	} {
-		t.Run(name, func(t *testing.T) {
-			g, msg, err := call()
-			if err == nil {
-				t.Fatalf("Start accepted %s", name)
-			}
-			// Nothing accompanies a non-nil error.
-			if g != nil || msg != nil {
-				t.Errorf("Start returned (%v, %v) alongside an error", g, msg)
-			}
-		})
+	if err := Serve(ctx, nil, &fakeConn{}); err == nil {
+		t.Error("Serve accepted a nil client")
+	}
+	if err := Serve(ctx, eq, nil); err == nil {
+		t.Error("Serve accepted a nil conn")
 	}
 }
