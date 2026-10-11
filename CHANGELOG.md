@@ -12,8 +12,10 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Release note: the next release must be a minor (v1.13.0 or later), not a
 patch. It adds public API (`entroq.InvalidArgumentError`), moves the SQLite
 schema to version 3, adds `eqc work --max-claims`, removes the
-`eqc mod --reset` flag, and changes how doc versions and claims work (see the
-doc sets entry). The PostgreSQL schema moves to 1.13.0: stop 1.12 services
+`eqc mod --reset` flag, bounds every Go worker handler body at five minutes by
+default (see the work timeout entry, and pass `WithWorkTimeout(0)` for a
+handler that legitimately runs longer), and changes how doc versions and claims
+work (see the doc sets entry). The PostgreSQL schema moves to 1.13.0: stop 1.12 services
 first, since the upgrade drops the doc functions they call, then run
 `eqpg schema upgrade` (or serve with `--init_schema`) before starting the new
 service. The upgrade moves data and holds a lock on the docs table while it
@@ -30,10 +32,12 @@ runs, so plan a short maintenance window on large doc tables.
   workers would never reach the claim limit.
 
 - **A bound on how long a handler body may run.** `worker.WithWorkTimeout(d)`
-  in Go, `work_timeout_s` in Python. Zero, the default, means a body may run as
-  long as it likes: a long-lived mostly-idle body is an ordinary thing to
-  write, and renewal exists so one can. Set it when you know roughly how long
-  the work should take. A body that runs past it is asked to stop -- a canceled
+  in Go, `work_timeout_s` in Python. Go bounds a body at
+  `worker.DefaultWorkTimeout`, five minutes, unless told otherwise; pass zero
+  for no bound at all, which a long-lived mostly-idle body wants and which
+  renewal exists to support. Python still defaults to no bound. Set it when you
+  know roughly how long the work should take. A body that runs past it is asked
+  to stop -- a canceled
   context in Go, a cancelled task in Python, so a body that never yields cannot
   be made to -- and renewal stops with it, rather than holding a task the
   worker has given up on. The task is then **retried**, with its attempt
