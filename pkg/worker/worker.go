@@ -964,11 +964,11 @@ func (w *Worker[T]) handleSentinelErrors(ctx context.Context, eqc entroq.Client,
 				// Optimistic: the task moved out from under us (already reclaimed
 				// or handled elsewhere). Known state, not fatal -- log and continue.
 				log.Printf("retry/quarantine skipped, task no longer ours: %v", err)
-				return true, nil
+				return true, stopAfter(re.stop, "retry")
 			}
 			return true, fmt.Errorf("retry or quarantine modify: %w", err)
 		}
-		return true, nil
+		return true, stopAfter(re.stop, "retry")
 	}
 	if me, ok := AsMove(sentinel); ok {
 		q := errQ
@@ -981,16 +981,26 @@ func (w *Worker[T]) handleSentinelErrors(ctx context.Context, eqc entroq.Client,
 				// Optimistic: the task moved out from under us (already reclaimed
 				// or handled elsewhere). Known state, not fatal -- log and continue.
 				log.Printf("quarantine skipped, task no longer ours: %v", err)
-				return true, nil
+				return true, stopAfter(me.stop, "move")
 			}
 			return true, fmt.Errorf("quarantine modify: %w", err)
 		}
-		return true, nil
+		return true, stopAfter(me.stop, "move")
 	}
 	if fe, ok := AsFatal(sentinel); ok {
 		return true, fe
 	}
 	return false, nil
+}
+
+// stopAfter reports the clean end a sentinel asked for with ThenStop, once its
+// disposition is settled. The task is accounted for, so Run returns nil, as it
+// does for Result.ThenStop after a commit.
+func stopAfter(stop bool, disposition string) error {
+	if !stop {
+		return nil
+	}
+	return fmt.Errorf("stopping after a %s that asked to be the last: %w", disposition, ErrShutdown)
 }
 
 // acquireDocs performs the doc acquisition phase for a claimed task: it
@@ -1498,7 +1508,7 @@ func isSentinelError(err error) bool {
 //   - Sentinel (RetryError/MoveError/FatalError): acted on. Retry re-queues the
 //     task with backoff, quarantining once max-attempts is reached; Move
 //     quarantines it immediately; Fatal stops the worker. Retry and Move keep the
-//     loop running, Fatal exits.
+//     loop running unless they asked to be the last with ThenStop, Fatal exits.
 //   - DependencyError: reclaimed. The commit cleanly did not apply (a version
 //     moved, a dependency was lost), a known state, so the task is left to be
 //     re-claimed on lease expiry and the loop continues. See OnDependency to
@@ -1672,6 +1682,7 @@ type RetryError struct {
 	after    time.Duration
 	hasAfter bool
 	moveTo   string
+	stop     bool
 }
 
 // Error implements the error interface.
@@ -1697,6 +1708,17 @@ func (e *RetryError) OrMoveTo(queue string) *RetryError {
 	return e
 }
 
+// ThenStop says this is the last task: retry or quarantine it as usual, then
+// end the Run cleanly, with Run returning nil. It is chainable.
+//
+// It is Result.ThenStop for a handler that is failing rather than committing.
+// The disposition lands first either way, so the task in hand is never
+// abandoned by the stop.
+func (e *RetryError) ThenStop() *RetryError {
+	e.stop = true
+	return e
+}
+
 // AsRetry reports whether err is, or wraps, a *RetryError.
 func AsRetry(err error) (*RetryError, bool) {
 	var e *RetryError
@@ -1709,8 +1731,9 @@ func AsRetry(err error) (*RetryError, bool) {
 // with a retry. By default the destination is the worker's ErrQMap; To
 // overrides it. Detect it with AsMove.
 type MoveError struct {
-	msg string
-	to  string
+	msg  string
+	to   string
+	stop bool
 }
 
 // Error implements the error interface.
@@ -1725,6 +1748,13 @@ func MoveErrorf(format string, args ...any) *MoveError {
 // ErrQMap. It is chainable.
 func (e *MoveError) To(queue string) *MoveError {
 	e.to = queue
+	return e
+}
+
+// ThenStop says this is the last task: quarantine it as usual, then end the
+// Run cleanly, with Run returning nil. It is chainable.
+func (e *MoveError) ThenStop() *MoveError {
+	e.stop = true
 	return e
 }
 

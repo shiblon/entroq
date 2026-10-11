@@ -591,6 +591,14 @@ func (g *Gateway) makeDoModify() worker.DoModifyRun[json.RawMessage] {
 		// is right. Waiting for a client that never collected it would not be.
 		received, err := g.recv(ctx, ReqModify)
 		if err != nil {
+			// A deadline means the client is unaccounted for: it may still be
+			// working, and nothing on this connection can tell it otherwise.
+			// Put the task back with its attempt counted and end the session,
+			// so the client's next request is a routing failure rather than a
+			// wait on a gateway that went around again without it.
+			if errors.Is(err, context.DeadlineExceeded) {
+				return nil, worker.RetryErrorf("client did not answer within %v", g.workTimeout).ThenStop()
+			}
 			return nil, fmt.Errorf("work: %w", err)
 		}
 		// A disposition other than ok replaces the commit: the worker retries,

@@ -288,3 +288,76 @@ func equalStrings(a, b []string) bool {
 	}
 	return true
 }
+
+// TestSentinelThenStopDisposesThenEnds checks the error-path twin of
+// Result.ThenStop: the sentinel's disposition lands, and only then does the Run
+// end cleanly.
+//
+// A handler that is failing still owes the task an answer. Stopping by
+// cancelling the Run's context would leave it to lapse with its attempt
+// uncounted, so a task that reliably kills its workers would never reach the
+// claim limit.
+func TestSentinelThenStopDisposesThenEnds(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		err    error
+		inQ    int
+		inErrQ int
+	}{
+		{name: "retry", err: RetryErrorf("client is unaccounted for").ThenStop(), inQ: 2},
+		{name: "move", err: MoveErrorf("client is unaccounted for").ThenStop(), inQ: 1, inErrQ: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			f := newCueFixture(ctx, t)
+
+			// A second task proves the worker stopped claiming rather than
+			// merely finishing what it had.
+			if _, err := f.client.Modify(ctx, entroq.InsertingInto("q")); err != nil {
+				t.Fatalf("Insert second: %v", err)
+			}
+
+			var mu sync.Mutex
+			work := 0
+			w := New[string](f.client,
+				WithDoModify(func(context.Context, entroq.Reader, *Work[string]) (*Result, error) {
+					mu.Lock()
+					work++
+					mu.Unlock()
+					return nil, tc.err
+				}),
+			)
+
+			errc := make(chan error, 1)
+			go func() { errc <- w.Run(ctx, Watching("q")) }()
+
+			select {
+			case err := <-errc:
+				// A clean end, with no cancellation anywhere.
+				if err != nil {
+					t.Errorf("Run after ThenStop = %v, want nil", err)
+				}
+			case <-ctx.Done():
+				t.Fatal("ThenStop did not end the Run")
+			}
+
+			mu.Lock()
+			ran := work
+			mu.Unlock()
+			if ran != 1 {
+				t.Errorf("the work phase ran %d times, want 1: the worker kept claiming after ThenStop", ran)
+			}
+
+			for q, want := range map[string]int{"q": tc.inQ, "q/err": tc.inErrQ} {
+				tasks, err := f.client.Tasks(ctx, q)
+				if err != nil {
+					t.Fatalf("Tasks(%q): %v", q, err)
+				}
+				if len(tasks) != want {
+					t.Errorf("%s holds %d tasks, want %d: the disposition did not land", q, len(tasks), want)
+				}
+			}
+		})
+	}
+}

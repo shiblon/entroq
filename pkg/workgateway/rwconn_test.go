@@ -379,3 +379,67 @@ func TestRWConnCloseIsOneStep(t *testing.T) {
 		t.Errorf("Send after Close = %v, want io.EOF", err)
 	}
 }
+
+// tryRecv is recv without the fatal, for a test that has to tell a closed
+// session from a wrong answer.
+func (w *client) tryRecv() (*Response, error) {
+	w.t.Helper()
+	var msg Response
+	if err := w.dec.Decode(&msg); err != nil {
+		return nil, err
+	}
+	return &msg, nil
+}
+
+// TestRWWorkTimeoutDoesNotMisdeliver is the pipe's version of a fired work
+// timeout, and it fails differently from the channel's.
+//
+// RWConn blocks in Decode, which no context interrupts, so the gateway does not
+// notice its deadline until the client speaks. It then consumes that request
+// and cannot answer it, the send refusing on the expired context, and goes
+// around for another task. The next thing the client reads is that task's cue:
+// it asked whether it was still warm and was handed a job.
+func TestRWWorkTimeoutDoesNotMisdeliver(t *testing.T) {
+	const budget = 200 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	eq, err := entroq.New(ctx, eqmem.Opener())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer eq.Close()
+	// Two tasks, so the gateway has another to claim the moment it gives up.
+	for i := 0; i < 2; i++ {
+		if _, err := eq.Modify(ctx, entroq.InsertingInto("inbox")); err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+	}
+
+	r, w, c := osPipes(t)
+	served(ctx, eq, r, w, WithMaxWorkTimeout(budget))
+
+	c.send(&Request{Type: ReqConfig, Config: &Config{Queues: []string{"inbox"}, ProtocolVersions: []int32{1}}})
+	check := c.recv()
+	if check.Type != RespCheck {
+		t.Fatalf("first message = %q, want %q", check.Type, RespCheck)
+	}
+	c.send(&Request{Type: ReqReady, Session: check.Session})
+	if work := c.recv(); work.Type != RespWork {
+		t.Fatalf("after ready, got %q, want %q", work.Type, RespWork)
+	}
+
+	// Outlast the budget without answering, the way a client whose work ran
+	// long does.
+	time.Sleep(3 * budget)
+
+	c.send(&Request{Type: ReqTime, Session: check.Session})
+	resp, err := c.tryRecv()
+	if err != nil {
+		// The session ended, which is what a diverged state deserves.
+		return
+	}
+	if resp.Type != RespTime {
+		t.Errorf("the answer to %q was %q, want %q: a reply must answer the request it follows", ReqTime, resp.Type, RespTime)
+	}
+}

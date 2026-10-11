@@ -21,6 +21,14 @@ runs, so plan a short maintenance window on large doc tables.
 
 ### Added
 
+- **`ThenStop` on `worker.RetryError` and `worker.MoveError`.** The error-path
+  twin of `Result.ThenStop`: the sentinel's disposition lands -- the task
+  retried with its attempt counted, or quarantined -- and only then does the
+  `Run` end, returning nil. For a handler that must stop but still owes the
+  task an answer. Cancelling the context to stop instead would leave the task
+  to lapse with its attempt uncounted, so a task that reliably kills its
+  workers would never reach the claim limit.
+
 - **A bound on how long a handler body may run.** `worker.WithWorkTimeout(d)`
   in Go, `work_timeout_s` in Python. Zero, the default, means a body may run as
   long as it likes: a long-lived mostly-idle body is an ordinary thing to
@@ -443,6 +451,15 @@ runs, so plan a short maintenance window on large doc tables.
   versions.
 
 ### Fixed
+
+- **A work gateway session ends when its work timeout fires.** The gateway used
+  to put the task back and claim another while the client was still working,
+  leaving the two with different ideas of what was outstanding and no way for
+  the client to find out: over HTTP its next request stalled instead of being
+  answered, and over a pipe it could read the next task's cue as the reply to
+  its own request. The session now ends once the task is back on its queue, so
+  the client's next request fails to route -- 404 over HTTP, EOF over a pipe --
+  which is what tells it to stop working.
 
 - **A renewal that fails transiently retries inside the lease margin.** Both
   workers waited the full renewal interval after a transient failure, which

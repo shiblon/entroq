@@ -400,3 +400,69 @@ func TestHTTPWorkSurvivesDisconnection(t *testing.T) {
 		t.Errorf("inbox still holds %d tasks; the answer after reconnecting did not commit", len(left))
 	}
 }
+
+// tryPost is post with a deadline and without the fatal. A request that never
+// completes is a result some tests need to see rather than hang on.
+func (w *httpWorker) tryPost(timeout time.Duration, req *Request) (*Response, int, error) {
+	w.t.Helper()
+	req.Session = w.session
+	body, err := json.Marshal(req)
+	if err != nil {
+		w.t.Fatalf("marshal %q: %v", req.Type, err)
+	}
+	hc := &http.Client{Timeout: timeout}
+	res, err := hc.Post(w.url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, 0, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return nil, res.StatusCode, nil
+	}
+	var resp Response
+	if err := json.NewDecoder(res.Body).Decode(&resp); err != nil {
+		w.t.Fatalf("decode answer to %q: %v", req.Type, err)
+	}
+	return &resp, res.StatusCode, nil
+}
+
+// TestHTTPWorkTimeoutEndsTheSession pins what a fired work timeout owes the
+// client.
+//
+// The gateway gives up on a task whose answer never came and goes around for
+// another one, but the client is still out there working. Their states have
+// diverged with the client unable to find out, so the session must end: its
+// next request is then a routing failure, which is the one signal that tells a
+// client to stop.
+func TestHTTPWorkTimeoutEndsTheSession(t *testing.T) {
+	const budget = 200 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	w, eq := httpFixture(ctx, t, WithMaxWorkTimeout(budget))
+	// Two tasks, so the gateway has another to claim the moment it gives up.
+	for i := 0; i < 2; i++ {
+		if _, err := eq.Modify(ctx, entroq.InsertingInto("inbox")); err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+	}
+
+	w.register(&Config{Queues: []string{"inbox"}, ProtocolVersions: []int32{1}})
+	if work := w.ask(&Request{Type: ReqReady}); work.Type != RespWork {
+		t.Fatalf("got %q, want %q", work.Type, RespWork)
+	}
+
+	// Outlast the budget without answering, the way a client whose work ran
+	// long does.
+	time.Sleep(3 * budget)
+
+	// A read stands in for the heartbeat: valid in any phase, and all a client
+	// has to ask with.
+	_, status, err := w.tryPost(2*time.Second, &Request{Type: ReqTime})
+	if err != nil {
+		t.Fatalf("the client's request never completed: %v", err)
+	}
+	if status != http.StatusNotFound {
+		t.Errorf("got status %d, want %d: a client whose work timed out must learn its session is gone", status, http.StatusNotFound)
+	}
+}
