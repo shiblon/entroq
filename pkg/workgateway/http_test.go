@@ -320,3 +320,83 @@ func TestHTTPRefusesWhatItDoesNotSpeak(t *testing.T) {
 		t.Errorf("a malformed body answered with %d, want %d", res.StatusCode, http.StatusBadRequest)
 	}
 }
+
+// TestHTTPWorkSurvivesDisconnection is what makes HTTP viable for long work.
+//
+// Once the gateway hands out a task the response completes and there is NO
+// request in flight. The client can go away for as long as its work takes and
+// come back with the answer, because DoWork is blocked on a channel read that
+// has no opinion about connections, and the session's context is the service's
+// rather than any request's.
+//
+// The lease here is far shorter than the gap, so the task is only still the
+// client's if renewal kept running across it -- with nobody connected.
+func TestHTTPWorkSurvivesDisconnection(t *testing.T) {
+	const lease = 200 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	backend, err := eqmem.Opener()(ctx)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	shared := func(context.Context) (entroq.Backend, error) { return backend, nil }
+	eq, err := entroq.New(ctx, shared)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer eq.Close()
+	intruder, err := entroq.New(ctx, shared, entroq.WithClaimantID("intruder"))
+	if err != nil {
+		t.Fatalf("New intruder: %v", err)
+	}
+
+	h := NewHandler(ctx, eq, WithLease(lease))
+	defer h.Close()
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	if _, err := eq.Modify(ctx, entroq.InsertingInto("inbox")); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	w := &httpWorker{t: t, url: srv.URL}
+	w.register(&Config{Queues: []string{"inbox"}, ProtocolVersions: []int32{1}})
+	work := w.ask(&Request{Type: ReqReady})
+	if work.Type != RespWork {
+		t.Fatalf("got %q, want %q", work.Type, RespWork)
+	}
+
+	// Nothing is connected now. Wait out several leases.
+	time.Sleep(5 * lease)
+
+	if got := h.Sessions(); got != 1 {
+		t.Errorf("handler holds %d sessions across the gap, want 1", got)
+	}
+	// Renewal held the task the whole time, with no request in flight.
+	if task, err := intruder.TryClaim(ctx, entroq.From("inbox")); err != nil {
+		t.Fatalf("Intruder claim: %v", err)
+	} else if task != nil {
+		t.Error("another claimant took the task while its worker was disconnected")
+	}
+
+	// And the answer still lands, on the turn it was always owed.
+	w.post(&Request{
+		Type: ReqModify,
+		Modification: &wireModReq{&pb.ModifyRequest{
+			Deletes: []*pb.TaskID{{
+				Queue:   work.Task.GetQueue(),
+				Id:      work.Task.GetId(),
+				Version: work.Task.GetVersion(),
+			}},
+		}},
+		Quit: true,
+	})
+	left, err := eq.Tasks(ctx, "inbox")
+	if err != nil {
+		t.Fatalf("Tasks: %v", err)
+	}
+	if len(left) != 0 {
+		t.Errorf("inbox still holds %d tasks; the answer after reconnecting did not commit", len(left))
+	}
+}
