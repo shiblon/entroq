@@ -67,6 +67,53 @@ func (r *brokenReader) Read(p []byte) (int, error) {
 
 func (r *brokenReader) Close() error { return nil }
 
+// failingWriter accepts nothing, the way a stream whose peer is gone does.
+type failingWriter struct{ err error }
+
+func (w failingWriter) Write(p []byte) (int, error) { return 0, w.err }
+
+func (w failingWriter) Close() error { return nil }
+
+// TestRWFailedSendEndsTheSession pins that a failed write is terminal, and
+// that the session reports the write as the reason.
+//
+// writeFrame writes a frame and its newline in one Write, and io.Writer
+// guarantees a short write comes with an error -- so a failed Send may have
+// left a fragment with no terminator on the stream. That terminator is the
+// only frame boundary there is, so anything written afterwards concatenates
+// onto the fragment and the peer can never resynchronize. Recovery is not
+// unreliable here, it is impossible, which is why the pump that owns the
+// stream ends the session rather than handing the problem back to one caller.
+func TestRWFailedSendEndsTheSession(t *testing.T) {
+	ctx := context.Background()
+	gone := errors.New("broken pipe")
+
+	// A reader that only ever blocks, so nothing but the write can end this.
+	blocked, idle, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("Pipe: %v", err)
+	}
+	defer idle.Close()
+
+	c := NewRWConn(blocked, failingWriter{err: gone})
+	defer c.Close()
+
+	if err := c.Send(ctx, &Response{Type: RespCheck}); !errors.Is(err, gone) {
+		t.Errorf("Send = %v, want the write error %v", err, gone)
+	}
+	select {
+	case <-c.done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the session never ended after its write failed")
+	}
+	if err := c.ending(); !errors.Is(err, gone) {
+		t.Errorf("the session ended with %v, want the write error %v", err, gone)
+	}
+	if _, err := c.Recv(ctx); !errors.Is(err, gone) {
+		t.Errorf("Recv after a failed write = %v, want the write error %v", err, gone)
+	}
+}
+
 // discardWriter takes responses nowhere, for a test that only drives reads.
 type discardWriter struct{}
 
