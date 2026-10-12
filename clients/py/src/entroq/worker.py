@@ -94,6 +94,14 @@ def default_err_q_map(inbox: str) -> str:
 # small clock disagreement on every renewal.
 DEFAULT_CLAIM_DURATION_S = 45.0
 
+# DEFAULT_WORK_TIMEOUT_S matches worker.DefaultWorkTimeout in Go, which is the
+# reference implementation. A body that wedges holds its task under renewal for
+# as long as the worker lives, and no other worker can ever have it, so the
+# default that costs nothing when work is quick is the one that catches that.
+# Five minutes is long enough that ordinary work never notices and short enough
+# that a wedged worker is found the same day. Pass 0 for no bound.
+DEFAULT_WORK_TIMEOUT_S = 300.0
+
 # Bounds the quarantine EntroQWorker._quarantine_at_limit attempts, which must
 # not hold up a worker that is already stopping.
 AT_LIMIT_TIMEOUT_S = 5.0
@@ -613,7 +621,7 @@ class EntroQWorker:
         err_queue: str = '',
         err_q_map: Callable[[str], str] | None = None,
         retry_delay_s: float = 30.0,
-        work_timeout_s: float = 0.0,
+        work_timeout_s: float = DEFAULT_WORK_TIMEOUT_S,
         max_attempts: int = 0,
         max_claims: int = 0,
         retry_transport_errors: bool = True,
@@ -628,10 +636,11 @@ class EntroQWorker:
         ``WithErrQMap``); they are mutually exclusive. With neither,
         :func:`default_err_q_map` appends ``/err`` to the task's own queue.
 
-        ``work_timeout_s`` bounds how long a handler body may run. 0, the
-        default, means it may run as long as it likes: a long-lived mostly-idle
-        body is an ordinary thing to write, and renewal exists so one can. Set
-        it when you know roughly how long the work should take. A body that
+        ``work_timeout_s`` bounds how long a handler body may run, and
+        defaults to :data:`DEFAULT_WORK_TIMEOUT_S`, five minutes, as the Go
+        worker does. Pass 0 for no bound at all, which a long-lived
+        mostly-idle body wants and which renewal exists to support. A body
+        that
         runs past it is cancelled, and the task is RETRIED rather than
         quarantined, with its attempt counted -- so a hang that was bad luck
         comes back and succeeds, while a task that always hangs exhausts

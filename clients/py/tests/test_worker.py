@@ -19,6 +19,7 @@ from entroq.worker import (
     granted_lease_s,
     StopWorker, FatalWorker, RetryError, MoveError,
     DocClaim, Handler, EntroQWorker, default_err_q_map,
+    DEFAULT_WORK_TIMEOUT_S,
     _fix_versions, _renewing,
 )
 
@@ -1211,7 +1212,7 @@ def test_work_timeout_quarantines_once_attempts_run_out():
 
 
 def test_work_timeout_zero_means_never():
-    """The default, and the reason for it: a body may idle on purpose."""
+    """Zero opts out, for a body that may idle on purpose."""
     finished = []
 
     async def idle_then_finish(t, docs):
@@ -1222,6 +1223,18 @@ def test_work_timeout_zero_means_never():
     tc = _work_timeout_change(work_timeout_s=0.0, body=idle_then_finish)
     assert finished == ['t1'], "a body with no timeout must run to completion"
     assert tc is None, "nothing to dispose of: the body succeeded"
+
+
+def test_work_timeout_defaults_to_five_minutes():
+    """Parity with Go, whose worker.DefaultWorkTimeout is five minutes.
+
+    A body that wedges otherwise holds its task under renewal for as long as
+    the worker lives, and no other worker can ever have it, so the default
+    that costs nothing when work is quick is the one that catches that.
+    """
+    worker = EntroQWorker(FakeClient(tasks=[]), 'q')
+    assert worker._work_timeout_s == DEFAULT_WORK_TIMEOUT_S
+    assert DEFAULT_WORK_TIMEOUT_S == 300.0, "five minutes, as Go bounds it"
 
 
 def test_work_timeout_leaves_a_body_that_finished_in_time_alone():

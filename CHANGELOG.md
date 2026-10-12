@@ -32,11 +32,12 @@ runs, so plan a short maintenance window on large doc tables.
   workers would never reach the claim limit.
 
 - **A bound on how long a handler body may run.** `worker.WithWorkTimeout(d)`
-  in Go, `work_timeout_s` in Python. Go bounds a body at
-  `worker.DefaultWorkTimeout`, five minutes, unless told otherwise; pass zero
-  for no bound at all, which a long-lived mostly-idle body wants and which
-  renewal exists to support. Python still defaults to no bound. Set it when you
-  know roughly how long the work should take. A body that runs past it is asked
+  in Go, `work_timeout_s` in Python. Both bound a body at five minutes unless
+  told otherwise -- `worker.DefaultWorkTimeout` in Go,
+  `DEFAULT_WORK_TIMEOUT_S` in Python -- and both take zero for no bound at all,
+  which a long-lived mostly-idle body wants and which renewal exists to
+  support. Set it when you know roughly how long the work should take. A body
+  that runs past it is asked
   to stop -- a canceled
   context in Go, a cancelled task in Python, so a body that never yields cannot
   be made to -- and renewal stops with it, rather than holding a task the
