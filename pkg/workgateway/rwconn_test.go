@@ -33,6 +33,13 @@ func (w *client) send(v any) {
 	}
 }
 
+// trySend is send without the fatal, for a test that has to tell a session
+// that is gone from a message that was refused.
+func (w *client) trySend(v any) error {
+	w.t.Helper()
+	return w.enc.Encode(v)
+}
+
 func (w *client) recv() *Response {
 	w.t.Helper()
 	var msg Response
@@ -40,6 +47,63 @@ func (w *client) recv() *Response {
 		w.t.Fatalf("client recv: %v", err)
 	}
 	return &msg
+}
+
+// brokenReader gives up some bytes and then fails, the way a connection reset
+// mid-frame does.
+type brokenReader struct {
+	data []byte
+	err  error
+}
+
+func (r *brokenReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, r.err
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
+func (r *brokenReader) Close() error { return nil }
+
+// discardWriter takes responses nowhere, for a test that only drives reads.
+type discardWriter struct{}
+
+func (discardWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+func (discardWriter) Close() error { return nil }
+
+// TestRWBrokenReadReportsTheRead pins which error ends a session when the
+// stream breaks part way through a frame.
+//
+// A failed read leaves a fragment, not a frame. Decoding it either fails and
+// buries the real cause under a parse error, or -- worse -- succeeds, and the
+// gateway acts on a request from a stream whose state it cannot see. Only a
+// hang-up is different, because a peer that closed without its last newline
+// still said something whole.
+func TestRWBrokenReadReportsTheRead(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		data string
+	}{
+		{name: "fragment cannot parse", data: `{"type":"rea`},
+		{name: "fragment happens to parse", data: `{"type":"ready"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reset := errors.New("connection reset by peer")
+			c := NewRWConn(&brokenReader{data: []byte(tc.data), err: reset}, discardWriter{})
+			defer c.Close()
+
+			req, err := c.Recv(context.Background())
+			if req != nil {
+				t.Errorf("Recv handed over %q from a stream that broke mid-frame", req.Type)
+			}
+			if !errors.Is(err, reset) {
+				t.Errorf("Recv = %v, want the read error %v to survive", err, reset)
+			}
+		})
+	}
 }
 
 // osPipes wires a session to a client over REAL OS PIPES, which is what a
@@ -391,15 +455,14 @@ func (w *client) tryRecv() (*Response, error) {
 	return &msg, nil
 }
 
-// TestRWWorkTimeoutDoesNotMisdeliver is the pipe's version of a fired work
-// timeout, and it fails differently from the channel's.
+// TestRWWorkTimeoutEndsTheSession pins what a fired work timeout owes a client
+// over a pipe, which is what it owes one over HTTP.
 //
-// RWConn blocks in Decode, which no context interrupts, so the gateway does not
-// notice its deadline until the client speaks. It then consumes that request
-// and cannot answer it, the send refusing on the expired context, and goes
-// around for another task. The next thing the client reads is that task's cue:
-// it asked whether it was still warm and was handed a job.
-func TestRWWorkTimeoutDoesNotMisdeliver(t *testing.T) {
+// The gateway gives up on a task whose answer never came while the client is
+// still out there working, so their states have diverged with the client unable
+// to find out. The task goes back with its attempt counted and the session
+// ends, rather than the gateway going around for another one without it.
+func TestRWWorkTimeoutEndsTheSession(t *testing.T) {
 	const budget = 200 * time.Millisecond
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -409,15 +472,16 @@ func TestRWWorkTimeoutDoesNotMisdeliver(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	defer eq.Close()
-	// Two tasks, so the gateway has another to claim the moment it gives up.
-	for i := 0; i < 2; i++ {
+	// Two tasks, so going around for another one is something this gateway
+	// could do if it were going to.
+	for range 2 {
 		if _, err := eq.Modify(ctx, entroq.InsertingInto("inbox")); err != nil {
 			t.Fatalf("Insert: %v", err)
 		}
 	}
 
 	r, w, c := osPipes(t)
-	served(ctx, eq, r, w, WithMaxWorkTimeout(budget))
+	done := served(ctx, eq, r, w, WithMaxWorkTimeout(budget))
 
 	c.send(&Request{Type: ReqConfig, Config: &Config{Queues: []string{"inbox"}, ProtocolVersions: []int32{1}}})
 	check := c.recv()
@@ -429,17 +493,43 @@ func TestRWWorkTimeoutDoesNotMisdeliver(t *testing.T) {
 		t.Fatalf("after ready, got %q, want %q", work.Type, RespWork)
 	}
 
-	// Outlast the budget without answering, the way a client whose work ran
-	// long does.
-	time.Sleep(3 * budget)
-
-	c.send(&Request{Type: ReqTime, Session: check.Session})
-	resp, err := c.tryRecv()
-	if err != nil {
-		// The session ended, which is what a diverged state deserves.
-		return
+	// Never answer, the way a client whose work ran long does. The budget
+	// expiring is the whole signal: the session ends without the client having
+	// to speak, which is what it could not do before.
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Serve = %v, want nil: a fired work timeout is a handled ending", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("the session never ended after its work timeout fired")
 	}
-	if resp.Type != RespTime {
-		t.Errorf("the answer to %q was %q, want %q: a reply must answer the request it follows", ReqTime, resp.Type, RespTime)
+
+	// The client learns by failing, which is the one signal that tells it to
+	// stop. Whether the write or the read reports it depends on which it
+	// reaches first, and either is the session being gone.
+	if err := c.trySend(&Request{Type: ReqTime, Session: check.Session}); err == nil {
+		if _, err := c.tryRecv(); err == nil {
+			t.Error("the client was still served after its work timed out")
+		}
+	}
+
+	// Dispose first, then exit: the task is back with its attempt counted, so a
+	// task that reliably kills its workers still reaches the claim limit.
+	left, err := eq.Tasks(ctx, "inbox")
+	if err != nil {
+		t.Fatalf("Tasks: %v", err)
+	}
+	if len(left) != 2 {
+		t.Fatalf("inbox holds %d tasks, want 2: the timed-out task was not put back", len(left))
+	}
+	var attempted int
+	for _, task := range left {
+		if task.Attempt > 0 {
+			attempted++
+		}
+	}
+	if attempted != 1 {
+		t.Errorf("%d tasks carry an attempt, want 1: a work timeout must count against its task", attempted)
 	}
 }

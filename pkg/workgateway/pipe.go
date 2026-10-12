@@ -1,84 +1,279 @@
 package workgateway
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
+
+	"golang.org/x/sync/errgroup"
 )
 
-// RWConn is a reader-writer connection that can be used with a work Gateway.
-// Anything that satisfies ReadCloser and WriteCloser can be used as transport
-// channels for the gateway.
+// RWConn carries a gateway session over a byte stream: a reader and a writer,
+// which is what a spawned child gets for its stdin and stdout. Anything
+// satisfying io.ReadCloser and io.WriteCloser will do, a unix socket included.
+// Send is from the gateway's perspective, as is Recv.
+//
+// Two pumps move the bytes, because neither a blocking read nor a blocking
+// write answers to a context. The reader pump frames and decodes, handing
+// requests to Recv over a channel; the writer pump takes responses from Send
+// and writes them. Cancellation is then a select on a channel, which contexts
+// do cleanly, and Close is what stops a pump already blocked in a syscall, by
+// closing the stream underneath it.
+//
+// The channels are unbuffered, so a pump runs at most one message ahead and a
+// request nobody collected is still there for the next Recv.
 type RWConn struct {
-	sync.Mutex
+	mu sync.Mutex
 
-	dec *json.Decoder
-	enc *json.Encoder
+	// done closes when the session has ended, for whatever reason. ended says
+	// which reason, and is set before this closes. Both are guarded by mu.
+	done  chan struct{}
+	ended error
 
-	r io.ReadCloser
-	w io.WriteCloser
+	rCh <-chan requestFrame
+	wCh chan<- responseFrame
 
-	done chan bool
+	// stop ends both pumps, and closing the streams is what unblocks one that
+	// is already in a syscall. closeStreams reports the same result however
+	// many times it is called, so the teardown path and Close can share it.
+	stop         context.CancelFunc
+	closeStreams func() error
 }
 
-// NewRWConn creates a new read-write connection for a Gateway.
-// The connection reads from the reader and forwards it to the gateway. The
-// gateway responses are forwarded to the writer. Send is from the gateway's
-// perspective, as is Recv.
+// requestFrame is one thing off the wire: a request, or the error that ended the
+// stream. Errors ride the same channel as requests so they arrive in order --
+// after the last good request rather than instead of it, which is the
+// difference between a malformed frame and a clean hang-up.
+type requestFrame struct {
+	req *Request
+	err error
+}
+
+// responseFrame is one response and somewhere to report what became of it. Send
+// waits for that verdict, so a nil return means the peer has the bytes rather
+// than meaning a pump accepted them and may yet drop the session's last word.
+type responseFrame struct {
+	resp *Response
+	ack  chan<- error
+}
+
+// NewRWConn creates a read-write connection for a Gateway, with the pumps
+// already running. Close it to end the session and stop them.
 func NewRWConn(r io.ReadCloser, w io.WriteCloser) *RWConn {
-	return &RWConn{
-		r:    r,
-		w:    w,
-		dec:  json.NewDecoder(r),
-		enc:  json.NewEncoder(w),
-		done: make(chan bool),
+	ctx, cancel := context.WithCancel(context.Background())
+	rCh := make(chan requestFrame)
+	wCh := make(chan responseFrame)
+
+	c := &RWConn{
+		done: make(chan struct{}),
+		rCh:  rCh,
+		wCh:  wCh,
+		stop: cancel,
+		closeStreams: sync.OnceValue(func() error {
+			return errors.Join(w.Close(), r.Close())
+		}),
 	}
+
+	g, gctx := errgroup.WithContext(ctx)
+
+	// A pump blocked in a syscall answers to nothing but a closed stream, so
+	// cancelling closes them. errgroup cancels gctx as soon as either pump
+	// fails, which is how one pump's failure releases the other. The close
+	// result is kept for the collector below to report.
+	context.AfterFunc(gctx, func() {
+		c.closeStreams()
+	})
+
+	g.Go(func() error {
+		return pumpRead(gctx, r, rCh)
+	})
+	g.Go(func() error {
+		return pumpWrite(gctx, w, wCh)
+	})
+
+	// Both pumps have returned by the time Wait does, so there is exactly one
+	// place that decides why a session ended.
+	go func() {
+		c.finish(errors.Join(g.Wait(), c.closeStreams()))
+	}()
+
+	return c
+}
+
+// pumpRead frames and decodes requests from r, handing each one to Recv.
+//
+// A frame is one JSON value on one line. JSON escapes the newlines inside
+// strings, so the terminator is unambiguous, and a shell client can take one
+// frame with a single `read -r`.
+//
+// bufio.Reader rather than json.Decoder because a Decoder keeps its first read
+// error forever: it cannot report a bad frame and carry on, and it cannot be
+// interrupted and resumed.
+func pumpRead(ctx context.Context, r io.Reader, out chan<- requestFrame) error {
+	br := bufio.NewReader(r)
+	for {
+		line, err := br.ReadBytes('\n')
+		if err != nil {
+			// A broken read leaves a fragment, not a frame, and the read error
+			// is why the session is ending -- not whatever the fragment fails
+			// to parse as, and not a request it may happen to parse into.
+			if !errors.Is(err, io.EOF) {
+				err = fmt.Errorf("read frame: %w", err)
+				deliver(ctx, out, requestFrame{err: err})
+				return err
+			}
+			// A peer that hung up without its last newline still said
+			// something whole: that line is decoded below, and the next read
+			// reports the end.
+			if len(line) == 0 {
+				deliver(ctx, out, requestFrame{err: err})
+				return err
+			}
+		}
+		req := new(Request)
+		if uerr := json.Unmarshal(line, req); uerr != nil {
+			uerr = fmt.Errorf("decode frame: %w", uerr)
+			deliver(ctx, out, requestFrame{err: uerr})
+			return uerr
+		}
+		if derr := deliver(ctx, out, requestFrame{req: req}); derr != nil {
+			return derr
+		}
+	}
+}
+
+// pumpWrite writes responses from in to w, one newline-terminated frame each.
+//
+// json.Marshal and an explicit newline rather than json.Encoder, so the frame
+// the gateway writes is exactly the frame pumpRead demands.
+func pumpWrite(ctx context.Context, w io.Writer, in <-chan responseFrame) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case out := <-in:
+			err := writeFrame(w, out.resp)
+			// The ack is buffered, so a Send that gave up waiting does not
+			// wedge the pump holding a verdict nobody wants.
+			out.ack <- err
+			if err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// writeFrame writes one response as a newline-terminated frame.
+func writeFrame(w io.Writer, resp *Response) error {
+	frame, err := json.Marshal(resp)
+	if err != nil {
+		return fmt.Errorf("encode %q: %w", resp.Type, err)
+	}
+	if _, err := w.Write(append(frame, '\n')); err != nil {
+		return fmt.Errorf("write %q: %w", resp.Type, err)
+	}
+	return nil
+}
+
+// deliver hands one requestFrame to Recv, giving up if the session ends first.
+//
+// A value nobody collects is not a failure of its own: the gateway may have
+// moved on, and the pump still has to be able to exit.
+func deliver(ctx context.Context, out chan<- requestFrame, f requestFrame) error {
+	select {
+	case out <- f:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// finish records why the session ended and releases everyone waiting on it. A
+// session the caller closed on purpose ends cleanly: the pumps' complaints
+// about streams that are gone are teardown noise, not the reason.
+func (c *RWConn) finish(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	select {
+	case <-c.done:
+		return
+	default:
+	}
+	c.ended = err
+	close(c.done)
+}
+
+// ending is what Send and Recv report once the session is over: why it ended
+// if a pump failed, and io.EOF if it was simply closed.
+func (c *RWConn) ending() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ended != nil {
+		return c.ended
+	}
+	return io.EOF
 }
 
 // Recv allows the gateway to do a blocking wait on data coming from the reader.
 func (c *RWConn) Recv(ctx context.Context) (*Request, error) {
 	select {
+	case f := <-c.rCh:
+		if f.err != nil {
+			return nil, fmt.Errorf("recv: %w", f.err)
+		}
+		return f.req, nil
 	case <-c.done:
-		return nil, io.EOF
+		return nil, c.ending()
 	case <-ctx.Done():
 		return nil, fmt.Errorf("recv canceled (%v): %w", context.Cause(ctx), ctx.Err())
-	default:
 	}
-	msg := new(Request)
-	if err := c.dec.Decode(msg); err != nil {
-		return nil, fmt.Errorf("recv decode: %w", err)
-	}
-	return msg, nil
 }
 
 // Send allows the gateway to do a blocking wait on sending data to the writer.
+//
+// It waits for the write itself, so nil means the peer has the bytes. An error
+// means they may or may not have landed: a write already under way finishes
+// whatever this call reports, and an expired context does not stop one that has
+// not started. So giving up on a Send ends a session rather than being
+// something to retry.
 func (c *RWConn) Send(ctx context.Context, msg *Response) error {
+	ack := make(chan error, 1)
 	select {
+	case c.wCh <- responseFrame{resp: msg, ack: ack}:
 	case <-c.done:
-		return io.EOF
+		return c.ending()
 	case <-ctx.Done():
 		return fmt.Errorf("send canceled (%v): %w", context.Cause(ctx), ctx.Err())
-	default:
 	}
-	if err := c.enc.Encode(msg); err != nil {
-		return fmt.Errorf("send encode: %w", err)
+	select {
+	case err := <-ack:
+		return err
+	case <-c.done:
+		return c.ending()
+	case <-ctx.Done():
+		return fmt.Errorf("send ack canceled (%v): %w", context.Cause(ctx), ctx.Err())
 	}
-	return nil
 }
 
-// Close closes the readers and writers and causes Send and Recv to return EOF errors.
+// Close ends the session: it stops the pumps and closes the streams under them,
+// and makes Send and Recv report the ending from then on. The caller that
+// closes it gets the result of closing the streams, and every other caller
+// gets io.EOF.
 func (c *RWConn) Close() error {
-	c.Lock()
-	defer c.Unlock()
+	c.mu.Lock()
 	select {
 	case <-c.done:
+		c.mu.Unlock()
 		return io.EOF
 	default:
 	}
 	close(c.done)
-	c.w.Close()
-	c.r.Close()
-	return nil
+	c.mu.Unlock()
+
+	c.stop()
+	return c.closeStreams()
 }
