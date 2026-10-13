@@ -12,10 +12,12 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Release note: the next release must be a minor (v1.13.0 or later), not a
 patch. It adds public API (`entroq.InvalidArgumentError`), moves the SQLite
 schema to version 3, adds `eqc work --max-claims`, removes the
-`eqc mod --reset` flag, bounds every Go worker handler body at five minutes by
-default (see the work timeout entry, and pass `WithWorkTimeout(0)` for a
-handler that legitimately runs longer), and changes how doc versions and claims
-work (see the doc sets entry). The PostgreSQL schema moves to 1.13.0: stop 1.12 services
+`eqc mod --reset` flag, bounds every worker handler body at five minutes by
+default (see the work timeout entry, and pass `WithWorkTimeout(0)` /
+`work_timeout_s=0` for a handler that legitimately runs longer), quarantines a
+task after five claims it did not survive (see the claim limit entry, and pass
+`WithMaxClaims(0)` / `max_claims=0` / `--max-claims 0` for no limit), and changes how doc versions
+and claims work (see the doc sets entry). The PostgreSQL schema moves to 1.13.0: stop 1.12 services
 first, since the upgrade drops the doc functions they call, then run
 `eqpg schema upgrade` (or serve with `--init_schema`) before starting the new
 service. The upgrade moves data and holds a lock on the docs table while it
@@ -30,6 +32,25 @@ runs, so plan a short maintenance window on large doc tables.
   task an answer. Cancelling the context to stop instead would leave the task
   to lapse with its attempt uncounted, so a task that reliably kills its
   workers would never reach the claim limit.
+
+- **A default claim limit, so a poison pill stops costing workers.**
+  `worker.WithMaxClaims(d)` in Go, `max_claims` in Python, now default to five
+  (`worker.DefaultMaxClaims`, `DEFAULT_MAX_CLAIMS`) instead of to no limit at
+  all, and `eqc work --max-claims` follows the library rather than restating
+  the number. Pass zero to turn it off.
+
+  A default is only safe because the count was made meaningful first: a worker
+  resets it whenever it modifies a task, and a retry, a move and a fired work
+  timeout are all modifications. So the count is of claims the task did not
+  survive -- a worker that was killed, ran out of memory, crashed, or lost its
+  claim -- and it cannot climb for a task that is merely busy. Before, with no
+  limit, a task that reliably killed whatever claimed it was never quarantined
+  at all, so it destroyed worker after worker indefinitely; the operator had to
+  know to set the flag in advance. Five absorbs a bad deploy window, where a
+  task in flight is killed by successive restarts, and bounds a genuine poison
+  pill to five lost workers. The task is moved to its error queue without the
+  handler being constructed, with an error naming the count, the limit and the
+  lease, since too short a lease produces the same symptom.
 
 - **A bound on how long a handler body may run.** `worker.WithWorkTimeout(d)`
   in Go, `work_timeout_s` in Python. Both bound a body at five minutes unless

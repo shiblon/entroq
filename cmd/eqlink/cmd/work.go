@@ -6,6 +6,8 @@ import (
 
 	"github.com/shiblon/entroq"
 	"github.com/spf13/cobra"
+
+	"github.com/shiblon/entroq/pkg/worker"
 )
 
 var (
@@ -102,7 +104,7 @@ func init() {
 	flags.DurationVar(&workLease, "lease", entroq.DefaultClaimDuration, "Claim lease and renewal interval (gateway-owned; not client-chosen).")
 	flags.StringArrayVar(&workQueues, "queue", nil, "A queue this worker serves (repeatable). Required in stdio mode.")
 	flags.Int32Var(&workMaxAttempts, "max-attempts", 0, "Max attempts before a retry is quarantined; 0 means unlimited.")
-	flags.Int32Var(&workMaxClaims, "max-claims", 0, "Max times a task may be claimed before it is quarantined without being dispatched; catches tasks that wedge or kill their worker. 0 means unlimited.")
+	flags.Int32Var(&workMaxClaims, "max-claims", worker.DefaultMaxClaims, "Max times a task may be claimed WITHOUT being modified before it is quarantined without being dispatched; catches tasks that wedge or kill their worker. 0 means unlimited.")
 	flags.BoolVar(&workTakeDocs, "take-docs", false, "The worker implements the takeDocs phase.")
 	flags.BoolVar(&workWork, "work", false, "The worker implements the work phase (required).")
 	flags.BoolVar(&workSuccess, "success", false, "The worker implements the success phase (post-commit).")

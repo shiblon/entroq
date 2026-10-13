@@ -19,7 +19,7 @@ from entroq.worker import (
     granted_lease_s,
     StopWorker, FatalWorker, RetryError, MoveError,
     DocClaim, Handler, EntroQWorker, default_err_q_map,
-    DEFAULT_WORK_TIMEOUT_S,
+    DEFAULT_WORK_TIMEOUT_S, DEFAULT_MAX_CLAIMS,
     _fix_versions, _renewing,
 )
 
@@ -1005,6 +1005,37 @@ def test_worker_move_error_increments_attempt():
     assert tc.attempt == 2
 
 
+def test_worker_max_claims_defaults_to_five():
+    """Parity with Go, whose worker.DefaultMaxClaims is five.
+
+    The count only climbs when a worker said nothing at all, so a task that
+    reaches the limit is a poison pill rather than one that is merely busy.
+    """
+    assert DEFAULT_MAX_CLAIMS == 5, "five, as Go bounds it"
+
+    task = _task(id='t1', version=1, claims=DEFAULT_MAX_CLAIMS + 1)
+    client = FakeClient(tasks=[task])
+    # No max_claims: the default is what is under test.
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0, err_queue='err')
+
+    work_called = []
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            work_called.append(t.id)
+            raise StopWorker
+
+        await worker._process(task, process)
+
+    asyncio.run(run())
+
+    assert work_called == [], "the handler must not run for a task over the limit"
+    tc = client.modify_calls[0].task_changes[0]
+    assert tc.queue == 'err'
+    assert 'maximum claims' in tc.err
+
+
 def test_worker_max_claims_moves_task_without_running_handler():
     task = _task(id='t1', version=1, claims=4)
     client = FakeClient(tasks=[task])
@@ -1071,7 +1102,8 @@ def test_worker_max_claims_allows_task_at_the_ceiling():
 def test_worker_max_claims_zero_means_no_limit():
     task = _task(id='t1', version=1, claims=1000)
     client = FakeClient(tasks=[task])
-    worker = EntroQWorker(client, 'q', claim_duration_s=60.0, err_queue='err')
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0, max_claims=0,
+                          err_queue='err')
 
     work_called = []
 
@@ -1427,7 +1459,8 @@ def test_worker_handler_failure_below_the_claim_limit_records_nothing():
 def test_worker_handler_failure_without_a_claim_limit_records_nothing():
     task = _task(id='t1', version=1, queue='q', claims=1000)
     client = FakeClient(tasks=[task])
-    worker = EntroQWorker(client, 'q', claim_duration_s=60.0, err_queue='err')
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0, max_claims=0,
+                          err_queue='err')
 
     async def run():
         @EntroQWorker.handler

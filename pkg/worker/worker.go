@@ -70,6 +70,21 @@ const DefaultRetryDelay = 30 * time.Second
 // hour -- and says so with WithWorkTimeout, passing zero for no bound.
 const DefaultWorkTimeout = 5 * time.Minute
 
+// DefaultMaxClaims bounds how many times a task may be claimed WITHOUT being
+// modified before it is quarantined, unless WithMaxClaims says otherwise.
+//
+// The count only climbs when a worker took the task and said nothing at all:
+// success resets it, so does a retry, a move, and a fired work timeout, since
+// each of those is a disposition (see entroq.ResettingClaims). What is left is
+// a worker that was killed, ran out of memory, panicked, or lost its claim --
+// so any accumulation is already abnormal, and a task reaching the limit is a
+// poison pill or is running under too short a lease.
+//
+// Five absorbs a bad deploy window, where a task in flight is killed by
+// successive restarts, and still bounds a poison pill to five lost workers.
+// Pass zero for no limit at all.
+const DefaultMaxClaims = 5
+
 // Handler[T] is an interface that can be implemented to define work to be done.
 // The value T is the pre-unmarshaled task value. Use T = json.RawMessage to
 // receive raw bytes without any type-level unmarshaling.
@@ -1435,8 +1450,8 @@ func WithWorkTimeout(d time.Duration) RunOption {
 
 // WithMaxClaims sets the maximum number of times a task may be claimed without
 // being modified before it is moved to the worker's error queue without
-// constructing or invoking the handler. If 0 (the default), there is no
-// maximum.
+// constructing or invoking the handler. It defaults to DefaultMaxClaims; pass
+// 0 for no maximum.
 //
 // The worker resets a task's claim count whenever it modifies the task (see
 // entroq.ResettingClaims), including a retry, and renewal keeps it. So the count
@@ -1543,6 +1558,7 @@ func (w *Worker[T]) Run(ctx context.Context, opts ...RunOption) error {
 		lease:          entroq.DefaultClaimDuration,
 		baseRetryDelay: DefaultRetryDelay,
 		workTimeout:    DefaultWorkTimeout,
+		maxClaims:      DefaultMaxClaims,
 	}
 	for _, opt := range opts {
 		opt(ro)

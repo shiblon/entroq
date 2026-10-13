@@ -102,6 +102,16 @@ DEFAULT_CLAIM_DURATION_S = 45.0
 # that a wedged worker is found the same day. Pass 0 for no bound.
 DEFAULT_WORK_TIMEOUT_S = 300.0
 
+# DEFAULT_MAX_CLAIMS matches worker.DefaultMaxClaims in Go. The count only
+# climbs when a worker took the task and said NOTHING: a success resets it, and
+# so do a retry, a move and a fired work timeout, since each is a disposition.
+# What is left is a worker that was killed, ran out of memory, crashed, or lost
+# its claim, so any accumulation is already abnormal and a task that reaches the
+# limit is a poison pill or is running under too short a lease. Five absorbs a
+# bad deploy window and still bounds a poison pill to five lost workers. Pass 0
+# for no limit.
+DEFAULT_MAX_CLAIMS = 5
+
 # Bounds the quarantine EntroQWorker._quarantine_at_limit attempts, which must
 # not hold up a worker that is already stopping.
 AT_LIMIT_TIMEOUT_S = 5.0
@@ -623,7 +633,7 @@ class EntroQWorker:
         retry_delay_s: float = 30.0,
         work_timeout_s: float = DEFAULT_WORK_TIMEOUT_S,
         max_attempts: int = 0,
-        max_claims: int = 0,
+        max_claims: int = DEFAULT_MAX_CLAIMS,
         retry_transport_errors: bool = True,
         transport_retry_base_s: float = 1.0,
         transport_retry_max_s: float = 30.0,
@@ -648,10 +658,12 @@ class EntroQWorker:
         worker on every claim. Renewal stops with the body, so an abandoned one
         is not holding the task past the moment the worker gave up on it.
 
-        ``max_claims`` bounds how many times a task may be claimed before it
-        is moved to the error queue without invoking the handler; it catches
-        tasks that crash or wedge their worker, which ``max_attempts`` (driven
-        by :class:`RetryError`) cannot see. 0 (the default) means no maximum.
+        ``max_claims`` bounds how many times a task may be claimed WITHOUT
+        being modified before it is moved to the error queue without invoking
+        the handler; it catches tasks that crash or wedge their worker, which
+        ``max_attempts`` (driven by :class:`RetryError`) cannot see. It
+        defaults to :data:`DEFAULT_MAX_CLAIMS`, five, as the Go worker does;
+        pass 0 for no maximum.
 
         Safe, pre-submit claim transport failures retry with full-jitter
         exponential backoff by default. Ambiguous transport failures and

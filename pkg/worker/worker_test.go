@@ -61,6 +61,68 @@ func TestWorker_Basic(t *testing.T) {
 	}
 }
 
+// TestWorker_MaxClaimsDefaultsToFive pins the default and the reason it is safe
+// to have one at all.
+//
+// The count only climbs when a worker took the task and said NOTHING: success
+// resets it, and so do a retry, a move and a fired work timeout, since each is
+// a disposition (entroq.ResettingClaims). So a task that reaches the limit was
+// claimed five times and never once survived, which is a poison pill or too
+// short a lease -- not a task that is merely busy.
+func TestWorker_MaxClaimsDefaultsToFive(t *testing.T) {
+	if DefaultMaxClaims != 5 {
+		t.Errorf("DefaultMaxClaims = %d, want 5", DefaultMaxClaims)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	client, err := entroq.New(ctx, eqmem.Opener())
+	if err != nil {
+		t.Fatalf("New client: %v", err)
+	}
+	defer client.Close()
+
+	const queue = "max_claims_default"
+	if _, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue("work"))); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	// Claim and release without resetting, the way a killed worker leaves a
+	// task: the count climbs and nothing brings it back down.
+	for i := 0; i < DefaultMaxClaims; i++ {
+		claimed, err := client.Claim(ctx, entroq.From(queue), entroq.ClaimFor(time.Second))
+		if err != nil {
+			t.Fatalf("claim %d: %v", i+1, err)
+		}
+		if _, err := client.Modify(ctx, claimed.Change(entroq.ArrivalTimeBy(0))); err != nil {
+			t.Fatalf("release %d: %v", i+1, err)
+		}
+	}
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	handlerMade := make(chan struct{}, 1)
+	go func() {
+		w := New[string](client, WithMakeHandler(func() (Handler[string], error) {
+			handlerMade <- struct{}{}
+			return nil, errors.New("handler must not be constructed")
+		}))
+		// No WithMaxClaims: the default is what is under test.
+		done <- w.Run(runCtx, Watching(queue))
+	}()
+
+	waitForTasks(ctx, t, client, queue+"/err", 1)
+	runCancel()
+	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+		t.Errorf("worker run: %v", err)
+	}
+	select {
+	case <-handlerMade:
+		t.Error("handler was constructed for a task over the default claim limit")
+	default:
+	}
+}
+
 func TestWorker_MaxClaimsQuarantinesBeforeHandler(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
