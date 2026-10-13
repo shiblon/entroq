@@ -12,9 +12,9 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// RWConn carries a gateway session over a byte stream: a reader and a writer,
-// which is what a spawned child gets for its stdin and stdout. Anything
-// satisfying io.ReadCloser and io.WriteCloser will do, a unix socket included.
+// StreamConn carries a gateway session over one byte stream: a unix socket, a
+// TCP conn, anything that reads and writes. Two one-way streams, which is what
+// a spawned child gets for its stdin and stdout, become one with Joining.
 // Send is from the gateway's perspective, as is Recv.
 //
 // Two pumps move the bytes, because neither a blocking read nor a blocking
@@ -26,7 +26,7 @@ import (
 //
 // The channels are unbuffered, so a pump runs at most one message ahead and a
 // request nobody collected is still there for the next Recv.
-type RWConn struct {
+type StreamConn struct {
 	mu sync.Mutex
 
 	// done closes when the session has ended, for whatever reason. ended says
@@ -37,11 +37,12 @@ type RWConn struct {
 	rCh <-chan requestFrame
 	wCh chan<- responseFrame
 
-	// stop ends both pumps, and closing the streams is what unblocks one that
-	// is already in a syscall. closeStreams reports the same result however
-	// many times it is called, so the teardown path and Close can share it.
-	stop         context.CancelFunc
-	closeStreams func() error
+	// stop ends both pumps, and closing the stream is what unblocks one that
+	// is already in a syscall. closeStream reports the same result however
+	// many times it is called, so the teardown path and Close can share it --
+	// and it closes ONCE, which is why the stream arrives already joined.
+	stop        context.CancelFunc
+	closeStream func() error
 }
 
 // requestFrame is one thing off the wire: a request, or the error that ended the
@@ -61,44 +62,73 @@ type responseFrame struct {
 	ack  chan<- error
 }
 
-// NewRWConn creates a read-write connection for a Gateway, with the pumps
-// already running. Close it to end the session and stop them.
-func NewRWConn(r io.ReadCloser, w io.WriteCloser) *RWConn {
+// Joining makes one two-way stream out of two one-way ones, which is what a
+// spawned child gets for its stdin and stdout. Closing the result closes both,
+// once, however many times it is called.
+func Joining(r io.ReadCloser, w io.WriteCloser) io.ReadWriteCloser {
+	return &joined{
+		r: r,
+		w: w,
+		// idempotent double close - returns nil every time it's called if the
+		// first close was a clean shutdown.
+		closeOnce: sync.OnceValue(func() error {
+			// The write side goes first, so a peer still reading sees the end
+			// of the stream rather than a reader that vanished.
+			return errors.Join(w.Close(), r.Close())
+		}),
+	}
+}
+
+// joined is the two one-way streams Joining made one of.
+type joined struct {
+	r         io.ReadCloser
+	w         io.WriteCloser
+	closeOnce func() error
+}
+
+func (j *joined) Read(p []byte) (int, error)  { return j.r.Read(p) }
+func (j *joined) Write(p []byte) (int, error) { return j.w.Write(p) }
+func (j *joined) Close() error                { return j.closeOnce() }
+
+// NewStreamConn creates a connection over one byte stream for a Gateway, with
+// the pumps already running. Close it to end the session and stop them.
+//
+// Closing the conn closes the stream exactly once, so a transport that is two
+// streams says so with Joining rather than being passed twice.
+func NewStreamConn(rwc io.ReadWriteCloser) *StreamConn {
 	ctx, cancel := context.WithCancel(context.Background())
 	rCh := make(chan requestFrame)
 	wCh := make(chan responseFrame)
 
-	c := &RWConn{
-		done: make(chan struct{}),
-		rCh:  rCh,
-		wCh:  wCh,
-		stop: cancel,
-		closeStreams: sync.OnceValue(func() error {
-			return errors.Join(w.Close(), r.Close())
-		}),
+	c := &StreamConn{
+		done:        make(chan struct{}),
+		rCh:         rCh,
+		wCh:         wCh,
+		stop:        cancel,
+		closeStream: sync.OnceValue(rwc.Close),
 	}
 
 	g, gctx := errgroup.WithContext(ctx)
 
 	// A pump blocked in a syscall answers to nothing but a closed stream, so
-	// cancelling closes them. errgroup cancels gctx as soon as either pump
+	// cancelling closes it. errgroup cancels gctx as soon as either pump
 	// fails, which is how one pump's failure releases the other. The close
 	// result is kept for the collector below to report.
 	context.AfterFunc(gctx, func() {
-		c.closeStreams()
+		c.closeStream()
 	})
 
 	g.Go(func() error {
-		return pumpRead(gctx, r, rCh)
+		return pumpRead(gctx, rwc, rCh)
 	})
 	g.Go(func() error {
-		return pumpWrite(gctx, w, wCh)
+		return pumpWrite(gctx, rwc, wCh)
 	})
 
 	// Both pumps have returned by the time Wait does, so there is exactly one
 	// place that decides why a session ended.
 	go func() {
-		c.finish(errors.Join(g.Wait(), c.closeStreams()))
+		c.finish(errors.Join(g.Wait(), c.closeStream()))
 	}()
 
 	return c
@@ -195,7 +225,7 @@ func deliver(ctx context.Context, out chan<- requestFrame, f requestFrame) error
 // finish records why the session ended and releases everyone waiting on it. A
 // session the caller closed on purpose ends cleanly: the pumps' complaints
 // about streams that are gone are teardown noise, not the reason.
-func (c *RWConn) finish(err error) {
+func (c *StreamConn) finish(err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	select {
@@ -209,7 +239,7 @@ func (c *RWConn) finish(err error) {
 
 // ending is what Send and Recv report once the session is over: why it ended
 // if a pump failed, and io.EOF if it was simply closed.
-func (c *RWConn) ending() error {
+func (c *StreamConn) ending() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.ended != nil {
@@ -219,7 +249,7 @@ func (c *RWConn) ending() error {
 }
 
 // Recv allows the gateway to do a blocking wait on data coming from the reader.
-func (c *RWConn) Recv(ctx context.Context) (*Request, error) {
+func (c *StreamConn) Recv(ctx context.Context) (*Request, error) {
 	select {
 	case f := <-c.rCh:
 		if f.err != nil {
@@ -240,7 +270,7 @@ func (c *RWConn) Recv(ctx context.Context) (*Request, error) {
 // whatever this call reports, and an expired context does not stop one that has
 // not started. So giving up on a Send ends a session rather than being
 // something to retry.
-func (c *RWConn) Send(ctx context.Context, msg *Response) error {
+func (c *StreamConn) Send(ctx context.Context, msg *Response) error {
 	ack := make(chan error, 1)
 	select {
 	case c.wCh <- responseFrame{resp: msg, ack: ack}:
@@ -263,7 +293,7 @@ func (c *RWConn) Send(ctx context.Context, msg *Response) error {
 // and makes Send and Recv report the ending from then on. The caller that
 // closes it gets the result of closing the streams, and every other caller
 // gets io.EOF.
-func (c *RWConn) Close() error {
+func (c *StreamConn) Close() error {
 	c.mu.Lock()
 	select {
 	case <-c.done:
@@ -275,5 +305,5 @@ func (c *RWConn) Close() error {
 	c.mu.Unlock()
 
 	c.stop()
-	return c.closeStreams()
+	return c.closeStream()
 }

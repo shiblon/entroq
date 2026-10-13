@@ -74,7 +74,7 @@ func (w failingWriter) Write(p []byte) (int, error) { return 0, w.err }
 
 func (w failingWriter) Close() error { return nil }
 
-// TestRWFailedSendEndsTheSession pins that a failed write is terminal, and
+// TestStreamFailedSendEndsTheSession pins that a failed write is terminal, and
 // that the session reports the write as the reason.
 //
 // writeFrame writes a frame and its newline in one Write, and io.Writer
@@ -84,7 +84,7 @@ func (w failingWriter) Close() error { return nil }
 // onto the fragment and the peer can never resynchronize. Recovery is not
 // unreliable here, it is impossible, which is why the pump that owns the
 // stream ends the session rather than handing the problem back to one caller.
-func TestRWFailedSendEndsTheSession(t *testing.T) {
+func TestStreamFailedSendEndsTheSession(t *testing.T) {
 	ctx := context.Background()
 	gone := errors.New("broken pipe")
 
@@ -95,7 +95,7 @@ func TestRWFailedSendEndsTheSession(t *testing.T) {
 	}
 	defer idle.Close()
 
-	c := NewRWConn(blocked, failingWriter{err: gone})
+	c := NewStreamConn(Joining(blocked, failingWriter{err: gone}))
 	defer c.Close()
 
 	if err := c.Send(ctx, &Response{Type: RespCheck}); !errors.Is(err, gone) {
@@ -121,7 +121,7 @@ func (discardWriter) Write(p []byte) (int, error) { return len(p), nil }
 
 func (discardWriter) Close() error { return nil }
 
-// TestRWBrokenReadReportsTheRead pins which error ends a session when the
+// TestStreamBrokenReadReportsTheRead pins which error ends a session when the
 // stream breaks part way through a frame.
 //
 // A failed read leaves a fragment, not a frame. Decoding it either fails and
@@ -129,7 +129,7 @@ func (discardWriter) Close() error { return nil }
 // gateway acts on a request from a stream whose state it cannot see. Only a
 // hang-up is different, because a peer that closed without its last newline
 // still said something whole.
-func TestRWBrokenReadReportsTheRead(t *testing.T) {
+func TestStreamBrokenReadReportsTheRead(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		data string
@@ -139,7 +139,7 @@ func TestRWBrokenReadReportsTheRead(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			reset := errors.New("connection reset by peer")
-			c := NewRWConn(&brokenReader{data: []byte(tc.data), err: reset}, discardWriter{})
+			c := NewStreamConn(Joining(&brokenReader{data: []byte(tc.data), err: reset}, discardWriter{}))
 			defer c.Close()
 
 			req, err := c.Recv(context.Background())
@@ -188,14 +188,14 @@ func osPipes(t *testing.T) (gwR io.ReadCloser, gwW io.WriteCloser, c *client) {
 // served runs one session in the background over the given pipes.
 func served(ctx context.Context, eq entroq.Client, r io.ReadCloser, w io.WriteCloser, options ...Option) chan error {
 	out := make(chan error, 1)
-	go func() { out <- Serve(ctx, eq, NewRWConn(r, w), options...) }()
+	go func() { out <- Serve(ctx, eq, NewStreamConn(Joining(r, w)), options...) }()
 	return out
 }
 
-// TestRWRunsOneTaskEndToEnd is the whole protocol over file descriptors: a
+// TestStreamRunsOneTaskEndToEnd is the whole protocol over file descriptors: a
 // client registers, is checked in, says it is ready, collects a task, answers
 // with a modification, and the task is gone.
-func TestRWRunsOneTaskEndToEnd(t *testing.T) {
+func TestStreamRunsOneTaskEndToEnd(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -268,9 +268,9 @@ func TestRWRunsOneTaskEndToEnd(t *testing.T) {
 	}
 }
 
-// TestRWAnswersReadsMidTurn checks that a client may ask questions while it
+// TestStreamAnswersReadsMidTurn checks that a client may ask questions while it
 // decides, as many as it likes, without consuming the turn it still owes.
-func TestRWAnswersReadsMidTurn(t *testing.T) {
+func TestStreamAnswersReadsMidTurn(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -335,12 +335,12 @@ func TestRWAnswersReadsMidTurn(t *testing.T) {
 	}
 }
 
-// TestRWHangUpFreesTheTask is the failure a pipe makes easiest to produce and
+// TestStreamHangUpFreesTheTask is the failure a pipe makes easiest to produce and
 // the one that matters: the parent dies holding a task.
 //
 // Another claimant gets it once the lease lapses, because nothing is renewing
 // it any more. No heartbeat was required of the client to make that true.
-func TestRWHangUpFreesTheTask(t *testing.T) {
+func TestStreamHangUpFreesTheTask(t *testing.T) {
 	const lease = 300 * time.Millisecond
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -408,10 +408,10 @@ func TestRWHangUpFreesTheTask(t *testing.T) {
 	}
 }
 
-// TestRWRefusesABadConfig checks that a refused registration is answered and
+// TestStreamRefusesABadConfig checks that a refused registration is answered and
 // does not take the process down with it: Start hands back a refusal and NO
 // session, which ServeRW has to notice rather than dereference.
-func TestRWRefusesABadConfig(t *testing.T) {
+func TestStreamRefusesABadConfig(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -446,12 +446,81 @@ func TestRWRefusesABadConfig(t *testing.T) {
 	}
 }
 
-// TestRWConnCloseIsOneStep is the hazard a channel close has and an error
+// oneStream is a single two-way stream that counts its closes and, as a real
+// socket does, refuses the second one.
+type oneStream struct {
+	io.Reader
+	io.Writer
+	closes int
+}
+
+func (s *oneStream) Close() error {
+	s.closes++
+	if s.closes > 1 {
+		return errors.New("use of closed network connection")
+	}
+	return nil
+}
+
+// halfStream is one direction of a joined stream, counting its closes.
+type halfStream struct {
+	closes int
+	err    error
+}
+
+func (h *halfStream) Read([]byte) (int, error)    { return 0, io.EOF }
+func (h *halfStream) Write(p []byte) (int, error) { return len(p), nil }
+func (h *halfStream) Close() error                { h.closes++; return h.err }
+
+// TestStreamConnClosesItsStreamOnce pins what Joining exists for.
+//
+// A socket handed over as both halves was closed twice, so a clean shutdown
+// reported "use of closed network connection": the one caller that really did
+// close it was told it had failed. A stream arrives already joined, so the conn
+// closes exactly one thing exactly once.
+func TestStreamConnClosesItsStreamOnce(t *testing.T) {
+	blocked, idle, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("Pipe: %v", err)
+	}
+	defer idle.Close()
+
+	sock := &oneStream{Reader: blocked, Writer: io.Discard}
+	c := NewStreamConn(sock)
+	if err := c.Close(); err != nil {
+		t.Errorf("Close = %v, want nil: closing one stream once is a clean shutdown", err)
+	}
+	if sock.closes != 1 {
+		t.Errorf("the stream was closed %d times, want 1", sock.closes)
+	}
+}
+
+// TestJoiningClosesBothHalves is the other side of that contract: a stream made
+// of two is not closed until both are, and either one's failure is reported.
+func TestJoiningClosesBothHalves(t *testing.T) {
+	stuck := errors.New("reader would not close")
+	r, w := &halfStream{err: stuck}, &halfStream{}
+
+	j := Joining(r, w)
+	if err := j.Close(); !errors.Is(err, stuck) {
+		t.Errorf("Close = %v, want the reader's %v", err, stuck)
+	}
+	// Closing twice must not close either half twice, which would report
+	// "already closed" for a teardown that was clean the first time.
+	if err := j.Close(); !errors.Is(err, stuck) {
+		t.Errorf("second Close = %v, want the same %v", err, stuck)
+	}
+	if r.closes != 1 || w.closes != 1 {
+		t.Errorf("closed the reader %d times and the writer %d, want 1 each", r.closes, w.closes)
+	}
+}
+
+// TestStreamConnCloseIsOneStep is the hazard a channel close has and an error
 // return does not: there is no safe way to test a channel before closing it, so
 // the lock has to make the test and the close a single step.
-func TestRWConnCloseIsOneStep(t *testing.T) {
+func TestStreamConnCloseIsOneStep(t *testing.T) {
 	r, w, _ := osPipes(t)
-	c := NewRWConn(r, w)
+	c := NewStreamConn(Joining(r, w))
 
 	start := make(chan struct{})
 	results := make(chan error, 8)
@@ -502,14 +571,14 @@ func (w *client) tryRecv() (*Response, error) {
 	return &msg, nil
 }
 
-// TestRWWorkTimeoutEndsTheSession pins what a fired work timeout owes a client
+// TestStreamWorkTimeoutEndsTheSession pins what a fired work timeout owes a client
 // over a pipe, which is what it owes one over HTTP.
 //
 // The gateway gives up on a task whose answer never came while the client is
 // still out there working, so their states have diverged with the client unable
 // to find out. The task goes back with its attempt counted and the session
 // ends, rather than the gateway going around for another one without it.
-func TestRWWorkTimeoutEndsTheSession(t *testing.T) {
+func TestStreamWorkTimeoutEndsTheSession(t *testing.T) {
 	const budget = 200 * time.Millisecond
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
