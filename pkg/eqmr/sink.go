@@ -11,59 +11,42 @@ import (
 	"github.com/shiblon/entroq/pkg/worker"
 )
 
-// Sink receives a run's output: one value for each distinct key, grouped by
-// reduce partition. It owns everything about that output, including its
-// format, its naming, its checksums, and how a consumer knows it is ready to
-// read. The run knows only how to hand it values.
+// Sink receives a run's output, one value per key, grouped by reduce
+// partition, and owns its format, naming, checksums, and readiness.
 //
-// Output is written in two steps, so that duplicate and failed attempts never
-// become visible. A reducer stages its partition's output under a name no
-// other attempt shares, and the controller commits exactly one staged attempt
-// per partition. Every method may be retried after a crash, so each must be
-// idempotent in the way its documentation says.
-//
-// The run never deletes a staged attempt itself. Which attempt was committed
-// is settled by the sink, outside EntroQ, so only the sink can say which ones
-// are garbage: once the run has ended, it is asked to sweep them.
+// A reducer stages each attempt at a partition under a name no other attempt
+// shares, and the controller commits one attempt per partition, so duplicate
+// and failed attempts are never visible. Every method may be retried after a
+// crash, and must be idempotent as documented. The run never deletes a staged
+// attempt; the sink sweeps the uncommitted ones when the run ends.
 //
 // A Sink is configured in every process that writes or commits for a run, and
-// the run names it by Descriptor, so a process that has a different sink under
-// the same name refuses to use it.
-//
-// Errors are retried, bounded by the run's claim ceiling, unless the sink knows
-// no retry can fix them: output it cannot store, say, or a destination that
-// refuses it. It says so by returning a worker.MoveError (worker.MoveErrorf),
-// and the run fails at once with that reason.
+// the run names it by Descriptor. Errors are retried, except a
+// worker.MoveError, which fails the run at once with its reason.
 type Sink interface {
 	// Descriptor identifies the sink. See Descriptor.
 	Descriptor() Descriptor
 
-	// Stage opens a writer for one attempt at one partition of run. Nothing
-	// it writes may be visible as output until it is committed.
+	// Stage opens a writer for one attempt at one partition of run. Nothing it
+	// writes is visible as output until it is committed.
 	Stage(ctx context.Context, run string, partition int) (SinkWriter, error)
 
 	// Commit makes a staged attempt the output of its partition. The first
-	// commit for a partition wins: a later one, whether a retry of the same
-	// attempt or a different attempt, must leave the committed output as it
-	// is and return nil.
-	//
-	// Commit may take as long as its storage needs: the controller holds the
-	// partition's claim, renewed, while it runs. It is on the path to the
-	// run's completion, though, so a commit that copies data rather than
-	// renaming or linking it makes every partition's acceptance that slow.
+	// commit for a partition wins: any later commit, of the same attempt or
+	// another, leaves the committed output as it is and returns nil. The
+	// controller holds the partition's claim while Commit runs, and every
+	// acceptance waits on it.
 	Commit(ctx context.Context, run string, partition int, staged json.RawMessage) error
 
-	// Finish marks run's output complete. It is called after every partition
-	// that received data has been committed, and is told the partition count
-	// and which partitions received no data at all, so it can represent them
-	// however its format requires. It must be safe to call more than once.
+	// Finish marks run's output complete, once every partition with data is
+	// committed. It is told the partition count and which partitions received
+	// no data. It must be safe to call more than once.
 	Finish(ctx context.Context, run string, partitions int, empty []int) error
 
-	// Sweep removes every staged attempt for run that was not committed:
-	// losers, retries, and attempts whose writer died before reporting them.
-	// It is called once the run has ended, done or failed, after Finish when
-	// there is one. It must never remove committed output, and must be safe
-	// to call more than once.
+	// Sweep removes every uncommitted staged attempt for run, including those
+	// whose writer died before reporting them. It is called once the run has
+	// ended, after any Finish. It must never remove committed output, and
+	// must be safe to call more than once.
 	Sweep(ctx context.Context, run string) error
 }
 
@@ -71,10 +54,9 @@ type Sink interface {
 // sorted order, each exactly once.
 type SinkWriter interface {
 	Write(ctx context.Context, key, value string) error
-	// Close finishes the attempt and returns a reference to it, opaque to the
-	// run, which is carried to the controller to commit. Close is called even
-	// when the attempt failed; what it staged is then never committed, and
-	// Sweep collects it.
+	// Close finishes the attempt and returns an opaque reference to it, for
+	// the controller to commit. It is called even when the attempt failed,
+	// and Sweep collects what was staged.
 	Close(ctx context.Context) (staged json.RawMessage, err error)
 }
 
@@ -98,14 +80,11 @@ const outputPartPrefix = "output/part/"
 func outputPartKey(p int) string { return fmt.Sprintf("%s%06d", outputPartPrefix, p) }
 func outputPartID(p int) string  { return fmt.Sprintf("output-part-%06d", p) }
 
-// documentSink keeps a run's output in the run's own document namespace. It is
-// meant for small jobs that want MapReduce orchestration and no storage of
-// their own; Controller.Results reads it back.
-//
-// A staged attempt is a set of chunk docs. Committing inserts the partition's
-// part doc, pointing at those chunks, with an explicit id, so a second commit
-// for the partition collides instead of replacing the first. Finish inserts a
-// manifest doc the same way.
+// documentSink keeps a run's output in the run's document namespace, for small
+// jobs; Controller.Results reads it. A staged attempt is a set of chunk docs,
+// and committing inserts the partition's part doc, pointing at them, under an
+// explicit id, so the first commit wins. Finish inserts a manifest the same
+// way.
 type documentSink struct {
 	client    *entroq.EntroQ
 	namespace string
@@ -135,9 +114,8 @@ func (s *documentSink) Descriptor() Descriptor {
 	return Descriptor{Name: documentSinkName, Driver: documentSinkDriver, Identity: fitText(s.namespace, maxDescriptorFieldBytes)}
 }
 
-// checkRun refuses a run other than the one whose namespace this sink keeps.
-// A document sink belongs to one run, so another run's output would land in the
-// wrong place. That is misuse, which no retry fixes.
+// checkRun refuses, permanently, a run other than the one whose namespace this
+// sink keeps.
 func (s *documentSink) checkRun(run, what string) error {
 	if run != s.namespace {
 		return worker.MoveErrorf("document sink for %q cannot %s for run %q", s.namespace, what, run)
@@ -174,9 +152,7 @@ func (s *documentSink) Finish(ctx context.Context, run string, partitions int, e
 	return ignoreCollision(err)
 }
 
-// Sweep deletes every staged chunk doc that no part doc references. Part docs
-// are the committed output, so what they point at is kept and everything else
-// under the staging prefix is an uncommitted attempt.
+// Sweep deletes every staged chunk doc that no part doc references.
 func (s *documentSink) Sweep(ctx context.Context, run string) error {
 	if err := s.checkRun(run, "sweep"); err != nil {
 		return err
@@ -230,8 +206,8 @@ func (s *documentSink) Sweep(ctx context.Context, run string) error {
 	return errors.Join(errs...)
 }
 
-// ignoreCollision treats an explicit-id insert that collided as the success it
-// is for an idempotent write: the doc was already written.
+// ignoreCollision treats a collided explicit-id insert as success: the doc was
+// already written.
 func ignoreCollision(err error) error {
 	if de, ok := entroq.AsDependency(err); ok && de.HasCollisions() && !de.HasMissing() && !de.HasMissingDocs() {
 		return nil
@@ -298,17 +274,15 @@ func (s *documentSink) manifest(ctx context.Context) (documentManifest, error) {
 	return m, nil
 }
 
-// documentSinkWriter buffers one attempt and writes it as chunk docs on Close.
-// The whole partition is held in memory, which is the price of keeping output
-// in documents and the reason this sink is for small jobs.
+// documentSinkWriter buffers one attempt, the whole partition, and writes it as
+// chunk docs on Close.
 type documentSinkWriter struct {
 	sink    *documentSink
 	records []intermediateRecord
 }
 
 // Write keeps one result. Documents hold text, so a value that is not valid
-// NUL-free UTF-8 can never be stored here, and it is refused as permanent. The
-// rule is this sink's, not the run's: a sink writing bytes need not have it.
+// NUL-free UTF-8 is refused permanently.
 func (w *documentSinkWriter) Write(_ context.Context, key, value string) error {
 	if err := ValidateText(fmt.Sprintf("result value for key %q", key), value); err != nil {
 		return worker.MoveErrorf("%v", err)

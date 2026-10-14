@@ -16,19 +16,16 @@ const (
 	PhaseFailed = "failed"
 )
 
-// stateDocKey and stateDocID name the run's single state doc. The explicit id
-// makes a second Setup against the same prefix collide instead of starting a
-// second run over the first.
+// stateDocKey and stateDocID name the run's state doc. The explicit id makes a
+// second run on the same prefix collide.
 const (
 	stateDocKey = "state"
 	stateDocID  = "state"
 )
 
-// runState is the content of the state doc: the run's phase and the facts
-// fixed when it was set up. Progress within a phase is not kept here. It is
-// derived from the docs the phase consumes and produces, so accepting one unit
-// of work never touches the run as a whole; only the checks that move the run
-// between phases claim and change this doc.
+// runState is the content of the state doc: the run's phase and what Setup
+// fixed. Only phase transitions change it; progress within a phase is derived
+// from the docs.
 type runState struct {
 	Phase string `json:"phase"`
 	// Reason explains a PhaseFailed outcome.
@@ -39,8 +36,7 @@ type runState struct {
 	// ReduceParts is the partition count the run was created with.
 	ReduceParts int `json:"reduce_parts"`
 
-	// Store holds the run's intermediate data, and Sink receives its output,
-	// both recorded by Setup.
+	// Store holds the run's intermediate data, and Sink receives its output.
 	Store Descriptor `json:"store"`
 	Sink  Descriptor `json:"sink"`
 }
@@ -55,8 +51,8 @@ func (s runState) failed(reason string) runState {
 	return s
 }
 
-// Status reports the run's current phase, and the failure reason when the run
-// has failed. It reads the state doc, so it works from any process.
+// Status reports the run's phase, and the reason if it failed. It works from
+// any process.
 func (c *Controller) Status(ctx context.Context) (phase, reason string, err error) {
 	doc, st, err := c.stateDoc(ctx)
 	if err != nil {
@@ -68,18 +64,12 @@ func (c *Controller) Status(ctx context.Context) (phase, reason string, err erro
 	return st.Phase, st.Reason, nil
 }
 
-// maxWaitInterval caps how long Wait sleeps between checks. Wait is a
-// client-side observer of durable state, so its latency is a separate question
-// from anything the controller does. Status is one cheap doc read, so a brisk fixed
-// cap costs little.
+// maxWaitInterval is how often Wait checks Status, which is one doc read.
 const maxWaitInterval = 100 * time.Millisecond
 
-// Wait blocks until the run reaches a terminal phase, returning an error if it
-// failed. Call it after Setup.
-//
-// It polls, because a run's progress lives in EntroQ rather than in this
-// process. It is a convenience for in-process runs; a long-lived deployment
-// should call Status on whatever schedule suits it rather than blocking here.
+// Wait polls until the run is done or failed, returning an error if it failed.
+// Call it after Setup. A long-lived deployment can call Status on its own
+// schedule instead.
 func (c *Controller) Wait(ctx context.Context) error {
 	ticker := time.NewTicker(maxWaitInterval)
 	defer ticker.Stop()
@@ -136,33 +126,24 @@ type PhaseProgress struct {
 	Pending int `json:"pending"`
 }
 
-// Progress is a snapshot of a run, sufficient to draw it.
-//
-// Counts are per phase, not per worker. A unit is claimed by whichever worker
-// is free, so no worker owns a knowable share of the run. For per-worker
-// throughput and idleness use the worker metrics, entroq.worker.tasks_total and
-// entroq.worker.slots.
-//
-// Map resolution follows the split count: a mapper commits once, at the end of
-// its split, so finer progress comes from smaller splits.
+// Progress is a snapshot of a run, enough to draw it. Counts are per phase;
+// per-worker throughput is in the worker metrics, entroq.worker.tasks_total and
+// entroq.worker.slots. A mapper commits once per split, so finer progress comes
+// from smaller splits.
 type Progress struct {
 	Phase  string        `json:"phase"`
 	Reason string        `json:"reason,omitempty"`
 	Map    PhaseProgress `json:"map"`
 	Reduce PhaseProgress `json:"reduce"`
-	// Quarantined is the number of tasks waiting in or judged by the error
-	// path. Any value above zero means the run is failing or has failed,
-	// unless only collection failed.
+	// Quarantined counts tasks in the error queues and the quarantine queue.
+	// Above zero, the run has failed or is failing, unless only collection
+	// failed.
 	Quarantined int `json:"quarantined"`
 }
 
-// Progress reports a snapshot of the run. It is safe to call from any process
-// and at any time, including after completion.
-//
-// Counts are derived from the docs each phase consumes, best effort: a split
-// doc is deleted when its map finish is accepted, and a partition's pointers
-// when its reduce finish is. A partition that received no data has nothing to
-// reduce and counts as done once the map phase ends.
+// Progress reports a snapshot of the run, from any process and at any time.
+// Counts are derived from the docs each phase consumes, best effort. A
+// partition with no data counts as done once the map phase ends.
 func (c *Controller) Progress(ctx context.Context) (*Progress, error) {
 	doc, st, err := c.stateDoc(ctx)
 	if err != nil {
@@ -173,11 +154,8 @@ func (c *Controller) Progress(ctx context.Context) (*Progress, error) {
 	}
 	p := &Progress{Phase: st.Phase, Reason: st.Reason}
 
-	// "Running" is a count of claimed TASKS, not claimed documents. Workers do
-	// not claim their input, so that a duplicate task can race a straggler
-	// rather than block on it; the task claim is what remains observable.
-	// Duplicates inflate the raw claimed count, since two workers may hold two
-	// tasks for one unit of work, so it is capped by the units outstanding.
+	// Running counts claimed tasks, capped by the units outstanding, since
+	// duplicate tasks for one unit are claimed separately.
 	queues := append([]string{c.MapQ(), c.ReduceQ(), c.QuarantineQ()}, c.errQueues()...)
 	stats, err := c.client.QueueStats(ctx, entroq.MatchExact(queues...))
 	if err != nil {
@@ -220,8 +198,7 @@ func (c *Controller) Progress(ctx context.Context) (*Progress, error) {
 	return p, nil
 }
 
-// countDocs counts the docs in the run's namespace with keys under prefix,
-// listing keys only.
+// countDocs counts the docs with keys under prefix.
 func (c *Controller) countDocs(ctx context.Context, prefix string) (int, error) {
 	docs, err := c.client.Docs(ctx, &entroq.DocQuery{
 		Namespace:  c.DocNS(),

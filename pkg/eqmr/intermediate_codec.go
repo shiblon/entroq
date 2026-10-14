@@ -14,13 +14,10 @@ import (
 // intermediateRunMagic opens every run: "EQMRRUN" and the format version.
 var intermediateRunMagic = [8]byte{'E', 'Q', 'M', 'R', 'R', 'U', 'N', 2}
 
-// errCorruptRun marks a run whose bytes are wrong: a checksum or count that
-// does not match, a format or frame no writer produces, data after the end, or
-// a run that is short although its source ended cleanly. Reading it again
-// reads the same wrong bytes, so it is permanent. A run that is missing, or
-// whose source broke off partway, is not marked: missing is how a losing
-// duplicate finds inputs already collected, and a broken source may read whole
-// next time.
+// errCorruptRun marks a run whose bytes are wrong, which is permanent: a
+// checksum or count that does not match, a format or frame no writer produces,
+// data after the end, or a short run whose source ended cleanly. A missing run,
+// or one whose source broke off, is not corrupt.
 var errCorruptRun = errors.New("corrupt intermediate run")
 
 // corruptf reports a corrupt run.
@@ -35,26 +32,18 @@ const (
 	// maxIntermediateRecordLen bounds the three fields of one record.
 	maxIntermediateRecordLen = 64 << 20
 
-	// intermediateBlockBytes is the size at which a writer closes a block. A
-	// reader holds one verified block at a time, so it is also the reader's
-	// memory per open run, except that a single record larger than this makes
-	// a block of its own.
+	// intermediateBlockBytes is the size at which a writer closes a block, and
+	// so a reader's memory per open run. A larger record is a block of its own.
 	intermediateBlockBytes = 64 << 10
 
-	// maxIntermediateBlockLen bounds a block's payload as a reader sees it: a
-	// full block plus one maximal record and its field lengths.
+	// maxIntermediateBlockLen bounds a block's payload: a full block plus one
+	// maximal record.
 	maxIntermediateBlockLen = intermediateBlockBytes + maxIntermediateRecordLen + 3*binary.MaxVarintLen64
 )
 
-// encodeIntermediateRun writes one canonical immutable run.
-//
-// Records are grouped into blocks, each carrying its record count and a
-// checksum, so a reader can verify a whole block before handing any of its
-// records on: damaged data is caught before anything uses it. Each checksum
-// covers the previous one as well as the block, chaining the blocks together,
-// so a block that is missing, repeated, reordered, or taken from another run
-// breaks the chain. The footer closes the chain with the run's record count,
-// which distinguishes a complete run from a truncated one.
+// encodeIntermediateRun writes one run as checksummed blocks closed by a
+// counted footer. Each checksum covers the previous one, so a block that is
+// missing, repeated, reordered, or from another run breaks the chain.
 func encodeIntermediateRun(w io.Writer, records []intermediateRecord) error {
 	if _, err := w.Write(intermediateRunMagic[:]); err != nil {
 		return fmt.Errorf("write header: %w", err)
@@ -117,15 +106,15 @@ func appendIntermediateRecord(b []byte, record intermediateRecord) []byte {
 	return b
 }
 
-// chainStart is the checksum the chain begins from, so a run's first block is
-// bound to the format it was written in.
+// chainStart begins the chain from the header, binding the first block to the
+// format.
 func chainStart() [8]byte {
 	var sum [8]byte
 	binary.BigEndian.PutUint64(sum[:], xxhash.Sum64(intermediateRunMagic[:]))
 	return sum
 }
 
-// chainSum is the checksum of parts, chained to the previous checksum prev.
+// chainSum is the checksum of parts, chained to prev.
 func chainSum(prev [8]byte, parts ...[]byte) [8]byte {
 	h := xxhash.New()
 	// Writes to an xxhash digest cannot fail.
@@ -138,8 +127,8 @@ func chainSum(prev [8]byte, parts ...[]byte) [8]byte {
 	return sum
 }
 
-// encodedIntermediateReader streams the records of one encoded run, verifying
-// each block before yielding any of its records.
+// encodedIntermediateReader streams a run's records, verifying each block
+// before yielding any of its records.
 type encodedIntermediateReader struct {
 	body          io.ReadCloser
 	src           *sourceReader
@@ -148,8 +137,8 @@ type encodedIntermediateReader struct {
 	expectedCount int
 	readCount     int
 
-	// block is the unread remainder of the current verified block, and
-	// blockLeft how many of its records are still to come.
+	// block is the rest of the current verified block, holding blockLeft
+	// records.
 	block     []byte
 	blockLeft int
 
@@ -157,12 +146,9 @@ type encodedIntermediateReader struct {
 	closed bool
 }
 
-// sourceReader records whether its source ended cleanly. A source that ends
-// cleanly says io.EOF: a file at its end, or a response body that arrived
-// whole. One that breaks off says something else, such as io.ErrUnexpectedEOF
-// for a connection dropped mid-body. A run that is short although its source
-// ended cleanly is short in storage, which is corruption; one whose source
-// broke off may read whole next time.
+// sourceReader records whether its source ended cleanly, with io.EOF. A run
+// short of a clean end is short in storage; one whose source broke off, with
+// any other error, may read whole next time.
 type sourceReader struct {
 	r     io.Reader
 	ended bool
@@ -176,8 +162,8 @@ func (s *sourceReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// short reports a run that stopped before it should have. It is corrupt if
-// the source ended cleanly, and otherwise an ordinary, retryable read error.
+// short reports a run that ended early: corrupt if the source ended cleanly,
+// otherwise a retryable read error.
 func (r *encodedIntermediateReader) short(err error, format string, args ...any) error {
 	what := fmt.Sprintf(format, args...)
 	if r.src.ended && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) {
@@ -256,8 +242,7 @@ func (r *encodedIntermediateReader) readBlock() error {
 	if err != nil {
 		return err
 	}
-	// Every record has at least three bytes of field lengths, so a count that
-	// would not fit is as wrong as a length beyond the limit.
+	// Every record takes at least three bytes.
 	if count == 0 || length > maxIntermediateBlockLen || count > length/3 {
 		return corruptf("block of %d records in %d bytes", count, length)
 	}
@@ -295,8 +280,8 @@ func (r *encodedIntermediateReader) readFooter() error {
 	return nil
 }
 
-// verify reads the checksum that follows parts and checks it against the
-// chain, advancing the chain when it matches.
+// verify reads the checksum after parts and checks it against the chain,
+// advancing it.
 func (r *encodedIntermediateReader) verify(parts ...[]byte) error {
 	var got [8]byte
 	if _, err := io.ReadFull(r.raw, got[:]); err != nil {
@@ -310,8 +295,8 @@ func (r *encodedIntermediateReader) verify(parts ...[]byte) error {
 	return nil
 }
 
-// readUvarint reads one uvarint from the stream, returning it along with buf
-// extended by its encoded bytes, which the frame's checksum covers.
+// readUvarint reads one uvarint, and appends its encoded bytes, which the
+// frame's checksum covers, to buf.
 func (r *encodedIntermediateReader) readUvarint(buf []byte, what string) (uint64, []byte, error) {
 	var n uint64
 	for i := 0; i < binary.MaxVarintLen64; i++ {
@@ -331,9 +316,8 @@ func (r *encodedIntermediateReader) readUvarint(buf []byte, what string) (uint64
 	return 0, buf, corruptf("%s overflows 64 bits", what)
 }
 
-// decodeRecord takes the next record from the current verified block. A block
-// whose checksum matched but which does not decode was written wrong, which is
-// as permanent as damage.
+// decodeRecord takes the next record from the current block. A verified block
+// that does not decode is corrupt.
 func (r *encodedIntermediateReader) decodeRecord() (intermediateRecord, error) {
 	var lengths [3]uint64
 	for i := range lengths {

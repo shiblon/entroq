@@ -13,26 +13,19 @@ import (
 	"syscall"
 )
 
-// fileObjectStoreDriver is the driver name, and its compatibility version, for
-// NewFileStore. References written under one version are read by every
-// compatible later one.
+// fileObjectStoreDriver is NewFileStore's driver name and compatibility
+// version.
 const fileObjectStoreDriver = "entroq.eqmr.file/1"
 
 // NewFileStore returns an intermediate store that keeps runs as files under
-// root, which it creates if needed. name is the logical name the run records;
-// every process that maps or reduces the run must configure a store with the
-// same name and root.
+// root, creating it if needed. name is the logical name the run records.
 //
-// Every process must see the same files under root: one machine, or a shared
-// filesystem mounted at the same path everywhere. The store is identified by
-// root's absolute path, so a process whose root resolves differently refuses
-// to read or write the run rather than look in the wrong place.
+// Every process that maps or reduces the run must see the same files at the
+// same root: one machine, or a shared filesystem. The store is identified by
+// root's absolute path.
 //
-// Each run's data lives in its own directory. Each object is written once,
-// under a unique name and never replaced, and synced before its reference is
-// returned, so nothing refers to an object until it is complete and durable.
-// A write that fails partway leaves an unreferenced file that sweeping the run
-// removes.
+// Each run has its own directory. Each object is written once under a unique
+// name and synced before its reference is returned.
 func NewFileStore(name, root string) (IntermediateStore, error) {
 	objects, err := newFileObjectStore(root)
 	if err != nil {
@@ -69,8 +62,8 @@ func newFileObjectStore(root string) (*fileObjectStore, error) {
 	return &fileObjectStore{root: abs}, nil
 }
 
-// runDir names a run's directory. A run prefix may hold any text, and be far
-// longer than a file name may be, so the directory is named by its hash.
+// runDir names a run's directory by a hash of the run, which may be any text
+// and any length.
 func runDir(run string) string {
 	sum := sha256.Sum256([]byte(run))
 	return "run-" + hex.EncodeToString(sum[:16])
@@ -84,12 +77,9 @@ func (s *fileObjectStore) put(ctx context.Context, run, objectID string, body io
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("eqmr file store put %q: %w", objectID, err)
 	}
-	// The object is written in place under its own unique name, created
-	// exclusively so an existing object is never replaced. Nothing can read it
-	// partway: no reference to it exists until put returns one, after the
-	// file is complete and durable, and committing that reference is what
-	// makes the object real. A failed write leaves an unreferenced file in the
-	// run's directory, which sweeping the run removes.
+	// Created exclusively, so no object is ever replaced. No reference to it
+	// exists until it is complete and synced; a failed write leaves an
+	// unreferenced file for the sweep.
 	path := filepath.Join(dir, objectID)
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
@@ -140,9 +130,8 @@ func (s *fileObjectStore) sweep(_ context.Context, run string) error {
 	return nil
 }
 
-// resolve turns a reference into a path under the root. References come from
-// durable state, so one that would reach outside the root is refused rather
-// than followed.
+// resolve turns a reference, from durable state, into a path under the root,
+// refusing one that would leave it.
 func (s *fileObjectStore) resolve(raw json.RawMessage) (string, error) {
 	var ref fileObjectRef
 	if err := json.Unmarshal(raw, &ref); err != nil {
@@ -155,14 +144,9 @@ func (s *fileObjectStore) resolve(raw json.RawMessage) (string, error) {
 	return filepath.Join(s.root, rel), nil
 }
 
-// syncDir makes a directory's entries durable, so a new object's name
-// survives a crash along with its contents.
-//
-// Not every filesystem can sync a directory. Many FUSE filesystems, and some
-// network ones, reject it as invalid or unsupported, because their directory
-// operations are already synchronous or because the notion does not apply.
-// There is nothing to sync on such a filesystem, so that rejection is not an
-// error; refusing it would make every write fail there.
+// syncDir makes a directory's entries durable. A filesystem that rejects
+// syncing a directory as invalid or unsupported, as many FUSE and network
+// filesystems do, has nothing to sync.
 func syncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {

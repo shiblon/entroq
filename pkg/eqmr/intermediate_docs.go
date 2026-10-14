@@ -21,7 +21,7 @@ const (
 type documentIntermediateStore struct {
 	client    *entroq.EntroQ
 	namespace string
-	// keyPrefix is the key prefix of the chunk docs it writes. Empty means
+	// keyPrefix prefixes the keys of the chunk docs it writes; empty means
 	// intermediateRunPrefix.
 	keyPrefix string
 }
@@ -57,8 +57,8 @@ func (s *documentIntermediateStore) chunkKeyPrefix() string {
 	return s.keyPrefix
 }
 
-// descriptor identifies the store by the run's document namespace, so a run
-// pointer cannot be resolved against another run's documents.
+// descriptor identifies the store by the run's namespace, so a pointer never
+// resolves against another run's docs.
 func (s *documentIntermediateStore) descriptor() Descriptor {
 	return Descriptor{
 		Name:     documentIntermediateStoreName,
@@ -125,8 +125,7 @@ func (s *documentIntermediateStore) delete(ctx context.Context, raw json.RawMess
 	return s.deleteRef(ctx, ref)
 }
 
-// sweep deletes every chunk doc this store has written for run, whether or not
-// anything still references it.
+// sweep deletes every chunk doc this store has written for run.
 func (s *documentIntermediateStore) sweep(ctx context.Context, run string) error {
 	if run != s.namespace {
 		return fmt.Errorf("sweep document runs: store for %q cannot hold runs of %q", s.namespace, run)
@@ -152,8 +151,7 @@ func (s *documentIntermediateStore) sweep(ctx context.Context, run string) error
 			args = append(args, d.Delete())
 		}
 		if _, err := s.client.Modify(ctx, args...); err != nil {
-			// A chunk deleted concurrently, by the collector, is fine: list
-			// again and continue with what is left.
+			// The collector deleted a chunk meanwhile: list again.
 			if de, ok := entroq.AsDependency(err); ok && de.HasMissingDocs() {
 				continue
 			}

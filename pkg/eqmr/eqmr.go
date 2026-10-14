@@ -1,37 +1,17 @@
-// Package eqmr is an EXPERIMENTAL MapReduce built entirely on EntroQ task
-// queues and documents. Its API and its queue and document layouts may change
-// or be removed without a migration path. Do not treat what it writes as a
-// stable interchange format.
+// Package eqmr is an EXPERIMENTAL MapReduce on EntroQ. Its API and its queue
+// and document layouts may change without a migration path.
 //
 // # Roles
 //
-// A run has three roles, each of which may be its own process or pod, and each
-// with its own scaling property:
+// A run has three roles, each its own process or pod if you like:
 //
-//   - Mappers (RunMapper) claim one map task, run the Mapper over every pair
-//     in its split, optionally apply a Combiner, assign each emitted key to a
-//     partition, write bounded immutable runs, and commit a finish task naming
-//     them. Scale them freely.
-//   - Reducers (RunReducer) open every published run for one partition, merge
-//     their record streams by key, run the Reducer once per key, stream each
-//     result into a staged attempt at the run's Sink, and commit a finish task
-//     naming the attempt. There is one unit per partition with data, so scale
-//     to the partition count.
-//   - Controllers (RunController) are a set of workers reacting to finish
-//     tasks. They alone write run state: they accept the first finish for each
-//     unit, publish its runs or commit its output, collect what losers and
-//     consumed partitions leave behind, tell the Sink when the output is
-//     complete, sweep a run once it has ended, and judge quarantined tasks.
-//     Run as many replicas as you like.
-//
-// # Output
-//
-// Output goes to a Sink, which owns its format, naming, and readiness. The run
-// only hands it values: a reducer stages an attempt at a partition, the
-// controller commits exactly one attempt per partition, and when every
-// partition is committed the controller calls Sink.Finish before the run is
-// done. Without WithSink, output goes to the run's own document sink, meant
-// for small jobs, which Results reads back.
+//   - Mappers (RunMapper) run the Mapper over one split, partition and sort
+//     what it emits into immutable runs, and commit a finish task naming them.
+//   - Reducers (RunReducer) merge one partition's runs, run the Reducer once
+//     per key, stream the results into a staged attempt at the run's Sink, and
+//     commit a finish task naming it. There is one unit per partition with data.
+//   - Controllers (RunController) react to finish tasks and alone write run
+//     state. Run any number of replicas.
 //
 // # Getting started
 //
@@ -46,8 +26,8 @@
 //	}
 //	results, err := ctrl.Results(ctx)
 //
-// A mapper pod needs the run prefix and nothing else. The partition count it
-// must agree on arrives with each task:
+// A mapper pod needs only the run prefix; the partition count arrives with
+// each task:
 //
 //	ctrl, err := eqmr.New(eq, os.Getenv("MR_PREFIX"))
 //	if err != nil { return err }
@@ -57,36 +37,29 @@
 //		}
 //	}
 //
-// Shard counts are required by Setup, which is where the layout is fixed. See
-// the examples for a controller pod and for combiners.
-//
 // # Completion
 //
-// Workers never write documents. Each commits a finish task in the same Modify
-// that deletes its own task, so a finish exists exactly when the work it
-// describes is done. A controller worker accepts the first finish for each
-// unit while holding a claim on that unit's input alone, deleting the input in
-// the Modify that records the acceptance, so acceptances of different units
-// never wait on one another.
+// The controller accepts the first finish for each unit while claiming only
+// that unit's input, and deletes the input in the Modify that records the
+// acceptance. That Modify also commits a check task. A check looks, without a
+// claim, for any of its phase's inputs; one that finds none claims the run's
+// state doc, checks again, and moves the run on. The last acceptance of a
+// phase always commits a check that sees the phase complete.
 //
-// That Modify also commits a check task. A check reads, cheaply and without a
-// claim, whether its phase's inputs are all gone; usually they are not, and it
-// simply retires. One that finds them gone claims the run's state doc, checks
-// again under the claim, and moves the run on: to the reduce phase, fanning
-// out a reduce task per partition that received data, or to done. Because each
-// check is created by the commit it follows, the check committed by whichever
-// acceptance is truly last is certain to see its phase complete, and the run
-// as a whole is serialized only at phase boundaries.
+// # Output
+//
+// Output goes to a Sink, which owns its format and readiness. The controller
+// commits one staged attempt per partition and calls Sink.Finish before the
+// run is done. Without WithSink, output goes to the run's document sink, which
+// Results reads.
 //
 // # Text
 //
-// Keys and values are strings, and must be valid UTF-8 with no NUL. Content is
-// JSONB in PostgreSQL, which rejects NUL, and a JSON string cannot represent
-// invalid UTF-8. ValidateText states the rule, and Setup, every emit, every
-// combine, and the document sink apply it, so a violation fails where it was
-// produced. Encode binary keys in the job that needs them. Document keys are
-// readable text: "state", "split/000007", "mapout/000003", "result/000003",
-// and, for the document store and sink, "run/..." and "output/...".
+// Keys and values are strings, and must be valid UTF-8 with no NUL, which
+// PostgreSQL JSONB and JSON strings require. ValidateText is the rule; Setup,
+// every emit and combine, and the document sink apply it. Document keys are
+// readable: "state", "split/000007", "mapout/000003", "result/000003", and,
+// for the document store and sink, "run/..." and "output/...".
 package eqmr
 
 import (
@@ -100,11 +73,8 @@ import (
 	"github.com/shiblon/entroq/pkg/worker"
 )
 
-// Limits mirrored from the backend schema. Note that the PostgreSQL CHECK
-// constraints use length(), which counts CHARACTERS, while the btree index they
-// feed is bounded in BYTES. Go's len() counts bytes, so validating here is
-// strictly the safer of the two and rejects multi-byte keys that Postgres would
-// accept but that consume more index space than intended.
+// Limits mirrored from the backend schema, in bytes, which is stricter than
+// PostgreSQL's character count.
 const (
 	// MaxNamespaceBytes bounds Config.Prefix, which becomes the doc namespace.
 	MaxNamespaceBytes = 1024
@@ -112,40 +82,27 @@ const (
 	MaxDocKeyBytes = 256
 )
 
-// Defaults applied when a Config leaves the corresponding field zero. Shard
-// counts are deliberately absent: they change the on-doc layout and cannot be
-// altered once a run has started, so they must always be stated.
+// Defaults for zero Config fields. Shard counts have none; they must always be
+// stated.
 const (
 	DefaultLease = 30 * time.Second
 
 	// DefaultMaxClaims bounds how many times a unit may be claimed before it is
-	// quarantined, which fails the run.
-	//
-	// A claim count covers both work that kills workers and ordinary
-	// infrastructure churn such as rolling deploys and evictions, so the bound
-	// has to survive a handful of the latter while still catching the former.
-	// Ten does. Raise it for a cluster that churns more; WithMaxClaims takes a
-	// negative value for no bound at all.
+	// quarantined, which fails the run. Claims also count ordinary churn such
+	// as rolling deploys, so raise it for a cluster that churns more.
 	DefaultMaxClaims int32 = 10
 )
 
-// Config carries a whole run configuration at once, for callers who would
-// rather build a struct than a list of options. Pass it with WithConfig.
-//
-// Every field has a matching option, and options are the primary form. A zero
-// field is left alone, so a partially filled Config merges with other options.
+// Config is a whole run configuration, passed with WithConfig. Every field has
+// a matching option, and a zero field is left alone.
 type Config struct {
-	// MapShards is the number of input splits. Input pairs are divided into
-	// this many split documents, each becoming one map task.
-	//
-	// A split document holds all of its pairs in one value, so
-	// len(input)/MapShards must comfortably fit the backend's message size
-	// limit (10MB by default for the gRPC service).
+	// MapShards is the number of input splits, each one split doc and one map
+	// task. A split doc must fit the backend message limit (10MB by default
+	// for the gRPC service).
 	MapShards int
 
-	// ReduceShards is the number of reduce partitions, and therefore the number
-	// of reduce tasks a run creates. Intermediate keys are assigned to
-	// partitions by ShardForKey.
+	// ReduceShards is the number of reduce partitions. Keys are assigned to
+	// them by ShardForKey.
 	ReduceShards int
 
 	// Lease is the task claim duration for every worker in the run.
@@ -155,22 +112,19 @@ type Config struct {
 	// quarantined. Negative means unlimited.
 	MaxClaims int32
 
-	// IntermediateStore holds the run's intermediate data. Setup records it in
-	// the run, and every process that maps, reduces, or controls the run must be
-	// configured with it. Nil means the run's own document store.
+	// IntermediateStore holds the run's intermediate data; nil means the run's
+	// document store. See WithIntermediateStore.
 	IntermediateStore IntermediateStore
 
-	// Sink receives the run's output. Setup records it in the run, and every
-	// process that reduces or controls the run must be configured with it.
-	// Nil means the run's own document sink, which Results can read back.
+	// Sink receives the run's output; nil means the run's document sink. See
+	// WithSink.
 	Sink Sink
 }
 
 // Option configures a Controller. See New.
 type Option func(*Config)
 
-// WithConfig merges a whole Config into the configuration. Zero fields are left
-// alone, so it can be combined with other options in any order.
+// WithConfig merges cfg into the configuration, leaving zero fields alone.
 func WithConfig(cfg Config) Option {
 	return func(c *Config) {
 		if cfg.MapShards != 0 {
@@ -194,59 +148,40 @@ func WithConfig(cfg Config) Option {
 	}
 }
 
-// WithMapShards sets the number of input splits.
-//
-// Required by Setup, and only by Setup: it fixes the document layout at the
-// moment a run is created. Worker processes never need it, so a mapper or
-// reducer pod constructs its Controller without one.
+// WithMapShards sets the number of input splits. Setup requires it.
 func WithMapShards(n int) Option {
 	return func(c *Config) { c.MapShards = n }
 }
 
-// WithReduceShards sets the number of reduce partitions.
-//
-// Required by Setup, and only by Setup. Mappers read the number from their own
-// task, so mapper processes need no configuration of their own.
+// WithReduceShards sets the number of reduce partitions. Setup requires it.
 func WithReduceShards(n int) Option {
 	return func(c *Config) { c.ReduceShards = n }
 }
 
-// WithLease sets the task claim duration for workers in this run.
-//
-// It has to outlast a single unit of work. A reduce unit is a whole partition,
-// so its duration scales with how much the map phase sent there rather than
-// with a fixed per-record cost; size this against the largest partition you
-// expect, not the average. Renewal happens at half the lease, and a unit whose
-// renewal slips is reclaimed mid-work and eventually quarantined.
+// WithLease sets the task claim duration for workers in this run. Renewal
+// happens at half the lease, so a renewal must complete within the other half;
+// a reduce unit is a whole partition, so size it for the largest.
 func WithLease(d time.Duration) Option {
 	return func(c *Config) { c.Lease = d }
 }
 
-// WithIntermediateStore keeps the run's intermediate data in store instead of
-// the run's document store. See NewFileStore.
-//
-// Setup records the store's descriptor in the run, so every process that maps,
-// reduces, or controls the run needs this option too, with a store that
-// reports the same descriptor; one that cannot resolve it exits rather than
-// read or write elsewhere.
+// WithIntermediateStore keeps the run's intermediate data in store; see
+// NewFileStore. Setup records its descriptor, and every process that maps,
+// reduces, or controls the run must be configured with a store that reports
+// the same one.
 func WithIntermediateStore(store IntermediateStore) Option {
 	return func(c *Config) { c.IntermediateStore = store }
 }
 
-// WithSink sends the run's output to sink instead of the run's document sink.
-//
-// Setup records the sink's Descriptor in the run, so every process that
-// reduces or controls the run needs this option too, with a sink that reports
-// the same descriptor; one that cannot resolve it exits rather than write
-// elsewhere. Mapper processes do not need it.
+// WithSink sends the run's output to sink. Setup records its Descriptor, and
+// every process that reduces or controls the run must be configured with a sink
+// that reports the same one.
 func WithSink(sink Sink) Option {
 	return func(c *Config) { c.Sink = sink }
 }
 
 // WithMaxClaims bounds how many times a unit may be claimed before it is
-// quarantined, which fails the run. Negative means unlimited, reproducing the
-// pkg/worker default; see DefaultMaxClaims for why this package takes a
-// position where a general worker cannot.
+// quarantined, which fails the run. Negative means unlimited.
 func WithMaxClaims(n int32) Option {
 	return func(c *Config) { c.MaxClaims = n }
 }
@@ -263,15 +198,8 @@ func (c *Config) withDefaults() Config {
 }
 
 // ValidateText reports whether s is usable as a MapReduce key or value: valid
-// UTF-8, with no NUL.
-//
-// Keys and values live inside document content, which is JSONB in PostgreSQL,
-// and JSONB rejects \u0000 ("unsupported Unicode escape sequence"). A JSON
-// string cannot represent invalid UTF-8 at all, and Go's encoding/json
-// substitutes U+FFFD for it silently.
-//
-// Setup and every emit apply this, so a violation fails where it was produced.
-// Encode binary keys or values in the job that needs them.
+// UTF-8, with no NUL. PostgreSQL JSONB rejects NUL, and Go's encoding/json
+// silently replaces invalid UTF-8.
 func ValidateText(what, s string) error {
 	if !utf8.ValidString(s) {
 		return fmt.Errorf("%s is not valid UTF-8 (encode it, with base64 or similar, if it is genuinely binary)", what)
@@ -283,11 +211,7 @@ func ValidateText(what, s string) error {
 }
 
 // ValidText reports whether s is usable as a doc namespace or key: valid UTF-8,
-// free of NUL, and within maxBytes. Both restrictions are real. PostgreSQL TEXT
-// in a UTF-8 database rejects invalid sequences and NUL outright, and a JSON
-// string cannot represent invalid UTF-8 at all (encoding/json silently
-// substitutes U+FFFD rather than failing, so an unvalidated key corrupts on the
-// way through the wire rather than erroring at the point of the mistake).
+// free of NUL, and within maxBytes.
 func ValidText(what, s string, maxBytes int) error {
 	if !utf8.ValidString(s) {
 		return fmt.Errorf("%s is not valid UTF-8: %q", what, s)
@@ -301,9 +225,9 @@ func ValidText(what, s string, maxBytes int) error {
 	return nil
 }
 
-// Controller holds the queue and doc layout for one run and drives its phases.
-// It is safe to construct one in every process that participates in the run:
-// it carries no run state of its own, because all of it lives in EntroQ.
+// Controller is one process's handle on a run: its layout, and the stores and
+// sinks this process can reach. Run state lives in EntroQ, so every
+// participating process constructs its own.
 type Controller struct {
 	client *entroq.EntroQ
 	cfg    Config
@@ -317,18 +241,10 @@ type Controller struct {
 	sink  Sink
 }
 
-// New creates a Controller for the run under prefix.
-//
-// prefix is the document namespace and the root of every queue name, and it is
-// the only thing a participating process cannot work out for itself. It must be
-// unique per run, valid UTF-8, NUL-free, and at most MaxNamespaceBytes bytes.
-//
-// Shard counts are options rather than parameters because only Setup needs
-// them. A mapper or reducer pod says
-//
-//	ctrl, err := eqmr.New(eq, prefix)
-//
-// and nothing more: the layout it must agree on travels with its work.
+// New creates a Controller for the run under prefix, which is the document
+// namespace and the root of every queue name. It must be unique per run, valid
+// UTF-8, NUL-free, and at most MaxNamespaceBytes bytes. Worker processes need
+// no options; the layout travels with their tasks.
 func New(eq *entroq.EntroQ, prefix string, opts ...Option) (*Controller, error) {
 	if eq == nil {
 		return nil, fmt.Errorf("eqmr: nil client")
@@ -375,9 +291,7 @@ func New(eq *entroq.EntroQ, prefix string, opts ...Option) (*Controller, error) 
 	return c, nil
 }
 
-// validateForSetup checks the fields only Setup requires. A Controller built for
-// a worker role legitimately has neither shard count, so these are not checked
-// at construction.
+// validateForSetup checks the fields only Setup requires.
 func (c *Config) validateForSetup() error {
 	if c.MapShards <= 0 {
 		return fmt.Errorf("eqmr: MapShards must be set with WithMapShards; it fixes how input is divided when a run is created and cannot change afterwards")
@@ -394,10 +308,8 @@ func (c *Controller) Config() Config { return c.cfg }
 // Prefix returns the document namespace and queue root for this run.
 func (c *Controller) Prefix() string { return c.prefix }
 
-// DocNS is the doc namespace holding the run's coordination state: the state
-// doc and every split, map-output pointer, and result marker, plus whatever the
-// document-backed store and sink keep there when they are in use. Only
-// controller workers write coordination state, apart from Setup.
+// DocNS is the run's doc namespace: its state doc, splits, pointers, and result
+// markers, and whatever the document store and sink keep.
 func (c *Controller) DocNS() string { return c.prefix }
 
 // MapQ is the queue of input-split tasks, watched by mapper workers.
@@ -409,31 +321,29 @@ func (c *Controller) ReduceQ() string { return c.prefix + "/reduce" }
 // MapDoneQ holds mapper finish tasks, watched by the controller.
 func (c *Controller) MapDoneQ() string { return c.prefix + "/map-done" }
 
-// MapCheckQ holds checks for the end of the map phase, one committed with each
-// accepted map finish, watched by the controller.
+// MapCheckQ holds checks for the end of the map phase, watched by the
+// controller.
 func (c *Controller) MapCheckQ() string { return c.prefix + "/map-check" }
 
-// ReduceCheckQ holds checks for the end of the reduce phase, one committed
-// with each accepted reduce finish, watched by the controller.
+// ReduceCheckQ holds checks for the end of the reduce phase, watched by the
+// controller.
 func (c *Controller) ReduceCheckQ() string { return c.prefix + "/reduce-check" }
 
 // ReduceDoneQ holds reducer finish tasks, watched by the controller.
 func (c *Controller) ReduceDoneQ() string { return c.prefix + "/reduce-done" }
 
-// GCQ holds requests to delete intermediate runs, watched by the controller.
+// GCQ holds collection tasks, watched by the controller.
 func (c *Controller) GCQ() string { return c.prefix + "/gc" }
 
-// QuarantineQ holds tasks the controller judged to be genuine failures. They
-// are kept, with their errors, for inspection.
+// QuarantineQ keeps failed tasks, with their errors, for inspection.
 func (c *Controller) QuarantineQ() string { return c.prefix + "/quarantine" }
 
-// errQSuffix is appended to a queue name to get its error queue, matching
-// worker.DefaultErrQMap. Every worker in a run quarantines to its own inbox's
-// error queue, so the controller can tell from the queue alone what failed.
+// errQSuffix makes a queue's error queue, as worker.DefaultErrQMap does. Each
+// worker quarantines to its own inbox's, so the queue says what failed.
 const errQSuffix = "/err"
 
-// errQueues lists the error queue of every queue in the run that a worker
-// watches, except the error worker's own: it quarantines to QuarantineQ.
+// errQueues lists the error queues of the run's worker queues. The error
+// worker quarantines to QuarantineQ.
 func (c *Controller) errQueues() []string {
 	inboxes := []string{c.MapQ(), c.ReduceQ(), c.MapDoneQ(), c.MapCheckQ(), c.ReduceDoneQ(), c.ReduceCheckQ(), c.GCQ()}
 	qs := make([]string, len(inboxes))
@@ -443,37 +353,27 @@ func (c *Controller) errQueues() []string {
 	return qs
 }
 
-// Doc key layout. These are readable on purpose: they are what shows up in psql
-// and in `eqc` output when a run needs debugging.
+// Doc keys, readable in psql and eqc output.
 func splitDocKey(n int) string { return fmt.Sprintf("%s%06d", splitPrefix, n) }
 
-// splitDocID is a deterministic id for a split doc, so that a retried Setup
-// recognizes the splits an earlier attempt already staged.
+// splitDocID is a deterministic split doc id, so a retried Setup recognizes
+// staged splits.
 func splitDocID(n int) string   { return fmt.Sprintf("split-%06d", n) }
 func mapOutDocKey(p int) string { return fmt.Sprintf("%s%06d", mapOutPrefix, p) }
 func resultDocKey(p int) string { return fmt.Sprintf("%s%06d", resultPrefix, p) }
 
-// mapOutSecondaryKey tells apart the pointers that share a partition's key:
-// run i of the split keyed splitKey. Every pointer for a partition shares its
-// primary key, so claiming that key takes the whole partition, and the
-// secondary key keeps each (key, secondary) pair unique. A split is accepted
-// once, so its runs' secondary keys never collide.
+// mapOutSecondaryKey names run i of the split keyed splitKey. A partition's
+// pointers share a primary key, so that claiming it takes the partition; this
+// keeps each (key, secondary) pair unique.
 func mapOutSecondaryKey(splitKey string, i int) string {
 	return fmt.Sprintf("%s/%04d", splitKey, i)
 }
 
-// resultDocID is a deterministic document id for the marker that a partition's
-// output is committed. The output itself lives in the sink.
-//
-// The controller already accepts exactly one finish per partition, by claiming
-// its pointer docs and deleting them as it records the acceptance. The explicit id
-// makes a second marker for the same partition an error rather than a silent
-// duplicate should that ever fail. Ids are capped at 64 bytes; this is 13.
+// resultDocID is the id of the marker that a partition's output is committed.
+// Being explicit, it makes a second marker for the partition an error.
 func resultDocID(p int) string { return fmt.Sprintf("result-%06d", p) }
 
-// Key range prefixes, and the exclusive upper bounds for scanning them. Every
-// prefix ends in '/' (0x2F), so replacing that byte with '0' (0x30) yields the
-// next string after every key under the prefix.
+// Key prefixes. Each ends in '/', so replacing it with '0' bounds a scan.
 const (
 	splitPrefix  = "split/"
 	mapOutPrefix = "mapout/"
@@ -481,8 +381,7 @@ const (
 )
 
 // prefixEnd returns the exclusive upper bound for a scan over keys beginning
-// with prefix. It requires an ASCII prefix ending in '/', which every layout
-// constant above satisfies.
+// with prefix, which must end in '/'.
 func prefixEnd(prefix string) string {
 	if prefix == "" || prefix[len(prefix)-1] != '/' {
 		panic(fmt.Sprintf("eqmr: key prefix %q must end in '/'", prefix))
@@ -495,43 +394,31 @@ func prefixEnd(prefix string) string {
 type docRef struct {
 	NS  string `json:"ns"`
 	Key string `json:"key"`
-	// ReduceShards is the partition count for the run, stamped by Setup. A
-	// mapper reads it here to decide which partition each emitted key belongs
-	// to, so mapper processes need no configuration of their own and no two
-	// can disagree about it.
+	// ReduceShards is the run's partition count, stamped by Setup.
 	ReduceShards int `json:"reduce_shards"`
-	// Store is the intermediate store for the run, also stamped by Setup, so
-	// every mapper writes where the run's reducers will read. A process that
-	// cannot resolve it exits rather than write somewhere else.
+	// Store is the run's intermediate store, stamped by Setup.
 	Store Descriptor `json:"store,omitzero"`
 }
 
-// asQuery reads the doc group by primary key without claiming it. Reading
-// rather than claiming is what allows two workers to process the same unit
-// concurrently; exclusion happens when they commit.
+// asQuery reads the doc group by primary key, without claiming it.
 func (r docRef) asQuery() *entroq.DocQuery {
 	return &entroq.DocQuery{Namespace: r.NS, KeyExact: r.Key}
 }
 
-// RunMapper runs a mapper for this run until ctx ends or the worker exits. It
-// watches the map queue with the run's lease and claim ceiling.
-//
-// A Mapper that returns an error kills the worker, which is the MapReduce
-// contract: a run whose map calls failed cannot support a claim about its
-// output. Restart it and let the pipeline decide. The task is reclaimed when
-// its lease expires, and a record that kills every worker exhausts the claim
-// ceiling and fails the run.
+// RunMapper runs a mapper for this run until ctx ends or the worker exits. A
+// Mapper error exits the worker; restart it. The task is reclaimed when its
+// lease expires, and the claim ceiling fails a run whose record always fails.
 func (c *Controller) RunMapper(ctx context.Context, mapFn Mapper, opts ...MapperOption) error {
 	return c.MapperWorker(mapFn, opts...).Run(ctx, c.workerRunOptions(c.MapQ())...)
 }
 
-// RunReducer runs a reducer for this run until ctx ends or the worker exits.
-// Restart it on return, as with RunMapper.
+// RunReducer runs a reducer for this run until ctx ends or the worker exits;
+// restart it, as with RunMapper.
 func (c *Controller) RunReducer(ctx context.Context, reduceFn Reducer) error {
 	return c.ReducerWorker(reduceFn).Run(ctx, c.workerRunOptions(c.ReduceQ())...)
 }
 
-// workerRunOptions is the run configuration shared by mappers and reducers.
+// workerRunOptions configures mappers and reducers.
 func (c *Controller) workerRunOptions(queue string) []worker.RunOption {
 	opts := []worker.RunOption{
 		worker.Watching(queue),

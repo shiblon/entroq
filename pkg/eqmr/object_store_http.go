@@ -78,8 +78,7 @@ func (s *httpObjectStore) info(ctx context.Context) (httpObjectStoreInfo, error)
 	return info, nil
 }
 
-// put stores one object, naming the run it belongs to so the driver can keep a
-// run's objects together and sweep them when the run ends.
+// put stores one object for the named run.
 func (s *httpObjectStore) put(ctx context.Context, run, objectID string, body io.Reader) (json.RawMessage, error) {
 	if objectID == "" {
 		return nil, fmt.Errorf("eqmr object store put: object ID is required")
@@ -138,8 +137,8 @@ func (s *httpObjectStore) delete(ctx context.Context, ref json.RawMessage) error
 	return nil
 }
 
-// sweep tells the driver that run has ended, so it may delete whatever it
-// holds for the run, however it knows how.
+// sweep tells the driver that run has ended, so it may delete what it holds
+// for it.
 func (s *httpObjectStore) sweep(ctx context.Context, run string) error {
 	body, err := json.Marshal(struct {
 		Run string `json:"run"`

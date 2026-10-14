@@ -14,18 +14,16 @@ import (
 // sorted intermediate run. A single record may exceed the bound.
 const DefaultIntermediateRunBytes = 1 << 20
 
-// intermediateRecord is the storage-level map output. Secondary is empty for
-// the current Mapper API, but remains a real sort dimension in the storage
-// contract so sources can add secondary sort without changing the shuffle.
+// intermediateRecord is one map output record. Secondary is a sort dimension
+// that the Mapper API leaves empty for now.
 type intermediateRecord struct {
 	Primary   string `json:"primary"`
 	Secondary string `json:"secondary"`
 	Value     string `json:"value"`
 }
 
-// intermediateRun is the durable pointer published by a mapper. Ref is opaque
-// to the pipeline and interpreted only by the store Store describes, so each
-// pointer names its store completely and runs from different stores can mix.
+// intermediateRun names one stored run: the store, by descriptor, and Ref,
+// which only that store interprets.
 type intermediateRun struct {
 	Partition int             `json:"partition"`
 	Store     Descriptor      `json:"store"`
@@ -39,14 +37,12 @@ type intermediateReader interface {
 }
 
 // IntermediateStore holds a run's intermediate data: the sorted immutable runs
-// mappers write and reducers merge. Its methods are unexported, so the stores
-// are the ones this package provides: the run's document store (the default),
-// NewFileStore, and stores built on the object-store protocol.
+// mappers write and reducers merge. Its methods are unexported; the stores are
+// the run's document store (the default), NewFileStore, and stores on the
+// object-store protocol.
 //
-// put receives a complete bounded run and names the run it belongs to, so a
-// store can keep each run's data together; readers expose records one at a
-// time so a store need not materialize a run to serve it. sweep deletes
-// everything a store holds for a run, referenced or not.
+// put stores one complete run for the named run, open streams it back, and
+// sweep deletes everything held for a run, referenced or not.
 type IntermediateStore interface {
 	descriptor() Descriptor
 	put(ctx context.Context, run string, records []intermediateRecord) (json.RawMessage, error)
@@ -55,10 +51,9 @@ type IntermediateStore interface {
 	sweep(ctx context.Context, run string) error
 }
 
-// intermediateWriter owns partitioning, buffering, sorting, combining, and run
-// cutting for one map attempt. Runs are durable before finish returns, but are
-// invisible to reducers until the mapper publishes their pointers atomically
-// with its split deletion.
+// intermediateWriter partitions, buffers, sorts, combines, and cuts runs for
+// one map attempt. Its runs are durable once finish returns, and reach
+// reducers only when the controller accepts the attempt.
 type intermediateWriter struct {
 	store      IntermediateStore
 	run        string
@@ -105,8 +100,8 @@ func (s *intermediateWriter) write(ctx context.Context, primary, secondary, valu
 }
 
 func intermediateRecordBytes(record intermediateRecord) int {
-	// The fixed allowance covers slice/string headers and JSON punctuation. The
-	// threshold is a memory bound, not a serialized-size promise.
+	// The allowance covers headers and punctuation; this bounds memory, not
+	// encoded size.
 	return len(record.Primary) + len(record.Secondary) + len(record.Value) + 64
 }
 
@@ -345,8 +340,8 @@ func (m *mergedIntermediate) Close() error {
 	return errors.Join(errs...)
 }
 
-// groupedIntermediate adapts the merged record stream to the existing
-// ReducerInput API without collecting all values for a primary key.
+// groupedIntermediate serves the merged stream as ReducerInput, one key at a
+// time, without collecting a key's values.
 type groupedIntermediate struct {
 	ctx    context.Context
 	merged *mergedIntermediate
