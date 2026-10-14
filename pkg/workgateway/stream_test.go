@@ -1,6 +1,7 @@
 package workgateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -150,6 +151,114 @@ func TestStreamBrokenReadReportsTheRead(t *testing.T) {
 				t.Errorf("Recv = %v, want the read error %v to survive", err, reset)
 			}
 		})
+	}
+}
+
+// floodReader emits bytes and never a newline, which is the shape that makes
+// an unbounded frame reader hold everything it has read while it waits for a
+// terminator that is not coming.
+//
+// It stops at a finite size, so a bound that regressed fails a test instead of
+// eating the machine, and sent reports how far it got.
+type floodReader struct {
+	remaining int
+	sent      int
+}
+
+func (r *floodReader) Read(p []byte) (int, error) {
+	if r.remaining <= 0 {
+		return 0, io.EOF
+	}
+	n := min(len(p), r.remaining)
+	for i := range p[:n] {
+		p[i] = 'x'
+	}
+	r.remaining -= n
+	r.sent += n
+	return n, nil
+}
+
+func (r *floodReader) Close() error { return nil }
+
+// frameOfSize makes a valid request frame of exactly n bytes, newline
+// included, by padding a field the read path does not look at.
+func frameOfSize(t *testing.T, n int) []byte {
+	t.Helper()
+	const prefix = `{"type":"ready","session":"`
+	const suffix = `"}` + "\n"
+	pad := n - len(prefix) - len(suffix)
+	if pad < 0 {
+		t.Fatalf("no frame is %d bytes; the envelope alone is %d", n, len(prefix)+len(suffix))
+	}
+	return []byte(prefix + strings.Repeat("x", pad) + suffix)
+}
+
+// TestStreamBoundsAFrame pins the limit at its edges, and pins that a frame
+// larger than bufio's buffer still arrives whole -- which is what says the
+// pieces the bounded read collects are reassembled rather than truncated.
+func TestStreamBoundsAFrame(t *testing.T) {
+	const max = 8 << 10
+	for _, tc := range []struct {
+		name   string
+		size   int
+		refuse bool
+	}{
+		{name: "at the limit", size: max},
+		{name: "one byte over", size: max + 1, refuse: true},
+		{name: "larger than the read buffer", size: 6 << 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			frame := frameOfSize(t, tc.size)
+			c := NewStreamConn(
+				Joining(io.NopCloser(bytes.NewReader(frame)), discardWriter{}),
+				WithMaxFrameBytes(max),
+			)
+			defer c.Close()
+
+			req, err := c.Recv(context.Background())
+			if tc.refuse {
+				if !errors.Is(err, ErrFrameTooLarge) {
+					t.Errorf("Recv = %v, want ErrFrameTooLarge", err)
+				}
+				if req != nil {
+					t.Errorf("Recv handed over %q from a frame over the limit", req.Type)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Recv of a %d byte frame: %v", tc.size, err)
+			}
+			if req.Type != ReqReady {
+				t.Errorf("Recv = %q, want %q to survive the read buffer", req.Type, ReqReady)
+			}
+		})
+	}
+}
+
+// TestStreamRefusesAnEndlessFrame is the bound against the case it exists for:
+// a peer that keeps writing and never terminates a frame. Unbounded, the
+// reader keeps every byte waiting for a newline, so the failure is the process
+// dying rather than a session ending.
+//
+// How far the reader got is half the point. Reading the flood to its end and
+// then failing to decode it would be the wrong error for the right reason, and
+// over an endless peer it would never fail at all.
+func TestStreamRefusesAnEndlessFrame(t *testing.T) {
+	const max = 64 << 10
+	flood := &floodReader{remaining: 4 * max}
+	c := NewStreamConn(Joining(flood, discardWriter{}), WithMaxFrameBytes(max))
+	defer c.Close()
+
+	req, err := c.Recv(context.Background())
+	if req != nil {
+		t.Errorf("Recv handed over %q from a frame that never ended", req.Type)
+	}
+	if !errors.Is(err, ErrFrameTooLarge) {
+		t.Fatalf("Recv = %v, want ErrFrameTooLarge", err)
+	}
+	// The limit plus at most the one buffered read that crossed it.
+	if flood.sent > 2*max {
+		t.Errorf("the reader took %d bytes against a %d byte limit", flood.sent, max)
 	}
 }
 
@@ -405,6 +514,148 @@ func TestStreamHangUpFreesTheTask(t *testing.T) {
 	}
 	if claimed == nil {
 		t.Error("no other claimant could take the task after the client hung up")
+	}
+}
+
+// TestStreamGoneNeedsNoReader pins that a hang-up is heard by watching, not by
+// receiving. The gateway is not in Recv while it claims, so a signal that
+// waited for someone to take the final frame would never arrive.
+func TestStreamGoneNeedsNoReader(t *testing.T) {
+	c := NewStreamConn(Joining(io.NopCloser(strings.NewReader("")), discardWriter{}))
+	defer c.Close()
+
+	select {
+	case <-c.Gone():
+	case <-time.After(5 * time.Second):
+		t.Fatal("Gone never closed after the stream ended, with nobody in Recv")
+	}
+}
+
+// TestStreamIdleHangUpStopsClaiming is the client that leaves between tasks.
+//
+// The gateway is claiming on its behalf, and a claim does not read the conn.
+// If it does not hear the hang-up some other way it claims on, and the next
+// task to arrive is claimed for a client that is not there -- after an
+// arbitrarily long wait, since nothing else ends the claim.
+func TestStreamIdleHangUpStopsClaiming(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	eq, err := entroq.New(ctx, eqmem.Opener())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer eq.Close()
+
+	r, w, c := osPipes(t)
+	done := served(ctx, eq, r, w)
+
+	c.send(&Request{Type: ReqConfig, Config: &Config{Queues: []string{"inbox"}, ProtocolVersions: []int32{1}}})
+	check := c.recv()
+	c.send(&Request{Type: ReqReady, Session: check.Session})
+	c.hangUp()
+
+	select {
+	case err := <-done:
+		// Leaving between tasks is a goodbye, whether it lands before the
+		// first claim or during one.
+		if err != nil {
+			t.Errorf("Serve = %v, want a clean stop", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the session is still claiming for a client that hung up")
+	}
+}
+
+// heldCommits is a backend whose commits wait to be let through, or for their
+// context to end, so a test can have a commit in flight while something else
+// happens and see whether that something cancelled it.
+type heldCommits struct {
+	entroq.Backend
+	release <-chan struct{}
+}
+
+func (b heldCommits) Modify(ctx context.Context, mod *entroq.Modification) (*entroq.ModifyResponse, error) {
+	select {
+	case <-b.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return b.Backend.Modify(ctx, mod)
+}
+
+// TestStreamHangUpAfterAnswerStillCommits pins the other side of hearing a
+// hang-up early: a client may send its answer and leave at once. The answer
+// arrived before the hang-up, so stopping the claiming must not stop the commit.
+//
+// The commit is held open across the hang-up. An in-memory commit is otherwise
+// over before the hang-up is even read, and a fix that cancelled the whole
+// session would pass by winning that race.
+func TestStreamHangUpAfterAnswerStillCommits(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	backend, err := eqmem.Opener()(ctx)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	release := make(chan struct{})
+	eq, err := entroq.New(ctx, func(context.Context) (entroq.Backend, error) {
+		return heldCommits{Backend: backend, release: release}, nil
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer eq.Close()
+	seed, err := entroq.New(ctx, func(context.Context) (entroq.Backend, error) { return backend, nil })
+	if err != nil {
+		t.Fatalf("New seed: %v", err)
+	}
+	if _, err := seed.Modify(ctx, entroq.InsertingInto("inbox")); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	r, w, c := osPipes(t)
+	done := served(ctx, eq, r, w)
+
+	c.send(&Request{Type: ReqConfig, Config: &Config{Queues: []string{"inbox"}, ProtocolVersions: []int32{1}}})
+	check := c.recv()
+	c.send(&Request{Type: ReqReady, Session: check.Session})
+	work := c.recv()
+	if work.Type != RespWork {
+		t.Fatalf("after ready, got %q, want %q", work.Type, RespWork)
+	}
+	c.send(&Request{
+		Type:    ReqModify,
+		Session: check.Session,
+		Modification: &wireModReq{&pb.ModifyRequest{
+			Deletes: []*pb.TaskID{{
+				Queue:   work.Task.GetQueue(),
+				Id:      work.Task.GetId(),
+				Version: work.Task.GetVersion(),
+			}},
+		}},
+	})
+	c.hangUp()
+
+	// Long enough for the hang-up to reach a commit in flight, if anything
+	// lets it.
+	time.Sleep(200 * time.Millisecond)
+	close(release)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Serve = %v, want a clean stop", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("the session did not end after the client answered and hung up")
+	}
+	left, err := seed.Tasks(ctx, "inbox")
+	if err != nil {
+		t.Fatalf("Tasks: %v", err)
+	}
+	if len(left) != 0 {
+		t.Errorf("inbox still holds %d tasks; the answer sent before hanging up did not commit", len(left))
 	}
 }
 

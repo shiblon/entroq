@@ -12,6 +12,16 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// DefaultMaxFrameBytes bounds one frame, newline included, unless
+// WithMaxFrameBytes says otherwise. It matches eqserve's --max_size_mb, so a
+// client whose messages fit over gRPC fits here too.
+const DefaultMaxFrameBytes = 10 << 20
+
+// ErrFrameTooLarge is what a frame over the limit gets. It ends the session:
+// a line abandoned part-read leaves no resync point, since the newline that
+// would mark the next frame is somewhere in the bytes nobody is reading.
+var ErrFrameTooLarge = errors.New("frame too large")
+
 // StreamConn carries a gateway session over one byte stream: a unix socket, a
 // TCP conn, anything that reads and writes. Two one-way streams, which is what
 // a spawned child gets for its stdin and stdout, become one with Joining.
@@ -33,6 +43,10 @@ type StreamConn struct {
 	// which reason, and is set before this closes. Both are guarded by mu.
 	done  chan struct{}
 	ended error
+
+	// gone closes when the reader pump stops, before it hands over its last
+	// frame, so it closes whether or not anyone ever takes that frame.
+	gone chan struct{}
 
 	rCh <-chan requestFrame
 	wCh chan<- responseFrame
@@ -95,13 +109,19 @@ func (j *joined) Close() error                { return j.closeOnce() }
 //
 // Closing the conn closes the stream exactly once, so a transport that is two
 // streams says so with Joining rather than being passed twice.
-func NewStreamConn(rwc io.ReadWriteCloser) *StreamConn {
+//
+// It takes the same options Serve does and uses the ones about framing, so an
+// operator's one list goes to both.
+func NewStreamConn(rwc io.ReadWriteCloser, options ...Option) *StreamConn {
+	opts := resolveOptions(options)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	rCh := make(chan requestFrame)
 	wCh := make(chan responseFrame)
 
 	c := &StreamConn{
 		done:        make(chan struct{}),
+		gone:        make(chan struct{}),
 		rCh:         rCh,
 		wCh:         wCh,
 		stop:        cancel,
@@ -119,7 +139,7 @@ func NewStreamConn(rwc io.ReadWriteCloser) *StreamConn {
 	})
 
 	g.Go(func() error {
-		return pumpRead(gctx, rwc, rCh)
+		return pumpRead(gctx, rwc, rCh, c.gone, opts.maxFrameBytes)
 	})
 	g.Go(func() error {
 		return pumpWrite(gctx, rwc, wCh)
@@ -143,36 +163,61 @@ func NewStreamConn(rwc io.ReadWriteCloser) *StreamConn {
 // bufio.Reader rather than json.Decoder because a Decoder keeps its first read
 // error forever: it cannot report a bad frame and carry on, and it cannot be
 // interrupted and resumed.
-func pumpRead(ctx context.Context, r io.Reader, out chan<- requestFrame) error {
+func pumpRead(ctx context.Context, r io.Reader, out chan<- requestFrame, gone chan<- struct{}, max int) error {
+	// end is the read side's last word. Nothing further can arrive, which is
+	// said first to anyone watching gone, and then handed to Recv in order.
+	end := func(err error) error {
+		close(gone)
+		deliver(ctx, out, requestFrame{err: err})
+		return err
+	}
 	br := bufio.NewReader(r)
 	for {
-		line, err := br.ReadBytes('\n')
+		line, err := readFrame(br, max)
 		if err != nil {
 			// A broken read leaves a fragment, not a frame, and the read error
 			// is why the session is ending -- not whatever the fragment fails
 			// to parse as, and not a request it may happen to parse into.
 			if !errors.Is(err, io.EOF) {
-				err = fmt.Errorf("read frame: %w", err)
-				deliver(ctx, out, requestFrame{err: err})
-				return err
+				return end(fmt.Errorf("read frame: %w", err))
 			}
 			// A peer that hung up without its last newline still said
 			// something whole: that line is decoded below, and the next read
 			// reports the end.
 			if len(line) == 0 {
-				deliver(ctx, out, requestFrame{err: err})
-				return err
+				return end(err)
 			}
 		}
 		req := new(Request)
 		if uerr := json.Unmarshal(line, req); uerr != nil {
-			uerr = fmt.Errorf("decode frame: %w", uerr)
-			deliver(ctx, out, requestFrame{err: uerr})
-			return uerr
+			return end(fmt.Errorf("decode frame: %w", uerr))
 		}
 		if derr := deliver(ctx, out, requestFrame{req: req}); derr != nil {
 			return derr
 		}
+	}
+}
+
+// readFrame reads one newline-terminated frame, refusing one over max bytes.
+// A max of zero or less is no bound.
+//
+// ReadSlice rather than ReadBytes, which grows a buffer for as long as a peer
+// withholds the newline: the bounded pieces are accumulated here instead, and
+// the count is checked before each one lands.
+func readFrame(br *bufio.Reader, max int) ([]byte, error) {
+	var frame []byte
+	for {
+		piece, err := br.ReadSlice('\n')
+		if max > 0 && len(frame)+len(piece) > max {
+			return nil, fmt.Errorf("%w: over %d bytes", ErrFrameTooLarge, max)
+		}
+		frame = append(frame, piece...)
+		// A full buffer means the newline is further along, not that the read
+		// failed, so the next ReadSlice carries on where this one stopped.
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		return frame, err
 	}
 }
 
@@ -287,6 +332,12 @@ func (c *StreamConn) Send(ctx context.Context, msg *Response) error {
 	case <-ctx.Done():
 		return fmt.Errorf("send ack canceled (%v): %w", context.Cause(ctx), ctx.Err())
 	}
+}
+
+// Gone closes once the client can send nothing more: it hung up, its stream
+// broke, or it sent a frame this conn will not read past.
+func (c *StreamConn) Gone() <-chan struct{} {
+	return c.gone
 }
 
 // Close ends the session: it stops the pumps and closes the streams under them,

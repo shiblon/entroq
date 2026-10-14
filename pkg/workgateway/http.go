@@ -31,8 +31,9 @@ import (
 // request. So a session is registered before the client can send anything that
 // would need to find it.
 type Handler struct {
-	eq      entroq.Client
-	options []Option
+	eq            entroq.Client
+	options       []Option
+	maxFrameBytes int
 
 	// ctx outlives any one request, because a session does. A request's own
 	// context ends when its reply is written, which would end the session with
@@ -67,10 +68,11 @@ type httpSession struct {
 // the request that happened to start it.
 func NewHandler(ctx context.Context, eq entroq.Client, options ...Option) *Handler {
 	return &Handler{
-		eq:       eq,
-		options:  options,
-		ctx:      ctx,
-		sessions: make(map[string]*httpSession),
+		eq:            eq,
+		options:       options,
+		maxFrameBytes: resolveOptions(options).maxFrameBytes,
+		ctx:           ctx,
+		sessions:      make(map[string]*httpSession),
 	}
 }
 
@@ -84,8 +86,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "the work gateway speaks POST", http.StatusMethodNotAllowed)
 		return
 	}
+	// The same bound the stream transport frames by, so a client's message
+	// either fits on both transports or on neither. MaxBytesReader hangs up
+	// as well as erroring, so a client still writing a huge body is stopped
+	// rather than left to finish sending what nobody will read.
+	if h.maxFrameBytes > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, int64(h.maxFrameBytes))
+	}
+
 	var req Request
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, fmt.Sprintf("request over %d bytes", tooLarge.Limit), http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, fmt.Sprintf("decode request: %v", err), http.StatusBadRequest)
 		return
 	}

@@ -129,6 +129,11 @@ func (g *Gateway) classify(err error) ExitClass {
 	if entroq.IsCanceled(err) || errors.Is(err, context.Canceled) || errors.Is(err, io.EOF) {
 		return ExitOK
 	}
+	// The gateway shuts its worker down only when the client has gone, so a
+	// Run that reports it is a client that left before its first task.
+	if errors.Is(err, worker.ErrShutdown) {
+		return ExitOK
+	}
 	g.Lock()
 	closed := g.closed
 	g.Unlock()

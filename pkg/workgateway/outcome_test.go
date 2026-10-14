@@ -132,6 +132,9 @@ func TestClassifyTellsASupervisorWhatToDo(t *testing.T) {
 		"a fatal is the caller's fault": {
 			&Gateway{}, worker.FatalErrorf("bad message"), ExitCaller,
 		},
+		"a shutdown is a client that left": {
+			&Gateway{}, fmt.Errorf("run: %w", worker.ErrShutdown), ExitOK,
+		},
 		"a surprise is ours": {&Gateway{}, errors.New("surprise"), ExitGateway},
 	} {
 		t.Run(name, func(t *testing.T) {

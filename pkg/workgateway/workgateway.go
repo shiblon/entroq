@@ -40,6 +40,15 @@ type Conn interface {
 	// transport: an HTTP service drops this connection and keeps serving
 	// everyone else, while a pipe gateway is its one session and exits.
 	Close() error
+
+	// Gone closes once no further request can arrive from the client, which
+	// the gateway must hear even when it is not in Recv: a client that hangs
+	// up while the gateway is claiming has spoken out of turn, and the claim
+	// must stop rather than land a task for nobody.
+	//
+	// It is the inbound half only. A client may send its last answer and
+	// close its end while still reading for the reply.
+	Gone() <-chan struct{}
 }
 
 // Config is a worker's registration, carried by the first message of a session.
@@ -107,12 +116,29 @@ type Config struct {
 }
 
 // Option configures a gateway session at Start. These are the operator's
-// settings, as against a client's Config.
+// settings, as against a client's Config. A transport takes the same list and
+// uses the ones about its framing.
 type Option func(*gatewayOpts)
 
 type gatewayOpts struct {
 	lease          time.Duration
 	maxWorkTimeout time.Duration
+	maxFrameBytes  int
+}
+
+// resolveOptions applies options over the defaults, which are the worker's
+// own, so an operator who sets nothing gets what a native worker would have
+// done.
+func resolveOptions(options []Option) gatewayOpts {
+	opts := gatewayOpts{
+		lease:          entroq.DefaultClaimDuration,
+		maxWorkTimeout: worker.DefaultWorkTimeout,
+		maxFrameBytes:  DefaultMaxFrameBytes,
+	}
+	for _, o := range options {
+		o(&opts)
+	}
+	return opts
 }
 
 // WithLease sets how long a claim is held before it must be renewed, which is
@@ -134,6 +160,18 @@ func WithLease(d time.Duration) Option {
 func WithMaxWorkTimeout(d time.Duration) Option {
 	return func(o *gatewayOpts) {
 		o.maxWorkTimeout = d
+	}
+}
+
+// WithMaxFrameBytes bounds one message on the wire, in both directions: a
+// frame, newline included, on a stream, and a body over HTTP.
+//
+// Pass zero for no bound at all, which costs the protection this exists for:
+// a message is held whole in memory to be decoded, so an unbounded one is as
+// large as a peer cares to make it.
+func WithMaxFrameBytes(n int) Option {
+	return func(o *gatewayOpts) {
+		o.maxFrameBytes = n
 	}
 }
 
@@ -414,15 +452,7 @@ func newGateway(eq entroq.Client, first *Request, conn Conn, options ...Option) 
 			conf.ProtocolVersions, supportedVersions)
 	}
 
-	// The defaults are the worker's own, so an operator who sets nothing gets
-	// what a native worker would have done.
-	opts := gatewayOpts{
-		lease:          entroq.DefaultClaimDuration,
-		maxWorkTimeout: worker.DefaultWorkTimeout,
-	}
-	for _, o := range options {
-		o(&opts)
-	}
+	opts := resolveOptions(options)
 
 	session := entroq.GenHex16()
 	claimant := conf.DangerousClaimantOverride
@@ -505,6 +535,20 @@ func (g *Gateway) Handle(ctx context.Context) error {
 		// to drain, so this is simply goodbye.
 		return nil
 	case ReqReady:
+		// A client gone between turns stops the claiming, and only that: a
+		// task in hand still commits, because its answer arrived before the
+		// client left.
+		go func() {
+			select {
+			case <-g.conn.Gone():
+				// Shutdown fails only when the session ends first, which
+				// is where this was headed anyway.
+				if err := g.worker.Shutdown(ctx); err != nil && ctx.Err() == nil {
+					log.Printf("work gateway: session %s: stop claiming: %v", g.sessionID, err)
+				}
+			case <-ctx.Done():
+			}
+		}()
 		return g.exit(g.worker.Run(ctx,
 			worker.AsClaimant(g.claimant),
 			worker.Watching(g.config.Queues...),

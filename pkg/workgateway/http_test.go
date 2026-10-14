@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -318,6 +320,44 @@ func TestHTTPRefusesWhatItDoesNotSpeak(t *testing.T) {
 	res.Body.Close()
 	if res.StatusCode != http.StatusBadRequest {
 		t.Errorf("a malformed body answered with %d, want %d", res.StatusCode, http.StatusBadRequest)
+	}
+}
+
+// TestHTTPRefusesAnOversizeBody pins the bound both transports share: a body
+// over the limit is 413, not the 400 that would read like a client's JSON was
+// malformed.
+//
+// Driven straight at the handler rather than through a socket, because
+// MaxBytesReader hangs the connection up as it refuses -- so a client still
+// writing its body may see the reset rather than the status, and a test over a
+// socket would be asserting on which of the two won.
+func TestHTTPRefusesAnOversizeBody(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	eq, err := entroq.New(ctx, eqmem.Opener())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer eq.Close()
+
+	const max = 8 << 10
+	h := NewHandler(ctx, eq, WithMaxFrameBytes(max))
+	defer h.Close()
+
+	// A config that opens with a string and never closes it, so the decoder
+	// has to keep reading and the limit is what stops it.
+	body := io.MultiReader(
+		strings.NewReader(`{"type":"config","session":"`),
+		&floodReader{remaining: 4 * max},
+	)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/", body))
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("an oversize body answered with %d, want %d", w.Code, http.StatusRequestEntityTooLarge)
+	}
+	if h.Sessions() != 0 {
+		t.Errorf("a refused body left %d sessions behind, want none", h.Sessions())
 	}
 }
 

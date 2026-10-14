@@ -289,3 +289,5 @@ func (c *fakeConn) Recv(ctx context.Context) (*Request, error) {
 }
 
 func (c *fakeConn) Close() error { return nil }
+
+func (c *fakeConn) Gone() <-chan struct{} { return nil }

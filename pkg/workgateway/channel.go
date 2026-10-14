@@ -27,6 +27,7 @@ type ChannelConn struct {
 	w chan<- *Response
 
 	done chan bool
+	gone chan struct{}
 }
 
 // NewChannelConn makes a conn over a request channel and a response channel.
@@ -40,7 +41,15 @@ func NewChannelConn(r <-chan *Request, w chan<- *Response) *ChannelConn {
 		r:    r,
 		w:    w,
 		done: make(chan bool),
+		gone: make(chan struct{}),
 	}
+}
+
+// Gone never closes yet. HTTP carries no hang-up: a session spans
+// connections, so a client that vanished looks like one that has not come
+// back, and nothing here can tell the two apart.
+func (c *ChannelConn) Gone() <-chan struct{} {
+	return c.gone
 }
 
 // Recv waits for the next request the transport forwards.
