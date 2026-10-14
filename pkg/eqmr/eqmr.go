@@ -10,8 +10,8 @@
 //   - Reducers (RunReducer) merge one partition's runs, run the Reducer once
 //     per key, stream the results into a staged attempt at the run's Sink, and
 //     commit a finish task naming it. There is one unit per partition with data.
-//   - Controllers (RunController) react to finish tasks and alone write run
-//     state. Run any number of replicas.
+//   - The controller (RunController) reacts to finish tasks and alone writes
+//     run state. Run one, and restart it to recover.
 //
 // # Getting started
 //

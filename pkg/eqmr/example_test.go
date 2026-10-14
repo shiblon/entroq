@@ -118,10 +118,8 @@ func ExampleController_RunMapper() {
 
 // ExampleController_RunController shows a controller pod.
 //
-// Run as many replicas as you like. Each acceptance claims only its own unit,
-// and only a check that finds a phase complete claims the run's state, so
-// replicas never coordinate beyond those claims, and one that dies loses
-// nothing: its tasks wait in their queues and its claims expire.
+// Run one per run. A controller that dies loses nothing: its tasks wait in
+// their queues and its claims expire, so restarting it resumes the run.
 func ExampleController_RunController() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

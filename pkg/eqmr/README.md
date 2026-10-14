@@ -22,7 +22,7 @@ intermediate runs go through a store, and output goes to a `Sink`.
              \                         /
               +-----------------------+
               |     RunController     |   also: {prefix}/map-check,
-              |     (scale 1..k)      |   /reduce-check, /gc, and
+              |     (one per run)     |   /reduce-check, /gc, and
               +-----------------------+   every {queue}/err
                          |
    docs:  state, split/NNNNNN, mapout/NNNNNN, result/NNNNNN
@@ -33,9 +33,9 @@ Mappers and reducers consume a task and commit a finish task in the `Modify`
 that deletes it; they never write a doc. The controller is a set of workers
 that react to finish tasks and alone write run state: work goes out as tasks,
 comes back as finish tasks, and the controller decides what each one means.
-Every role scales on its own, any number of controller replicas may run, and a
-replica that dies is recoverable by simply restarting it: its tasks wait in
-their queues and are picked up again when the workers restart.
+Mappers and reducers scale on their own. Run one controller per run; one that
+dies is recovered by restarting it, since its tasks wait in their queues and
+its claims expire.
 
 `Controller.Run` does all of this in one process, for tests, benchmarks, and
 small jobs.
@@ -53,10 +53,10 @@ of different units never wait on one another; a later finish for the same unit
 finds its input gone.
 
 **Checks.** Each acceptance commits a check task in the same `Modify`, and the
-check decides whether the phase is over. Because check does no mutations, and
-always follows a mutation, it is guaranteed that at least one of the checks
-will see an empty docset and know to move the phase forward. Because moving
-forward also mutates state, any late checks will safely fail to commit.
+check decides whether the phase is over. Checks never touch the docs a phase
+consumes, so the check committed by the last acceptance always finds them gone.
+The first check to find them gone claims the state doc and moves the run on;
+any check after it sees the phase has moved and retires without a claim.
 
 | phase | ends when | ended by |
 |---|---|---|

@@ -50,7 +50,7 @@ type gcTask struct {
 }
 
 // RunController runs this run's controller workers until ctx ends or one exits.
-// Run any number of replicas.
+// Run one per run, and restart it to recover: its work waits in EntroQ.
 //
 // It first fails an unfinished run that names a store or sink this process
 // cannot reach, and returns an error.
@@ -177,8 +177,9 @@ func stateWorker[T any](c *Controller, decide stateDecision[T], opts ...worker.O
 }
 
 // barrierWorker builds a controller worker for check tasks. reached looks
-// without a claim, and the task retires if it is false. Otherwise the state doc
-// is claimed and decide is called; decide must check again under the claim.
+// without a claim, and the task retires if it is false, as it is for every
+// check after the one that ends the phase. Otherwise the state doc is claimed
+// and decide is called; decide must check again under the claim.
 func barrierWorker[T any](c *Controller, reached func(context.Context) (bool, error), decide stateDecision[T], opts ...worker.Option[T]) *worker.Worker[T] {
 	opts = append(opts,
 		worker.WithTakeDocs(func(ctx context.Context, _ *entroq.Task, _ T) ([]*entroq.DocClaim, error) {
@@ -322,14 +323,13 @@ func (c *Controller) mapDoneWorker() *worker.Worker[mapDone] {
 // there are none.
 func (c *Controller) mapCheckWorker() *worker.Worker[barrierCheck] {
 	reached := func(ctx context.Context) (bool, error) {
-		left, err := c.anyDocs(ctx, splitPrefix)
-		return !left, err
+		return c.consumed(ctx, PhaseMap, splitPrefix)
 	}
 	return barrierWorker(c, reached, func(ctx context.Context, task *entroq.Task, _ barrierCheck, st runState) ([]entroq.ModifyArg, *runState, error) {
 		if st.Phase != PhaseMap {
 			return []entroq.ModifyArg{task.Delete()}, nil, nil
 		}
-		if ok, err := reached(ctx); err != nil || !ok {
+		if left, err := c.anyDocs(ctx, splitPrefix); err != nil || left {
 			return []entroq.ModifyArg{task.Delete()}, nil, err
 		}
 		parts, err := c.keyPartitions(ctx, mapOutPrefix)
@@ -407,14 +407,13 @@ func (c *Controller) reduceDoneWorker() *worker.Worker[reduceDone] {
 // done.
 func (c *Controller) reduceCheckWorker() *worker.Worker[barrierCheck] {
 	reached := func(ctx context.Context) (bool, error) {
-		left, err := c.anyDocs(ctx, mapOutPrefix)
-		return !left, err
+		return c.consumed(ctx, PhaseReduce, mapOutPrefix)
 	}
 	return barrierWorker(c, reached, func(ctx context.Context, task *entroq.Task, _ barrierCheck, st runState) ([]entroq.ModifyArg, *runState, error) {
 		if st.Phase != PhaseReduce {
 			return []entroq.ModifyArg{task.Delete()}, nil, nil
 		}
-		if ok, err := reached(ctx); err != nil || !ok {
+		if left, err := c.anyDocs(ctx, mapOutPrefix); err != nil || left {
 			return []entroq.ModifyArg{task.Delete()}, nil, err
 		}
 		done, err := c.keyPartitions(ctx, resultPrefix)
@@ -456,6 +455,17 @@ func samePointers(published []*entroq.Doc, consumed []entroq.DocID) bool {
 		}
 	}
 	return true
+}
+
+// consumed reports, without a claim, whether the run is in phase and no doc has
+// a key under prefix: whether a check may end the phase.
+func (c *Controller) consumed(ctx context.Context, phase, prefix string) (bool, error) {
+	st, err := c.readState(ctx)
+	if err != nil || st.Phase != phase {
+		return false, err
+	}
+	left, err := c.anyDocs(ctx, prefix)
+	return !left, err
 }
 
 // anyDocs reports whether any doc has a key under prefix. It takes no claim, so
