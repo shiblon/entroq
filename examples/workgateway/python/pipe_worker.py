@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
-"""A resident EntroQ worker over the work gateway, PIPE transport, stdlib Python.
+"""A resident EntroQ worker over the work gateway's pipe transport, stdlib only.
 
-The work itself lives in handler.py, shared with the WebSocket example
-(ws_worker.py); this file is only the pipe transport and its supervision loop.
+The work itself lives in handler.py; this file is the transport and its
+supervision loop.
 
 It spawns `eqlink work` as a child -- the gateway, which runs the EntroQ worker
-loop (claim, renew, commit) on our behalf -- and speaks the small
-newline-delimited JSON protocol over the child's stdin/stdout. The whole thing is
-wrapped in a reconnect loop keyed on the gateway's exit code, so this process
-survives a restarting or relocating EntroQ backend without dying.
+loop (claim, renew, commit) on our behalf -- and speaks newline-delimited JSON
+over the child's stdin and stdout. The client drives: it registers with a
+config, says it is ready, and then answers each task the gateway hands it.
 
-That is the recipe for a long-lived host -- e.g. a monolith where the worker is
-one of many things in the process -- for which crashing on a backend blip would
-be a self-inflicted outage. If this worker were instead its own supervised
-service, you could drop the reconnect loop entirely: let the process exit when
-the gateway does, and let your platform (systemd/k8s/docker) restart it. See
-docs/workgateway-protocol.md for both recipes and the full contract.
+The reconnect loop is keyed on the gateway's exit code, so this process
+survives a restarting backend. That is the recipe for a long-lived host, such
+as a monolith where the worker is one of many things in the process. A worker
+that is its own supervised service can drop the loop: exit when the gateway
+does, and let the platform restart it.
 
 Prerequisites: a reachable EntroQ gRPC service and `eqlink` on PATH.
 
-    ENTROQ_ADDR=localhost:37706 QUEUE=in python3 worker.py
+    ENTROQ_ADDR=localhost:37706 QUEUE=in python3 pipe_worker.py
 """
 import json
 import os
@@ -32,117 +30,147 @@ from handler import handle
 
 ENTROQ_ADDR = os.environ.get("ENTROQ_ADDR", "localhost:37706")
 QUEUE = os.environ.get("QUEUE", "in")
+EQLINK = os.environ.get("EQLINK", "eqlink")
 
-# Gateway exit codes follow sysexits.h. The one bit we branch on is retry-vs-stop:
-# 75 (EX_TEMPFAIL) is a transient backend blip to reconnect on; 0 (clean),
-# 78 (caller fault), and 70 (gateway fault) are all terminal -- stop and surface.
+# The gateway protocols this worker speaks. The gateway picks the highest one
+# both sides know, or refuses the config naming what it does speak.
+PROTOCOLS = [1]
+
+# Gateway exit codes follow sysexits.h. The one bit worth branching on is
+# retry-vs-stop: 75 (EX_TEMPFAIL) is a transient backend blip to reconnect on;
+# 0 (clean), 78 (caller fault) and 70 (gateway fault) are terminal.
 EXIT_TRANSIENT = 75
 
-# The gateway protocol this worker speaks. The gateway opens every session with
-# a hello naming its protocol; a worker that does not speak it stops, naming the
-# gateway's version so a person can see what is installed.
-PROTOCOL = 1
 
+class Session:
+    """One gateway child and the one conversation it carries."""
 
-def check_hello(msg):
-    if msg.get("protocol") != PROTOCOL:
-        sys.exit(
-            f"[worker] gateway {msg.get('version')} speaks protocol "
-            f"{msg.get('protocol')}; this worker speaks {PROTOCOL}"
+    def __init__(self):
+        self.proc = subprocess.Popen(
+            [EQLINK, "--entroq", ENTROQ_ADDR, "work"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            # stderr is inherited, so the gateway's diagnostics reach ours.
         )
+        self.id = ""
+        self.in_hand = False
+        self.stopping = False
 
+    def send(self, msg):
+        msg["session"] = self.id
+        self.proc.stdin.write((json.dumps(msg) + "\n").encode())
+        self.proc.stdin.flush()
 
-def serve(proc):
-    """Answer phase messages from one gateway child until it exits.
+    def recv(self):
+        line = self.proc.stdout.readline()
+        return json.loads(line) if line else None
 
-    Strict request/response: the gateway sends a phase message, we reply. An
-    out-of-band {"type":"error"} may arrive in place of a phase message -- it is
-    one-way (we only log it); the reconnect decision comes from the exit code.
-    """
-    for line in proc.stdout:
-        msg = json.loads(line)
-        kind = msg.get("type")
-        if kind == "hello":
-            check_hello(msg)
-        elif kind == "doWork":
-            reply = handle(msg["task"])
-            proc.stdin.write((json.dumps(reply) + "\n").encode())
-            proc.stdin.flush()
-        elif kind == "abort":
-            # The gateway lost the claim on the task it names. This worker handles
-            # one task at a time without reading, so by now it has answered that
-            # doWork, and the gateway discards the answer; nothing to stop.
+    def stop(self):
+        """Ask to stop. A task in hand finishes first, because the quit rides
+        on its reply; with nothing in hand there is nothing to finish, and
+        hanging up is the whole goodbye."""
+        self.stopping = True
+        if not self.in_hand:
+            self.hang_up()
+
+    def hang_up(self):
+        if not self.proc.stdin.closed:
+            self.proc.stdin.close()
+
+    def serve(self):
+        """Run the conversation until the gateway ends it, and return its
+        exit code."""
+        try:
+            self.converse()
+        except BrokenPipeError:
+            # The gateway went away mid-write; its exit code says why.
             pass
-        elif kind == "error":
-            print(
-                f"[worker] gateway error [{msg.get('class')}]: {msg.get('message')}",
-                file=sys.stderr,
-            )
-        else:
-            print(f"[worker] unexpected message {kind!r}", file=sys.stderr)
+        finally:
+            self.hang_up()
+            self.proc.wait()
+        return self.proc.returncode
+
+    def converse(self):
+        self.send({"type": "config", "config": {
+            "queues": [QUEUE],
+            "protocol_versions": PROTOCOLS,
+        }})
+        check = self.recv()
+        if check is None:
+            return
+        if check.get("type") != "check":
+            report(check)
+            return
+        self.id = check["session"]
+        print(f"[worker] session {self.id} as {check.get('claimant')}, "
+              f"work timeout {check.get('work_timeout_s', 0)}s", file=sys.stderr)
+
+        if self.stopping:
+            return
+        self.send({"type": "ready"})
+        while True:
+            msg = self.recv()
+            if msg is None:
+                return
+            kind = msg.get("type")
+            if kind == "work":
+                self.in_hand = True
+                reply = handle(msg["task"])
+                if self.stopping:
+                    reply["quit"] = True
+                self.send(reply)
+                self.in_hand = False
+            elif kind == "quit":
+                # The answer to a quit: the last reply committed.
+                return
+            else:
+                report(msg)
 
 
-def run_gateway():
-    """Spawn one gateway child, serve it, and return its exit code.
+def report(msg):
+    if msg.get("type") == "error":
+        print(f"[worker] gateway error [{msg.get('class')}]: {msg.get('message')}",
+              file=sys.stderr)
+    else:
+        print(f"[worker] unexpected message {msg.get('type')!r}", file=sys.stderr)
 
-    We register only the work phase (--work). stderr is inherited (the default),
-    so the gateway's diagnostics reach ours; do not redirect it away or you lose
-    them.
-    """
-    proc = subprocess.Popen(
-        ["eqlink", "--entroq", ENTROQ_ADDR, "work", "--queue", QUEUE, "--work"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-    )
-    _set_child(proc)
-    try:
-        serve(proc)
-    finally:
-        proc.stdin.close()
-        proc.wait()
-    _set_child(None)
-    return proc.returncode
+
+_session = None
+
+
+def _on_signal(signum, frame):
+    global _stop_requested
+    _stop_requested = True
+    if _session is not None:
+        _session.stop()
+
+
+_stop_requested = False
 
 
 def main():
+    global _session
     backoff = 0.2
-    while True:
+    while not _stop_requested:
         started = time.monotonic()
-        code = run_gateway()
-        if code == EXIT_TRANSIENT:
-            # A run that lasted a while before the blip is a fresh outage, not a
-            # continuing one, so reset the backoff.
+        _session = Session()
+        code = _session.serve()
+        _session = None
+        if code == EXIT_TRANSIENT and not _stop_requested:
+            # A run that lasted a while before the blip is a fresh outage, not
+            # a continuing one, so the backoff starts over.
             if time.monotonic() - started > 30:
                 backoff = 0.2
-            print(
-                f"[worker] backend unavailable (exit {code}); reconnecting in {backoff:.1f}s",
-                file=sys.stderr,
-            )
+            print(f"[worker] backend unavailable (exit {code}); "
+                  f"reconnecting in {backoff:.1f}s", file=sys.stderr)
             time.sleep(backoff)
             backoff = min(backoff * 2, 5.0)
             continue
-        # Clean stop or a caller/gateway fault: terminal, do not retry.
         print(f"[worker] gateway stopped (exit {code}); exiting", file=sys.stderr)
         sys.exit(code)
 
 
-# Graceful shutdown: pass SIGINT/SIGTERM to the gateway so it winds down the
-# current claim cleanly instead of orphaning it until the lease expires.
-_child = None
-
-
-def _set_child(proc):
-    global _child
-    _child = proc
-
-
-def _shutdown(signum, frame):
-    if _child is not None and _child.poll() is None:
-        _child.terminate()
-    sys.exit(0)
-
-
 if __name__ == "__main__":
-    signal.signal(signal.SIGINT, _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
     main()

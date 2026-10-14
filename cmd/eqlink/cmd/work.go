@@ -1,117 +1,168 @@
 package cmd
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"net/http"
+	"os"
 	"time"
 
 	"github.com/shiblon/entroq"
-	"github.com/spf13/cobra"
-
 	"github.com/shiblon/entroq/pkg/worker"
+	"github.com/shiblon/entroq/pkg/workgateway"
+	"github.com/spf13/cobra"
+	"golang.org/x/sync/errgroup"
 )
 
 var (
-	workAddr          string
-	workLease         time.Duration
-	workQueues        []string
-	workMaxAttempts   int32
-	workMaxClaims     int32
-	workTakeDocs      bool
-	workWork          bool
-	workSuccess       bool
-	workDependency    bool
-	workErrorQueue    string
-	workRetryDelay    time.Duration
-	workEntroQTimeout time.Duration
+	workAddr           string
+	workLease          time.Duration
+	workMaxWorkTimeout time.Duration
+	workMaxFrameMB     int
 )
 
 var workCmd = &cobra.Command{
-	Use:   "work --queue Q [--queue Q...] --work",
-	Short: "Run a worker gateway: drive a language-agnostic worker over a JSON protocol.",
+	Use:   "work [--addr ADDR]",
+	Short: "Run a work gateway: host a worker written in any language over a JSON protocol.",
 	Long: `Runs the EntroQ worker loop (claim, renew, commit) on behalf of a worker written
-in any language, which speaks a small newline-delimited JSON protocol and never
-touches EntroQ, gRPC, or the queue API.
+in any language, which speaks a small JSON protocol and never touches EntroQ,
+gRPC, or the queue API.
+
+The client drives. It speaks first, with a config naming the queues it serves
+and the phases it wants, and the gateway answers with a check naming its session
+and claimant. The client says it is ready, and from then on the gateway hands it
+one task at a time and waits for its answer:
+
+    client  -> {"type":"config","config":{"queues":["in"],"protocol_versions":[1]}}
+    gateway -> {"type":"check","session":"...","claimant":"...","expect":"ready"}
+    client  -> {"type":"ready","session":"..."}
+    gateway -> {"type":"work","task":{...},"expect":"modify"}
+    client  -> {"type":"modify","session":"...","modification":{...}}
+    gateway -> {"type":"work",...}                       # the next task
 
 Every domain object on the wire (task, docs, modification, dependency list) is
-the canonical protojson of the corresponding message in api/entroq.proto, so a
-worker generates those types from the same proto the rest of EntroQ uses and
-hand-models nothing. Only the thin envelope around them (the "type" tag and the
-phase framing) is gateway-specific.
+the canonical protojson of the corresponding message in api/entroq.proto. The
+modification is a ModifyRequest: it says everything about the task's fate, so a
+task the client consumed is one it deletes. Leave its claimant_id empty; the
+gateway owns the claim. An outcome of "retry", "move", "fatal" or "error"
+replaces the commit with that disposition. Setting "quit" on a modify commits it
+and then ends the session, answered with {"type":"quit"}.
 
-Registration is out-of-band and set at connection time. In stdio mode (the
-default) the client typically spawns this process and declares its registration
-with flags: the queues it serves, its claim and attempt ceilings, and which
-phases it implements (--take-docs, --work, --success, --dependency). A work
-handler is required.
+With no --addr, one session runs over stdio: a client spawns this process and
+writes to its stdin, and reads its stdout, one JSON value per line. Diagnostics
+go to stderr. The first SIGINT or SIGTERM waits up to --lease for the client to
+quit; a second stops at once, leaving any task in hand to its lease.
 
-Then, per claimed task, the gateway sends only the registered phases and reads a
-reply. Exactly one post-commit phase (success or dependency) fires, and only if
-registered:
+With --addr, sessions run over HTTP: the client POSTs each message and gets the
+gateway's answer as the response, and a session spans as many connections as it
+likes. The first SIGINT or SIGTERM ends every session and stops the server,
+leaving any task in hand to its lease.
 
-    gateway -> {"type":"takeDocs","task":{...}}          # only if --take-docs
-    client  -> {"type":"docs","claims":[{"namespace":..,"key":..}]}
-    gateway -> {"type":"doWork","task":{...},"docs":[...]}
-    client  -> {"type":"result","outcome":"ok","ack":true,"modification":{...}}
-    gateway -> {"type":"success"}                        # commit ok; only if --success
-    client  -> {"type":"done","outcome":"ok"}
-    gateway -> {"type":"dependency","deps":[...]}        # commit lost a dependency; only if --dependency
-    client  -> {"type":"done","outcome":"ok"}
-
-The modification is a protojson ModifyRequest; leave its claimant_id empty, as
-the gateway owns the claim and attributes the commit itself. "ok" commits the
-(possibly empty) modification; "ok" alone does not delete the task. Set
-"ack":true as the shorthand for "I consumed this task" and the gateway also
-deletes it (unless the modification already disposes of it, in which case the
-modification wins). "retry"/"move"/"fatal" map to the worker's structured
-errors. If the commit loses a dependency race, the gateway reports the failed
-dependencies (a protojson ModifyDep list) and the done outcome picks the task's
-fate the same way. Diagnostics go to stderr; stdout carries only the protocol,
-so a spawning client should let this process inherit its stderr to see them.
-
-A worker error that does not itself drop the connection (a transient EntroQ
-outage being retried, or a caller/gateway fault about to stop the worker) is
-reported to the client out of band as {"type":"error","class":...,"message":...}
-in place of the next phase message; it is one-way, the client decides what to do.
-The gateway rides out an unreachable EntroQ backend (one being restarted or
-relocated) for --entroq-timeout, reconnecting transparently, before giving up.
 On stop it exits with a class code a supervisor can key on: 0 clean, 75
 transient (retryable), 78 caller fault, 70 gateway fault.
 
-The first SIGINT or SIGTERM drains: the gateway stops claiming, finishes the
-task in hand (waiting up to --lease for it), and exits 0. A second stops at
-once, leaving the task to its lease.
-
-With --addr the gateway serves WebSocket instead, and each connecting worker
-declares the same registration via URL query params (?queue=..&work=1&...).
-Concurrency is more connections; a dropped connection is a clean stop, and a
-task the worker never answered is released for another worker at once. A
-drain finishes every connection's task and closes it normally, refusing new
-connections meanwhile. The same classes surface as
-WebSocket close codes (1013 transient, 1008 caller, 1011 gateway).`,
+See examples/workgateway for a client.`,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		// TEMPORARY: pkg/workgateway is mid-rewrite for protocol 2, which the
-		// client drives. The flags and the description above are kept as the
-		// material for rewiring this command onto the new Gateway.
-		return fmt.Errorf("eqlink work is being rewired for work gateway protocol 2 and is temporarily unavailable")
+		if workMaxFrameMB < 0 {
+			return fmt.Errorf("--max-frame-mb must not be negative")
+		}
+		opts := []workgateway.Option{
+			workgateway.WithLease(workLease),
+			workgateway.WithMaxWorkTimeout(workMaxWorkTimeout),
+			workgateway.WithMaxFrameBytes(workMaxFrameMB << 20),
+		}
+		if workAddr != "" {
+			return serveWorkHTTP(workAddr, opts)
+		}
+		return serveWorkStdio(opts)
 	},
+}
+
+// serveWorkStdio runs one session over stdin and stdout, for a client that
+// spawned this process.
+func serveWorkStdio(opts []workgateway.Option) error {
+	// A quit is the client's to send, so the drain is waiting for one: a
+	// client in the same process group got the same signal and is finishing.
+	served := make(chan struct{})
+	ctx, stop := onSignal(context.Background(), workLease, func(sctx context.Context) error {
+		select {
+		case <-served:
+			return nil
+		case <-sctx.Done():
+			return fmt.Errorf("session still open: %w", sctx.Err())
+		}
+	})
+	defer stop()
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	g, gctx := errgroup.WithContext(ctx)
+	eq, err := localEQ(gctx, g)
+	if err != nil {
+		return err
+	}
+	defer eq.Close()
+
+	g.Go(func() error {
+		defer close(served)
+		// The session is the whole run, so its end releases whatever else
+		// the group is holding open.
+		defer cancel()
+		conn := workgateway.NewStreamConn(workgateway.Joining(os.Stdin, os.Stdout), opts...)
+		return workgateway.Serve(gctx, eq, conn, opts...)
+	})
+	return g.Wait()
+}
+
+// serveWorkHTTP serves sessions over HTTP on addr until a signal stops it.
+func serveWorkHTTP(addr string, opts []workgateway.Option) error {
+	// Sessions live on a context of their own, because a waiting request is
+	// a session waiting on a claim: the server cannot shut down around them
+	// until they have ended.
+	sessCtx, endSessions := context.WithCancel(context.Background())
+	defer endSessions()
+
+	srv := &http.Server{Addr: addr}
+	ctx, stop := onSignal(context.Background(), workLease, func(sctx context.Context) error {
+		endSessions()
+		return srv.Shutdown(sctx)
+	})
+	defer stop()
+
+	g, gctx := errgroup.WithContext(ctx)
+	eq, err := localEQ(gctx, g)
+	if err != nil {
+		return err
+	}
+	defer eq.Close()
+
+	h := workgateway.NewHandler(sessCtx, eq, opts...)
+	srv.Handler = h
+
+	g.Go(func() error {
+		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("serve %s: %w", addr, err)
+		}
+		return nil
+	})
+	// A second signal, or a failure anywhere in the group, skips the drain.
+	g.Go(func() error {
+		<-gctx.Done()
+		endSessions()
+		return srv.Close()
+	})
+	return g.Wait()
 }
 
 func init() {
 	flags := workCmd.Flags()
-	flags.StringVar(&workAddr, "addr", "", "If set, serve the gateway over WebSocket on this address (workers connect to /work and register via URL params). Otherwise run one worker over stdio.")
-	flags.DurationVar(&workLease, "lease", entroq.DefaultClaimDuration, "Claim lease and renewal interval (gateway-owned; not client-chosen).")
-	flags.StringArrayVar(&workQueues, "queue", nil, "A queue this worker serves (repeatable). Required in stdio mode.")
-	flags.Int32Var(&workMaxAttempts, "max-attempts", 0, "Max attempts before a retry is quarantined; 0 means unlimited.")
-	flags.Int32Var(&workMaxClaims, "max-claims", worker.DefaultMaxClaims, "Max times a task may be claimed WITHOUT being modified before it is quarantined without being dispatched; catches tasks that wedge or kill their worker. 0 means unlimited.")
-	flags.BoolVar(&workTakeDocs, "take-docs", false, "The worker implements the takeDocs phase.")
-	flags.BoolVar(&workWork, "work", false, "The worker implements the work phase (required).")
-	flags.BoolVar(&workSuccess, "success", false, "The worker implements the success phase (post-commit).")
-	flags.BoolVar(&workDependency, "dependency", false, "The worker implements the dependency phase (commit lost a dependency).")
-	flags.StringVar(&workErrorQueue, "error-queue", "", `Queue a quarantined task, or one moved with no destination, goes to; "{inbox}" stands for the task's queue. Default "{inbox}/err".`)
-	flags.DurationVar(&workRetryDelay, "retry-delay", 0, "Base delay before a retried task is available again; 0 keeps the worker default.")
-	flags.DurationVar(&workEntroQTimeout, "entroq-timeout", 60*time.Second, "How long to ride out an unreachable EntroQ backend (restart or relocation) before exiting; 0 disables the ride-out.")
+	flags.StringVar(&workAddr, "addr", "", "If set, serve sessions over HTTP on this address. Otherwise run one session over stdio.")
+	flags.DurationVar(&workLease, "lease", entroq.DefaultClaimDuration, "Claim lease and renewal interval, and how long the first signal waits for a stdio client to quit.")
+	flags.DurationVar(&workMaxWorkTimeout, "max-work-timeout", worker.DefaultWorkTimeout, "Longest a client may hold one task, and what one that asks for nothing gets; 0 lets a client ask for any bound, including none.")
+	flags.IntVar(&workMaxFrameMB, "max-frame-mb", workgateway.DefaultMaxFrameBytes>>20, "Largest message in MB, in either direction; 0 is no bound.")
 
 	rootCmd.AddCommand(workCmd)
 }

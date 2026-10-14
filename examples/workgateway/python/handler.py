@@ -1,19 +1,28 @@
-"""The worker's business logic, shared by both transport examples.
+"""The worker's business logic, kept apart from the transport.
 
-A gateway client's actual work lives in one place; the transport (a stdio pipe or
-a WebSocket) is a separate concern. `handle` receives the protojson of an
-api.Task and returns the result message to send back. Replace its body with real
-work.
+`handle` receives the protojson of an api.Task and returns the reply that
+settles it. Replace its body with real work.
 """
 import sys
 
 
 def handle(task):
-    """Process one task and return its result message."""
+    """Process one task and return the reply that settles it."""
     # `task` is the protojson of an api.Task; its JSON payload is under "value".
     print(f"[worker] task {task.get('id')}: value={task.get('value')!r}", file=sys.stderr)
 
-    # "ok" commits; "ack" is the shorthand for "I consumed this task", so the
-    # gateway deletes it for us. To produce new work instead, add a "modification"
-    # (a protojson ModifyRequest) and leave its claimant_id empty.
-    return {"type": "result", "outcome": "ok", "ack": True}
+    # The modification is a protojson ModifyRequest, and it says everything
+    # about the task's fate: a task this worker consumed is one it deletes. To
+    # produce new work, add "inserts"; leave "claimant_id" empty, because the
+    # gateway owns the claim. To give up on the task instead, reply with an
+    # "outcome" of "retry" or "move" and an "error" saying why.
+    return {
+        "type": "modify",
+        "modification": {
+            "deletes": [{
+                "queue": task["queue"],
+                "id": task["id"],
+                "version": task.get("version", 0),
+            }],
+        },
+    }
