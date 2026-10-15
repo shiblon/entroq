@@ -278,8 +278,9 @@ const (
 	ReqDocs       RequestType = "docs"
 	ReqQueues     RequestType = "queues"
 	ReqNamespaces RequestType = "namespaces"
-	ReqError      RequestType = "error"
-	ReqQuit       RequestType = "quit"
+	// ReqDone answers a post-commit notice (success, dependency) with the
+	// outcome the client picks for the task.
+	ReqDone RequestType = "done"
 )
 
 // Request is the wire type for inbound messages from the client to the gateway.
@@ -314,11 +315,11 @@ type Request struct {
 	DocsQuery  *wireDocsReq  `json:"docs_query,omitempty"`
 	MatchQuery *wireMatchReq `json:"match_query,omitempty"`
 
-	// Quit asks the gateway to finish this task and then stop claiming.
-	//
-	// It rides on a reply rather than arriving as a message of its own, so the
-	// result it accompanies commits before the session ends. A quit with
-	// nothing in hand would have nothing to drain.
+	// Quit asks the gateway to drain: finish the task in hand, through every
+	// turn it has left, and then stop, answering the last request with a quit.
+	// Any message may carry it, and it holds from then on, so a client sets it
+	// the moment it decides to stop. On a config or a ready there is nothing in
+	// hand, and the answer is a quit at once.
 	Quit bool `json:"quit,omitempty"`
 
 	// Modification contains everything needed to modify tasks and docs.
@@ -396,6 +397,13 @@ func Serve(ctx context.Context, eq entroq.Client, conn Conn, options ...Option) 
 	first, err := conn.Recv(ctx)
 	if err != nil {
 		return fmt.Errorf("recv config: %w", err)
+	}
+	if first != nil && first.Quit {
+		// Nothing has started, so there is nothing to drain.
+		if err := conn.Send(ctx, &Response{Type: RespQuit}); err != nil {
+			return fmt.Errorf("send quit: %w", err)
+		}
+		return nil
 	}
 
 	g, err := newGateway(eq, first, conn, options...)
@@ -532,11 +540,12 @@ func (g *Gateway) Handle(ctx context.Context) error {
 		return g.exit(fmt.Errorf("handle recv: %w", err))
 	}
 	switch msg.Type {
-	case ReqQuit:
-		// A client that quits before asking for anything has nothing in hand
-		// to drain, so this is simply goodbye.
-		return nil
 	case ReqReady:
+		if msg.Quit {
+			// Nothing is in hand yet, so there is nothing to drain.
+			g.quit()
+			return g.finish(ctx, nil)
+		}
 		// A client gone between turns stops the claiming, and only that: a
 		// task in hand still commits, because its answer arrived before the
 		// client left.
@@ -551,7 +560,7 @@ func (g *Gateway) Handle(ctx context.Context) error {
 			case <-ctx.Done():
 			}
 		}()
-		return g.exit(g.worker.Run(ctx,
+		return g.finish(ctx, g.worker.Run(ctx,
 			worker.AsClaimant(g.claimant),
 			worker.Watching(g.config.Queues...),
 			worker.WithMaxAttempts(g.config.MaxAttempts),
@@ -560,8 +569,35 @@ func (g *Gateway) Handle(ctx context.Context) error {
 			worker.WithWorkTimeout(g.workTimeout),
 		))
 	default:
-		return g.exit(worker.FatalErrorf("expected %q to begin the session, got %q", ReqReady, msg.Type))
+		return g.finish(ctx, worker.FatalErrorf("expected %q to begin the session, got %q", ReqReady, msg.Type))
 	}
+}
+
+// finish answers the request the session ended on and reports how it ended.
+//
+// Every request gets exactly one response: the quit a client asked for, or the
+// error that stopped the session, with its class. A clean stop the client did
+// not ask for -- a hang-up, a Close -- owes nobody an answer.
+func (g *Gateway) finish(ctx context.Context, runErr error) error {
+	err := g.exit(runErr)
+	var last *Response
+	if ee, ok := AsExit(err); ok {
+		last = g.newSend(RespError, "")
+		last.Class = ee.Class.String()
+		last.Message = ee.Error()
+	} else if g.quitRequested() {
+		last = g.newSend(RespQuit, "")
+	} else {
+		return err
+	}
+	// Over HTTP an answer waits for a request to carry it, and a client that
+	// ended mid-work may never send one.
+	sctx, cancel := context.WithTimeout(ctx, g.opts.lease)
+	defer cancel()
+	if serr := g.conn.Send(sctx, last); serr != nil {
+		log.Printf("work gateway: session %s: send %s: %v", g.sessionID, last.Type, serr)
+	}
+	return err
 }
 
 // Closed indicates whether the gateway is closed already.
@@ -609,17 +645,15 @@ func (g *Gateway) recv(ctx context.Context, expect RequestType) (*Request, error
 		if err != nil {
 			return nil, fmt.Errorf("gateway recv: %w", err)
 		}
+		if msg.Quit {
+			g.quit()
+		}
 		switch msg.Type {
 		case ReqDocs, ReqTasks, ReqNamespaces, ReqQueues, ReqTime:
 			if err := g.handleReadAndRespond(ctx, msg); err != nil {
 				return nil, fmt.Errorf("handle read: %w", err)
 			}
 			continue
-		case ReqQuit:
-			// TODO: quit belongs on a work reply, so the result it carries can
-			// commit before the session ends. As a message of its own it can
-			// only arrive where an answer was due.
-			return nil, fmt.Errorf("client asked to quit while %q was due", expect)
 		}
 		if msg.Type != expect {
 			return nil, fmt.Errorf("gateway recv expected %v, got %v", expect, msg.Type)
@@ -650,7 +684,7 @@ func (g *Gateway) makeDoModify() worker.DoModifyRun[json.RawMessage] {
 		// A disposition other than ok replaces the commit: the worker retries,
 		// moves or stops, and there is nothing to apply.
 		if d := g.disposition(received.Outcome, received.Error); d != nil {
-			return nil, d
+			return nil, g.drainAfter(d)
 		}
 		args, err := g.modifyArgs(received.Modification)
 		if err != nil {
@@ -659,21 +693,20 @@ func (g *Gateway) makeDoModify() worker.DoModifyRun[json.RawMessage] {
 			// claiming the task again to fail the same way.
 			return nil, worker.FatalErrorf("work modification: %v", err)
 		}
-		if received.Quit {
-			g.quit()
-		}
 		// BOTH hooks are always registered, whatever the client asked for.
 		// They cost a wire trip only if it wants one, and the gateway needs
-		// them either way: between them they cover both outcomes of a commit,
-		// which is the only place a drain can act without losing anything.
-		return worker.Modify(args...).
-			OnSuccess(g.makeOnSuccess()).
-			OnDependency(g.makeOnDependency()), nil
+		// them either way: a quit may still arrive on the reply to either.
+		res := worker.Modify(args...)
+		res.OnSuccess(g.makeOnSuccess(res)).OnDependency(g.makeOnDependency())
+		if g.quitRequested() {
+			res.ThenStop()
+		}
+		return res, nil
 	}
 }
 
-// quit records that the client asked to stop. The session ends from a
-// post-commit hook rather than here, so whatever is in hand commits first.
+// quit records that the client asked to drain. Nothing stops here: the task in
+// hand finishes first, and the worker stops after it (see drainAfter).
 func (g *Gateway) quit() {
 	g.Lock()
 	defer g.Unlock()
@@ -782,22 +815,37 @@ func (g *Gateway) makeCueWork() worker.CueWorkRun[json.RawMessage] {
 	}
 }
 
-// makeOnSuccess is the hook the worker runs after a commit lands. It tells the
-// client, if the client asked to be told, and ends the session if a quit has
-// been requested.
+// drainAfter makes d the last disposition of the session when the client has
+// asked to drain: it lands, and then the worker stops cleanly. A fatal or an
+// unclassified error stops the worker anyway.
+func (g *Gateway) drainAfter(d error) error {
+	if !g.quitRequested() {
+		return d
+	}
+	if re, ok := worker.AsRetry(d); ok {
+		return re.ThenStop()
+	}
+	if me, ok := worker.AsMove(d); ok {
+		return me.ThenStop()
+	}
+	return d
+}
+
+// makeOnSuccess is the hook the worker runs after res commits. It tells the
+// client, if the client asked to be told.
 //
-// Closing here is safe in a way it would not be during work: the commit has
-// already landed, so there is nothing in flight to lose.
-func (g *Gateway) makeOnSuccess() func(context.Context) error {
+// A quit on the client's reply still drains, because the worker reads res's
+// stop after this hook returns.
+func (g *Gateway) makeOnSuccess(res *worker.Result) func(context.Context) error {
 	return func(ctx context.Context) error {
-		var reported error
-		if g.config.WantSuccess {
-			reported = g.report(ctx, g.newSend(RespSuccess, ReqError))
+		if !g.config.WantSuccess {
+			return nil
 		}
+		err := g.report(ctx, g.newSend(RespSuccess, ReqDone))
 		if g.quitRequested() {
-			return errors.Join(reported, g.drained(ctx))
+			res.ThenStop()
 		}
-		return reported
+		return err
 	}
 }
 
@@ -807,47 +855,24 @@ func (g *Gateway) makeOnSuccess() func(context.Context) error {
 // failed and the disposition lands only if this task was not itself what went
 // missing.
 //
-// A quit ends the session here too, and the disposition is given up to do it:
-// closing cancels the context the worker would write it on, so the task is
-// left to its lease instead, which is this hook default anyway. Nothing is
-// lost that was not already lost with the commit.
+// A quit lets the disposition land and then stops. With no disposition the
+// task is left to its lease, this hook's default, and stopping loses nothing.
 func (g *Gateway) makeOnDependency() func(context.Context, *entroq.DependencyError) error {
 	return func(ctx context.Context, depErr *entroq.DependencyError) error {
 		var reported error
 		if g.config.WantDependency {
-			msg := g.newSend(RespDependency, ReqError)
+			msg := g.newSend(RespDependency, ReqDone)
 			// Deps leads with a DETAIL entry carrying the message and then
 			// names each dependency that failed, so there is nothing a Message
 			// would add that a client is not better off reading from the list.
 			msg.Deps = depsToWire(depErr)
 			reported = g.report(ctx, msg)
 		}
-		if g.quitRequested() {
-			// The disposition is given up to stop: closing cancels the context
-			// the worker would write it on, so the task is left to its lease,
-			// which is this hook's default anyway.
-			return g.drained(ctx)
+		if reported == nil && g.quitRequested() {
+			return fmt.Errorf("client asked to drain: %w", worker.ErrShutdown)
 		}
-		return reported
+		return g.drainAfter(reported)
 	}
-}
-
-// drained answers the client's quit and then ends the session.
-//
-// The answer matters because of what a transport needs: EVERY request gets
-// exactly one response. A quit arrives on a reply, and if the session simply
-// stopped there would be no answer to that reply at all -- which over HTTP is a
-// request that never completes, and over a pipe a client waiting for something
-// that is not coming.
-//
-// It goes out before Close, because Close is what makes sending impossible.
-func (g *Gateway) drained(ctx context.Context) error {
-	sendErr := g.conn.Send(ctx, g.newSend(RespQuit, ""))
-	g.Close()
-	if sendErr != nil {
-		return fmt.Errorf("send drained: %w", sendErr)
-	}
-	return nil
 }
 
 // report sends a post-commit message and turns the client answer into the
@@ -857,12 +882,9 @@ func (g *Gateway) report(ctx context.Context, msg *Response) error {
 	if err := g.conn.Send(ctx, msg); err != nil {
 		return fmt.Errorf("send %s: %w", msg.Type, err)
 	}
-	received, err := g.recv(ctx, ReqError)
+	received, err := g.recv(ctx, ReqDone)
 	if err != nil {
 		return fmt.Errorf("%s: %w", msg.Type, err)
-	}
-	if received.Quit {
-		g.quit()
 	}
 	return g.disposition(received.Outcome, received.Error)
 }

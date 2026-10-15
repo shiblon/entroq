@@ -279,7 +279,7 @@ func TestHTTPForgetsFinishedSessions(t *testing.T) {
 
 	// Quit with nothing in hand: there is no work to drain, so this is simply
 	// goodbye.
-	w.post(&Request{Type: ReqQuit})
+	w.post(&Request{Type: ReqReady, Quit: true})
 
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
