@@ -213,6 +213,9 @@ const (
 	RespNamespaces ResponseType = "namespaces"
 	RespQuit       ResponseType = "quit"
 
+	// RespOK answers a working request. It carries nothing.
+	RespOK ResponseType = "ok"
+
 	// RespError answers a read that failed. It is the read failing, not the
 	// session: the client hears why and decides, and the task in hand is
 	// untouched.
@@ -229,6 +232,10 @@ type Response struct {
 	// a client's answer: what it asked for, or less if the operator caps it
 	// lower. Zero is no bound at all.
 	WorkTimeoutS int32 `json:"work_timeout_s,omitempty"`
+
+	// SilenceTimeoutS, in a check, is how long the gateway waits on a client
+	// that has said it is working and then fallen quiet: see ReqWorking.
+	SilenceTimeoutS int32 `json:"silence_timeout_s,omitempty"`
 
 	Type ResponseType `json:"type"`
 
@@ -278,6 +285,16 @@ const (
 	ReqDocs       RequestType = "docs"
 	ReqQueues     RequestType = "queues"
 	ReqNamespaces RequestType = "namespaces"
+
+	// ReqWorking says the client is still at work on the task in hand, and is
+	// answered with RespOK at no cost to the backend. It is optional. The first
+	// one during a task holds the client to the silence timeout until it
+	// answers: from then on, any request must come within that window of the
+	// last, or the task goes back with its attempt counted and the session
+	// ends. A client that never sends one is bounded by the work timeout alone.
+	// Send one every third of the window, so one late beat is not fatal.
+	ReqWorking RequestType = "working"
+
 	// ReqDone answers a post-commit notice (success, dependency) with the
 	// outcome the client picks for the task.
 	ReqDone RequestType = "done"
@@ -373,6 +390,10 @@ type Gateway struct {
 	cancel   context.CancelFunc
 	closed   bool
 	quitting bool
+
+	// armed is whether the task in hand holds the client to the silence
+	// timeout. Only the worker's goroutine touches it.
+	armed bool
 }
 
 // Serve runs one client's session over conn, from its config message until
@@ -428,6 +449,7 @@ func Serve(ctx context.Context, eq entroq.Client, conn Conn, options ...Option) 
 	check := g.newSend(RespCheck, ReqReady)
 	check.Claimant = g.claimant
 	check.WorkTimeoutS = int32(g.workTimeout / time.Second)
+	check.SilenceTimeoutS = int32(g.silenceTimeout() / time.Second)
 	if err := conn.Send(ctx, check); err != nil {
 		return fmt.Errorf("send check: %w", err)
 	}
@@ -641,14 +663,20 @@ func (g *Gateway) Close() {
 // ends only when the answer the phase is waiting for arrives.
 func (g *Gateway) recv(ctx context.Context, expect RequestType) (*Request, error) {
 	for {
-		msg, err := g.conn.Recv(ctx)
+		msg, err := g.recvWithin(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("gateway recv: %w", err)
+			return nil, err
 		}
 		if msg.Quit {
 			g.quit()
 		}
 		switch msg.Type {
+		case ReqWorking:
+			g.armed = true
+			if err := g.conn.Send(ctx, g.newSend(RespOK, "")); err != nil {
+				return nil, fmt.Errorf("send %s: %w", RespOK, err)
+			}
+			continue
 		case ReqDocs, ReqTasks, ReqNamespaces, ReqQueues, ReqTime:
 			if err := g.handleReadAndRespond(ctx, msg); err != nil {
 				return nil, fmt.Errorf("handle read: %w", err)
@@ -658,8 +686,51 @@ func (g *Gateway) recv(ctx context.Context, expect RequestType) (*Request, error
 		if msg.Type != expect {
 			return nil, fmt.Errorf("gateway recv expected %v, got %v", expect, msg.Type)
 		}
+		// The task's answer ends what the client owed for it, so the next
+		// task starts unheld.
+		if msg.Type == ReqModify {
+			g.armed = false
+		}
 		return msg, nil
 	}
+}
+
+// errSilent is a client that said it was working and then fell quiet for the
+// whole silence timeout.
+var errSilent = errors.New("client fell silent while working")
+
+// silenceTimeout is how long an armed client may go without a request.
+func (g *Gateway) silenceTimeout() time.Duration {
+	return 2 * g.opts.lease
+}
+
+// recvWithin is one Recv, bounded by the silence timeout while the task in
+// hand is armed.
+func (g *Gateway) recvWithin(ctx context.Context) (*Request, error) {
+	if !g.armed {
+		msg, err := g.conn.Recv(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("gateway recv: %w", err)
+		}
+		return msg, nil
+	}
+	sctx, cancel := context.WithTimeoutCause(ctx, g.silenceTimeout(), errSilent)
+	defer cancel()
+	msg, err := g.conn.Recv(sctx)
+	if err != nil {
+		if ctx.Err() == nil && errors.Is(context.Cause(sctx), errSilent) {
+			return nil, fmt.Errorf("gateway recv: %w (%v)", errSilent, g.silenceTimeout())
+		}
+		return nil, fmt.Errorf("gateway recv: %w", err)
+	}
+	return msg, nil
+}
+
+// silenced is what a silent client gets, the same as a fired work timeout: the
+// task goes back with its attempt counted and the session ends, since the
+// client may still be at work and cannot be told otherwise.
+func silenced(err error) error {
+	return worker.RetryErrorf("%v", err).ThenStop()
 }
 
 // makeDoModify makes a DoModify handler for this gateway that can be passed into a Run.
@@ -670,6 +741,9 @@ func (g *Gateway) makeDoModify() worker.DoModifyRun[json.RawMessage] {
 		// the split: the client has the task, so holding the claim open for it
 		// is right. Waiting for a client that never collected it would not be.
 		received, err := g.recv(ctx, ReqModify)
+		if errors.Is(err, errSilent) {
+			return nil, silenced(err)
+		}
 		if err != nil {
 			// A deadline means the client is unaccounted for: it may still be
 			// working, and nothing on this connection can tell it otherwise.
@@ -906,6 +980,9 @@ func (g *Gateway) makeTakeDocs() worker.TakeRun[json.RawMessage] {
 			return nil, fmt.Errorf("send take docs: %w", err)
 		}
 		received, err := g.recv(ctx, ReqTake)
+		if errors.Is(err, errSilent) {
+			return nil, silenced(err)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("take docs: %w", err)
 		}
