@@ -38,6 +38,7 @@ type fanInRun struct {
 	eq        *entroq.EntroQ
 	back      *stateClaims
 	ctrl      *eqmr.Controller
+	input     []*eqmr.KV
 	histogram map[string]int
 
 	runCtx context.Context
@@ -73,11 +74,11 @@ func newFanInRun(ctx context.Context, t *testing.T) *fanInRun {
 	}
 	bodies, histogram := eqmrtest.Docs(50, 50, fanInSplits, 17)
 	r.histogram = histogram
-	input := make([]*eqmr.KV, len(bodies))
+	r.input = make([]*eqmr.KV, len(bodies))
 	for i, b := range bodies {
-		input[i] = eqmr.NewKV("", b)
+		r.input[i] = eqmr.NewKV("", b)
 	}
-	if err := r.ctrl.Setup(ctx, input); err != nil {
+	if err := r.ctrl.Setup(ctx, r.input); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 
@@ -100,6 +101,29 @@ func (r *fanInRun) startWorkers() {
 	}
 	for range 4 {
 		r.start(r.runCtx, func(ctx context.Context) error { return r.ctrl.RunReducer(ctx, eqmr.SumReducer) })
+	}
+}
+
+// waitMapped waits until at least n splits are accepted, and fails if the map
+// phase ended first.
+func (r *fanInRun) waitMapped(ctx context.Context, n int) {
+	r.t.Helper()
+	for {
+		p, err := r.ctrl.Progress(ctx)
+		if err != nil {
+			r.t.Fatalf("progress: %v", err)
+		}
+		if p.Phase != eqmr.PhaseMap {
+			r.t.Fatalf("run reached %q before %d splits were seen accepted", p.Phase, n)
+		}
+		if p.Map.Done >= n {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			r.t.Fatalf("map phase made no progress: %v", ctx.Err())
+		case <-time.After(5 * time.Millisecond):
+		}
 	}
 }
 
@@ -167,20 +191,7 @@ func TestControllerRestart(t *testing.T) {
 	go func() { defer close(firstDone); _ = r.ctrl.RunController(firstCtx) }()
 	r.startWorkers()
 
-	for {
-		p, err := r.ctrl.Progress(ctx)
-		if err != nil {
-			t.Fatalf("progress: %v", err)
-		}
-		if p.Map.Done >= fanInSplits/4 {
-			break
-		}
-		select {
-		case <-ctx.Done():
-			t.Fatalf("map phase made no progress: %v", ctx.Err())
-		case <-time.After(5 * time.Millisecond):
-		}
-	}
+	r.waitMapped(ctx, fanInSplits/4)
 	stopFirst()
 	<-firstDone
 	p, err := r.ctrl.Progress(ctx)
@@ -193,6 +204,28 @@ func TestControllerRestart(t *testing.T) {
 
 	r.start(r.runCtx, r.ctrl.RunController)
 	r.finish(ctx)
+}
+
+// TestSetupResumesRun sets up a run again partway through its map phase, and
+// again once it is done, as a restarted launcher would. Neither brings back an
+// accepted split, so the run finishes and leaves nothing behind.
+func TestSetupResumesRun(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	r := newFanInRun(ctx, t)
+	r.start(r.runCtx, r.ctrl.RunController)
+	r.startWorkers()
+	r.waitMapped(ctx, fanInSplits/4)
+	if err := r.ctrl.Setup(ctx, r.input); err != nil {
+		t.Fatalf("setup mid-run: %v", err)
+	}
+	r.finish(ctx)
+
+	if err := r.ctrl.Setup(ctx, r.input); err != nil {
+		t.Fatalf("setup after done: %v", err)
+	}
+	requireCollected(ctx, t, r.eq, r.ctrl)
 }
 
 // TestTwoControllers runs a second controller by mistake. The state doc's

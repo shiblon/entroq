@@ -41,9 +41,11 @@ func (c *Controller) Setup(ctx context.Context, input []*KV) error {
 // the source set by WithSource. MapShards does not apply, and must be unset.
 //
 // It stages the split docs under deterministic ids, then creates the state doc
-// and every map task in one Modify, so a run is never half set up. SetupFrom
-// may be retried with the same source. A Prefix that holds a different run is
-// an error, and so is a source with no splits.
+// and every map task in one Modify, so a run is never half set up. On a Prefix
+// that already holds the run it does nothing, so a retry or a restarted
+// launcher resumes the run; run one launcher at a time, since one that stages
+// while another's run is accepting splits brings them back. A Prefix that
+// holds a different run is an error, and so is a source with no splits.
 func (c *Controller) SetupFrom(ctx context.Context) error {
 	if c.cfg.Source == nil {
 		return fmt.Errorf("eqmr setup: no source; configure one with WithSource")
@@ -72,6 +74,12 @@ func (c *Controller) setup(ctx context.Context, src Source) error {
 	if err := sink.validate(); err != nil {
 		return fmt.Errorf("eqmr setup sink: %w", err)
 	}
+	// A run that exists is resumed, not staged again: staging would bring back
+	// the splits it has already accepted.
+	want := runState{MapShards: c.cfg.MapShards, ReduceParts: c.cfg.ReduceShards, Source: source, Store: store, Sink: sink}
+	if found, err := c.alreadySetUp(ctx, want); found || err != nil {
+		return err
+	}
 	splits, err := src.Splits(ctx)
 	if err != nil {
 		return fmt.Errorf("eqmr setup: list splits: %w", err)
@@ -92,14 +100,8 @@ func (c *Controller) setup(ctx context.Context, src Source) error {
 		staged = staged[:0]
 		return nil
 	}
-	st := runState{
-		Phase:       PhaseMap,
-		MapSplits:   len(splits),
-		ReduceParts: c.cfg.ReduceShards,
-		Source:      source,
-		Store:       store,
-		Sink:        sink,
-	}
+	st := want
+	st.Phase, st.MapSplits = PhaseMap, len(splits)
 	start := []entroq.ModifyArg{entroq.PuttingDocInto(c.DocNS(),
 		entroq.WithIDKeys(stateDocID, stateDocKey, ""),
 		entroq.WithContent(st),
@@ -131,7 +133,11 @@ func (c *Controller) setup(ctx context.Context, src Source) error {
 	// The run and all of its map tasks appear together.
 	_, err = c.client.Modify(ctx, start...)
 	if de, ok := entroq.AsDependency(err); ok && de.HasCollisions() {
-		return c.alreadySetUp(ctx, st)
+		// A retry whose first commit landed.
+		if found, err := c.alreadySetUp(ctx, want); found || err != nil {
+			return err
+		}
+		return fmt.Errorf("eqmr setup: start run: %w", de)
 	}
 	if err != nil {
 		return fmt.Errorf("eqmr setup: start run: %w", err)
@@ -139,18 +145,22 @@ func (c *Controller) setup(ctx context.Context, src Source) error {
 	return nil
 }
 
-// alreadySetUp reports whether a commit that collided with an existing state
-// doc was a retry of the Setup that created it.
-func (c *Controller) alreadySetUp(ctx context.Context, want runState) error {
+// alreadySetUp reports whether Prefix holds a run, and errors if it is not the
+// one want describes. A run is recognized by its shard counts and descriptors,
+// not its splits, so resuming it does not list the input again.
+func (c *Controller) alreadySetUp(ctx context.Context, want runState) (bool, error) {
 	doc, st, err := c.stateDoc(ctx)
 	if err != nil {
-		return fmt.Errorf("eqmr setup: %w", err)
+		return false, fmt.Errorf("eqmr setup: %w", err)
 	}
-	if doc != nil && st.MapSplits == want.MapSplits && st.ReduceParts == want.ReduceParts &&
-		st.Source == want.Source && st.Store == want.Store && st.Sink == want.Sink {
-		return nil
+	if doc == nil {
+		return false, nil
 	}
-	return fmt.Errorf("eqmr setup: prefix %q already holds a different run", c.prefix)
+	if st.MapShards != want.MapShards || st.ReduceParts != want.ReduceParts ||
+		st.Source != want.Source || st.Store != want.Store || st.Sink != want.Sink {
+		return true, fmt.Errorf("eqmr setup: prefix %q already holds a different run", c.prefix)
+	}
+	return true, nil
 }
 
 // MapperOption configures a mapper worker.

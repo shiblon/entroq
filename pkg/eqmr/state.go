@@ -31,6 +31,8 @@ type runState struct {
 	// Reason explains a PhaseFailed outcome.
 	Reason string `json:"reason,omitempty"`
 
+	// MapShards is the split count Setup was asked for; zero for SetupFrom.
+	MapShards int `json:"map_shards,omitempty"`
 	// MapSplits is the number of split docs Setup wrote.
 	MapSplits int `json:"map_splits"`
 	// ReduceParts is the partition count the run was created with.

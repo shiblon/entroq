@@ -45,7 +45,10 @@ small jobs.
 
 **Setup** stages the input as split (sharded) docs. It then creates the run, its
 state doc and every map task, in one `Modify`. Setup is atomic and idempotent,
-so it's never half done and can always be safely retried.
+so it's never half done and can always be safely retried. On a prefix that
+already holds the run it does nothing, so a restarted launcher, or `Run`,
+resumes the run. Run one launcher at a time: one that stages splits while
+another's run is accepting them brings accepted splits back.
 
 **Acceptance.** The controller accepts the first finish for each unit while
 claiming only that unit's input, the split doc or the partition's pointer docs,
