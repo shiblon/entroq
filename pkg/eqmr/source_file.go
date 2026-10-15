@@ -42,18 +42,36 @@ var (
 	}}
 )
 
-// NewFileSource returns a source that reads files, one split per file, in the
-// order given. Paths are absolute, and lines end in "\n" or "\r\n". name is
-// the logical name the run records.
+// FileSourceOption configures NewFileSource.
+type FileSourceOption func(*fileSource)
+
+// WithFiles sets the absolute paths a file source reads, one split each, in
+// order. Only the process that calls SetupFrom needs them.
+func WithFiles(files ...string) FileSourceOption {
+	return func(s *fileSource) { s.files = files }
+}
+
+// WithFormat sets how a file source reads lines; the default is Lines. It is
+// part of the source's identity, so every process must set the same one.
+func WithFormat(format FileFormat) FileSourceOption {
+	return func(s *fileSource) { s.format = format }
+}
+
+// NewFileSource returns a source that reads files, one split per file. Lines
+// end in "\n" or "\r\n". name is the logical name the run records.
 //
-// Only Setup needs files; a mapper passes nil. Every process that maps the run
-// must see the files at the same paths. The source is identified by its format.
-func NewFileSource(name string, files []string, format FileFormat) (Source, error) {
-	if format.parse == nil {
+// Every process that maps the run must see the files at the same paths. The
+// source is identified by its format.
+func NewFileSource(name string, opts ...FileSourceOption) (Source, error) {
+	s := &fileSource{format: Lines}
+	for _, opt := range opts {
+		opt(s)
+	}
+	if s.format.parse == nil {
 		return nil, fmt.Errorf("eqmr file source: format is required")
 	}
-	seen := make(map[string]bool, len(files))
-	for _, f := range files {
+	seen := make(map[string]bool, len(s.files))
+	for _, f := range s.files {
 		if !filepath.IsAbs(f) {
 			return nil, fmt.Errorf("eqmr file source: %q is not an absolute path", f)
 		}
@@ -62,15 +80,12 @@ func NewFileSource(name string, files []string, format FileFormat) (Source, erro
 		}
 		seen[f] = true
 	}
-	return &fileSource{
-		desc: Descriptor{
-			Name:     name,
-			Driver:   fileSourceDriver,
-			Identity: "format=" + format.name,
-		},
-		files:  files,
-		format: format,
-	}, nil
+	s.desc = Descriptor{
+		Name:     name,
+		Driver:   fileSourceDriver,
+		Identity: "format=" + s.format.name,
+	}
+	return s, nil
 }
 
 type fileSource struct {

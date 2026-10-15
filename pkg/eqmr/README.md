@@ -92,18 +92,20 @@ head, a short hash of the whole, and its tail.
 ## Input
 
 `Setup(ctx, input)` divides records you hold in memory into `MapShards` splits
-and keeps them in the split docs. `SetupFrom(ctx, src)` takes its splits from a
-`Source`, and each split doc holds only the source's reference to one split.
-Every mapper process is configured with `WithSource`.
+and keeps them in the split docs. `SetupFrom(ctx)` takes its splits from the
+`Source` set by `WithSource`, and each split doc holds only the source's
+reference to one split. Every mapper process is configured with a source that
+reports the same descriptor.
 
-`NewFileSource(name, files, format)` reads absolute file names, one split per
-file. A file is never divided: run more files than mappers, and reshard a file
-too large for one mapper. The formats are `Lines`, keyed `<path>:<line>`, and
-`TSV`, a key and a value per line. Mappers pass no file list:
+`NewFileSource(name, opts...)` reads absolute file names, one split per file.
+A file is never divided: run more files than mappers, and reshard a file too
+large for one mapper. The formats are `Lines` (the default), keyed
+`<path>:<line>`, and `TSV`, a key and a value per line. The format is part of
+the descriptor, so mappers set the same one; only the launcher lists files:
 
 ```go
-src, err := eqmr.NewFileSource("corpus", files, eqmr.Lines) // launcher
-src, err := eqmr.NewFileSource("corpus", nil, eqmr.Lines)   // mapper pod
+src, err := eqmr.NewFileSource("corpus", eqmr.WithFiles(files...)) // launcher
+src, err := eqmr.NewFileSource("corpus")                           // mapper pod
 ```
 
 `shardname.Expand("logs/day@64")` lists a sharded set,

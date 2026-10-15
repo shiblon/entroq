@@ -38,18 +38,20 @@ func (c *Controller) Setup(ctx context.Context, input []*KV) error {
 }
 
 // SetupFrom creates the run with one split doc and one map task per split of
-// src. Every process that maps the run must be configured WithSource(src).
-// MapShards does not apply, and must be unset.
+// the source set by WithSource. MapShards does not apply, and must be unset.
 //
 // It stages the split docs under deterministic ids, then creates the state doc
 // and every map task in one Modify, so a run is never half set up. SetupFrom
 // may be retried with the same source. A Prefix that holds a different run is
 // an error, and so is a source with no splits.
-func (c *Controller) SetupFrom(ctx context.Context, src Source) error {
+func (c *Controller) SetupFrom(ctx context.Context) error {
+	if c.cfg.Source == nil {
+		return fmt.Errorf("eqmr setup: no source; configure one with WithSource")
+	}
 	if c.cfg.MapShards != 0 {
 		return fmt.Errorf("eqmr setup: MapShards applies only to Setup; a source's splits are its own")
 	}
-	return c.setup(ctx, src)
+	return c.setup(ctx, c.cfg.Source)
 }
 
 func (c *Controller) setup(ctx context.Context, src Source) error {

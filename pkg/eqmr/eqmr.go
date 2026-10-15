@@ -49,7 +49,8 @@
 // # Input
 //
 // Setup divides in-memory input into split docs. SetupFrom takes its splits
-// from a Source, such as NewFileSource, which mappers open by reference.
+// from the configured Source, such as NewFileSource, which mappers open by
+// reference.
 //
 // # Output
 //
@@ -104,7 +105,7 @@ type Config struct {
 	// MapShards is the number of splits Setup divides its input into, each one
 	// split doc and one map task. A split doc must fit the backend message
 	// limit (10MB by default for the gRPC service). SetupFrom takes its splits
-	// from the source.
+	// from the Source.
 	MapShards int
 
 	// ReduceShards is the number of reduce partitions. Keys are assigned to
@@ -126,8 +127,8 @@ type Config struct {
 	// WithSink.
 	Sink Sink
 
-	// Sources are the inputs this process can read. See WithSource.
-	Sources []Source
+	// Source is the run's input for SetupFrom and its mappers. See WithSource.
+	Source Source
 }
 
 // Option configures a Controller. See New.
@@ -154,7 +155,9 @@ func WithConfig(cfg Config) Option {
 		if cfg.Sink != nil {
 			c.Sink = cfg.Sink
 		}
-		c.Sources = append(c.Sources, cfg.Sources...)
+		if cfg.Source != nil {
+			c.Source = cfg.Source
+		}
 	}
 }
 
@@ -190,10 +193,11 @@ func WithSink(sink Sink) Option {
 	return func(c *Config) { c.Sink = sink }
 }
 
-// WithSource lets this process map runs that read src. Every process that
-// maps a run set up with SetupFrom(src) needs it.
+// WithSource reads the run's input from src; see NewFileSource. SetupFrom
+// records its Descriptor, and every process that maps the run must be
+// configured with a source that reports the same one.
 func WithSource(src Source) Option {
-	return func(c *Config) { c.Sources = append(c.Sources, src) }
+	return func(c *Config) { c.Source = src }
 }
 
 // WithMaxClaims bounds how many times a unit may be claimed before it is
@@ -305,7 +309,11 @@ func New(eq *entroq.EntroQ, prefix string, opts ...Option) (*Controller, error) 
 	if err != nil {
 		return nil, err
 	}
-	srcs, err := newSources(append([]Source{c.inlineSource(nil, 0)}, cfg.Sources...)...)
+	srcList := []Source{c.inlineSource(nil, 0)}
+	if cfg.Source != nil {
+		srcList = append(srcList, cfg.Source)
+	}
+	srcs, err := newSources(srcList...)
 	if err != nil {
 		return nil, err
 	}

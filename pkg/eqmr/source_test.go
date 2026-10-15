@@ -97,7 +97,7 @@ func TestFileSourceReadsLines(t *testing.T) {
 		"sub/b.txt": "only\n",
 		"empty.txt": "",
 	})
-	src, err := eqmr.NewFileSource("in", under(root, "sub/b.txt", "a.txt", "empty.txt"), eqmr.Lines)
+	src, err := eqmr.NewFileSource("in", eqmr.WithFiles(under(root, "sub/b.txt", "a.txt", "empty.txt")...))
 	if err != nil {
 		t.Fatalf("new file source: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestFileSourceReadsTSV(t *testing.T) {
 		"good.tsv": "k1\tv1\nk2\tv\t2\n",
 		"bad.tsv":  "k1\tv1\nno tab\n",
 	})
-	src, err := eqmr.NewFileSource("in", under(root, "good.tsv"), eqmr.TSV)
+	src, err := eqmr.NewFileSource("in", eqmr.WithFiles(under(root, "good.tsv")...), eqmr.WithFormat(eqmr.TSV))
 	if err != nil {
 		t.Fatalf("new file source: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestFileSourceReadsTSV(t *testing.T) {
 		t.Errorf("read %q, want key and value split at the first tab", got)
 	}
 
-	bad, err := eqmr.NewFileSource("in", under(root, "bad.tsv"), eqmr.TSV)
+	bad, err := eqmr.NewFileSource("in", eqmr.WithFiles(under(root, "bad.tsv")...), eqmr.WithFormat(eqmr.TSV))
 	if err != nil {
 		t.Fatalf("new file source: %v", err)
 	}
@@ -162,11 +162,11 @@ func isMove(err error) bool {
 func TestFileSourceRejectsBadLists(t *testing.T) {
 	root := t.TempDir()
 	for _, files := range [][]string{{"a.txt"}, {"../a.txt"}, under(root, "a", "a")} {
-		if _, err := eqmr.NewFileSource("in", files, eqmr.Lines); err == nil {
+		if _, err := eqmr.NewFileSource("in", eqmr.WithFiles(files...)); err == nil {
 			t.Errorf("NewFileSource(%q) succeeded, want an error", files)
 		}
 	}
-	if _, err := eqmr.NewFileSource("in", nil, eqmr.FileFormat{}); err == nil {
+	if _, err := eqmr.NewFileSource("in", eqmr.WithFormat(eqmr.FileFormat{})); err == nil {
 		t.Error("NewFileSource with no format succeeded, want an error")
 	}
 }
@@ -194,24 +194,24 @@ func TestFileSourceRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new file store: %v", err)
 	}
-	src, err := eqmr.NewFileSource("corpus", under(root, files...), eqmr.Lines)
+	src, err := eqmr.NewFileSource("corpus", eqmr.WithFiles(under(root, files...)...))
 	if err != nil {
 		t.Fatalf("new file source: %v", err)
 	}
-	launcher, err := eqmr.New(eq, testPrefix(), eqmr.WithReduceShards(3), eqmr.WithIntermediateStore(store))
+	launcher, err := eqmr.New(eq, testPrefix(), eqmr.WithReduceShards(3), eqmr.WithIntermediateStore(store), eqmr.WithSource(src))
 	if err != nil {
 		t.Fatalf("new launcher: %v", err)
 	}
-	if err := launcher.SetupFrom(ctx, src); err != nil {
+	if err := launcher.SetupFrom(ctx); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	// A retry of the same setup is recognized.
-	if err := launcher.SetupFrom(ctx, src); err != nil {
+	if err := launcher.SetupFrom(ctx); err != nil {
 		t.Fatalf("retried setup: %v", err)
 	}
 
 	// A mapper names the source without its file list.
-	mapperSrc, err := eqmr.NewFileSource("corpus", nil, eqmr.Lines)
+	mapperSrc, err := eqmr.NewFileSource("corpus")
 	if err != nil {
 		t.Fatalf("new mapper source: %v", err)
 	}
@@ -247,51 +247,59 @@ func TestSetupFromRejects(t *testing.T) {
 	root := t.TempDir()
 	writeFiles(t, root, map[string]string{"a.txt": "a\n"})
 
-	src, err := eqmr.NewFileSource("in", under(root, "a.txt"), eqmr.Lines)
+	src, err := eqmr.NewFileSource("in", eqmr.WithFiles(under(root, "a.txt")...))
 	if err != nil {
 		t.Fatalf("new file source: %v", err)
 	}
-	missing, err := eqmr.NewFileSource("in", under(root, "a.txt", "gone.txt"), eqmr.Lines)
+	missing, err := eqmr.NewFileSource("in", eqmr.WithFiles(under(root, "a.txt", "gone.txt")...))
 	if err != nil {
 		t.Fatalf("new file source: %v", err)
 	}
-	empty, err := eqmr.NewFileSource("in", nil, eqmr.Lines)
+	empty, err := eqmr.NewFileSource("in")
 	if err != nil {
 		t.Fatalf("new file source: %v", err)
 	}
-	elsewhere, err := eqmr.NewFileSource("in", under(root, "a.txt"), eqmr.TSV)
+	elsewhere, err := eqmr.NewFileSource("in", eqmr.WithFiles(under(root, "a.txt")...), eqmr.WithFormat(eqmr.TSV))
 	if err != nil {
 		t.Fatalf("new file source: %v", err)
 	}
 
-	sharded, err := eqmr.New(eq, testPrefix(), testOpts(2, 2)...)
+	sharded, err := eqmr.New(eq, testPrefix(), append(testOpts(2, 2), eqmr.WithSource(src))...)
 	if err != nil {
 		t.Fatalf("new controller: %v", err)
 	}
-	if err := sharded.SetupFrom(ctx, src); err == nil || !strings.Contains(err.Error(), "MapShards") {
+	if err := sharded.SetupFrom(ctx); err == nil || !strings.Contains(err.Error(), "MapShards") {
 		t.Errorf("SetupFrom with MapShards set: got %v, want an error naming MapShards", err)
 	}
 
-	ctrl, err := eqmr.New(eq, testPrefix(), eqmr.WithReduceShards(2))
-	if err != nil {
-		t.Fatalf("new controller: %v", err)
+	prefix := testPrefix()
+	setupFrom := func(opts ...eqmr.Option) error {
+		ctrl, err := eqmr.New(eq, prefix, append(opts, eqmr.WithReduceShards(2))...)
+		if err != nil {
+			t.Fatalf("new controller: %v", err)
+		}
+		return ctrl.SetupFrom(ctx)
 	}
-	if err := ctrl.SetupFrom(ctx, missing); !errors.Is(err, os.ErrNotExist) {
+	if err := setupFrom(); err == nil || !strings.Contains(err.Error(), "WithSource") {
+		t.Errorf("SetupFrom with no source: got %v, want an error naming WithSource", err)
+	}
+	if err := setupFrom(eqmr.WithSource(missing)); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("SetupFrom with a missing file: got %v, want not-exist", err)
 	}
-	if err := ctrl.SetupFrom(ctx, empty); err == nil {
+	if err := setupFrom(eqmr.WithSource(empty)); err == nil {
 		t.Error("SetupFrom with no files succeeded, want an error")
 	}
-	if err := ctrl.SetupFrom(ctx, src); err != nil {
+	if err := setupFrom(eqmr.WithSource(src)); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
-	if err := ctrl.SetupFrom(ctx, elsewhere); err == nil || !strings.Contains(err.Error(), "different run") {
+	if err := setupFrom(eqmr.WithSource(elsewhere)); err == nil || !strings.Contains(err.Error(), "different run") {
 		t.Errorf("SetupFrom of another source on the same prefix: got %v, want a different-run error", err)
 	}
 }
 
 // TestSourceFailuresFailRun covers a mapper that was not given the run's
-// source, and an input file removed after Setup. Neither can succeed on a
+// source or was given it with another format, and an input file removed after
+// Setup. Neither can succeed on a
 // retry, so each fails the run with a reason.
 func TestSourceFailuresFailRun(t *testing.T) {
 	for _, tc := range []struct {
@@ -303,6 +311,17 @@ func TestSourceFailuresFailRun(t *testing.T) {
 			name:   "unconfigured",
 			before: func(string, *[]eqmr.Option, eqmr.Source) {},
 			reason: "not configured",
+		},
+		{
+			name: "other format",
+			before: func(_ string, opts *[]eqmr.Option, _ eqmr.Source) {
+				tsv, err := eqmr.NewFileSource("in", eqmr.WithFormat(eqmr.TSV))
+				if err != nil {
+					panic(err)
+				}
+				*opts = append(*opts, eqmr.WithSource(tsv))
+			},
+			reason: "identity format=lines",
 		},
 		{
 			name: "removed",
@@ -320,15 +339,15 @@ func TestSourceFailuresFailRun(t *testing.T) {
 			root := t.TempDir()
 			writeFiles(t, root, map[string]string{"a.txt": "a\n", "b.txt": "b\n"})
 
-			src, err := eqmr.NewFileSource("in", under(root, "a.txt", "b.txt"), eqmr.Lines)
+			src, err := eqmr.NewFileSource("in", eqmr.WithFiles(under(root, "a.txt", "b.txt")...))
 			if err != nil {
 				t.Fatalf("new file source: %v", err)
 			}
-			launcher, err := eqmr.New(eq, testPrefix(), eqmr.WithReduceShards(2))
+			launcher, err := eqmr.New(eq, testPrefix(), eqmr.WithReduceShards(2), eqmr.WithSource(src))
 			if err != nil {
 				t.Fatalf("new launcher: %v", err)
 			}
-			if err := launcher.SetupFrom(ctx, src); err != nil {
+			if err := launcher.SetupFrom(ctx); err != nil {
 				t.Fatalf("setup: %v", err)
 			}
 
