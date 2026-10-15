@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 
 	"github.com/shiblon/entroq"
@@ -19,22 +20,48 @@ type reduceTask struct {
 }
 
 // Setup divides input into Config.MapShards contiguous splits and creates the
-// run, with one split doc and one map task per non-empty split.
+// run from them; see SetupFrom. Empty input is an error.
+func (c *Controller) Setup(ctx context.Context, input []*KV) error {
+	if c.cfg.MapShards <= 0 {
+		return fmt.Errorf("eqmr setup: MapShards must be set with WithMapShards; it fixes how input is divided")
+	}
+	// Validate every record first, so an error names the record.
+	for i, kv := range input {
+		if err := ValidateText(fmt.Sprintf("input key at index %d", i), kv.Key); err != nil {
+			return fmt.Errorf("eqmr setup: %w", err)
+		}
+		if err := ValidateText(fmt.Sprintf("input value at index %d", i), kv.Value); err != nil {
+			return fmt.Errorf("eqmr setup: %w", err)
+		}
+	}
+	return c.setup(ctx, c.inlineSource(input, c.cfg.MapShards))
+}
+
+// SetupFrom creates the run with one split doc and one map task per split of
+// src. Every process that maps the run must be configured WithSource(src).
+// MapShards does not apply, and must be unset.
 //
 // It stages the split docs under deterministic ids, then creates the state doc
-// and every map task in one Modify, so a run is never half set up. Setup may be
-// retried with the same input. A Prefix that holds a different run is an
-// error, and so is empty input.
-func (c *Controller) Setup(ctx context.Context, input []*KV) error {
+// and every map task in one Modify, so a run is never half set up. SetupFrom
+// may be retried with the same source. A Prefix that holds a different run is
+// an error, and so is a source with no splits.
+func (c *Controller) SetupFrom(ctx context.Context, src Source) error {
+	if c.cfg.MapShards != 0 {
+		return fmt.Errorf("eqmr setup: MapShards applies only to Setup; a source's splits are its own")
+	}
+	return c.setup(ctx, src)
+}
+
+func (c *Controller) setup(ctx context.Context, src Source) error {
 	const batchSize = 250
 
-	if err := c.cfg.validateForSetup(); err != nil {
-		return err
+	if c.cfg.ReduceShards <= 0 {
+		return fmt.Errorf("eqmr setup: ReduceShards must be set with WithReduceShards; it fixes the document layout when the map phase writes its output")
 	}
-	if len(input) == 0 {
-		return fmt.Errorf("eqmr setup: no input")
+	source := src.Descriptor()
+	if err := source.validate(); err != nil {
+		return fmt.Errorf("eqmr setup source: %w", err)
 	}
-	splits := splitInput(input, c.cfg.MapShards)
 	store := c.defaultStore()
 	if err := store.validate(); err != nil {
 		return fmt.Errorf("eqmr setup: %w", err)
@@ -43,22 +70,12 @@ func (c *Controller) Setup(ctx context.Context, input []*KV) error {
 	if err := sink.validate(); err != nil {
 		return fmt.Errorf("eqmr setup sink: %w", err)
 	}
-
-	// Validate every record first, so an error names the record.
-	created := 0
-	for _, split := range splits {
-		if len(split) == 0 {
-			continue
-		}
-		created++
-		for j, kv := range split {
-			if err := ValidateText(fmt.Sprintf("input key at index %d", j), kv.Key); err != nil {
-				return fmt.Errorf("eqmr setup: %w", err)
-			}
-			if err := ValidateText(fmt.Sprintf("input value at index %d", j), kv.Value); err != nil {
-				return fmt.Errorf("eqmr setup: %w", err)
-			}
-		}
+	splits, err := src.Splits(ctx)
+	if err != nil {
+		return fmt.Errorf("eqmr setup: list splits: %w", err)
+	}
+	if len(splits) == 0 {
+		return fmt.Errorf("eqmr setup: no input")
 	}
 
 	// Deterministic ids let a retry skip splits already staged.
@@ -73,27 +90,23 @@ func (c *Controller) Setup(ctx context.Context, input []*KV) error {
 		staged = staged[:0]
 		return nil
 	}
+	st := runState{
+		Phase:       PhaseMap,
+		MapSplits:   len(splits),
+		ReduceParts: c.cfg.ReduceShards,
+		Source:      source,
+		Store:       store,
+		Sink:        sink,
+	}
 	start := []entroq.ModifyArg{entroq.PuttingDocInto(c.DocNS(),
 		entroq.WithIDKeys(stateDocID, stateDocKey, ""),
-		entroq.WithContent(runState{
-			Phase:       PhaseMap,
-			MapSplits:   created,
-			ReduceParts: c.cfg.ReduceShards,
-			Store:       store,
-			Sink:        sink,
-		}),
+		entroq.WithContent(st),
 	)}
 	for i, split := range splits {
-		if len(split) == 0 {
-			continue
-		}
 		key := splitDocKey(i)
-		if err := ValidText("split doc key", key, MaxDocKeyBytes); err != nil {
-			return fmt.Errorf("eqmr setup: %w", err)
-		}
 		staged = append(staged, entroq.PuttingDocInto(c.DocNS(),
 			entroq.WithIDKeys(splitDocID(i), key, ""),
-			entroq.WithContent(split),
+			entroq.WithContent(splitDoc{Split: split}),
 			entroq.WithSkipCollidingDoc(true),
 		))
 		if len(staged) >= batchSize {
@@ -105,6 +118,7 @@ func (c *Controller) Setup(ctx context.Context, input []*KV) error {
 			NS:           c.DocNS(),
 			Key:          key,
 			ReduceShards: c.cfg.ReduceShards,
+			Source:       source,
 			Store:        store,
 		})))
 	}
@@ -113,9 +127,9 @@ func (c *Controller) Setup(ctx context.Context, input []*KV) error {
 	}
 
 	// The run and all of its map tasks appear together.
-	_, err := c.client.Modify(ctx, start...)
+	_, err = c.client.Modify(ctx, start...)
 	if de, ok := entroq.AsDependency(err); ok && de.HasCollisions() {
-		return c.alreadySetUp(ctx, created, store, sink)
+		return c.alreadySetUp(ctx, st)
 	}
 	if err != nil {
 		return fmt.Errorf("eqmr setup: start run: %w", err)
@@ -125,35 +139,16 @@ func (c *Controller) Setup(ctx context.Context, input []*KV) error {
 
 // alreadySetUp reports whether a commit that collided with an existing state
 // doc was a retry of the Setup that created it.
-func (c *Controller) alreadySetUp(ctx context.Context, splits int, store, sink Descriptor) error {
+func (c *Controller) alreadySetUp(ctx context.Context, want runState) error {
 	doc, st, err := c.stateDoc(ctx)
 	if err != nil {
 		return fmt.Errorf("eqmr setup: %w", err)
 	}
-	if doc != nil && st.MapSplits == splits && st.ReduceParts == c.cfg.ReduceShards && st.Store == store && st.Sink == sink {
+	if doc != nil && st.MapSplits == want.MapSplits && st.ReduceParts == want.ReduceParts &&
+		st.Source == want.Source && st.Store == want.Store && st.Sink == want.Sink {
 		return nil
 	}
 	return fmt.Errorf("eqmr setup: prefix %q already holds a different run", c.prefix)
-}
-
-// splitInput divides input into n contiguous groups whose sizes differ by at
-// most one. Groups may be empty when len(input) < n.
-func splitInput(input []*KV, n int) [][]*KV {
-	splits := make([][]*KV, n)
-	if len(input) == 0 {
-		return splits
-	}
-	per, extra := len(input)/n, len(input)%n
-	start := 0
-	for i := range n {
-		size := per
-		if i < extra {
-			size++
-		}
-		splits[i] = input[start : start+size]
-		start += size
-	}
-	return splits
 }
 
 // MapperOption configures a mapper worker.
@@ -200,27 +195,38 @@ func (c *Controller) MapperWorker(mapFn Mapper, opts ...MapperOption) *worker.Wo
 			}
 			doc := found[0]
 
-			var split []*KV
+			var split splitDoc
 			if err := json.Unmarshal(doc.Content, &split); err != nil {
 				// A malformed split cannot succeed on a retry.
 				return nil, worker.MoveErrorf("parse split doc %q: %v", ref.Key, err)
 			}
 
-			// The partition count and store come from the task, so a mapper
-			// cannot disagree with its run. A store that is missing, malformed,
-			// or unreachable fails the run.
+			// The partition count, source, and store come from the task, so a
+			// mapper cannot disagree with its run. A source or store that is
+			// missing, malformed, or unreachable fails the run.
 			if ref.ReduceShards <= 0 {
 				return nil, worker.MoveErrorf("map task for %q carries no partition count", ref.Key)
 			}
-			if err := ref.Store.validate(); err != nil {
+			for _, d := range []Descriptor{ref.Source, ref.Store} {
+				if err := d.validate(); err != nil {
+					return nil, worker.MoveErrorf("map task for %q: %v", ref.Key, err)
+				}
+			}
+			src, err := c.sources.resolve(ref.Source)
+			if err != nil {
 				return nil, worker.MoveErrorf("map task for %q: %v", ref.Key, err)
 			}
 			store, err := c.resolveStore(ref.Store)
 			if err != nil {
 				return nil, worker.MoveErrorf("map task for %q: %v", ref.Key, err)
 			}
+			records, err := src.Open(ctx, split.Split)
+			if err != nil {
+				return nil, moveOrRetry(err, "open split %q", ref.Key)
+			}
+			defer records.Close()
 			out := newIntermediateWriter(store, c.prefix, ref.ReduceShards, o.intermediateRunBytes, o.combiner)
-			if err := runMapper(ctx, mapFn, split, out); err != nil {
+			if err := runMapper(ctx, mapFn, records, out); err != nil {
 				abortIntermediate(ctx, out, ref.Key)
 				return nil, err
 			}
@@ -251,9 +257,9 @@ func abortIntermediate(ctx context.Context, out *intermediateWriter, split strin
 	}
 }
 
-// runMapper streams every emitted record into out, which cuts sorted runs as
-// its buffer fills.
-func runMapper(ctx context.Context, mapFn Mapper, split []*KV, out *intermediateWriter) error {
+// runMapper calls mapFn on every record and streams what it emits into out,
+// which cuts sorted runs as its buffer fills.
+func runMapper(ctx context.Context, mapFn Mapper, records Records, out *intermediateWriter) error {
 	// Text is checked where it is emitted, so an error names the mapper call.
 	// Invalid text cannot succeed on a retry.
 	emit := func(_ context.Context, k, v string) error {
@@ -266,12 +272,24 @@ func runMapper(ctx context.Context, mapFn Mapper, split []*KV, out *intermediate
 		return out.write(ctx, k, "", v)
 	}
 
-	for _, kv := range split {
+	for {
+		kv, err := records.Next(ctx)
+		if err == io.EOF {
+			return out.err
+		}
+		if err != nil {
+			return moveOrRetry(err, "read input")
+		}
+		if err := ValidateText("input key", kv.Key); err != nil {
+			return worker.MoveErrorf("%v", err)
+		}
+		if err := ValidateText(fmt.Sprintf("input value for key %q", kv.Key), kv.Value); err != nil {
+			return worker.MoveErrorf("%v", err)
+		}
 		if err := mapFn(ctx, kv.Key, kv.Value, emit); err != nil {
 			return fmt.Errorf("map %s: %w", kv, err)
 		}
 	}
-	return out.err
 }
 
 // ReducerWorker returns a worker for reduce tasks. It merges the runs named by
@@ -327,7 +345,7 @@ func (c *Controller) ReducerWorker(reduceFn Reducer) *worker.Worker[reduceTask] 
 			}
 			writer, err := sink.Stage(ctx, c.prefix, rt.Partition)
 			if err != nil {
-				return nil, errors.Join(sinkFailure(err, "stage partition %d", rt.Partition), merged.Close())
+				return nil, errors.Join(moveOrRetry(err, "stage partition %d", rt.Partition), merged.Close())
 			}
 			reduceErr := reduceIntermediate(ctx, merged, reduceFn, writer)
 			mergeErr := merged.Close()
@@ -336,7 +354,7 @@ func (c *Controller) ReducerWorker(reduceFn Reducer) *worker.Worker[reduceTask] 
 				return nil, err
 			}
 			if stageErr != nil {
-				return nil, sinkFailure(stageErr, "stage partition %d", rt.Partition)
+				return nil, moveOrRetry(stageErr, "stage partition %d", rt.Partition)
 			}
 
 			// The controller decides which attempt is committed. One that no
@@ -352,9 +370,9 @@ func (c *Controller) ReducerWorker(reduceFn Reducer) *worker.Worker[reduceTask] 
 	)
 }
 
-// sinkFailure quarantines the task on a worker.MoveError from the sink, which
-// fails the run, and retries anything else.
-func sinkFailure(err error, format string, args ...any) error {
+// moveOrRetry quarantines the task on a worker.MoveError from a source or sink,
+// which fails the run, and retries anything else.
+func moveOrRetry(err error, format string, args ...any) error {
 	what := fmt.Sprintf(format, args...)
 	if _, ok := worker.AsMove(err); ok {
 		return worker.MoveErrorf("%s: %v", what, err)
@@ -393,7 +411,7 @@ func reduceIntermediate(ctx context.Context, merged *mergedIntermediate, reduceF
 			return runReadFailure(err, "drain reduce input %q", input.Key())
 		}
 		if err := out.Write(ctx, input.Key(), result); err != nil {
-			return sinkFailure(err, "write output for %q", input.Key())
+			return moveOrRetry(err, "write output for %q", input.Key())
 		}
 	}
 }

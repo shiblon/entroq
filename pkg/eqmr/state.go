@@ -36,9 +36,11 @@ type runState struct {
 	// ReduceParts is the partition count the run was created with.
 	ReduceParts int `json:"reduce_parts"`
 
-	// Store holds the run's intermediate data, and Sink receives its output.
-	Store Descriptor `json:"store"`
-	Sink  Descriptor `json:"sink"`
+	// Source is the run's input, Store holds its intermediate data, and Sink
+	// receives its output.
+	Source Descriptor `json:"source"`
+	Store  Descriptor `json:"store"`
+	Sink   Descriptor `json:"sink"`
 }
 
 func (s runState) terminal() bool {

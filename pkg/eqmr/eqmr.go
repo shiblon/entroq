@@ -46,6 +46,11 @@
 // state doc, checks again, and moves the run on. The last acceptance of a
 // phase always commits a check that sees the phase complete.
 //
+// # Input
+//
+// Setup divides in-memory input into split docs. SetupFrom takes its splits
+// from a Source, such as NewFileSource, which mappers open by reference.
+//
 // # Output
 //
 // Output goes to a Sink, which owns its format and readiness. The controller
@@ -96,9 +101,10 @@ const (
 // Config is a whole run configuration, passed with WithConfig. Every field has
 // a matching option, and a zero field is left alone.
 type Config struct {
-	// MapShards is the number of input splits, each one split doc and one map
-	// task. A split doc must fit the backend message limit (10MB by default
-	// for the gRPC service).
+	// MapShards is the number of splits Setup divides its input into, each one
+	// split doc and one map task. A split doc must fit the backend message
+	// limit (10MB by default for the gRPC service). SetupFrom takes its splits
+	// from the source.
 	MapShards int
 
 	// ReduceShards is the number of reduce partitions. Keys are assigned to
@@ -119,6 +125,9 @@ type Config struct {
 	// Sink receives the run's output; nil means the run's document sink. See
 	// WithSink.
 	Sink Sink
+
+	// Sources are the inputs this process can read. See WithSource.
+	Sources []Source
 }
 
 // Option configures a Controller. See New.
@@ -145,6 +154,7 @@ func WithConfig(cfg Config) Option {
 		if cfg.Sink != nil {
 			c.Sink = cfg.Sink
 		}
+		c.Sources = append(c.Sources, cfg.Sources...)
 	}
 }
 
@@ -178,6 +188,12 @@ func WithIntermediateStore(store IntermediateStore) Option {
 // that reports the same one.
 func WithSink(sink Sink) Option {
 	return func(c *Config) { c.Sink = sink }
+}
+
+// WithSource lets this process map runs that read src. Every process that
+// maps a run set up with SetupFrom(src) needs it.
+func WithSource(src Source) Option {
+	return func(c *Config) { c.Sources = append(c.Sources, src) }
 }
 
 // WithMaxClaims bounds how many times a unit may be claimed before it is
@@ -233,9 +249,11 @@ type Controller struct {
 	cfg    Config
 	prefix string
 
-	// stores and sinks are what this process can reach, by descriptor.
-	stores intermediateStores
-	sinks  sinks
+	// sources, stores, and sinks are what this process can reach, by
+	// descriptor.
+	sources sources
+	stores  intermediateStores
+	sinks   sinks
 	// store and sink are the ones Setup records for a new run.
 	store IntermediateStore
 	sink  Sink
@@ -287,19 +305,12 @@ func New(eq *entroq.EntroQ, prefix string, opts ...Option) (*Controller, error) 
 	if err != nil {
 		return nil, err
 	}
-	c.stores, c.sinks = stores, sinks
+	srcs, err := newSources(append([]Source{c.inlineSource(nil, 0)}, cfg.Sources...)...)
+	if err != nil {
+		return nil, err
+	}
+	c.sources, c.stores, c.sinks = srcs, stores, sinks
 	return c, nil
-}
-
-// validateForSetup checks the fields only Setup requires.
-func (c *Config) validateForSetup() error {
-	if c.MapShards <= 0 {
-		return fmt.Errorf("eqmr: MapShards must be set with WithMapShards; it fixes how input is divided when a run is created and cannot change afterwards")
-	}
-	if c.ReduceShards <= 0 {
-		return fmt.Errorf("eqmr: ReduceShards must be set with WithReduceShards; it fixes the document layout when the map phase writes its output and cannot change mid-run")
-	}
-	return nil
 }
 
 // Config returns the effective configuration, with defaults applied.
@@ -396,6 +407,8 @@ type docRef struct {
 	Key string `json:"key"`
 	// ReduceShards is the run's partition count, stamped by Setup.
 	ReduceShards int `json:"reduce_shards"`
+	// Source is the run's input, stamped by Setup.
+	Source Descriptor `json:"source"`
 	// Store is the run's intermediate store, stamped by Setup.
 	Store Descriptor `json:"store,omitzero"`
 }

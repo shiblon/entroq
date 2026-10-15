@@ -6,7 +6,8 @@ interchange format.
 
 A run is coordinated entirely through EntroQ: work is tasks, run state is a
 doc. Data may live in EntroQ too, for small jobs, but nothing assumes it does:
-intermediate runs go through a store, and output goes to a `Sink`.
+input comes from a `Source`, intermediate runs go through a store, and output
+goes to a `Sink`.
 
 ## Shape
 
@@ -87,6 +88,26 @@ recorded in the run by its `Descriptor`. Every process that maps, reduces, or
 controls the run must be configured with one that reports the same descriptor.
 A long name in a descriptor, such as a long run prefix, is shortened to its
 head, a short hash of the whole, and its tail.
+
+## Input
+
+`Setup(ctx, input)` divides records you hold in memory into `MapShards` splits
+and keeps them in the split docs. `SetupFrom(ctx, src)` takes its splits from a
+`Source`, and each split doc holds only the source's reference to one split.
+Every mapper process is configured with `WithSource`.
+
+`NewFileSource(name, files, format)` reads absolute file names, one split per
+file. A file is never divided: run more files than mappers, and reshard a file
+too large for one mapper. The formats are `Lines`, keyed `<path>:<line>`, and
+`TSV`, a key and a value per line. Mappers pass no file list:
+
+```go
+src, err := eqmr.NewFileSource("corpus", files, eqmr.Lines) // launcher
+src, err := eqmr.NewFileSource("corpus", nil, eqmr.Lines)   // mapper pod
+```
+
+`shardname.Expand("logs/day@64")` lists a sharded set,
+`logs/day-00000-of-00064` through `logs/day-00063-of-00064`.
 
 ## Shuffle
 
@@ -232,8 +253,10 @@ window, wrong for intermediates.
 
 ## Known limits
 
-- A split doc holds its input inline and must fit the backend message limit
-  (10MB by default for the gRPC service).
+- With `Setup`, a split doc holds its input and must fit the backend message
+  limit (10MB by default for the gRPC service).
+- A passthrough reshard keeps every record only when keys are unique, as
+  `Lines` keys are, since a reducer returns one value per key.
 - Mapper memory is bounded by `IntermediateRunBytes`, except for a single
   record. A reducer holds one block or chunk per input run; many small runs
   raise that, which a later map-phase merger can reduce.
