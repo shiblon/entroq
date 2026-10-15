@@ -68,6 +68,12 @@ type ExitError struct {
 	err   error
 }
 
+// NewExitError classifies err for a transport that failed on its own account,
+// before any session could: a gateway that cannot reach EntroQ at startup, say.
+func NewExitError(class ExitClass, err error) *ExitError {
+	return &ExitError{Class: class, err: err}
+}
+
 // Error implements the error interface.
 func (e *ExitError) Error() string { return e.err.Error() }
 

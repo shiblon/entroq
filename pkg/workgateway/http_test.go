@@ -506,3 +506,128 @@ func TestHTTPWorkTimeoutEndsTheSession(t *testing.T) {
 		t.Errorf("got status %d, want %d: a client whose work timed out must learn its session is gone", status, http.StatusNotFound)
 	}
 }
+
+// waitForSessions polls until h holds want sessions, and reports whether it got
+// there before the deadline.
+func waitForSessions(h *Handler, want int, within time.Duration) bool {
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		if h.Sessions() == want {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return h.Sessions() == want
+}
+
+// TestHTTPIdleHangUpStopsClaiming is the HTTP form of a client leaving between
+// tasks. A ready parked on an empty queue is a connection held open by the
+// client, and a client that drops it must not leave a session claiming on its
+// behalf.
+func TestHTTPIdleHangUpStopsClaiming(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	eq, err := entroq.New(ctx, eqmem.Opener())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer eq.Close()
+	h := NewHandler(ctx, eq)
+	defer h.Close()
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	w := &httpWorker{t: t, url: srv.URL}
+	w.register(&Config{Queues: []string{"inbox"}, ProtocolVersions: []int32{1}})
+	if _, _, err := w.tryPost(200*time.Millisecond, &Request{Type: ReqReady}); err == nil {
+		t.Fatal("a ready on an empty queue was answered; it should have waited")
+	}
+
+	if !waitForSessions(h, 0, 5*time.Second) {
+		t.Fatal("the session is still claiming for a client that hung up")
+	}
+	if _, status := w.post(&Request{Type: ReqReady}); status != http.StatusNotFound {
+		t.Errorf("a request after the hang-up got %d, want %d", status, http.StatusNotFound)
+	}
+}
+
+// TestHTTPHangUpAfterAnswerStillCommits pins the other side of a hang-up: a
+// client that sends its answer and stops waiting for the reply still gets its
+// answer committed, because the gateway had it before the client left.
+//
+// The commit is held open across the hang-up, so a fix that cancelled the whole
+// session cannot pass by finishing the commit first.
+func TestHTTPHangUpAfterAnswerStillCommits(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	backend, err := eqmem.Opener()(ctx)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	release := make(chan struct{})
+	eq, err := entroq.New(ctx, func(context.Context) (entroq.Backend, error) {
+		return heldCommits{Backend: backend, release: release}, nil
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer eq.Close()
+	seed, err := entroq.New(ctx, func(context.Context) (entroq.Backend, error) { return backend, nil })
+	if err != nil {
+		t.Fatalf("New seed: %v", err)
+	}
+	if _, err := seed.Modify(ctx, entroq.InsertingInto("inbox")); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	h := NewHandler(ctx, eq)
+	defer h.Close()
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	w := &httpWorker{t: t, url: srv.URL}
+	w.register(&Config{Queues: []string{"inbox"}, ProtocolVersions: []int32{1}})
+	h.mu.Lock()
+	sess := h.sessions[w.session]
+	h.mu.Unlock()
+	work := w.ask(&Request{Type: ReqReady})
+	if work.Type != RespWork {
+		t.Fatalf("got %q, want %q", work.Type, RespWork)
+	}
+
+	_, _, err = w.tryPost(200*time.Millisecond, &Request{
+		Type: ReqModify,
+		Modification: &wireModReq{&pb.ModifyRequest{
+			Deletes: []*pb.TaskID{{
+				Queue:   work.Task.GetQueue(),
+				Id:      work.Task.GetId(),
+				Version: work.Task.GetVersion(),
+			}},
+		}},
+	})
+	if err == nil {
+		t.Fatal("the modify was answered while its commit was held")
+	}
+	// The server learns of the dropped connection on its own schedule. Let
+	// the commit through only once the session has heard, or has ended.
+	select {
+	case <-sess.conn.Gone():
+	case <-sess.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the session never heard the client hang up")
+	}
+	close(release)
+
+	if !waitForSessions(h, 0, 5*time.Second) {
+		t.Fatal("the session outlived a client that hung up")
+	}
+	left, err := seed.Tasks(ctx, "inbox")
+	if err != nil {
+		t.Fatalf("Tasks: %v", err)
+	}
+	if len(left) != 0 {
+		t.Errorf("inbox still holds %d tasks; the answer sent before the hang-up did not commit", len(left))
+	}
+}

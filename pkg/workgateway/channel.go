@@ -45,17 +45,33 @@ func NewChannelConn(r <-chan *Request, w chan<- *Response) *ChannelConn {
 	}
 }
 
-// Gone never closes yet. HTTP carries no hang-up: a session spans
-// connections, so a client that vanished looks like one that has not come
-// back, and nothing here can tell the two apart.
+// Gone closes when the transport calls HangUp.
 func (c *ChannelConn) Gone() <-chan struct{} {
 	return c.gone
+}
+
+// HangUp tells the gateway its client has gone. After it, Send and Recv report
+// io.EOF, because nobody is left to take an answer or to send a request.
+//
+// A transport calls it when a client stops waiting for an answer it is owed:
+// the gateway has the request, so the state of the turn is no longer anything
+// the client can know. Safe to call more than once.
+func (c *ChannelConn) HangUp() {
+	c.Lock()
+	defer c.Unlock()
+	select {
+	case <-c.gone:
+	default:
+		close(c.gone)
+	}
 }
 
 // Recv waits for the next request the transport forwards.
 func (c *ChannelConn) Recv(ctx context.Context) (*Request, error) {
 	select {
 	case <-c.done:
+		return nil, io.EOF
+	case <-c.gone:
 		return nil, io.EOF
 	case <-ctx.Done():
 		return nil, fmt.Errorf("recv canceled (%v): %w", context.Cause(ctx), ctx.Err())
@@ -68,6 +84,8 @@ func (c *ChannelConn) Recv(ctx context.Context) (*Request, error) {
 func (c *ChannelConn) Send(ctx context.Context, msg *Response) error {
 	select {
 	case <-c.done:
+		return io.EOF
+	case <-c.gone:
 		return io.EOF
 	case <-ctx.Done():
 		return fmt.Errorf("send canceled (%v): %w", context.Cause(ctx), ctx.Err())

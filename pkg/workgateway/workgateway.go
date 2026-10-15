@@ -46,8 +46,10 @@ type Conn interface {
 	// up while the gateway is claiming has spoken out of turn, and the claim
 	// must stop rather than land a task for nobody.
 	//
-	// It is the inbound half only. A client may send its last answer and
-	// close its end while still reading for the reply.
+	// It says nothing about the outbound half, which is the transport's: a
+	// stream client may send its last answer and close its end while still
+	// reading for the reply, and an HTTP client that stopped waiting reads
+	// nothing more.
 	Gone() <-chan struct{}
 }
 

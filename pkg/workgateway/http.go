@@ -49,6 +49,7 @@ type Handler struct {
 type httpSession struct {
 	req    chan *Request
 	resp   chan *Response
+	conn   *ChannelConn
 	cancel context.CancelFunc
 
 	// done closes when Serve has returned, so a session that ended before it
@@ -143,12 +144,12 @@ func (h *Handler) open(reqCtx context.Context, req *Request) (*Response, error) 
 		cancel: cancel,
 		done:   make(chan struct{}),
 	}
-	conn := NewChannelConn(s.req, s.resp)
+	s.conn = NewChannelConn(s.req, s.resp)
 
 	go func() {
 		defer cancel()
 		defer close(s.done)
-		if err := Serve(ctx, h.eq, conn, h.options...); err != nil {
+		if err := Serve(ctx, h.eq, s.conn, h.options...); err != nil {
 			log.Printf("work gateway: session ended: %v", err)
 		}
 		h.forget(s)
@@ -207,9 +208,9 @@ func (h *Handler) forget(s *httpSession) {
 // request over, wait for the answer.
 //
 // Both halves watch the request's context, so a client that gives up releases
-// this handler. They do NOT cancel the session: the gateway is mid-turn and
-// owns the task, and a client that hangs up mid-request is expected to come
-// back for the same answer rather than to have lost its work.
+// this handler. Giving up before the gateway took the request changes nothing.
+// Giving up after it is a hang-up: the gateway is acting on a request whose
+// answer has nowhere to go, so the session stops claiming and ends.
 func (s *httpSession) exchange(reqCtx context.Context, req *Request) (*Response, error) {
 	select {
 	case s.req <- req:
@@ -226,6 +227,7 @@ func (s *httpSession) exchange(reqCtx context.Context, req *Request) (*Response,
 		// completes is the worst failure a transport can have.
 		return nil, fmt.Errorf("session ended while answering %q: %w", req.Type, errNoSession)
 	case <-reqCtx.Done():
+		s.conn.HangUp()
 		return nil, fmt.Errorf("awaiting answer to %q: %w", req.Type, reqCtx.Err())
 	}
 }
