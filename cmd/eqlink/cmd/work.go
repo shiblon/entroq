@@ -111,8 +111,17 @@ See examples/workgateway for a client.`,
 func serveWorkStdio(opts []workgateway.Option) error {
 	// A quit is the client's to send, so the drain is waiting for one: a
 	// client in the same process group got the same signal and is finishing.
-	served := make(chan struct{})
+	// Before the session starts there is no client to wait for.
+	started, served := make(chan struct{}), make(chan struct{})
 	ctx, stop := onSignal(context.Background(), workLease, func(sctx context.Context) error {
+		// Check that we've started. If not, exit immediately. Receiving a
+		// signal before start should not wait for a drain.
+		select {
+		case <-started:
+		default:
+			return nil
+		}
+		// Now we're going to wait for a drain or a cancelation because we've actually started.
 		select {
 		case <-served:
 			return nil
@@ -126,11 +135,16 @@ func serveWorkStdio(opts []workgateway.Option) error {
 	defer cancel()
 	g, gctx := errgroup.WithContext(ctx)
 	eq, err := workEQ(gctx, g)
+	if errors.Is(err, errStopped) {
+		// Explicit stop is not an error, just exit cleanly.
+		return nil
+	}
 	if err != nil {
 		return err
 	}
 	defer eq.Close()
 
+	close(started)
 	g.Go(func() error {
 		defer close(served)
 		// The session is the whole run, so its end releases whatever else
@@ -159,6 +173,10 @@ func serveWorkHTTP(addr string, opts []workgateway.Option) error {
 
 	g, gctx := errgroup.WithContext(ctx)
 	eq, err := workEQ(gctx, g)
+	if errors.Is(err, errStopped) {
+		// Explicit stop is not an error, just exit cleanly.
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -228,16 +246,20 @@ func watchParent(ctx context.Context, parent int, every time.Duration, stop func
 	}
 }
 
+// errStopped is a start-up that a stop cut short, which is a clean stop.
+var errStopped = errors.New("stopped during start-up")
+
 // workEQ opens EntroQ for a gateway, classifying a failure the way a session's
 // exit is classified: an EntroQ that never answered is transient, and anything
-// else is configuration a retry will not fix.
+// else is configuration a retry will not fix. A stop during the dial is
+// errStopped.
 func workEQ(ctx context.Context, g *errgroup.Group) (*entroq.EntroQ, error) {
 	eq, err := localEQ(ctx, g)
 	switch {
 	case err == nil:
 		return eq, nil
 	case ctx.Err() != nil:
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", errStopped, err)
 	case errors.Is(err, context.DeadlineExceeded) || entroq.IsUnavailable(err):
 		return nil, workgateway.NewExitError(workgateway.ExitTransient, err)
 	default:

@@ -25,7 +25,7 @@ func onSignal(ctx context.Context, grace time.Duration, shutdown func(context.Co
 		case <-ctx.Done():
 			return
 		case sig := <-sigs:
-			log.Printf("%v: draining for up to %v; signal again to stop now", sig, grace)
+			log.Printf("%v: stopping, draining for up to %v if necessary; signal again to stop now", sig, grace)
 		}
 		go func() {
 			defer cancel()

@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"os"
+	"syscall"
 	"testing"
 	"time"
 
@@ -70,6 +71,45 @@ func TestWorkEQ_Classifies(t *testing.T) {
 			}
 			if ee.Class != tc.want {
 				t.Errorf("class = %v, want %v (%v)", ee.Class, tc.want, err)
+			}
+		})
+	}
+}
+
+// TestServeWork_StopsDuringStartup: a signal while EntroQ is still being
+// dialed stops the gateway at once and cleanly, in either mode. There is no
+// session yet, so a drain has nothing to wait for.
+func TestServeWork_StopsDuringStartup(t *testing.T) {
+	saved := []any{entroqAddr, entroqStartupTimeout, workLease}
+	defer func() {
+		entroqAddr = saved[0].(string)
+		entroqStartupTimeout = saved[1].(time.Duration)
+		workLease = saved[2].(time.Duration)
+	}()
+	// Port 1 refuses every connection, and both bounds are far longer than
+	// the test allows, so only the signal can end the dial in time.
+	entroqAddr = "127.0.0.1:1"
+	entroqStartupTimeout = time.Minute
+	workLease = time.Minute
+
+	for name, serve := range map[string]func() error{
+		"stdio": func() error { return serveWorkStdio(nil) },
+		"http":  func() error { return serveWorkHTTP("127.0.0.1:0", nil) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			done := make(chan error, 1)
+			go func() { done <- serve() }()
+			time.Sleep(200 * time.Millisecond)
+			if err := syscall.Kill(syscall.Getpid(), syscall.SIGTERM); err != nil {
+				t.Fatalf("signal: %v", err)
+			}
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Errorf("serve = %v, want a clean stop", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("a signal during start-up did not stop the gateway")
 			}
 		})
 	}
