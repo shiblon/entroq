@@ -311,8 +311,8 @@ type Request struct {
 	// DocSetClaims names the doc sets this task needs. Valid for type "take".
 	DocSetClaims []wireClaim `json:"doc_set_claims,omitempty"`
 
-	// Outcome is the task's disposition, on a "modify" reply and on the
-	// post-commit replies. Empty means OutcomeOK.
+	// Outcome is the task's disposition, on a "take" or "modify" reply and on
+	// the post-commit replies. Empty means OutcomeOK.
 	Outcome Outcome `json:"outcome,omitempty"`
 
 	// Error says why, for any outcome but ok. It is structured because the
@@ -985,6 +985,11 @@ func (g *Gateway) makeTakeDocs() worker.TakeRun[json.RawMessage] {
 		}
 		if err != nil {
 			return nil, fmt.Errorf("take docs: %w", err)
+		}
+		// A take may settle the task instead, as a native take phase may, with
+		// nothing claimed yet.
+		if d := g.disposition(received.Outcome, received.Error); d != nil {
+			return nil, g.drainAfter(d)
 		}
 		args, err := claimsFromWire(received.DocSetClaims)
 		if err != nil {
