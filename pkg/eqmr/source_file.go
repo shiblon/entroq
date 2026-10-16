@@ -20,27 +20,64 @@ const fileSourceDriver = "entroq.eqmr.filesource/1"
 // maxSourceLineBytes bounds one line of a file source.
 const maxSourceLineBytes = maxIntermediateRecordLen
 
-// FileFormat is how a file source turns lines into records: Lines or TSV.
+// FileFormat is how files map to records, one line each: Lines or TSV. A file
+// sink writes what a file source of the same format reads back.
 type FileFormat struct {
 	name  string
 	parse func(path string, line int, text string) (*KV, error)
+	// line is the text of a record, without its newline.
+	line func(key, value string) (string, error)
 }
 
 var (
-	// Lines reads each line as a record keyed "<path>:<line>", numbered from 1.
-	Lines = FileFormat{name: "lines", parse: func(path string, line int, text string) (*KV, error) {
-		return NewKV(fmt.Sprintf("%s:%d", path, line), text), nil
-	}}
+	// Lines reads each line as a record keyed "<path>:<line>", numbered from 1,
+	// and writes each value as a line.
+	Lines = FileFormat{
+		name: "lines",
+		parse: func(path string, line int, text string) (*KV, error) {
+			return NewKV(fmt.Sprintf("%s:%d", path, line), text), nil
+		},
+		line: func(key, value string) (string, error) {
+			if err := oneLine("value", key, value); err != nil {
+				return "", err
+			}
+			return value, nil
+		},
+	}
 
-	// TSV reads each line as a key, a tab, and a value.
-	TSV = FileFormat{name: "tsv", parse: func(path string, line int, text string) (*KV, error) {
-		key, value, ok := strings.Cut(text, "\t")
-		if !ok {
-			return nil, worker.MoveErrorf("%s:%d has no tab", path, line)
-		}
-		return NewKV(key, value), nil
-	}}
+	// TSV reads and writes each line as a key, a tab, and a value.
+	TSV = FileFormat{
+		name: "tsv",
+		parse: func(path string, line int, text string) (*KV, error) {
+			key, value, ok := strings.Cut(text, "\t")
+			if !ok {
+				return nil, worker.MoveErrorf("%s:%d has no tab", path, line)
+			}
+			return NewKV(key, value), nil
+		},
+		line: func(key, value string) (string, error) {
+			if strings.Contains(key, "\t") {
+				return "", worker.MoveErrorf("key %q has a tab", key)
+			}
+			if err := oneLine("key", key, key); err != nil {
+				return "", err
+			}
+			if err := oneLine("value", key, value); err != nil {
+				return "", err
+			}
+			return key + "\t" + value, nil
+		},
+	}
 )
+
+// oneLine refuses text that would not read back as written: a newline splits
+// the line, and a final "\r" is taken for part of a "\r\n".
+func oneLine(what, key, text string) error {
+	if strings.Contains(text, "\n") || strings.HasSuffix(text, "\r") {
+		return worker.MoveErrorf("%s for key %q does not fit on one line", what, key)
+	}
+	return nil
+}
 
 // FileSourceOption configures NewFileSource.
 type FileSourceOption func(*fileSource)

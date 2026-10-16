@@ -27,7 +27,7 @@ func TestDocumentSinkFirstCommitWins(t *testing.T) {
 	sink := newDocumentSink(eq, run)
 	stage := func(kvs ...*KV) []byte {
 		t.Helper()
-		w, err := sink.Stage(ctx, run, 0)
+		w, err := sink.Stage(ctx, run, 0, 1)
 		if err != nil {
 			t.Fatalf("stage: %v", err)
 		}
@@ -114,7 +114,7 @@ func TestDocumentSinkRefusesOtherRuns(t *testing.T) {
 	}
 	defer eq.Close()
 	sink := newDocumentSink(eq, "/mine")
-	_, stageErr := sink.Stage(ctx, "/theirs", 0)
+	_, stageErr := sink.Stage(ctx, "/theirs", 0, 1)
 	for what, err := range map[string]error{
 		"stage":  stageErr,
 		"commit": sink.Commit(ctx, "/theirs", 0, []byte(`{}`)),

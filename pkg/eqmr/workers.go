@@ -15,6 +15,8 @@ import (
 // reduceTask is the value of a reduce task: one partition of the shuffle.
 type reduceTask struct {
 	Partition int `json:"partition"`
+	// Partitions is the run's partition count.
+	Partitions int `json:"partitions"`
 	// Sink is the run's sink, stamped from the run state.
 	Sink Descriptor `json:"sink"`
 }
@@ -355,7 +357,7 @@ func (c *Controller) ReducerWorker(reduceFn Reducer) *worker.Worker[reduceTask] 
 			if err != nil {
 				return nil, runReadFailure(err, "open partition %d", rt.Partition)
 			}
-			writer, err := sink.Stage(ctx, c.prefix, rt.Partition)
+			writer, err := sink.Stage(ctx, c.prefix, rt.Partition, rt.Partitions)
 			if err != nil {
 				return nil, errors.Join(moveOrRetry(err, "stage partition %d", rt.Partition), merged.Close())
 			}

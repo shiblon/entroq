@@ -43,7 +43,7 @@ func (s *memSink) Descriptor() eqmr.Descriptor {
 	return eqmr.Descriptor{Name: s.name, Driver: "test.mem/1", Identity: s.name}
 }
 
-func (s *memSink) Stage(context.Context, string, int) (eqmr.SinkWriter, error) {
+func (s *memSink) Stage(context.Context, string, int, int) (eqmr.SinkWriter, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.nextID++

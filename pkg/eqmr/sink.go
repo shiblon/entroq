@@ -27,9 +27,9 @@ type Sink interface {
 	// Descriptor identifies the sink. See Descriptor.
 	Descriptor() Descriptor
 
-	// Stage opens a writer for one attempt at one partition of run. Nothing it
-	// writes is visible as output until it is committed.
-	Stage(ctx context.Context, run string, partition int) (SinkWriter, error)
+	// Stage opens a writer for one attempt at partition of run's partitions.
+	// Nothing it writes is visible as output until it is committed.
+	Stage(ctx context.Context, run string, partition, partitions int) (SinkWriter, error)
 
 	// Commit makes a staged attempt the output of its partition. The first
 	// commit for a partition wins: any later commit, of the same attempt or
@@ -123,7 +123,7 @@ func (s *documentSink) checkRun(run, what string) error {
 	return nil
 }
 
-func (s *documentSink) Stage(_ context.Context, run string, _ int) (SinkWriter, error) {
+func (s *documentSink) Stage(_ context.Context, run string, _, _ int) (SinkWriter, error) {
 	if err := s.checkRun(run, "stage output"); err != nil {
 		return nil, err
 	}

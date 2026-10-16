@@ -57,7 +57,8 @@
 // Output goes to a Sink, which owns its format and readiness. The controller
 // commits one staged attempt per partition and calls Sink.Finish before the
 // run is done. Without WithSink, output goes to the run's document sink, which
-// Results reads.
+// Results reads. NewFileSink writes sharded files that a file source reads
+// back.
 //
 // # Text
 //

@@ -166,6 +166,19 @@ in fact committed.
 The default document sink suits small jobs, and `Results` and
 `ResultsForPartition` read it. Other sinks are read with their own readers.
 
+`NewFileSink(name, base, format)` writes partition P of R to
+`base-0000P-of-0000R`, one `Lines` or `TSV` line per record, so `base@R` names
+the output and a file source of the same format reads it back as the next
+run's input. Every partition has a file, empty if it received no data, and
+`Finish` writes `base.manifest`, listing them, to mark the output complete.
+
+Attempts are staged in a hidden `.<name>.eqmr` directory beside the output and
+committed by hard link, which fails if the shard exists, so the first commit
+wins without a lock; the filesystem must support links. The output belongs to
+the run that first writes it, and another run is refused until the shards, the
+manifest, and the hidden directory are removed. A value with a newline, or a
+`TSV` key with a tab, fails the run.
+
 ## Duplicates and backup tasks
 
 Workers read their input without claiming it, so two may process one unit at

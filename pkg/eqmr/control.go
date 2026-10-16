@@ -343,7 +343,7 @@ func (c *Controller) mapCheckWorker() *worker.Worker[barrierCheck] {
 		next.Phase = PhaseReduce
 		mods := []entroq.ModifyArg{task.Delete()}
 		for _, p := range parts {
-			mods = append(mods, entroq.InsertingInto(c.ReduceQ(), entroq.WithValue(reduceTask{Partition: p, Sink: st.Sink})))
+			mods = append(mods, entroq.InsertingInto(c.ReduceQ(), entroq.WithValue(reduceTask{Partition: p, Partitions: st.ReduceParts, Sink: st.Sink})))
 		}
 		return mods, &next, nil
 	})
