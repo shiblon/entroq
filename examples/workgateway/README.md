@@ -35,3 +35,8 @@ dies with the worker, however the worker dies.
 Insert a task on the queue (e.g. with `eqc`) and watch it go. The first Ctrl-C
 drains: work in hand finishes and commits, nothing new is claimed. A second
 Ctrl-C hangs up at once and leaves any task in hand to its lease.
+
+The worker passes each signal on to its gateways, which do the draining, and
+answers until each says quit. A gateway runs in a session of its own so that a
+signal reaches it once, through the worker; under a supervisor, signal the
+worker alone (systemd `KillMode=mixed`).

@@ -27,7 +27,6 @@ import http.client
 import json
 import os
 import signal
-import socket
 import subprocess
 import sys
 import threading
@@ -152,8 +151,8 @@ class Modification:
 M = Modification
 
 
-# Transports. Each has exchange(msg) -> reply, abort() to give up on a waiting
-# exchange from another thread, and close().
+# Transports. Each has exchange(msg) -> reply and close(). A child runs in a
+# session of its own, so a signal reaches it only when the Gateway passes it on.
 
 class HTTPChild:
     """One `eqlink work --addr` child, shared by every session in this process.
@@ -172,12 +171,18 @@ class HTTPChild:
             return HTTPExchange(*self.addr)
 
     def _start(self):
-        proc = subprocess.Popen(self.argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+        proc = subprocess.Popen(self.argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                start_new_session=True)
         line = proc.stdout.readline()
         if not line:
             raise exit_error(proc.wait())
         host, port = json.loads(line)["addr"].rsplit(":", 1)
         return proc, (host, int(port))
+
+    def signal(self, signum):
+        with self.mu:
+            if self.proc is not None and self.proc.poll() is None:
+                self.proc.send_signal(signum)
 
     def close(self):
         # Called once every session has ended, so nothing is connecting.
@@ -210,11 +215,6 @@ class HTTPExchange:
             self.session = reply.get("session", "")
         return reply
 
-    def abort(self):
-        # Dropping the connection is hanging up: the gateway stops claiming.
-        if self.conn.sock is not None:
-            self.conn.sock.shutdown(socket.SHUT_RDWR)
-
     def close(self):
         self.conn.close()
 
@@ -223,7 +223,8 @@ class StdioExchange:
     """One session over a child's stdin and stdout, one JSON value per line."""
 
     def __init__(self, argv):
-        self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     start_new_session=True)
         self.mu = threading.Lock()
 
     def exchange(self, msg):
@@ -238,9 +239,9 @@ class StdioExchange:
             raise exit_error(self.proc.wait())
         return json.loads(line)
 
-    def abort(self):
-        # Closing stdin is hanging up: the gateway stops claiming.
-        self.proc.stdin.close()
+    def signal(self, signum):
+        if self.proc.poll() is None:
+            self.proc.send_signal(signum)
 
     def close(self):
         if not self.proc.stdin.closed:
@@ -295,8 +296,6 @@ class Session:
         self.stopping = threading.Event()
         self.ctx = Context(xchg, self.stopping)
         self.keepalive_s = 0
-        self.mu = threading.Lock()
-        self.abortable = False
 
     def run(self):
         reply = self.send({"type": "config", "config": self.w.config()})
@@ -334,24 +333,10 @@ class Session:
             reply = self.send(msg)
 
     def send(self, msg):
-        """The loop's exchange. Once stopping, every message carries quit, and
-        a wait that carries none -- the gateway holds the turn, nothing is in
-        hand -- is what stop() aborts."""
-        with self.mu:
-            if self.stopping.is_set():
-                msg["quit"] = True
-            self.abortable = not msg.get("quit")
-        try:
-            return self.xchg.exchange(msg)
-        finally:
-            with self.mu:
-                self.abortable = False
-
-    def stop(self):
-        with self.mu:
-            self.stopping.set()
-            if self.abortable:
-                self.xchg.abort()
+        """The loop's exchange. Once stopping, every message carries quit."""
+        if self.stopping.is_set():
+            msg["quit"] = True
+        return self.xchg.exchange(msg)
 
     def settle(self, fn, *args):
         """Run fn, returning what it returns and, if it raised, the fate that
@@ -438,6 +423,7 @@ class Gateway:
     def __init__(self, entroq="localhost:37706", transport="http", eqlink="eqlink", args=()):
         self.argv = [eqlink, "--entroq", entroq, "work", *args]
         self.transport = transport
+        self.child = None
         self.stopping = threading.Event()
         self.mu = threading.Lock()
         self.sessions = set()
@@ -447,10 +433,9 @@ class Gateway:
         """Run until every worker has stopped: by ctx.stop, by SIGINT or
         SIGTERM, or by a failure a new session cannot fix. The first signal
         drains; a second hangs up at once."""
-        child = None
         if self.transport == "http":
-            child = HTTPChild(self.argv)
-            connect = child.connect
+            self.child = HTTPChild(self.argv)
+            connect = self.child.connect
         else:
             def connect():
                 return StdioExchange(self.argv)
@@ -463,23 +448,35 @@ class Gateway:
             for r in runners:
                 r.join()
         finally:
-            if child is not None:
-                child.close()
+            if self.child is not None:
+                self.child.close()
         if self.failure is not None:
             raise self.failure
 
-    def stop(self):
-        """Drain: every task in hand finishes, and no session claims again."""
+    def stop(self, signum=signal.SIGTERM):
+        """Drain: every task in hand finishes, and no session claims again. The
+        gateway does it, told by signum, and answers each session with a quit."""
         self.stopping.set()
         with self.mu:
             for s in self.sessions:
-                s.stop()
+                s.stopping.set()
+        self._signal(signum)
+
+    def _signal(self, signum):
+        if self.child is not None:
+            self.child.signal(signum)
+            return
+        with self.mu:
+            for s in self.sessions:
+                s.xchg.signal(signum)
 
     def _on_signal(self, signum, frame):
         if self.stopping.is_set():
-            os._exit(130)  # a second signal: hang up, leaving tasks to their leases
+            # A second signal: the gateway hangs up, leaving tasks to their leases.
+            self._signal(signum)
+            os._exit(130)
         print(f"[worker] {signal.Signals(signum).name}: draining", file=sys.stderr)
-        self.stop()
+        self.stop(signum)
 
     def _serve(self, worker, connect):
         """Run one worker's sessions one after another until it stops."""
@@ -504,7 +501,7 @@ class Gateway:
             except SessionGone:
                 pass
             except (OSError, http.client.HTTPException):
-                pass  # an aborted exchange, or a gateway that went away
+                pass  # a gateway that went away
             except GatewayError as e:
                 if not self._recoverable(e):
                     return
