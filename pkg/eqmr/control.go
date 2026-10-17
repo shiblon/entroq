@@ -385,7 +385,7 @@ func (c *Controller) reduceDoneWorker() *worker.Worker[reduceDone] {
 			}
 			// Committing again after a crash is a no-op.
 			if err := sink.Commit(ctx, c.prefix, rd.Partition, rd.Staged); err != nil {
-				return nil, moveOrRetry(err, "commit output for partition %d", rd.Partition)
+				return nil, moveOrRetry(ctx, err, "commit output for partition %d", rd.Partition)
 			}
 
 			mods := []entroq.ModifyArg{task.Delete(), checking(c.ReduceCheckQ())}
