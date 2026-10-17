@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/pkg/backend/eqmem"
 	"github.com/shiblon/entroq/pkg/eqmr"
 )
 
@@ -31,9 +30,9 @@ func testPrefix() string { return "/eqmrtest/" + entroq.GenHex16() }
 
 func newClient(ctx context.Context, t *testing.T) *entroq.EntroQ {
 	t.Helper()
-	eq, err := entroq.New(ctx, eqmem.Opener())
+	eq, err := entroq.New(ctx, opener)
 	if err != nil {
-		t.Fatalf("open in-memory client: %v", err)
+		t.Fatalf("open client: %v", err)
 	}
 	t.Cleanup(func() { eq.Close() })
 	return eq
