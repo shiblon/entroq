@@ -190,7 +190,7 @@ func serveChannels(t *testing.T, eq entroq.Client, options ...Option) *session {
 	conn := NewChannelConn(s.req, s.resp)
 	go func() {
 		defer close(s.done)
-		s.err = Serve(ctx, eq, conn, options...)
+		s.err = NewServer(ctx, eq, options...).ServeConn(ctx, conn)
 	}()
 	t.Cleanup(func() {
 		cancel()
@@ -326,10 +326,10 @@ func TestServeErrorsOnlyWhenItCannotReply(t *testing.T) {
 	defer cancel()
 	eq := testClient(ctx, t)
 
-	if err := Serve(ctx, nil, &fakeConn{}); err == nil {
-		t.Error("Serve accepted a nil client")
+	if err := NewServer(ctx, nil).ServeConn(ctx, &fakeConn{}); err == nil {
+		t.Error("ServeConn accepted a nil client")
 	}
-	if err := Serve(ctx, eq, nil); err == nil {
-		t.Error("Serve accepted a nil conn")
+	if err := NewServer(ctx, eq).ServeConn(ctx, nil); err == nil {
+		t.Error("ServeConn accepted a nil conn")
 	}
 }

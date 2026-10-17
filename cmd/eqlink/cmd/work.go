@@ -109,25 +109,20 @@ See examples/workgateway for a client.`,
 // serveWorkStdio runs one session over stdin and stdout, for a client that
 // spawned this process.
 func serveWorkStdio(opts []workgateway.Option) error {
-	// A quit is the client's to send, so the drain is waiting for one: a
-	// client in the same process group got the same signal and is finishing.
-	// Before the session starts there is no client to wait for.
-	started, served := make(chan struct{}), make(chan struct{})
+	// The session drains: it finishes the task in hand and answers with a quit.
+	// Before the server exists there is nothing to drain.
+	var gw *workgateway.Server
+	started := make(chan struct{})
 	ctx, stop := onSignal(context.Background(), workLease, func(sctx context.Context) error {
-		// Check that we've started. If not, exit immediately. Receiving a
-		// signal before start should not wait for a drain.
 		select {
 		case <-started:
 		default:
 			return nil
 		}
-		// Now we're going to wait for a drain or a cancelation because we've actually started.
-		select {
-		case <-served:
-			return nil
-		case <-sctx.Done():
-			return fmt.Errorf("session still open: %w", sctx.Err())
+		if err := gw.Shutdown(sctx); err != nil {
+			return fmt.Errorf("session still open: %w", err)
 		}
+		return nil
 	})
 	defer stop()
 
@@ -144,14 +139,14 @@ func serveWorkStdio(opts []workgateway.Option) error {
 	}
 	defer eq.Close()
 
+	gw = workgateway.NewServer(gctx, eq, opts...)
 	close(started)
 	g.Go(func() error {
-		defer close(served)
 		// The session is the whole run, so its end releases whatever else
 		// the group is holding open.
 		defer cancel()
 		conn := workgateway.NewStreamConn(workgateway.Joining(os.Stdin, os.Stdout), opts...)
-		return workgateway.Serve(gctx, eq, conn, opts...)
+		return gw.ServeConn(gctx, conn)
 	})
 	return g.Wait()
 }
@@ -164,9 +159,20 @@ func serveWorkHTTP(addr string, opts []workgateway.Option) error {
 	sessCtx, endSessions := context.WithCancel(context.Background())
 	defer endSessions()
 
+	// Each session drains as a stdio one does, and the server shuts down once
+	// they all have. Before the gateway exists there is nothing to drain.
 	srv := &http.Server{}
+	var gw *workgateway.Server
+	started := make(chan struct{})
 	ctx, stop := onSignal(context.Background(), workLease, func(sctx context.Context) error {
-		endSessions()
+		select {
+		case <-started:
+		default:
+			return nil
+		}
+		if err := gw.Shutdown(sctx); err != nil {
+			return fmt.Errorf("sessions still open: %w", err)
+		}
 		return srv.Shutdown(sctx)
 	})
 	defer stop()
@@ -182,7 +188,9 @@ func serveWorkHTTP(addr string, opts []workgateway.Option) error {
 	}
 	defer eq.Close()
 
-	srv.Handler = workgateway.NewHandler(sessCtx, eq, opts...)
+	gw = workgateway.NewServer(sessCtx, eq, opts...)
+	srv.Handler = gw
+	close(started)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return workgateway.NewExitError(workgateway.ExitCaller, fmt.Errorf("listen: %w", err))

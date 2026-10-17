@@ -78,7 +78,7 @@ func httpFixture(ctx context.Context, t *testing.T, options ...Option) (*httpWor
 	t.Cleanup(func() { eq.Close() })
 
 	// The handler's context is the SERVICE's, not any request's.
-	h := NewHandler(ctx, eq, options...)
+	h := NewServer(ctx, eq, options...)
 	t.Cleanup(h.Close)
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
@@ -266,7 +266,7 @@ func TestHTTPForgetsFinishedSessions(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	defer eq.Close()
-	h := NewHandler(ctx, eq)
+	h := NewServer(ctx, eq)
 	defer h.Close()
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -341,7 +341,7 @@ func TestHTTPRefusesAnOversizeBody(t *testing.T) {
 	defer eq.Close()
 
 	const max = 8 << 10
-	h := NewHandler(ctx, eq, WithMaxFrameBytes(max))
+	h := NewServer(ctx, eq, WithMaxFrameBytes(max))
 	defer h.Close()
 
 	// A config that opens with a string and never closes it, so the decoder
@@ -391,7 +391,7 @@ func TestHTTPWorkSurvivesDisconnection(t *testing.T) {
 		t.Fatalf("New intruder: %v", err)
 	}
 
-	h := NewHandler(ctx, eq, WithLease(lease))
+	h := NewServer(ctx, eq, WithLease(lease))
 	defer h.Close()
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -509,7 +509,7 @@ func TestHTTPWorkTimeoutEndsTheSession(t *testing.T) {
 
 // waitForSessions polls until h holds want sessions, and reports whether it got
 // there before the deadline.
-func waitForSessions(h *Handler, want int, within time.Duration) bool {
+func waitForSessions(h *Server, want int, within time.Duration) bool {
 	deadline := time.Now().Add(within)
 	for time.Now().Before(deadline) {
 		if h.Sessions() == want {
@@ -533,7 +533,7 @@ func TestHTTPIdleHangUpStopsClaiming(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	defer eq.Close()
-	h := NewHandler(ctx, eq)
+	h := NewServer(ctx, eq)
 	defer h.Close()
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -582,7 +582,7 @@ func TestHTTPHangUpAfterAnswerStillCommits(t *testing.T) {
 		t.Fatalf("Insert: %v", err)
 	}
 
-	h := NewHandler(ctx, eq)
+	h := NewServer(ctx, eq)
 	defer h.Close()
 	srv := httptest.NewServer(h)
 	defer srv.Close()

@@ -325,14 +325,13 @@ runs, so plan a short maintenance window on large doc tables.
 - **`eqlink work` drains on the first signal.** The first SIGINT or SIGTERM
   stops claiming, finishes the task in hand, and exits 0, waiting up to
   `--lease` for it; a second stops at once, leaving the task to its lease, as
-  the first did before. `eqlink work --addr` closes each connection normally
-  once its task is done and refuses new connections meanwhile.
-- **Breaking (Go): `workgateway.Server` replaces `workgateway.Handler`.**
-  `NewServer(eq, lease, entroqTimeout)` is the `http.Handler`, with `Shutdown`
-  to drain every connection and `Close` to stop them, like `http.Server`;
-  `workgateway.Serve` takes it in place of the handler's arguments. A context no
-  longer stops the connections: call `Close`. `Bridge.Shutdown` drains one
-  session.
+  the first did before. A drained session answers its client with a quit.
+  `eqlink work --addr` drains every session the same way, answers a config
+  that arrives meanwhile with a quit, and shuts down once all have ended.
+- **Breaking (Go): `workgateway.Server` replaces `workgateway.Handler` and
+  `workgateway.Serve`.** `NewServer(ctx, eq, options...)` is the
+  `http.Handler`, and `ServeConn` runs one session over a `Conn`. Like
+  `http.Server`, `Shutdown` drains every session and `Close` stops them all.
 - **Modify can change only when tasks and doc sets are ready again.**
   `Modification` gains `Arrives` and `DocArrives`: a task or doc set at a
   version, ready again at a given time, or now, which releases it. Each moves

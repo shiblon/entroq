@@ -297,7 +297,7 @@ func osPipes(t *testing.T) (gwR io.ReadCloser, gwW io.WriteCloser, c *client) {
 // served runs one session in the background over the given pipes.
 func served(ctx context.Context, eq entroq.Client, r io.ReadCloser, w io.WriteCloser, options ...Option) chan error {
 	out := make(chan error, 1)
-	go func() { out <- Serve(ctx, eq, NewStreamConn(Joining(r, w)), options...) }()
+	go func() { out <- NewServer(ctx, eq, options...).ServeConn(ctx, NewStreamConn(Joining(r, w))) }()
 	return out
 }
 

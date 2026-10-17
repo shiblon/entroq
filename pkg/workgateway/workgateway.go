@@ -396,66 +396,6 @@ type Gateway struct {
 	armed bool
 }
 
-// Serve runs one client's session over conn, from its config message until
-// whatever ends it, and blocks for the life of the session.
-//
-// A transport calls this in a goroutine of its own, on a context of the
-// TRANSPORT's lifetime rather than one request's, and keeps only the conn and
-// that context's cancel. It needs nothing else: a session id arrives in the
-// check, which the transport must read in order to answer the config request
-// anyway, and which therefore reaches it before the client can send anything
-// further.
-//
-// A registration this gateway will not serve is ANSWERED rather than returned,
-// so the error here is for whoever runs the gateway. A client learns from the
-// message.
-func Serve(ctx context.Context, eq entroq.Client, conn Conn, options ...Option) error {
-	if eq == nil || conn == nil {
-		return fmt.Errorf("work gateway needs a client and a conn")
-	}
-	defer conn.Close()
-
-	first, err := conn.Recv(ctx)
-	if err != nil {
-		return fmt.Errorf("recv config: %w", err)
-	}
-	if first != nil && first.Quit {
-		// Nothing has started, so there is nothing to drain.
-		if err := conn.Send(ctx, &Response{Type: RespQuit}); err != nil {
-			return fmt.Errorf("send quit: %w", err)
-		}
-		return nil
-	}
-
-	g, err := newGateway(eq, first, conn, options...)
-	if err != nil {
-		if sendErr := conn.Send(ctx, &Response{
-			Type:    RespError,
-			Class:   ExitCaller.String(),
-			Message: err.Error(),
-		}); sendErr != nil {
-			return fmt.Errorf("send refusal (%v): %w", err, sendErr)
-		}
-		return fmt.Errorf("config refused: %w", err)
-	}
-
-	// The check answers the config request that got us here, and carries the
-	// three things a client cannot work out for itself: which session it is,
-	// which consumer holds its tasks, and how long it will actually be given
-	// for one of them.
-	//
-	// Sending it here is safe because Serve is already the goroutine: the
-	// caller is not waiting on this send, it is waiting to read it.
-	check := g.newSend(RespCheck, ReqReady)
-	check.Claimant = g.claimant
-	check.WorkTimeoutS = int32(g.workTimeout / time.Second)
-	check.SilenceTimeoutS = int32(g.silenceTimeout() / time.Second)
-	if err := conn.Send(ctx, check); err != nil {
-		return fmt.Errorf("send check: %w", err)
-	}
-	return g.Handle(ctx)
-}
-
 // newGateway builds a session from a registration, or says why it will not.
 //
 // Every error it returns is a client's fault, which is what lets Serve answer
@@ -787,7 +727,22 @@ func (g *Gateway) quit() {
 	g.quitting = true
 }
 
-// quitRequested reports whether a client has asked to stop.
+// drain is the operator's quit: the session finishes the task in hand and
+// answers with a quit, as it would for its client's, and a claim it is blocked
+// in stops at once. It returns without waiting; a drain that lands before the
+// worker runs still holds, because a Run after Shutdown returns ErrShutdown.
+func (g *Gateway) drain() {
+	g.quit()
+	go func() {
+		// Shutdown waits on the task in hand for as long as it takes; Close is
+		// what cuts that short.
+		if err := g.worker.Shutdown(context.Background()); err != nil {
+			log.Printf("work gateway: session %s: drain: %v", g.sessionID, err)
+		}
+	}()
+}
+
+// quitRequested reports whether the client or the operator asked to stop.
 func (g *Gateway) quitRequested() bool {
 	g.Lock()
 	defer g.Unlock()
