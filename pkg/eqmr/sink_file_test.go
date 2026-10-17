@@ -2,7 +2,10 @@ package eqmr_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -84,18 +87,39 @@ func TestFileSinkChainsRuns(t *testing.T) {
 		t.Fatalf("read manifest: %v", err)
 	}
 	var manifest struct {
-		Run   string   `json:"run"`
-		Files []string `json:"files"`
-		Empty []int    `json:"empty"`
+		Run   string `json:"run"`
+		Files []struct {
+			Name    string `json:"name"`
+			SHA256  string `json:"sha256"`
+			Records int    `json:"records"`
+			Bytes   int    `json:"bytes"`
+		} `json:"files"`
+		Empty []int `json:"empty"`
 	}
 	if err := json.Unmarshal(raw, &manifest); err != nil {
 		t.Fatalf("parse manifest: %v", err)
 	}
 	if manifest.Run != first.Prefix() || len(manifest.Files) != parts || len(manifest.Empty) < parts-4 {
-		t.Errorf("manifest %s, want run %q, %d files, and at least %d empty", raw, first.Prefix(), parts, parts-4)
+		t.Fatalf("manifest %s, want run %q, %d files, and at least %d empty", raw, first.Prefix(), parts, parts-4)
 	}
-	if manifest.Files[0] != filepath.Base(shardname.Name(base, 0, parts)) {
-		t.Errorf("first file %q, want %q", manifest.Files[0], shardname.Name(base, 0, parts))
+	records := 0
+	for i, f := range manifest.Files {
+		if want := filepath.Base(shardname.Name(base, i, parts)); f.Name != want {
+			t.Errorf("file %d is %q, want %q", i, f.Name, want)
+		}
+		body, err := os.ReadFile(filepath.Join(dir, f.Name))
+		if err != nil {
+			t.Fatalf("read %s: %v", f.Name, err)
+		}
+		sum := sha256.Sum256(body)
+		if f.SHA256 != hex.EncodeToString(sum[:]) || f.Bytes != len(body) || f.Records != strings.Count(string(body), "\n") {
+			t.Errorf("manifest says %s has sha256 %s, %d bytes, %d records; it has %x, %d, %d",
+				f.Name, f.SHA256, f.Bytes, f.Records, sum, len(body), strings.Count(string(body), "\n"))
+		}
+		records += f.Records
+	}
+	if records != 4 {
+		t.Errorf("manifest counts %d records, want 4", records)
 	}
 	waitSwept(t, dir)
 
@@ -287,5 +311,33 @@ func TestNewFileSinkRejectsBadBase(t *testing.T) {
 	}
 	if _, err := eqmr.NewFileSink("out", "/tmp/out", eqmr.FileFormat{}); err == nil {
 		t.Error("NewFileSink with no format succeeded, want an error")
+	}
+}
+
+// TestFileSinkRefusesTruncatedAttempt commits an attempt cut short after it was
+// staged, and is refused rather than publishing a short shard.
+func TestFileSinkRefusesTruncatedAttempt(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	base := filepath.Join(dir, "out")
+	sink, err := eqmr.NewFileSink("out", base, eqmr.TSV)
+	if err != nil {
+		t.Fatalf("new file sink: %v", err)
+	}
+	staged := stage(ctx, t, sink, "/run", 0, 1, "a=1", "b=2")
+	var ref struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(staged, &ref); err != nil {
+		t.Fatalf("parse staged: %v", err)
+	}
+	if err := os.Truncate(filepath.Join(dir, ".out.eqmr", "staged", ref.Name), 4); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	if err := sink.Commit(ctx, "/run", 0, staged); !isMove(err) {
+		t.Errorf("commit of a truncated attempt: got %v, want a MoveError", err)
+	}
+	if _, err := os.Stat(shardname.Name(base, 0, 1)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("shard after a refused commit: got %v, want none", err)
 	}
 }
