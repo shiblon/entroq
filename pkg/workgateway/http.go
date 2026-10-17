@@ -21,7 +21,7 @@ type httpSession struct {
 	// was registered can still be taken back out of the map.
 	done chan struct{}
 
-	// id is the session the gateway minted, learned from the check. Guarded by
+	// id is the session the gateway minted, learned from the ready. Guarded by
 	// the Server's mutex, because the goroutine that ends a session reads it
 	// while the request that opened one writes it.
 	id string
@@ -82,7 +82,7 @@ var errNoSession = errors.New("unknown session")
 
 // open starts a session and answers its config request.
 //
-// The session is registered under the id the check reports, which is why this
+// The session is registered under the id the ready reports, which is why this
 // reads the answer before returning it: the client cannot send a second request
 // until it has this reply, so nothing can arrive for a session that is not yet
 // in the map.
@@ -123,7 +123,7 @@ func (s *Server) open(reqCtx context.Context, req *Request) (*Response, error) {
 	s.sessions[hs.id] = hs
 	s.mu.Unlock()
 
-	// It may have ended between the check and that registration, in which case
+	// It may have ended between the ready and that registration, in which case
 	// its own cleanup ran while there was nothing yet to clean. Checking AFTER
 	// registering is what makes the two orders equivalent.
 	select {

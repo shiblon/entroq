@@ -41,8 +41,8 @@ func open(t *testing.T, c *client, conf *Config) (string, *Response) {
 	conf.ProtocolVersions = []int32{1}
 	c.send(&Request{Type: ReqConfig, Config: conf})
 	check := c.recv()
-	if check.Type != RespCheck {
-		t.Fatalf("got %q, want %q", check.Type, RespCheck)
+	if check.Type != RespReady {
+		t.Fatalf("got %q, want %q", check.Type, RespReady)
 	}
 	c.send(&Request{Type: ReqReady, Session: check.Session})
 	return check.Session, c.recv()

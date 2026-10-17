@@ -221,8 +221,8 @@ func TestCheckAnswersTheConfig(t *testing.T) {
 		Queues:           []string{"inbox"},
 		ProtocolVersions: []int32{1},
 	}})
-	if check.Type != RespCheck {
-		t.Fatalf("answer to config = %q, want %q", check.Type, RespCheck)
+	if check.Type != RespReady {
+		t.Fatalf("answer to config = %q, want %q", check.Type, RespReady)
 	}
 	if check.Session == "" {
 		t.Error("check names no session, so a transport cannot register one")

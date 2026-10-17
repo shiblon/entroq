@@ -99,8 +99,8 @@ func TestHTTPRunsOneTaskEndToEnd(t *testing.T) {
 	}
 
 	check := w.register(&Config{Queues: []string{"inbox"}, ProtocolVersions: []int32{1}})
-	if check.Type != RespCheck {
-		t.Fatalf("answer to config = %q, want %q", check.Type, RespCheck)
+	if check.Type != RespReady {
+		t.Fatalf("answer to config = %q, want %q", check.Type, RespReady)
 	}
 	if check.Session == "" || check.Claimant == "" {
 		t.Fatalf("check names no session or claimant: %+v", check)

@@ -43,7 +43,7 @@ func TestDrainAnswersAnIdleSessionWithQuit(t *testing.T) {
 
 	c.send(&Request{Type: ReqConfig, Config: &Config{Queues: []string{"inbox"}, ProtocolVersions: []int32{1}}})
 	check := c.recv()
-	expectType(t, check, RespCheck)
+	expectType(t, check, RespReady)
 	c.send(&Request{Type: ReqReady, Session: check.Session})
 
 	// The ready is parked on an empty queue; the drain is what answers it.

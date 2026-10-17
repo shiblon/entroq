@@ -28,7 +28,7 @@ import (
 // is in and does not need to, because the gateway takes the turns.
 //
 // HTTP sessions live in a map keyed by the id the gateway minted, which this
-// learns from the check -- the very message it must read in order to answer
+// learns from the ready -- the very message it must read in order to answer
 // the config request. So a session is registered before the client can send
 // anything that would need to find it.
 type Server struct {
@@ -86,7 +86,7 @@ func (s *Server) ServeConn(ctx context.Context, conn Conn) error {
 //
 // A transport calls this on a context of the TRANSPORT's lifetime rather than
 // one request's, and keeps only the conn and that context's cancel. It needs
-// nothing else: a session id arrives in the check, which the transport must
+// nothing else: a session id arrives in the ready, which the transport must
 // read in order to answer the config request anyway, and which therefore
 // reaches it before the client can send anything further.
 //
@@ -131,19 +131,19 @@ func (s *Server) serve(ctx context.Context, conn Conn) error {
 	}
 	defer s.part(g)
 
-	// The check answers the config request that got us here, and carries the
+	// The ready answers the config request that got us here, and carries the
 	// three things a client cannot work out for itself: which session it is,
 	// which consumer holds its tasks, and how long it will actually be given
 	// for one of them.
 	//
 	// Sending it here is safe because serve is already the goroutine: the
 	// caller is not waiting on this send, it is waiting to read it.
-	check := g.newSend(RespCheck, ReqReady)
-	check.Claimant = g.claimant
-	check.WorkTimeoutS = int32(g.workTimeout / time.Second)
-	check.SilenceTimeoutS = int32(g.silenceTimeout() / time.Second)
-	if err := conn.Send(ctx, check); err != nil {
-		return fmt.Errorf("send check: %w", err)
+	ready := g.newSend(RespReady, ReqReady)
+	ready.Claimant = g.claimant
+	ready.WorkTimeoutS = int32(g.workTimeout / time.Second)
+	ready.SilenceTimeoutS = int32(g.silenceTimeout() / time.Second)
+	if err := conn.Send(ctx, ready); err != nil {
+		return fmt.Errorf("send ready: %w", err)
 	}
 	return g.Handle(ctx)
 }

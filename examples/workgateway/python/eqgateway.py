@@ -206,8 +206,8 @@ class HTTPExchange:
             raise GatewayError("caller" if resp.status < 500 else "gateway",
                                f"HTTP {resp.status}: {body.decode().strip()}")
         reply = json.loads(body)
-        if reply.get("type") == "check":
-            self.session = reply["session"]
+        if not self.session:
+            self.session = reply.get("session", "")
         return reply
 
     def abort(self):
@@ -300,10 +300,9 @@ class Session:
 
     def run(self):
         reply = self.send({"type": "config", "config": self.w.config()})
-        if reply["type"] == "check":
+        if reply["type"] == "ready":
             # Every third of the window, so one late keepalive is not fatal.
             self.keepalive_s = reply.get("silence_timeout_s", 0) / 3
-            reply = self.send({"type": "ready"})
         work = None
         while True:
             kind = reply["type"]
@@ -311,7 +310,10 @@ class Session:
                 return
             if kind == "error":
                 raise GatewayError(reply.get("class", "gateway"), reply.get("message", ""))
-            if kind == "take":
+            if kind == "ready":
+                # The gateway is waiting on a claim, and says so now and then.
+                msg = {"type": "ready"}
+            elif kind == "take":
                 work = Work(reply["task"])
                 claims, fate = self.settle(self.w.take, work, self.ctx)
                 msg = {"type": "take", "doc_set_claims": claims or [], **fate}

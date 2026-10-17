@@ -39,16 +39,21 @@ in any language, which speaks a small JSON protocol and never touches EntroQ,
 gRPC, or the queue API.
 
 The client drives. It speaks first, with a config naming the queues it serves
-and the phases it wants, and the gateway answers with a check naming its session
-and claimant. The client says it is ready, and from then on the gateway hands it
-one task at a time and waits for its answer:
+and the phases it wants, and the gateway answers with a ready naming its session
+and claimant. The client answers ready with ready, and from then on the gateway
+hands it one task at a time and waits for its answer:
 
     client  -> {"type":"config","config":{"queues":["in"],"protocol_versions":[1]}}
-    gateway -> {"type":"check","session":"...","claimant":"...","expect":"ready"}
+    gateway -> {"type":"ready","session":"...","claimant":"...","expect":"ready"}
     client  -> {"type":"ready","session":"..."}
     gateway -> {"type":"work","task":{...},"expect":"modify"}
     client  -> {"type":"modify","session":"...","modification":{...}}
     gateway -> {"type":"work",...}                       # the next task
+
+While it waits on a claim, the gateway answers with a ready every third of the
+silence window (silence_timeout_s, in the first ready), and the client answers
+with a ready of its own within that window; the next task answers whichever
+ready is waiting.
 
 Every domain object on the wire (task, docs, modification, dependency list) is
 the canonical protojson of the corresponding message in api/entroq.proto. The
@@ -60,8 +65,10 @@ and then ends the session, answered with {"type":"quit"}.
 
 With no --addr, one session runs over stdio: a client spawns this process and
 writes to its stdin, and reads its stdout, one JSON value per line. Diagnostics
-go to stderr. The first SIGINT or SIGTERM waits up to --lease for the client to
-quit; a second stops at once, leaving any task in hand to its lease.
+go to stderr. The first SIGINT or SIGTERM drains the session: it claims nothing
+more, finishes the task in hand, answers the client with a quit, and exits,
+waiting up to --lease; a second stops at once, leaving any task in hand to its
+lease.
 
 With --addr, sessions run over HTTP: the client POSTs each message and gets the
 gateway's answer as the response, and a session spans as many connections as it
@@ -74,8 +81,9 @@ after it:
 so a parent can pass port 0 and read where to connect. The gateway stops when
 its parent process exits, checked once a second against --parent-pid, or the
 parent it started with; --detached turns that off, for a gateway run as a
-service. The first SIGINT or SIGTERM ends every session and stops the server,
-leaving any task in hand to its lease.
+service. The first SIGINT or SIGTERM drains every session, as over stdio, and
+answers a config that arrives meanwhile with a quit; the server stops once all
+have ended. A second stops at once, leaving any task in hand to its lease.
 
 It exits with a class code a supervisor can key on: 0 clean, 75 transient
 (retryable, including EntroQ unreachable at startup), 78 caller fault

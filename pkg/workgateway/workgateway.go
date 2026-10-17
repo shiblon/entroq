@@ -112,7 +112,7 @@ type Config struct {
 	// The client asks because the client is what knows how long its work takes.
 	// The operator caps it with WithMaxWorkTimeout, because an unbounded wait
 	// holds a task under renewal where no other worker can reach it. A clamped
-	// request is reported back in the check, so a worker written against a
+	// request is reported back in the ready that answers its config, so a worker written against a
 	// budget it did not get does not merely look flaky.
 	WorkTimeoutS int32 `json:"work_timeout_s"`
 }
@@ -201,7 +201,10 @@ type ResponseType string
 
 // Send consts indicate the type of message the gateway is sending.
 const (
-	RespCheck      ResponseType = "check"
+	// RespReady answers a config, carrying what the session settled on, and
+	// any request whose answer has waited a third of the silence window while
+	// the gateway claims. A client answers it with a ready of its own.
+	RespReady      ResponseType = "ready"
 	RespTake       ResponseType = "take"
 	RespWork       ResponseType = "work"
 	RespSuccess    ResponseType = "success"
@@ -228,12 +231,12 @@ type Response struct {
 	Session  string `json:"session"`
 	Claimant string `json:"claimant"`
 
-	// WorkTimeoutS, in a check, is how long this session will actually wait for
+	// WorkTimeoutS, in the ready that answers a config, is how long this session will actually wait for
 	// a client's answer: what it asked for, or less if the operator caps it
 	// lower. Zero is no bound at all.
 	WorkTimeoutS int32 `json:"work_timeout_s,omitempty"`
 
-	// SilenceTimeoutS, in a check, is how long the gateway waits on a client
+	// SilenceTimeoutS, in the ready that answers a config, is how long the gateway waits on a client
 	// that has said it is working and then fallen quiet: see ReqWorking.
 	SilenceTimeoutS int32 `json:"silence_timeout_s,omitempty"`
 
@@ -355,9 +358,11 @@ type Request struct {
 // Protocol:
 //
 //	Client -> Config   -> Gateway
-//	Client <- Check	   -> Gateway
+//	Client <- Ready    <- Gateway
 //	Client -> Ready    -> Gateway
-//	... (Gateway waits on a claim)
+//	... (Gateway waits on a claim; every third of the silence window:)
+//	Client <- Ready    <- Gateway
+//	Client -> Ready    -> Gateway
 //	Client <- TakeDocs      <- Gateway
 //	Client -> Doc Refs -> Gateway
 //	Client <- Do Work  <- Gateway
@@ -383,13 +388,17 @@ type Gateway struct {
 
 	opts gatewayOpts
 
-	// workTimeout is what this session settled on, which the check reports so
+	// workTimeout is what this session settled on, which the ready reports so
 	// a clamped client knows the budget it actually has.
 	workTimeout time.Duration
 
 	cancel   context.CancelFunc
 	closed   bool
 	quitting bool
+
+	// kept is conn once Handle starts, answering with a ready any request
+	// that waits too long on a claim.
+	kept *keptConn
 
 	// armed is whether the task in hand holds the client to the silence
 	// timeout. Only the worker's goroutine touches it.
@@ -492,6 +501,16 @@ func (g *Gateway) Handle(ctx context.Context) error {
 	g.Lock()
 	closed := g.closed
 	g.cancel = cancel
+	g.kept = &keptConn{
+		Conn:   g.conn,
+		ctx:    ctx,
+		every:  g.silenceTimeout() / 3,
+		within: g.silenceTimeout(),
+		ready:  func() *Response { return g.newSend(RespReady, ReqReady) },
+		quit:   g.drain,
+		fail:   g.stopClaiming,
+	}
+	g.conn = g.kept
 	g.Unlock()
 	if closed {
 		return fmt.Errorf("session closed, can't serve")
@@ -522,14 +541,14 @@ func (g *Gateway) Handle(ctx context.Context) error {
 			case <-ctx.Done():
 			}
 		}()
-		return g.finish(ctx, g.worker.Run(ctx,
+		return g.finish(ctx, g.ended(g.worker.Run(ctx,
 			worker.AsClaimant(g.claimant),
 			worker.Watching(g.config.Queues...),
 			worker.WithMaxAttempts(g.config.MaxAttempts),
 			worker.WithMaxClaims(g.config.MaxClaims),
 			worker.WithLease(g.opts.lease),
 			worker.WithWorkTimeout(g.workTimeout),
-		))
+		)))
 	default:
 		return g.finish(ctx, worker.FatalErrorf("expected %q to begin the session, got %q", ReqReady, msg.Type))
 	}
@@ -541,6 +560,10 @@ func (g *Gateway) Handle(ctx context.Context) error {
 // error that stopped the session, with its class. A clean stop the client did
 // not ask for -- a hang-up, a Close -- owes nobody an answer.
 func (g *Gateway) finish(ctx context.Context, runErr error) error {
+	if errors.Is(runErr, errIdleSilent) {
+		// The client has gone, and nothing it could read is owed.
+		return nil
+	}
 	err := g.exit(runErr)
 	var last *Response
 	if ee, ok := AsExit(err); ok {
@@ -556,7 +579,13 @@ func (g *Gateway) finish(ctx context.Context, runErr error) error {
 	// ended mid-work may never send one.
 	sctx, cancel := context.WithTimeout(ctx, g.opts.lease)
 	defer cancel()
-	if serr := g.conn.Send(sctx, last); serr != nil {
+	// An idle turn that failed left its request owed, and the kept conn
+	// sends nothing more, so the answer to it goes out underneath.
+	conn := g.conn
+	if g.kept != nil && g.kept.failure() != nil {
+		conn = g.kept.Conn
+	}
+	if serr := conn.Send(sctx, last); serr != nil {
 		log.Printf("work gateway: session %s: send %s: %v", g.sessionID, last.Type, serr)
 	}
 	return err
@@ -740,6 +769,25 @@ func (g *Gateway) drain() {
 			log.Printf("work gateway: session %s: drain: %v", g.sessionID, err)
 		}
 	}()
+}
+
+// stopClaiming ends a session whose client failed an idle turn: it claims
+// nothing more, and the task in hand, if any, is left to its lease.
+func (g *Gateway) stopClaiming() {
+	go func() {
+		if err := g.worker.Shutdown(context.Background()); err != nil {
+			log.Printf("work gateway: session %s: stop claiming: %v", g.sessionID, err)
+		}
+	}()
+}
+
+// ended is why the session ended: the worker's reason, unless an idle turn
+// failed, which is what stopped the worker.
+func (g *Gateway) ended(runErr error) error {
+	if err := g.kept.failure(); err != nil {
+		return err
+	}
+	return runErr
 }
 
 // quitRequested reports whether the client or the operator asked to stop.

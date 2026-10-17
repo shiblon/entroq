@@ -99,7 +99,7 @@ func TestStreamFailedSendEndsTheSession(t *testing.T) {
 	c := NewStreamConn(Joining(blocked, failingWriter{err: gone}))
 	defer c.Close()
 
-	if err := c.Send(ctx, &Response{Type: RespCheck}); !errors.Is(err, gone) {
+	if err := c.Send(ctx, &Response{Type: RespReady}); !errors.Is(err, gone) {
 		t.Errorf("Send = %v, want the write error %v", err, gone)
 	}
 	select {
@@ -325,8 +325,8 @@ func TestStreamRunsOneTaskEndToEnd(t *testing.T) {
 	c.send(&Request{Type: ReqConfig, Config: &Config{Queues: []string{"inbox"}, ProtocolVersions: []int32{1}}})
 
 	check := c.recv()
-	if check.Type != RespCheck {
-		t.Fatalf("first message = %q, want %q", check.Type, RespCheck)
+	if check.Type != RespReady {
+		t.Fatalf("first message = %q, want %q", check.Type, RespReady)
 	}
 	if check.Session == "" || check.Claimant == "" {
 		t.Errorf("check names no session or claimant: %+v", check)
@@ -806,7 +806,7 @@ func TestStreamConnCloseIsOneStep(t *testing.T) {
 	if _, err := c.Recv(ctx); !errors.Is(err, io.EOF) {
 		t.Errorf("Recv after Close = %v, want io.EOF", err)
 	}
-	if err := c.Send(ctx, &Response{Type: RespCheck}); !errors.Is(err, io.EOF) {
+	if err := c.Send(ctx, &Response{Type: RespReady}); !errors.Is(err, io.EOF) {
 		t.Errorf("Send after Close = %v, want io.EOF", err)
 	}
 }
@@ -852,8 +852,8 @@ func TestStreamWorkTimeoutEndsTheSession(t *testing.T) {
 
 	c.send(&Request{Type: ReqConfig, Config: &Config{Queues: []string{"inbox"}, ProtocolVersions: []int32{1}}})
 	check := c.recv()
-	if check.Type != RespCheck {
-		t.Fatalf("first message = %q, want %q", check.Type, RespCheck)
+	if check.Type != RespReady {
+		t.Fatalf("first message = %q, want %q", check.Type, RespReady)
 	}
 	c.send(&Request{Type: ReqReady, Session: check.Session})
 	if work := c.recv(); work.Type != RespWork {
