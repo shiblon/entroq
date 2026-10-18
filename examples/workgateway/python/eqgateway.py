@@ -21,7 +21,7 @@ or for several kinds of work in one process, hand them all to one Gateway:
 Underneath is the whole client side of the protocol: one blocking call,
 exchange, that sends a message and returns the gateway's answer, and a switch on
 what comes back. It runs over HTTP to one `eqlink work --addr` child shared by
-every session, or over stdio to a child per session.
+every session.
 """
 import http.client
 import json
@@ -151,8 +151,9 @@ class Modification:
 M = Modification
 
 
-# Transports. Each has exchange(msg) -> reply and close(). A child runs in a
-# session of its own, so a signal reaches it only when the Gateway passes it on.
+# The transport: one child, and an exchange(msg) -> reply per session. The
+# child runs in a session of its own, so a signal reaches it only when the
+# Gateway passes it on.
 
 class HTTPChild:
     """One `eqlink work --addr` child, shared by every session in this process.
@@ -217,36 +218,6 @@ class HTTPExchange:
 
     def close(self):
         self.conn.close()
-
-
-class StdioExchange:
-    """One session over a child's stdin and stdout, one JSON value per line."""
-
-    def __init__(self, argv):
-        self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     start_new_session=True)
-        self.mu = threading.Lock()
-
-    def exchange(self, msg):
-        with self.mu:
-            try:
-                self.proc.stdin.write((json.dumps(msg) + "\n").encode())
-                self.proc.stdin.flush()
-            except (BrokenPipeError, ValueError):
-                pass  # the read below finds the gateway gone and says why
-            line = self.proc.stdout.readline()
-        if not line:
-            raise exit_error(self.proc.wait())
-        return json.loads(line)
-
-    def signal(self, signum):
-        if self.proc.poll() is None:
-            self.proc.send_signal(signum)
-
-    def close(self):
-        if not self.proc.stdin.closed:
-            self.proc.stdin.close()
-        self.proc.wait()
 
 
 def exit_error(code):
@@ -416,14 +387,11 @@ class Worker:
 
 class Gateway:
     """Runs workers through `eqlink work`, each as a session of its own, and
-    stops them together. Over HTTP every session shares one child; over stdio
-    each has its own. args are the operator's flags for `eqlink work`, such as
-    --lease."""
+    stops them together. Every session shares one child. args are the
+    operator's flags for `eqlink work`, such as --lease."""
 
-    def __init__(self, entroq="localhost:37706", transport="http", eqlink="eqlink", args=()):
-        self.argv = [eqlink, "--entroq", entroq, "work", *args]
-        self.transport = transport
-        self.child = None
+    def __init__(self, entroq="localhost:37706", eqlink="eqlink", args=()):
+        self.child = HTTPChild([eqlink, "--entroq", entroq, "work", *args])
         self.stopping = threading.Event()
         self.mu = threading.Lock()
         self.sessions = set()
@@ -433,23 +401,16 @@ class Gateway:
         """Run until every worker has stopped: by ctx.stop, by SIGINT or
         SIGTERM, or by a failure a new session cannot fix. The first signal
         drains; a second hangs up at once."""
-        if self.transport == "http":
-            self.child = HTTPChild(self.argv)
-            connect = self.child.connect
-        else:
-            def connect():
-                return StdioExchange(self.argv)
         signal.signal(signal.SIGINT, self._on_signal)
         signal.signal(signal.SIGTERM, self._on_signal)
-        runners = [threading.Thread(target=self._serve, args=(w, connect)) for w in workers]
+        runners = [threading.Thread(target=self._serve, args=(w,)) for w in workers]
         try:
             for r in runners:
                 r.start()
             for r in runners:
                 r.join()
         finally:
-            if self.child is not None:
-                self.child.close()
+            self.child.close()
         if self.failure is not None:
             raise self.failure
 
@@ -460,30 +421,22 @@ class Gateway:
         with self.mu:
             for s in self.sessions:
                 s.stopping.set()
-        self._signal(signum)
-
-    def _signal(self, signum):
-        if self.child is not None:
-            self.child.signal(signum)
-            return
-        with self.mu:
-            for s in self.sessions:
-                s.xchg.signal(signum)
+        self.child.signal(signum)
 
     def _on_signal(self, signum, frame):
         if self.stopping.is_set():
             # A second signal: the gateway hangs up, leaving tasks to their leases.
-            self._signal(signum)
+            self.child.signal(signum)
             os._exit(130)
         print(f"[worker] {signal.Signals(signum).name}: draining", file=sys.stderr)
         self.stop(signum)
 
-    def _serve(self, worker, connect):
+    def _serve(self, worker):
         """Run one worker's sessions one after another until it stops."""
         backoff = 0.2
         while not self.stopping.is_set():
             try:
-                xchg = connect()
+                xchg = self.child.connect()
             except GatewayError as e:
                 if not self._recoverable(e):
                     return

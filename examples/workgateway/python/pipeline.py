@@ -15,8 +15,7 @@ Prerequisites: a reachable EntroQ and `eqlink` on PATH.
 
     ENTROQ_ADDR=localhost:37706 python3 pipeline.py
 
-Over HTTP (the default) the four workers share one `eqlink work` child.
-TRANSPORT=stdio gives each its own instead. EQLINK_ARGS adds flags for
+The four workers share one `eqlink work` child. EQLINK_ARGS adds flags for
 `eqlink work`, such as "--lease 3s".
 """
 import os
@@ -65,7 +64,6 @@ def nap(w, ctx):
 
 if __name__ == "__main__":
     gateway = Gateway(
-        transport=os.environ.get("TRANSPORT", "http"),
         eqlink=os.environ.get("EQLINK", "eqlink"),
         entroq=os.environ.get("ENTROQ_ADDR", "localhost:37706"),
         args=shlex.split(os.environ.get("EQLINK_ARGS", "")),

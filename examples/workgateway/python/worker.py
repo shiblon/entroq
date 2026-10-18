@@ -6,8 +6,7 @@ Prerequisites: a reachable EntroQ and `eqlink` on PATH.
     ENTROQ_ADDR=localhost:37706 QUEUE=in python3 worker.py
 
 WORKERS runs that many at once (default 2), each holding one task at a time.
-TRANSPORT=stdio runs a gateway child per worker instead of one HTTP gateway for
-all of them. EQLINK_ARGS adds flags for `eqlink work`, such as "--lease 10s".
+EQLINK_ARGS adds flags for `eqlink work`, such as "--lease 10s".
 """
 import os
 import shlex
@@ -32,7 +31,6 @@ def work(w, ctx):
 if __name__ == "__main__":
     queue = os.environ.get("QUEUE", "in")
     gateway = Gateway(
-        transport=os.environ.get("TRANSPORT", "http"),
         eqlink=os.environ.get("EQLINK", "eqlink"),
         entroq=os.environ.get("ENTROQ_ADDR", "localhost:37706"),
         args=shlex.split(os.environ.get("EQLINK_ARGS", "")),

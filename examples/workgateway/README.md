@@ -23,11 +23,9 @@ gateway as a child process, so nothing else need be running:
 ENTROQ_ADDR=localhost:37706 QUEUE=in python3 python/worker.py
 ```
 
-By default it runs one `eqlink work --addr 127.0.0.1:0` child and two workers
-over HTTP to it (`WORKERS` sets how many), each a session holding one task at a
-time. `TRANSPORT=stdio` runs a child per worker and talks to it over stdin and
-stdout instead. Either way the gateway
-dies with the worker, however the worker dies.
+It runs one `eqlink work --addr 127.0.0.1:0` child and two workers over HTTP
+to it (`WORKERS` sets how many), each a session holding one task at a
+time. The gateway dies with the worker, however the worker dies.
 
 `pipeline.py` runs the same way, on queues under `demo/`
 (`ENTROQ_ADDR=localhost:37706 python3 python/pipeline.py`).
