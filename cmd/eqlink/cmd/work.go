@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/shiblon/entroq"
@@ -85,38 +87,82 @@ service. The first SIGINT or SIGTERM drains every session, as over stdio, and
 answers a config that arrives meanwhile with a quit; the server stops once all
 have ended. A second stops at once, leaving any task in hand to its lease.
 
+Every HTTP answer is a JSON message. An error's status follows its class: 400
+caller, 503 transient, 500 gateway, and 404 for "gone", a session the gateway
+does not hold, which the client answers by starting over with a config.
+
 It exits with a class code a supervisor can key on: 0 clean, 75 transient
 (retryable, including EntroQ unreachable at startup), 78 caller fault
-(including bad flags or credentials), 70 gateway fault.
+(including bad flags or credentials), 70 gateway fault. One that fails before
+a client owns stdout first writes the reason there, as one line:
+
+    {"type":"error","class":"transient","message":"..."}
 
 See examples/workgateway for a client.`,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if workMaxFrameMB < 0 {
-			return badFlag("--max-frame-mb must not be negative")
-		}
-		if workParentPID < 0 {
-			return badFlag("--parent-pid must not be negative")
-		}
-		if workAddr == "" && (workParentPID != 0 || workDetached) {
-			return badFlag("--parent-pid and --detached apply only with --addr")
-		}
-		opts := []workgateway.Option{
-			workgateway.WithLease(workLease),
-			workgateway.WithMaxWorkTimeout(workMaxWorkTimeout),
-			workgateway.WithMaxFrameBytes(workMaxFrameMB << 20),
-		}
-		if workAddr != "" {
-			return serveWorkHTTP(workAddr, opts)
-		}
-		return serveWorkStdio(opts)
+		out := &workOut{w: os.Stdout}
+		return out.report(runWork(out))
 	},
+}
+
+// runWork checks the flags and serves sessions on the transport they name.
+func runWork(out *workOut) error {
+	if workMaxFrameMB < 0 {
+		return badFlag("--max-frame-mb must not be negative")
+	}
+	if workParentPID < 0 {
+		return badFlag("--parent-pid must not be negative")
+	}
+	if workAddr == "" && (workParentPID != 0 || workDetached) {
+		return badFlag("--parent-pid and --detached apply only with --addr")
+	}
+	opts := []workgateway.Option{
+		workgateway.WithLease(workLease),
+		workgateway.WithMaxWorkTimeout(workMaxWorkTimeout),
+		workgateway.WithMaxFrameBytes(workMaxFrameMB << 20),
+	}
+	if workAddr != "" {
+		return serveWorkHTTP(workAddr, out, opts)
+	}
+	return serveWorkStdio(out, opts)
+}
+
+// workOut is stdout, which a client owns once it has been handed over: to a
+// stdio session, or to the HTTP address line. A gateway that fails before then
+// says why there, as an error a client reads like any other answer.
+type workOut struct {
+	w     io.WriteCloser
+	taken atomic.Bool
+}
+
+// take hands the stream to a client; nothing else is written to it after.
+func (o *workOut) take() io.WriteCloser {
+	o.taken.Store(true)
+	return o.w
+}
+
+// report writes err as an error line if no client owns the stream yet, and
+// returns err.
+func (o *workOut) report(err error) error {
+	if err == nil || o.taken.Load() {
+		return err
+	}
+	class := workgateway.ExitGateway
+	if ee, ok := workgateway.AsExit(err); ok {
+		class = ee.Class
+	}
+	line := &workgateway.Response{Type: workgateway.RespError, Class: class.String(), Message: err.Error()}
+	if werr := json.NewEncoder(o.w).Encode(line); werr != nil {
+		log.Printf("work gateway: report %v: %v", err, werr)
+	}
+	return err
 }
 
 // serveWorkStdio runs one session over stdin and stdout, for a client that
 // spawned this process.
-func serveWorkStdio(opts []workgateway.Option) error {
+func serveWorkStdio(out *workOut, opts []workgateway.Option) error {
 	// The session drains: it finishes the task in hand and answers with a quit.
 	// Before the server exists there is nothing to drain.
 	var gw *workgateway.Server
@@ -153,14 +199,14 @@ func serveWorkStdio(opts []workgateway.Option) error {
 		// The session is the whole run, so its end releases whatever else
 		// the group is holding open.
 		defer cancel()
-		conn := workgateway.NewStreamConn(workgateway.Joining(os.Stdin, os.Stdout), opts...)
+		conn := workgateway.NewStreamConn(workgateway.Joining(os.Stdin, out.take()), opts...)
 		return gw.ServeConn(gctx, conn)
 	})
 	return g.Wait()
 }
 
 // serveWorkHTTP serves sessions over HTTP on addr until a signal stops it.
-func serveWorkHTTP(addr string, opts []workgateway.Option) error {
+func serveWorkHTTP(addr string, out *workOut, opts []workgateway.Option) error {
 	// Sessions live on a context of their own, because a waiting request is
 	// a session waiting on a claim: the server cannot shut down around them
 	// until they have ended.
@@ -208,7 +254,7 @@ func serveWorkHTTP(addr string, opts []workgateway.Option) error {
 	announce := struct {
 		Addr string `json:"addr"`
 	}{ln.Addr().String()}
-	if err := json.NewEncoder(os.Stdout).Encode(announce); err != nil {
+	if err := json.NewEncoder(out.take()).Encode(announce); err != nil {
 		if cerr := ln.Close(); cerr != nil {
 			log.Printf("work gateway: close listener: %v", cerr)
 		}

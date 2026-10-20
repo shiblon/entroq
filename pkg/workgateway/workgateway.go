@@ -255,7 +255,9 @@ type Response struct {
 
 	// Class and Message say why the gateway will not go on. Class is an
 	// ExitClass token ("transient", "caller", "gateway"), so a client branches
-	// on whether reconnecting could help rather than reading the message.
+	// on whether reconnecting could help rather than reading the message. Over
+	// HTTP it may also be "gone": the request named a session the server does
+	// not hold, and the client starts over with a config.
 	//
 	// This is the SESSION failing, not a task: a task's fate travels the other
 	// way, as the Outcome a client reports.

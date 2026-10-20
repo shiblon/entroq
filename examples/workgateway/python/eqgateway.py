@@ -48,6 +48,14 @@ class SessionGone(Exception):
     """The gateway no longer has this session, so start a new one."""
 
 
+def failure(msg):
+    """The exception an error message raises: "gone" starts a new session, and
+    any other class ends this one as a GatewayError."""
+    if msg.get("class") == "gone":
+        return SessionGone(msg.get("message", ""))
+    return GatewayError(msg.get("class", "gateway"), msg.get("message", ""))
+
+
 class Work:
     """A task in hand: the task (the protojson of an api.Task), its value, the
     docs claimed for it, and the sets they were claimed as. docs and sets are
@@ -177,7 +185,11 @@ class HTTPChild:
         line = proc.stdout.readline()
         if not line:
             raise exit_error(proc.wait())
-        host, port = json.loads(line)["addr"].rsplit(":", 1)
+        announce = json.loads(line)
+        if announce.get("type") == "error":
+            proc.wait()
+            raise failure(announce)
+        host, port = announce["addr"].rsplit(":", 1)
         return proc, (host, int(port))
 
     def signal(self, signum):
@@ -206,12 +218,14 @@ class HTTPExchange:
             self.conn.request("POST", "/", json.dumps(msg), {"Content-Type": "application/json"})
             resp = self.conn.getresponse()
             body = resp.read()
-        if resp.status == 404:
-            raise SessionGone(body.decode().strip())
-        if resp.status != 200:
+        if resp.getheader("Content-Type", "") != "application/json":
+            # Not the gateway's answer (a proxy's, say), so the status is all
+            # there is to go on.
             raise GatewayError("caller" if resp.status < 500 else "gateway",
-                               f"HTTP {resp.status}: {body.decode().strip()}")
+                               f"HTTP {resp.status}: {body.decode(errors='replace').strip()}")
         reply = json.loads(body)
+        if reply.get("type") == "error":
+            raise failure(reply)
         if not self.session:
             self.session = reply.get("session", "")
         return reply
@@ -221,7 +235,7 @@ class HTTPExchange:
 
 
 def exit_error(code):
-    """What a gateway's exit code says about the session it carried."""
+    """What a gateway's exit code says, when it exited without a word."""
     if code == 0:
         return SessionGone("gateway exited")
     cls = {75: "transient", 78: "caller"}.get(code, "gateway")
@@ -278,8 +292,6 @@ class Session:
             kind = reply["type"]
             if kind == "quit":
                 return
-            if kind == "error":
-                raise GatewayError(reply.get("class", "gateway"), reply.get("message", ""))
             if kind == "ready":
                 # The gateway is waiting on a claim, and says so now and then.
                 msg = {"type": "ready"}
@@ -316,6 +328,8 @@ class Session:
             return None, {}
         try:
             return self.keeping_alive(fn, *args), {}
+        except (GatewayError, SessionGone):
+            raise  # a read that found the session ending; the task has no say
         except RetryError as e:
             return None, {"outcome": "retry", "error": {"message": str(e), "queue": e.or_move_to}}
         except MoveError as e:

@@ -34,7 +34,7 @@ type httpSession struct {
 // to know which session the body belongs to, or whether it starts one.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "the work gateway speaks POST", http.StatusMethodNotAllowed)
+		refuse(w, http.StatusMethodNotAllowed, ExitCaller.String(), "the work gateway speaks POST")
 		return
 	}
 	// The same bound the stream transport frames by, so a client's message
@@ -49,10 +49,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
-			http.Error(w, fmt.Sprintf("request over %d bytes", tooLarge.Limit), http.StatusRequestEntityTooLarge)
+			refuse(w, http.StatusRequestEntityTooLarge, ExitCaller.String(), fmt.Sprintf("request over %d bytes", tooLarge.Limit))
 			return
 		}
-		http.Error(w, fmt.Sprintf("decode request: %v", err), http.StatusBadRequest)
+		refuse(w, http.StatusBadRequest, ExitCaller.String(), fmt.Sprintf("decode request: %v", err))
 		return
 	}
 
@@ -69,10 +69,44 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	answer(w, statusOf(resp), resp)
+}
+
+// classGone is the class of an error for a request naming a session this
+// server does not hold. It is not an ExitClass, because nothing exits with it:
+// the client starts over with a config, at once.
+const classGone = "gone"
+
+// statusOf is the HTTP status for resp: 200, or for an error the status its
+// class calls for.
+func statusOf(resp *Response) int {
+	if resp.Type != RespError {
+		return http.StatusOK
+	}
+	switch resp.Class {
+	case ExitCaller.String():
+		return http.StatusBadRequest
+	case ExitTransient.String():
+		return http.StatusServiceUnavailable
+	case classGone:
+		return http.StatusNotFound
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+// answer writes resp as the JSON body of a response with status.
+func answer(w http.ResponseWriter, status int, resp *Response) {
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		log.Printf("work gateway: write response: %v", err)
 	}
+}
+
+// refuse answers a request with an error of class, and status.
+func refuse(w http.ResponseWriter, status int, class, message string) {
+	answer(w, status, &Response{Type: RespError, Class: class, Message: message})
 }
 
 // errNoSession is what a request naming a session this server does not hold
@@ -187,17 +221,17 @@ func (s *httpSession) exchange(reqCtx context.Context, req *Request) (*Response,
 // fail answers a request this server could not carry.
 //
 // A session it does not know is the one worth distinguishing: it means start
-// over, not try again, so it gets 404 rather than a 5xx a client would retry
-// into the same wall.
+// over, not try again, so it is gone, 404, rather than a 5xx a client would
+// retry into the same wall.
 func (s *Server) fail(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, errNoSession):
-		http.Error(w, err.Error(), http.StatusNotFound)
+		refuse(w, http.StatusNotFound, classGone, err.Error())
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		// The client stopped waiting, so there is nobody to tell. 499 is
 		// nginx's for exactly this and costs nothing if it goes nowhere.
 		w.WriteHeader(499)
 	default:
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		refuse(w, http.StatusInternalServerError, ExitGateway.String(), err.Error())
 	}
 }

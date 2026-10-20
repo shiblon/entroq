@@ -26,7 +26,8 @@ type httpWorker struct {
 }
 
 // post carries one exchange and returns the status alongside the answer, since
-// a status is part of what this transport tells a client.
+// a status is part of what this transport tells a client. Every answer is a
+// JSON Response, an error as much as anything else.
 func (w *httpWorker) post(req *Request) (*Response, int) {
 	w.t.Helper()
 	req.Session = w.session
@@ -39,22 +40,28 @@ func (w *httpWorker) post(req *Request) (*Response, int) {
 		w.t.Fatalf("post %q: %v", req.Type, err)
 	}
 	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		return nil, res.StatusCode
+	return decodeAnswer(w.t, req.Type, res), res.StatusCode
+}
+
+// decodeAnswer is the JSON Response in res's body.
+func decodeAnswer(t *testing.T, kind RequestType, res *http.Response) *Response {
+	t.Helper()
+	if ct := res.Header.Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("answer to %q (status %d) has Content-Type %q, want application/json", kind, res.StatusCode, ct)
 	}
 	var resp Response
 	if err := json.NewDecoder(res.Body).Decode(&resp); err != nil {
-		w.t.Fatalf("decode answer to %q: %v", req.Type, err)
+		t.Fatalf("decode answer to %q: %v", kind, err)
 	}
-	return &resp, res.StatusCode
+	return &resp
 }
 
 // ask is post for the usual case, where anything but 200 is a test failure.
 func (w *httpWorker) ask(req *Request) *Response {
 	w.t.Helper()
 	resp, status := w.post(req)
-	if resp == nil {
-		w.t.Fatalf("%q answered with status %d", req.Type, status)
+	if status != http.StatusOK {
+		w.t.Fatalf("%q answered with status %d: %+v", req.Type, status, resp)
 	}
 	return resp
 }
@@ -129,8 +136,8 @@ func TestHTTPRunsOneTaskEndToEnd(t *testing.T) {
 	})
 	// The session ends while answering, so either a last answer or a closed
 	// session is correct here; what matters is what happened to the task.
-	if resp == nil && status != http.StatusNotFound {
-		t.Errorf("answer to the final modify had status %d", status)
+	if status != http.StatusOK && status != http.StatusNotFound {
+		t.Errorf("answer to the final modify had status %d: %+v", status, resp)
 	}
 
 	left, err := eq.Tasks(ctx, "inbox")
@@ -226,23 +233,36 @@ func TestHTTPUnknownSessionIsNotFound(t *testing.T) {
 
 	w, _ := httpFixture(ctx, t)
 	w.session = "a-session-that-never-was"
-	if _, status := w.post(&Request{Type: ReqReady}); status != http.StatusNotFound {
+	resp, status := w.post(&Request{Type: ReqReady})
+	if status != http.StatusNotFound {
 		t.Errorf("unknown session answered with %d, want %d", status, http.StatusNotFound)
+	}
+	expectRefusal(t, resp, classGone)
+}
+
+// expectRefusal checks that resp is an error of class, with a message.
+func expectRefusal(t *testing.T, resp *Response, class string) {
+	t.Helper()
+	if resp.Type != RespError || resp.Class != class || resp.Message == "" {
+		t.Errorf("answer = %+v, want an error of class %q with a message", resp, class)
 	}
 }
 
 // TestHTTPRefusesABadConfig checks that a registration this gateway will not
-// serve is still answered, with a class a client can branch on, and that it
-// leaves no session behind.
+// serve is still answered, with a class a client can branch on and the status
+// for it, and that it leaves no session behind.
 func TestHTTPRefusesABadConfig(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	w, _ := httpFixture(ctx, t)
-	resp := w.ask(&Request{Type: ReqConfig, Config: &Config{
+	resp, status := w.post(&Request{Type: ReqConfig, Config: &Config{
 		Queues:           []string{"inbox"},
 		ProtocolVersions: []int32{99},
 	}})
+	if status != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", status, http.StatusBadRequest)
+	}
 	if resp.Type != RespError {
 		t.Errorf("refusal type = %q, want %q", resp.Type, RespError)
 	}
@@ -296,9 +316,9 @@ func TestHTTPForgetsFinishedSessions(t *testing.T) {
 	}
 }
 
-// TestHTTPRefusesWhatItDoesNotSpeak covers the two transport-level refusals,
-// which are statuses rather than protocol messages: nothing is known about the
-// session yet, so there is nothing to answer in the protocol's own terms.
+// TestHTTPRefusesWhatItDoesNotSpeak covers the two transport-level refusals.
+// Nothing is known about the session yet, but each is still answered as an
+// error a client reads the same way as any other: a caller fault.
 func TestHTTPRefusesWhatItDoesNotSpeak(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -308,18 +328,41 @@ func TestHTTPRefusesWhatItDoesNotSpeak(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	res.Body.Close()
+	defer res.Body.Close()
 	if res.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("GET answered with %d, want %d", res.StatusCode, http.StatusMethodNotAllowed)
 	}
+	expectRefusal(t, decodeAnswer(t, "GET", res), ExitCaller.String())
 
 	res, err = http.Post(w.url, "application/json", bytes.NewReader([]byte("not json")))
 	if err != nil {
 		t.Fatalf("Post: %v", err)
 	}
-	res.Body.Close()
+	defer res.Body.Close()
 	if res.StatusCode != http.StatusBadRequest {
 		t.Errorf("a malformed body answered with %d, want %d", res.StatusCode, http.StatusBadRequest)
+	}
+	expectRefusal(t, decodeAnswer(t, "not json", res), ExitCaller.String())
+}
+
+// TestHTTPStatusFollowsTheClass pins the status each error class is answered
+// with, so a client or a proxy that reads only the status reads it rightly.
+func TestHTTPStatusFollowsTheClass(t *testing.T) {
+	for _, tc := range []struct {
+		resp *Response
+		want int
+	}{
+		{&Response{Type: RespWork}, http.StatusOK},
+		{&Response{Type: RespQuit}, http.StatusOK},
+		{&Response{Type: RespError, Class: ExitCaller.String()}, http.StatusBadRequest},
+		{&Response{Type: RespError, Class: ExitTransient.String()}, http.StatusServiceUnavailable},
+		{&Response{Type: RespError, Class: classGone}, http.StatusNotFound},
+		{&Response{Type: RespError, Class: ExitGateway.String()}, http.StatusInternalServerError},
+		{&Response{Type: RespError}, http.StatusInternalServerError},
+	} {
+		if got := statusOf(tc.resp); got != tc.want {
+			t.Errorf("statusOf(%s %q) = %d, want %d", tc.resp.Type, tc.resp.Class, got, tc.want)
+		}
 	}
 }
 
@@ -356,6 +399,7 @@ func TestHTTPRefusesAnOversizeBody(t *testing.T) {
 	if w.Code != http.StatusRequestEntityTooLarge {
 		t.Errorf("an oversize body answered with %d, want %d", w.Code, http.StatusRequestEntityTooLarge)
 	}
+	expectRefusal(t, decodeAnswer(t, ReqConfig, w.Result()), ExitCaller.String())
 	if h.Sessions() != 0 {
 		t.Errorf("a refused body left %d sessions behind, want none", h.Sessions())
 	}
@@ -456,14 +500,11 @@ func (w *httpWorker) tryPost(timeout time.Duration, req *Request) (*Response, in
 		return nil, 0, err
 	}
 	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
+	if res.StatusCode == 499 {
+		// The gateway saw this client give up; there is no body.
 		return nil, res.StatusCode, nil
 	}
-	var resp Response
-	if err := json.NewDecoder(res.Body).Decode(&resp); err != nil {
-		w.t.Fatalf("decode answer to %q: %v", req.Type, err)
-	}
-	return &resp, res.StatusCode, nil
+	return decodeAnswer(w.t, req.Type, res), res.StatusCode, nil
 }
 
 // TestHTTPWorkTimeoutEndsTheSession pins what a fired work timeout owes the

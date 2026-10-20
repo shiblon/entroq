@@ -1,7 +1,11 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"syscall"
 	"testing"
@@ -93,8 +97,8 @@ func TestServeWork_StopsDuringStartup(t *testing.T) {
 	workLease = time.Minute
 
 	for name, serve := range map[string]func() error{
-		"stdio": func() error { return serveWorkStdio(nil) },
-		"http":  func() error { return serveWorkHTTP("127.0.0.1:0", nil) },
+		"stdio": func() error { return serveWorkStdio(discardOut(), nil) },
+		"http":  func() error { return serveWorkHTTP("127.0.0.1:0", discardOut(), nil) },
 	} {
 		t.Run(name, func(t *testing.T) {
 			done := make(chan error, 1)
@@ -112,5 +116,67 @@ func TestServeWork_StopsDuringStartup(t *testing.T) {
 				t.Fatal("a signal during start-up did not stop the gateway")
 			}
 		})
+	}
+}
+
+// discardOut is a workOut nobody reads.
+func discardOut() *workOut {
+	return &workOut{w: nopWriteCloser{io.Discard}}
+}
+
+type nopWriteCloser struct{ io.Writer }
+
+func (nopWriteCloser) Close() error { return nil }
+
+// TestServeWork_SaysWhyItCouldNotStart is a gateway that cannot reach EntroQ:
+// before it exits, it writes the reason on stdout as the one line a client
+// reads, an error of the class its exit code carries.
+func TestServeWork_SaysWhyItCouldNotStart(t *testing.T) {
+	saved := []any{entroqAddr, entroqStartupTimeout}
+	defer func() {
+		entroqAddr = saved[0].(string)
+		entroqStartupTimeout = saved[1].(time.Duration)
+	}()
+	entroqAddr = "127.0.0.1:1"
+	entroqStartupTimeout = 200 * time.Millisecond
+
+	for name, serve := range map[string]func(*workOut) error{
+		"stdio": func(out *workOut) error { return serveWorkStdio(out, nil) },
+		"http":  func(out *workOut) error { return serveWorkHTTP("127.0.0.1:0", out, nil) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			out := &workOut{w: nopWriteCloser{&buf}}
+			err := out.report(serve(out))
+			if ee, ok := workgateway.AsExit(err); !ok || ee.Class != workgateway.ExitTransient {
+				t.Fatalf("serve = %v, want a transient exit", err)
+			}
+			var line workgateway.Response
+			dec := json.NewDecoder(&buf)
+			if err := dec.Decode(&line); err != nil {
+				t.Fatalf("decode stdout %q: %v", buf.String(), err)
+			}
+			if line.Type != workgateway.RespError || line.Class != workgateway.ExitTransient.String() || line.Message == "" {
+				t.Errorf("stdout line = %+v, want a transient error with a message", line)
+			}
+			if dec.More() {
+				t.Errorf("stdout has more than one line: %q", buf.String())
+			}
+		})
+	}
+}
+
+// TestWorkOut_StaysQuietOnceTaken is a failure after a client owns stdout: the
+// stream is the client's, so nothing is added to it.
+func TestWorkOut_StaysQuietOnceTaken(t *testing.T) {
+	var buf bytes.Buffer
+	out := &workOut{w: nopWriteCloser{&buf}}
+	out.take()
+	want := errors.New("after the handover")
+	if err := out.report(want); err != want {
+		t.Errorf("report = %v, want %v", err, want)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("stdout = %q, want nothing", buf.String())
 	}
 }
