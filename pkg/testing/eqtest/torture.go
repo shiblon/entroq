@@ -745,7 +745,7 @@ func (tt *torture) run(ctx context.Context, t *testing.T) {
 		bg.Go(func() { tt.killer(runCtx, crew) })
 	}
 
-	waitErr := tt.waitDone(runCtx)
+	waitErr := tt.waitDone(runCtx, t)
 	stop()
 	crew.wg.Wait()
 	bg.Wait()
@@ -769,16 +769,38 @@ func (tt *torture) run(ctx context.Context, t *testing.T) {
 }
 
 // waitDone waits for every job to finish, and gives up if commits stop.
-func (tt *torture) waitDone(ctx context.Context) error {
+func (tt *torture) waitDone(ctx context.Context, t *testing.T) error {
+	const reportEvery = 30 * time.Second
 	stallAfter := max(20*tt.cfg.Lease, 30*time.Second)
-	last, lastAt := int64(-1), time.Now()
+	// Each round of each job commits a split, its pieces, and a merge.
+	want := int64(tt.cfg.Jobs * tt.cfg.Rounds * (tt.cfg.FanOut + 2))
+	start := time.Now()
+	last, lastAt := int64(-1), start
+	reportAt := start.Add(reportEvery)
 	for {
 		stats, err := tt.eq.QueueStats(ctx, entroq.MatchExact(tt.doneQ))
 		if err != nil {
 			return fmt.Errorf("done queue stats: %w", err)
 		}
-		if s := stats[tt.doneQ]; s != nil && s.Size >= tt.cfg.Jobs {
+		done := 0
+		if s := stats[tt.doneQ]; s != nil {
+			done = s.Size
+		}
+		if done >= tt.cfg.Jobs {
 			return nil
+		}
+		if now := time.Now(); now.After(reportAt) {
+			reportAt = now.Add(reportEvery)
+			n, elapsed := tt.counts.commits.Load(), now.Sub(start)
+			eta := "unknown"
+			if n > 0 {
+				eta = (time.Duration(float64(elapsed) * float64(want-n) / float64(n))).Round(time.Second).String()
+			}
+			tt.mu.Lock()
+			violations := len(tt.violations)
+			tt.mu.Unlock()
+			t.Logf("torture: progress %v: %d/%d commits (%.1f%%), %d/%d jobs done, %d kills, %d violations, ETA %s",
+				elapsed.Round(time.Second), n, want, 100*float64(n)/float64(want), done, tt.cfg.Jobs, tt.counts.kills.Load(), violations, eta)
 		}
 		if n := tt.counts.commits.Load(); n != last {
 			last, lastAt = n, time.Now()
