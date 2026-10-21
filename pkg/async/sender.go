@@ -75,6 +75,7 @@ type Sender struct {
 	tlsConfig    *tls.Config
 
 	srv         *http.Server // set by Serve; Close uses it for shutdown
+	closed      bool         // set by Close; a Serve after it returns at once
 	metricsOnce sync.Once
 
 	// OTel instruments, initialized on first use.
@@ -208,11 +209,17 @@ func (s *Sender) doInitMetrics() error {
 // Close gracefully shuts down the sender. It waits for all in-flight requests
 // to complete (or ctx to expire), then shuts down the HTTP server.
 //
-// After Close returns, Run or Serve will also return.
+// After Close returns, Run or Serve will also return, and a Run or Serve that
+// had not yet started returns at once.
 func (s *Sender) Close(ctx context.Context) error {
 	s.Lock()
+	s.closed = true
 	srv := s.srv
 	s.Unlock()
+	if srv == nil {
+		// Serve has not started, and now will not.
+		return nil
+	}
 
 	// Sequence: stop accepting new connections, then drain existing responses
 	// from the queue (finish them out if possible).
@@ -223,7 +230,7 @@ func (s *Sender) Close(ctx context.Context) error {
 }
 
 // Run starts the HTTP server on the address provided to NewSender and blocks
-// until Close is called.
+// until Close is called or ctx ends.
 func (s *Sender) Run(ctx context.Context) error {
 	lis, err := net.Listen("tcp", s.addr)
 	if err != nil {
@@ -233,8 +240,9 @@ func (s *Sender) Run(ctx context.Context) error {
 }
 
 // Serve starts the HTTP server on an already-open listener and blocks until
-// Close is called. Useful when the caller needs to know the bound address
-// before starting (e.g. when using ":0" for a random port in tests).
+// Close is called or ctx ends, which stops the server at once. Useful when the
+// caller needs to know the bound address before starting (e.g. when using ":0"
+// for a random port in tests).
 func (s *Sender) Serve(ctx context.Context, lis net.Listener) error {
 	if err := s.initMetrics(); err != nil {
 		return err
@@ -250,9 +258,24 @@ func (s *Sender) Serve(ctx context.Context, lis net.Listener) error {
 	}
 
 	s.Lock()
+	if s.closed {
+		s.Unlock()
+		if err := lis.Close(); err != nil {
+			log.Printf("sender close listener: %v", err)
+		}
+		return nil
+	}
 	s.srv = &http.Server{Handler: handler, TLSConfig: tlsConfig}
 	srv := s.srv
 	s.Unlock()
+	// ctx ending stops the server at once, leaving sessions in flight to GC;
+	// Close is the gentle way.
+	stop := context.AfterFunc(ctx, func() {
+		if err := srv.Close(); err != nil {
+			log.Printf("sender close on context end: %v", err)
+		}
+	})
+	defer stop()
 
 	var err error
 	if tlsConfig != nil {
