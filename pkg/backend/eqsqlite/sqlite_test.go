@@ -352,3 +352,13 @@ func TestGCDocGroups(t *testing.T) {
 	defer b.Close()
 	eqtest.GCDocGroups(ctx, t, b, b.collectDocsOnce, "sqlitetest")
 }
+
+func TestTorture(t *testing.T) {
+	ctx := context.Background()
+	client, err := entroq.New(ctx, Opener(filepath.Join(t.TempDir(), "entroq.sqlite")))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer client.Close()
+	eqtest.Torture(ctx, t, client, "sqlitetest")
+}

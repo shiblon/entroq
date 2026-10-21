@@ -832,3 +832,17 @@ func TestEQMemModifyReportsAllFailureClasses(t *testing.T) {
 func TestEQMemModifyRejectsWrongNamespace(t *testing.T) {
 	RunQTest(t, eqtest.ModifyRejectsWrongNamespace)
 }
+
+func TestEQMemTorture(t *testing.T) {
+	ctx := context.Background()
+	client, err := entroq.New(ctx, Opener())
+	if err != nil {
+		t.Fatalf("Get client: %v", err)
+	}
+	defer client.Close()
+	eqtest.Torture(ctx, t, client, "")
+}
+
+func TestEQMemJournalTorture(t *testing.T) {
+	RunQTest(t, eqtest.Torture)
+}

@@ -265,3 +265,7 @@ func TestModifyReportsAllFailureClasses(t *testing.T) {
 func TestModifyRejectsWrongNamespace(t *testing.T) {
 	RunQTest(t, eqtest.ModifyRejectsWrongNamespace)
 }
+
+func TestTorture(t *testing.T) {
+	RunQTest(t, eqtest.Torture)
+}

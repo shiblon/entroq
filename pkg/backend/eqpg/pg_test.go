@@ -669,6 +669,28 @@ func TestModifyRejectsWrongNamespace(t *testing.T) {
 	RunQTest(t, eqtest.ModifyRejectsWrongNamespace)
 }
 
+func TestTorture(t *testing.T) {
+	RunQTest(t, eqtest.Torture)
+}
+
+// TestTortureOverGRPC runs the torture test through the gRPC service, where a
+// worker killed mid-commit can leave the server holding a commit the client
+// never saw land.
+func TestTortureOverGRPC(t *testing.T) {
+	ctx := context.Background()
+	client, stop, err := eqtest.ClientService(ctx, Opener(pgHostPort,
+		WithDB("postgres"),
+		WithUsername("postgres"),
+		WithPassword("password"),
+		WithConnectAttempts(10),
+	))
+	if err != nil {
+		t.Fatalf("start gRPC service over postgres: %v", err)
+	}
+	defer stop()
+	eqtest.Torture(ctx, t, client, "pgtest/"+client.GenID())
+}
+
 // TestModifyReportsFailedCommit checks that a modification whose transaction
 // fails at COMMIT is reported as failed. A deferred constraint broken inside the
 // transaction makes COMMIT the statement that fails, which is also where a

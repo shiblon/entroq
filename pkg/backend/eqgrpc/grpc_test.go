@@ -226,3 +226,7 @@ func TestGRPCModifyReportsAllFailureClasses(t *testing.T) {
 func TestGRPCModifyRejectsWrongNamespace(t *testing.T) {
 	RunQTest(t, eqtest.ModifyRejectsWrongNamespace)
 }
+
+func TestGRPCTorture(t *testing.T) {
+	RunQTest(t, eqtest.Torture)
+}
