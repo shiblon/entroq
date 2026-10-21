@@ -668,3 +668,43 @@ func TestModifyReportsAllFailureClasses(t *testing.T) {
 func TestModifyRejectsWrongNamespace(t *testing.T) {
 	RunQTest(t, eqtest.ModifyRejectsWrongNamespace)
 }
+
+// TestModifyReportsFailedCommit checks that a modification whose transaction
+// fails at COMMIT is reported as failed. A deferred constraint broken inside the
+// transaction makes COMMIT the statement that fails, which is also where a
+// canceled context lands when a worker is killed mid-commit.
+func TestModifyReportsFailedCommit(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	client, err := pgClient(ctx)
+	if err != nil {
+		t.Fatalf("Get client: %v", err)
+	}
+	defer client.Close()
+
+	breakAtCommit := func(ctx context.Context, tx *sql.Tx) error {
+		for _, stmt := range []string{
+			`CREATE TEMP TABLE commit_breaker (id INTEGER UNIQUE DEFERRABLE INITIALLY DEFERRED) ON COMMIT DROP`,
+			`INSERT INTO commit_breaker VALUES (1), (1)`,
+		} {
+			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	queue := "pgtest/" + client.GenID() + "/commit"
+	if _, err := client.Modify(ctx,
+		entroq.InsertingInto(queue),
+		entroq.WithModifyOption(RunningInTx(breakAtCommit)),
+	); err == nil {
+		t.Error("Modify reported success for a transaction that failed at COMMIT")
+	}
+	tasks, err := client.Tasks(ctx, queue)
+	if err != nil {
+		t.Fatalf("Tasks: %v", err)
+	}
+	if len(tasks) != 0 {
+		t.Errorf("failed commit left %d tasks in %s", len(tasks), queue)
+	}
+}

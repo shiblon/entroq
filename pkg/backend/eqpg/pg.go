@@ -738,7 +738,11 @@ func (b *EQPG) modifyHandlingRetriable(ctx context.Context, doModify func() (*en
 // dependencies, checks versions, and performs all inserts/changes/deletes in
 // one round trip. Returns a DependencyError (SQLSTATE EQ001) if any
 // dependency constraint is violated.
-func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *modifyConfig) (*entroq.ModifyResponse, error) {
+//
+// The results are named so that the deferred commit can fail the call: a
+// commit that does not land, as when ctx is canceled before it, must not
+// report the modification as made.
+func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *modifyConfig) (out *entroq.ModifyResponse, err error) {
 	// Build parallel arrays for task operation set.
 	depIDs, depVers, depQueues := taskIDArrays(mod.Depends)
 	delIDs, delVers, delQueues := taskIDArrays(mod.Deletes)
@@ -766,7 +770,7 @@ func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *mo
 			}
 		} else {
 			if cmErr := tx.Commit(); cmErr != nil {
-				err = fmt.Errorf("pg modify commit failed: %w", cmErr)
+				out, err = nil, fmt.Errorf("pg modify commit failed: %w", cmErr)
 			}
 		}
 	}()
