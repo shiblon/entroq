@@ -298,8 +298,8 @@ func (r *Receiver) runSession(ctx context.Context, start sessionStart) error {
 		}
 		return nil
 	})
-	g.Go(func() error { return r.runRequestWorkers(gctx, state, socket, cancel) })
-	g.Go(func() error { return r.runResponseWorkers(gctx, start, state, socket, cancel) })
+	g.Go(func() error { return r.runRequestLane(gctx, state, socket, cancel) })
+	g.Go(func() error { return r.runResponseLane(gctx, start, state, socket, cancel) })
 	g.Go(func() error {
 		return state.liveness.run(gctx, func() {
 			log.Printf("receiver session %q peer liveness timeout", start.session)
@@ -322,47 +322,29 @@ type receiverSessionState struct {
 	responseLanes sessionLanes
 	liveness      *peerLiveness
 
-	opened                 bool
-	requestCompleted       bool
-	responseCompleted      bool
-	requestWorkerSwitched  bool
-	responseWorkerSwitched bool
-	requestWorkerCancel    context.CancelFunc
-	responseWorkerCancel   context.CancelFunc
-	statusCode             int
+	opened     bool
+	statusCode int
 }
 
-func (r *Receiver) runRequestWorkers(ctx context.Context, state *receiverSessionState, socket *responseSocket, complete func()) error {
-	for {
-		workerCtx, stopWorker := context.WithDeadline(ctx, state.requestLanes.local.collectAt)
-		state.requestWorkerCancel = stopWorker
-		state.requestWorkerSwitched = false
-		requestWorker := worker.New(r.eq,
-			worker.WithDoModify(r.requestHandler(state, socket)),
-			worker.WithMeterProvider[Envelope](r.cfg.mp),
-		)
-		err := requestWorker.Run(workerCtx, worker.Watching(state.requestLanes.local.queue),
-			worker.AsClaimant(r.claimant()))
-		workerErr := workerCtx.Err()
-		stopWorker()
-		if err != nil {
-			return fmt.Errorf("request data worker: %w", err)
-		}
-		if state.requestCompleted || ctx.Err() != nil {
-			return nil
-		}
-		if errors.Is(workerErr, context.DeadlineExceeded) {
-			log.Printf("receiver request lane %q expired; abandoning the upstream socket", state.requestLanes.local.queue)
-			complete()
-			return nil
-		}
-		if !state.requestWorkerSwitched {
-			return fmt.Errorf("request data worker exited without completing or switching queues")
-		}
+// runRequestLane claims request frames, writing each to the upstream and
+// answering it with an ACK. A lane that expires abandons the upstream socket.
+func (r *Receiver) runRequestLane(ctx context.Context, state *receiverSessionState, socket *responseSocket, complete func()) error {
+	err := runLane(ctx, r.eq, r.cfg.mp, r.claimant(), &state.requestLanes, noDocs[Envelope],
+		func(turns *laneTurns) worker.DoModifyRun[Envelope] {
+			return r.requestHandler(state, socket, turns)
+		})
+	if errors.Is(err, errLaneExpired) {
+		log.Printf("receiver request lane %q expired; abandoning the upstream socket", state.requestLanes.local.queue)
+		complete()
+		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("request data worker: %w", err)
+	}
+	return nil
 }
 
-func (r *Receiver) requestHandler(state *receiverSessionState, socket *responseSocket) worker.DoModifyRun[Envelope] {
+func (r *Receiver) requestHandler(state *receiverSessionState, socket *responseSocket, turns *laneTurns) worker.DoModifyRun[Envelope] {
 	return func(ctx context.Context, _ entroq.Reader, work *worker.Work[Envelope]) (*worker.Result, error) {
 		task, env := work.Task, work.Value
 		if env.Session != state.session {
@@ -385,14 +367,10 @@ func (r *Receiver) requestHandler(state *receiverSessionState, socket *responseS
 			}
 			if err := socket.open(ctx, env); err != nil {
 				ack := Envelope{FrameControl: FrameControl{Session: env.Session, Final: true, Error: err.Error()}}
-				return worker.Modify(
+				return turns.end(worker.Modify(
 					task.Delete(),
 					entroq.InsertingInto(env.ReplyQueue, entroq.WithValue(ack)),
-				).OnSuccess(func(context.Context) error {
-					state.requestCompleted = true
-					state.requestWorkerCancel()
-					return nil
-				}), nil
+				), turnDone, nil), nil
 			}
 			state.opened = true
 		} else if hasRequestMetadata(env) {
@@ -423,13 +401,10 @@ func (r *Receiver) requestHandler(state *receiverSessionState, socket *responseS
 						Error:   err.Error(),
 					}})))
 				}
-				return worker.Modify(mods...).OnDependency(func(_ context.Context, depErr *entroq.DependencyError) error {
+				result := worker.Modify(mods...).OnDependency(func(_ context.Context, depErr *entroq.DependencyError) error {
 					return worker.FatalErrorf("session %q request failure commit lost dependency: %v", env.Session, depErr)
-				}).OnSuccess(func(context.Context) error {
-					state.requestCompleted = true
-					state.requestWorkerCancel()
-					return nil
-				}), nil
+				})
+				return turns.end(result, turnDone, nil), nil
 			}
 		}
 
@@ -456,67 +431,50 @@ func (r *Receiver) requestHandler(state *receiverSessionState, socket *responseS
 				return worker.FatalErrorf("session %q request commit lost dependency after socket write: %v", env.Session, err)
 			})
 		}
-		return result.OnSuccess(func(context.Context) error {
-			if env.Final {
-				state.requestCompleted = true
-				state.requestWorkerCancel()
-			} else if localSwitched {
-				state.requestWorkerSwitched = true
-				state.requestWorkerCancel()
-			}
-			return nil
-		}), nil
+		next := turnNext
+		switch {
+		case env.Final:
+			next = turnDone
+		case localSwitched:
+			next = turnRotated
+		}
+		return turns.end(result, next, nil), nil
 	}
 }
 
-func (r *Receiver) runResponseWorkers(ctx context.Context, start sessionStart, state *receiverSessionState, socket *responseSocket, complete func()) error {
-	for {
-		workerCtx, stopWorker := context.WithDeadline(ctx, state.responseLanes.local.collectAt)
-		state.responseWorkerCancel = stopWorker
-		state.responseWorkerSwitched = false
-		responseWorker := worker.New(r.eq,
-			// Only this lane touches the singleton receiver session doc.
-			// Letting both concurrent workers claim it under the same claimant
-			// ID would remove mutual exclusion and create version races between
-			// doc renewals.
-			worker.WithTakeDocs(func(_ context.Context, _ entroq.Reader, work *worker.Work[Response]) (*worker.TakeResult, error) {
-				ack := work.Value
-				if ack.Session != start.session {
-					return nil, worker.FatalErrorf("session mismatch: ACK %q, worker %q", ack.Session, start.session)
-				}
-				return worker.Take(entroq.ClaimKey(start.receiverDocNS, start.session)), nil
-			}),
-			worker.WithDoModify(r.responseHandler(start, state, socket, complete)),
-			worker.WithMeterProvider[Response](r.cfg.mp),
-		)
-		err := responseWorker.Run(workerCtx,
-			worker.Watching(state.responseLanes.local.queue),
-			// The same consumer the bootstrap worker held the session doc as,
-			// so this can take it; see Receiver.claimant.
-			worker.AsClaimant(r.claimant()),
-			worker.WithLease(r.cfg.heartbeat.timeout),
-		)
-		workerErr := workerCtx.Err()
-		stopWorker()
-		if err != nil {
-			return fmt.Errorf("response ACK worker: %w", err)
+// runResponseLane claims response ACKs, answering each with the next frame of
+// the upstream response. Only this lane touches the singleton receiver session
+// doc: letting both of a session's lanes claim it under the same claimant
+// would remove mutual exclusion and race their renewals. A lane that expires
+// abandons the upstream socket.
+func (r *Receiver) runResponseLane(ctx context.Context, start sessionStart, state *receiverSessionState, socket *responseSocket, complete func()) error {
+	takeSessionDoc := func(_ context.Context, _ entroq.Reader, work *worker.Work[Response]) (*worker.TakeResult, error) {
+		ack := work.Value
+		if ack.Session != start.session {
+			return nil, worker.FatalErrorf("session mismatch: ACK %q, worker %q", ack.Session, start.session)
 		}
-		if state.responseCompleted || ctx.Err() != nil {
-			return nil
-		}
-		if errors.Is(workerErr, context.DeadlineExceeded) {
-			log.Printf("receiver response lane %q expired; abandoning the upstream socket", state.responseLanes.local.queue)
-			state.responseCompleted = true
-			complete()
-			return nil
-		}
-		if !state.responseWorkerSwitched {
-			return fmt.Errorf("response ACK worker exited without completing or switching queues")
-		}
+		return worker.Take(entroq.ClaimKey(start.receiverDocNS, start.session)), nil
 	}
+	// r.claimant is the same consumer the bootstrap worker held the session doc
+	// as, so this lane can take it; see Receiver.claimant.
+	err := runLane(ctx, r.eq, r.cfg.mp, r.claimant(), &state.responseLanes, takeSessionDoc,
+		func(turns *laneTurns) worker.DoModifyRun[Response] {
+			return r.responseHandler(start, state, socket, complete, turns)
+		},
+		worker.WithLease(r.cfg.heartbeat.timeout),
+	)
+	if errors.Is(err, errLaneExpired) {
+		log.Printf("receiver response lane %q expired; abandoning the upstream socket", state.responseLanes.local.queue)
+		complete()
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("response ACK worker: %w", err)
+	}
+	return nil
 }
 
-func (r *Receiver) responseHandler(start sessionStart, state *receiverSessionState, socket *responseSocket, complete func()) worker.DoModifyRun[Response] {
+func (r *Receiver) responseHandler(start sessionStart, state *receiverSessionState, socket *responseSocket, complete func(), turns *laneTurns) worker.DoModifyRun[Response] {
 	return func(ctx context.Context, _ entroq.Reader, work *worker.Work[Response]) (*worker.Result, error) {
 		task, ack, sets := work.Task, work.Value, work.Sets
 		if len(sets) != 1 || len(sets[0].Docs) != 1 {
@@ -531,8 +489,7 @@ func (r *Receiver) responseHandler(start sessionStart, state *receiverSessionSta
 			if ack.Error == "" || ack.ReplyQueue != "" {
 				return nil, worker.FatalErrorf("session %q received invalid terminal response ACK", ack.Session)
 			}
-			return worker.Modify(task.Delete(), docs[0].Delete()).OnSuccess(func(context.Context) error {
-				state.responseCompleted = true
+			return turns.end(worker.Modify(task.Delete(), docs[0].Delete()), turnDone, func(context.Context) error {
 				complete()
 				return nil
 			}), nil
@@ -619,17 +576,16 @@ func (r *Receiver) responseHandler(start sessionStart, state *receiverSessionSta
 				return worker.FatalErrorf("session %q response commit lost dependency after socket read: %v", ack.Session, err)
 			})
 		}
-		return result.OnSuccess(func(context.Context) error {
-			if resp.Final {
-				r.recordSession(ctx, start, state, ack.ReplyQueue)
-				state.responseCompleted = true
-				complete()
-				return nil
-			}
+		if !resp.Final {
+			next := turnNext
 			if localSwitched {
-				state.responseWorkerSwitched = true
-				state.responseWorkerCancel()
+				next = turnRotated
 			}
+			return turns.end(result, next, nil), nil
+		}
+		return turns.end(result, turnDone, func(context.Context) error {
+			r.recordSession(ctx, start, state, ack.ReplyQueue)
+			complete()
 			return nil
 		}), nil
 	}

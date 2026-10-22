@@ -38,7 +38,7 @@ func TestRequestAcknowledgementRejectsApplicationData(t *testing.T) {
 
 func TestResponseAcknowledgementRejectsApplicationData(t *testing.T) {
 	receiver := &Receiver{}
-	handler := receiver.responseHandler(sessionStart{}, &receiverSessionState{}, newResponseSocket(), func() {})
+	handler := receiver.responseHandler(sessionStart{}, &receiverSessionState{}, newResponseSocket(), func() {}, &laneTurns{})
 	_, err := handler(context.Background(), nil, &worker.Work[Response]{
 		Value: Response{
 			FrameControl: FrameControl{

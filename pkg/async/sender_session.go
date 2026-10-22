@@ -34,12 +34,7 @@ type senderSession struct {
 	liveness      *peerLiveness
 	cancel        context.CancelCauseFunc
 
-	requestWorkerCancel    context.CancelFunc
-	responseWorkerCancel   context.CancelFunc
-	requestWorkerSwitched  bool
-	responseWorkerSwitched bool
-	requestCompleted       bool
-	responseCompleted      bool
+	responseCompleted bool
 
 	responseStarted bool
 	responseStatus  int
@@ -75,8 +70,8 @@ func (s *senderSession) run(parent context.Context) error {
 
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return s.source.run(gctx) })
-	g.Go(func() error { return s.runRequestWorkers(gctx) })
-	g.Go(func() error { return s.runResponseWorkers(gctx) })
+	g.Go(func() error { return s.runRequestLane(gctx) })
+	g.Go(func() error { return s.runResponseLane(gctx) })
 	g.Go(func() error {
 		return s.liveness.run(gctx, func() { cancel(errSenderPeerTimeout) })
 	})
@@ -138,35 +133,25 @@ func (s *senderSession) notifyPeerCanceled(parent context.Context, cause error) 
 	}
 }
 
-func (s *senderSession) runRequestWorkers(ctx context.Context) error {
-	for {
-		workerCtx, stopWorker := context.WithDeadline(ctx, s.requestLanes.local.collectAt)
-		s.requestWorkerCancel = stopWorker
-		s.requestWorkerSwitched = false
-		requestWorker := worker.New(s.sender.eq,
-			worker.WithDoModify(s.handleRequestAck),
-			worker.WithMeterProvider[Envelope](s.sender.mp),
-		)
-		err := requestWorker.Run(workerCtx, worker.Watching(s.requestLanes.local.queue),
-			worker.AsClaimant(s.claimant()))
-		workerErr := workerCtx.Err()
-		stopWorker()
-		if err != nil {
-			return fmt.Errorf("request ACK worker: %w", err)
-		}
-		if s.requestCompleted || ctx.Err() != nil {
-			return nil
-		}
-		if errors.Is(workerErr, context.DeadlineExceeded) {
-			return errSenderQueueExpired
-		}
-		if !s.requestWorkerSwitched {
-			return fmt.Errorf("request ACK worker exited without completing or switching queues")
-		}
+// runRequestLane claims request ACKs, answering each with the next frame of
+// the request body.
+func (s *senderSession) runRequestLane(ctx context.Context) error {
+	err := runLane(ctx, s.sender.eq, s.sender.mp, s.claimant(), &s.requestLanes, noDocs[Envelope],
+		func(turns *laneTurns) worker.DoModifyRun[Envelope] {
+			return func(ctx context.Context, _ entroq.Reader, work *worker.Work[Envelope]) (*worker.Result, error) {
+				return s.handleRequestAck(ctx, turns, work)
+			}
+		})
+	if errors.Is(err, errLaneExpired) {
+		return errSenderQueueExpired
 	}
+	if err != nil {
+		return fmt.Errorf("request ACK worker: %w", err)
+	}
+	return nil
 }
 
-func (s *senderSession) handleRequestAck(ctx context.Context, _ entroq.Reader, work *worker.Work[Envelope]) (*worker.Result, error) {
+func (s *senderSession) handleRequestAck(ctx context.Context, turns *laneTurns, work *worker.Work[Envelope]) (*worker.Result, error) {
 	task, ack := work.Task, work.Value
 	if ack.Session != s.session {
 		return nil, worker.FatalErrorf("request ACK session mismatch: got %q, want %q", ack.Session, s.session)
@@ -179,10 +164,8 @@ func (s *senderSession) handleRequestAck(ctx context.Context, _ entroq.Reader, w
 		if ack.Error == "" || ack.ReplyQueue != "" {
 			return nil, worker.FatalErrorf("session %q received invalid terminal request ACK", s.session)
 		}
-		return worker.Modify(task.Delete()).OnSuccess(func(context.Context) error {
-			s.requestCompleted = true
+		return turns.end(worker.Modify(task.Delete()), turnDone, func(context.Context) error {
 			s.source.body.Close()
-			s.requestWorkerCancel()
 			return nil
 		}), nil
 	}
@@ -254,47 +237,35 @@ func (s *senderSession) handleRequestAck(ctx context.Context, _ entroq.Reader, w
 			return worker.FatalErrorf("session %q request commit lost dependency after body read: %v", s.session, err)
 		})
 	}
-	return result.OnSuccess(func(context.Context) error {
-		if env.Final {
-			s.requestCompleted = true
-			s.requestWorkerCancel()
-		} else if localSwitched {
-			s.requestWorkerSwitched = true
-			s.requestWorkerCancel()
-		}
-		return nil
-	}), nil
-}
-
-func (s *senderSession) runResponseWorkers(ctx context.Context) error {
-	for {
-		workerCtx, stopWorker := context.WithDeadline(ctx, s.responseLanes.local.collectAt)
-		s.responseWorkerCancel = stopWorker
-		s.responseWorkerSwitched = false
-		responseWorker := worker.New(s.sender.eq,
-			worker.WithDoModify(s.handleResponse),
-			worker.WithMeterProvider[Response](s.sender.mp),
-		)
-		err := responseWorker.Run(workerCtx, worker.Watching(s.responseLanes.local.queue),
-			worker.AsClaimant(s.claimant()))
-		workerErr := workerCtx.Err()
-		stopWorker()
-		if err != nil {
-			return fmt.Errorf("response data worker: %w", err)
-		}
-		if s.responseCompleted || ctx.Err() != nil {
-			return nil
-		}
-		if errors.Is(workerErr, context.DeadlineExceeded) {
-			return errSenderQueueExpired
-		}
-		if !s.responseWorkerSwitched {
-			return fmt.Errorf("response data worker exited without completing or switching queues")
-		}
+	next := turnNext
+	switch {
+	case env.Final:
+		next = turnDone
+	case localSwitched:
+		next = turnRotated
 	}
+	return turns.end(result, next, nil), nil
 }
 
-func (s *senderSession) handleResponse(ctx context.Context, _ entroq.Reader, work *worker.Work[Response]) (*worker.Result, error) {
+// runResponseLane claims response frames, writing each to the caller and
+// answering it with an ACK.
+func (s *senderSession) runResponseLane(ctx context.Context) error {
+	err := runLane(ctx, s.sender.eq, s.sender.mp, s.claimant(), &s.responseLanes, noDocs[Response],
+		func(turns *laneTurns) worker.DoModifyRun[Response] {
+			return func(ctx context.Context, _ entroq.Reader, work *worker.Work[Response]) (*worker.Result, error) {
+				return s.handleResponse(ctx, turns, work)
+			}
+		})
+	if errors.Is(err, errLaneExpired) {
+		return errSenderQueueExpired
+	}
+	if err != nil {
+		return fmt.Errorf("response data worker: %w", err)
+	}
+	return nil
+}
+
+func (s *senderSession) handleResponse(ctx context.Context, turns *laneTurns, work *worker.Work[Response]) (*worker.Result, error) {
 	task, resp := work.Task, work.Value
 	if resp.Session != s.session {
 		return nil, worker.FatalErrorf("response session mismatch: got %q, want %q", resp.Session, s.session)
@@ -347,9 +318,10 @@ func (s *senderSession) handleResponse(ctx context.Context, _ entroq.Reader, wor
 					Error:   err.Error(),
 				}})))
 			}
-			return worker.Modify(mods...).OnDependency(func(_ context.Context, depErr *entroq.DependencyError) error {
+			result := worker.Modify(mods...).OnDependency(func(_ context.Context, depErr *entroq.DependencyError) error {
 				return worker.FatalErrorf("session %q response failure commit lost dependency: %v", s.session, depErr)
-			}).OnSuccess(func(context.Context) error {
+			})
+			return turns.end(result, turnDone, func(context.Context) error {
 				s.responseCompleted = true
 				s.cancel(err)
 				return nil
@@ -391,23 +363,23 @@ func (s *senderSession) handleResponse(ctx context.Context, _ entroq.Reader, wor
 	result := worker.Modify(mods...).OnDependency(func(_ context.Context, err *entroq.DependencyError) error {
 		return worker.FatalErrorf("session %q response commit lost dependency after socket write: %v", s.session, err)
 	})
-	return result.OnSuccess(func(context.Context) error {
-		if resp.Final {
-			s.responseCompleted = true
-			if s.sender.auditLog != nil {
-				s.sender.auditLog.LogAttrs(ctx, slog.LevelInfo, "response_received",
-					slog.String("response_queue", s.responseLanes.local.queue),
-					slog.Int("status_code", s.responseStatus),
-					slog.Float64("duration_s", time.Since(s.startedAt).Seconds()),
-				)
-			}
-			s.cancel(s.responseErr)
-			return nil
-		}
+	if !resp.Final {
+		next := turnNext
 		if localSwitched {
-			s.responseWorkerSwitched = true
-			s.responseWorkerCancel()
+			next = turnRotated
 		}
+		return turns.end(result, next, nil), nil
+	}
+	return turns.end(result, turnDone, func(context.Context) error {
+		s.responseCompleted = true
+		if s.sender.auditLog != nil {
+			s.sender.auditLog.LogAttrs(ctx, slog.LevelInfo, "response_received",
+				slog.String("response_queue", s.responseLanes.local.queue),
+				slog.Int("status_code", s.responseStatus),
+				slog.Float64("duration_s", time.Since(s.startedAt).Seconds()),
+			)
+		}
+		s.cancel(s.responseErr)
 		return nil
 	}), nil
 }
