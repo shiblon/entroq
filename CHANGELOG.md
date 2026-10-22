@@ -121,9 +121,7 @@ runs, so plan a short maintenance window on large doc tables.
   on a shut-down worker returns `worker.ErrShutdown`.
 - **The worker outcome `released`.** A `worker.Modify` result that only
   makes the task arrive, releasing or deferring it, is counted in
-  `entroq.worker.tasks_total` as `released` rather than `done`. The work
-  gateway releases the task and its doc sets this way when a worker hangs up
-  during `doWork`; before, it released only the task and counted it as done.
+  `entroq.worker.tasks_total` as `released` rather than `done`.
 - **`entroq.UnsupportedError`.** A request the backend does not understand,
   such as a call an older server lacks, or any call to a server whose
   protocol the client does not accept, is an `UnsupportedError`
@@ -295,39 +293,37 @@ runs, so plan a short maintenance window on large doc tables.
   k).For(d))` with `eq.ClaimDocs(ctx, entroq.ClaimKey(ns, k),
   entroq.ClaimingSetsFor(d))`, and read the set as the result's first.
   The unused `DocClaimOpt`, `LockingFor`, and `WithDocClaimant` are removed.
-- **Work gateway protocol 1.** `eqlink work` opens every session with a
-  `hello` naming the protocol version it speaks (`workgateway.Protocol`) and
-  its release, so a worker checks compatibility before any task and names both
-  versions when it cannot proceed; a gateway without the hello is protocol 0.
-  `doWork` carries the claimed doc sets, each with its docs and its version
-  and claim, including sets with no docs. A worker can report an `error`
-  outcome for a handler failure it does not understand. `--error-queue` (with
-  `{inbox}` standing for the task's queue) and `--retry-delay`, or the
-  `errorQueue` and `retryDelay` URL params, pass through the Go worker's error
-  queue and base retry delay. The example workers check the hello. `eqc work
-  --error-queue` takes the same `{inbox}` template (`worker.ErrQTemplate`), so a
-  worker watching several queues can quarantine each task beside its inbox; a
-  name without `{inbox}` still means one queue for all.
-- **The work gateway hears the worker at all times.** A background reader takes
-  every message the worker sends, so the gateway notices a worker that hangs up
-  while it is claiming or committing: it stops claiming at once, where it used
-  to claim one more task for a worker that was gone. Hanging up never interrupts
-  a commit already under way, so a worker may send its result and exit. A
-  message sent when no request is outstanding is a protocol violation (the
-  caller class). If the gateway loses its claim mid-task, it sends a one-way
-  `abort` naming the task; the worker still answers, the gateway discards the
-  answer, and a worker that does not answer within a lease ends the session as a
-  caller fault. A task whose `takeDocs` or `doWork` the worker never answered
-  is released when it hangs up, available at once instead of after its lease.
-  `docs/workgateway-protocol.md` now lists which messages a worker answers and
-  the full failure contract: each failure, what the gateway does, and what
-  becomes of the task.
+- **Breaking: the work gateway protocol is client-driven, and is protocol 1.**
+  Every message a worker sends is an answer and a request, and the gateway
+  never speaks unprompted. A session opens with a `config` carrying the
+  registration (queues, the turns the worker wants, error queue, retry
+  ceilings and delay, work timeout, `protocol_versions`) in place of `eqlink
+  work` flags and URL parameters, and is answered with `ready`, naming the
+  session, its claimant, the work timeout granted and the silence window. The
+  payloads are the protojson of `api/entroq.proto`. A worker may read (`time`,
+  `tasks`, `docs`, `queues`, `namespaces`) within a turn, answers with the Go
+  worker's five outcomes, drains with `quit` on any message, and may send
+  `working` to arm a silence window two leases long. A request waiting on an
+  empty queue is answered with `ready` every third of that window. It runs over
+  stdio, one session per process, or over plain HTTP with `--addr`, a POST per
+  message; the WebSocket transport is gone. Every error is a JSON message with
+  a class (`transient`, `caller`, `gateway`, and over HTTP `gone`), carried as
+  well by the exit code, the HTTP status (400, 503, 500, 404), and, when
+  `eqlink work` fails before a client owns its stdout, one error line there. A
+  client that breaks the protocol is a `caller` fault and is told why.
+  `max_claims` of zero takes the worker's default of five and a negative value
+  is no limit. See `docs/workgateway-protocol.md`; the example Python library
+  in `examples/workgateway/` speaks HTTP and forwards its signals to its
+  gateway.
+- **`eqc work --error-queue` takes an `{inbox}` template** (`worker.ErrQTemplate`),
+  so a worker watching several queues can quarantine each task beside its
+  inbox; a name without `{inbox}` still means one queue for all.
 - **`eqlink work` drains on the first signal.** The first SIGINT or SIGTERM
-  stops claiming, finishes the task in hand, and exits 0, waiting up to
-  `--lease` for it; a second stops at once, leaving the task to its lease, as
-  the first did before. A drained session answers its client with a quit.
-  `eqlink work --addr` drains every session the same way, answers a config
-  that arrives meanwhile with a quit, and shuts down once all have ended.
+  drains every session: none claims again, a task in hand finishes through the
+  turns it has left, and each is answered with `quit`, as is a config that
+  arrives meanwhile. It waits up to `--lease`; a second signal stops at once,
+  leaving any task in hand to its lease. Over HTTP the server shuts down once
+  every session has ended.
 - **Breaking (Go): `workgateway.Server` replaces `workgateway.Handler` and
   `workgateway.Serve`.** `NewServer(ctx, eq, options...)` is the
   `http.Handler`, and `ServeConn` runs one session over a `Conn`. Like
@@ -404,7 +400,7 @@ runs, so plan a short maintenance window on large doc tables.
   key, with its version but not who holds it.
 - **A doc set counts its docs.** `entroq.DocSet.NumDocs`, and `len` on the
   `Doc` standing for a set in claim responses and in the work gateway's
-  `doWork` sets, is how many docs the set has. PostgreSQL and SQLite keep it
+  `doc_sets`, is how many docs the set has. PostgreSQL and SQLite keep it
   on the set's lock row, which every write already updates, and lock
   collection now checks it instead of looking for docs; Redis counts it from its
   doc index when it reads a lock; the in-memory backend keeps it on the lock and
@@ -476,6 +472,15 @@ runs, so plan a short maintenance window on large doc tables.
   versions.
 
 ### Fixed
+
+- **EQLink's sender stops cleanly and keeps its receiver informed.**
+  `Sender.Close` before `Serve` no longer panics, and a `Serve` after it
+  returns at once. `Serve` stops when its context ends, so `eqlink send` stops
+  when anything else in it fails. A sender session ends while its client still
+  holds an HTTP/1 request body open: a read deadline releases the body read,
+  which closing the body could not. A sender that fails on its own account
+  while its caller is still connected tells the receiver at once, rather than
+  leaving it to its three-minute liveness timeout.
 
 - **A work gateway session ends when its work timeout fires.** The gateway used
   to put the task back and claim another while the client was still working,
