@@ -22,7 +22,7 @@ import os
 import shlex
 import sys
 
-from eqgateway import DocClaim, Gateway, M, RetryError, Worker
+from eqgateway import claim_set, Gateway, M, RetryError, Worker
 
 PREFIX = os.environ.get("PREFIX", "demo")
 
@@ -32,15 +32,15 @@ def log(msg):
 
 
 def shout(w, ctx):
-    return M(M.changing(w.task, queue=f"{PREFIX}/shouted", value=str(w.value).upper()))
+    return M(M.changing(w.task, queue=f"{PREFIX}/shouted", value=str(w.task["value"]).upper()))
 
 
 def tell_take(w, ctx):
-    return [DocClaim(PREFIX, "told")]
+    return [claim_set(PREFIX, "told")]
 
 
 def tell(w, ctx):
-    log(f"tell: {w.value}")
+    log(f"tell: {w.task['value']}")
     if not w.docs:
         count = M.inserting(namespace=PREFIX, key="told", content=1)
     else:
@@ -54,10 +54,11 @@ def told(w, ctx):
 
 
 def nap(w, ctx):
-    if not isinstance(w.value, (int, float)):
-        raise RetryError(f"cannot nap for {w.value!r}", or_move_to=f"{PREFIX}/slow/dead")
-    log(f"nap: {w.value}s")
-    if not ctx.sleep(w.value):
+    seconds = w.task["value"]
+    if not isinstance(seconds, (int, float)):
+        raise RetryError(f"cannot nap for {seconds!r}", or_move_to=f"{PREFIX}/slow/dead")
+    log(f"nap: {seconds}s")
+    if not ctx.sleep(seconds):
         raise RetryError("woken early to drain")
     return M(M.deleting(w.task))
 

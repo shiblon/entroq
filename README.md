@@ -227,7 +227,7 @@ import { NodeGateway } from "entroq/node";
 await new NodeGateway({ entroq: "localhost:37706" }).run(
     new Worker(["/my/queue"], {
         work: async (w) => {
-            console.log("Processing:", w.value);
+            console.log("Processing:", w.task.value);
             // Return a modification to commit atomically; here we delete to finish.
             return M.of(M.deleting(w.task));
         },

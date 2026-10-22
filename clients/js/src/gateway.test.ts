@@ -122,7 +122,7 @@ describe("Session", () => {
     const w = new Worker(["in"], {
       take: () => [claimSet("ns", "k")],
       work: (w) => {
-        seen.push({ docs: w.docs, sets: w.sets, value: w.value });
+        seen.push({ docs: w.docs, sets: w.sets, value: w.task.value });
         return M.of(M.deleting(w.task), M.changing(w.docs[0], { content: { a: 2 } }));
       },
       onSuccess: () => {
@@ -219,11 +219,11 @@ describe("Session", () => {
 });
 
 describe("Modification", () => {
-  it("delays an insert or change by byMs, as a duration", () => {
+  it("passes byMs through as a duration", () => {
     const m = M.of(M.inserting({ queue: "next", value: 1, byMs: 1500 }), M.changing(task, { queue: "later", byMs: 20 }));
-    expect(m.request.inserts).toEqual([{ queue: "next", value: 1, byMs: "1500" }]);
+    expect(m.request.inserts).toEqual([{ queue: "next", value: 1, byMs: 1500 }]);
     expect(m.request.changes).toEqual([
-      { oldId: { queue: "in", id: "t1", version: 3 }, newData: { queue: "later", value: { n: 1 }, byMs: "20" } },
+      { oldId: { queue: "in", id: "t1", version: 3 }, newData: { queue: "later", value: { n: 1 }, byMs: 20 } },
     ]);
   });
 

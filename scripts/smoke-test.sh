@@ -59,7 +59,7 @@ const { NodeGateway } = require('./clients/js/dist/node.js');
         const gateway = new NodeGateway({ eqlink: process.env.EQLINK, entroq: 'localhost:37706', handleSignals: false });
         await gateway.run(new Worker(['/smoke/js'], {
             work: (w, ctx) => {
-                seen = w.value;
+                seen = w.task.value;
                 ctx.stop();
                 return M.of(M.deleting(w.task));
             },

@@ -7,7 +7,7 @@ A worker built on it supplies functions and nothing else:
 
     Worker(["in"], work).run()
 
-work(w, ctx) settles one task: w carries the task, its value and its docs, and
+work(w, ctx) settles one task: w carries the task and its docs, and
 what it returns is committed. Raising RetryError, MoveError or FatalWorker gives
 the task another fate. Three more functions are optional: take(w, ctx) names
 the doc sets a task needs, on_success(w, ctx) runs after a commit lands, and
@@ -57,13 +57,12 @@ def failure(msg):
 
 
 class Work:
-    """A task in hand: the task (the protojson of an api.Task), its value, the
-    docs claimed for it, and the sets they were claimed as. docs and sets are
-    empty in take, which decides them."""
+    """A task in hand: the task (the protojson of an api.Task), the docs
+    claimed for it, and the sets they were claimed as. docs and sets are empty
+    in take, which decides them."""
 
     def __init__(self, task, doc_sets=()):
         self.task = task
-        self.value = task.get("value")
         self.sets = [s["set"] for s in doc_sets]
         self.docs = [d for s in doc_sets for d in s.get("docs", [])]
 
@@ -90,11 +89,9 @@ class FatalWorker(Exception):
     fix in this process. The task comes back when its lease lapses."""
 
 
-class DocClaim(dict):
+def claim_set(namespace, key):
     """A doc set for take to claim."""
-
-    def __init__(self, namespace, key):
-        super().__init__(set={"namespace": namespace, "key": key})
+    return {"set": {"namespace": namespace, "key": key}}
 
 
 def task_id(task):
@@ -109,19 +106,15 @@ def _is_doc(item):
     return "namespace" in item
 
 
-def _arriving(data, by_s):
-    if by_s:
-        data["by_ms"] = int(by_s * 1000)
-    return data
-
-
 class Modification:
     """Task and doc operations committed together, or not at all:
 
         M(M.deleting(w.task), M.inserting(queue="next", value=v))
 
     Name a task or doc as it was handed over. The gateway moves the versions
-    of the task in hand and its claimed docs to wherever renewal left them."""
+    of the task in hand and its claimed docs to wherever renewal left them.
+    Fields pass through as given, and the gateway refuses what it cannot
+    commit."""
 
     def __init__(self, *ops):
         self.request = {}
@@ -129,23 +122,21 @@ class Modification:
             self.request.setdefault(field, []).append(item)
 
     @staticmethod
-    def inserting(queue="", value=None, by_s=0, **doc):
-        """A task, given queue, value, and by_s to delay it; or a doc, given
-        namespace, key, and optionally secondary_key and content."""
-        if queue:
-            return "inserts", _arriving({"queue": queue, "value": value}, by_s)
-        return "doc_inserts", doc
+    def inserting(**item):
+        """A task, given queue and value, and by_ms to delay it; or a doc, given
+        namespace and key, and optionally secondary_key and content."""
+        return ("inserts" if "queue" in item else "doc_inserts"), item
 
     @staticmethod
-    def changing(item, by_s=0, **fields):
+    def changing(item, **fields):
         """A task or doc with the fields named replaced: a task's queue or
-        value, which by_s may delay; a doc's content or keys."""
+        value, or by_ms to delay it; a doc's content or keys."""
         if _is_doc(item):
             # Handed over as protojson, whose names are camelCase.
             data = {k: item[k] for k in ("namespace", "id", "key", "secondaryKey", "content") if k in item}
             return "doc_changes", {"old_id": doc_id(item), "new_data": {**data, **fields}}
         data = {"queue": item["queue"], "value": item.get("value"), **fields}
-        return "changes", {"old_id": task_id(item), "new_data": _arriving(data, by_s)}
+        return "changes", {"old_id": task_id(item), "new_data": data}
 
     @staticmethod
     def deleting(item):
@@ -371,7 +362,7 @@ class Worker:
     """A worker: its functions and how it registers. It runs as one session."""
 
     def __init__(self, queues, work, take=None, on_success=None, on_dependency=None,
-                 work_timeout_s=0, max_attempts=0, retry_delay_s=0, error_queue=""):
+                 work_timeout_s=0, max_attempts=0, max_claims=0, retry_delay_s=0, error_queue=""):
         self.queues = queues
         self.work = work
         self.take = take
@@ -379,6 +370,7 @@ class Worker:
         self.on_dependency = on_dependency
         self.work_timeout_s = work_timeout_s
         self.max_attempts = max_attempts
+        self.max_claims = max_claims
         self.retry_delay_s = retry_delay_s
         self.error_queue = error_queue
 
@@ -391,6 +383,7 @@ class Worker:
             "want_dependency": self.on_dependency is not None,
             "work_timeout_s": self.work_timeout_s,
             "max_attempts": self.max_attempts,
+            "max_claims": self.max_claims,
             "retry_delay_s": self.retry_delay_s,
             "error_queue": self.error_queue,
         }
@@ -440,54 +433,53 @@ class Gateway:
 
     def _on_signal(self, signum, frame):
         if self.stopping.is_set():
-            # A second signal: the gateway hangs up, leaving tasks to their leases.
+            # A second signal: the gateway hangs up, leaving tasks to their
+            # leases, and this process exits as the signal would have made it.
             self.child.signal(signum)
-            os._exit(130)
+            os._exit(128 + signum)
         print(f"[worker] {signal.Signals(signum).name}: draining", file=sys.stderr)
         self.stop(signum)
 
     def _serve(self, worker):
-        """Run one worker's sessions one after another until it stops."""
-        backoff = 0.2
+        """Run one worker's sessions, one after another, until it stops. A
+        session that is gone is replaced at once. A transient error, or a
+        gateway that went away or never answered, is retried with backoff.
+        Anything else stops every worker, and run raises it."""
+        backoff = 0
         while not self.stopping.is_set():
+            xchg = session = None
             try:
                 xchg = self.child.connect()
-            except GatewayError as e:
-                if not self._recoverable(e):
-                    return
-                self.stopping.wait(backoff)
-                backoff = min(backoff * 2, 5.0)
-                continue
-            session = Session(worker, xchg)
-            with self.mu:
-                self.sessions.add(session)
-                if self.stopping.is_set():
-                    session.stopping.set()
-            try:
-                session.run()
-                backoff = 0.2
-            except SessionGone:
-                pass
-            except (OSError, http.client.HTTPException):
-                pass  # a gateway that went away
-            except GatewayError as e:
-                if not self._recoverable(e):
-                    return
-                if not session.stopping.is_set():
-                    self.stopping.wait(backoff)
-                    backoff = min(backoff * 2, 5.0)
-            finally:
+                session = Session(worker, xchg)
                 with self.mu:
-                    self.sessions.discard(session)
-                xchg.close()
-            if session.stopping.is_set():
+                    self.sessions.add(session)
+                    if self.stopping.is_set():
+                        session.stopping.set()
+                session.run()
+                backoff = 0
+            except SessionGone:
+                backoff = 0
+            except Exception as e:
+                if not _retryable(e):
+                    print(f"[worker] {e}; stopping", file=sys.stderr)
+                    self.failure = self.failure or e
+                    self.stop()
+                    return
+                print(f"[worker] {e}; reconnecting", file=sys.stderr)
+                backoff = min(max(backoff * 2, 0.2), 5.0)
+            finally:
+                if session is not None:
+                    with self.mu:
+                        self.sessions.discard(session)
+                if xchg is not None:
+                    xchg.close()
+            if session is not None and session.stopping.is_set():
                 return
+            self.stopping.wait(backoff)
 
-    def _recoverable(self, e):
-        if e.cls == "transient":
-            print(f"[worker] {e}; reconnecting", file=sys.stderr)
-            return True
-        print(f"[worker] {e}; stopping", file=sys.stderr)
-        self.failure = e
-        self.stop()
-        return False
+
+def _retryable(e):
+    """A transient error, or a gateway that went away or never answered."""
+    if isinstance(e, GatewayError):
+        return e.cls == "transient"
+    return isinstance(e, (OSError, http.client.HTTPException))
