@@ -238,3 +238,40 @@ func TestSubjectFromJWTRefusesWhatItCannotUse(t *testing.T) {
 		})
 	}
 }
+
+// TestClaimedBySelfMeansTheAskingClient: a scoped client's ClaimedBySelf is
+// its own claimant, the one a worker Run holds its tasks as, and not the
+// connection's, which holds none of them.
+func TestClaimedBySelfMeansTheAskingClient(t *testing.T) {
+	ctx := context.Background()
+	eq, err := entroq.New(ctx, eqmem.Opener())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer eq.Close()
+
+	const queue = "claimed_by_self"
+	if _, err := eq.Modify(ctx, entroq.InsertingInto(queue)); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	run := eq.Scoped()
+	held, err := run.TryClaim(ctx, entroq.From(queue), entroq.ClaimFor(time.Minute))
+	if err != nil || held == nil {
+		t.Fatalf("TryClaim: %v, %v", held, err)
+	}
+
+	mine, err := run.Tasks(ctx, queue, entroq.ClaimedBySelf())
+	if err != nil {
+		t.Fatalf("Tasks as the run: %v", err)
+	}
+	if len(mine) != 1 || mine[0].ID != held.ID {
+		t.Errorf("the run's ClaimedBySelf found %v, want the task it holds, %s", mine, held.ID)
+	}
+	theirs, err := eq.Tasks(ctx, queue, entroq.ClaimedBySelf())
+	if err != nil {
+		t.Fatalf("Tasks as the connection: %v", err)
+	}
+	if len(theirs) != 0 {
+		t.Errorf("the connection's ClaimedBySelf found %v, a task the run holds", theirs)
+	}
+}

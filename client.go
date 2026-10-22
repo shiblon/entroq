@@ -184,7 +184,7 @@ func (c *scopedClient) Docs(ctx context.Context, rq *DocQuery) ([]*Doc, error) {
 }
 
 func (c *scopedClient) Tasks(ctx context.Context, queue string, opts ...TasksOpt) ([]*Task, error) {
-	return c.eq.Tasks(ctx, queue, opts...)
+	return c.eq.tasks(ctx, queue, c.claimant, opts)
 }
 
 func (c *scopedClient) NamespaceStats(ctx context.Context, opts ...QueuesOpt) (map[string]*NamespaceStat, error) {

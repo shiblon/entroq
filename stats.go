@@ -33,6 +33,10 @@ type TasksQuery struct {
 	// service receiving it in a request should ensure that values
 	// are not passed over the wire.
 	OmitValues bool
+
+	// claimedBySelf asks for Claimant to be the asking client's own, filled
+	// in by Tasks once it knows who is asking (see ClaimedBySelf).
+	claimedBySelf bool
 }
 
 // Validate checks that the query names a queue, task IDs, or both. Task IDs
@@ -171,9 +175,19 @@ func (c *EntroQ) WaitQueuesEmpty(ctx context.Context, opts ...QueuesOpt) error {
 
 // Tasks returns a slice of all tasks in the given queue.
 func (c *EntroQ) Tasks(ctx context.Context, queue string, opts ...TasksOpt) ([]*Task, error) {
+	return c.tasks(ctx, queue, c.ClientID, opts)
+}
+
+// tasks lists the tasks in queue for a client whose claimant is self, which is
+// who ClaimedBySelf means: a scoped client asks as its own claimant, not the
+// connection's.
+func (c *EntroQ) tasks(ctx context.Context, queue, self string, opts []TasksOpt) ([]*Task, error) {
 	query := &TasksQuery{Queue: queue}
 	for _, opt := range opts {
-		opt(c, query)
+		opt(query)
+	}
+	if query.claimedBySelf {
+		query.Claimant = self
 	}
 	if err := query.Validate(); err != nil {
 		return nil, fmt.Errorf("tasks: %w", err)
@@ -182,34 +196,37 @@ func (c *EntroQ) Tasks(ctx context.Context, queue string, opts ...TasksOpt) ([]*
 }
 
 // TasksOpt is an option that can be passed into Tasks to control what it returns.
-type TasksOpt func(*EntroQ, *TasksQuery)
+type TasksOpt func(*TasksQuery)
 
 // ClaimedBySelf filters the tasks query to only return tasks claimed by this client
 // (or tasks whose claim has expired).
+//
+// "This client" is the one Tasks is called on: a scoped client's own claimant,
+// such as a worker Run's, and not its connection's.
 func ClaimedBySelf() TasksOpt {
-	return func(c *EntroQ, q *TasksQuery) {
-		q.Claimant = c.ClientID
+	return func(q *TasksQuery) {
+		q.claimedBySelf = true
 	}
 }
 
 // ClaimedBy filters the tasks query to only return tasks claimed by the given
 // claimant (or tasks whose claim has expired).
 func ClaimedBy(id string) TasksOpt {
-	return func(_ *EntroQ, q *TasksQuery) {
+	return func(q *TasksQuery) {
 		q.Claimant = id
 	}
 }
 
 // LimitTasks sets the limit on the number of tasks to return. A value <= 0 indicates "no limit".
 func LimitTasks(limit int) TasksOpt {
-	return func(_ *EntroQ, q *TasksQuery) {
+	return func(q *TasksQuery) {
 		q.Limit = limit
 	}
 }
 
 // OmitValues tells a tasks query to only return metadata, not values.
 func OmitValues() TasksOpt {
-	return func(_ *EntroQ, q *TasksQuery) {
+	return func(q *TasksQuery) {
 		q.OmitValues = true
 	}
 }
@@ -218,7 +235,7 @@ func OmitValues() TasksOpt {
 // query. The default is "all that match other specs" if no IDs are specified.
 // Note that versions are not part of the ID.
 func WithTaskID(ids ...string) TasksOpt {
-	return func(_ *EntroQ, q *TasksQuery) {
+	return func(q *TasksQuery) {
 		q.IDs = append(q.IDs, ids...)
 	}
 }

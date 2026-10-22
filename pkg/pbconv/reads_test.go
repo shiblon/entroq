@@ -19,12 +19,11 @@ func applyMatch(opts []entroq.QueuesOpt) *entroq.MatchQuery {
 	return q
 }
 
-// applyTasks applies task options. The client argument is only read by the
-// options that filter on the client's own identity, which none of these are.
+// applyTasks applies task options to a fresh query.
 func applyTasks(opts []entroq.TasksOpt) *entroq.TasksQuery {
 	q := new(entroq.TasksQuery)
 	for _, opt := range opts {
-		opt(nil, q)
+		opt(q)
 	}
 	return q
 }
