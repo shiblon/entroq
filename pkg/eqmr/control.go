@@ -182,7 +182,7 @@ func stateWorker[T any](c *Controller, decide stateDecision[T], opts ...worker.O
 // and decide is called; decide must check again under the claim.
 func barrierWorker[T any](c *Controller, reached func(context.Context) (bool, error), decide stateDecision[T], opts ...worker.Option[T]) *worker.Worker[T] {
 	opts = append(opts,
-		worker.WithTakeDocs(func(ctx context.Context, _ *entroq.Task, _ T) ([]*entroq.DocClaim, error) {
+		worker.WithTakeDocs(func(ctx context.Context, _ entroq.Reader, work *worker.Work[T]) (*worker.TakeResult, error) {
 			ok, err := reached(ctx)
 			if err != nil && !entroq.IsUnavailable(err) {
 				return nil, err
@@ -192,9 +192,10 @@ func barrierWorker[T any](c *Controller, reached func(context.Context) (bool, er
 			if err == nil && !ok {
 				return nil, nil
 			}
-			return []*entroq.DocClaim{entroq.ClaimKey(c.DocNS(), stateDocKey)}, nil
+			return worker.Take(entroq.ClaimKey(c.DocNS(), stateDocKey)), nil
 		}),
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, value T, docs []*entroq.Doc) (*worker.Result, error) {
+		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, work *worker.Work[T]) (*worker.Result, error) {
+			task, value, docs := work.Task, work.Value, entroq.DocsIn(work.Sets)
 			if len(docs) == 0 {
 				// Not reached.
 				return worker.Modify(task.Delete()), nil
@@ -290,10 +291,12 @@ func (c *Controller) finishing(ctx context.Context, task *entroq.Task, st runSta
 // are collected.
 func (c *Controller) mapDoneWorker() *worker.Worker[mapDone] {
 	return worker.New[mapDone](c.client,
-		worker.WithTakeDocs(func(_ context.Context, _ *entroq.Task, md mapDone) ([]*entroq.DocClaim, error) {
-			return []*entroq.DocClaim{entroq.ClaimKey(c.DocNS(), md.SplitKey)}, nil
+		worker.WithTakeDocs(func(_ context.Context, _ entroq.Reader, work *worker.Work[mapDone]) (*worker.TakeResult, error) {
+			md := work.Value
+			return worker.Take(entroq.ClaimKey(c.DocNS(), md.SplitKey)), nil
 		}),
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, md mapDone, docs []*entroq.Doc) (*worker.Result, error) {
+		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, work *worker.Work[mapDone]) (*worker.Result, error) {
+			task, md, docs := work.Task, work.Value, entroq.DocsIn(work.Sets)
 			st, err := c.readState(ctx)
 			if err != nil {
 				return nil, retryIfUnavailable(err)
@@ -359,10 +362,12 @@ func (c *Controller) mapCheckWorker() *worker.Worker[barrierCheck] {
 // sink commit and the Modify can make the committed attempt look like a loser.
 func (c *Controller) reduceDoneWorker() *worker.Worker[reduceDone] {
 	return worker.New[reduceDone](c.client,
-		worker.WithTakeDocs(func(_ context.Context, _ *entroq.Task, rd reduceDone) ([]*entroq.DocClaim, error) {
-			return []*entroq.DocClaim{entroq.ClaimKey(c.DocNS(), mapOutDocKey(rd.Partition))}, nil
+		worker.WithTakeDocs(func(_ context.Context, _ entroq.Reader, work *worker.Work[reduceDone]) (*worker.TakeResult, error) {
+			rd := work.Value
+			return worker.Take(entroq.ClaimKey(c.DocNS(), mapOutDocKey(rd.Partition))), nil
 		}),
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, rd reduceDone, docs []*entroq.Doc) (*worker.Result, error) {
+		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, work *worker.Work[reduceDone]) (*worker.Result, error) {
+			task, rd, docs := work.Task, work.Value, entroq.DocsIn(work.Sets)
 			st, err := c.readState(ctx)
 			if err != nil {
 				return nil, retryIfUnavailable(err)
@@ -513,7 +518,8 @@ func (c *Controller) keyPartitions(ctx context.Context, prefix string) ([]int, e
 // so a retry deletes what is left. Collection never touches run state.
 func (c *Controller) gcWorker() *worker.Worker[gcTask] {
 	return worker.New[gcTask](c.client,
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, gc gcTask, _ []*entroq.Doc) (*worker.Result, error) {
+		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, work *worker.Work[gcTask]) (*worker.Result, error) {
+			task, gc := work.Task, work.Value
 			for i, run := range gc.Runs {
 				store, err := c.stores.resolve(run.Store)
 				if err != nil {
@@ -596,12 +602,11 @@ func (c *Controller) failNow(ctx context.Context, reason string) error {
 func (c *Controller) updateState(ctx context.Context, change func(runState) (*runState, []entroq.ModifyArg)) error {
 	claimant := entroq.GenHex16()
 	for {
-		docs, err := c.client.ClaimDocs(ctx, &entroq.DocClaim{
-			Namespace: c.DocNS(),
-			Key:       stateDocKey,
-			Claimant:  claimant,
-			Duration:  c.cfg.Lease,
-		})
+		sets, err := c.client.ClaimDocs(ctx,
+			entroq.ClaimKey(c.DocNS(), stateDocKey),
+			entroq.ClaimingSetsAs(claimant),
+			entroq.ClaimingSetsFor(c.cfg.Lease),
+		)
 		if _, ok := entroq.AsDependency(err); ok {
 			select {
 			case <-ctx.Done():
@@ -613,6 +618,7 @@ func (c *Controller) updateState(ctx context.Context, change func(runState) (*ru
 		if err != nil {
 			return err
 		}
+		docs := entroq.DocsIn(sets)
 		if len(docs) != 1 {
 			return fmt.Errorf("run %q has %d state docs, want 1", c.prefix, len(docs))
 		}

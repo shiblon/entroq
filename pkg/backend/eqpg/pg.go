@@ -5,7 +5,7 @@
 //
 // This backend garbage-collects on its own. Queues and doc namespaces that opt
 // in by name (a /gc= component) have their arrived tasks or complete unclaimed
-// doc groups reaped by an always-on background loop started when the backend is
+// doc sets reaped by an always-on background loop started when the backend is
 // opened. It is a first-class backend behavior, not a separate process, so a
 // client talking directly to PostgreSQL with this package (the many-clients,
 // one-database model, with no "eqpg serve" in front) collects gc=-marked queues
@@ -27,8 +27,10 @@ import (
 
 	"github.com/lib/pq"
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/backend/internal/arrival"
 	"github.com/shiblon/entroq/pkg/backend/internal/gcmetrics"
-	"github.com/shiblon/entroq/pkg/backend/internal/limits"
+	"github.com/shiblon/entroq/pkg/backend/internal/validate"
+	"github.com/shiblon/entroq/pkg/internal/latency"
 	"github.com/shiblon/entroq/pkg/subq"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
@@ -270,13 +272,19 @@ func OpenDB(target string, opts ...PGOpt) (*sql.DB, error) {
 // PostgreSQL URL, verifying that the database schema is present and at the
 // expected version. Fails loudly if the schema is uninitialized or at the wrong
 // version; run "eqpg schema init" or "eqpg schema upgrade" first.
-func Open(ctx context.Context, target string, opts ...PGOpt) (*EQPG, error) {
+func Open(ctx context.Context, target string, opts ...PGOpt) (b *EQPG, err error) {
 	options := defaultOptions(opts)
 
 	db, err := OpenDB(target, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open postgres DB: %w", err)
 	}
+	// The backend owns db once New succeeds; until then, Open does.
+	defer func() {
+		if err != nil {
+			db.Close()
+		}
+	}()
 
 	if options.nw == nil {
 		options.nw = subq.New()
@@ -402,6 +410,7 @@ func (b *EQPG) initMetrics(mp metric.MeterProvider) error {
 	b.claimDuration, err = meter.Float64Histogram("entroq.claim.duration",
 		metric.WithDescription("Duration of TryClaim calls against the database."),
 		metric.WithUnit("s"),
+		latency.Buckets(),
 	)
 	if err != nil {
 		return fmt.Errorf("claim duration histogram: %w", err)
@@ -409,6 +418,7 @@ func (b *EQPG) initMetrics(mp metric.MeterProvider) error {
 	b.modifyDuration, err = meter.Float64Histogram("entroq.modify.duration",
 		metric.WithDescription("Duration of Modify calls against the database."),
 		metric.WithUnit("s"),
+		latency.Buckets(),
 	)
 	if err != nil {
 		return fmt.Errorf("modify duration histogram: %w", err)
@@ -453,7 +463,8 @@ func (b *EQPG) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[string]i
 }
 
 // QueueStats returns a mapping from queue names to their statistics.
-func (b *EQPG) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[string]*entroq.QueueStat, error) {
+func (b *EQPG) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (_ map[string]*entroq.QueueStat, err error) {
+	defer func() { err = interrupted(ctx, err) }()
 	// All metrics come from one index-only grouped scan: a single pass grouped by
 	// queue over a covering index on (queue, at, claims), with FILTERs deriving
 	// the claimed/future/available counts and MAX(claims) folded into the same
@@ -528,7 +539,11 @@ func (b *EQPG) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[stri
 }
 
 // Tasks returns a slice of all tasks in the given queue.
-func (b *EQPG) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Task, error) {
+func (b *EQPG) Tasks(ctx context.Context, tq *entroq.TasksQuery) (_ []*entroq.Task, err error) {
+	defer func() { err = interrupted(ctx, err) }()
+	if err := tq.Validate(); err != nil {
+		return nil, fmt.Errorf("eqpg tasks: %w", err)
+	}
 	q := "SELECT id, version, queue, at, created, modified, claimant, value, claims, attempt, err FROM tasks WHERE true"
 	var values []any
 
@@ -537,19 +552,21 @@ func (b *EQPG) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Task
 		values = append(values, tq.Queue)
 	}
 
+	// A claimant filter keeps what that claimant can act on now: tasks anyone
+	// could claim, and tasks it holds. A task's claimant is whoever last wrote
+	// it, so the claimant alone does not mean it is held.
 	if tq.Claimant != "" {
-		q += fmt.Sprintf(" AND (claimant = $%d OR claimant = $%d OR at < NOW())", len(values)+1, len(values)+2)
-		values = append(values, "", tq.Claimant)
+		q += fmt.Sprintf(" AND (at <= NOW() OR claimant = $%d)", len(values)+1)
+		values = append(values, tq.Claimant)
 	}
 
-	// Add IDs if a set of limiting IDs has been requested.
-	strIDs := make([]string, 0, len(tq.IDs))
-	for _, id := range tq.IDs {
-		strIDs = append(strIDs, id)
-	}
-	if len(strIDs) != 0 {
-		q += fmt.Sprintf(" AND id = any($%d)", len(values)+1)
-		values = append(values, pq.StringArray(strIDs))
+	// No order is promised, but tasks come in arrival order, or in the order
+	// their IDs were asked for, as the indexes make that cheap.
+	if len(tq.IDs) != 0 {
+		q += fmt.Sprintf(" AND id = any($%d) ORDER BY array_position($%[1]d, id)", len(values)+1)
+		values = append(values, pq.StringArray(tq.IDs))
+	} else {
+		q += " ORDER BY at, id"
 	}
 
 	if tq.Limit > 0 {
@@ -596,11 +613,9 @@ func (b *EQPG) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, 
 // TryClaim attempts to claim an "arrived" task from any of the specified
 // queues, attempting to do so fairly across queues. Returns a nil task (no
 // error) if all queues are empty.
-func (b *EQPG) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
-	if cq.Duration == 0 {
-		return nil, fmt.Errorf("no duration set for claim %q", cq.Queues)
-	}
-	if err := limits.Claimant(cq.Claimant); err != nil {
+func (b *EQPG) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (_ *entroq.Task, err error) {
+	defer func() { err = interrupted(ctx, err) }()
+	if err := validate.Claim(cq); err != nil {
 		return nil, fmt.Errorf("eqpg claim: %w", err)
 	}
 	start := time.Now()
@@ -609,7 +624,7 @@ func (b *EQPG) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 	}()
 	task := new(entroq.Task)
 	var val []byte
-	err := b.DB.QueryRowContext(ctx,
+	err = b.DB.QueryRowContext(ctx,
 		`SELECT id, version, queue, at, created, modified, claimant, value, claims, attempt, err
 		 FROM try_claim($1, $2, $3)`,
 		pq.Array(cq.Queues), cq.Claimant, pgInterval(cq.Duration),
@@ -628,6 +643,20 @@ func (b *EQPG) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 	return task, nil
 }
 
+// interrupted reports err as the caller's cancellation or deadline when ctx is
+// done. lib/pq stops a query the context interrupts by asking the server to
+// cancel it, and returns the server's "canceling statement due to user
+// request" (57014), which does not wrap the context's error: a caller
+// checking entroq.IsCanceled or IsTimeout would see a server failure instead.
+// Whether the query was running decides which error pq returns, so a caller
+// canceling while a claim waits could get either. Both are kept.
+func interrupted(ctx context.Context, err error) error {
+	if err == nil || ctx.Err() == nil || errors.Is(err, ctx.Err()) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", ctx.Err(), err)
+}
+
 // isRetryable returns true for PostgreSQL errors that indicate a transaction
 // should be retried: serialization failures (40001) and deadlocks (40P01).
 func isRetryable(err error) bool {
@@ -640,59 +669,21 @@ func isRetryable(err error) bool {
 	return false
 }
 
-// modifyConfig holds options for how Modify should execute.
-type modifyConfig struct {
-	runInTx func(context.Context, *sql.Tx) error
-}
-
-// modOpt is a private type for options that only this backend understands.
-// It satisfies the entroq.ModifyOption interface so that it can be passed
-// there.
-type modOpt func(c *modifyConfig)
-
-// IsModifyBackend returns nil if b is an *EQPG, or a descriptive error otherwise.
-// Its presence also causes modOpt to satisfy the entroq.ModifyOption interface.
-func (modOpt) IsModifyBackend(b entroq.Backend) error {
-	if _, ok := b.(*EQPG); !ok {
-		return fmt.Errorf("requires a PostgreSQL (*eqpg.EQPG) backend, got %T", b)
-	}
-	return nil
-}
-
-// RunningInTx returns an entroq.ModifyOption that signals to this backend
-// to run f inside the Modify transaction.
-//
-// Important: the callback is responsible for managing any rows returned,
-// including closing them before the callback completes.
-func RunningInTx(f func(context.Context, *sql.Tx) error) entroq.ModifyOption {
-	return modOpt(func(c *modifyConfig) {
-		c.runInTx = f
-	})
-}
-
 // Modify attempts to apply an atomic modification to the task store. Either
 // all succeeds or all fails.
-func (b *EQPG) Modify(ctx context.Context, mod *entroq.Modification) (*entroq.ModifyResponse, error) {
+func (b *EQPG) Modify(ctx context.Context, mod *entroq.Modification) (_ *entroq.ModifyResponse, err error) {
+	defer func() { err = interrupted(ctx, err) }()
 	// Reject writes to an empty queue/namespace before touching the database, so
 	// an empty queue is never written.
-	if err := mod.EnsureModifyKeys(); err != nil {
-		return nil, fmt.Errorf("eqpg modify: %w", err)
-	}
-	if err := limits.Modification(mod); err != nil {
+	if err := validate.Modification(mod); err != nil {
 		return nil, fmt.Errorf("eqpg modify: %w", err)
 	}
 	start := time.Now()
 	defer func() {
 		b.modifyDuration.Record(ctx, time.Since(start).Seconds())
 	}()
-	options := &modifyConfig{}
-	for _, o := range mod.Options() {
-		if pgOpt, ok := o.(modOpt); ok {
-			pgOpt(options)
-		}
-	}
 	return b.modifyHandlingRetriable(ctx, func() (*entroq.ModifyResponse, error) {
-		return b.modify(ctx, mod, options)
+		return b.modify(ctx, mod)
 	})
 }
 
@@ -734,106 +725,90 @@ func (b *EQPG) modifyHandlingRetriable(ctx context.Context, doModify func() (*en
 	return nil, entroq.DependencyErrorf("retry limit: %v", err)
 }
 
+// lockArrivingTasks reads the tasks arrivals name, locked FOR UPDATE in ID
+// order; a missing one is absent from the result.
+func lockArrivingTasks(ctx context.Context, tx *sql.Tx, arrivals []*entroq.TaskArrival) (map[string]*entroq.Task, error) {
+	ids := make([]string, 0, len(arrivals))
+	for _, a := range arrivals {
+		ids = append(ids, a.ID)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id, version, queue, at, created, modified, claimant, value, claims, attempt, err
+		FROM entroq.tasks WHERE id = any($1) ORDER BY id FOR UPDATE`, pq.StringArray(ids))
+	if err != nil {
+		return nil, fmt.Errorf("pg lock arriving tasks: %w", err)
+	}
+	defer rows.Close()
+	tasks := make(map[string]*entroq.Task, len(ids))
+	for rows.Next() {
+		t := new(entroq.Task)
+		var val []byte
+		if err := rows.Scan(&t.ID, &t.Version, &t.Queue, &t.At, &t.Created, &t.Modified, &t.Claimant, &val, &t.Claims, &t.Attempt, &t.Err); err != nil {
+			return nil, fmt.Errorf("pg scan arriving task: %w", err)
+		}
+		t.Value = val
+		tasks[t.ID] = t
+	}
+	return tasks, rows.Err()
+}
+
 // modify calls the modify_arrays stored procedure, which atomically locks
 // dependencies, checks versions, and performs all inserts/changes/deletes in
 // one round trip. Returns a DependencyError (SQLSTATE EQ001) if any
 // dependency constraint is violated.
-func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *modifyConfig) (*entroq.ModifyResponse, error) {
-	// Build parallel arrays for task operation set.
-	depIDs, depVers, depQueues := taskIDArrays(mod.Depends)
-	delIDs, delVers, delQueues := taskIDArrays(mod.Deletes)
-	insIDs, insQueues, insAts, insValues, insAttempts, insErrs := insertArrays(mod.Inserts)
-	chgIDs, chgVers, chgFromQueues, chgQueues, chgAts, chgValues, chgAttempts, chgErrs := changeArrays(mod.Changes)
-
-	// Build parallel arrays for resource operation set.
-	rDepNS, rDepIDs, rDepVers := resourceIDArrays(mod.DocDepends)
-	rDelNS, rDelIDs, rDelVers := resourceIDArrays(mod.DocDeletes)
-	rInsNS, rInsIDs, rInsPKeys, rInsSKeys, rInsValues, rInsAts := resourceInsertArrays(mod.DocInserts)
-	rChgNS, rChgIDs, rChgVers, rChgPKeys, rChgSKeys, rChgValues, rChgAts := resourceChangeArrays(mod.DocChanges)
-
-	if options == nil {
-		options = &modifyConfig{}
-	}
-
+func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification) (resp *entroq.ModifyResponse, err error) {
 	tx, err := b.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("pg modify begin tx: %w", err)
 	}
 	defer func() {
 		if err != nil {
-			if rbErr := tx.Rollback(); rbErr != nil {
+			// A canceled context rolls the transaction back on its own.
+			if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
 				err = fmt.Errorf("pg modify rollback failed: %v (original error: %w)", rbErr, err)
 			}
 		} else {
 			if cmErr := tx.Commit(); cmErr != nil {
-				err = fmt.Errorf("pg modify commit failed: %w", cmErr)
+				resp, err = nil, fmt.Errorf("pg modify commit failed: %w", cmErr)
 			}
 		}
 	}()
 
-	// Run caller's DB work first, inside the same transaction, if specified.
-	if options.runInTx != nil {
-		if err := options.runInTx(ctx, tx); err != nil {
-			return nil, fmt.Errorf("pg modify caller tx work: %w", err)
-		}
-	}
+	resp = new(entroq.ModifyResponse)
 
-	resp := new(entroq.ModifyResponse)
-
-	// Resource modifications.
-	if len(rDepIDs)+len(rDelIDs)+len(rInsIDs)+len(rChgIDs) > 0 {
-		rRows, err := tx.QueryContext(ctx, `
-			SELECT kind, namespace, id, version, claimant, at, key_primary, key_secondary, value, created, modified
-			FROM _modify_docs(
-				$1,
-				$2::text[], $3::text[], $4::integer[],
-				$5::text[], $6::text[], $7::integer[],
-				$8::text[], $9::text[], $10::text[], $11::text[], $12::text[], $13::timestamptz[],
-				$14::text[], $15::text[], $16::integer[], $17::text[], $18::text[], $19::text[], $20::timestamptz[]
-			)`,
-			mod.Claimant,
-			pq.Array(rDepNS), pq.Array(rDepIDs), pq.Array(rDepVers),
-			pq.Array(rDelNS), pq.Array(rDelIDs), pq.Array(rDelVers),
-			pq.Array(rInsNS), pq.Array(rInsIDs), pq.Array(rInsPKeys), pq.Array(rInsSKeys), pq.Array(rInsValues), pq.Array(rInsAts),
-			pq.Array(rChgNS), pq.Array(rChgIDs), pq.Array(rChgVers), pq.Array(rChgPKeys), pq.Array(rChgSKeys), pq.Array(rChgValues), pq.Array(rChgAts),
-		)
+	// Task arrivals are changes of the stored tasks' arrival times alone, so
+	// they are read first, locked, and passed on as ordinary changes.
+	if len(mod.Arrives) > 0 {
+		stored, err := lockArrivingTasks(ctx, tx, mod.Arrives)
 		if err != nil {
-			return nil, parseModifyDocsError(err, mod)
+			return nil, err
 		}
-		defer rRows.Close()
-
-		for rRows.Next() {
-			r := new(entroq.Doc)
-			var kind string
-			var val []byte
-			if err := rRows.Scan(&kind, &r.Namespace, &r.ID, &r.Version, &r.Claimant, &r.At, &r.Key, &r.SecondaryKey, &val, &r.Created, &r.Modified); err != nil {
-				return nil, fmt.Errorf("pg modify resource scan: %w", err)
-			}
-			r.Content = val
-			switch kind {
-			case "inserted":
-				resp.InsertedDocs = append(resp.InsertedDocs, r)
-			case "changed":
-				resp.ChangedDocs = append(resp.ChangedDocs, r)
-			}
-		}
+		mod = arrival.Changes(mod, func(id string) *entroq.Task { return stored[id] })
 	}
 
-	// Task modifications.
+	// Doc modifications, by the rules in docset.
+	if err := modifyDocs(ctx, tx, mod, resp); err != nil {
+		return nil, withTaskDeps(ctx, tx, mod, err)
+	}
+
+	// Task modifications, as parallel arrays per operation.
+	depIDs, depVers, depQueues := taskIDArrays(mod.Depends)
+	delIDs, delVers, delQueues := taskIDArrays(mod.Deletes)
+	insIDs, insQueues, insBys, insValues, insAttempts, insErrs := insertArrays(mod.Inserts)
+	chgIDs, chgVers, chgFromQueues, chgQueues, chgBys, chgValues, chgAttempts, chgErrs, chgResets := changeArrays(mod)
 	rows, err := tx.QueryContext(ctx, `
 		SELECT kind, id, version, queue, at, created, modified, claimant, value, claims, attempt, err
 		FROM _modify_arrays(
 			$1,
 			$2::text[], $3::integer[], $4::text[],
 			$5::text[], $6::integer[], $7::text[],
-			$8::text[], $9::text[], $10::timestamptz[], $11::text[], $12::integer[], $13::text[],
-			$14::text[], $15::integer[], $16::text[], $17::text[], $18::timestamptz[], $19::text[], $20::integer[], $21::text[]
+			$8::text[], $9::text[], $10::bigint[], $11::text[], $12::integer[], $13::text[],
+			$14::text[], $15::integer[], $16::text[], $17::text[], $18::bigint[], $19::text[], $20::integer[], $21::text[], $22::boolean[]
 		)`,
 		mod.Claimant,
 		pq.Array(depIDs), pq.Array(depVers), pq.Array(depQueues),
 		pq.Array(delIDs), pq.Array(delVers), pq.Array(delQueues),
-		pq.Array(insIDs), pq.Array(insQueues), pq.Array(insAts), pq.Array(insValues), pq.Array(insAttempts), pq.Array(insErrs),
-		pq.Array(chgIDs), pq.Array(chgVers), pq.Array(chgFromQueues), pq.Array(chgQueues), pq.Array(chgAts), pq.Array(chgValues), pq.Array(chgAttempts), pq.Array(chgErrs),
+		pq.Array(insIDs), pq.Array(insQueues), pq.Array(insBys), pq.Array(insValues), pq.Array(insAttempts), pq.Array(insErrs),
+		pq.Array(chgIDs), pq.Array(chgVers), pq.Array(chgFromQueues), pq.Array(chgQueues), pq.Array(chgBys), pq.Array(chgValues), pq.Array(chgAttempts), pq.Array(chgErrs), pq.Array(chgResets),
 	)
 	if err != nil {
 		return nil, parseModifyError(err, mod)
@@ -864,6 +839,49 @@ func (b *EQPG) modify(ctx context.Context, mod *entroq.Modification, options *mo
 // parseModifyError converts an EQ001 PostgreSQL error into a DependencyError,
 // categorizing each affected task ID by which operation set it belongs to.
 // Other errors are returned unchanged.
+// withTaskDeps returns docErr with this modification's failed task
+// dependencies merged in, so one failed call reports every dependency that
+// failed rather than the doc rules this time and the task rules next time.
+//
+// The doc rules are decided in Go (docset.Evaluate), so a failure there leaves
+// the transaction usable and the task dependencies one query away --
+// entroq._check_task_deps, the same check _modify_arrays makes first, asked on
+// its own because it writes nothing. The transaction is about to roll back
+// either way, so the row locks it takes and the abort its RAISE causes cost
+// nothing.
+//
+// Anything other than a dependency failure leaves docErr alone: it is the
+// answer, and a diagnostic query is not the place to replace it.
+func withTaskDeps(ctx context.Context, tx *sql.Tx, mod *entroq.Modification, docErr error) error {
+	docDep, ok := entroq.AsDependency(docErr)
+	if !ok {
+		return docErr
+	}
+	depIDs, depVers, depQueues := taskIDArrays(mod.Depends)
+	delIDs, delVers, delQueues := taskIDArrays(mod.Deletes)
+	chgIDs, chgVers, chgFromQueues, _, _, _, _, _, _ := changeArrays(mod)
+	insIDs, _, _, _, _, _ := insertArrays(mod.Inserts)
+	_, err := tx.ExecContext(ctx, `
+		SELECT entroq._check_task_deps(
+			$1,
+			$2::text[], $3::integer[], $4::text[],
+			$5::text[], $6::integer[], $7::text[],
+			$8::text[], $9::integer[], $10::text[],
+			$11::text[]
+		)`,
+		mod.Claimant,
+		pq.Array(depIDs), pq.Array(depVers), pq.Array(depQueues),
+		pq.Array(delIDs), pq.Array(delVers), pq.Array(delQueues),
+		pq.Array(chgIDs), pq.Array(chgVers), pq.Array(chgFromQueues),
+		pq.Array(insIDs),
+	)
+	taskDep, ok := entroq.AsDependency(parseModifyError(err, mod))
+	if !ok {
+		return docErr
+	}
+	return taskDep.Merge(docDep)
+}
+
 func parseModifyError(err error, mod *entroq.Modification) error {
 	if err == nil {
 		return nil
@@ -882,6 +900,10 @@ func parseModifyError(err error, mod *entroq.Modification) error {
 			ID      string `json:"id"`
 			Version int32  `json:"version"`
 		} `json:"mismatched"`
+		Claimed []struct {
+			ID      string `json:"id"`
+			Version int32  `json:"version"`
+		} `json:"claimed"`
 		Collisions []struct {
 			ID      string `json:"id"`
 			Version int32  `json:"version"`
@@ -921,79 +943,11 @@ func parseModifyError(err error, mod *entroq.Modification) error {
 	for _, m := range detail.Mismatched {
 		categorize(m.ID, m.Version)
 	}
+	for _, c := range detail.Claimed {
+		depErr.Claims = append(depErr.Claims, &entroq.TaskID{ID: c.ID, Version: c.Version})
+	}
 	for _, c := range detail.Collisions {
 		depErr.Inserts = append(depErr.Inserts, &entroq.TaskID{ID: c.ID, Version: c.Version})
-	}
-
-	return depErr
-}
-
-// parseModifyDocsError converts an EQ001 PostgreSQL error from _modify_docs
-// into a DependencyError with doc fields populated. The doc error JSON uses
-// {ns, id, version} for missing/mismatched and {ns, id} for collisions,
-// unlike the task error which uses {id, version}. Other errors are returned unchanged.
-func parseModifyDocsError(err error, mod *entroq.Modification) error {
-	if err == nil {
-		return nil
-	}
-	pgerr := new(pq.Error)
-	if !errors.As(err, &pgerr) || string(pgerr.Code) != "EQ001" {
-		return err
-	}
-
-	var detail struct {
-		Missing []struct {
-			NS      string `json:"ns"`
-			ID      string `json:"id"`
-			Version int32  `json:"version"`
-		} `json:"missing"`
-		Mismatched []struct {
-			NS      string `json:"ns"`
-			ID      string `json:"id"`
-			Version int32  `json:"version"`
-		} `json:"mismatched"`
-		Collisions []struct {
-			NS string `json:"ns"`
-			ID string `json:"id"`
-		} `json:"collisions"`
-	}
-	if jsonErr := json.Unmarshal([]byte(pgerr.Detail), &detail); jsonErr != nil {
-		return fmt.Errorf("pg modify docs EQ001 with unparseable detail %q: %w", pgerr.Detail, err)
-	}
-
-	// Build lookup sets to categorize (namespace, id) pairs by operation.
-	dependKeys := make(map[string]bool, len(mod.DocDepends))
-	for _, d := range mod.DocDepends {
-		dependKeys[entroq.DocKey(d.Namespace, d.ID)] = true
-	}
-	deleteKeys := make(map[string]bool, len(mod.DocDeletes))
-	for _, d := range mod.DocDeletes {
-		deleteKeys[entroq.DocKey(d.Namespace, d.ID)] = true
-	}
-
-	depErr := new(entroq.DependencyError)
-
-	categorize := func(ns, id string, version int32) {
-		did := &entroq.DocID{Namespace: ns, ID: id, Version: version}
-		k := entroq.DocKey(ns, id)
-		switch {
-		case dependKeys[k]:
-			depErr.DocDepends = append(depErr.DocDepends, did)
-		case deleteKeys[k]:
-			depErr.DocDeletes = append(depErr.DocDeletes, did)
-		default:
-			depErr.DocChanges = append(depErr.DocChanges, did)
-		}
-	}
-
-	for _, m := range detail.Missing {
-		categorize(m.NS, m.ID, m.Version)
-	}
-	for _, m := range detail.Mismatched {
-		categorize(m.NS, m.ID, m.Version)
-	}
-	for _, c := range detail.Collisions {
-		depErr.DocInserts = append(depErr.DocInserts, &entroq.DocID{Namespace: c.NS, ID: c.ID})
 	}
 
 	return depErr
@@ -1022,18 +976,20 @@ func jsonTextVal(v json.RawMessage) *string {
 	return &s
 }
 
-// insertArrays splits a slice of TaskData inserts into parallel arrays for the stored procedure.
-func insertArrays(inserts []*entroq.TaskData) (ids []string, queues []string, ats []time.Time, values []*string, attempts []int32, errs []string) {
+// insertArrays splits a slice of TaskData inserts into parallel arrays for the
+// stored procedure. An arrival travels as milliseconds from the database's own
+// now(), so no instant from this process's clock reaches the schema.
+func insertArrays(inserts []*entroq.TaskData) (ids []string, queues []string, bys []int64, values []*string, attempts []int32, errs []string) {
 	ids = make([]string, len(inserts))
 	queues = make([]string, len(inserts))
-	ats = make([]time.Time, len(inserts))
+	bys = make([]int64, len(inserts))
 	values = make([]*string, len(inserts))
 	attempts = make([]int32, len(inserts))
 	errs = make([]string, len(inserts))
 	for i, ins := range inserts {
 		ids[i] = ins.ID // empty signals auto-generate, the common case
 		queues[i] = ins.Queue
-		ats[i] = ins.At // zero time signals use now()
+		bys[i] = ins.By().Milliseconds()
 		values[i] = jsonTextVal(ins.Value)
 		attempts[i] = ins.Attempt
 		errs[i] = ins.Err
@@ -1045,24 +1001,29 @@ func insertArrays(inserts []*entroq.TaskData) (ids []string, queues []string, at
 // stored procedure. fromQueues is the source (current) queue matched by the
 // modify key; queues is the destination the task moves to (equal for a plain
 // change).
-func changeArrays(changes []*entroq.Task) (ids []string, versions []int32, fromQueues []string, queues []string, ats []time.Time, values []*string, attempts []int32, errs []string) {
+// change). An arrival travels as milliseconds from the database's own now(),
+// as it does for an insert.
+func changeArrays(mod *entroq.Modification) (ids []string, versions []int32, fromQueues []string, queues []string, bys []int64, values []*string, attempts []int32, errs []string, resets []bool) {
+	changes := mod.Changes
 	ids = make([]string, len(changes))
 	versions = make([]int32, len(changes))
 	fromQueues = make([]string, len(changes))
 	queues = make([]string, len(changes))
-	ats = make([]time.Time, len(changes))
+	bys = make([]int64, len(changes))
 	values = make([]*string, len(changes))
 	attempts = make([]int32, len(changes))
 	errs = make([]string, len(changes))
+	resets = make([]bool, len(changes))
 	for i, chg := range changes {
 		ids[i] = chg.ID
 		versions[i] = chg.Version
 		fromQueues[i] = chg.FromQueue
 		queues[i] = chg.Queue
-		ats[i] = chg.At
+		bys[i] = chg.By().Milliseconds()
 		values[i] = jsonTextVal(chg.Value)
 		attempts[i] = chg.Attempt
 		errs[i] = chg.Err
+		resets[i] = mod.ResetsClaims(chg.ID)
 	}
 	return
 }
@@ -1080,48 +1041,9 @@ func resourceIDArrays(rids []*entroq.DocID) (ns, ids []string, versions []int32)
 	return
 }
 
-// resourceInsertArrays splits a slice of ResourceData into parallel arrays.
-func resourceInsertArrays(inserts []*entroq.DocData) (ns, ids, pkeys, skeys []string, values []*string, ats []time.Time) {
-	ns = make([]string, len(inserts))
-	ids = make([]string, len(inserts))
-	pkeys = make([]string, len(inserts))
-	skeys = make([]string, len(inserts))
-	values = make([]*string, len(inserts))
-	ats = make([]time.Time, len(inserts))
-	for i, ins := range inserts {
-		ns[i] = ins.Namespace
-		ids[i] = ins.ID
-		pkeys[i] = ins.Key
-		skeys[i] = ins.SecondaryKey
-		values[i] = jsonTextVal(ins.Content)
-		ats[i] = ins.At
-	}
-	return
-}
-
-// resourceChangeArrays splits a slice of Resource changes into parallel arrays.
-func resourceChangeArrays(changes []*entroq.Doc) (ns, ids []string, versions []int32, pkeys, skeys []string, values []*string, ats []time.Time) {
-	ns = make([]string, len(changes))
-	ids = make([]string, len(changes))
-	versions = make([]int32, len(changes))
-	pkeys = make([]string, len(changes))
-	skeys = make([]string, len(changes))
-	values = make([]*string, len(changes))
-	ats = make([]time.Time, len(changes))
-	for i, chg := range changes {
-		ns[i] = chg.Namespace
-		ids[i] = chg.ID
-		versions[i] = chg.Version
-		pkeys[i] = chg.Key
-		skeys[i] = chg.SecondaryKey
-		values[i] = jsonTextVal(chg.Content)
-		ats[i] = chg.At
-	}
-	return
-}
-
 // Time returns the time used in all calculations in this process.
-func (b *EQPG) Time(ctx context.Context) (time.Time, error) {
+func (b *EQPG) Time(ctx context.Context) (_ time.Time, err error) {
+	defer func() { err = interrupted(ctx, err) }()
 	row := b.DB.QueryRowContext(ctx, "SELECT now()")
 	var t time.Time
 	if err := row.Scan(&t); err != nil {
@@ -1147,40 +1069,42 @@ func scanDocRows(rows *sql.Rows) ([]*entroq.Doc, error) {
 
 // Docs returns docs in a namespace. If IDs are specified, only those docs are
 // returned (key range and limit are ignored). Otherwise, docs are filtered by
-// optional key range and subject to limit.
-func (b *EQPG) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, error) {
-	var (
-		rows *sql.Rows
-		err  error
-	)
+// optional key range and subject to limit. Each doc carries its set's
+// version and claim.
+func (b *EQPG) Docs(ctx context.Context, rq *entroq.DocQuery) (_ []*entroq.Doc, err error) {
+	defer func() { err = interrupted(ctx, err) }()
+	if err := rq.Validate(); err != nil {
+		return nil, fmt.Errorf("eqpg docs: %w", err)
+	}
+	var rows *sql.Rows
+	columns := docColumns
+	if rq.OmitValues {
+		columns = strings.Replace(columns, "d.value", "NULL::jsonb", 1)
+	}
 	if len(rq.IDs) > 0 {
 		rows, err = b.DB.QueryContext(ctx,
-			`SELECT namespace, id, version, claimant, at, key_primary, key_secondary, value, created, modified
-			 FROM entroq.docs
-			 WHERE (namespace = $1 OR $1 = '') AND id = ANY($2)
-			 ORDER BY namespace, key_primary, key_secondary`,
+			`SELECT `+columns+` FROM `+docsWithLocks+`
+			 WHERE d.namespace = $1 AND d.id = ANY($2)
+			 ORDER BY array_position($2, d.id)`,
 			rq.Namespace, pq.StringArray(rq.IDs),
 		)
 	} else if rq.KeyExact != "" {
 		rows, err = b.DB.QueryContext(ctx,
-			`SELECT namespace, id, version, claimant, at, key_primary, key_secondary, value, created, modified
-			 FROM entroq.docs
-			 WHERE (namespace = $1 OR $1 = '') AND key_primary = $2
-			 ORDER BY key_primary, key_secondary`,
-			rq.Namespace, rq.KeyExact,
+			`SELECT `+columns+` FROM `+docsWithLocks+`
+			 WHERE d.namespace = $1 AND d.key_primary = $2
+			 ORDER BY d.key_primary, d.key_secondary, d.id
+			 LIMIT NULLIF($3, 0)`,
+			rq.Namespace, rq.KeyExact, rq.Limit,
 		)
 	} else {
 		rows, err = b.DB.QueryContext(ctx,
-			`SELECT namespace, id, version, claimant, at, key_primary, key_secondary,
-			        CASE WHEN $5 THEN NULL::jsonb ELSE value END AS value,
-			        created, modified
-			 FROM entroq.docs
-			 WHERE ($1 = '' OR namespace = $1)
-			   AND ($2 = '' OR key_primary >= $2)
-			   AND ($3 = '' OR key_primary < $3)
-			 ORDER BY namespace, key_primary, key_secondary
+			`SELECT `+columns+` FROM `+docsWithLocks+`
+			 WHERE d.namespace = $1
+			   AND ($2 = '' OR d.key_primary >= $2)
+			   AND ($3 = '' OR d.key_primary < $3)
+			 ORDER BY d.key_primary, d.key_secondary, d.id
 			 LIMIT NULLIF($4, 0)`,
-			rq.Namespace, rq.KeyStart, rq.KeyEnd, rq.Limit, rq.OmitValues,
+			rq.Namespace, rq.KeyStart, rq.KeyEnd, rq.Limit,
 		)
 	}
 	if err != nil {
@@ -1190,76 +1114,27 @@ func (b *EQPG) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, er
 	return scanDocRows(rows)
 }
 
-// ClaimDocs claims all docs with the given primary key in the namespace.
-// Returns a DependencyError if any doc with that key is already claimed by
-// another claimant. Returns an empty slice (not an error) if none exist.
-func (b *EQPG) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.Doc, error) {
-	if err := cq.Validate(); err != nil {
+// ClaimDocs claims every doc set cq names, all or none, in one transaction
+// (see claimDocs). A set can be claimed before it has docs. It returns a
+// DependencyError naming the held sets, and their members, while someone else
+// holds any of them.
+func (b *EQPG) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) (sets []*entroq.DocSet, err error) {
+	defer func() { err = interrupted(ctx, err) }()
+	if err := validate.DocClaim(cq); err != nil {
 		return nil, fmt.Errorf("claim docs: %w", err)
 	}
-	if err := limits.DocClaim(cq); err != nil {
-		return nil, fmt.Errorf("claim docs: %w", err)
-	}
-
-	dur := pgInterval(cq.Duration)
-	rows, err := b.DB.QueryContext(ctx,
-		`SELECT namespace, id, version, claimant, at, key_primary, key_secondary, value, created, modified
-		 FROM entroq._claim_docs($1, $2, $3::interval, $4)`,
-		cq.Namespace, cq.Claimant, dur, cq.Key,
-	)
+	tx, err := b.DB.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, parseClaimDocsError(err)
+		return nil, fmt.Errorf("pg claim docs begin tx: %w", err)
 	}
-	defer rows.Close()
-	results, err := scanDocRows(rows)
-	if err != nil {
-		return nil, parseClaimDocsError(err)
-	}
-	return results, nil
-}
-
-// parseClaimDocsError converts an EQ001 from _claim_docs into a DependencyError
-// with DocDeletes (missing docs) and DocClaims (already-claimed docs) populated.
-// Other errors are returned unchanged.
-func parseClaimDocsError(err error) error {
-	if err == nil {
-		return nil
-	}
-	pgerr := new(pq.Error)
-	if !errors.As(err, &pgerr) || string(pgerr.Code) != "EQ001" {
-		return fmt.Errorf("pg claim docs: %w", err)
-	}
-
-	var detail struct {
-		MissingDocs []struct {
-			Namespace string `json:"namespace"`
-			ID        string `json:"id"`
-			Version   int32  `json:"version"`
-		} `json:"missing_docs"`
-		ClaimedDocs []struct {
-			Namespace string `json:"namespace"`
-			ID        string `json:"id"`
-			Version   int32  `json:"version"`
-		} `json:"claimed_docs"`
-	}
-	if jsonErr := json.Unmarshal([]byte(pgerr.Detail), &detail); jsonErr != nil {
-		return fmt.Errorf("pg claim docs EQ001 with unparseable detail %q: %w", pgerr.Detail, err)
-	}
-
-	depErr := new(entroq.DependencyError)
-	for _, d := range detail.MissingDocs {
-		depErr.DocDeletes = append(depErr.DocDeletes, &entroq.DocID{
-			Namespace: d.Namespace,
-			ID:        d.ID,
-			Version:   d.Version,
-		})
-	}
-	for _, d := range detail.ClaimedDocs {
-		depErr.DocClaims = append(depErr.DocClaims, &entroq.DocID{
-			Namespace: d.Namespace,
-			ID:        d.ID,
-			Version:   d.Version,
-		})
-	}
-	return depErr
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+			return
+		}
+		if cmErr := tx.Commit(); cmErr != nil {
+			sets, err = nil, fmt.Errorf("pg claim docs commit: %w", cmErr)
+		}
+	}()
+	return claimDocs(ctx, tx, cq)
 }

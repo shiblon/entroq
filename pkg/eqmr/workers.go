@@ -90,14 +90,18 @@ func (c *Controller) setup(ctx context.Context, src Source) error {
 		return fmt.Errorf("eqmr setup: no input")
 	}
 
-	// Deterministic ids let a retry skip splits already staged.
+	// Deterministic ids and batches let a retry skip splits already staged: a
+	// batch commits whole or not at all, so one that fails only on colliding
+	// ids landed before.
 	var staged []entroq.ModifyArg
 	flush := func() error {
 		if len(staged) == 0 {
 			return nil
 		}
 		if _, err := c.client.Modify(ctx, staged...); err != nil {
-			return fmt.Errorf("eqmr setup: stage splits: %w", err)
+			if de, ok := entroq.AsDependency(err); !ok || !de.OnlyCollisions() {
+				return fmt.Errorf("eqmr setup: stage splits: %w", err)
+			}
 		}
 		staged = staged[:0]
 		return nil
@@ -113,7 +117,6 @@ func (c *Controller) setup(ctx context.Context, src Source) error {
 		staged = append(staged, entroq.PuttingDocInto(c.DocNS(),
 			entroq.WithIDKeys(splitDocID(i), key, ""),
 			entroq.WithContent(splitDoc{Split: split}),
-			entroq.WithSkipCollidingDoc(true),
 		))
 		if len(staged) >= batchSize {
 			if err := flush(); err != nil {
@@ -197,7 +200,8 @@ func (c *Controller) MapperWorker(mapFn Mapper, opts ...MapperOption) *worker.Wo
 	}
 
 	return worker.New[docRef](c.client,
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, ref docRef, _ []*entroq.Doc) (*worker.Result, error) {
+		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, work *worker.Work[docRef]) (*worker.Result, error) {
+			task, ref := work.Task, work.Value
 			// Not claiming the split lets a duplicate task race this one.
 			found, err := c.client.Docs(ctx, ref.asQuery())
 			if err != nil {
@@ -315,7 +319,8 @@ func runMapper(ctx context.Context, mapFn Mapper, records Records, out *intermed
 // finds no pointers on the retry and retires.
 func (c *Controller) ReducerWorker(reduceFn Reducer) *worker.Worker[reduceTask] {
 	return worker.New[reduceTask](c.client,
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, rt reduceTask, _ []*entroq.Doc) (*worker.Result, error) {
+		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, work *worker.Work[reduceTask]) (*worker.Result, error) {
+			task, rt := work.Task, work.Value
 			// Not claiming the pointers lets a duplicate task race this one.
 			docs, err := c.client.Docs(ctx, &entroq.DocQuery{
 				Namespace: c.DocNS(),

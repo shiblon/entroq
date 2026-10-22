@@ -10,7 +10,7 @@ import (
 )
 
 func (b *backend) NamespaceStats(ctx context.Context, qq *entroq.MatchQuery) (map[string]*entroq.NamespaceStat, error) {
-	resp, err := pb.NewEntroQClient(b.conn).NamespaceStats(ctx, &pb.NamespacesRequest{
+	resp, err := b.client().NamespaceStats(ctx, &pb.NamespacesRequest{
 		MatchPrefix: qq.MatchPrefix,
 		MatchExact:  qq.MatchExact,
 		Limit:       int32(qq.Limit),

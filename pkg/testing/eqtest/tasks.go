@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"path"
+	"slices"
 	"testing"
 	"time"
 
@@ -106,8 +107,7 @@ func TaskChangeFarPastArrivalNormalized(ctx context.Context, t *testing.T, clien
 		t.Fatalf("time: %v", err)
 	}
 	// Two windows in the past: well beyond the far-past cap.
-	farPast := before.Add(-2 * entroq.ArrivalPastWindow)
-	resp, err = client.Modify(ctx, inserted.Change(entroq.ArrivalTimeTo(farPast)))
+	resp, err = client.Modify(ctx, inserted.Change(entroq.ArrivalTimeBy(-2*entroq.ArrivalPastWindow)))
 	if err != nil {
 		t.Fatalf("change far-past arrival: %v", err)
 	}
@@ -304,10 +304,9 @@ func TasksWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	if want, got := len(ids), len(inserted); want != got {
 		t.Fatalf("Expected %d tasks inserted, got %d", want, got)
 	}
-	for i, task := range inserted {
-		if want, got := ids[i], task.ID; want != got {
-			t.Fatalf("Inserted task should have ID %q, but has %q", want, got)
-		}
+	// Neither Modify nor Tasks promises an order, so results compare as sets.
+	if diff := diffIDs(ids, inserted); diff != "" {
+		t.Fatalf("Inserted task IDs (-want +got):\n%s", diff)
 	}
 
 	// Once inserted, we should be able to query for zero (all), one, or more of them.
@@ -336,14 +335,18 @@ func TasksWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPref
 	if err != nil {
 		t.Fatalf("Error getting tasks from queue %q: %v", queue, err)
 	}
-	if want, got := len(idSubSet), len(tasks); want != got {
-		t.Fatalf("Expected %d tasks in 'all' query, got %d", want, got)
+	if diff := diffIDs(idSubSet, tasks); diff != "" {
+		t.Fatalf("Tasks queried by ID (-want +got):\n%s", diff)
 	}
-	for i, task := range tasks {
-		if want, got := idSubSet[i], task.ID; want != got {
-			t.Fatalf("Wanted queried task %d to have ID %q, got %q", i, want, got)
-		}
+}
+
+// diffIDs compares the IDs of tasks with want, ignoring order.
+func diffIDs(want []string, tasks []*entroq.Task) string {
+	got := make([]string, 0, len(tasks))
+	for _, t := range tasks {
+		got = append(got, t.ID)
 	}
+	return cmp.Diff(slices.Sorted(slices.Values(want)), slices.Sorted(slices.Values(got)))
 }
 
 // TasksClaimantLimit pins down the Tasks(Queue, Claimant, Limit) contract, the
@@ -373,10 +376,10 @@ func TasksClaimantLimit(ctx context.Context, t *testing.T, client *entroq.EntroQ
 	// matches (available tasks always satisfy a claimant filter).
 	t.Run("available_limit", func(t *testing.T) {
 		queue := path.Join(qPrefix, "claimant_limit", "available")
-		past := time.Now().Add(-time.Hour).UTC()
+		const past = -time.Hour
 		var args []entroq.ModifyArg
 		for range 10 {
-			args = append(args, entroq.InsertingInto(queue, entroq.WithArrivalTime(past)))
+			args = append(args, entroq.InsertingInto(queue, entroq.WithArrivalTimeIn(past)))
 		}
 		if _, err := client.Modify(ctx, args...); err != nil {
 			t.Fatalf("insert available: %v", err)
@@ -415,10 +418,10 @@ func TasksClaimantLimit(ctx context.Context, t *testing.T, client *entroq.EntroQ
 			otherClaim = 10 * time.Second // nearer expiry: sorts ahead of mine
 		)
 
-		past := time.Now().Add(-time.Hour).UTC()
+		const past = -time.Hour
 		var args []entroq.ModifyArg
 		for range nMine + nOther {
-			args = append(args, entroq.InsertingInto(queue, entroq.WithArrivalTime(past)))
+			args = append(args, entroq.InsertingInto(queue, entroq.WithArrivalTimeIn(past)))
 		}
 		if _, err := client.Modify(ctx, args...); err != nil {
 			t.Fatalf("insert pool: %v", err)
@@ -546,31 +549,28 @@ func TasksWithIDOnly(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 		}
 	}
 
-	results1, err := client.Tasks(ctx, "", entroq.WithTaskID(ids1...))
-	if err != nil {
-		t.Errorf("First group of task IDs had an error: %v", err)
-	}
-	for i, task := range results1 {
-		if want, got := ids1[i], task.ID; want != got {
-			t.Errorf("Expected task %d from group 1 to have ID %v, got %v", i, want, got)
+	// Tasks promises no order, so results match their inserted task by ID.
+	check := func(group string, want []*entroq.Task, ids []string) {
+		t.Helper()
+		got, err := client.Tasks(ctx, "", entroq.WithTaskID(ids...))
+		if err != nil {
+			t.Fatalf("%s: Tasks by ID: %v", group, err)
 		}
-		if want, got := string(tasks1[i].Value), string(task.Value); want != got {
-			t.Errorf("Expected task %d from group 1 to have bytes %s, got %s", i, want, got)
+		if diff := diffIDs(ids, got); diff != "" {
+			t.Fatalf("%s: task IDs (-want +got):\n%s", group, diff)
 		}
-	}
-
-	results2, err := client.Tasks(ctx, "", entroq.WithTaskID(ids2...))
-	if err != nil {
-		t.Errorf("First group of task IDs had an error: %v", err)
-	}
-	for i, task := range results2 {
-		if want, got := ids2[i], task.ID; want != got {
-			t.Errorf("Expected task %d from group 2 to have ID %v, got %v", i, want, got)
+		byID := make(map[string]*entroq.Task, len(want))
+		for _, w := range want {
+			byID[w.ID] = w
 		}
-		if want, got := string(tasks2[i].Value), string(task.Value); want != got {
-			t.Errorf("Expected task %d from group 2 to have bytes %s, got %s", i, want, got)
+		for _, task := range got {
+			if want, got := string(byID[task.ID].Value), string(task.Value); want != got {
+				t.Errorf("%s: task %q: want value %s, got %s", group, task.ID, want, got)
+			}
 		}
 	}
+	check("group 1", tasks1, ids1)
+	check("group 2", tasks2, ids2)
 }
 
 // InsertWithID tests the ability to insert tasks with a specified ID,
@@ -639,10 +639,8 @@ func InsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 		t.Fatalf("Expected %d insertion errors in dependency error, got %v", want, got)
 	}
 
-	// Try to insert again, but allow it to be skipped.
-	_, err = client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithID(knownID), entroq.WithSkipColliding(true)))
-	if err != nil {
-		t.Fatalf("Expected no error inserting with existing skippable ID %v: %v", knownID, err)
+	if !depErr.OnlyCollisions() {
+		t.Errorf("Collision: want an error of only collisions, got %v", depErr)
 	}
 
 	resp, err = client.Modify(ctx, entroq.InsertingInto(queue))
@@ -651,26 +649,19 @@ func InsertWithID(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 	}
 	inserted = resp.InsertedTasks
 
-	// Try to insert the known ID and delete the new ID at the same time. This
-	// should work when it's set to skip colliding.
-	if _, err = client.Modify(ctx,
-		entroq.InsertingInto(queue,
-			entroq.WithID(knownID),
-			entroq.WithSkipColliding(true)),
-		inserted[0].Delete()); err != nil {
-		t.Fatalf("Expected no error inserting skippable and deleting, got: %v", err)
+	// A colliding insert fails its whole modification: the delete beside it
+	// does not happen either. The collision says the insert was committed
+	// before, which is how a restarted inserter knows its batch is done.
+	_, err = client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithID(knownID)), inserted[0].Delete())
+	if depErr, ok := entroq.AsDependency(err); !ok || !depErr.OnlyCollisions() {
+		t.Fatalf("Colliding insert with a delete: want an error of only collisions, got %v", err)
 	}
-
-	// Check that we have only one task in the queue, and that it's the expected one.
 	tasks, err := client.Tasks(ctx, queue)
 	if err != nil {
 		t.Fatalf("Error getting tasks: %v", err)
 	}
-	if want, got := 1, len(tasks); want != got {
-		t.Fatalf("Expected len(tasks) = %d, got %v", want, got)
-	}
-	if want, got := knownID, tasks[0].ID; want != got {
-		t.Fatalf("Expected ID %v found, got %v", want, got)
+	if want, got := 2, len(tasks); want != got {
+		t.Fatalf("After the refused modification: want %d tasks, nothing deleted, got %d", want, got)
 	}
 }
 
@@ -711,12 +702,14 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 			Claimant: client.ID(),
 		},
 	}
-	var insData []*entroq.TaskData
-	for _, task := range insWant {
-		insData = append(insData, task.Data())
-	}
-
-	resp, err := client.Modify(ctx, entroq.Inserting(insData...))
+	// An insert names its arrival as a duration, so the second task is asked
+	// for futureTaskDuration out and the backend resolves both against the one
+	// now of this modification. The wanted tasks above keep the equivalent
+	// instants, which the comparison below skips and the later claim uses.
+	resp, err := client.Modify(ctx,
+		entroq.InsertingInto(queue, entroq.WithRawValue(helloVal)),
+		entroq.InsertingInto(queue, entroq.WithRawValue(thereVal), entroq.WithArrivalTimeIn(futureTaskDuration)),
+	)
 	if err != nil {
 		t.Fatalf("Got unexpected error inserting two tasks: %+v", err)
 	}
@@ -769,6 +762,9 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	}
 	if claimed.Claims != 1 {
 		t.Fatalf("Expected claim to increment task claims to %d, got %d", 1, claimed.Claims)
+	}
+	if claimed.Claimant != client.ClientID {
+		t.Fatalf("Claimed task's claimant is %q, want the claiming client %q", claimed.Claimant, client.ClientID)
 	}
 
 	// TryClaim not ready task.
@@ -903,15 +899,15 @@ func ClaimRandomHead(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 
 	// A fixed arrival time in the past: both tasks are immediately claimable and
 	// perfectly tied, so nothing but the backend's tiebreak decides the winner.
-	at := time.Now().Add(-time.Hour).UTC()
+	const at = -time.Hour
 
 	var smallerIDWins, firstInsertedWins int
 	for i := range trials {
 		queue := path.Join(qPrefix, "claim_random_head", fmt.Sprint(i))
 
 		resp, err := client.Modify(ctx,
-			entroq.InsertingInto(queue, entroq.WithValue("a"), entroq.WithArrivalTime(at)),
-			entroq.InsertingInto(queue, entroq.WithValue("b"), entroq.WithArrivalTime(at)),
+			entroq.InsertingInto(queue, entroq.WithValue("a"), entroq.WithArrivalTimeIn(at)),
+			entroq.InsertingInto(queue, entroq.WithValue("b"), entroq.WithArrivalTimeIn(at)),
 		)
 		if err != nil {
 			t.Fatalf("trial %d: insert pair: %v", i, err)
@@ -964,16 +960,16 @@ func ClaimRandomHead(ctx context.Context, t *testing.T, client *entroq.EntroQ, q
 // "no move", so the behavior is path-dependent rather than a uniform invariant.)
 func EmptyWriteTargetRejected(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	// A task insert with no queue is rejected.
-	if _, err := client.Modify(ctx, entroq.InsertingInto("", entroq.WithValue("v"))); err == nil {
-		t.Errorf("insert into empty queue: got nil error, want rejection")
+	if _, err := client.Modify(ctx, entroq.InsertingInto("", entroq.WithValue("v"))); !entroq.IsInvalidArgument(err) {
+		t.Errorf("insert into empty queue: want an invalid argument, got %v", err)
 	}
 
 	// A doc insert with no namespace is rejected.
 	if _, err := client.Modify(ctx, entroq.PuttingDocInto("",
 		entroq.WithIDKeys("empty-ns-doc", "", ""),
 		entroq.WithContent(json.RawMessage(`"v"`)),
-	)); err == nil {
-		t.Errorf("doc insert into empty namespace: got nil error, want rejection")
+	)); !entroq.IsInvalidArgument(err) {
+		t.Errorf("doc insert into empty namespace: want an invalid argument, got %v", err)
 	}
 
 	// A well-formed insert into a real queue still works: the guard is not
@@ -987,8 +983,8 @@ func EmptyWriteTargetRejected(ctx context.Context, t *testing.T, client *entroq.
 // ModifyReportsAllFailureClasses verifies the Backend.Modify contract that a
 // failed modification reports EVERY failing operation across all classes in a
 // single DependencyError, not just the first class encountered. A caller's
-// skip-colliding insert logic in particular depends on collisions always being
-// reported even alongside other failures.
+// OnlyCollisions check in particular is true only when collisions are the
+// whole story, so every other failure beside them must be reported too.
 func ModifyReportsAllFailureClasses(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	q := path.Join(qPrefix, "all_failures")
 	wrongQ := path.Join(qPrefix, "all_failures_wrong")
@@ -1130,4 +1126,190 @@ func InsertKeepsAttemptAndErr(ctx context.Context, t *testing.T, client *entroq.
 	if stored[0].Attempt != 3 || stored[0].Err != "earlier failure" {
 		t.Errorf("Stored: want attempt 3 and err %q, got %s", "earlier failure", stored[0])
 	}
+}
+
+// ModifyRejectsDuplicateIDs checks that a modification naming the same task or
+// doc in more than one operation is rejected as an invalid argument, before
+// anything is applied. That includes deleting and re-inserting one ID, which
+// would restart its version.
+func ModifyRejectsDuplicateIDs(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	q := path.Join(qPrefix, "duplicate_ids")
+	ns := path.Join(qPrefix, "duplicate_ids")
+
+	resp, err := client.Modify(ctx,
+		entroq.InsertingInto(q, entroq.WithValue("seed")),
+		entroq.PuttingDocInto(ns, entroq.WithContent("seed")),
+	)
+	if err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+	task, doc := resp.InsertedTasks[0], resp.InsertedDocs[0]
+	newID := uniqueTaskID("dup")
+
+	cases := []struct {
+		name string
+		args []entroq.ModifyArg
+	}{
+		{"two task inserts", []entroq.ModifyArg{
+			entroq.InsertingInto(q, entroq.WithID(newID)),
+			entroq.InsertingInto(q, entroq.WithID(newID)),
+		}},
+		{"task change and delete", []entroq.ModifyArg{task.Change(entroq.ValueTo("x")), task.Delete()}},
+		{"task change and depend", []entroq.ModifyArg{task.Change(entroq.ValueTo("x")), task.Depend()}},
+		{"task delete and insert", []entroq.ModifyArg{task.Delete(), entroq.InsertingInto(q, entroq.WithID(task.ID))}},
+		{"two doc inserts", []entroq.ModifyArg{
+			entroq.PuttingDocInto(ns, entroq.WithIDKeys(newID, "k", "")),
+			entroq.PuttingDocInto(ns, entroq.WithIDKeys(newID, "k", "")),
+		}},
+		{"doc change and delete", []entroq.ModifyArg{doc.Change(entroq.WithContent("x")), doc.Delete()}},
+		{"doc change and depend", []entroq.ModifyArg{doc.Change(entroq.WithContent("x")), doc.Depend()}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := client.Modify(ctx, c.args...)
+			if !entroq.IsInvalidArgument(err) {
+				t.Fatalf("want InvalidArgument, got %v", err)
+			}
+		})
+	}
+
+	// Nothing may have been applied.
+	tasks, err := client.Tasks(ctx, q)
+	if err != nil {
+		t.Fatalf("List tasks: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Version != task.Version || string(tasks[0].Value) != string(task.Value) {
+		t.Errorf("Tasks changed by rejected modifications: %v", tasks)
+	}
+	docs, err := client.Docs(ctx, &entroq.DocQuery{Namespace: ns})
+	if err != nil {
+		t.Fatalf("List docs: %v", err)
+	}
+	if len(docs) != 1 || docs[0].Version != doc.Version {
+		t.Errorf("Docs changed by rejected modifications: %v", docs)
+	}
+}
+
+// ModifyRespectsTaskClaims checks that a task held by one claimant cannot be
+// changed or deleted by another, even at its current version, while a depend
+// still succeeds, the holder can still write, and an expired claim protects
+// nothing.
+func ModifyRespectsTaskClaims(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	q := path.Join(qPrefix, "task_claims")
+	const intruder = "intruder"
+
+	if _, err := client.Modify(ctx, entroq.InsertingInto(q, entroq.WithValue("v0"))); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	held, err := client.Claim(ctx, entroq.From(q), entroq.ClaimFor(time.Minute))
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+
+	for name, arg := range map[string]entroq.ModifyArg{
+		"change": held.Change(entroq.ValueTo("stolen")),
+		"delete": held.Delete(),
+	} {
+		_, err := client.Modify(ctx, arg, entroq.ModifyAs(intruder))
+		depErr, ok := entroq.AsDependency(err)
+		if !ok || !depErr.HasClaims() {
+			t.Errorf("Intruder %s of a held task: want a claim dependency error, got %v", name, err)
+		}
+	}
+	if _, err := client.Modify(ctx, held.Depend(), entroq.ModifyAs(intruder)); err != nil {
+		t.Errorf("Intruder depend on a held task: %v", err)
+	}
+
+	resp, err := client.Modify(ctx, held.Change(entroq.ValueTo("v1"), entroq.ArrivalTimeBy(100*time.Millisecond)))
+	if err != nil {
+		t.Fatalf("Holder change: %v", err)
+	}
+	renewed := resp.ChangedTasks[0]
+
+	// Once the claim expires, anyone holding the current version may write.
+	time.Sleep(200 * time.Millisecond)
+	if _, err := client.Modify(ctx, renewed.Change(entroq.ValueTo("v2")), entroq.ModifyAs(intruder)); err != nil {
+		t.Errorf("Change after the claim expired: %v", err)
+	}
+}
+
+// TasksWithIDStaysInQueue checks that a Tasks query naming a queue returns
+// only tasks in that queue, even when it also lists the ID of a task in
+// another queue. The service authorizes the queried queue, so this is what
+// keeps a caller from reading other queues by ID.
+func TasksWithIDStaysInQueue(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	qa := path.Join(qPrefix, "tasks_id_queue", "a")
+	qb := path.Join(qPrefix, "tasks_id_queue", "b")
+
+	resp, err := client.Modify(ctx, entroq.InsertingInto(qa), entroq.InsertingInto(qb))
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	inA, inB := resp.InsertedTasks[0], resp.InsertedTasks[1]
+
+	got, err := client.Tasks(ctx, qa, entroq.WithTaskID(inA.ID, inB.ID))
+	if err != nil {
+		t.Fatalf("Tasks in %q by ID: %v", qa, err)
+	}
+	if len(got) != 1 || got[0].ID != inA.ID {
+		t.Errorf("Tasks in %q by IDs %q, %q: want only %q, got %v", qa, inA.ID, inB.ID, inA.ID, got)
+	}
+
+	got, err = client.Tasks(ctx, "", entroq.WithTaskID(inB.ID))
+	if err != nil {
+		t.Fatalf("Tasks by ID alone: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != inB.ID {
+		t.Errorf("Tasks by ID alone: want %q, got %v", inB.ID, got)
+	}
+}
+
+// ClaimsReset verifies that a task's claim count is of claims since it was
+// last reset: a change made with ResettingClaims resets it, while any other
+// change, and an arrival, which only refreshes the task, keep it.
+func ClaimsReset(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
+	queue := path.Join(qPrefix, "claims_reset")
+	if _, err := client.Modify(ctx, entroq.InsertingInto(queue)); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	claim := func(t *testing.T, want int32) *entroq.Task {
+		t.Helper()
+		task, err := client.TryClaim(ctx, entroq.From(queue), entroq.ClaimFor(time.Minute))
+		if err != nil || task == nil {
+			t.Fatalf("Claim: %v, %v", task, err)
+		}
+		if task.Claims != want {
+			t.Fatalf("Claimed task: want claims %d, got %d", want, task.Claims)
+		}
+		return task
+	}
+	changed := func(t *testing.T, step string, resp *entroq.ModifyResponse, err error, want int32) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("%s: %v", step, err)
+		}
+		if got := resp.ChangedTasks[0].Claims; got != want {
+			t.Errorf("%s: want claims %d, got %d", step, want, got)
+		}
+		stats, err := client.QueueStats(ctx, entroq.MatchExact(queue))
+		if err != nil {
+			t.Fatalf("Stats: %v", err)
+		}
+		if got := stats[queue].MaxClaims; got != int(want) {
+			t.Errorf("%s: want the queue's max claims %d, got %d", step, want, got)
+		}
+	}
+
+	task := claim(t, 1)
+	resp, err := client.UpdateArrival(ctx, entroq.ReadyNow().Tasks(task))
+	changed(t, "Release by arrival", resp, err, 1)
+	task = claim(t, 2)
+
+	resp, err = client.Modify(ctx, task.Change(entroq.ValueTo("worked"), entroq.ArrivalTimeBy(0)))
+	changed(t, "Change", resp, err, 2)
+	task = claim(t, 3)
+
+	resp, err = client.Modify(ctx, task.Change(entroq.ResettingClaims(), entroq.ArrivalTimeBy(0)))
+	changed(t, "Change resetting claims", resp, err, 0)
+	claim(t, 1)
 }

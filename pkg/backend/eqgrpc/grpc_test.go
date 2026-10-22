@@ -115,6 +115,50 @@ func TestGRPCInsertKeepsAttemptAndErr(t *testing.T) {
 	RunQTest(t, eqtest.InsertKeepsAttemptAndErr)
 }
 
+func TestGRPCModifyRejectsDuplicateIDs(t *testing.T) {
+	RunQTest(t, eqtest.ModifyRejectsDuplicateIDs)
+}
+
+func TestGRPCModifyRespectsTaskClaims(t *testing.T) {
+	RunQTest(t, eqtest.ModifyRespectsTaskClaims)
+}
+
+func TestGRPCTasksWithIDStaysInQueue(t *testing.T) {
+	RunQTest(t, eqtest.TasksWithIDStaysInQueue)
+}
+
+func TestGRPCDocSets(t *testing.T) {
+	RunQTest(t, eqtest.DocSets)
+}
+
+func TestGRPCDocMemberVersionFromSet(t *testing.T) {
+	RunQTest(t, eqtest.DocMemberVersionFromSet)
+}
+
+func TestGRPCDocSecondaryKeysAreUnique(t *testing.T) {
+	RunQTest(t, eqtest.DocSecondaryKeysAreUnique)
+}
+
+func TestGRPCDocSetDepends(t *testing.T) {
+	RunQTest(t, eqtest.DocSetDepends)
+}
+
+func TestGRPCDocAndTaskDependenciesFailTogether(t *testing.T) {
+	RunQTest(t, eqtest.DocAndTaskDependenciesFailTogether)
+}
+
+func TestGRPCUpdateArrival(t *testing.T) {
+	RunQTest(t, eqtest.UpdateArrival)
+}
+
+func TestGRPCClaimStampsLease(t *testing.T) {
+	RunQTest(t, eqtest.ClaimStampsLease)
+}
+
+func TestGRPCArrivalResolvesOnBackendClock(t *testing.T) {
+	RunQTest(t, eqtest.ArrivalResolvesOnBackendClock)
+}
+
 func TestGRPCTaskChangeFutureArrival(t *testing.T) {
 	RunQTest(t, eqtest.TaskChangeFutureArrival)
 }
@@ -169,6 +213,22 @@ func TestGRPCWorkerCompactDependencyHandler(t *testing.T) {
 
 func TestGRPCWorkerDependencyMove(t *testing.T) {
 	RunQTest(t, eqtest.WorkerDependencyMove)
+}
+
+func TestGRPCWorkerHoldsEmptyGroup(t *testing.T) {
+	RunQTest(t, eqtest.WorkerHoldsEmptyGroup)
+}
+
+func TestGRPCWorkerReleasesSets(t *testing.T) {
+	RunQTest(t, eqtest.WorkerReleasesSets)
+}
+
+func TestGRPCClaimsReset(t *testing.T) {
+	RunQTest(t, eqtest.ClaimsReset)
+}
+
+func TestGRPCDocClaimSets(t *testing.T) {
+	RunQTest(t, eqtest.DocClaimSets)
 }
 
 func TestGRPCSimpleDocLifecycle(t *testing.T) {
@@ -226,3 +286,82 @@ func TestGRPCModifyReportsAllFailureClasses(t *testing.T) {
 func TestGRPCModifyRejectsWrongNamespace(t *testing.T) {
 	RunQTest(t, eqtest.ModifyRejectsWrongNamespace)
 }
+
+func TestGRPCInvalidRequests(t *testing.T) {
+	RunQTest(t, eqtest.InvalidRequests)
+}
+
+// TestGRPCBackendRejectsInvalidRequests sends requests the client would have
+// rejected straight through the gRPC backend, so the service's own checks
+// must refuse them, and the codes must come back as invalid arguments.
+func TestGRPCBackendRejectsInvalidRequests(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stop, dial, err := eqtest.StartService(ctx, eqmem.Opener())
+	if err != nil {
+		t.Fatalf("start service: %v", err)
+	}
+	defer stop()
+	b, err := eqgrpc.Opener("bufnet", eqgrpc.WithNiladicDialer(dial), eqgrpc.WithInsecure())(ctx)
+	if err != nil {
+		t.Fatalf("open backend: %v", err)
+	}
+	defer b.Close()
+	eqtest.BackendRejectsInvalidRequests(ctx, t, b, "/grpctest")
+}
+
+func TestGRPCTasksClaimantFilter(t *testing.T) {
+	RunQTest(t, eqtest.TasksClaimantFilter)
+}
+
+func TestGRPCQueueStatsCounts(t *testing.T) {
+	RunQTest(t, eqtest.QueueStatsCounts)
+}
+
+func TestGRPCQueueStatsMatching(t *testing.T) {
+	RunQTest(t, eqtest.QueueStatsMatching)
+}
+
+func TestGRPCDocsOrderAndLimits(t *testing.T) {
+	RunQTest(t, eqtest.DocsOrderAndLimits)
+}
+
+func TestGRPCTaskClaimantIsHolder(t *testing.T) {
+	RunQTest(t, eqtest.TaskClaimantIsHolder)
+}
+
+func TestGRPCClaimLongDuration(t *testing.T) {
+	RunQTest(t, eqtest.ClaimLongDuration)
+}
+
+func TestGRPCClaimRandomHead(t *testing.T) {
+	RunQTest(t, eqtest.ClaimRandomHead)
+}
+
+func TestGRPCDocKeyRangeByteOrder(t *testing.T) {
+	RunQTest(t, eqtest.DocKeyRangeByteOrder)
+}
+
+func TestGRPCLengthLimits(t *testing.T) {
+	RunQTest(t, eqtest.LengthLimits)
+}
+
+func TestGRPCNamespacePrefixMatchLiteral(t *testing.T) {
+	RunQTest(t, eqtest.NamespacePrefixMatchLiteral)
+}
+
+func TestGRPCQueuePrefixMatchLiteral(t *testing.T) {
+	RunQTest(t, eqtest.QueuePrefixMatchLiteral)
+}
+
+func TestGRPCQueueStatsLimit(t *testing.T) {
+	RunQTest(t, eqtest.QueueStatsLimit)
+}
+
+func TestGRPCTasksClaimantLimit(t *testing.T) {
+	RunQTest(t, eqtest.TasksClaimantLimit)
+}
+
+// GCCollectsInLoop is not run over gRPC: garbage collection belongs to the
+// storage backend behind the service, and each storage backend runs it with
+// its own test-only GC interval.

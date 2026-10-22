@@ -27,7 +27,8 @@
 //			log.Fatalf("Failed to open service backends: %v", err)
 //		}
 //
-//		s := grpc.NewServer()
+//		// ServerKeepalive accepts the client's pings during a long Claim.
+//		s := grpc.NewServer(eqgrpc.ServerKeepalive())
 //		pb.RegisterEntroQServer(s, svc)
 //		s.Serve(listener)
 //	}
@@ -38,6 +39,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 	"sync"
 	"time"
 
@@ -47,12 +49,15 @@ import (
 	"github.com/shiblon/entroq/pkg/authz"
 	"github.com/shiblon/entroq/pkg/pbconv"
 	"github.com/shiblon/entroq/pkg/queues"
+	"github.com/shiblon/entroq/pkg/version"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	protov2 "google.golang.org/protobuf/proto"
 
 	pb "github.com/shiblon/entroq/api"
 )
@@ -65,6 +70,10 @@ type QSvc struct {
 
 	mp             metric.MeterProvider
 	metricInterval time.Duration
+
+	leaseFloor   time.Duration
+	leaseCeiling time.Duration
+	leaseClamped metric.Int64Counter
 
 	// guards the cached stats used by the observable gauge callback.
 	mu                   sync.Mutex
@@ -99,6 +108,39 @@ func WithMetricInterval(d time.Duration) Option {
 			d = 5 * time.Second
 		}
 		s.metricInterval = d
+	}
+}
+
+// Default bounds a client's requested claim lease is clamped into, for tasks
+// and doc sets alike, unless WithClaimLeaseBounds says otherwise.
+//
+// The floor is the default claim duration, so a client may ask for a LONGER
+// lease but never a shorter one. The server dictates lease length because a
+// client has no incentive to be careful with it: a lease too short to survive
+// its own first renewal churns storage and burns claim counts for every other
+// client, not just the one that asked.
+//
+// The ceiling bounds how long a claim may hold what it took, on its FIRST hold
+// only: renewal is a lease change rather than a claim, and is not clamped. A
+// holder that keeps renewing is not bounded by it.
+const (
+	DefaultClaimLeaseFloor   = entroq.DefaultClaimDuration
+	DefaultClaimLeaseCeiling = time.Hour
+)
+
+// WithClaimLeaseBounds sets the range a client's requested claim lease is
+// clamped into, replacing DefaultClaimLeaseFloor and DefaultClaimLeaseCeiling.
+// A request naming no duration is left alone for the default to apply; one
+// outside the bounds is clamped to the nearer bound and counted, rather than
+// refused, because a lease shorter than the floor is a legitimate thing for a
+// client to ask when its own deadline is near. Asking for something nobody
+// could have meant is refused earlier, by entroq.MaxClaimDuration.
+//
+// New reports an error if the ceiling is below the floor, or either is not
+// positive.
+func WithClaimLeaseBounds(floor, ceiling time.Duration) Option {
+	return func(s *QSvc) {
+		s.leaseFloor, s.leaseCeiling = floor, ceiling
 	}
 }
 
@@ -137,6 +179,8 @@ func New(ctx context.Context, opener entroq.BackendOpener, opts ...Option) (*QSv
 		mp:             noop.NewMeterProvider(),
 		metricInterval: time.Minute,
 		authzHeader:    "authorization",
+		leaseFloor:     DefaultClaimLeaseFloor,
+		leaseCeiling:   DefaultClaimLeaseCeiling,
 	}
 
 	for _, o := range opts {
@@ -145,6 +189,14 @@ func New(ctx context.Context, opener entroq.BackendOpener, opts ...Option) (*QSv
 	if (svc.an == nil) != (svc.az == nil) {
 		_ = impl.Close()
 		return nil, fmt.Errorf("eqsvcgrpc authentication and authorization must be configured together")
+	}
+	if svc.leaseFloor <= 0 || svc.leaseCeiling <= 0 || svc.leaseCeiling < svc.leaseFloor {
+		_ = impl.Close()
+		return nil, fmt.Errorf("eqsvcgrpc claim lease bounds must be positive with ceiling >= floor, got [%v, %v]", svc.leaseFloor, svc.leaseCeiling)
+	}
+	if svc.leaseCeiling > entroq.MaxClaimDuration {
+		_ = impl.Close()
+		return nil, fmt.Errorf("eqsvcgrpc claim lease ceiling %v exceeds the sanity bound %v", svc.leaseCeiling, entroq.MaxClaimDuration)
 	}
 
 	if err := svc.initMetrics(); err != nil {
@@ -174,6 +226,11 @@ func (s *QSvc) initMetrics() error {
 	)
 	if err != nil {
 		return fmt.Errorf("namespace size gauge: %w", err)
+	}
+	if s.leaseClamped, err = meter.Int64Counter("entroq.claim.lease_clamped",
+		metric.WithDescription("Claims whose requested lease was clamped into the service's bounds, by kind and reason."),
+	); err != nil {
+		return fmt.Errorf("lease clamped counter: %w", err)
 	}
 
 	_, err = meter.RegisterCallback(func(ctx context.Context, o metric.Observer) error {
@@ -416,7 +473,12 @@ func autoCodeErrorf(format string, vals ...any) error {
 	if entroq.IsInvalidArgument(err) {
 		return status.New(codes.InvalidArgument, err.Error()).Err()
 	}
-	return err
+	// An error that already carries a status, such as one passed through from
+	// a remote backend, keeps its code; anything else is the server's failure.
+	if _, ok := status.FromError(err); ok {
+		return err
+	}
+	return status.New(codes.Internal, err.Error()).Err()
 }
 
 func codeErrorf(code codes.Code, format string, vals ...any) error {
@@ -512,8 +574,6 @@ func (s *QSvc) modifyAuthz(ctx context.Context, req *pb.ModifyRequest) (*authz.R
 		q(ins.Queue, authz.Insert)
 	}
 	for _, chg := range req.Changes {
-		// Nil-safe getters: a change with OldId/NewData unset yields empty queues,
-		// which fail the queue-integrity check downstream rather than panicking here.
 		change(chg.GetOldId().GetQueue(), chg.GetNewData().GetQueue(), q)
 	}
 	for _, del := range req.Deletes {
@@ -544,16 +604,61 @@ func (s *QSvc) modifyAuthz(ctx context.Context, req *pb.ModifyRequest) (*authz.R
 	return authReq, nil
 }
 
+// protocolHeaders are the response headers every RPC sends: the protocols
+// this server serves, from which a client chooses, and its release.
+var protocolHeaders = metadata.Pairs(
+	version.ProtocolHeader, version.FormatProtocols(version.ServedProtocols),
+	version.VersionHeader, version.Version,
+)
+
+// negotiate sends the protocol headers on a unary RPC, and returns the
+// protocol the request declares, under which the server reads it. A request
+// that declares none is protocol 1, as every client before the header is. One
+// declaring a protocol this server does not serve is refused, naming what to
+// upgrade, and so is one carrying fields this server does not know (see
+// checkKnown). Sending the headers does nothing for a caller not over gRPC;
+// the JSON handler sends them itself.
+func negotiate(ctx context.Context, req protov2.Message) (int32, error) {
+	_ = grpc.SetHeader(ctx, protocolHeaders)
+	md, _ := metadata.FromIncomingContext(ctx)
+	vals := md.Get(version.ProtocolHeader)
+	if len(vals) == 0 {
+		return 1, checkKnown(req, 1)
+	}
+	ps, err := version.ParseProtocols(vals[0])
+	if err != nil || len(ps) != 1 {
+		return 0, codeErrorf(codes.InvalidArgument, "a request declares one protocol in %s, got %q", version.ProtocolHeader, vals[0])
+	}
+	p := ps[0]
+	if !version.Serves(p) {
+		upgrade := "the client"
+		if p > version.Protocol {
+			upgrade = "the server"
+		}
+		return 0, codeErrorf(codes.Unimplemented, "this server serves EntroQ protocols %s, not %d: upgrade %s",
+			version.FormatProtocols(version.ServedProtocols), p, upgrade)
+	}
+	if err := checkKnown(req, p); err != nil {
+		return 0, err
+	}
+	return p, nil
+}
+
 // Claim is the blocking version of TryClaim.
 func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
-	if err := s.Authorize(ctx, s.claimAuthz(ctx, req)); err != nil {
-		return nil, err // don't wrap, has status codes
+	if _, err := negotiate(ctx, req); err != nil {
+		return nil, err
 	}
-
-	duration := time.Duration(req.DurationMs) * time.Millisecond
 	pollTime := time.Duration(0)
 	if req.PollMs > 0 {
 		pollTime = time.Duration(req.PollMs) * time.Millisecond
+	}
+	opts := append(s.claimOpts(ctx, req), entroq.ClaimPollTime(pollTime))
+	if err := entroq.NewClaimQuery(opts...).Validate(); err != nil {
+		return nil, autoCodeErrorf("claim: %w", err)
+	}
+	if err := s.Authorize(ctx, s.claimAuthz(ctx, req)); err != nil {
+		return nil, err // don't wrap, has status codes
 	}
 
 	// Block until a task is available or the caller's context ends, re-checking
@@ -561,11 +666,7 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 	// client holds this open on a single RPC with no per-attempt deadline; a dead
 	// connection is surfaced by client keepalive, not by racing claim delivery
 	// with a cancel. See pkg/backend/eqgrpc backend.Claim.
-	task, err := s.impl.Claim(ctx,
-		entroq.From(req.Queues...),
-		entroq.ClaimFor(duration),
-		entroq.WithClaimant(req.ClaimantId),
-		entroq.ClaimPollTime(pollTime))
+	task, err := s.impl.Claim(ctx, opts...)
 	if err != nil {
 		return nil, autoCodeErrorf("eqsvcgrpc claim: %w", err)
 	}
@@ -587,15 +688,18 @@ func (s *QSvc) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRespon
 // available to claim. Callers can check for context cancelation codes to know
 // that this has happened, and may opt to immediately re-send the request.
 func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
+	if _, err := negotiate(ctx, req); err != nil {
+		return nil, err
+	}
+	opts := s.claimOpts(ctx, req)
+	if err := entroq.NewClaimQuery(opts...).Validate(); err != nil {
+		return nil, autoCodeErrorf("try claim: %w", err)
+	}
 	if err := s.Authorize(ctx, s.claimAuthz(ctx, req)); err != nil {
 		return nil, err // don't wrap, has status codes
 	}
 
-	duration := time.Duration(req.DurationMs) * time.Millisecond
-	task, err := s.impl.TryClaim(ctx,
-		entroq.From(req.Queues...),
-		entroq.ClaimFor(duration),
-		entroq.WithClaimant(req.ClaimantId))
+	task, err := s.impl.TryClaim(ctx, opts...)
 	if err != nil {
 		return nil, autoCodeErrorf("try claim: %w", err)
 	}
@@ -609,6 +713,84 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 	return &pb.ClaimResponse{Task: pt}, nil
 }
 
+// claimOpts are the claim options a request asks for. The claimant is the
+// request's, never the service's own: an empty one fails the claim's check.
+func (s *QSvc) claimOpts(ctx context.Context, req *pb.ClaimRequest) []entroq.ClaimOpt {
+	return []entroq.ClaimOpt{
+		entroq.From(req.Queues...),
+		entroq.ClaimFor(s.clampLease(ctx, "task", time.Duration(req.DurationMs)*time.Millisecond)),
+		entroq.WithClaimant(req.ClaimantId),
+	}
+}
+
+// clampLease brings a client's requested lease within the service's bounds,
+// counting any clamp it makes so an operator can see a client asking for
+// something it will not get. A non-positive duration means the request named
+// none, and comes back unchanged so the caller's own default applies.
+//
+// It clamps rather than refuses. A lease below the floor is a reasonable thing
+// to ask for -- a worker whose own deadline is near wants its doc sets to
+// expire with it -- it just cannot have it, because a lease too short to
+// survive its first renewal costs every other client. A lease nobody could
+// have meant was already refused by entroq.MaxClaimDuration.
+func (s *QSvc) clampLease(ctx context.Context, kind string, d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	bounded, reason := d, ""
+	switch {
+	case d < s.leaseFloor:
+		bounded, reason = s.leaseFloor, "below_floor"
+	case d > s.leaseCeiling:
+		bounded, reason = s.leaseCeiling, "above_ceiling"
+	}
+	if reason != "" {
+		s.countLeaseClamp(ctx, kind, reason)
+	}
+	return bounded
+}
+
+// countLeaseClamp records that a claim did not get the lease it asked for.
+// Attributes stay low-cardinality on purpose: a claimant would name the client
+// at fault, but claimant IDs are per-consumer and would make this unusable as
+// a time series.
+func (s *QSvc) countLeaseClamp(ctx context.Context, kind, reason string) {
+	s.leaseClamped.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("kind", kind),
+		attribute.String("reason", reason),
+	))
+}
+
+// resolveSetLease decides how long a doc claim holds its sets.
+//
+// A duration is clamped into the service's bounds, because a lease too short
+// churns storage for every other client and one too long strands what a dead
+// holder was holding.
+//
+// A claim that matches a task passes through, and there is nothing here to
+// clamp: it names the task rather than a length, and the backend reads that
+// task's own arrival. The task's lease was bounded when it was claimed, so the
+// hold inherits those bounds instead of needing its own.
+//
+// A nil result means the request named no lease worth passing on, and
+// entroq.ClaimDocs fills in DefaultClaimDuration.
+func (s *QSvc) resolveSetLease(ctx context.Context, match *pb.TaskID, duration time.Duration) (entroq.DocClaimArg, error) {
+	if match != nil {
+		if match.GetId() == "" || match.GetQueue() == "" {
+			return nil, codeErrorf(codes.InvalidArgument, "claim docs: task_to_match needs an ID and a queue, got %v", match)
+		}
+		return entroq.MatchingLeaseOf(&entroq.Task{
+			ID:      match.GetId(),
+			Version: match.GetVersion(),
+			Queue:   match.GetQueue(),
+		}), nil
+	}
+	if duration = s.clampLease(ctx, "doc", duration); duration <= 0 {
+		return nil, nil
+	}
+	return entroq.ClaimingSetsFor(duration), nil
+}
+
 // Modify attempts to make the specified modification from the given
 // ModifyRequest. If all goes well, it returns a ModifyResponse. If the
 // modification fails due to a dependency error (one of the specified tasks was
@@ -617,9 +799,32 @@ func (s *QSvc) TryClaim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimRes
 // reconstruct an entroq.DependencyError, or directly to find out which IDs
 // caused the dependency failure. Code UNKNOWN is returned on other errors.
 func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyResponse, error) {
+	protocol, err := negotiate(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	// Check the modification's shape before authorizing it, with the same
+	// check every backend runs, so a malformed request is InvalidArgument
+	// whether or not an authorizer is configured.
+	modArgs, err := pbconv.ModifyArgsFromProto(req, protocol)
+	if err != nil {
+		var inv *pbconv.InvalidRequestError
+		if errors.As(err, &inv) {
+			return nil, codeErrorf(codes.InvalidArgument, "%v", err)
+		}
+		var uns *pbconv.UnsupportedRequestError
+		if errors.As(err, &uns) {
+			return nil, codeErrorf(codes.Unimplemented, "%v", err)
+		}
+		return nil, autoCodeErrorf("modify: %w", err)
+	}
+	if err := entroq.NewModification(req.ClaimantId, modArgs...).EnsureModifyKeys(); err != nil {
+		return nil, autoCodeErrorf("modify: %w", err)
+	}
+
 	// Authorization is enforced only when an authorizer is configured (admins may
-	// run open). When it is, a modification naming an empty queue/namespace fails
-	// closed here before reaching the backend.
+	// run open). A modification naming an empty queue or namespace fails the
+	// check above; modifyAuthz still refuses one, as a backstop.
 	if s.az != nil {
 		authReq, err := s.modifyAuthz(ctx, req)
 		if err != nil {
@@ -628,15 +833,6 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 		if err := s.Authorize(ctx, authReq); err != nil {
 			return nil, err // don't wrap, has status codes
 		}
-	}
-
-	modArgs, err := pbconv.ModifyArgsFromProto(req)
-	if err != nil {
-		var inv *pbconv.InvalidRequestError
-		if errors.As(err, &inv) {
-			return nil, codeErrorf(codes.InvalidArgument, "%v", err)
-		}
-		return nil, autoCodeErrorf("modify: %w", err)
 	}
 
 	resp, err := s.impl.Modify(ctx, modArgs...)
@@ -681,40 +877,50 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 		}
 		pbResp.ChangedDocs = append(pbResp.ChangedDocs, pd)
 	}
+	// A doc set whose lease changed comes back as a Doc with no ID.
+	for _, g := range resp.ChangedSets {
+		pbResp.ChangedDocs = append(pbResp.ChangedDocs, pbconv.DocSetToProto(g))
+	}
 	return pbResp, nil
 }
 
 func (s *QSvc) Tasks(ctx context.Context, req *pb.TasksRequest) (*pb.TasksResponse, error) {
+	if _, err := negotiate(ctx, req); err != nil {
+		return nil, err
+	}
+	queue, opts, err := pbconv.TasksQueryFromProto(req)
+	if err != nil {
+		return nil, autoCodeErrorf("tasks: %w", err)
+	}
 	if err := s.Authorize(ctx, s.tasksAuthz(ctx, req)); err != nil {
 		return nil, err // don't wrap, has status codes
 	}
-
-	// Claimant will only really be a filter if it is nonzero.
-	// Task IDs will only be used as a filter if non-empty.
-	opts := []entroq.TasksOpt{
-		entroq.ClaimedBy(req.ClaimantId),
-		entroq.WithTaskID(req.TaskId...),
-		entroq.LimitTasks(int(req.Limit)),
-	}
-	if req.OmitValues {
-		opts = append(opts, entroq.OmitValues())
-	}
-	tasks, err := s.impl.Tasks(ctx, req.Queue, opts...)
+	tasks, err := s.impl.Tasks(ctx, queue, opts...)
 	if err != nil {
 		return nil, autoCodeErrorf("failed to get tasks: %w", err)
 	}
-	resp := new(pb.TasksResponse)
-	for _, task := range tasks {
-		pt, err := pbconv.TaskToProto(task)
-		if err != nil {
-			return nil, autoCodeErrorf("tasks task proto: %w", err)
+	// Backends already bind task IDs to their queue, but the service must not
+	// depend on that to keep a caller out of queues it cannot read. The filter
+	// is the service's because the reason for it is: it exists for
+	// authorization, which the conversion knows nothing about.
+	if queue != "" {
+		kept := tasks[:0]
+		for _, task := range tasks {
+			if task.Queue == queue {
+				kept = append(kept, task)
+			}
 		}
-		resp.Tasks = append(resp.Tasks, pt)
+		tasks = kept
+	}
+	resp, err := pbconv.TasksResponseFromTasks(tasks)
+	if err != nil {
+		return nil, autoCodeErrorf("tasks task proto: %w", err)
 	}
 	return resp, nil
 }
 
 func (s *QSvc) StreamTasks(req *pb.TasksRequest, stream pb.EntroQ_StreamTasksServer) error {
+	_ = stream.SetHeader(protocolHeaders)
 	resp, err := s.Tasks(stream.Context(), req)
 	if err != nil {
 		return autoCodeErrorf("get tasks to stream: %w", err)
@@ -738,21 +944,14 @@ func (s *QSvc) StreamTasks(req *pb.TasksRequest, stream pb.EntroQ_StreamTasksSer
 // a dedicated authz action (distinct from Read on task content). That lands in a
 // follow-up because it also requires an authz-policy/CRD schema change.
 func (s *QSvc) Queues(ctx context.Context, req *pb.QueuesRequest) (*pb.QueuesResponse, error) {
-	queueMap, err := s.impl.Queues(ctx,
-		entroq.MatchPrefix(req.MatchPrefix...),
-		entroq.MatchExact(req.MatchExact...),
-		entroq.LimitQueues(int(req.Limit)))
+	if _, err := negotiate(ctx, req); err != nil {
+		return nil, err
+	}
+	queueMap, err := s.impl.Queues(ctx, pbconv.MatchOptsFromProto(req)...)
 	if err != nil {
 		return nil, autoCodeErrorf("failed to get queues: %w", err)
 	}
-	resp := new(pb.QueuesResponse)
-	for name, count := range queueMap {
-		resp.Queues = append(resp.Queues, &pb.QueueStats{
-			Name:     name,
-			NumTasks: int32(count),
-		})
-	}
-	return resp, nil
+	return pbconv.QueuesResponseFromCounts(queueMap), nil
 }
 
 // QueueStats returns a mapping from queue names to queue stats.
@@ -760,25 +959,14 @@ func (s *QSvc) Queues(ctx context.Context, req *pb.QueuesRequest) (*pb.QueuesRes
 // TODO(listing-authz): currently UNGATED. Same listing capability as Queues;
 // see that method. Gated in the follow-up.
 func (s *QSvc) QueueStats(ctx context.Context, req *pb.QueuesRequest) (*pb.QueuesResponse, error) {
-	queueMap, err := s.impl.QueueStats(ctx,
-		entroq.MatchPrefix(req.MatchPrefix...),
-		entroq.MatchExact(req.MatchExact...),
-		entroq.LimitQueues(int(req.Limit)))
+	if _, err := negotiate(ctx, req); err != nil {
+		return nil, err
+	}
+	queueMap, err := s.impl.QueueStats(ctx, pbconv.MatchOptsFromProto(req)...)
 	if err != nil {
 		return nil, autoCodeErrorf("failed to get queues: %w", err)
 	}
-	resp := new(pb.QueuesResponse)
-	for _, stat := range queueMap {
-		resp.Queues = append(resp.Queues, &pb.QueueStats{
-			Name:         stat.Name,
-			NumTasks:     int32(stat.Size),
-			NumClaimed:   int32(stat.Claimed),
-			NumAvailable: int32(stat.Available),
-			NumFuture:    int32(stat.Future),
-			MaxClaims:    int32(stat.MaxClaims),
-		})
-	}
-	return resp, nil
+	return pbconv.QueuesResponseFromStats(queueMap), nil
 }
 
 // Time returns the current time in milliseconds since the Epoch.
@@ -786,6 +974,9 @@ func (s *QSvc) QueueStats(ctx context.Context, req *pb.QueuesRequest) (*pb.Queue
 // Intentionally UNAUTHENTICATED: it is the server clock, carries no queue or
 // task data, and clients need it to reason about arrival times.
 func (s *QSvc) Time(ctx context.Context, req *pb.TimeRequest) (*pb.TimeResponse, error) {
+	if _, err := negotiate(ctx, req); err != nil {
+		return nil, err
+	}
 	return &pb.TimeResponse{TimeMs: pbconv.ToMS(time.Now().UTC())}, nil
 }
 
@@ -805,41 +996,35 @@ func depDetails(depErr *entroq.DependencyError) []proto.Message {
 
 // Docs returns a listing of docs matching the given query.
 func (s *QSvc) Docs(ctx context.Context, req *pb.DocsRequest) (*pb.DocsResponse, error) {
-	q := req.GetQuery()
+	if _, err := negotiate(ctx, req); err != nil {
+		return nil, err
+	}
+	dq, err := pbconv.DocQueryFromProto(req)
+	if err != nil {
+		return nil, autoCodeErrorf("docs: %w", err)
+	}
 	// Reading doc content is gated on Read for the namespace (unlike queue/
 	// namespace metadata, which is open). Enforced only when an authorizer is set.
+	//
+	// The namespace comes from the CONVERTED query, so what is authorized and
+	// what is read cannot drift apart.
 	if s.az != nil {
-		if q.GetNamespace() == "" {
-			return nil, codeErrorf(codes.PermissionDenied, "docs: a namespace is required")
-		}
 		authReq := s.newAuthzRequest(ctx)
 		authReq.Namespaces = append(authReq.Namespaces, &authz.Namespace{
-			Exact:   q.GetNamespace(),
+			Exact:   dq.Namespace,
 			Actions: []authz.Action{authz.Read},
 		})
 		if err := s.Authorize(ctx, authReq); err != nil {
 			return nil, err // don't wrap, has status codes
 		}
 	}
-	docs, err := s.impl.Docs(ctx, &entroq.DocQuery{
-		Namespace:  q.GetNamespace(),
-		IDs:        q.GetIds(),
-		KeyExact:   q.GetKeyExact(),
-		KeyStart:   q.GetKeyStart(),
-		KeyEnd:     q.GetKeyEnd(),
-		Limit:      int(q.GetLimit()),
-		OmitValues: q.GetOmitValues(),
-	})
+	docs, err := s.impl.Docs(ctx, dq)
 	if err != nil {
 		return nil, autoCodeErrorf("docs: %w", err)
 	}
-	resp := new(pb.DocsResponse)
-	for _, d := range docs {
-		pd, err := pbconv.DocToProto(d)
-		if err != nil {
-			return nil, autoCodeErrorf("docs doc proto: %w", err)
-		}
-		resp.Docs = append(resp.Docs, pd)
+	resp, err := pbconv.DocsResponseFromDocs(docs)
+	if err != nil {
+		return nil, autoCodeErrorf("docs doc proto: %w", err)
 	}
 	return resp, nil
 }
@@ -851,51 +1036,106 @@ func (s *QSvc) Docs(ctx context.Context, req *pb.DocsRequest) (*pb.DocsResponse,
 // dedicated listing action in the follow-up (needs an authz-policy/CRD change).
 // Doc content (Docs) is already gated.
 func (s *QSvc) NamespaceStats(ctx context.Context, req *pb.NamespacesRequest) (*pb.NamespacesResponse, error) {
-	nsMap, err := s.impl.NamespaceStats(ctx,
-		entroq.MatchPrefix(req.MatchPrefix...),
-		entroq.MatchExact(req.MatchExact...),
-		entroq.WithLimit(int(req.Limit)))
+	if _, err := negotiate(ctx, req); err != nil {
+		return nil, err
+	}
+	nsMap, err := s.impl.NamespaceStats(ctx, pbconv.MatchOptsFromProto(req)...)
 	if err != nil {
 		return nil, autoCodeErrorf("namespace stats: %w", err)
 	}
-	resp := new(pb.NamespacesResponse)
-	for _, stat := range nsMap {
-		resp.Namespaces = append(resp.Namespaces, &pb.NamespaceStat{
-			Name:       stat.Name,
-			NumDocs:    int32(stat.Size),
-			NumClaimed: int32(stat.Claimed),
+	return pbconv.NamespacesResponseFromStats(nsMap), nil
+}
+
+// claimDocsAuthz builds the authorization request for a doc claim: Claim on
+// every namespace a set is in, Read as well where the claim discloses
+// something, and Read on a matched task's queue.
+//
+// A claim takes ownership, which Claim is for, and it also hands back the
+// set's docs, which is a read of their contents. WithoutMembers is how a
+// caller asks for the lock alone, so a set claimed that way needs no Read:
+// what a request needs is what it actually does.
+//
+// A claim matching a task reads that task. The hold it grants is the task's
+// own arrival, returned on every set the claim produces, and whether the claim
+// succeeds at all says whether that task is in that queue at that version.
+func (s *QSvc) claimDocsAuthz(ctx context.Context, cq *pb.DocClaim, dc *entroq.DocClaim) *authz.Request {
+	authReq := s.newAuthzRequest(ctx)
+	authReq.ClaimantId = cq.GetClaimant()
+	byNS := make(map[string]*authz.Namespace, len(dc.Sets))
+	for _, set := range dc.Sets {
+		ns, ok := byNS[set.Namespace]
+		if !ok {
+			ns = &authz.Namespace{Exact: set.Namespace, Actions: []authz.Action{authz.Claim}}
+			byNS[set.Namespace] = ns
+			authReq.Namespaces = append(authReq.Namespaces, ns)
+		}
+		if !set.OmitMembers && !slices.Contains(ns.Actions, authz.Read) {
+			ns.Actions = append(ns.Actions, authz.Read)
+		}
+	}
+	if match := cq.GetTaskToMatch(); match != nil {
+		authReq.Queues = append(authReq.Queues, &authz.Queue{
+			Exact:   match.GetQueue(),
+			Actions: []authz.Action{authz.Read},
 		})
 	}
-	return resp, nil
+	return authReq
 }
 
 // ClaimDocs atomically claims a set of docs matching the given query.
 // Returns a NotFound status with ModifyDep details if any docs are missing or
 // already claimed.
 func (s *QSvc) ClaimDocs(ctx context.Context, req *pb.ClaimDocsRequest) (*pb.ClaimDocsResponse, error) {
+	protocol, err := negotiate(ctx, req)
+	if err != nil {
+		return nil, err
+	}
 	cq := req.GetClaimQuery()
-	// Claiming a doc is gated on Claim for the namespace. Enforced only when an
-	// authorizer is set.
-	if s.az != nil {
-		if cq.GetNamespace() == "" {
-			return nil, codeErrorf(codes.PermissionDenied, "claim docs: a namespace is required")
+	// The claimant is the request's: the service's client would otherwise fill
+	// in its own for an empty one, so check the claim as received. At protocol
+	// 2 the sets name what to claim, and the namespace and key are ignored.
+	args := []entroq.DocClaimArg{entroq.ClaimingSetsAs(cq.GetClaimant())}
+	if sets := cq.GetSets(); len(sets) > 0 {
+		if protocol < 2 {
+			return nil, codeErrorf(codes.InvalidArgument, "claim docs: sets are protocol 2, and the request declares protocol %d", protocol)
 		}
-		authReq := s.newAuthzRequest(ctx)
-		authReq.ClaimantId = cq.GetClaimant()
-		authReq.Namespaces = append(authReq.Namespaces, &authz.Namespace{
-			Exact:   cq.GetNamespace(),
-			Actions: []authz.Action{authz.Claim},
-		})
-		if err := s.Authorize(ctx, authReq); err != nil {
+		for _, sc := range sets {
+			key, ok := sc.GetSet().GetRef().(*pb.DocID_Key)
+			if !ok {
+				return nil, codeErrorf(codes.InvalidArgument, "claim docs: a doc set is named by its key, not a doc ID")
+			}
+			set := entroq.ClaimKey(sc.GetSet().GetNamespace(), key.Key)
+			if sc.GetOmitMembers() {
+				set = set.WithoutMembers()
+			}
+			args = append(args, set)
+		}
+	} else {
+		args = append(args, entroq.ClaimKey(cq.GetNamespace(), cq.GetKey()))
+	}
+	if cq.GetTaskToMatch() != nil && protocol < 2 {
+		return nil, codeErrorf(codes.InvalidArgument, "claim docs: task_to_match is protocol 2, and the request declares protocol %d", protocol)
+	}
+	lease, err := s.resolveSetLease(ctx, cq.GetTaskToMatch(),
+		time.Duration(cq.GetDurationMs())*time.Millisecond,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if lease != nil {
+		args = append(args, lease)
+	}
+	dc := entroq.NewDocClaim(args...)
+	if err := dc.Validate(); err != nil {
+		return nil, autoCodeErrorf("claim docs: %w", err)
+	}
+	// Enforced only when an authorizer is set.
+	if s.az != nil {
+		if err := s.Authorize(ctx, s.claimDocsAuthz(ctx, cq, dc)); err != nil {
 			return nil, err // don't wrap, has status codes
 		}
 	}
-	claimed, err := s.impl.ClaimDocs(ctx, &entroq.DocClaim{
-		Namespace: cq.GetNamespace(),
-		Claimant:  cq.GetClaimant(),
-		Key:       cq.GetKey(),
-		Duration:  time.Duration(cq.GetDurationMs()) * time.Millisecond,
-	})
+	claimed, err := s.impl.ClaimDocs(ctx, args...)
 	if err != nil {
 		if depErr, ok := entroq.AsDependency(err); ok {
 			details := depDetails(depErr)
@@ -908,12 +1148,15 @@ func (s *QSvc) ClaimDocs(ctx context.Context, req *pb.ClaimDocsRequest) (*pb.Cla
 		return nil, autoCodeErrorf("claim docs: %w", err)
 	}
 	resp := new(pb.ClaimDocsResponse)
-	for _, d := range claimed {
-		pd, err := pbconv.DocToProto(d)
-		if err != nil {
-			return nil, autoCodeErrorf("claim docs doc proto: %w", err)
+	for _, g := range claimed {
+		resp.Sets = append(resp.Sets, pbconv.DocSetToProto(g))
+		for _, d := range g.Docs {
+			pd, err := pbconv.DocToProto(d)
+			if err != nil {
+				return nil, autoCodeErrorf("claim docs doc proto: %w", err)
+			}
+			resp.Docs = append(resp.Docs, pd)
 		}
-		resp.Docs = append(resp.Docs, pd)
 	}
 	return resp, nil
 }

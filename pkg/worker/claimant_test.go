@@ -2,8 +2,8 @@ package worker
 
 import (
 	"context"
+	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,16 +11,15 @@ import (
 	"github.com/shiblon/entroq/pkg/backend/eqmem"
 )
 
-// TestRunsOnOneClientExcludeEachOther pins that two runs sharing a client
-// exclude each other on a doc they both take, because each runs under its own
-// claimant by default. A claim excludes other claimants only, so with a shared
-// claimant (WithClaimant("")) both runs would hold the doc at once.
+// TestConcurrentRunsHoldSetsApart is the guarantee this exists for: two Runs
+// sharing one connection must not be able to claim each other's doc sets.
 //
-// It also exercises every operation the run performs as its claimant: the doc
-// is renewed mid-work (the handler outlasts half the lease) and changed in the
-// commit, and either would fail under the wrong claimant.
-func TestRunsOnOneClientExcludeEachOther(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+// A claimant is a consumer, not a process. Before each Run scoped itself, two
+// Runs on one connection were one claimant, so doc-set exclusion -- which keys
+// on the claimant -- silently stopped excluding, and each invalidated the
+// versions the other held. Nothing reported it.
+func TestConcurrentRunsHoldSetsApart(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	client, err := entroq.New(ctx, eqmem.Opener())
@@ -30,73 +29,132 @@ func TestRunsOnOneClientExcludeEachOther(t *testing.T) {
 	defer client.Close()
 
 	const (
-		tasks = 6
-		lease = 200 * time.Millisecond
+		queue = "two_runs"
+		ns    = "two_runs"
+		key   = "contended"
 	)
-	args := []entroq.ModifyArg{entroq.PuttingDocInto("ns", entroq.WithKeys("counter", ""), entroq.WithContent(0))}
-	for range tasks {
-		args = append(args, entroq.InsertingInto("q", entroq.WithValue("work")))
-	}
-	if _, err := client.Modify(ctx, args...); err != nil {
-		t.Fatalf("seed: %v", err)
+	// One doc set both Runs will want, and two tasks so both get work.
+	if _, err := client.Modify(ctx,
+		entroq.PuttingDocInto(ns, entroq.WithKeys(key, "")),
+		entroq.InsertingInto(queue, entroq.WithValue("a")),
+		entroq.InsertingInto(queue, entroq.WithValue("b")),
+	); err != nil {
+		t.Fatalf("Seed: %v", err)
 	}
 
-	var holders, maxHolders atomic.Int32
-	w := New(client,
-		WithTakeDocs(func(context.Context, *entroq.Task, string) ([]*entroq.DocClaim, error) {
-			return []*entroq.DocClaim{entroq.ClaimKey("ns", "counter")}, nil
+	// Each task's handler reports who holds the set while it holds it, and
+	// stays in the body until released, so the two overlap if they can.
+	var mu sync.Mutex
+	holders := map[string]int{}
+	inBody := make(chan struct{}, 2)
+	release := make(chan struct{})
+
+	w := New[string](client,
+		WithTakeDocs[string](func(ctx context.Context, _ entroq.Reader, work *Work[string]) (*TakeResult, error) {
+			return Take(entroq.ClaimKey(ns, key)), nil
 		}),
-		WithDoModify(func(_ context.Context, task *entroq.Task, _ string, docs []*entroq.Doc) (*Result, error) {
-			n := holders.Add(1)
-			defer holders.Add(-1)
-			for {
-				m := maxHolders.Load()
-				if n <= m || maxHolders.CompareAndSwap(m, n) {
-					break
-				}
+		WithDoModify[string](func(ctx context.Context, _ entroq.Reader, work *Work[string]) (*Result, error) {
+			task, sets := work.Task, work.Sets
+			mu.Lock()
+			for _, g := range sets {
+				holders[g.Claimant]++
 			}
-			count, err := entroq.GetContent[int](docs[0])
-			if err != nil {
-				return nil, FatalErrorf("parse counter: %v", err)
-			}
-			time.Sleep(lease * 3 / 4)
-			return Modify(task.Delete(), docs[0].Change(entroq.WithContent(count+1))), nil
+			mu.Unlock()
+			inBody <- struct{}{}
+			<-release
+			return Modify(task.Delete()), nil
 		}),
 	)
 
-	runCtx, stop := context.WithCancel(ctx)
-	defer stop()
-	var wg sync.WaitGroup
-	for range 2 {
-		wg.Add(1)
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+	errs := make(chan error, 2)
+	for _, name := range []string{"run-1", "run-2"} {
 		go func() {
-			defer wg.Done()
-			_ = w.Run(runCtx, Watching("q"), WithLease(lease), WithBaseRetryDelay(0))
+			errs <- w.Run(runCtx, Watching(queue), AsClaimant(name),
+				WithLease(10*time.Second), WithBaseRetryDelay(20*time.Millisecond))
 		}()
 	}
 
-	for {
-		docs, err := client.Docs(ctx, &entroq.DocQuery{Namespace: "ns", KeyExact: "counter"})
-		if err != nil {
-			t.Fatalf("read counter: %v", err)
-		}
-		count, err := entroq.GetContent[int](docs[0])
-		if err != nil {
-			t.Fatalf("parse counter: %v", err)
-		}
-		if count == tasks {
-			break
-		}
-		select {
-		case <-ctx.Done():
-			t.Fatalf("counter reached %d of %d", count, tasks)
-		case <-time.After(10 * time.Millisecond):
+	// One body gets in. The other cannot, because the set it needs is held by
+	// a DIFFERENT consumer -- which is the whole point. It retries on
+	// contention instead.
+	select {
+	case <-inBody:
+	case err := <-errs:
+		t.Fatalf("a Run stopped instead of working: %v", err)
+	case <-ctx.Done():
+		t.Fatal("neither Run reached its body")
+	}
+	select {
+	case <-inBody:
+		t.Fatal("both Runs hold the same doc set at once: they are one consumer, and the exclusion is not working")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	close(release)
+
+	// The second body now gets the set, after the first released it.
+	select {
+	case <-inBody:
+	case err := <-errs:
+		t.Fatalf("a Run stopped instead of taking the released set: %v", err)
+	case <-ctx.Done():
+		t.Fatal("the second Run never got the set the first released")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(holders) == 0 {
+		t.Fatal("no holder recorded")
+	}
+	for h := range holders {
+		if h != "run-1" && h != "run-2" {
+			t.Errorf("set held by %q, want one of the Runs' own claimants", h)
 		}
 	}
-	stop()
-	wg.Wait()
+}
 
-	if got := maxHolders.Load(); got != 1 {
-		t.Errorf("%d runs held the doc at once, want 1", got)
+// TestRunClaimantDefaultsToItsConnectionAndSequence pins the default name,
+// which is what anything reading claimants off stored tasks or metrics sees.
+func TestRunClaimantDefaultsToItsConnectionAndSequence(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	client, err := entroq.New(ctx, eqmem.Opener(), entroq.WithClaimantID("conn"))
+	if err != nil {
+		t.Fatalf("New client: %v", err)
+	}
+	defer client.Close()
+
+	const queue = "default_claimant"
+	if _, err := client.Modify(ctx, entroq.InsertingInto(queue)); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	seen := make(chan string, 1)
+	w := New[string](client, WithDoModify[string](
+		func(ctx context.Context, _ entroq.Reader, work *Work[string]) (*Result, error) {
+			task := work.Task
+			seen <- task.Claimant
+			return Modify(task.Delete()), nil
+		}))
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+	go func() { _ = w.Run(runCtx, Watching(queue), WithLease(10*time.Second)) }()
+
+	select {
+	case got := <-seen:
+		// Derived from the connection rather than random, so it reads as what
+		// it is: one consumer of a known connection.
+		if !strings.HasPrefix(got, "conn/") {
+			t.Errorf("task claimed by %q, want it derived from the connection's %q", got, "conn")
+		}
+		if got == "conn" {
+			t.Error("the Run claimed as the connection itself, which is the sharing this prevents")
+		}
+	case <-ctx.Done():
+		t.Fatal("no task was claimed")
 	}
 }

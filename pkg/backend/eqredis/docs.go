@@ -14,13 +14,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/pkg/backend/internal/limits"
+	"github.com/shiblon/entroq/pkg/backend/internal/docset"
+	"github.com/shiblon/entroq/pkg/backend/internal/validate"
 )
 
 // docIndexSep is the separator used between fields in a namespace index member.
@@ -62,13 +64,11 @@ func parseDocIndexMember(member string) (keyPrimary, keySecondary, id string) {
 	return member, "", ""
 }
 
-// docFields holds all fields stored in a doc Hash.
+// docFields holds all fields stored in a doc Hash. A doc's version, claimant,
+// and arrival time are its set's, stored in the set's lock (lockKey).
 type docFields struct {
 	Namespace    string
 	ID           string
-	Version      int32
-	Claimant     string
-	AtMs         int64
 	KeyPrimary   string
 	KeySecondary string
 	Content      []byte
@@ -76,17 +76,11 @@ type docFields struct {
 	Modified     int64
 }
 
+// toDoc returns the stored doc without its set's lock; see docset.Overlay.
 func (f *docFields) toDoc() *entroq.Doc {
-	var at time.Time
-	if f.AtMs > 0 {
-		at = time.UnixMilli(f.AtMs).UTC()
-	}
 	return &entroq.Doc{
 		Namespace:    f.Namespace,
 		ID:           f.ID,
-		Version:      f.Version,
-		Claimant:     f.Claimant,
-		At:           at,
 		Key:          f.KeyPrimary,
 		SecondaryKey: f.KeySecondary,
 		Content:      f.Content,
@@ -99,9 +93,6 @@ func (f *docFields) toMap() map[string]any {
 	return map[string]any{
 		"namespace":     f.Namespace,
 		"id":            f.ID,
-		"version":       strconv.FormatInt(int64(f.Version), 10),
-		"claimant":      f.Claimant,
-		"at":            strconv.FormatInt(f.AtMs, 10),
 		"key_primary":   f.KeyPrimary,
 		"key_secondary": f.KeySecondary,
 		"content":       string(f.Content),
@@ -118,14 +109,6 @@ func parseDocFields(vals map[string]string) (*docFields, error) {
 		return strconv.ParseInt(s, 10, 64)
 	}
 
-	version, err := parseInt(vals["version"])
-	if err != nil {
-		return nil, fmt.Errorf("parse doc version: %w", err)
-	}
-	at, err := parseInt(vals["at"])
-	if err != nil {
-		return nil, fmt.Errorf("parse doc at: %w", err)
-	}
 	created, err := parseInt(vals["created"])
 	if err != nil {
 		return nil, fmt.Errorf("parse doc created: %w", err)
@@ -143,9 +126,6 @@ func parseDocFields(vals map[string]string) (*docFields, error) {
 	return &docFields{
 		Namespace:    vals["namespace"],
 		ID:           vals["id"],
-		Version:      int32(version),
-		Claimant:     vals["claimant"],
-		AtMs:         at,
 		KeyPrimary:   vals["key_primary"],
 		KeySecondary: vals["key_secondary"],
 		Content:      content,
@@ -154,12 +134,37 @@ func parseDocFields(vals map[string]string) (*docFields, error) {
 	}, nil
 }
 
+// maxDocsRetries bounds rereads of a doc that moved between sets. Each
+// reread knows where every doc that moved went, so one is enough unless the
+// docs keep moving.
+const maxDocsRetries = 10
+
 // Docs returns docs in a namespace, optionally filtered by key range or IDs.
 func (e *EQRedis) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, error) {
+	if err := rq.Validate(); err != nil {
+		return nil, fmt.Errorf("eqredis docs: %w", err)
+	}
+	// ids are the docs to read, and keys their primary keys where known.
 	var ids []string
+	keys := make(map[string]string)
 
 	if len(rq.IDs) > 0 {
 		ids = rq.IDs
+		// Look up the primary keys, which never change, so the docs and their
+		// set locks can be read together below.
+		pipe := e.client.Pipeline()
+		cmds := make([]*redis.StringCmd, len(ids))
+		for i, id := range ids {
+			cmds[i] = pipe.HGet(ctx, docKey(rq.Namespace, id), "key_primary")
+		}
+		if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+			return nil, fmt.Errorf("docs key lookup: %w", err)
+		}
+		for i, cmd := range cmds {
+			if key, err := cmd.Result(); err == nil {
+				keys[ids[i]] = key
+			}
+		}
 	} else {
 		// Use namespace index for key-range scan.
 		idxKey := docNSIndexKey(rq.Namespace)
@@ -196,171 +201,176 @@ func (e *EQRedis) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc,
 		}
 
 		for _, m := range members {
-			_, _, id := parseDocIndexMember(m)
+			key, _, id := parseDocIndexMember(m)
 			ids = append(ids, id)
+			keys[id] = key
 		}
 	}
 
 	if len(ids) == 0 {
 		return nil, nil
 	}
-
-	// Pipeline HGETALL for each doc.
-	pipe := e.client.Pipeline()
-	cmds := make([]*redis.MapStringStringCmd, len(ids))
-	for i, id := range ids {
-		cmds[i] = pipe.HGetAll(ctx, docKey(rq.Namespace, id))
+	for attempt := range maxDocsRetries {
+		docs, ok, err := e.readDocsWithLocks(ctx, rq, ids, keys)
+		if err != nil || ok {
+			return docs, err
+		}
+		if err := waitToRetry(ctx, attempt); err != nil {
+			return nil, fmt.Errorf("eqredis docs: %w", err)
+		}
 	}
-	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
-		return nil, fmt.Errorf("docs pipeline hgetall: %w", err)
+	return nil, fmt.Errorf("eqredis docs: %d docs in %q kept moving between sets", len(ids), rq.Namespace)
+}
+
+// readDocsWithLocks reads docs and their sets' locks in one transaction, so
+// each doc's content and its set's version come from the same moment. Read
+// apart, a write landing between them would pair old content with the new
+// version, and a read-modify-write of that content would pass its version
+// check and overwrite the newer content.
+//
+// keys gives each doc's primary key, read beforehand, and names which sets to
+// read locks for. A doc found in a set keys does not name has no version here,
+// so this records where that doc actually is and returns false for the caller
+// to read again. Every such doc is corrected in one pass, so the next read
+// covers all of them.
+func (e *EQRedis) readDocsWithLocks(ctx context.Context, rq *entroq.DocQuery, ids []string, keys map[string]string) ([]*entroq.Doc, bool, error) {
+	var sets []docset.Set
+	for _, id := range ids {
+		if key, ok := keys[id]; ok {
+			if g := (docset.Set{Namespace: rq.Namespace, Key: key}); !slices.Contains(sets, g) {
+				sets = append(sets, g)
+			}
+		}
+	}
+	docCmds := make([]*redis.MapStringStringCmd, len(ids))
+	lockCmds := make([]*redis.MapStringStringCmd, len(sets))
+	if _, err := e.client.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		for i, id := range ids {
+			docCmds[i] = pipe.HGetAll(ctx, docKey(rq.Namespace, id))
+		}
+		for i, g := range sets {
+			lockCmds[i] = pipe.HGetAll(ctx, lockKey(g))
+		}
+		return nil
+	}); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, false, fmt.Errorf("eqredis docs: %w", err)
+	}
+	locks := make(map[docset.Set]docset.Lock, len(sets))
+	for i, g := range sets {
+		l, err := parseLock(lockCmds[i].Val())
+		if err != nil {
+			return nil, false, fmt.Errorf("eqredis docs: %w", err)
+		}
+		locks[g] = l
 	}
 
 	var docs []*entroq.Doc
-	for i, cmd := range cmds {
-		vals, err := cmd.Result()
-		if errors.Is(err, redis.Nil) || len(vals) == 0 {
+	moved := false
+	for i, cmd := range docCmds {
+		vals := cmd.Val()
+		if len(vals) == 0 {
 			continue
-		}
-		if err != nil {
-			return nil, fmt.Errorf("docs hgetall %q: %w", ids[i], err)
 		}
 		f, err := parseDocFields(vals)
 		if err != nil {
-			return nil, fmt.Errorf("docs parse %q: %w", ids[i], err)
+			return nil, false, fmt.Errorf("docs parse %q: %w", ids[i], err)
 		}
 		d := f.toDoc()
 		if rq.OmitValues {
 			d.Content = nil
 		}
+		l, ok := locks[docset.Set{Namespace: d.Namespace, Key: d.Key}]
+		if !ok {
+			keys[ids[i]] = d.Key
+			moved = true
+			continue
+		}
+		// Each doc carries its set's version and claim, the only ones it has.
+		if l != docset.Absent {
+			d = docset.Overlay(d, l)
+		}
 		docs = append(docs, d)
 	}
-	return docs, nil
+	if moved {
+		return nil, false, nil
+	}
+	return docs, true, nil
 }
 
-// ClaimDocs claims all docs sharing a primary key in a namespace.
-// Returns a DependencyError if any doc with that key is already claimed
-// by a different claimant.
-func (e *EQRedis) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.Doc, error) {
-	if err := limits.DocClaim(cq); err != nil {
+// ClaimDocs claims every doc set cq names, all or none (see
+// docset.ClaimAll), watching every set's lock and writing them in one MULTI.
+// A set can be claimed before it has docs. It returns a DependencyError naming
+// the held sets, and their members, while someone else holds any of them.
+//
+// The claim is written before the members are read. Every insert writes and
+// watches its set's lock: one that commits before the claim is in the
+// members read after it, and one that has not committed yet fails its watch
+// when the claim writes the lock, then retries and finds the set held.
+func (e *EQRedis) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.DocSet, error) {
+	if err := validate.DocClaim(cq); err != nil {
 		return nil, fmt.Errorf("eqredis claim docs: %w", err)
 	}
-	now := time.Now().UTC()
-	nowMs := now.UnixMilli()
-	newAtMs := now.Add(cq.Duration).UnixMilli()
-	idxKey := docNSIndexKey(cq.Namespace)
-
-	for range maxClaimRetries {
-		// Find all doc IDs with this primary key using the namespace index.
-		min := "[" + cq.Key + docIndexSep
-		// The key immediately after all entries with this prefix:
-		// increment the last byte of Key to get the exclusive upper bound.
-		maxKey := cq.Key + "\x01"
-		max := "(" + maxKey
-
-		members, err := e.client.ZRangeArgs(ctx, redis.ZRangeArgs{
-			Key:   idxKey,
-			Start: min,
-			Stop:  max,
-			ByLex: true,
-		}).Result()
-		if err != nil {
-			return nil, fmt.Errorf("claim docs index scan: %w", err)
-		}
-		if len(members) == 0 {
-			return nil, nil
-		}
-
-		var docIDs []string
-		for _, m := range members {
-			_, _, id := parseDocIndexMember(m)
-			docIDs = append(docIDs, id)
-		}
-
-		watchKeys := make([]string, len(docIDs))
-		for i, id := range docIDs {
-			watchKeys[i] = docKey(cq.Namespace, id)
-		}
-
-		var claimed []*entroq.Doc
-
-		err = e.client.Watch(ctx, func(tx *redis.Tx) error {
-			// Read current state of all docs.
-			pipe := tx.Pipeline()
-			cmds := make([]*redis.MapStringStringCmd, len(docIDs))
-			for i, id := range docIDs {
-				cmds[i] = pipe.HGetAll(ctx, docKey(cq.Namespace, id))
+	sets := docset.SetsOf(cq)
+	keys := make([]string, len(sets))
+	for i, g := range sets {
+		keys[i] = lockKey(g)
+	}
+	for attempt := range maxClaimRetries {
+		var claimed []docset.Lock
+		err := e.client.Watch(ctx, func(tx *redis.Tx) error {
+			now := time.Now().UTC()
+			locks, err := readLocks(ctx, tx, sets)
+			if err != nil {
+				return err
 			}
-			if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
-				return fmt.Errorf("claim docs read: %w", err)
-			}
-
-			var fields []*docFields
-			for _, cmd := range cmds {
-				vals, err := cmd.Result()
-				if errors.Is(err, redis.Nil) || len(vals) == 0 {
-					continue
+			lock := func(g docset.Set) docset.Lock { return locks[g] }
+			members := func(g docset.Set) ([]*entroq.Doc, error) { return setMembers(ctx, tx, g) }
+			// Read optimistically, and deliberately NOT watched: see
+			// docset.HoldUntil. Watching the task would make this claim abort
+			// and retry whenever the task is touched, including by its own
+			// holder renewing it, and buy nothing for the cost.
+			until := now.Add(cq.Duration)
+			if cq.TaskToMatch != nil {
+				// Read, but deliberately NOT watched: see
+				// docset.MissingTaskErrorf. Watching the task would make this
+				// claim abort and retry whenever the task is touched,
+				// including by its own holder renewing it.
+				vals, err := tx.HGetAll(ctx, taskKey(cq.TaskToMatch.ID)).Result()
+				if err != nil || len(vals) == 0 {
+					return docset.MissingTaskErrorf(cq.TaskToMatch, "eqredis claim docs")
 				}
-				if err != nil {
-					return fmt.Errorf("claim docs hgetall: %w", err)
+				f, err := parseTaskFields(vals)
+				if err != nil || f.Version != cq.TaskToMatch.Version || f.Queue != cq.TaskToMatch.Queue {
+					return docset.MissingTaskErrorf(cq.TaskToMatch, "eqredis claim docs")
 				}
-				f, err := parseDocFields(vals)
-				if err != nil {
-					return fmt.Errorf("claim docs parse: %w", err)
-				}
-				fields = append(fields, f)
+				until = time.UnixMilli(f.AtMs).UTC()
 			}
-
-			// Check for docs already claimed by a different claimant.
-			depErr := &entroq.DependencyError{}
-			for _, f := range fields {
-				alreadyClaimed := f.Claimant != "" && f.Claimant != cq.Claimant && f.AtMs > nowMs
-				if alreadyClaimed {
-					depErr.DocClaims = append(depErr.DocClaims, &entroq.DocID{
-						Namespace: f.Namespace,
-						ID:        f.ID,
-						Version:   f.Version,
-					})
-				}
+			if claimed, err = docset.ClaimAll(cq, now, until, lock, members); err != nil {
+				return err
 			}
-			if depErr.HasAny() {
-				return depErr
-			}
-
-			// Atomically claim all docs.
-			claimed = nil
-			_, err := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-				for _, f := range fields {
-					updated := &docFields{
-						Namespace:    f.Namespace,
-						ID:           f.ID,
-						Version:      f.Version + 1,
-						Claimant:     cq.Claimant,
-						AtMs:         newAtMs,
-						KeyPrimary:   f.KeyPrimary,
-						KeySecondary: f.KeySecondary,
-						Content:      f.Content,
-						Created:      f.Created,
-						Modified:     nowMs,
-					}
-					pipe.HSet(ctx, docKey(f.Namespace, f.ID), updated.toMap())
-					pipe.ZAdd(ctx, nsclaimedKey(f.Namespace), redis.Z{Score: float64(newAtMs), Member: f.ID})
-					claimed = append(claimed, updated.toDoc())
+			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+				for i, g := range sets {
+					writeLock(ctx, pipe, g, claimed[i], now)
 				}
 				return nil
 			})
 			return err
-		}, watchKeys...)
-
+		}, keys...)
 		if errors.Is(err, redis.TxFailedErr) {
+			if err := waitToRetry(ctx, attempt); err != nil {
+				return nil, fmt.Errorf("eqredis claim docs: %w", err)
+			}
 			continue
 		}
-		if depErr, ok := err.(*entroq.DependencyError); ok {
-			return nil, depErr
-		}
 		if err != nil {
-			return nil, fmt.Errorf("claim docs watch: %w", err)
+			return nil, fmt.Errorf("eqredis claim docs: %w", err)
 		}
-		return claimed, nil
+		members := func(g docset.Set) ([]*entroq.Doc, error) { return setMembers(ctx, e.client, g) }
+		out, err := docset.ClaimedSets(cq, claimed, members)
+		if err != nil {
+			return nil, fmt.Errorf("eqredis claim docs: %w", err)
+		}
+		return out, nil
 	}
-	return nil, fmt.Errorf("claimdocs max retries (%d) reached", maxClaimRetries)
+	return nil, fmt.Errorf("eqredis claim docs: too much contention on %v", sets)
 }

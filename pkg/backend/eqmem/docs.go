@@ -3,16 +3,23 @@ package eqmem
 import (
 	"context"
 	"fmt"
+	"log"
+	"slices"
 
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/pkg/backend/internal/limits"
+	"github.com/shiblon/entroq/pkg/backend/internal/docset"
+	"github.com/shiblon/entroq/pkg/backend/internal/validate"
 )
 
 // Docs returns a slice of docs in a namespace. If IDs are specified, only
 // those docs are returned (key range is ignored and Limit does not apply).
 // Otherwise, docs are filtered by optional key range and subject to Limit.
-// Results are returned sorted by (key_primary, key_secondary).
+// Results are returned sorted by (key_primary, key_secondary). Each doc carries
+// its set's version and claim.
 func (m *EQMem) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, error) {
+	if err := rq.Validate(); err != nil {
+		return nil, fmt.Errorf("eqmem docs: %w", err)
+	}
 	nls, unlock := m.lockNamespaces([]string{rq.Namespace})
 
 	if len(nls) == 0 {
@@ -21,39 +28,39 @@ func (m *EQMem) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, e
 	}
 	nss := nls[0].docs
 
+	result := func(d *entroq.Doc, l docset.Lock) *entroq.Doc {
+		res := docset.Overlay(d, l)
+		if rq.OmitValues {
+			res.Content = nil
+		}
+		return res
+	}
+
 	if len(rq.IDs) > 0 {
 		defer unlock()
 		var found []*entroq.Doc
 		for _, id := range rq.IDs {
-			r, ok := nss.Get(id)
+			d, ok := nss.Get(id)
 			if !ok {
 				continue
 			}
-			res := r.Copy()
-			if rq.OmitValues {
-				res.Content = nil
-			}
-			found = append(found, res)
+			found = append(found, result(d, nss.Lock(d.Key)))
 		}
 		return found, nil
 	}
 
 	// Range scan: clone under lock then release so writers aren't blocked.
-	snap := nss.snapshot()
+	snap, locks := nss.snapshot()
 	unlock()
 
 	limit := rq.Limit
 	var found []*entroq.Doc
 
-	collect := func(r *entroq.Doc) bool {
+	collect := func(d *entroq.Doc) bool {
 		if limit > 0 && len(found) >= limit {
 			return false
 		}
-		res := r.Copy()
-		if rq.OmitValues {
-			res.Content = nil
-		}
-		found = append(found, res)
+		found = append(found, result(d, lockIn(locks, d.Key)))
 		return true
 	}
 
@@ -84,50 +91,72 @@ func (m *EQMem) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, e
 	return found, nil
 }
 
-// ClaimDocs attempts an all-or-nothing claim of all docs sharing the given
-// primary key in the namespace. If any doc with that key is already claimed by
-// another claimant, a DependencyError is returned. Returns an empty slice (not
-// an error) if no docs with the key exist.
-func (m *EQMem) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.Doc, error) {
-	if err := limits.DocClaim(cq); err != nil {
+// ClaimDocs claims every doc set cq names, all or none (see
+// docset.ClaimAll), holding every namespace involved at once, in order.
+func (m *EQMem) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.DocSet, error) {
+	if err := validate.DocClaim(cq); err != nil {
 		return nil, fmt.Errorf("eqmem claim docs: %w", err)
 	}
-	nls, unlock := m.lockNamespaces([]string{cq.Namespace})
-	defer unlock()
-
-	if len(nls) == 0 {
-		return nil, nil
+	sets := docset.SetsOf(cq)
+	var names []string
+	for _, g := range sets {
+		if !slices.Contains(names, g.Namespace) {
+			names = append(names, g.Namespace)
+		}
 	}
-	nss := nls[0].docs
 
+	// Resolve the hold BEFORE taking any namespace lock, so no lock is held
+	// while another is taken and this adds nothing to eqmem's lock ordering.
+	//
+	// The task is read optimistically and without its queue lock, which
+	// docset.HoldUntil explains is sufficient: a task that changes between
+	// this read and the write below leaves the hold wrong by at most one
+	// lease, which the holder's next renewal corrects. The read is safe
+	// because queues are a sync.Map and a writer replaces a task rather than
+	// mutating it in place, so the task this returns cannot change underneath.
 	now, _ := m.Time(ctx)
-	claimExpiry := now.Add(cq.Duration)
-
-	var candidates []*entroq.Doc
-	nss.AscendFrom(docKeyEntry{Key: cq.Key}, func(r *entroq.Doc) bool {
-		if r.Key != cq.Key {
-			return false
+	until := now.Add(cq.Duration)
+	if cq.TaskToMatch != nil {
+		// Read without the queue lock, before any namespace lock is taken, so
+		// this adds nothing to eqmem's lock ordering. The read is safe because
+		// queues are a sync.Map and a writer replaces a task rather than
+		// mutating it in place; see docset.MissingTaskErrorf for why reading it
+		// optimistically is enough.
+		tq := func() *taskQueue {
+			defer un(lock(m))
+			return m.queues[cq.TaskToMatch.Queue]
+		}()
+		if tq == nil {
+			return nil, docset.MissingTaskErrorf(cq.TaskToMatch, "eqmem claim docs")
 		}
-		candidates = append(candidates, r)
-		return true
-	})
-
-	for _, r := range candidates {
-		if r.Claimant != "" && now.Before(r.At) && r.Claimant != cq.Claimant {
-			return nil, entroq.DependencyErrorf("doc %s already claimed by %s until %v", r.ID, r.Claimant, r.At)
+		t, ok := tq.Get(cq.TaskToMatch.ID)
+		if !ok || t.Version != cq.TaskToMatch.Version {
+			return nil, docset.MissingTaskErrorf(cq.TaskToMatch, "eqmem claim docs")
 		}
+		until = t.At
 	}
 
-	var results []*entroq.Doc
-	for _, r := range candidates {
-		nr := r.Copy()
-		nr.Claimant = cq.Claimant
-		nr.At = claimExpiry
-		nr.Version++
-		nr.Modified = now
-		nss.Set(r.ID, nr)
-		results = append(results, nr)
+	nls, unlock := m.lockNamespaces(names)
+	defer unlock()
+	byNS := make(map[string]*docNamespace, len(nls))
+	for _, nl := range nls {
+		byNS[nl.namespace] = nl.docs
 	}
 
-	return results, nil
+	lockOf := func(g docset.Set) docset.Lock { return byNS[g.Namespace].Lock(g.Key) }
+	members := func(g docset.Set) ([]*entroq.Doc, error) { return byNS[g.Namespace].Members(g.Key), nil }
+	claimed, err := docset.ClaimAll(cq, now, until, lockOf, members)
+	if err != nil {
+		return nil, fmt.Errorf("eqmem claim docs: %w", err)
+	}
+
+	written := make(map[docset.Set]docset.Lock, len(sets))
+	for i, g := range sets {
+		byNS[g.Namespace].SetLock(g.Key, claimed[i])
+		written[g] = claimed[i]
+	}
+	if err := m.journalLocks(written); err != nil {
+		log.Fatalf("Inconsistent internal state: doc claim succeeded but could not be journaled: %v", err)
+	}
+	return docset.ClaimedSets(cq, claimed, members)
 }

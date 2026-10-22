@@ -14,7 +14,7 @@ import (
 // fromDocProto converts a proto Doc to an entroq.Doc.
 // Docs returns a slice of docs in a namespace.
 func (b *backend) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc, error) {
-	resp, err := pb.NewEntroQClient(b.conn).Docs(ctx, &pb.DocsRequest{
+	resp, err := b.client().Docs(ctx, &pb.DocsRequest{
 		Query: &pb.DocQuery{
 			Namespace:  rq.Namespace,
 			Ids:        rq.IDs,
@@ -35,23 +35,43 @@ func (b *backend) Docs(ctx context.Context, rq *entroq.DocQuery) ([]*entroq.Doc,
 	return docs, nil
 }
 
-// ClaimDocs attempts an all-or-nothing claim of all docs with the given
-// primary key in the namespace. Returns a DependencyError if any are claimed.
-func (b *backend) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.Doc, error) {
-	resp, err := pb.NewEntroQClient(b.conn).ClaimDocs(ctx, &pb.ClaimDocsRequest{
-		ClaimQuery: &pb.DocClaim{
-			Namespace:  cq.Namespace,
-			Claimant:   cq.Claimant,
-			Key:        cq.Key,
-			DurationMs: int64(cq.Duration / time.Millisecond),
-		},
-	})
+// ClaimDocs claims every doc set cq names, all or none, and returns them in
+// the order named, each with its members unless claimed OmitMembers. Returns a
+// DependencyError while someone else holds any of them. Sets are named by key,
+// and the server answers with each.
+func (b *backend) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.DocSet, error) {
+	claim := &pb.DocClaim{
+		Claimant:   cq.Claimant,
+		DurationMs: int64(cq.Duration / time.Millisecond),
+	}
+	if cq.TaskToMatch != nil {
+		claim.TaskToMatch = pbconv.TaskIDToProto(cq.TaskToMatch)
+	}
+	for _, s := range cq.Sets {
+		claim.Sets = append(claim.Sets, &pb.DocSetClaim{
+			Set:         pbconv.DocSetIDToProto(s.Namespace, s.Key, 0),
+			OmitMembers: s.OmitMembers,
+		})
+	}
+	resp, err := b.client().ClaimDocs(ctx, &pb.ClaimDocsRequest{ClaimQuery: claim})
 	if err != nil {
 		return nil, fmt.Errorf("grpc claim docs: %w", unpackGRPCError(err))
 	}
-	docs := make([]*entroq.Doc, 0, len(resp.Docs))
-	for _, d := range resp.Docs {
-		docs = append(docs, pbconv.MustDocFromProto(d))
+	return claimedSets(resp)
+}
+
+// claimedSets is the doc sets a ClaimDocs response describes, in order, each
+// with the members that came back for it.
+func claimedSets(resp *pb.ClaimDocsResponse) ([]*entroq.DocSet, error) {
+	members := make(map[[2]string][]*entroq.Doc)
+	for _, d := range resp.GetDocs() {
+		doc := pbconv.MustDocFromProto(d)
+		k := [2]string{doc.Namespace, doc.Key}
+		members[k] = append(members[k], doc)
 	}
-	return docs, nil
+	sets := make([]*entroq.DocSet, 0, len(resp.GetSets()))
+	for _, g := range resp.GetSets() {
+		sets = append(sets, pbconv.DocSetFromProto(g, members[[2]string{g.GetNamespace(), g.GetKey()}]))
+	}
+	return sets, nil
 }

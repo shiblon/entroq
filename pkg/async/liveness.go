@@ -2,6 +2,7 @@ package async
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -48,17 +49,20 @@ func (l *peerLiveness) observed() {
 	}
 }
 
-// run resets the peer deadline after every observed frame and calls timeout
-// once when no frame arrives in time. Reset safely replaces either an active or
-// expired deadline, so no separate stop-and-drain handshake is needed.
-func (l *peerLiveness) run(ctx context.Context, timeout func()) error {
+// errPeerSilent is a peer that sent no frame within the liveness timeout.
+var errPeerSilent = errors.New("eqlink peer sent no frame within the liveness timeout")
+
+// run resets the peer deadline after every observed frame, and returns
+// errPeerSilent when no frame arrives in time, or nil once ctx ends. Reset
+// safely replaces either an active or expired deadline, so no separate
+// stop-and-drain handshake is needed.
+func (l *peerLiveness) run(ctx context.Context) error {
 	timer := time.NewTimer(l.timing.timeout)
 	defer timer.Stop()
 	for {
 		select {
 		case <-timer.C:
-			timeout()
-			return nil
+			return errPeerSilent
 		case <-l.activity:
 			timer.Reset(l.timing.timeout)
 		case <-ctx.Done():

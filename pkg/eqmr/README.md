@@ -267,7 +267,7 @@ markers, its document-sink output if any, and its quarantined tasks if it
 failed; intermediates are collected as it goes. Once the sink has finished,
 nothing in EntroQ is needed to read the output.
 
-A namespace under EntroQ's `/gc=` convention expires its unclaimed doc groups
+A namespace under EntroQ's `/gc=` convention expires its unclaimed doc sets
 at a time fixed when they are inserted: right for output with a bounded reading
 window, wrong for intermediates.
 

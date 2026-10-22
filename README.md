@@ -170,7 +170,7 @@ svc, _ := entroq.New(ctx, eqgrpc.Opener("localhost:37706", eqgrpc.WithInsecure()
 defer svc.Close()
 
 w := worker.New(svc,
-    worker.WithDoModify(func(ctx context.Context, task *entroq.Task, val json.RawMessage, docs []*entroq.Doc) (*worker.Result, error) {
+    worker.WithDoModify(func(ctx context.Context, task *entroq.Task, val json.RawMessage, _ []*entroq.DocSet) (*worker.Result, error) {
         log.Printf("Processing: %s", string(task.Value))
         return worker.Modify(task.Delete()), nil // finish by deleting
     }),
@@ -242,11 +242,15 @@ EntroQ.Worker.run(client, ["/my/queue"], MyWorker)
 ### Any language (work gateway)
 A worker can be written in **any** language without importing EntroQ or gRPC:
 `eqlink work` runs the hard part of the worker loop (claim, renew, commit) on its
-behalf and speaks a small newline-delimited JSON protocol over a stdio pipe or a
-WebSocket. See the wire contract and the client recipes in
+behalf, and the worker drives it with a small JSON protocol over plain HTTP or
+a stdio pipe. See the wire contract and the client recipes in
 [`docs/workgateway-protocol.md`](docs/workgateway-protocol.md), and a minimal
-Python example in [`examples/workgateway/`](examples/workgateway/). This surface
-is new and currently experimental (see the [changelog](CHANGELOG.md)).
+Python example in [`examples/workgateway/`](examples/workgateway/).
+
+> [!WARNING]
+> The work gateway is experimental. Its protocol and its behavior under
+> cancellation and disconnection may change without backward compatibility
+> (see the [changelog](CHANGELOG.md)).
 
 ## Document Store
 
@@ -260,8 +264,8 @@ to read or coordinate around.
 
 Doc namespaces can opt into the same built-in garbage collection as task queues
 by placing `/gc=<timestamp>` in the namespace. Once active, GC removes each
-primary-key group atomically, and only while every member of that group is
-unclaimed. A claimed group does not prevent collection of other groups in the
+primary-key set atomically, and only while every member of that set is
+unclaimed. A claimed set does not prevent collection of other sets in the
 same namespace. Malformed `gc=` values are reported and never collected.
 
 Docs and tasks share the same `Modify` call, so you can atomically insert a

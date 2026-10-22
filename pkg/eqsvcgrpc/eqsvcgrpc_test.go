@@ -7,10 +7,12 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/shiblon/entroq"
 	pb "github.com/shiblon/entroq/api"
 	"github.com/shiblon/entroq/pkg/authn"
 	"github.com/shiblon/entroq/pkg/authz"
 	"github.com/shiblon/entroq/pkg/backend/eqmem"
+	"github.com/shiblon/entroq/pkg/pbconv"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -199,7 +201,7 @@ func TestModifyRejectsDocNamespaceChange(t *testing.T) {
 
 	req := &pb.ModifyRequest{
 		DocChanges: []*pb.DocChange{{
-			OldId:   &pb.DocID{Namespace: "ns-a", Id: "d1"},
+			OldId:   pbconv.DocIDToProto("ns-a", "d1", 0),
 			NewData: &pb.DocData{Namespace: "ns-b"},
 		}},
 	}
@@ -209,7 +211,7 @@ func TestModifyRejectsDocNamespaceChange(t *testing.T) {
 
 	// A same-namespace change (empty destination = unspecified) is NOT rejected
 	// for the namespace reason; it fails only because the doc does not exist.
-	req.DocChanges[0].NewData.Namespace = ""
+	req.DocChanges[0].GetNewData().Namespace = ""
 	if _, err := svc.Modify(ctx, req); status.Code(err) == codes.InvalidArgument {
 		t.Errorf("same-namespace doc change should not be an InvalidArgument, got %v", err)
 	}
@@ -365,5 +367,166 @@ func TestBearerTokenStopsAtAuthenticator(t *testing.T) {
 	}
 	if bytes.Contains(encoded, []byte("secret-token")) || bytes.Contains(encoded, []byte("authz")) {
 		t.Fatalf("authorization request leaked credentials: %s", encoded)
+	}
+}
+
+// queueBlindBackend is a backend with the bug the service must not trust:
+// its Tasks ignores the queue when task IDs are given.
+type queueBlindBackend struct{ entroq.Backend }
+
+func (b queueBlindBackend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Task, error) {
+	if len(tq.IDs) > 0 {
+		q := *tq
+		q.Queue = ""
+		tq = &q
+	}
+	return b.Backend.Tasks(ctx, tq)
+}
+
+// TestTasksDropsTasksOutsideQueriedQueue checks that the service itself keeps
+// a Tasks query inside the queue it authorized, even over a backend that
+// returns tasks from other queues.
+func TestTasksDropsTasksOutsideQueriedQueue(t *testing.T) {
+	ctx := context.Background()
+	opener := func(ctx context.Context) (entroq.Backend, error) {
+		b, err := eqmem.Opener()(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return queueBlindBackend{b}, nil
+	}
+	svc, err := New(ctx, opener)
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	defer svc.Close()
+
+	ins, err := svc.Modify(ctx, &pb.ModifyRequest{Inserts: []*pb.TaskData{{Queue: "readable"}, {Queue: "secret"}}})
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	secretID := ins.Inserted[1].Id
+
+	resp, err := svc.Tasks(ctx, &pb.TasksRequest{Queue: "readable", TaskId: []string{secretID}})
+	if err != nil {
+		t.Fatalf("tasks: %v", err)
+	}
+	if len(resp.Tasks) != 0 {
+		t.Errorf("tasks in %q by the ID of a task in %q: want none, got %v", "readable", "secret", resp.Tasks)
+	}
+}
+
+// TestMalformedRequestsFailBeforeAuthorization checks that a request the
+// service can never carry out is an invalid argument, found before the
+// authorizer is asked, so the code does not depend on whether authorization
+// is configured. A doc claim with no claimant must not become a claim by the
+// service itself.
+func TestMalformedRequestsFailBeforeAuthorization(t *testing.T) {
+	ctx := context.Background()
+	calls := map[string]func(s *QSvc) error{
+		"insert into no queue": func(s *QSvc) error {
+			_, err := s.Modify(ctx, &pb.ModifyRequest{ClaimantId: "c", Inserts: []*pb.TaskData{{Queue: ""}}})
+			return err
+		},
+		"doc insert into no namespace": func(s *QSvc) error {
+			_, err := s.Modify(ctx, &pb.ModifyRequest{ClaimantId: "c", DocInserts: []*pb.DocData{{Namespace: ""}}})
+			return err
+		},
+		"tasks with no queue or IDs": func(s *QSvc) error {
+			_, err := s.Tasks(ctx, &pb.TasksRequest{})
+			return err
+		},
+		"docs with no namespace": func(s *QSvc) error {
+			_, err := s.Docs(ctx, &pb.DocsRequest{Query: &pb.DocQuery{Ids: []string{"a"}}})
+			return err
+		},
+		"doc claim with no claimant": func(s *QSvc) error {
+			_, err := s.ClaimDocs(ctx, &pb.ClaimDocsRequest{ClaimQuery: &pb.DocClaim{Namespace: "ns", Key: "k"}})
+			return err
+		},
+		"claim from no queues": func(s *QSvc) error {
+			_, err := s.TryClaim(ctx, &pb.ClaimRequest{ClaimantId: "c"})
+			return err
+		},
+		"claim with no claimant": func(s *QSvc) error {
+			_, err := s.TryClaim(ctx, &pb.ClaimRequest{Queues: []string{"q"}})
+			return err
+		},
+	}
+	for name, call := range calls {
+		t.Run(name, func(t *testing.T) {
+			az := new(stubAuthorizer)
+			svc, err := New(ctx, eqmem.Opener(), WithAuthenticator(allowingAuthenticator()), WithAuthorizer(az))
+			if err != nil {
+				t.Fatalf("new service: %v", err)
+			}
+			defer svc.Close()
+			if err := call(svc); status.Code(err) != codes.InvalidArgument {
+				t.Errorf("want InvalidArgument, got %v", err)
+			}
+			if az.called {
+				t.Error("authorizer was consulted for a malformed request")
+			}
+		})
+	}
+}
+
+// failingBackend fails every task listing with an error no caller could fix.
+type failingBackend struct{ entroq.Backend }
+
+func (failingBackend) Tasks(context.Context, *entroq.TasksQuery) ([]*entroq.Task, error) {
+	return nil, errors.New("storage unavailable")
+}
+
+func TestServerFailureIsInternal(t *testing.T) {
+	ctx := context.Background()
+	opener := func(ctx context.Context) (entroq.Backend, error) {
+		b, err := eqmem.Opener()(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return failingBackend{b}, nil
+	}
+	svc, err := New(ctx, opener)
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	defer svc.Close()
+	if _, err := svc.Tasks(ctx, &pb.TasksRequest{Queue: "q"}); status.Code(err) != codes.Internal {
+		t.Errorf("Tasks on a failing backend: want Internal, got %v", err)
+	}
+}
+
+// fakeTaskStream is a StreamTasks server stream that records what is sent.
+type fakeTaskStream struct {
+	pb.EntroQ_StreamTasksServer
+	ctx  context.Context
+	sent []*pb.TasksResponse
+}
+
+func (s *fakeTaskStream) Context() context.Context    { return s.ctx }
+func (s *fakeTaskStream) SetHeader(metadata.MD) error { return nil }
+func (s *fakeTaskStream) Send(r *pb.TasksResponse) error {
+	s.sent = append(s.sent, r)
+	return nil
+}
+
+// TestStreamTasksKeepsStatusCode checks that StreamTasks, which wraps the
+// errors of Tasks, keeps their codes rather than reporting every failure as a
+// server error.
+func TestStreamTasksKeepsStatusCode(t *testing.T) {
+	ctx := context.Background()
+	az := &stubAuthorizer{err: &authz.AuthzError{Failed: []*authz.Queue{{Exact: "q", Actions: []authz.Action{authz.Read}}}}}
+	svc, err := New(ctx, eqmem.Opener(), WithAuthenticator(allowingAuthenticator()), WithAuthorizer(az))
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	defer svc.Close()
+	stream := &fakeTaskStream{ctx: ctx}
+	if err := svc.StreamTasks(&pb.TasksRequest{Queue: "q"}, stream); status.Code(err) != codes.PermissionDenied {
+		t.Errorf("StreamTasks denied: want PermissionDenied, got %v", err)
+	}
+	if err := svc.StreamTasks(&pb.TasksRequest{}, stream); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("StreamTasks with no queue or IDs: want InvalidArgument, got %v", err)
 	}
 }

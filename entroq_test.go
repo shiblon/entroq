@@ -51,7 +51,8 @@ func Example() {
 	w := worker.New(eq,
 		// Workers claim a task and pass it to your handler functions. In the
 		// background, the task's lease is renewed while the first function runs.
-		worker.WithDoWork(func(ctx context.Context, initial *entroq.Task, v string, _ []*entroq.Doc) error {
+		worker.WithDoWork(func(ctx context.Context, _ entroq.Reader, work *worker.Work[string]) error {
+			v := work.Value
 			fmt.Printf("Worker handling task %q\n", v)
 			// Do work with it here.
 			return nil
@@ -59,7 +60,9 @@ func Example() {
 		// When ready to commit changes to the task (including deletion), the second
 		// function passes the version-stable task after the renewer is stopped,
 		// making it safe to use it in modification transactions.
-		worker.WithFinish(func(ctx context.Context, mod worker.Modifier, final *entroq.Task, v string, _ []*entroq.Doc) error {
+		worker.WithFinish(func(ctx context.Context, eqc entroq.Client, work *worker.Work[string]) error {
+			mod := eqc
+			final, v := work.Task, work.Value
 			fmt.Printf("Deleting task %q\n", v)
 			_, err := mod.Modify(ctx, final.Delete())
 			if err != nil {
@@ -107,7 +110,7 @@ func Example_dependencies() {
 	var config *entroq.Task
 
 	w := worker.New(eq,
-		worker.WithDoWork(func(ctx context.Context, initial *entroq.Task, _ json.RawMessage, _ []*entroq.Doc) error {
+		worker.WithDoWork(func(ctx context.Context, _ entroq.Reader, work *worker.Work[json.RawMessage]) error {
 			if config == nil {
 				tasks, err := eq.Tasks(ctx, "config")
 				if err != nil || len(tasks) == 0 {
@@ -118,7 +121,9 @@ func Example_dependencies() {
 			// ... do work with initial and config ...
 			return nil
 		}),
-		worker.WithFinish(func(ctx context.Context, mod worker.Modifier, final *entroq.Task, _ json.RawMessage, _ []*entroq.Doc) error {
+		worker.WithFinish(func(ctx context.Context, eqc entroq.Client, work *worker.Work[json.RawMessage]) error {
+			mod := eqc
+			final := work.Task
 			if config == nil {
 				return fmt.Errorf("config missing during finalize")
 			}
@@ -394,12 +399,12 @@ func Example_docAtomicTaskCommit() {
 		log.Fatalf("claim task: %v", err)
 	}
 
-	// Claim the state doc for exclusive modification.
-	claimed, err := eq.ClaimDocs(ctx, entroq.ClaimKey("state", stateDoc.Key).For(5*time.Second))
+	// Claim the state doc's set for exclusive modification.
+	claimed, err := eq.ClaimDocs(ctx, entroq.ClaimKey("state", stateDoc.Key), entroq.ClaimingSetsFor(5*time.Second))
 	if err != nil {
 		log.Fatalf("claim doc: %v", err)
 	}
-	counter := claimed[0]
+	counter := claimed[0].Docs[0]
 
 	var count int
 	if err := json.Unmarshal(counter.Content, &count); err != nil {
@@ -440,9 +445,10 @@ func Example_docAtomicTaskCommit() {
 }
 
 // Example_docClaimContention demonstrates the all-or-nothing locking behavior
-// of ClaimDocs. All docs sharing a primary key are claimed together; a second
-// claimant attempting the same key while the lock is held gets a DependencyError.
-// A key that does not exist returns an empty slice rather than an error.
+// of ClaimDocs. All docs sharing a primary key are claimed together, as one
+// set; a second claimant attempting the same key while the set is held
+// gets a DependencyError. A key with no docs is an empty set: claiming it
+// succeeds and holds it, with no docs.
 func Example_docClaimContention() {
 	ctx := context.Background()
 	eq, err := entroq.New(ctx, eqmem.Opener())
@@ -454,12 +460,12 @@ func Example_docClaimContention() {
 	const ns = "locks"
 	const key = "resource"
 
-	// A missing key returns an empty slice, not an error.
-	empty, err := eq.ClaimDocs(ctx, entroq.ClaimKey(ns, "no-such-key").For(time.Second))
+	// A key with no docs is an empty set, claimed like any other.
+	empty, err := eq.ClaimDocs(ctx, entroq.ClaimKey(ns, "no-such-key"), entroq.ClaimingSetsFor(time.Second))
 	if err != nil {
-		log.Fatalf("missing-key claim: %v", err)
+		log.Fatalf("empty set claim: %v", err)
 	}
-	fmt.Printf("missing key: %d docs\n", len(empty))
+	fmt.Printf("empty set: %d docs\n", len(empty[0].Docs))
 
 	// Create two docs sharing the same primary key.
 	if _, err := eq.Modify(ctx,
@@ -470,25 +476,20 @@ func Example_docClaimContention() {
 	}
 
 	// First claimant acquires both docs atomically.
-	docs, err := eq.ClaimDocs(ctx, entroq.ClaimKey(ns, key))
+	sets, err := eq.ClaimDocs(ctx, entroq.ClaimKey(ns, key))
 	if err != nil {
 		log.Fatalf("first claim: %v", err)
 	}
-	fmt.Printf("first claim: %d docs\n", len(docs))
+	fmt.Printf("first claim: %d docs\n", len(sets[0].Docs))
 
 	// A second claimant is blocked while the first holds the lock.
 	// The lock expires automatically after Duration; use doc.Change() to
 	// release it early (which increments the version).
-	_, err = eq.ClaimDocs(ctx, &entroq.DocClaim{
-		Namespace: ns,
-		Claimant:  "other-claimant",
-		Key:       key,
-		Duration:  entroq.DefaultClaimDuration,
-	})
+	_, err = eq.ClaimDocs(ctx, entroq.ClaimKey(ns, key), entroq.ClaimingSetsAs("other-claimant"))
 	fmt.Printf("contention: IsDependency=%v\n", entroq.IsDependency(err))
 
 	// Output:
-	// missing key: 0 docs
+	// empty set: 0 docs
 	// first claim: 2 docs
 	// contention: IsDependency=true
 }
@@ -612,29 +613,31 @@ func containsAll(s string, subs ...string) bool {
 }
 
 func TestRetryOrQuarantineArrival(t *testing.T) {
-	future := time.Now().Add(time.Hour)
+	// An arrival is requested as a duration, so the override and the
+	// assertions are durations too.
+	const delay = time.Hour
 
 	t.Run("retry honors arrival override", func(t *testing.T) {
 		task := &entroq.Task{ID: "task", Version: 1, Queue: "work"}
 		mod := entroq.NewModification("worker",
-			task.RetryOrQuarantine("retry", "errors", 2, entroq.ArrivalTimeTo(future)),
+			task.RetryOrQuarantine("retry", "errors", 2, entroq.ArrivalTimeBy(delay)),
 		)
-		if got := mod.Changes[0].At; !got.Equal(future) {
-			t.Fatalf("retry arrival = %s, want %s", got, future)
+		if got := mod.Changes[0].By(); got != delay {
+			t.Fatalf("retry arrival = %s, want %s from now", got, delay)
 		}
 	})
 
 	t.Run("quarantine forces immediate arrival", func(t *testing.T) {
 		task := &entroq.Task{ID: "task", Version: 1, Queue: "work", Attempt: 1}
 		mod := entroq.NewModification("worker",
-			task.RetryOrQuarantine("failed", "errors", 2, entroq.ArrivalTimeTo(future)),
+			task.RetryOrQuarantine("failed", "errors", 2, entroq.ArrivalTimeBy(delay)),
 		)
 		change := mod.Changes[0]
 		if change.Queue != "errors" {
 			t.Fatalf("quarantine queue = %q, want %q", change.Queue, "errors")
 		}
-		if !change.At.IsZero() {
-			t.Fatalf("quarantine arrival = %s, want zero time", change.At)
+		if got := change.By(); got != 0 {
+			t.Fatalf("quarantine arrival = %s from now, want 0: a retry delay must not leak into it", got)
 		}
 	})
 }

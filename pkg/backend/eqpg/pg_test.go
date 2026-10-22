@@ -3,14 +3,15 @@ package eqpg
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/testing/dockerprobe"
 	"github.com/shiblon/entroq/pkg/testing/eqtest"
 	"github.com/shiblon/entroq/pkg/worker"
 	"github.com/testcontainers/testcontainers-go"
@@ -22,31 +23,15 @@ import (
 
 var pgHostPort string
 
-// dockerAvailable reports whether a Docker daemon is reachable. The eqpg tests
-// run Postgres in a testcontainer, so without Docker there is nothing to test
-// against. Detecting its absence lets TestMain skip cleanly (exit 0) instead of
-// failing the package -- important because a bare `go test ./...` (or any CI
-// without a Docker service) would otherwise hard-fail here, and the Example_*
-// functions, which run unconditionally, would crash on an empty endpoint.
-func dockerAvailable(ctx context.Context) bool {
-	cli, err := testcontainers.NewDockerClient()
-	if err != nil {
-		return false
-	}
-	defer cli.Close()
-	// NewDockerClient does not fail when the daemon is unreachable (it swallows
-	// the probe and hands back an env-derived client), so the ping is the real
-	// check. Bound it: an unreachable or black-hole endpoint must not hang here.
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	_, err = cli.Ping(ctx)
-	return err == nil
-}
+// The eqpg tests run Postgres in a testcontainer, so without a usable Docker
+// daemon there is nothing to test against and TestMain skips the package. The
+// Example_* functions run unconditionally and would crash on an empty endpoint,
+// so the skip has to happen before them.
 
 func TestMain(m *testing.M) {
 	ctx := context.Background()
 
-	if !dockerAvailable(ctx) {
+	if !dockerprobe.Available(ctx) {
 		log.Println("SKIP: Docker is not available; skipping eqpg integration tests (they require a Postgres testcontainer).")
 		os.Exit(0)
 	}
@@ -101,8 +86,7 @@ func TestReadinessLoop(t *testing.T) {
 	queue := fmt.Sprintf("/test/readiness/%d", time.Now().UnixNano())
 
 	// Arrive in the future so the insert itself wakes no one.
-	at := time.Now().Add(2 * time.Second)
-	if _, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithArrivalTime(at))); err != nil {
+	if _, err := client.Modify(ctx, entroq.InsertingInto(queue, entroq.WithArrivalTimeIn(2*time.Second))); err != nil {
 		t.Fatalf("Failed to insert delayed task: %v", err)
 	}
 
@@ -189,6 +173,118 @@ func TestUpgradeDropsRetiredReadiness(t *testing.T) {
 	}
 }
 
+// freshDB creates an empty database in the shared PostgreSQL instance and
+// drops it when the test ends.
+func freshDB(ctx context.Context, t *testing.T, name string) *sql.DB {
+	t.Helper()
+	admin, err := OpenDB(pgHostPort, WithDB("postgres"), WithUsername("postgres"), WithPassword("password"))
+	if err != nil {
+		t.Fatalf("Open admin db: %v", err)
+	}
+	t.Cleanup(func() { admin.Close() })
+	if _, err := admin.ExecContext(ctx, "DROP DATABASE IF EXISTS "+name); err != nil {
+		t.Fatalf("Drop stale database: %v", err)
+	}
+	if _, err := admin.ExecContext(ctx, "CREATE DATABASE "+name); err != nil {
+		t.Fatalf("Create database: %v", err)
+	}
+	db, err := OpenDB(pgHostPort, WithDB(name), WithUsername("postgres"), WithPassword("password"))
+	if err != nil {
+		t.Fatalf("Open fresh db: %v", err)
+	}
+	t.Cleanup(func() {
+		db.Close()
+		if _, err := admin.ExecContext(context.Background(), "DROP DATABASE "+name); err != nil {
+			t.Logf("Drop test database (non-fatal): %v", err)
+		}
+	})
+	return db
+}
+
+// TestUpgradeFrom1_11 upgrades a database initialized with the last released
+// schema (1.11.0, shipped through 1.12.x), whose docs carried their own
+// versions and claims. Each set must get a lock one version past its
+// highest member, with claims released; the per-doc columns must be gone and
+// every doc tied to its set's lock; and the digest must let the backend
+// open, and stop it opening once it no longer matches.
+func TestUpgradeFrom1_11(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	const name = "entroq_upgrade_from_1_11"
+	db := freshDB(ctx, t, name)
+
+	old, err := os.ReadFile("testdata/schema-1.11.0.sql")
+	if err != nil {
+		t.Fatalf("Read 1.11.0 schema: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, string(old)); err != nil {
+		t.Fatalf("Apply 1.11.0 schema: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO entroq.docs (namespace, id, version, claimant, at, key_primary, key_secondary, value) VALUES
+		('ns', 'a', 2, '', now(), 'k', '1', '"a"'),
+		('ns', 'b', 7, 'holder', now() + interval '1 hour', 'k', '2', '"b"'),
+		('ns', 'c', 0, '', now(), 'other', '', '"c"')`); err != nil {
+		t.Fatalf("Insert 1.11.0 docs: %v", err)
+	}
+
+	for range 2 { // the second pass must change nothing
+		if _, err := UpgradeSchema(ctx, db); err != nil {
+			t.Fatalf("Upgrade: %v", err)
+		}
+	}
+
+	var dropped int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM pg_attribute
+		WHERE attrelid = 'entroq.docs'::regclass AND attname IN ('version', 'claimant', 'at') AND NOT attisdropped`).Scan(&dropped); err != nil {
+		t.Fatalf("Read docs columns: %v", err)
+	}
+	if dropped != 0 {
+		t.Errorf("Docs keep %d of their per-doc version, claimant, and at columns", dropped)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO entroq.docs (namespace, id, key_primary) VALUES ('ns', 'orphan', 'nolock')`); err == nil {
+		t.Error("Inserted a doc whose set has no lock")
+	}
+
+	b, err := Open(ctx, pgHostPort, WithDB(name), WithUsername("postgres"), WithPassword("password"), WithConnectAttempts(10))
+	if err != nil {
+		t.Fatalf("Open upgraded database: %v", err)
+	}
+	defer b.Close()
+	docs, err := b.Docs(ctx, &entroq.DocQuery{Namespace: "ns"})
+	if err != nil || len(docs) != 3 {
+		t.Fatalf("Docs after upgrade: %v, %v", docs, err)
+	}
+	want := map[string]int32{"a": 8, "b": 8, "c": 1}
+	for _, d := range docs {
+		if d.Version != want[d.ID] || d.Claimant != "" {
+			t.Errorf("Upgraded doc %q: want version %d and no claimant, got version %d, claimant %q", d.ID, want[d.ID], d.Version, d.Claimant)
+		}
+	}
+	if _, err := b.Modify(ctx, entroq.NewModification("me", docs[0].Change(entroq.WithContent("after")))); err != nil {
+		t.Errorf("Change after upgrade: %v", err)
+	}
+
+	// Another build's schema at the same version, or one applied without a
+	// digest, must not open.
+	for _, stmt := range []string{
+		`UPDATE entroq.meta SET value = 'other' WHERE key = 'schema_digest'`,
+		`DELETE FROM entroq.meta WHERE key = 'schema_digest'`,
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("Change digest: %v", err)
+		}
+		if bad, err := Open(ctx, pgHostPort, WithDB(name), WithUsername("postgres"), WithPassword("password"), WithConnectAttempts(1)); err == nil {
+			bad.Close()
+			t.Errorf("Opened a database after %q", stmt)
+		} else if !strings.Contains(err.Error(), "schema upgrade") {
+			t.Errorf("Open after %q: want advice to run schema upgrade, got %v", stmt, err)
+		}
+		if res, err := UpgradeSchema(ctx, db); err != nil || res != UpgradeApplied {
+			t.Fatalf("Upgrade after %q: %v, %v", stmt, res, err)
+		}
+	}
+}
+
 func pgClient(ctx context.Context) (client *entroq.EntroQ, err error) {
 	return entroq.New(ctx, Opener(pgHostPort,
 		WithDB("postgres"),
@@ -226,12 +322,15 @@ func Example() {
 	go func() { time.Sleep(2 * time.Second); cancel() }()
 
 	w := worker.New(client,
-		worker.WithDoWork(func(ctx context.Context, claimed *entroq.Task, s string, _ []*entroq.Doc) error {
+		worker.WithDoWork(func(ctx context.Context, _ entroq.Reader, work *worker.Work[string]) error {
+			s := work.Value
 			// Do work with the task.
 			fmt.Println(s)
 			return nil
 		}),
-		worker.WithFinish(func(ctx context.Context, mod worker.Modifier, final *entroq.Task, _ string, _ []*entroq.Doc) error {
+		worker.WithFinish(func(ctx context.Context, eqc entroq.Client, work *worker.Work[string]) error {
+			mod := eqc
+			final := work.Task
 			// Delete the task to "commit" the work.
 			// At this point, you can also call directly into eqpg.ModifyOpts and
 			// hand it a function to call that has a transaction. That transaction
@@ -252,92 +351,6 @@ func Example() {
 	// Output:
 	// hello
 	// hello
-}
-
-func Example_inTransaction() {
-	ctx := context.Background()
-	// Create the backend separately to get access to the database for raw SQL.
-	backend, err := Open(ctx, // eqpg.Open
-		pgHostPort,
-		WithDB("postgres"),
-		WithUsername("postgres"),
-		WithPassword("password"),
-		WithConnectAttempts(2))
-	if err != nil {
-		log.Fatalf("EQPG failed to open: %v", err)
-	}
-	client, err := entroq.New(ctx, nil /* no opener */, entroq.WithBackend(backend))
-	if err != nil {
-		log.Fatalf("Entroq init error: %v", err)
-	}
-	defer client.Close()
-
-	// Prep a simple database table. We'll update it inside the Modify transaction.
-	if _, err := backend.DB.ExecContext(ctx,
-		`CREATE TABLE IF NOT EXISTS exampleCounter (id int);
-		 TRUNCATE exampleCounter;
-		 INSERT INTO exampleCounter (id) VALUES (0);`,
-	); err != nil {
-		log.Fatalf("Failed to prep exampleCounter: %v", err)
-	}
-
-	// Insert some tasks.
-	_, err = client.Modify(ctx,
-		entroq.InsertingInto("/example/queue 1", entroq.WithValue("hello")),
-		entroq.InsertingInto("/example/queue 2", entroq.WithValue("hello")),
-		entroq.InsertingInto("/example/queue 2", entroq.WithValue("hello")),
-	)
-	if err != nil {
-		log.Fatalf("insertion failed: %v", err)
-	}
-
-	// For the sake of the example: cancel the worker after 2 seconds. Usually you won't ever cancel a worker.
-	// Note that timeouts are considered unclean shutdowns, so we do a pure cancel in a goroutine.
-	workerCtx, cancel := context.WithCancel(ctx) // don't overwrite the main context, we'll need it after Run!
-	defer cancel()
-	go func() { time.Sleep(2 * time.Second); cancel() }()
-
-	// Create a worker that just prints the task value, then in finalization,
-	// when the task version is finalized (background renewal is stopped),
-	// updates the counter table.
-	w := worker.New(client,
-		worker.WithDoWork(func(ctx context.Context, claimed *entroq.Task, s string, _ []*entroq.Doc) error {
-			// Do work with the task.
-			fmt.Println(s)
-			return nil
-		}),
-		worker.WithFinish(func(ctx context.Context, mod worker.Modifier, final *entroq.Task, _ string, _ []*entroq.Doc) error {
-			// Delete the task to "commit" the work.
-
-			// The counter is updated in the same transaction as the entroq modification.
-			// If either fails, the entire transaction fails, leaving all work
-			// items in a consistent state.
-			inTx := func(ctx context.Context, tx *sql.Tx) error {
-				_, err := tx.ExecContext(ctx, "UPDATE exampleCounter SET id = id + 1")
-				return err
-			}
-			if _, err := mod.Modify(ctx, final.Delete(), entroq.WithModifyOption(RunningInTx(inTx))); err != nil {
-				return fmt.Errorf("Failed to delete/commit task: %w", err)
-			}
-			return nil
-		}),
-	)
-	if err := w.Run(workerCtx, worker.Watching("/example/queue 1", "/example/queue 2")); err != nil && !errors.Is(err, context.Canceled) {
-		log.Fatalf("worker run failed: %v", err)
-	}
-
-	// The worker's context is canceled, so we use a fresh context to check the DB.
-	var count int
-	if err := backend.DB.QueryRowContext(ctx, "SELECT id FROM exampleCounter").Scan(&count); err != nil {
-		log.Fatalf("Failed to get count: %v", err)
-	}
-	fmt.Printf("Count: %d\n", count)
-
-	// Output:
-	// hello
-	// hello
-	// hello
-	// Count: 3
 }
 
 func RunQTest(t *testing.T, tester eqtest.Tester) {
@@ -381,6 +394,34 @@ func TestChangeKeepsStoredFields(t *testing.T) {
 
 func TestInsertKeepsAttemptAndErr(t *testing.T) {
 	RunQTest(t, eqtest.InsertKeepsAttemptAndErr)
+}
+
+func TestModifyRejectsDuplicateIDs(t *testing.T) {
+	RunQTest(t, eqtest.ModifyRejectsDuplicateIDs)
+}
+
+func TestModifyRespectsTaskClaims(t *testing.T) {
+	RunQTest(t, eqtest.ModifyRespectsTaskClaims)
+}
+
+func TestTasksWithIDStaysInQueue(t *testing.T) {
+	RunQTest(t, eqtest.TasksWithIDStaysInQueue)
+}
+
+func TestDocSets(t *testing.T) {
+	RunQTest(t, eqtest.DocSets)
+}
+
+func TestUpdateArrival(t *testing.T) {
+	RunQTest(t, eqtest.UpdateArrival)
+}
+
+func TestClaimStampsLease(t *testing.T) {
+	RunQTest(t, eqtest.ClaimStampsLease)
+}
+
+func TestArrivalResolvesOnBackendClock(t *testing.T) {
+	RunQTest(t, eqtest.ArrivalResolvesOnBackendClock)
 }
 
 func TestTaskChangeFarPastArrivalNormalized(t *testing.T) {
@@ -508,6 +549,42 @@ func TestWorkerCompactDependencyHandler(t *testing.T) {
 
 func TestWorkerDependencyMove(t *testing.T) {
 	RunQTest(t, eqtest.WorkerDependencyMove)
+}
+
+func TestWorkerHoldsEmptyGroup(t *testing.T) {
+	RunQTest(t, eqtest.WorkerHoldsEmptyGroup)
+}
+
+func TestDocSecondaryKeyRaceHasOneWinner(t *testing.T) {
+	RunQTest(t, eqtest.DocSecondaryKeyRaceHasOneWinner)
+}
+
+func TestDocMemberVersionFromSet(t *testing.T) {
+	RunQTest(t, eqtest.DocMemberVersionFromSet)
+}
+
+func TestDocSecondaryKeysAreUnique(t *testing.T) {
+	RunQTest(t, eqtest.DocSecondaryKeysAreUnique)
+}
+
+func TestDocSetDepends(t *testing.T) {
+	RunQTest(t, eqtest.DocSetDepends)
+}
+
+func TestDocAndTaskDependenciesFailTogether(t *testing.T) {
+	RunQTest(t, eqtest.DocAndTaskDependenciesFailTogether)
+}
+
+func TestWorkerReleasesSets(t *testing.T) {
+	RunQTest(t, eqtest.WorkerReleasesSets)
+}
+
+func TestClaimsReset(t *testing.T) {
+	RunQTest(t, eqtest.ClaimsReset)
+}
+
+func TestDocClaimSets(t *testing.T) {
+	RunQTest(t, eqtest.DocClaimSets)
 }
 
 func TestPGSimpleDocLifecycle(t *testing.T) {
@@ -667,4 +744,57 @@ func TestModifyReportsAllFailureClasses(t *testing.T) {
 
 func TestModifyRejectsWrongNamespace(t *testing.T) {
 	RunQTest(t, eqtest.ModifyRejectsWrongNamespace)
+}
+
+func TestInvalidRequests(t *testing.T) {
+	RunQTest(t, eqtest.InvalidRequests)
+}
+
+func TestBackendRejectsInvalidRequests(t *testing.T) {
+	ctx := context.Background()
+	b, err := Open(ctx, pgHostPort, WithDB("postgres"), WithUsername("postgres"), WithPassword("password"), WithConnectAttempts(10))
+	if err != nil {
+		t.Fatalf("open backend: %v", err)
+	}
+	defer b.Close()
+	eqtest.BackendRejectsInvalidRequests(ctx, t, b, "/pgtest/"+entroq.GenHex16())
+	eqtest.StorageRejectsZeroDurations(ctx, t, b, "/pgtest/"+entroq.GenHex16())
+}
+
+func TestTasksClaimantFilter(t *testing.T) {
+	RunQTest(t, eqtest.TasksClaimantFilter)
+}
+
+func TestQueueStatsCounts(t *testing.T) {
+	RunQTest(t, eqtest.QueueStatsCounts)
+}
+
+func TestQueueStatsMatching(t *testing.T) {
+	RunQTest(t, eqtest.QueueStatsMatching)
+}
+
+func TestDocsOrderAndLimits(t *testing.T) {
+	RunQTest(t, eqtest.DocsOrderAndLimits)
+}
+
+func TestTaskClaimantIsHolder(t *testing.T) {
+	RunQTest(t, eqtest.TaskClaimantIsHolder)
+}
+
+func TestTaskChangeFutureArrival(t *testing.T) {
+	RunQTest(t, eqtest.TaskChangeFutureArrival)
+}
+
+// TestDocConcurrencyStress is slow, so it runs in parallel with the other parallel tests
+// once the sequential ones finish; it uses its own namespace and queue.
+func TestDocConcurrencyStress(t *testing.T) {
+	t.Parallel()
+	RunQTest(t, eqtest.DocConcurrencyStress)
+}
+
+// TestMixedAtomicStress is slow, so it runs in parallel with the other parallel tests
+// once the sequential ones finish; it uses its own namespace and queue.
+func TestMixedAtomicStress(t *testing.T) {
+	t.Parallel()
+	RunQTest(t, eqtest.MixedAtomicStress)
 }

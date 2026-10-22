@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"net/http"
@@ -32,18 +33,18 @@ type senderSession struct {
 	responseLanes sessionLanes
 	startedAt     time.Time
 	liveness      *peerLiveness
-	cancel        context.CancelCauseFunc
-
-	requestWorkerCancel    context.CancelFunc
-	responseWorkerCancel   context.CancelFunc
-	requestWorkerSwitched  bool
-	responseWorkerSwitched bool
-	requestCompleted       bool
-	responseCompleted      bool
 
 	responseStarted bool
 	responseStatus  int
 	responseErr     error
+}
+
+// claimant is the consumer a session's workers hold things as: the connection
+// itself, for the reasons on Receiver.claimant. A session hands one exchange
+// between its workers and also touches those tasks through the sender's client
+// directly, so splitting the two would split the consumer.
+func (s *senderSession) claimant() string {
+	return s.sender.eq.ID()
 }
 
 func newSenderSession(sender *Sender, writer http.ResponseWriter, request *http.Request, session string, requestAck, responseData *receiveLane, bootstrapTask *entroq.Task, startedAt time.Time) *senderSession {
@@ -52,7 +53,7 @@ func newSenderSession(sender *Sender, writer http.ResponseWriter, request *http.
 		writer:        writer,
 		session:       session,
 		bootstrapTask: bootstrapTask,
-		source:        newBodySource(request.Body, request.Trailer),
+		source:        newBodySource(request.Body, request.Trailer, releaseBody(writer, request.Body)),
 		requestLanes:  sessionLanes{local: requestAck},
 		responseLanes: sessionLanes{local: responseData},
 		startedAt:     startedAt,
@@ -60,37 +61,64 @@ func newSenderSession(sender *Sender, writer http.ResponseWriter, request *http.
 	}
 }
 
-func (s *senderSession) run(parent context.Context) error {
-	ctx, cancel := context.WithCancelCause(parent)
-	defer cancel(nil)
-	s.cancel = cancel
+// releaseBody returns a func that ends a Read of the request body that is
+// waiting on the client. Closing the body cannot do it alone: an HTTP/1 server
+// body's Close waits for a Read in progress. A read deadline on the connection
+// ends the Read; a writer without deadlines, such as a test recorder, gets the
+// Close.
+func releaseBody(w http.ResponseWriter, body io.Closer) func() {
+	rc := http.NewResponseController(w)
+	return func() {
+		err := rc.SetReadDeadline(time.Now())
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, http.ErrNotSupported) {
+			log.Printf("release request body: %v", err)
+		}
+		if err := body.Close(); err != nil {
+			log.Printf("close request body: %v", err)
+		}
+	}
+}
 
-	g, gctx := errgroup.WithContext(ctx)
+// sessionEnd is a session ending on its own terms: the terminal response
+// committed, or writing it to the caller failed and the peer was told. err is
+// the remote error that arrived after the response had started, if one did.
+type sessionEnd struct {
+	err error
+}
+
+func (e *sessionEnd) Error() string { return "eqlink session ended" }
+
+// run carries the exchange until a worker ends it, each returning what ended
+// it: the response lane a *sessionEnd, liveness errPeerSilent, a lane its
+// failure. With none of those, the caller's context ended it. The peer is told
+// unless the response finished or the peer itself has gone quiet.
+func (s *senderSession) run(parent context.Context) error {
+	g, gctx := errgroup.WithContext(parent)
 	g.Go(func() error { return s.source.run(gctx) })
-	g.Go(func() error { return s.runRequestWorkers(gctx) })
-	g.Go(func() error { return s.runResponseWorkers(gctx) })
-	g.Go(func() error {
-		return s.liveness.run(gctx, func() { cancel(errSenderPeerTimeout) })
-	})
+	g.Go(func() error { return s.runRequestLane(gctx) })
+	g.Go(func() error { return s.runResponseLane(gctx) })
+	g.Go(func() error { return s.liveness.run(gctx) })
 
 	err := g.Wait()
 	s.deleteBootstrapTask(parent)
-	if s.responseCompleted {
-		return s.responseErr
+	if err == nil {
+		// No worker decided the end, so the caller's context did.
+		err = context.Cause(parent)
 	}
-	if err != nil {
-		if parent.Err() != nil {
-			s.notifyPeerCanceled(parent, err)
-		}
-		return err
+	var end *sessionEnd
+	switch {
+	case errors.As(err, &end):
+		return end.err
+	case errors.Is(err, errPeerSilent):
+		return errSenderPeerTimeout
+	case err == nil:
+		return fmt.Errorf("session workers exited before terminal response committed")
 	}
-	if cause := context.Cause(ctx); cause != nil {
-		if parent.Err() != nil {
-			s.notifyPeerCanceled(parent, cause)
-		}
-		return cause
-	}
-	return fmt.Errorf("session workers exited before terminal response committed")
+	s.notifyPeerCanceled(parent, err)
+	return err
 }
 
 // deleteBootstrapTask removes unaccepted demand after a local cancellation or
@@ -130,34 +158,26 @@ func (s *senderSession) notifyPeerCanceled(parent context.Context, cause error) 
 	}
 }
 
-func (s *senderSession) runRequestWorkers(ctx context.Context) error {
-	for {
-		workerCtx, stopWorker := context.WithDeadline(ctx, s.requestLanes.local.collectAt)
-		s.requestWorkerCancel = stopWorker
-		s.requestWorkerSwitched = false
-		requestWorker := worker.New(s.sender.eq,
-			worker.WithDoModify(s.handleRequestAck),
-			worker.WithMeterProvider[Envelope](s.sender.mp),
-		)
-		err := requestWorker.Run(workerCtx, worker.Watching(s.requestLanes.local.queue))
-		workerErr := workerCtx.Err()
-		stopWorker()
-		if err != nil {
-			return fmt.Errorf("request ACK worker: %w", err)
-		}
-		if s.requestCompleted || ctx.Err() != nil {
-			return nil
-		}
-		if errors.Is(workerErr, context.DeadlineExceeded) {
-			return errSenderQueueExpired
-		}
-		if !s.requestWorkerSwitched {
-			return fmt.Errorf("request ACK worker exited without completing or switching queues")
-		}
+// runRequestLane claims request ACKs, answering each with the next frame of
+// the request body.
+func (s *senderSession) runRequestLane(ctx context.Context) error {
+	_, err := runLane(ctx, s.sender.eq, s.sender.mp, s.claimant(), &s.requestLanes, noDocs[Envelope],
+		func(turns *laneTurns) worker.DoModifyRun[Envelope] {
+			return func(ctx context.Context, _ entroq.Reader, work *worker.Work[Envelope]) (*worker.Result, error) {
+				return s.handleRequestAck(ctx, turns, work)
+			}
+		})
+	if errors.Is(err, errLaneExpired) {
+		return errSenderQueueExpired
 	}
+	if err != nil {
+		return fmt.Errorf("request ACK worker: %w", err)
+	}
+	return nil
 }
 
-func (s *senderSession) handleRequestAck(ctx context.Context, task *entroq.Task, ack Envelope, _ []*entroq.Doc) (*worker.Result, error) {
+func (s *senderSession) handleRequestAck(ctx context.Context, turns *laneTurns, work *worker.Work[Envelope]) (*worker.Result, error) {
+	task, ack := work.Task, work.Value
 	if ack.Session != s.session {
 		return nil, worker.FatalErrorf("request ACK session mismatch: got %q, want %q", ack.Session, s.session)
 	}
@@ -169,10 +189,8 @@ func (s *senderSession) handleRequestAck(ctx context.Context, task *entroq.Task,
 		if ack.Error == "" || ack.ReplyQueue != "" {
 			return nil, worker.FatalErrorf("session %q received invalid terminal request ACK", s.session)
 		}
-		return worker.Modify(task.Delete()).OnSuccess(func(context.Context) error {
-			s.requestCompleted = true
-			s.source.body.Close()
-			s.requestWorkerCancel()
+		return turns.end(worker.Modify(task.Delete()), turnDone, func(context.Context) error {
+			s.source.release()
 			return nil
 		}), nil
 	}
@@ -244,46 +262,40 @@ func (s *senderSession) handleRequestAck(ctx context.Context, task *entroq.Task,
 			return worker.FatalErrorf("session %q request commit lost dependency after body read: %v", s.session, err)
 		})
 	}
-	return result.OnSuccess(func(context.Context) error {
-		if env.Final {
-			s.requestCompleted = true
-			s.requestWorkerCancel()
-		} else if localSwitched {
-			s.requestWorkerSwitched = true
-			s.requestWorkerCancel()
-		}
-		return nil
-	}), nil
-}
-
-func (s *senderSession) runResponseWorkers(ctx context.Context) error {
-	for {
-		workerCtx, stopWorker := context.WithDeadline(ctx, s.responseLanes.local.collectAt)
-		s.responseWorkerCancel = stopWorker
-		s.responseWorkerSwitched = false
-		responseWorker := worker.New(s.sender.eq,
-			worker.WithDoModify(s.handleResponse),
-			worker.WithMeterProvider[Response](s.sender.mp),
-		)
-		err := responseWorker.Run(workerCtx, worker.Watching(s.responseLanes.local.queue))
-		workerErr := workerCtx.Err()
-		stopWorker()
-		if err != nil {
-			return fmt.Errorf("response data worker: %w", err)
-		}
-		if s.responseCompleted || ctx.Err() != nil {
-			return nil
-		}
-		if errors.Is(workerErr, context.DeadlineExceeded) {
-			return errSenderQueueExpired
-		}
-		if !s.responseWorkerSwitched {
-			return fmt.Errorf("response data worker exited without completing or switching queues")
-		}
+	next := turnNext
+	switch {
+	case env.Final:
+		next = turnDone
+	case localSwitched:
+		next = turnRotated
 	}
+	return turns.end(result, next, nil), nil
 }
 
-func (s *senderSession) handleResponse(ctx context.Context, task *entroq.Task, resp Response, _ []*entroq.Doc) (*worker.Result, error) {
+// runResponseLane claims response frames, writing each to the caller and
+// answering it with an ACK. It returns a *sessionEnd once the response is
+// done, which ends the session.
+func (s *senderSession) runResponseLane(ctx context.Context) error {
+	done, err := runLane(ctx, s.sender.eq, s.sender.mp, s.claimant(), &s.responseLanes, noDocs[Response],
+		func(turns *laneTurns) worker.DoModifyRun[Response] {
+			return func(ctx context.Context, _ entroq.Reader, work *worker.Work[Response]) (*worker.Result, error) {
+				return s.handleResponse(ctx, turns, work)
+			}
+		})
+	if errors.Is(err, errLaneExpired) {
+		return errSenderQueueExpired
+	}
+	if err != nil {
+		return fmt.Errorf("response data worker: %w", err)
+	}
+	if done {
+		return &sessionEnd{err: s.responseErr}
+	}
+	return nil
+}
+
+func (s *senderSession) handleResponse(ctx context.Context, turns *laneTurns, work *worker.Work[Response]) (*worker.Result, error) {
+	task, resp := work.Task, work.Value
 	if resp.Session != s.session {
 		return nil, worker.FatalErrorf("response session mismatch: got %q, want %q", resp.Session, s.session)
 	}
@@ -335,13 +347,10 @@ func (s *senderSession) handleResponse(ctx context.Context, task *entroq.Task, r
 					Error:   err.Error(),
 				}})))
 			}
-			return worker.Modify(mods...).OnDependency(func(_ context.Context, depErr *entroq.DependencyError) error {
+			result := worker.Modify(mods...).OnDependency(func(_ context.Context, depErr *entroq.DependencyError) error {
 				return worker.FatalErrorf("session %q response failure commit lost dependency: %v", s.session, depErr)
-			}).OnSuccess(func(context.Context) error {
-				s.responseCompleted = true
-				s.cancel(err)
-				return nil
-			}), nil
+			})
+			return turns.end(result, turnDone, nil), nil
 		}
 	}
 	if resp.Final {
@@ -379,22 +388,20 @@ func (s *senderSession) handleResponse(ctx context.Context, task *entroq.Task, r
 	result := worker.Modify(mods...).OnDependency(func(_ context.Context, err *entroq.DependencyError) error {
 		return worker.FatalErrorf("session %q response commit lost dependency after socket write: %v", s.session, err)
 	})
-	return result.OnSuccess(func(context.Context) error {
-		if resp.Final {
-			s.responseCompleted = true
-			if s.sender.auditLog != nil {
-				s.sender.auditLog.LogAttrs(ctx, slog.LevelInfo, "response_received",
-					slog.String("response_queue", s.responseLanes.local.queue),
-					slog.Int("status_code", s.responseStatus),
-					slog.Float64("duration_s", time.Since(s.startedAt).Seconds()),
-				)
-			}
-			s.cancel(s.responseErr)
-			return nil
-		}
+	if !resp.Final {
+		next := turnNext
 		if localSwitched {
-			s.responseWorkerSwitched = true
-			s.responseWorkerCancel()
+			next = turnRotated
+		}
+		return turns.end(result, next, nil), nil
+	}
+	return turns.end(result, turnDone, func(context.Context) error {
+		if s.sender.auditLog != nil {
+			s.sender.auditLog.LogAttrs(ctx, slog.LevelInfo, "response_received",
+				slog.String("response_queue", s.responseLanes.local.queue),
+				slog.Int("status_code", s.responseStatus),
+				slog.Float64("duration_s", time.Since(s.startedAt).Seconds()),
+			)
 		}
 		return nil
 	}), nil

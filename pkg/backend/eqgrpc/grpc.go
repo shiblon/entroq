@@ -10,9 +10,9 @@
 // You can start, for example, a postgres-backed QSvc like this (or just use pg/svc):
 //
 //	ctx := context.Background()
-//	svc, err := eqsvcgrpc.New(ctx, pg.Opener(dbHostPort)) // Other options available, too.
+//	svc, err := eqsvcgrpc.New(ctx, eqpg.Opener(dbHostPort)) // Other options available, too.
 //	if err != nil {
-//		log.Fatalf("Can't open PG backend: %v",e rr)
+//		log.Fatalf("Can't open PG backend: %v", err)
 //	}
 //	defer svc.Close()
 //
@@ -21,7 +21,7 @@
 //		log.Fatalf("Can't start this service")
 //	}
 //
-//	s := eqgrpc.NewServer()
+//	s := grpc.NewServer(eqgrpc.ServerKeepalive())
 //	pb.RegisterEntroQServer(s, svc)
 //	s.Serve(lis)
 //
@@ -41,15 +41,21 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
+	"slices"
+	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/authz"
 	"github.com/shiblon/entroq/pkg/pbconv"
+	"github.com/shiblon/entroq/pkg/version"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/shiblon/entroq/api"
@@ -113,9 +119,26 @@ func WithNiladicDialer(f func() (net.Conn, error)) Option {
 	}))
 }
 
+// ServerKeepalive is the server option that accepts this client's keepalive
+// pings while an RPC such as Claim is open. The grpc-go server default refuses
+// pings more often than every five minutes and closes the connection on the
+// third, failing any claim that waits longer than a few pings. Every server
+// for EntroQ clients needs it:
+//
+//	s := grpc.NewServer(eqgrpc.ServerKeepalive())
+func ServerKeepalive() grpc.ServerOption {
+	return grpc.KeepaliveEnforcementPolicy(serverKeepalivePolicy())
+}
+
+// serverKeepalivePolicy accepts pings as often as DefaultKeepaliveTime, but
+// only while an RPC is open, as the client only sends them then.
+func serverKeepalivePolicy() keepalive.EnforcementPolicy {
+	return keepalive.EnforcementPolicy{MinTime: DefaultKeepaliveTime}
+}
+
 // WithMaxSize is a convenience method for setting
 // WithDialOptions(grpc.WithDefaultCallOptions(grpc.MaxCallRecvSize(...), grpc.MaxCallSendSize(...))).
-// Default is 4MB.
+// By default the client limits neither, leaving the server's limits to govern.
 func WithMaxSize(maxMB int) Option {
 	return WithDialOpts(grpc.WithDefaultCallOptions(
 		grpc.MaxCallRecvMsgSize(maxMB*MB),
@@ -177,11 +200,17 @@ func Opener(addr string, opts ...Option) entroq.BackendOpener {
 		// stays false, so pings go only while an RPC such as Claim is active. Servers
 		// must accept DefaultKeepaliveTime; the official server does. Prepended so a
 		// caller's WithDialOpts can override it.
+		//
+		// Responses are not size-limited by default: the server's send limit
+		// (--max_size_mb) already bounds them, and gRPC's 4MB client default
+		// would reject responses the server is configured to send. WithMaxSize
+		// sets a limit.
 		dialOpts := append([]grpc.DialOption{
 			grpc.WithKeepaliveParams(keepalive.ClientParameters{
 				Time:    DefaultKeepaliveTime,
 				Timeout: DefaultKeepaliveTimeout,
 			}),
+			grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(math.MaxInt32)),
 		}, options.dialOpts...)
 		conn, err := grpc.DialContext(ctx, addr, dialOpts...)
 		if err != nil {
@@ -212,6 +241,94 @@ func closeFailedConnection(conn *grpc.ClientConn, openErr error) error {
 
 type backend struct {
 	conn *grpc.ClientConn
+	// protocol is the protocol this client chose with the server: 0 until a
+	// response has said which the server serves.
+	protocol atomic.Int32
+}
+
+// client returns a gRPC client whose calls negotiate the protocol with the
+// server.
+func (b *backend) client() pb.EntroQClient {
+	return pb.NewEntroQClient(listeningConn{b.conn, b})
+}
+
+// listeningConn refuses a server that does not serve this client's protocol,
+// before making any call to it, and declares the protocol on every call.
+type listeningConn struct {
+	*grpc.ClientConn
+	b *backend
+}
+
+// Invoke makes a unary call to a server that serves this client's protocol,
+// declaring it, and notes a server that stops serving it.
+func (c listeningConn) Invoke(ctx context.Context, method string, args, reply any, opts ...grpc.CallOption) error {
+	if err := c.b.checkServer(ctx); err != nil {
+		return err
+	}
+	var md metadata.MD
+	err := c.ClientConn.Invoke(declare(ctx), method, args, reply, append(opts, grpc.Header(&md))...)
+	if md.Len() > 0 && !slices.Contains(servedOf(md), version.Protocol) {
+		c.b.protocol.Store(0) // ask again before the next call
+	}
+	return err
+}
+
+// NewStream opens a stream to a server that serves this client's protocol,
+// declaring it.
+func (c listeningConn) NewStream(ctx context.Context, desc *grpc.StreamDesc, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+	if err := c.b.checkServer(ctx); err != nil {
+		return nil, err
+	}
+	return c.ClientConn.NewStream(declare(ctx), desc, method, opts...)
+}
+
+// declare adds this client's protocol to a call's request headers.
+func declare(ctx context.Context) context.Context {
+	return metadata.AppendToOutgoingContext(ctx, version.ProtocolHeader, strconv.Itoa(version.Protocol))
+}
+
+// servedOf reads the protocols a server serves from its response headers; a
+// server that sends none serves only protocol 1.
+func servedOf(md metadata.MD) []int32 {
+	vals := md.Get(version.ProtocolHeader)
+	if len(vals) == 0 {
+		return []int32{1}
+	}
+	ps, err := version.ParseProtocols(vals[0])
+	if err != nil {
+		return []int32{1}
+	}
+	return ps
+}
+
+// checkServer refuses a server that does not serve this client's protocol,
+// asking it with a Time call if no response has said yet. A client speaks
+// one protocol and never falls back to another: the server lists what it
+// serves, and upgrading means moving that list.
+func (b *backend) checkServer(ctx context.Context) error {
+	if b.protocol.Load() != 0 {
+		return nil
+	}
+	var md metadata.MD
+	// Ask on the bare connection: this is the check the others wait on.
+	if _, err := pb.NewEntroQClient(b.conn).Time(declare(ctx), new(pb.TimeRequest), grpc.Header(&md)); err != nil {
+		if status.Code(err) != codes.Unimplemented {
+			return fmt.Errorf("grpc server protocol: %w", unpackGRPCError(err))
+		}
+		// A server that does not serve the protocol the probe declared
+		// refuses it, and still says what it serves.
+	}
+	served := servedOf(md)
+	if slices.Contains(served, version.Protocol) {
+		b.protocol.Store(version.Protocol)
+		return nil
+	}
+	upgrade := "this client"
+	if slices.Max(served) < version.Protocol {
+		upgrade = "the server"
+	}
+	return entroq.Unsupportedf("grpc: the EntroQ server serves protocols %s, and this client speaks protocol %d: upgrade %s",
+		version.FormatProtocols(served), version.Protocol, upgrade)
 }
 
 // New creates a new gRPC backend that attaches to the task service via gRPC.
@@ -232,7 +349,7 @@ func (b *backend) Close() error {
 
 // Queues produces a mapping from queue names to queue sizes.
 func (b *backend) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[string]int, error) {
-	resp, err := pb.NewEntroQClient(b.conn).Queues(ctx, &pb.QueuesRequest{
+	resp, err := b.client().Queues(ctx, &pb.QueuesRequest{
 		MatchPrefix: qq.MatchPrefix,
 		MatchExact:  qq.MatchExact,
 		Limit:       int32(qq.Limit),
@@ -249,7 +366,7 @@ func (b *backend) Queues(ctx context.Context, qq *entroq.QueuesQuery) (map[strin
 
 // QueueStats maps queue names to stats for those queues.
 func (b *backend) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[string]*entroq.QueueStat, error) {
-	resp, err := pb.NewEntroQClient(b.conn).QueueStats(ctx, &pb.QueuesRequest{
+	resp, err := b.client().QueueStats(ctx, &pb.QueuesRequest{
 		MatchPrefix: qq.MatchPrefix,
 		MatchExact:  qq.MatchExact,
 		Limit:       int32(qq.Limit),
@@ -273,7 +390,7 @@ func (b *backend) QueueStats(ctx context.Context, qq *entroq.QueuesQuery) (map[s
 
 // Tasks produces a list of tasks in a given queue, possibly limited by claimant.
 func (b *backend) Tasks(ctx context.Context, tq *entroq.TasksQuery) ([]*entroq.Task, error) {
-	stream, err := pb.NewEntroQClient(b.conn).StreamTasks(ctx, &pb.TasksRequest{
+	stream, err := b.client().StreamTasks(ctx, &pb.TasksRequest{
 		ClaimantId: tq.Claimant,
 		TaskId:     tq.IDs,
 		Queue:      tq.Queue,
@@ -316,7 +433,7 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 	// residual two-generals case (a committed claim whose response never arrives)
 	// is a bounded latency cost, not a correctness one: the task self-heals when
 	// its claim duration expires and can be claimed again.
-	resp, err := pb.NewEntroQClient(b.conn).Claim(ctx, &pb.ClaimRequest{
+	resp, err := b.client().Claim(ctx, &pb.ClaimRequest{
 		ClaimantId: cq.Claimant,
 		Queues:     cq.Queues,
 		DurationMs: int64(cq.Duration / time.Millisecond),
@@ -337,7 +454,7 @@ func (b *backend) Claim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Tas
 // TryClaim attempts to claim a task from the queue. Normally returns both a
 // nil task and nil error if nothing is ready.
 func (b *backend) TryClaim(ctx context.Context, cq *entroq.ClaimQuery) (*entroq.Task, error) {
-	resp, err := pb.NewEntroQClient(b.conn).TryClaim(ctx, &pb.ClaimRequest{
+	resp, err := b.client().TryClaim(ctx, &pb.ClaimRequest{
 		ClaimantId: cq.Claimant,
 		Queues:     cq.Queues,
 		DurationMs: int64(cq.Duration / time.Millisecond),
@@ -400,11 +517,27 @@ func depErrorFromStat(stat *status.Status) error {
 			continue
 		}
 
+		// Doc set dependency: a DocID naming a set by key failed as a whole.
+		if key := detail.GetDocId().GetKey(); key != "" {
+			ref := entroq.NewDocSetRef(detail.DocId.GetNamespace(), key, detail.DocId.GetVersion())
+			switch detail.Type {
+			case pb.ActionType_CLAIM:
+				depErr.DocClaims = append(depErr.DocClaims, ref)
+			case pb.ActionType_CHANGE:
+				depErr.DocArrives = append(depErr.DocArrives, ref)
+			case pb.ActionType_DEPEND:
+				depErr.DocDepends = append(depErr.DocDepends, ref)
+			default:
+				return fmt.Errorf("grpc doc set dependency unknown type %v in detail %v", detail.Type, detail)
+			}
+			continue
+		}
+
 		// Doc dependency: doc_id is set, id is nil.
 		if detail.DocId != nil {
 			did := &entroq.DocID{
 				Namespace: detail.DocId.Namespace,
-				ID:        detail.DocId.Id,
+				ID:        detail.DocId.GetId(),
 				Version:   detail.DocId.Version,
 			}
 			switch detail.Type {
@@ -462,6 +595,8 @@ func unpackGRPCError(grpcErr error) error {
 		return authzErrFromStat(stat)
 	case codes.InvalidArgument:
 		return entroq.InvalidArgumentf("%s", stat.Message())
+	case codes.Unimplemented:
+		return entroq.Unsupportedf("%s", stat.Message())
 	case codes.Unavailable:
 		// The server is unreachable (down, restarting, or being relocated).
 		// Translate to entroq's transient-unavailable error so callers can retry
@@ -474,8 +609,55 @@ func unpackGRPCError(grpcErr error) error {
 
 // Modify modifies the task system with the given batch of modifications.
 func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (*entroq.ModifyResponse, error) {
+	req, err := b.modifyRequest(mod)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := b.client().Modify(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("grpc modify: %w", unpackGRPCError(err))
+	}
+
+	mResp := new(entroq.ModifyResponse)
+	for _, t := range resp.GetInserted() {
+		task, err := pbconv.TaskFromProto(t)
+		if err != nil {
+			return nil, fmt.Errorf("grpc modify task proto: %w", err)
+		}
+		mResp.InsertedTasks = append(mResp.InsertedTasks, task)
+	}
+	for _, t := range resp.GetChanged() {
+		task, err := pbconv.TaskFromProto(t)
+		if err != nil {
+			return nil, fmt.Errorf("grpc modify changed: %w", err)
+		}
+		mResp.ChangedTasks = append(mResp.ChangedTasks, task)
+	}
+	for _, d := range resp.GetInsertedDocs() {
+		mResp.InsertedDocs = append(mResp.InsertedDocs, pbconv.MustDocFromProto(d))
+	}
+	for _, d := range resp.GetChangedDocs() {
+		// A doc set whose lease changed comes back as a Doc with no ID.
+		if pbconv.IsDocSet(d) {
+			mResp.ChangedSets = append(mResp.ChangedSets, pbconv.DocSetFromProto(d, nil))
+			continue
+		}
+		mResp.ChangedDocs = append(mResp.ChangedDocs, pbconv.MustDocFromProto(d))
+	}
+
+	return mResp, nil
+}
+
+// modifyRequest builds the wire request for mod.
+func (b *backend) modifyRequest(mod *entroq.Modification) (*pb.ModifyRequest, error) {
 	req := &pb.ModifyRequest{
 		ClaimantId: mod.Claimant,
+	}
+	for _, a := range mod.Arrives {
+		req.Changes = append(req.Changes, pbconv.TaskArrivalToProto(a))
+	}
+	for _, a := range mod.DocArrives {
+		req.DocChanges = append(req.DocChanges, pbconv.DocArrivalToProto(a))
 	}
 	for _, ins := range mod.Inserts {
 		pd, err := pbconv.TaskDataToProto(ins)
@@ -485,7 +667,7 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (*entroq
 		req.Inserts = append(req.Inserts, pd)
 	}
 	for _, task := range mod.Changes {
-		pc, err := pbconv.TaskChangeToProto(task)
+		pc, err := pbconv.TaskChangeToProto(task, mod.ResetsClaims(task.ID))
 		if err != nil {
 			return nil, fmt.Errorf("grpc modify change value: %w", err)
 		}
@@ -511,10 +693,14 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (*entroq
 		if err != nil {
 			return nil, fmt.Errorf("doc insert value: %w", err)
 		}
+		// The arrival goes out as by_ms alone: at_ms is read from a protocol-1
+		// client and never written, so no arrival this client asks for depends
+		// on the offset between its clock and the server's, nor on how long
+		// the request takes to arrive.
 		req.DocInserts = append(req.DocInserts, &pb.DocData{
 			Namespace:    di.Namespace,
 			Id:           di.ID,
-			AtMs:         pbconv.ToMS(di.At),
+			ByMs:         di.By().Milliseconds(),
 			Key:          di.Key,
 			SecondaryKey: di.SecondaryKey,
 			Content:      val,
@@ -528,63 +714,29 @@ func (b *backend) Modify(ctx context.Context, mod *entroq.Modification) (*entroq
 			return nil, fmt.Errorf("doc change value: %w", err)
 		}
 		req.DocChanges = append(req.DocChanges, &pb.DocChange{
-			OldId: &pb.DocID{Namespace: dc.Namespace, Id: dc.ID, Version: dc.Version},
+			OldId: pbconv.DocIDToProto(dc.Namespace, dc.ID, dc.Version),
 			NewData: &pb.DocData{
 				Key:          dc.Key,
 				SecondaryKey: dc.SecondaryKey,
 				Content:      val,
-				AtMs:         pbconv.ToMS(dc.At),
+				ByMs:         dc.By().Milliseconds(),
 			},
 		})
 	}
 	for _, dd := range mod.DocDeletes {
-		req.DocDeletes = append(req.DocDeletes, &pb.DocID{
-			Namespace: dd.Namespace,
-			Id:        dd.ID,
-			Version:   dd.Version,
-		})
+		req.DocDeletes = append(req.DocDeletes, pbconv.DocIDToProto(dd.Namespace, dd.ID, dd.Version))
 	}
 	for _, ddep := range mod.DocDepends {
-		req.DocDepends = append(req.DocDepends, &pb.DocID{
-			Namespace: ddep.Namespace,
-			Id:        ddep.ID,
-			Version:   ddep.Version,
-		})
+		// DocRefToProto, not DocIDToProto: a depend may watch a whole set by
+		// key, and naming that by ID would send an empty one.
+		req.DocDepends = append(req.DocDepends, pbconv.DocRefToProto(ddep))
 	}
-
-	resp, err := pb.NewEntroQClient(b.conn).Modify(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("grpc modify: %w", unpackGRPCError(err))
-	}
-
-	mResp := new(entroq.ModifyResponse)
-	for _, t := range resp.GetInserted() {
-		task, err := pbconv.TaskFromProto(t)
-		if err != nil {
-			return nil, fmt.Errorf("grpc modify task proto: %w", err)
-		}
-		mResp.InsertedTasks = append(mResp.InsertedTasks, task)
-	}
-	for _, t := range resp.GetChanged() {
-		task, err := pbconv.TaskFromProto(t)
-		if err != nil {
-			return nil, fmt.Errorf("grpc modify changed: %w", err)
-		}
-		mResp.ChangedTasks = append(mResp.ChangedTasks, task)
-	}
-	for _, d := range resp.GetInsertedDocs() {
-		mResp.InsertedDocs = append(mResp.InsertedDocs, pbconv.MustDocFromProto(d))
-	}
-	for _, d := range resp.GetChangedDocs() {
-		mResp.ChangedDocs = append(mResp.ChangedDocs, pbconv.MustDocFromProto(d))
-	}
-
-	return mResp, nil
+	return req, nil
 }
 
 // Time returns the time as reported by the server.
 func (b *backend) Time(ctx context.Context) (time.Time, error) {
-	resp, err := pb.NewEntroQClient(b.conn).Time(ctx, new(pb.TimeRequest))
+	resp, err := b.client().Time(ctx, new(pb.TimeRequest))
 	if err != nil {
 		return time.Time{}, fmt.Errorf("grpc time: %w", unpackGRPCError(err))
 	}

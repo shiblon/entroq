@@ -41,11 +41,11 @@ func GCCollectsInLoop(ctx context.Context, t *testing.T, client *entroq.EntroQ, 
 	}
 }
 
-// GCDocGroups verifies the doc-GC policy and safety boundaries: a namespace
-// opts in as a whole, each primary-key group is collected independently, and a
-// live lease protects only its complete group. A marker on a primary key alone
+// GCDocSets verifies the doc-GC policy and safety boundaries: a namespace
+// opts in as a whole, each primary-key set is collected independently, and a
+// live lease protects only its complete set. A marker on a primary key alone
 // does not opt an ordinary namespace into GC.
-func GCDocGroups(ctx context.Context, t *testing.T, backend entroq.Backend, collect func(context.Context, int) (int, error), prefix string) {
+func GCDocSets(ctx context.Context, t *testing.T, backend entroq.Backend, collect func(context.Context, int) (int, error), prefix string) {
 	t.Helper()
 	activation := time.Now().Add(2 * time.Second)
 	ns := path.Join(prefix, "g", "sess=t;gc="+strconv.FormatInt(activation.Unix(), 10))
@@ -53,7 +53,6 @@ func GCDocGroups(ctx context.Context, t *testing.T, backend entroq.Backend, coll
 	unclaimedKey := "unclaimed"
 	ordinaryNS := path.Join(prefix, "doc-gc-unmarked")
 	markedKey := path.Join(prefix, "legacy", "gc=0")
-	past := time.Now().Add(-time.Hour)
 
 	if _, err := backend.Modify(ctx, entroq.NewModification("",
 		entroq.PuttingDocInto(ns, entroq.WithIDKeys(entroq.GenHex16(), claimedKey, "a")),
@@ -61,54 +60,51 @@ func GCDocGroups(ctx context.Context, t *testing.T, backend entroq.Backend, coll
 		entroq.PuttingDocInto(ns, entroq.WithIDKeys(entroq.GenHex16(), unclaimedKey, "a")),
 		entroq.PuttingDocInto(ordinaryNS, entroq.WithIDKeys(entroq.GenHex16(), markedKey, "a")),
 	)); err != nil {
-		t.Fatalf("GCDocGroups: insert: %v", err)
+		t.Fatalf("GCDocSets: insert: %v", err)
 	}
-	claimed, err := backend.ClaimDocs(ctx, &entroq.DocClaim{
-		Namespace: ns,
-		Key:       claimedKey,
-		Claimant:  "doc-gc-test",
-		Duration:  time.Hour,
-	})
+	claimed, err := docsOf(backend.ClaimDocs(ctx, entroq.NewDocClaim(entroq.ClaimKey(ns, claimedKey), entroq.ClaimingSetsAs("doc-gc-test"), entroq.ClaimingSetsFor(time.Hour))))
 	if err != nil {
-		t.Fatalf("GCDocGroups: claim: %v", err)
+		t.Fatalf("GCDocSets: claim: %v", err)
 	}
 	if len(claimed) != 2 {
-		t.Fatalf("GCDocGroups: claimed %d docs, want 2", len(claimed))
+		t.Fatalf("GCDocSets: claimed %d docs, want 2", len(claimed))
 	}
 	if wait := time.Until(activation); wait > 0 {
 		timer := time.NewTimer(wait)
 		defer timer.Stop()
 		select {
 		case <-ctx.Done():
-			t.Fatalf("GCDocGroups: wait for activation: %v", ctx.Err())
+			t.Fatalf("GCDocSets: wait for activation: %v", ctx.Err())
 		case <-timer.C:
 		}
 	}
 
 	if _, err := collect(ctx, 10000); err != nil {
-		t.Fatalf("GCDocGroups: collect claimed group: %v", err)
+		t.Fatalf("GCDocSets: collect claimed set: %v", err)
 	}
 	if docs, err := backend.Docs(ctx, &entroq.DocQuery{Namespace: ns, KeyExact: claimedKey}); err != nil || len(docs) != 2 {
-		t.Fatalf("GCDocGroups: claimed group changed: len=%d err=%v", len(docs), err)
+		t.Fatalf("GCDocSets: claimed set changed: len=%d err=%v", len(docs), err)
 	}
 	if docs, err := backend.Docs(ctx, &entroq.DocQuery{Namespace: ns, KeyExact: unclaimedKey}); err != nil || len(docs) != 0 {
-		t.Fatalf("GCDocGroups: unclaimed sibling remains: len=%d err=%v", len(docs), err)
+		t.Fatalf("GCDocSets: unclaimed sibling remains: len=%d err=%v", len(docs), err)
 	}
 	if docs, err := backend.Docs(ctx, &entroq.DocQuery{Namespace: ordinaryNS, KeyExact: markedKey}); err != nil || len(docs) != 1 {
-		t.Fatalf("GCDocGroups: primary-key marker opted in ordinary namespace: len=%d err=%v", len(docs), err)
+		t.Fatalf("GCDocSets: primary-key marker opted in ordinary namespace: len=%d err=%v", len(docs), err)
 	}
 
 	args := make([]entroq.ModifyArg, 0, len(claimed))
 	for _, doc := range claimed {
-		args = append(args, doc.Change(entroq.WithDocArrivalTime(past)))
+		// An arrival of zero releases the set, which is what a past instant
+		// used to mean here and now says outright.
+		args = append(args, doc.Change(entroq.WithDocArrivalTimeBy(0)))
 	}
 	if _, err := backend.Modify(ctx, entroq.NewModification("doc-gc-test", args...)); err != nil {
-		t.Fatalf("GCDocGroups: release: %v", err)
+		t.Fatalf("GCDocSets: release: %v", err)
 	}
 	if _, err := collect(ctx, 10000); err != nil {
-		t.Fatalf("GCDocGroups: collect released group: %v", err)
+		t.Fatalf("GCDocSets: collect released set: %v", err)
 	}
 	if docs, err := backend.Docs(ctx, &entroq.DocQuery{Namespace: ns, KeyExact: claimedKey}); err != nil || len(docs) != 0 {
-		t.Fatalf("GCDocGroups: released group remains: len=%d err=%v", len(docs), err)
+		t.Fatalf("GCDocSets: released set remains: len=%d err=%v", len(docs), err)
 	}
 }

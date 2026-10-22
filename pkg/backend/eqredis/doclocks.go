@@ -1,0 +1,358 @@
+package eqredis
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strconv"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/backend/internal/docset"
+)
+
+// lockKey is the hash holding a doc set's lock: the only version, claimant,
+// and arrival time its members have. A set can be claimed before it has
+// docs, so the lock is kept apart from them. The key is last, after the
+// escaped namespace, as in docKey.
+func lockKey(g docset.Set) string {
+	return keyPrefix + "dl:" + docKeyEscaper.Replace(g.Namespace) + "/" + g.Key
+}
+
+// lockIndexKey is the set of primary keys in a namespace that have a lock.
+func lockIndexKey(ns string) string {
+	return keyPrefix + "dlidx:" + ns
+}
+
+// heldGroupsKey is the sorted set of primary keys in a namespace whose set
+// is claimed, scored by when the claim ends.
+func heldGroupsKey(ns string) string {
+	return keyPrefix + "dlheld:" + ns
+}
+
+// docLocksMigratedKey marks a database whose doc sets all have locks.
+const docLocksMigratedKey = keyPrefix + "migrated:doclocks"
+
+// docFieldsMigratedKey marks a database whose doc hashes no longer hold their
+// own version, claimant, and arrival time. It is separate from
+// docLocksMigratedKey because development builds set that marker while still
+// writing the fields.
+const docFieldsMigratedKey = keyPrefix + "migrated:docfields"
+
+// setMembersRange bounds a set's entries in the namespace doc index, which
+// continue with docIndexSep after the primary key.
+func setMembersRange(key string) (min, max string) {
+	return "[" + key + docIndexSep, "(" + key + "\x01"
+}
+
+// occupantRange bounds the single index entry a doc would have at this place in
+// its set. Index members are "{primary}{sep}{secondary}{sep}{id}", so bounding
+// the complete "{primary}{sep}{secondary}{sep}" prefix matches every id at that
+// pair -- of which a map allows at most one.
+func occupantRange(key, secondary string) (min, max string) {
+	prefix := key + docIndexSep + secondary + docIndexSep
+	return "[" + prefix, "(" + key + docIndexSep + secondary + "\x01"
+}
+
+func parseLock(vals map[string]string) (docset.Lock, error) {
+	if len(vals) == 0 {
+		return docset.Absent, nil
+	}
+	version, err := strconv.ParseInt(vals["version"], 10, 32)
+	if err != nil {
+		return docset.Lock{}, fmt.Errorf("parse doc lock version: %w", err)
+	}
+	at, err := strconv.ParseInt(vals["at"], 10, 64)
+	if err != nil {
+		return docset.Lock{}, fmt.Errorf("parse doc lock at: %w", err)
+	}
+	return docset.Lock{Stored: true, Version: int32(version), Claimant: vals["claimant"], At: time.UnixMilli(at).UTC()}, nil
+}
+
+// readLocks reads the locks of sets; a set with none maps to
+// docset.Absent. A lock's doc count is not stored but counted from the
+// namespace doc index, which costs a logarithmic lookup and cannot drift from
+// the docs.
+func readLocks(ctx context.Context, c redis.Cmdable, sets []docset.Set) (map[docset.Set]docset.Lock, error) {
+	locks := make(map[docset.Set]docset.Lock, len(sets))
+	if len(sets) == 0 {
+		return locks, nil
+	}
+	pipe := c.Pipeline()
+	cmds := make([]*redis.MapStringStringCmd, len(sets))
+	counts := make([]*redis.IntCmd, len(sets))
+	for i, g := range sets {
+		cmds[i] = pipe.HGetAll(ctx, lockKey(g))
+		min, max := setMembersRange(g.Key)
+		counts[i] = pipe.ZLexCount(ctx, docNSIndexKey(g.Namespace), min, max)
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("read doc locks: %w", err)
+	}
+	for i, g := range sets {
+		l, err := parseLock(cmds[i].Val())
+		if err != nil {
+			return nil, err
+		}
+		l.NumDocs = int(counts[i].Val())
+		locks[g] = l
+	}
+	return locks, nil
+}
+
+// writeLock queues writing g's lock and its bookkeeping in pipe.
+func writeLock(ctx context.Context, pipe redis.Pipeliner, g docset.Set, l docset.Lock, now time.Time) {
+	pipe.HSet(ctx, lockKey(g), map[string]any{
+		"version":  strconv.FormatInt(int64(l.Version), 10),
+		"claimant": l.Claimant,
+		"at":       strconv.FormatInt(l.At.UnixMilli(), 10),
+	})
+	pipe.SAdd(ctx, lockIndexKey(g.Namespace), g.Key)
+	pipe.SAdd(ctx, namespacesKey, g.Namespace)
+	if l.Held(now) {
+		pipe.ZAdd(ctx, heldGroupsKey(g.Namespace), redis.Z{Score: float64(l.At.UnixMilli()), Member: g.Key})
+	} else {
+		pipe.ZRem(ctx, heldGroupsKey(g.Namespace), g.Key)
+	}
+}
+
+// occupantKey indexes a doc by the place it holds in its set.
+func occupantKey(ns, key, secondary string) string {
+	return ns + docIndexSep + key + docIndexSep + secondary
+}
+
+// readOccupants reads the docs already holding the secondary keys mod's inserts
+// want. A set is a map from secondary key to doc, so an insert onto an occupied
+// secondary key is a collision; see docset.Evaluate.
+//
+// Only inserts need this: keys are immutable after creation, so nothing else can
+// move a doc onto an occupied key. One ZRANGEBYLEX per insert finds the single
+// index entry that pair can have, and the ids found are read in one pipeline.
+func readOccupants(ctx context.Context, c redis.Cmdable, mod *entroq.Modification) (map[string]*entroq.Doc, error) {
+	occupants := make(map[string]*entroq.Doc, len(mod.DocInserts))
+	if len(mod.DocInserts) == 0 {
+		return occupants, nil
+	}
+	pipe := c.Pipeline()
+	ranges := make([]*redis.StringSliceCmd, len(mod.DocInserts))
+	for i, ins := range mod.DocInserts {
+		min, max := occupantRange(ins.Key, ins.SecondaryKey)
+		ranges[i] = pipe.ZRangeArgs(ctx, redis.ZRangeArgs{
+			Key: docNSIndexKey(ins.Namespace), Start: min, Stop: max, ByLex: true})
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("find doc occupants: %w", err)
+	}
+	type want struct{ ns, id string }
+	var wants []want
+	for i, cmd := range ranges {
+		members, err := cmd.Result()
+		if err != nil && !errors.Is(err, redis.Nil) {
+			return nil, fmt.Errorf("find doc occupants: %w", err)
+		}
+		for _, m := range members {
+			_, _, id := parseDocIndexMember(m)
+			wants = append(wants, want{mod.DocInserts[i].Namespace, id})
+		}
+	}
+	if len(wants) == 0 {
+		return occupants, nil
+	}
+	read := c.Pipeline()
+	cmds := make([]*redis.MapStringStringCmd, len(wants))
+	for i, w := range wants {
+		cmds[i] = read.HGetAll(ctx, docKey(w.ns, w.id))
+	}
+	if _, err := read.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("read doc occupants: %w", err)
+	}
+	for _, cmd := range cmds {
+		vals, err := cmd.Result()
+		if err != nil || len(vals) == 0 {
+			continue
+		}
+		f, err := parseDocFields(vals)
+		if err != nil {
+			return nil, fmt.Errorf("parse doc occupant: %w", err)
+		}
+		occupants[occupantKey(f.Namespace, f.KeyPrimary, f.KeySecondary)] = f.toDoc()
+	}
+	return occupants, nil
+}
+
+// setMembers reads the docs of the set g.
+func setMembers(ctx context.Context, c redis.Cmdable, g docset.Set) ([]*entroq.Doc, error) {
+	min, max := setMembersRange(g.Key)
+	members, err := c.ZRangeArgs(ctx, redis.ZRangeArgs{Key: docNSIndexKey(g.Namespace), Start: min, Stop: max, ByLex: true}).Result()
+	if err != nil {
+		return nil, fmt.Errorf("list doc set members: %w", err)
+	}
+	if len(members) == 0 {
+		return nil, nil
+	}
+	pipe := c.Pipeline()
+	cmds := make([]*redis.MapStringStringCmd, len(members))
+	for i, m := range members {
+		_, _, id := parseDocIndexMember(m)
+		cmds[i] = pipe.HGetAll(ctx, docKey(g.Namespace, id))
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("read doc set members: %w", err)
+	}
+	var docs []*entroq.Doc
+	for _, cmd := range cmds {
+		vals := cmd.Val()
+		if len(vals) == 0 {
+			continue
+		}
+		f, err := parseDocFields(vals)
+		if err != nil {
+			return nil, err
+		}
+		docs = append(docs, f.toDoc())
+	}
+	return docs, nil
+}
+
+// migrateDocLocks gives every doc set a lock, once per database. Before doc
+// sets had locks each doc carried its own version and claim; a set's lock
+// starts one version past its highest member, so any version read before the
+// migration is stale. Claims held at migration time are released, and the old
+// per-doc claim sets are removed.
+func migrateDocLocks(ctx context.Context, client *redis.Client) error {
+	done, err := client.Exists(ctx, docLocksMigratedKey).Result()
+	if err != nil {
+		return fmt.Errorf("check doc lock migration: %w", err)
+	}
+	if done == 1 {
+		return nil
+	}
+	namespaces, err := client.SMembers(ctx, namespacesKey).Result()
+	if err != nil {
+		return fmt.Errorf("list namespaces: %w", err)
+	}
+	now := time.Now().UTC()
+	for _, ns := range namespaces {
+		members, err := client.ZRange(ctx, docNSIndexKey(ns), 0, -1).Result()
+		if err != nil {
+			return fmt.Errorf("list docs in %q: %w", ns, err)
+		}
+		highest := make(map[string]int32)
+		for _, m := range members {
+			key, _, id := parseDocIndexMember(m)
+			v, err := client.HGet(ctx, docKey(ns, id), "version").Int()
+			if errors.Is(err, redis.Nil) {
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("read version of doc %q in %q: %w", id, ns, err)
+			}
+			if cur, ok := highest[key]; !ok || int32(v) > cur {
+				highest[key] = int32(v)
+			}
+		}
+		pipe := client.TxPipeline()
+		for key, v := range highest {
+			g := docset.Set{Namespace: ns, Key: key}
+			if n, err := client.Exists(ctx, lockKey(g)).Result(); err != nil {
+				return fmt.Errorf("check lock of %q in %q: %w", key, ns, err)
+			} else if n == 1 {
+				continue
+			}
+			writeLock(ctx, pipe, g, docset.Lock{Stored: true, Version: v + 1, At: now}, now)
+		}
+		pipe.Del(ctx, nsclaimedKey(ns))
+		if _, err := pipe.Exec(ctx); err != nil {
+			return fmt.Errorf("create doc locks in %q: %w", ns, err)
+		}
+	}
+	if err := client.Set(ctx, docLocksMigratedKey, "1", 0).Err(); err != nil {
+		return fmt.Errorf("mark doc lock migration: %w", err)
+	}
+	return nil
+}
+
+// migrateDocFields removes the version, claimant, and arrival time from every
+// doc hash, once per database, after migrateDocLocks has read them into set
+// locks. Reads replace them with the lock's, so the fields only cost memory.
+func migrateDocFields(ctx context.Context, client *redis.Client) error {
+	done, err := client.Exists(ctx, docFieldsMigratedKey).Result()
+	if err != nil {
+		return fmt.Errorf("check doc field migration: %w", err)
+	}
+	if done == 1 {
+		return nil
+	}
+	namespaces, err := client.SMembers(ctx, namespacesKey).Result()
+	if err != nil {
+		return fmt.Errorf("list namespaces: %w", err)
+	}
+	for _, ns := range namespaces {
+		members, err := client.ZRange(ctx, docNSIndexKey(ns), 0, -1).Result()
+		if err != nil {
+			return fmt.Errorf("list docs in %q: %w", ns, err)
+		}
+		pipe := client.Pipeline()
+		for _, m := range members {
+			_, _, id := parseDocIndexMember(m)
+			pipe.HDel(ctx, docKey(ns, id), "version", "claimant", "at")
+		}
+		if _, err := pipe.Exec(ctx); err != nil {
+			return fmt.Errorf("remove doc fields in %q: %w", ns, err)
+		}
+	}
+	if err := client.Set(ctx, docFieldsMigratedKey, "1", 0).Err(); err != nil {
+		return fmt.Errorf("mark doc field migration: %w", err)
+	}
+	return nil
+}
+
+// collectLockScript deletes a doc set's lock if the set is unheld and has
+// no docs, checking and deleting atomically. An insert already watching the
+// lock fails its watch when the lock goes, and retries against a new set.
+//
+//	KEYS[1]=lock hash  KEYS[2]=namespace doc index  KEYS[3]=lock index set
+//	KEYS[4]=held sets ZSET
+//	ARGV[1]=primary key  ARGV[2]=member range min  ARGV[3]=member range max
+//	ARGV[4]=nowMs
+//	returns 1 if the lock was deleted, 0 otherwise.
+var collectLockScript = redis.NewScript(`
+local l = redis.call('HMGET', KEYS[1], 'claimant', 'at')
+if l[1] and l[1] ~= '' and tonumber(l[2]) > tonumber(ARGV[4]) then return 0 end
+if redis.call('ZLEXCOUNT', KEYS[2], ARGV[2], ARGV[3]) > 0 then return 0 end
+redis.call('SREM', KEYS[3], ARGV[1])
+redis.call('ZREM', KEYS[4], ARGV[1])
+return redis.call('DEL', KEYS[1])
+`)
+
+// collectLocksOnce removes the locks of up to batch sets that have no docs
+// and are not held, so claimed-then-abandoned sets do not accumulate.
+func (e *EQRedis) collectLocksOnce(ctx context.Context, batch int) (int, error) {
+	namespaces, err := e.client.SMembers(ctx, namespacesKey).Result()
+	if err != nil {
+		return 0, fmt.Errorf("list namespaces: %w", err)
+	}
+	collected := 0
+	for _, ns := range namespaces {
+		keys, err := e.client.SMembers(ctx, lockIndexKey(ns)).Result()
+		if err != nil {
+			return collected, fmt.Errorf("list doc locks in %q: %w", ns, err)
+		}
+		for _, key := range keys {
+			if collected >= batch || ctx.Err() != nil {
+				return collected, ctx.Err()
+			}
+			g := docset.Set{Namespace: ns, Key: key}
+			min, max := setMembersRange(key)
+			n, err := collectLockScript.Run(ctx, e.client,
+				[]string{lockKey(g), docNSIndexKey(ns), lockIndexKey(ns), heldGroupsKey(ns)},
+				key, min, max, time.Now().UnixMilli()).Int()
+			if err != nil {
+				return collected, fmt.Errorf("collect lock of %q in %q: %w", key, ns, err)
+			}
+			collected += n
+		}
+	}
+	return collected, nil
+}

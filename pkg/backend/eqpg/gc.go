@@ -40,6 +40,9 @@ func (b *EQPG) gcSweep(ctx context.Context, batch int) {
 	if _, err := b.collectDocsOnce(ctx, batch); err != nil && ctx.Err() == nil {
 		log.Printf("eqpg doc gc: %v", err)
 	}
+	if _, err := b.collectLocksOnce(ctx, batch); err != nil && ctx.Err() == nil {
+		log.Printf("eqpg doc lock gc: %v", err)
+	}
 	b.gcMetrics.Sweep(ctx, time.Since(start))
 }
 

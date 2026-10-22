@@ -3,6 +3,7 @@ package eqsqlite
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -57,6 +58,15 @@ CREATE INDEX docs_namespace_keys ON docs (namespace, key_primary, key_secondary,
 CREATE INDEX docs_namespace_at ON docs (namespace, at_ms, id);
 `
 
+// schemaV2 is the version 2 layout: version 1 with byte-counting CHECKs and a
+// 1024-byte namespace limit. Each doc still carried its own version, claimant,
+// and arrival time.
+var schemaV2 = strings.NewReplacer(
+	"length(namespace) <= 64", "octet_length(namespace) <= 1024",
+	"length(", "octet_length(",
+	"VALUES (1, 1)", "VALUES (1, 2)",
+).Replace(schemaV1)
+
 func execRaw(ctx context.Context, t *testing.T, path string, stmts ...string) {
 	t.Helper()
 	db, err := sql.Open("sqlite", sqliteDSN(path, 5*time.Second, false))
@@ -95,6 +105,11 @@ func checkSchemaRejects(ctx context.Context, t *testing.T, path string) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	// Only a CHECK should reject these rows, not a doc's missing set lock.
+	db.SetMaxOpenConns(1)
+	if _, err := db.ExecContext(ctx, "PRAGMA foreign_keys = OFF"); err != nil {
+		t.Fatal(err)
+	}
 
 	// wide is n characters and 2n bytes; nul is one counted character before a
 	// NUL, n bytes in total.
@@ -102,7 +117,8 @@ func checkSchemaRejects(ctx context.Context, t *testing.T, path string) {
 	nul := func(n int) string { return "x\x00" + strings.Repeat("y", n-2) }
 	const (
 		task = "INSERT INTO tasks VALUES (?, 0, 'q', 0, ?, 0, NULL, 0, 0, 0, '')"
-		doc  = "INSERT INTO docs VALUES (?, ?, 0, ?, 0, ?, ?, NULL, 0, 0)"
+		doc  = "INSERT INTO docs VALUES (?, ?, ?, ?, NULL, 0, 0)"
+		lock = "INSERT INTO doc_locks VALUES (?, ?, 0, ?, 0)"
 	)
 	// Every row has its own primary key, so only a CHECK can reject it.
 	tests := []struct {
@@ -113,11 +129,11 @@ func checkSchemaRejects(ctx context.Context, t *testing.T, path string) {
 		{"task id multibyte", task, []any{wide(33), ""}},
 		{"task id NUL", task, []any{nul(65), ""}},
 		{"task claimant multibyte", task, []any{"t1", wide(33)}},
-		{"doc namespace NUL", doc, []any{nul(1025), "d1", "", "k", ""}},
-		{"doc id multibyte", doc, []any{"ns", wide(33), "", "k", ""}},
-		{"doc claimant NUL", doc, []any{"ns", "d2", nul(65), "k", ""}},
-		{"doc key multibyte", doc, []any{"ns", "d3", "", wide(129), ""}},
-		{"doc secondary key NUL", doc, []any{"ns", "d4", "", "k", nul(257)}},
+		{"doc namespace NUL", doc, []any{nul(1025), "d1", "k", ""}},
+		{"doc id multibyte", doc, []any{"ns", wide(33), "k", ""}},
+		{"doc key multibyte", doc, []any{"ns", "d3", wide(129), ""}},
+		{"doc secondary key NUL", doc, []any{"ns", "d4", "k", nul(257)}},
+		{"lock claimant NUL", lock, []any{"ns", "k2", nul(65)}},
 	}
 	for _, test := range tests {
 		if _, err := db.ExecContext(ctx, test.query, test.args...); err == nil {
@@ -125,7 +141,7 @@ func checkSchemaRejects(ctx context.Context, t *testing.T, path string) {
 		}
 	}
 	// Version 1 capped namespaces at 64 characters; version 2 allows 1024 bytes.
-	if _, err := db.ExecContext(ctx, doc, strings.Repeat("n", 1024), "d5", "", "k", ""); err != nil {
+	if _, err := db.ExecContext(ctx, doc, strings.Repeat("n", 1024), "d5", "k", ""); err != nil {
 		t.Errorf("schema rejected a 1024-byte namespace: %v", err)
 	}
 }
@@ -173,14 +189,17 @@ func TestMigrateV1ToV2(t *testing.T) {
 	if err != nil || len(docs) != 1 {
 		t.Fatalf("docs after migration: %v, %v", docs, err)
 	}
-	if got := docs[0]; got.ID != "doc-1" || got.Version != 4 || got.Key != "k" || got.SecondaryKey != "s" {
+	// Migrating on to version 3 gives the doc's set a lock one version past
+	// its highest member.
+	if got := docs[0]; got.ID != "doc-1" || got.Version != 5 || got.Key != "k" || got.SecondaryKey != "s" {
 		t.Fatalf("migrated doc = %#v", got)
 	}
 	if err := client.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// The rebuilt tables carry the version 2 CHECKs.
+	// The rebuilt tables carry the version 2 CHECKs and the version 3 layout.
 	checkSchemaRejects(ctx, t, path)
+	checkVersion3Layout(ctx, t, path)
 }
 
 func TestMigrateV1ToV2RollsBackOversizedRows(t *testing.T) {
@@ -202,4 +221,115 @@ func TestMigrateV1ToV2RollsBackOversizedRows(t *testing.T) {
 		t.Fatalf("schema version after failed migration = %d, want 1", v)
 	}
 	execRaw(ctx, t, path, "SELECT id FROM tasks WHERE id = '"+wide+"'")
+}
+
+// checkVersion3Layout fails unless the database at path has the version 3
+// doc layout: no per-doc version, claimant, or arrival time, every doc tied to
+// its set's lock, and this build's schema digest.
+func checkVersion3Layout(ctx context.Context, t *testing.T, path string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", sqliteDSN(path, 5*time.Second, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var dropped int
+	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM pragma_table_info('docs') WHERE name IN ('version', 'claimant', 'at_ms')").Scan(&dropped); err != nil {
+		t.Fatal(err)
+	}
+	if dropped != 0 {
+		t.Errorf("docs keep %d of their per-doc version, claimant, and at_ms columns", dropped)
+	}
+	if _, err := db.ExecContext(ctx, "INSERT INTO docs VALUES ('ns', 'orphan', 'nolock', '', NULL, 0, 0)"); err == nil {
+		t.Error("inserted a doc whose set has no lock")
+	}
+	var digest string
+	if err := db.QueryRowContext(ctx, "SELECT schema_digest FROM entroq_meta WHERE id = 1").Scan(&digest); err != nil {
+		t.Fatal(err)
+	}
+	if digest != schemaDigest {
+		t.Errorf("schema digest %q, want %q", digest, schemaDigest)
+	}
+}
+
+// TestMigrateV2ToV3 checks that a version 2 database, where each doc carried
+// its own version and claim, gains one lock per doc set, one version past
+// the set's highest member, with any claim released, and loses the per-doc
+// columns.
+func TestMigrateV2ToV3(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "entroq.sqlite")
+	future := time.Now().Add(time.Hour).UnixMilli()
+	execRaw(ctx, t, path, schemaV2,
+		`INSERT INTO docs VALUES ('ns', 'a', 2, '', 0, 'k', '1', '"a"', 1, 1)`,
+		fmt.Sprintf(`INSERT INTO docs VALUES ('ns', 'b', 7, 'holder', %d, 'k', '2', '"b"', 1, 1)`, future),
+		`INSERT INTO docs VALUES ('ns', 'c', 0, '', 0, 'other', '', '"c"', 1, 1)`,
+	)
+
+	client, err := entroq.New(ctx, Opener(path))
+	if err != nil {
+		t.Fatalf("open version 2 database: %v", err)
+	}
+	defer client.Close()
+	if v := rawSchemaVersion(ctx, t, path); v != SchemaVersion {
+		t.Fatalf("schema version after migration = %d, want %d", v, SchemaVersion)
+	}
+
+	docs, err := client.Docs(ctx, &entroq.DocQuery{Namespace: "ns"})
+	if err != nil || len(docs) != 3 {
+		t.Fatalf("docs after migration: %v, %v", docs, err)
+	}
+	want := map[string]int32{"a": 8, "b": 8, "c": 1}
+	for _, d := range docs {
+		if d.Version != want[d.ID] || d.Claimant != "" {
+			t.Errorf("migrated doc %q: want version %d and no claimant, got version %d, claimant %q", d.ID, want[d.ID], d.Version, d.Claimant)
+		}
+	}
+	// The migrated set is writable at its lock's version.
+	if _, err := client.Modify(ctx, docs[0].Change(entroq.WithContent("after"))); err != nil {
+		t.Errorf("change after migration: %v", err)
+	}
+	checkVersion3Layout(ctx, t, path)
+}
+
+// TestOpenRefusesOtherDevelopmentLayout checks that a file at the current
+// version but from another build's schema, as development builds made while
+// version 3 changed, is refused rather than run on the wrong layout.
+func TestOpenRefusesOtherDevelopmentLayout(t *testing.T) {
+	ctx := context.Background()
+	create := func(t *testing.T, path string) {
+		b, err := Open(ctx, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, setup := range map[string]func(t *testing.T, path string){
+		"different digest": func(t *testing.T, path string) {
+			create(t, path)
+			execRaw(ctx, t, path, "UPDATE entroq_meta SET schema_digest = 'other' WHERE id = 1")
+		},
+		"no digest": func(t *testing.T, path string) {
+			create(t, path)
+			execRaw(ctx, t, path, "UPDATE entroq_meta SET schema_digest = '' WHERE id = 1")
+		},
+		// Version 3 as early development builds left it: docs still carrying
+		// their own versions, and no digest column.
+		"early version 3": func(t *testing.T, path string) {
+			execRaw(ctx, t, path, strings.Replace(schemaV2, "VALUES (1, 2)", "VALUES (1, 3)", 1))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "entroq.sqlite")
+			setup(t, path)
+			if b, err := Open(ctx, path); err == nil {
+				b.Close()
+				t.Fatal("opened a file from another schema layout")
+			} else if !strings.Contains(err.Error(), "development build") {
+				t.Fatalf("open error does not explain the refusal: %v", err)
+			}
+		})
+	}
 }

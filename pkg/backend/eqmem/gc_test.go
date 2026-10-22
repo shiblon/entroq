@@ -103,7 +103,7 @@ func TestGCMetricsEmitted(t *testing.T) {
 	defer b.Close()
 
 	// Three due tasks across two session queues that fold to one hierarchy.
-	past := time.Now().Add(-time.Hour)
+	const past = -time.Hour
 	inserts := []struct{ id, queue string }{
 		{"m1", "/metrics/sess=a;gc=0/inbox"},
 		{"m2", "/metrics/sess=a;gc=0/inbox"},
@@ -111,7 +111,7 @@ func TestGCMetricsEmitted(t *testing.T) {
 	}
 	for _, c := range inserts {
 		if _, err := b.Modify(ctx, entroq.NewModification("",
-			entroq.InsertingInto(c.queue, entroq.WithID(c.id), entroq.WithArrivalTime(past), entroq.WithRawValue([]byte("{}"))))); err != nil {
+			entroq.InsertingInto(c.queue, entroq.WithID(c.id), entroq.WithArrivalTimeIn(past), entroq.WithRawValue([]byte("{}"))))); err != nil {
 			t.Fatalf("insert %s: %v", c.id, err)
 		}
 	}
@@ -182,10 +182,10 @@ func TestGCReportsMalformed(t *testing.T) {
 	defer b.Close()
 
 	// A task in a malformed gc= queue: opted in, but the value won't parse.
-	past := time.Now().Add(-time.Hour)
+	const past = -time.Hour
 	const bad = "/bad/gc=notatime"
 	if _, err := b.Modify(ctx, entroq.NewModification("",
-		entroq.InsertingInto(bad, entroq.WithID("x1"), entroq.WithArrivalTime(past), entroq.WithRawValue([]byte("{}"))))); err != nil {
+		entroq.InsertingInto(bad, entroq.WithID("x1"), entroq.WithArrivalTimeIn(past), entroq.WithRawValue([]byte("{}"))))); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
 
@@ -242,7 +242,7 @@ func TestGCLoopCollects(t *testing.T) {
 	eqtest.GCCollectsInLoop(ctx, t, client, "/test/gcloop")
 }
 
-func TestGCDocGroups(t *testing.T) {
+func TestGCDocSets(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	b, err := New(ctx, withGCInterval(time.Hour))
@@ -250,7 +250,7 @@ func TestGCDocGroups(t *testing.T) {
 		t.Fatalf("new backend: %v", err)
 	}
 	defer b.Close()
-	eqtest.GCDocGroups(ctx, t, b, b.collectDocsOnce, "/memtest")
+	eqtest.GCDocSets(ctx, t, b, b.collectDocsOnce, "/memtest")
 }
 
 // TestGCCollectOnce drives collectOnce directly (white-box) to pin the semantics:
@@ -269,13 +269,13 @@ func TestGCCollectOnce(t *testing.T) {
 	defer b.Close()
 
 	const p = "/test/collectonce"
-	past := time.Now().Add(-time.Hour)
-	future := time.Now().Add(time.Hour)
-	futureGC := fmt.Sprintf("%s/c/gc=%d", p, future.Unix())
+	const past = -time.Hour
+	const future = time.Hour
+	futureGC := fmt.Sprintf("%s/c/gc=%d", p, time.Now().Add(future).Unix())
 
 	cases := []struct {
 		id, queue string
-		at        time.Time
+		at        time.Duration
 		collected bool
 	}{
 		{"co_due0", p + "/a/gc=0", past, true},       // always-active, arrived => collected
@@ -286,7 +286,7 @@ func TestGCCollectOnce(t *testing.T) {
 	}
 	for _, c := range cases {
 		if _, err := b.Modify(ctx, entroq.NewModification("",
-			entroq.InsertingInto(c.queue, entroq.WithID(c.id), entroq.WithArrivalTime(c.at), entroq.WithRawValue([]byte("{}"))))); err != nil {
+			entroq.InsertingInto(c.queue, entroq.WithID(c.id), entroq.WithArrivalTimeIn(c.at), entroq.WithRawValue([]byte("{}"))))); err != nil {
 			t.Fatalf("insert %s: %v", c.id, err)
 		}
 	}

@@ -20,15 +20,18 @@ type stateClaims struct {
 	claims, held atomic.Int64
 }
 
-func (b *stateClaims) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.Doc, error) {
-	docs, err := b.Backend.ClaimDocs(ctx, cq)
-	if cq.Key == "state" {
+func (b *stateClaims) ClaimDocs(ctx context.Context, cq *entroq.DocClaim) ([]*entroq.DocSet, error) {
+	sets, err := b.Backend.ClaimDocs(ctx, cq)
+	for _, s := range cq.Sets {
+		if s.Key != "state" {
+			continue
+		}
 		b.claims.Add(1)
 		if _, ok := entroq.AsDependency(err); ok {
 			b.held.Add(1)
 		}
 	}
-	return docs, err
+	return sets, err
 }
 
 // fanInRun is a run with many splits and the workers to finish them fast, so

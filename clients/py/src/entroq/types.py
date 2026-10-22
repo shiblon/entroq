@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import warnings
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional, List, Any, Union
@@ -44,6 +46,10 @@ class TaskChange:
     value: Any = None
     attempt: int = 0
     err: str = ''
+    # reset_claims zeroes the task's claim count along with the change. A task
+    # changed on purpose is not the one whose repeated claims suggested a
+    # poison pill, so the count that would quarantine it starts over.
+    reset_claims: bool = False
 
 @dataclass
 class Task:
@@ -79,15 +85,56 @@ class Task:
             at=overrides.get('at', None),
             value=overrides.get('value', self.value),
             attempt=overrides.get('attempt', self.attempt),
+            reset_claims=overrides.get('reset_claims', False),
             err=overrides.get('err', self.err),
         )
 
 @dataclass
 class DocID:
-    """Identifies a specific version of a doc (for deletes and depends)."""
+    """Identifies a specific version of a doc, or of a whole doc set.
+
+    A set is named by key with no id, which is what makes a set reference: its
+    lock has its own version, separate from any member's. A doc is named by
+    id.
+    """
     namespace: str
     id: str
     version: int
+    key: str = ''
+
+    def is_set_ref(self) -> bool:
+        """True when this names a whole doc set rather than one doc."""
+        return not self.id and bool(self.key)
+
+    def __str__(self) -> str:
+        if self.is_set_ref():
+            return f'{self.namespace}/[{self.key}]:v{self.version}'
+        return f'{self.namespace}/{self.id}:v{self.version}'
+
+
+@dataclass
+class DocClaim:
+    """Names one doc set to claim, by namespace and primary key.
+
+    omit_members claims the set and returns none of its docs. Its holder can
+    read them later, or insert one it knows is new, without racing anyone.
+
+    duration_s is ignored. A set claimed for a task expires in step with that
+    task, from a single reading of the store's clock, so there is no separate
+    duration to give. EntroQBase.claim_doc_sets takes duration_ms for a claim
+    made without a task to tie it to.
+    """
+    namespace: str
+    key: str
+    duration_s: Optional[float] = None
+    omit_members: bool = False
+
+    def __post_init__(self) -> None:
+        if self.duration_s is not None:
+            warnings.warn(
+                'DocClaim.duration_s is ignored: a set claimed for a task '
+                'expires with that task',
+                DeprecationWarning, stacklevel=3)
 
 
 @dataclass
@@ -99,6 +146,34 @@ class DocData:
     content: Any = None
     id: Optional[str] = None
     at: Optional[datetime] = None
+
+
+@dataclass
+class TaskArrival:
+    """Renews or releases a task's claim, changing nothing else about it.
+
+    by_s is how long from the backend's own now the task arrives: positive
+    holds it, zero or less releases it. A duration rather than an instant, so
+    the arrival does not depend on this process's clock agreeing with the
+    store's, nor on how long the request takes to get there.
+    """
+    id: str
+    version: int
+    queue: str
+    by_s: float = 0.0
+
+
+@dataclass
+class DocArrival:
+    """Renews or releases a doc set's claim, naming the set by its key.
+
+    Naming the set rather than its members is what lets a set with no docs be
+    renewed at all. by_s is as for TaskArrival.
+    """
+    namespace: str
+    key: str
+    version: int
+    by_s: float = 0.0
 
 
 @dataclass
@@ -136,6 +211,15 @@ class Doc:
     def as_id(self) -> 'DocID':
         return DocID(namespace=self.namespace, id=self.id, version=self.version)
 
+    def is_set_ref(self) -> bool:
+        """True when this names a whole doc set rather than one doc.
+
+        A set comes back as a doc with no ID, carrying the set's own lock:
+        namespace, key, version, claimant, arrival. Renewals and releases name
+        sets, so a response to one holds these alongside real docs.
+        """
+        return not self.id and bool(self.key)
+
     def as_change(self, **overrides) -> 'DocChange':
         """Return a DocChange for this doc with optional field overrides.
 
@@ -153,14 +237,30 @@ class Doc:
         )
 
 
+class ClaimedDocs(list):
+    """The member docs of claimed sets, with the sets themselves on ``sets``.
+
+    This is a list of the members, so iterating, indexing, or counting a claim
+    result works as it always has. ``sets`` holds each claimed set at its own
+    lock version, which is what a renewal or release names: a set has a lock
+    even with no docs under it, and naming the set is the only way to renew a
+    claim on an empty one.
+    """
+
+    def __init__(self, docs: Iterable[Doc] = (), sets: Iterable[Doc] = ()) -> None:
+        super().__init__(docs)
+        self.sets: List[Doc] = list(sets)
+
+
 class DependencyError(Exception):
     """Raised when a modify call fails due to dependency constraints.
 
     Task-scoped and doc-scoped failures are kept apart. The ``doc_*`` lists
     hold :class:`DocID` values; the rest hold :class:`TaskID` values. Workers
-    use :meth:`has_missing_docs` and :meth:`has_claimed_docs` to tell a poison
-    pill (a required doc is gone) from transient contention (another claimant
-    holds it), mirroring the Go client.
+    use :meth:`has_missing_docs`, :meth:`has_claimed_docs` and
+    :meth:`has_missing` to tell a poison pill (a required doc is gone) from
+    transient contention (another claimant holds it) from a task that is no
+    longer theirs, mirroring the Go client.
     """
     def __init__(self, message="", missing=(), mismatched=(), collisions=(), inserts=(), depends=(), deletes=(), changes=(), claims=(),
                  doc_inserts=(), doc_depends=(), doc_deletes=(), doc_changes=(), doc_claims=()):
@@ -179,6 +279,14 @@ class DependencyError(Exception):
         self.doc_deletes = list(doc_deletes)
         self.doc_changes = list(doc_changes)
         self.doc_claims = list(doc_claims)
+
+    def has_missing(self) -> bool:
+        """True when a task the operation named was absent or not at its version.
+
+        Arrivals ride the wire as changes, so a failed task arrival lands in
+        ``changes`` and counts here, as it does in Go's ``HasMissing``.
+        """
+        return bool(self.depends or self.deletes or self.changes)
 
     def has_missing_docs(self) -> bool:
         """True when a required doc is absent, not merely claimed elsewhere.
@@ -209,6 +317,21 @@ class DependencyError(Exception):
             'docChanges': [str(d) for d in self.doc_changes],
             'docClaims': [str(d) for d in self.doc_claims],
         })
+
+
+class InvalidArgumentError(Exception):
+    """Raised when the service refuses a request as malformed.
+
+    The request could not be valid for anyone: a required field missing, a
+    duration outside the permitted bounds, a change mode this protocol does not
+    allow. Retrying it unchanged cannot help, which is what separates it from
+    :class:`DependencyError` -- that one says the world moved, this one says the
+    request was wrong.
+    """
+
+    def __init__(self, message: str = "") -> None:
+        super().__init__(message)
+        self.message = message
 
 
 class TransportError(Exception):
@@ -248,6 +371,18 @@ class _TaskChange(_Op):
         self.change = change
     def _apply(self, m: Modification) -> None:
         m.task_changes.append(self.change)
+
+class _TaskArrival(_Op):
+    def __init__(self, arrival: TaskArrival) -> None:
+        self.arrival = arrival
+    def _apply(self, m: Modification) -> None:
+        m.task_arrivals.append(self.arrival)
+
+class _DocArrival(_Op):
+    def __init__(self, arrival: DocArrival) -> None:
+        self.arrival = arrival
+    def _apply(self, m: Modification) -> None:
+        m.doc_arrivals.append(self.arrival)
 
 class _TaskDelete(_Op):
     def __init__(self, id: TaskID) -> None:
@@ -309,8 +444,21 @@ class Modification:
         self.doc_changes: List[DocChange] = []
         self.doc_deletes: List[DocID] = []
         self.doc_depends: List[DocID] = []
+        self.task_arrivals: List[TaskArrival] = []
+        self.doc_arrivals: List[DocArrival] = []
         for op in ops:
             op._apply(self)
+
+    def is_empty(self) -> bool:
+        """True when this names no operation at all.
+
+        A backend refuses such a modification: one that does nothing is a
+        mistake, most often a list its builder forgot to carry.
+        """
+        return not (self.task_inserts or self.task_changes or self.task_deletes
+                    or self.task_depends or self.task_arrivals
+                    or self.doc_inserts or self.doc_changes or self.doc_deletes
+                    or self.doc_depends or self.doc_arrivals)
 
     @classmethod
     def inserting(cls, item: Union[TaskData, DocData]) -> _Op:
@@ -325,6 +473,28 @@ class Modification:
         if isinstance(item, (Task, TaskChange)):
             return _TaskChange(item.as_change(**overrides) if isinstance(item, Task) else item)
         return _DocChange(item.as_change(**overrides) if isinstance(item, Doc) else item)
+
+    @classmethod
+    def arriving(cls, item: Union[Task, Doc], by_s: float) -> _Op:
+        """Return an op making a task or a doc's set ready again in by_s.
+
+        It changes only the arrival: a positive by_s renews the claim, and zero
+        or less releases it. Nothing else about the item is sent, so a renewal
+        cannot carry a stale value back to the store, and does not resend a
+        payload every cycle the way a full change does.
+
+        A Doc must be a set reference (see Doc.is_set_ref): an arrival belongs
+        to the set, whose lock has its own version, and a member's version is
+        a different number that would fail the check or pass it by accident.
+        Claiming a set returns it on ClaimedDocs.sets.
+        """
+        if isinstance(item, Task):
+            return _TaskArrival(TaskArrival(item.id, item.version, item.queue, by_s))
+        if not item.is_set_ref():
+            raise ValueError(
+                f'arriving: {item.namespace}/{item.id} is a doc, not a set; '
+                'name the set it belongs to, from ClaimedDocs.sets')
+        return _DocArrival(DocArrival(item.namespace, item.key, item.version, by_s))
 
     @classmethod
     def deleting(cls, item: Union[Task, TaskID, Doc, DocID]) -> _Op:

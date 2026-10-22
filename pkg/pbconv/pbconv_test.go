@@ -49,7 +49,7 @@ func TestModifyArgsFromProto(t *testing.T) {
 		Inserts:    []*pb.TaskData{{Queue: "out", Value: structpb.NewStringValue("hi")}},
 		Deletes:    []*pb.TaskID{{Id: "abc", Version: 2, Queue: "in"}},
 	}
-	args, err := ModifyArgsFromProto(req)
+	args, err := ModifyArgsFromProto(req, 2)
 	if err != nil {
 		t.Fatalf("ModifyArgsFromProto: %v", err)
 	}
@@ -73,11 +73,11 @@ func TestModifyArgsFromProto(t *testing.T) {
 func TestModifyArgsFromProtoRejectsNamespaceMove(t *testing.T) {
 	req := &pb.ModifyRequest{
 		DocChanges: []*pb.DocChange{{
-			OldId:   &pb.DocID{Namespace: "ns-a", Id: "d1"},
+			OldId:   DocIDToProto("ns-a", "d1", 0),
 			NewData: &pb.DocData{Namespace: "ns-b"},
 		}},
 	}
-	_, err := ModifyArgsFromProto(req)
+	_, err := ModifyArgsFromProto(req, 2)
 	var inv *InvalidRequestError
 	if !errors.As(err, &inv) {
 		t.Fatalf("cross-namespace doc change: got %v, want *InvalidRequestError", err)
@@ -110,5 +110,155 @@ func TestDependencyErrorDetails(t *testing.T) {
 	}
 	if !gotDocDelete {
 		t.Errorf("missing DELETE detail for doc ns/d1 in %+v", deps)
+	}
+}
+
+func modification(t *testing.T, req *pb.ModifyRequest) (*entroq.Modification, error) {
+	t.Helper()
+	args, err := ModifyArgsFromProto(req, 2)
+	if err != nil {
+		return nil, err
+	}
+	return entroq.NewModification("", args...), nil
+}
+
+func TestModifyArgsFromProtoRefusesMissingParts(t *testing.T) {
+	old := &pb.TaskID{Id: "t", Version: 1, Queue: "q"}
+	for name, req := range map[string]*pb.ModifyRequest{
+		"change with no task":     {Changes: []*pb.TaskChange{{NewData: &pb.TaskData{}}}},
+		"change with no data":     {Changes: []*pb.TaskChange{{OldId: old}}},
+		"change of unknown mode":  {Changes: []*pb.TaskChange{{OldId: old, NewData: &pb.TaskData{}, Mode: pb.ChangeMode(99)}}},
+		"doc change with no doc":  {DocChanges: []*pb.DocChange{{NewData: &pb.DocData{}}}},
+		"doc change with no data": {DocChanges: []*pb.DocChange{{OldId: DocIDToProto("ns", "d", 0)}}},
+		"doc delete naming none":  {DocDeletes: []*pb.DocID{{Namespace: "ns"}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var inv *InvalidRequestError
+			if _, err := ModifyArgsFromProto(req, 2); !errors.As(err, &inv) {
+				t.Errorf("got %v, want *InvalidRequestError", err)
+			}
+		})
+	}
+}
+
+func TestModifyArgsFromProtoLeases(t *testing.T) {
+	// A lease renews for a duration. It cannot carry an instant: CHANGE_LEASE is
+	// protocol 2 and at_ms is protocol 1, so the two never appear together --
+	// see "lease naming an instant" in TestModifyArgsFromProtoModes.
+	const ahead = time.Minute
+	mod, err := modification(t, &pb.ModifyRequest{
+		Changes: []*pb.TaskChange{{
+			OldId:   &pb.TaskID{Id: "t", Version: 3, Queue: "q"},
+			NewData: &pb.TaskData{ByMs: ahead.Milliseconds()},
+			Mode:    pb.ChangeMode_CHANGE_LEASE,
+		}},
+		DocChanges: []*pb.DocChange{{
+			OldId:   DocSetIDToProto("ns", "k", 5),
+			NewData: &pb.DocData{ByMs: ahead.Milliseconds()},
+			Mode:    pb.ChangeMode_CHANGE_LEASE,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("ModifyArgsFromProto: %v", err)
+	}
+	if len(mod.Changes) != 0 || len(mod.DocChanges) != 0 {
+		t.Errorf("Leases became changes: %v", mod)
+	}
+	// The duration passes through exactly: no clock is involved on either side,
+	// which is the whole reason a lease carries one.
+	if len(mod.Arrives) != 1 || mod.Arrives[0].TaskID != (entroq.TaskID{ID: "t", Version: 3, Queue: "q"}) ||
+		mod.Arrives[0].By != ahead {
+		t.Errorf("Task lease: got %+v, want ready in exactly %v", mod.Arrives, ahead)
+	}
+	if len(mod.DocArrives) != 1 || mod.DocArrives[0].DocID != *entroq.NewDocSetRef("ns", "k", 5) ||
+		mod.DocArrives[0].By != ahead {
+		t.Errorf("Doc set lease: got %+v, want ready in exactly %v", mod.DocArrives, ahead)
+	}
+}
+
+// TestModifyArgsFromProtoModes checks what each mode may carry, and that a
+// request declaring protocol 1 may use none but the default.
+func TestModifyArgsFromProtoModes(t *testing.T) {
+	old := &pb.TaskID{Id: "t", Version: 1, Queue: "q"}
+	lease := pb.ChangeMode_CHANGE_LEASE
+	for name, tc := range map[string]struct {
+		protocol int32
+		req      *pb.ModifyRequest
+	}{
+		"task lease with a value":       {2, &pb.ModifyRequest{Changes: []*pb.TaskChange{{OldId: old, NewData: &pb.TaskData{Value: structpb.NewStringValue("x")}, Mode: lease}}}},
+		"task lease moving it":          {2, &pb.ModifyRequest{Changes: []*pb.TaskChange{{OldId: old, NewData: &pb.TaskData{Queue: "elsewhere"}, Mode: lease}}}},
+		"doc lease with content":        {2, &pb.ModifyRequest{DocChanges: []*pb.DocChange{{OldId: DocSetIDToProto("ns", "k", 0), NewData: &pb.DocData{Content: structpb.NewStringValue("x")}, Mode: lease}}}},
+		"doc lease of another key":      {2, &pb.ModifyRequest{DocChanges: []*pb.DocChange{{OldId: DocSetIDToProto("ns", "k", 0), NewData: &pb.DocData{Key: "other"}, Mode: lease}}}},
+		"doc claims reset":              {2, &pb.ModifyRequest{DocChanges: []*pb.DocChange{{OldId: DocIDToProto("ns", "d", 0), NewData: &pb.DocData{}, Mode: pb.ChangeMode_CHANGE_RESET_CLAIMS}}}},
+		"task lease naming an instant":  {2, &pb.ModifyRequest{Changes: []*pb.TaskChange{{OldId: old, NewData: &pb.TaskData{AtMs: 1}, Mode: lease}}}},
+		"doc lease naming an instant":   {2, &pb.ModifyRequest{DocChanges: []*pb.DocChange{{OldId: DocSetIDToProto("ns", "k", 0), NewData: &pb.DocData{AtMs: 1}, Mode: lease}}}},
+		"task insert naming an instant": {2, &pb.ModifyRequest{Inserts: []*pb.TaskData{{Queue: "q", AtMs: 1}}}},
+		"task change naming an instant": {2, &pb.ModifyRequest{Changes: []*pb.TaskChange{{OldId: old, NewData: &pb.TaskData{Queue: "q", AtMs: 1}}}}},
+		"doc insert naming an instant":  {2, &pb.ModifyRequest{DocInserts: []*pb.DocData{{Namespace: "ns", Key: "k", AtMs: 1}}}},
+		"doc change naming an instant":  {2, &pb.ModifyRequest{DocChanges: []*pb.DocChange{{OldId: DocIDToProto("ns", "d", 0), NewData: &pb.DocData{AtMs: 1}}}}},
+		"task lease at protocol 1":      {1, &pb.ModifyRequest{Changes: []*pb.TaskChange{{OldId: old, NewData: &pb.TaskData{}, Mode: lease}}}},
+		"claims reset at protocol 1":    {1, &pb.ModifyRequest{Changes: []*pb.TaskChange{{OldId: old, NewData: &pb.TaskData{}, Mode: pb.ChangeMode_CHANGE_RESET_CLAIMS}}}},
+		"doc lease by ID":               {2, &pb.ModifyRequest{DocChanges: []*pb.DocChange{{OldId: DocIDToProto("ns", "d", 0), NewData: &pb.DocData{}, Mode: lease}}}},
+		"doc lease at protocol 1":       {1, &pb.ModifyRequest{DocChanges: []*pb.DocChange{{OldId: DocSetIDToProto("ns", "k", 0), NewData: &pb.DocData{}, Mode: lease}}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var inv *InvalidRequestError
+			if _, err := ModifyArgsFromProto(tc.req, tc.protocol); !errors.As(err, &inv) {
+				t.Errorf("got %v, want *InvalidRequestError", err)
+			}
+		})
+	}
+	if _, err := ModifyArgsFromProto(&pb.ModifyRequest{Changes: []*pb.TaskChange{{OldId: old, NewData: &pb.TaskData{Queue: "q"}}}}, 1); err != nil {
+		t.Errorf("Default change at protocol 1: %v", err)
+	}
+}
+
+func TestModifyArgsFromProtoNotYetSupported(t *testing.T) {
+	for name, req := range map[string]*pb.ModifyRequest{
+		"doc change by key": {DocChanges: []*pb.DocChange{{OldId: DocSetIDToProto("ns", "k", 0), NewData: &pb.DocData{}}}},
+		"doc delete by key": {DocDeletes: []*pb.DocID{DocSetIDToProto("ns", "k", 0)}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var uns *UnsupportedRequestError
+			if _, err := ModifyArgsFromProto(req, 2); !errors.As(err, &uns) {
+				t.Errorf("got %v, want *UnsupportedRequestError", err)
+			}
+		})
+	}
+}
+
+func TestDependencyErrorDetailsNameSets(t *testing.T) {
+	deps := DependencyErrorDetails(&entroq.DependencyError{
+		DocClaims:  []*entroq.DocID{entroq.NewDocSetRef("ns", "held", 2)},
+		DocArrives: []*entroq.DocID{entroq.NewDocSetRef("ns", "stale", 4)},
+	})
+	found := make(map[string]pb.ActionType)
+	for _, d := range deps[1:] {
+		if d.GetDocId().GetId() != "" {
+			t.Errorf("Set failure named by ID: %+v", d)
+		}
+		found[d.GetDocId().GetKey()] = d.Type
+	}
+	if found["held"] != pb.ActionType_CLAIM || found["stale"] != pb.ActionType_CHANGE {
+		t.Errorf("Set failures: got %v", found)
+	}
+}
+
+// TestModifyArgsFromProtoClaims checks that a change resets the task's claim
+// count only in the mode that asks for it.
+func TestModifyArgsFromProtoClaims(t *testing.T) {
+	mod, err := modification(t, &pb.ModifyRequest{
+		Changes: []*pb.TaskChange{
+			{OldId: &pb.TaskID{Id: "kept", Version: 1, Queue: "q"}, NewData: &pb.TaskData{Queue: "q"}},
+			{OldId: &pb.TaskID{Id: "reset", Version: 1, Queue: "q"}, NewData: &pb.TaskData{Queue: "q"}, Mode: pb.ChangeMode_CHANGE_RESET_CLAIMS},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ModifyArgsFromProto: %v", err)
+	}
+	for _, c := range mod.Changes {
+		if want := c.ID == "reset"; mod.ResetsClaims(c.ID) != want {
+			t.Errorf("Change %s: resets claims %v, want %v", c.ID, mod.ResetsClaims(c.ID), want)
+		}
 	}
 }

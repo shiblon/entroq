@@ -422,7 +422,7 @@ type docRef struct {
 	Store Descriptor `json:"store,omitzero"`
 }
 
-// asQuery reads the doc group by primary key, without claiming it.
+// asQuery reads the doc set by primary key, without claiming it.
 func (r docRef) asQuery() *entroq.DocQuery {
 	return &entroq.DocQuery{Namespace: r.NS, KeyExact: r.Key}
 }

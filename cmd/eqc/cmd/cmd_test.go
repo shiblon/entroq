@@ -40,7 +40,15 @@ func TestMain(m *testing.M) {
 	// A short readiness interval wakes claims promptly when a task becomes
 	// available only through time, such as an expired claim, so tests that
 	// wait on that do not race the default 5-second tick.
-	svc, err := eqsvcgrpc.New(ctx, eqmem.Opener(eqmem.WithReadinessInterval(100*time.Millisecond)))
+	//
+	// A one-second lease floor for the same reason: a test that stands a dead
+	// worker up by letting a short claim expire needs the short claim it asked
+	// for. The floor exists so a lease can survive its first renewal, and
+	// against an in-process service a renewal is sub-millisecond, so a second
+	// is a real setting here rather than one picked to make a test pass.
+	svc, err := eqsvcgrpc.New(ctx,
+		eqmem.Opener(eqmem.WithReadinessInterval(100*time.Millisecond)),
+		eqsvcgrpc.WithClaimLeaseBounds(time.Second, eqsvcgrpc.DefaultClaimLeaseCeiling))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eqsvcgrpc: %v\n", err)
 		os.Exit(1)
@@ -450,6 +458,22 @@ func TestWorkMaxClaimsMovesInputAndResetRevivesIt(t *testing.T) {
 
 	waitFor(t, "reset task processed", work, func() bool {
 		return len(tasksInQueue(t, in)) == 0 && len(tasksInQueue(t, errQ)) == 0
+	})
+}
+
+// TestWorkErrorQueueTemplate checks that "{inbox}" in --error-queue stands for
+// each input queue, so a worker watching several queues quarantines each
+// task beside its own inbox.
+func TestWorkErrorQueueTemplate(t *testing.T) {
+	a, b := uniqueQueue(t, "a"), uniqueQueue(t, "b")
+	mustRun(t, "ins", "-q", a, "-v", `{"x":1}`)
+	mustRun(t, "ins", "-q", b, "-v", `{"x":2}`)
+
+	work := startRun(t, "work", "-q", a, "-q", b, "--max-attempts", "1", "--error-queue", "{inbox}/quarantine", "--", "false")
+	defer work.stop(t)
+
+	waitFor(t, "each failed task quarantined beside its inbox", work, func() bool {
+		return len(tasksInQueue(t, a+"/quarantine")) == 1 && len(tasksInQueue(t, b+"/quarantine")) == 1
 	})
 }
 

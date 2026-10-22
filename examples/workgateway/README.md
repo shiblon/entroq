@@ -1,55 +1,40 @@
-# Work gateway examples
+# Work gateway example
 
-Minimal clients for the EntroQ work gateway (`eqlink work`). A gateway client is
-a worker written in any language: it never imports EntroQ or gRPC, it just speaks
-a small newline-delimited JSON protocol while the gateway runs the hard part
-(claim, renew, commit) in Go. The full contract and the client recipes are in
-[../../docs/workgateway-protocol.md](../../docs/workgateway-protocol.md).
+An EntroQ worker in Python through the work gateway (`eqlink work`), stdlib
+only. A gateway client never imports EntroQ or gRPC: it speaks a small JSON
+protocol while the gateway runs the worker loop (claim, renew, commit) in Go.
 
-These Python examples keep the worker's actual work in one shared file and show
-the same logic over **both transports**:
+- **`python/worker.py`** is the worker: one `work(w, ctx)` function that
+  says what becomes of each task.
+- **`python/pipeline.py`** runs several workers in one process, all sharing one
+  gateway child: two move tasks along to the next queue, one consumes them and
+  counts them in a doc, and one shows retry, quarantine and long work.
+- **`python/eqgateway.py`** is the client library underneath, and the thing to
+  read if you are writing one in another language. It is the whole client side
+  of the protocol: one blocking `exchange`, a switch on its answer, the stop
+  rule, and a keepalive around long work.
 
-- **`handler.py`** — the business logic (`handle(task)`), shared by both.
-- **`pipe_worker.py`** — the **pipe** transport: spawns `eqlink work` as a child
-  and talks to it over stdio. stdlib only.
-- **`ws_worker.py`** — the **WebSocket** transport: dials an already-running
-  `eqlink work --addr` gateway. Needs `pip install websockets`.
+## Running it
 
-Both are *resident* workers with a reconnect loop — the recipe for a long-lived
-process (a monolith) that must not die when the backend blips. Each keys its
-reconnect decision on the signal the gateway gives when it stops: the pipe worker
-on the process **exit code** (`75` = transient → reconnect), the WebSocket worker
-on the **close code** (`1013` = transient → reconnect). Anything else stops. The
-simpler **crash-only** recipe — for a worker that is its own supervised service —
-drops the loop entirely and lets the platform restart the process; see the
-protocol doc.
-
-## Pipe
-
-Needs a reachable EntroQ and `eqlink` on `PATH`. The worker spawns `eqlink work`
-itself, so nothing else need be running:
+Needs a reachable EntroQ and `eqlink` on `PATH`. The worker starts its own
+gateway as a child process, so nothing else need be running:
 
 ```sh
-ENTROQ_ADDR=localhost:37706 QUEUE=in python3 pipe_worker.py
+ENTROQ_ADDR=localhost:37706 QUEUE=in python3 python/worker.py
 ```
 
-## WebSocket
+It runs one `eqlink work --addr 127.0.0.1:0` child and two workers over HTTP
+to it (`WORKERS` sets how many), each a session holding one task at a
+time. The gateway dies with the worker, however the worker dies.
 
-Run a gateway as a service first, then dial it:
+`pipeline.py` runs the same way, on queues under `demo/`
+(`ENTROQ_ADDR=localhost:37706 python3 python/pipeline.py`).
 
-```sh
-# terminal 1: the gateway, serving WebSocket
-eqlink --entroq localhost:37706 work --addr :8080 --queue in --work
+Insert a task on the queue (e.g. with `eqc`) and watch it go. The first Ctrl-C
+drains: work in hand finishes and commits, nothing new is claimed. A second
+Ctrl-C hangs up at once and leaves any task in hand to its lease.
 
-# terminal 2: the worker
-GATEWAY_WS_URL=ws://localhost:8080/work?queue=in&work=1 python3 ws_worker.py
-```
-
-## Trying it
-
-Insert a task on the queue (e.g. with `eqc`) and watch the worker claim and
-consume it. Stop with Ctrl-C — it closes cleanly, letting the gateway wind down
-the current claim rather than orphaning it for a lease period.
-
-They are deliberately tiny: the point is the shape of a correct client, not a
-framework.
+The worker passes each signal on to its gateways, which do the draining, and
+answers until each says quit. A gateway runs in a session of its own so that a
+signal reaches it once, through the worker; under a supervisor, signal the
+worker alone (systemd `KillMode=mixed`).

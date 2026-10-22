@@ -21,10 +21,12 @@ func TestClaimUnblocksAtFutureArrival(t *testing.T) {
 	defer client.Close()
 
 	const queue = "/test/future-readiness"
-	arrival := time.Now().Add(200 * time.Millisecond)
+	// The insert names the delay; arrival is kept only to assert against.
+	const delay = 200 * time.Millisecond
+	arrival := time.Now().Add(delay)
 	resp, err := client.Modify(ctx, entroq.InsertingInto(
 		queue,
-		entroq.WithArrivalTime(arrival),
+		entroq.WithArrivalTimeIn(delay),
 		entroq.WithValue("future"),
 	))
 	if err != nil {

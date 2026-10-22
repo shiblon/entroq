@@ -92,7 +92,8 @@ func (hw *Worker) Run(ctx context.Context, eq *entroq.EntroQ, opts ...Option) er
 		opt(hw, &workerRunOpts, ro)
 	}
 
-	handler := func(ctx context.Context, task *entroq.Task, reqSpec Request, _ []*entroq.Doc) (*worker.Result, error) {
+	handler := func(ctx context.Context, _ entroq.Reader, work *worker.Work[Request]) (*worker.Result, error) {
+		task, reqSpec := work.Task, work.Value
 		outbox := reqSpec.Outbox
 		if outbox == "" {
 			outbox = task.Queue + "/done"

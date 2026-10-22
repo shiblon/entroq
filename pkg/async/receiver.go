@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/internal/latency"
 	"github.com/shiblon/entroq/pkg/worker"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
@@ -34,6 +35,27 @@ type receiverConfig struct {
 
 // Receiver accepts request frames from a service inbox and supervises the
 // ephemeral workers that own active HTTP sessions.
+// claimant is the consumer every one of a receiver's workers holds things as:
+// the connection itself.
+//
+// A Run is its own consumer by default, which keeps competing workers from
+// claiming each other's doc sets. An eqlink peer is one consumer instead, for
+// two reasons that both come down to handing things off rather than competing.
+//
+// Its workers HAND OFF a held doc set. The bootstrap worker inserts the
+// session doc with a future arrival, which starts it held, and the response
+// worker claims that same set through TakeDocs. Holding it in between is what
+// keeps anyone else from taking it, so only one claimant can do the handoff --
+// see eqtest.DocClaimantBehavior, which documents the pattern as requiring the
+// same identity.
+//
+// And it mixes worker claims with DIRECT client modifications of the same
+// tasks (Sender.Modify, senderSession's bootstrap delete), which hold as the
+// connection. A sub-name for the workers would split the peer in two.
+func (r *Receiver) claimant() string {
+	return r.eq.ID()
+}
+
 type Receiver struct {
 	eq       *entroq.EntroQ
 	upstream string
@@ -122,6 +144,7 @@ func NewReceiver(eq *entroq.EntroQ, upstream string, opts ...ReceiverOption) *Re
 	duration, _ := meter.Float64Histogram("receiver.duration_seconds",
 		metric.WithDescription("HTTP session duration in seconds."),
 		metric.WithUnit("s"),
+		latency.Buckets(),
 	)
 	return &Receiver{
 		eq:            eq,
@@ -176,12 +199,7 @@ func (r *Receiver) Run(ctx context.Context, inbox string) error {
 	)
 	for range r.cfg.concurrency {
 		g.Go(func() error {
-			// The session doc's claim belongs to this process, not to one
-			// run: bootstrap inserts it claimed, runSession claims it again
-			// through the client, and the response lane takes it over. All
-			// three must be the same claimant, so this run opts out of the
-			// per-run default and uses the client's.
-			if err := bootstrap.Run(gctx, worker.Watching(inbox), worker.WithClaimant("")); err != nil {
+			if err := bootstrap.Run(gctx, worker.Watching(inbox), worker.AsClaimant(r.claimant())); err != nil {
 				return fmt.Errorf("receiver bootstrap: %w", err)
 			}
 			return nil
@@ -191,7 +209,8 @@ func (r *Receiver) Run(ctx context.Context, inbox string) error {
 }
 
 func (r *Receiver) bootstrapHandler(runCtx context.Context, starts chan<- sessionStart) worker.DoModifyRun[Envelope] {
-	return func(_ context.Context, task *entroq.Task, env Envelope, _ []*entroq.Doc) (*worker.Result, error) {
+	return func(_ context.Context, _ entroq.Reader, work *worker.Work[Envelope]) (*worker.Result, error) {
+		task, env := work.Task, work.Value
 		if env.Session == "" {
 			return nil, worker.MoveErrorf("eqlink frame has no session")
 		}
@@ -279,13 +298,14 @@ func (r *Receiver) runSession(ctx context.Context, start sessionStart) error {
 		}
 		return nil
 	})
-	g.Go(func() error { return r.runRequestWorkers(gctx, state, socket, cancel) })
-	g.Go(func() error { return r.runResponseWorkers(gctx, start, state, socket, cancel) })
+	g.Go(func() error { return r.runRequestLane(gctx, state, socket, cancel) })
+	g.Go(func() error { return r.runResponseLane(gctx, start, state, socket, cancel) })
 	g.Go(func() error {
-		return state.liveness.run(gctx, func() {
-			log.Printf("receiver session %q peer liveness timeout", start.session)
+		if err := state.liveness.run(gctx); err != nil {
+			log.Printf("receiver session %q: %v", start.session, err)
 			cancel()
-		})
+		}
+		return nil
 	})
 	if err := g.Wait(); err != nil {
 		return err
@@ -303,47 +323,31 @@ type receiverSessionState struct {
 	responseLanes sessionLanes
 	liveness      *peerLiveness
 
-	opened                 bool
-	requestCompleted       bool
-	responseCompleted      bool
-	requestWorkerSwitched  bool
-	responseWorkerSwitched bool
-	requestWorkerCancel    context.CancelFunc
-	responseWorkerCancel   context.CancelFunc
-	statusCode             int
+	opened     bool
+	statusCode int
 }
 
-func (r *Receiver) runRequestWorkers(ctx context.Context, state *receiverSessionState, socket *responseSocket, complete func()) error {
-	for {
-		workerCtx, stopWorker := context.WithDeadline(ctx, state.requestLanes.local.collectAt)
-		state.requestWorkerCancel = stopWorker
-		state.requestWorkerSwitched = false
-		requestWorker := worker.New(r.eq,
-			worker.WithDoModify(r.requestHandler(state, socket)),
-			worker.WithMeterProvider[Envelope](r.cfg.mp),
-		)
-		err := requestWorker.Run(workerCtx, worker.Watching(state.requestLanes.local.queue))
-		workerErr := workerCtx.Err()
-		stopWorker()
-		if err != nil {
-			return fmt.Errorf("request data worker: %w", err)
-		}
-		if state.requestCompleted || ctx.Err() != nil {
-			return nil
-		}
-		if errors.Is(workerErr, context.DeadlineExceeded) {
-			log.Printf("receiver request lane %q expired; abandoning the upstream socket", state.requestLanes.local.queue)
-			complete()
-			return nil
-		}
-		if !state.requestWorkerSwitched {
-			return fmt.Errorf("request data worker exited without completing or switching queues")
-		}
+// runRequestLane claims request frames, writing each to the upstream and
+// answering it with an ACK. A lane that expires abandons the upstream socket.
+func (r *Receiver) runRequestLane(ctx context.Context, state *receiverSessionState, socket *responseSocket, complete func()) error {
+	_, err := runLane(ctx, r.eq, r.cfg.mp, r.claimant(), &state.requestLanes, noDocs[Envelope],
+		func(turns *laneTurns) worker.DoModifyRun[Envelope] {
+			return r.requestHandler(state, socket, turns)
+		})
+	if errors.Is(err, errLaneExpired) {
+		log.Printf("receiver request lane %q expired; abandoning the upstream socket", state.requestLanes.local.queue)
+		complete()
+		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("request data worker: %w", err)
+	}
+	return nil
 }
 
-func (r *Receiver) requestHandler(state *receiverSessionState, socket *responseSocket) worker.DoModifyRun[Envelope] {
-	return func(ctx context.Context, task *entroq.Task, env Envelope, _ []*entroq.Doc) (*worker.Result, error) {
+func (r *Receiver) requestHandler(state *receiverSessionState, socket *responseSocket, turns *laneTurns) worker.DoModifyRun[Envelope] {
+	return func(ctx context.Context, _ entroq.Reader, work *worker.Work[Envelope]) (*worker.Result, error) {
+		task, env := work.Task, work.Value
 		if env.Session != state.session {
 			return nil, worker.FatalErrorf("request session mismatch: got %q, want %q", env.Session, state.session)
 		}
@@ -364,14 +368,10 @@ func (r *Receiver) requestHandler(state *receiverSessionState, socket *responseS
 			}
 			if err := socket.open(ctx, env); err != nil {
 				ack := Envelope{FrameControl: FrameControl{Session: env.Session, Final: true, Error: err.Error()}}
-				return worker.Modify(
+				return turns.end(worker.Modify(
 					task.Delete(),
 					entroq.InsertingInto(env.ReplyQueue, entroq.WithValue(ack)),
-				).OnSuccess(func(context.Context) error {
-					state.requestCompleted = true
-					state.requestWorkerCancel()
-					return nil
-				}), nil
+				), turnDone, nil), nil
 			}
 			state.opened = true
 		} else if hasRequestMetadata(env) {
@@ -402,13 +402,10 @@ func (r *Receiver) requestHandler(state *receiverSessionState, socket *responseS
 						Error:   err.Error(),
 					}})))
 				}
-				return worker.Modify(mods...).OnDependency(func(_ context.Context, depErr *entroq.DependencyError) error {
+				result := worker.Modify(mods...).OnDependency(func(_ context.Context, depErr *entroq.DependencyError) error {
 					return worker.FatalErrorf("session %q request failure commit lost dependency: %v", env.Session, depErr)
-				}).OnSuccess(func(context.Context) error {
-					state.requestCompleted = true
-					state.requestWorkerCancel()
-					return nil
-				}), nil
+				})
+				return turns.end(result, turnDone, nil), nil
 			}
 		}
 
@@ -435,72 +432,56 @@ func (r *Receiver) requestHandler(state *receiverSessionState, socket *responseS
 				return worker.FatalErrorf("session %q request commit lost dependency after socket write: %v", env.Session, err)
 			})
 		}
-		return result.OnSuccess(func(context.Context) error {
-			if env.Final {
-				state.requestCompleted = true
-				state.requestWorkerCancel()
-			} else if localSwitched {
-				state.requestWorkerSwitched = true
-				state.requestWorkerCancel()
-			}
-			return nil
-		}), nil
+		next := turnNext
+		switch {
+		case env.Final:
+			next = turnDone
+		case localSwitched:
+			next = turnRotated
+		}
+		return turns.end(result, next, nil), nil
 	}
 }
 
-func (r *Receiver) runResponseWorkers(ctx context.Context, start sessionStart, state *receiverSessionState, socket *responseSocket, complete func()) error {
-	for {
-		workerCtx, stopWorker := context.WithDeadline(ctx, state.responseLanes.local.collectAt)
-		state.responseWorkerCancel = stopWorker
-		state.responseWorkerSwitched = false
-		responseWorker := worker.New(r.eq,
-			// Only this lane touches the singleton receiver session doc.
-			// Letting both concurrent workers claim it under the same claimant
-			// ID would remove mutual exclusion and create version races between
-			// doc renewals.
-			worker.WithTakeDocs(func(_ context.Context, _ *entroq.Task, ack Response) ([]*entroq.DocClaim, error) {
-				if ack.Session != start.session {
-					return nil, worker.FatalErrorf("session mismatch: ACK %q, worker %q", ack.Session, start.session)
-				}
-				return []*entroq.DocClaim{
-					entroq.ClaimKey(start.receiverDocNS, start.session),
-				}, nil
-			}),
-			worker.WithDoModify(r.responseHandler(start, state, socket, complete)),
-			worker.WithMeterProvider[Response](r.cfg.mp),
-		)
-		err := responseWorker.Run(workerCtx,
-			worker.Watching(state.responseLanes.local.queue),
-			worker.WithLease(r.cfg.heartbeat.timeout),
-			// This lane takes over the process's claim on the session doc;
-			// see the bootstrap run in Run.
-			worker.WithClaimant(""),
-		)
-		workerErr := workerCtx.Err()
-		stopWorker()
-		if err != nil {
-			return fmt.Errorf("response ACK worker: %w", err)
+// runResponseLane claims response ACKs, answering each with the next frame of
+// the upstream response. Only this lane touches the singleton receiver session
+// doc: letting both of a session's lanes claim it under the same claimant
+// would remove mutual exclusion and race their renewals. A lane that expires
+// abandons the upstream socket.
+func (r *Receiver) runResponseLane(ctx context.Context, start sessionStart, state *receiverSessionState, socket *responseSocket, complete func()) error {
+	takeSessionDoc := func(_ context.Context, _ entroq.Reader, work *worker.Work[Response]) (*worker.TakeResult, error) {
+		ack := work.Value
+		if ack.Session != start.session {
+			return nil, worker.FatalErrorf("session mismatch: ACK %q, worker %q", ack.Session, start.session)
 		}
-		if state.responseCompleted || ctx.Err() != nil {
-			return nil
-		}
-		if errors.Is(workerErr, context.DeadlineExceeded) {
-			log.Printf("receiver response lane %q expired; abandoning the upstream socket", state.responseLanes.local.queue)
-			state.responseCompleted = true
-			complete()
-			return nil
-		}
-		if !state.responseWorkerSwitched {
-			return fmt.Errorf("response ACK worker exited without completing or switching queues")
-		}
+		return worker.Take(entroq.ClaimKey(start.receiverDocNS, start.session)), nil
 	}
+	// r.claimant is the same consumer the bootstrap worker held the session doc
+	// as, so this lane can take it; see Receiver.claimant.
+	_, err := runLane(ctx, r.eq, r.cfg.mp, r.claimant(), &state.responseLanes, takeSessionDoc,
+		func(turns *laneTurns) worker.DoModifyRun[Response] {
+			return r.responseHandler(start, state, socket, complete, turns)
+		},
+		worker.WithLease(r.cfg.heartbeat.timeout),
+	)
+	if errors.Is(err, errLaneExpired) {
+		log.Printf("receiver response lane %q expired; abandoning the upstream socket", state.responseLanes.local.queue)
+		complete()
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("response ACK worker: %w", err)
+	}
+	return nil
 }
 
-func (r *Receiver) responseHandler(start sessionStart, state *receiverSessionState, socket *responseSocket, complete func()) worker.DoModifyRun[Response] {
-	return func(ctx context.Context, task *entroq.Task, ack Response, docs []*entroq.Doc) (*worker.Result, error) {
-		if len(docs) != 1 {
-			return nil, worker.FatalErrorf("session %q claimed %d receiver session docs", ack.Session, len(docs))
+func (r *Receiver) responseHandler(start sessionStart, state *receiverSessionState, socket *responseSocket, complete func(), turns *laneTurns) worker.DoModifyRun[Response] {
+	return func(ctx context.Context, _ entroq.Reader, work *worker.Work[Response]) (*worker.Result, error) {
+		task, ack, sets := work.Task, work.Value, work.Sets
+		if len(sets) != 1 || len(sets[0].Docs) != 1 {
+			return nil, worker.FatalErrorf("session %q claimed %d receiver session doc sets, want one holding one doc", ack.Session, len(sets))
 		}
+		docs := sets[0].Docs
 		if !responseDataEmpty(ack) {
 			return nil, worker.FatalErrorf("session %q received response data where an ACK was expected", ack.Session)
 		}
@@ -509,8 +490,7 @@ func (r *Receiver) responseHandler(start sessionStart, state *receiverSessionSta
 			if ack.Error == "" || ack.ReplyQueue != "" {
 				return nil, worker.FatalErrorf("session %q received invalid terminal response ACK", ack.Session)
 			}
-			return worker.Modify(task.Delete(), docs[0].Delete()).OnSuccess(func(context.Context) error {
-				state.responseCompleted = true
+			return turns.end(worker.Modify(task.Delete(), docs[0].Delete()), turnDone, func(context.Context) error {
 				complete()
 				return nil
 			}), nil
@@ -597,17 +577,16 @@ func (r *Receiver) responseHandler(start sessionStart, state *receiverSessionSta
 				return worker.FatalErrorf("session %q response commit lost dependency after socket read: %v", ack.Session, err)
 			})
 		}
-		return result.OnSuccess(func(context.Context) error {
-			if resp.Final {
-				r.recordSession(ctx, start, state, ack.ReplyQueue)
-				state.responseCompleted = true
-				complete()
-				return nil
-			}
+		if !resp.Final {
+			next := turnNext
 			if localSwitched {
-				state.responseWorkerSwitched = true
-				state.responseWorkerCancel()
+				next = turnRotated
 			}
+			return turns.end(result, next, nil), nil
+		}
+		return turns.end(result, turnDone, func(context.Context) error {
+			r.recordSession(ctx, start, state, ack.ReplyQueue)
+			complete()
 			return nil
 		}), nil
 	}

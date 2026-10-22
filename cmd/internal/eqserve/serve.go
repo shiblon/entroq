@@ -30,7 +30,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	hpb "google.golang.org/grpc/health/grpc_health_v1"
-	"google.golang.org/grpc/keepalive"
 )
 
 const bytesPerMB = 1024 * 1024
@@ -61,6 +60,9 @@ type Config struct {
 	MeshUpdateSubject string
 
 	MetricInterval time.Duration
+
+	ClaimLeaseFloor   time.Duration
+	ClaimLeaseCeiling time.Duration
 }
 
 // BindFlags adds the common service flags to f.
@@ -85,6 +87,14 @@ func (c *Config) BindFlags(f *pflag.FlagSet) {
 	f.StringVar(&c.OPAPath, "opa_path", "", fmt.Sprintf("OPA API path. Default: %s.", opahttp.DefaultAPIPath))
 	f.StringVar(&c.MeshPolicyFile, "mesh_policy_file", "", "Initial mesh policy document; typically a projected ConfigMap file.")
 	f.StringVar(&c.MeshUpdateSubject, "mesh_update_subject", "", "Authenticated subject permitted to replace native mesh policy.")
+	f.DurationVar(&c.ClaimLeaseFloor, "claim_lease_floor", eqsvcgrpc.DefaultClaimLeaseFloor,
+		"Shortest lease a claim may hold what it took; a shorter request is clamped up to this. "+
+			"The server sets lease length because a lease too short to survive its own first renewal "+
+			"churns storage for every client, not just the one that asked.")
+	f.DurationVar(&c.ClaimLeaseCeiling, "claim_lease_ceiling", eqsvcgrpc.DefaultClaimLeaseCeiling,
+		"Longest lease a claim's FIRST hold may take; a longer request is clamped down to this. "+
+			"Renewal is a lease change rather than a claim and is not clamped, so a holder that keeps "+
+			"renewing is not bounded by it.")
 }
 
 // OpenFunc constructs a backend opener after telemetry has been initialized.
@@ -113,6 +123,11 @@ func Run(ctx context.Context, cfg Config, open OpenFunc, backendDescription stri
 	svcOpts := append(security.serviceOptions, eqsvcgrpc.WithMeterProvider(mp))
 	if cfg.MetricInterval > 0 {
 		svcOpts = append(svcOpts, eqsvcgrpc.WithMetricInterval(cfg.MetricInterval))
+	}
+	// Zero means the flags were never bound -- Run is called directly in
+	// tests -- so leave the service's own defaults in place.
+	if cfg.ClaimLeaseFloor > 0 || cfg.ClaimLeaseCeiling > 0 {
+		svcOpts = append(svcOpts, eqsvcgrpc.WithClaimLeaseBounds(cfg.ClaimLeaseFloor, cfg.ClaimLeaseCeiling))
 	}
 
 	svc, err := eqsvcgrpc.New(ctx, open(mp), svcOpts...)
@@ -147,7 +162,7 @@ func Run(ctx context.Context, cfg Config, open OpenFunc, backendDescription stri
 	grpcServer := grpc.NewServer(
 		grpc.MaxRecvMsgSize(cfg.MaxSize*bytesPerMB),
 		grpc.MaxSendMsgSize(cfg.MaxSize*bytesPerMB),
-		grpc.KeepaliveEnforcementPolicy(serverKeepalivePolicy()),
+		eqgrpc.ServerKeepalive(),
 	)
 	pb.RegisterEntroQServer(grpcServer, svc)
 	hpb.RegisterHealthServer(grpcServer, health.NewServer())
@@ -181,12 +196,6 @@ func Run(ctx context.Context, cfg Config, open OpenFunc, backendDescription stri
 			return fmt.Errorf("shut down HTTP server: %w", err)
 		}
 		return nil
-	}
-}
-
-func serverKeepalivePolicy() keepalive.EnforcementPolicy {
-	return keepalive.EnforcementPolicy{
-		MinTime: eqgrpc.DefaultKeepaliveTime,
 	}
 }
 
