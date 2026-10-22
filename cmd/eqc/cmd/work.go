@@ -68,6 +68,7 @@ func init() {
 	flags.Int32Var(&flagWork.maxClaims, "max-claims", worker.DefaultMaxClaims, "Maximum claims the input task may collect WITHOUT being modified before it is moved to the error queue without running the command. Claim N may run; a later claim is moved. Catches tasks whose runs never finish, such as a command that crashes the worker. 0 means no maximum.")
 	flags.StringVar(&flagWork.errorQueue, "error-queue", "", `Queue for exhausted or non-retriable failed tasks; "{inbox}" stands for the input queue. Defaults to "{inbox}/err".`)
 	flags.DurationVar(&flagWork.lease, "lease", entroq.DefaultClaimDuration, "Claim lease and renewal interval.")
+	flags.Duration("work-timeout", worker.DefaultWorkTimeout, "How long one run of the command may take before it is killed and the task retried, its attempt counted. 0 means no limit.")
 	flags.Int64Var(&flagWork.maxOutputBytes, "max-output-bytes", defaultMaxWorkOutputSize, "Maximum stdout bytes to capture from the command. Use 0 for unlimited.")
 }
 
@@ -103,6 +104,10 @@ that copies input task values to the output queue.`,
 		if err != nil {
 			return fmt.Errorf("read --lease: %w", err)
 		}
+		workTimeout, err := cmd.Flags().GetDuration("work-timeout")
+		if err != nil {
+			return fmt.Errorf("read --work-timeout: %w", err)
+		}
 
 		w := worker.New(eq,
 			worker.WithDoModify(cfg.doWork),
@@ -112,6 +117,7 @@ that copies input task values to the output queue.`,
 			worker.Watching(queues...),
 			worker.WithLease(lease),
 			worker.WithMaxClaims(cfg.maxClaims),
+			worker.WithWorkTimeout(workTimeout),
 		)
 	},
 }

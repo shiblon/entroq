@@ -10,6 +10,7 @@ import (
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/backend/eqmem"
+	"github.com/shiblon/entroq/pkg/worker"
 )
 
 func TestWorker_run(t *testing.T) {
@@ -140,5 +141,59 @@ func TestWorker_timeout(t *testing.T) {
 	err = <-errCh
 	if err != nil && !entroq.IsCanceled(err) {
 		t.Errorf("Worker failed: %v", err)
+	}
+}
+
+// TestWorkTimeoutRetriesTheRequest: a request cut off because the worker's
+// work timeout ran out got no answer, so the task is retried, its attempt
+// counted, rather than moved to the error box. The request's own Timeout
+// (TestWorker_timeout) is an answer, and does go there.
+func TestWorkTimeoutRetriesTheRequest(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	eq, err := entroq.New(ctx, eqmem.Opener())
+	if err != nil {
+		t.Fatalf("Failed to create eq: %v", err)
+	}
+	defer eq.Close()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(10 * time.Second):
+		}
+	}))
+	defer server.Close()
+
+	const queue = "/test/worktimeout"
+	req := &Request{URL: server.URL, Errbox: "/test/worktimeout/err"}
+	if _, err := eq.Modify(ctx, entroq.InsertingInto(queue, entroq.WithValue(req))); err != nil {
+		t.Fatalf("Failed to insert request task: %v", err)
+	}
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go func() {
+		_ = Run(runCtx, eq, Watching(queue),
+			WithRunOption(worker.WithWorkTimeout(200*time.Millisecond)),
+			WithRunOption(worker.WithBaseRetryDelay(time.Hour)),
+		)
+	}()
+
+	for {
+		tasks, err := eq.Tasks(ctx, queue)
+		if err != nil {
+			t.Fatalf("Tasks: %v", err)
+		}
+		if len(tasks) == 1 && tasks[0].Attempt == 1 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("the timed-out request's task was never retried: %v", tasks)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	if failed, _ := eq.Tasks(ctx, "/test/worktimeout/err"); len(failed) != 0 {
+		t.Errorf("a timed-out request landed in the error box: %v", failed)
 	}
 }

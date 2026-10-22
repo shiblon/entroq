@@ -21,20 +21,23 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/cmd/internal/eqflags"
 	"github.com/shiblon/entroq/pkg/backend/eqgrpc"
 	"github.com/shiblon/entroq/pkg/version"
+	"github.com/shiblon/entroq/pkg/worker"
 	"github.com/shiblon/entroq/pkg/workers/procworker"
 	"github.com/spf13/cobra"
 )
 
 var (
-	cfgFile  string
-	settings = eqflags.NewEnvironment("EQPROCWORKER")
-	eqaddr   string
-	inbox    string
+	cfgFile     string
+	settings    = eqflags.NewEnvironment("EQPROCWORKER")
+	eqaddr      string
+	inbox       string
+	workTimeout time.Duration
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -100,7 +103,10 @@ var rootCmd = &cobra.Command{
 		defer eq.Close()
 
 		log.Printf("Starting worker for %q on inbox %q", eqaddr, inbox)
-		if err := procworker.Run(ctx, eq, procworker.WithQueues(inbox)); err != nil {
+		if err := procworker.Run(ctx, eq,
+			procworker.WithQueues(inbox),
+			procworker.WithRunOption(worker.WithWorkTimeout(workTimeout)),
+		); err != nil {
 			log.Fatalf("Error executing worker: %v", err)
 		}
 	},
@@ -122,6 +128,7 @@ func init() {
 
 	pflags.StringVar(&inbox, "inbox", "/subprocworker/inbox", "Queue to listen to")
 	pflags.StringVar(&eqaddr, "eqaddr", ":37706", "address of service, uses port 37706 if none is specified")
+	pflags.DurationVar(&workTimeout, "work-timeout", worker.DefaultWorkTimeout, "How long one subprocess may run before it is killed and the task retried, its attempt counted. 0 means no limit.")
 }
 
 // initConfig reads in config file and ENV variables if set.

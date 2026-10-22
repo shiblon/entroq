@@ -13,6 +13,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/backend/eqmem"
+	"github.com/shiblon/entroq/pkg/worker"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -198,5 +199,54 @@ func TestRun(t *testing.T) {
 	cancel()
 	if err := g.Wait(); err != nil && !entroq.IsCanceled(err) {
 		t.Fatalf("Unexpected error: %v", err)
+	}
+}
+
+// TestWorkTimeoutRetriesTheCommand: a command killed because the work timeout
+// ran out did not fail, so the task is retried, its attempt counted, rather
+// than moved to the error box as a command failure.
+func TestWorkTimeoutRetriesTheCommand(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	eq, err := entroq.New(ctx, eqmem.Opener())
+	if err != nil {
+		t.Fatalf("Can't open eq: %v", err)
+	}
+	defer eq.Close()
+
+	const inbox = "/subproctest/timeout"
+	in := &Input{Cmd: []string{"/bin/sleep", "10"}}
+	if _, err := eq.Modify(ctx, entroq.InsertingInto(inbox, entroq.WithRawValue(in.JSON()))); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go func() {
+		_ = Run(runCtx, eq,
+			WithQueues(inbox),
+			WithRunOption(worker.WithWorkTimeout(200*time.Millisecond)),
+			WithRunOption(worker.WithBaseRetryDelay(time.Hour)),
+		)
+	}()
+
+	for {
+		tasks, err := eq.Tasks(ctx, inbox)
+		if err != nil {
+			t.Fatalf("Tasks: %v", err)
+		}
+		if len(tasks) == 1 && tasks[0].Attempt == 1 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("the timed-out command's task was never retried: %v", tasks)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	for _, q := range []string{inbox + "/error", inbox + "/error/failed-start"} {
+		if failed, _ := eq.Tasks(ctx, q); len(failed) != 0 {
+			t.Errorf("a timed-out command landed in %s as a failure: %v", q, failed)
+		}
 	}
 }

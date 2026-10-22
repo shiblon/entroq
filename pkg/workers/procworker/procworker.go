@@ -227,6 +227,12 @@ func (pw *Worker) doWork(ctx context.Context, _ entroq.Reader, work *worker.Work
 	destQueue := outbox
 
 	if err := cmd.Run(); err != nil {
+		// A command killed because the worker is stopping, or because the
+		// work timeout ran out, did not fail: report the worker's error and
+		// commit nothing, so the worker lets the claim lapse or retries it.
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("run command: %w", ctx.Err())
+		}
 		destQueue = errbox
 		output.Err = err.Error()
 		_, ok := err.(*exec.ExitError)
