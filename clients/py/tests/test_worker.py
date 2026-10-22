@@ -1441,31 +1441,20 @@ def test_worker_disposition_then_stop(err):
     assert tc.attempt == 1
 
 
-def test_worker_move_with_no_destination_still_records_it():
-    """A move a custom map gives no queue is never a no-op: the task stays
-    put, ready now, with its attempt and error recorded, as in Go."""
+@pytest.mark.parametrize("err,attempt", [
+    (MoveError("bad"), 0),
+    (RetryError("again"), 4),
+], ids=["move", "exhausted retry"])
+def test_worker_unmapped_inbox_falls_back_to_the_default_error_queue(err, attempt):
+    """A custom map that gives an inbox no error queue falls back to
+    <inbox>/err, so a move, or a retry out of attempts, always moves, as in Go."""
     async def body(t):
-        raise MoveError("bad")
-    client, keep_going = _process_once(_task(id='t1', version=1), body,
-                                       err_q_map=lambda inbox: '')
-    assert keep_going is True
-    (tc,) = client.modify_calls[0].task_changes
-    assert tc.queue == 'q' and tc.at is None
-    assert tc.attempt == 1 and tc.err == 'bad'
-    assert tc.reset_claims
-
-
-def test_worker_exhausted_retry_with_nowhere_to_go_retries():
-    """At the attempt ceiling with no queue to move to, the task is retried
-    after its delay, as Go's RetryOrQuarantine does, rather than made ready."""
-    async def body(t):
-        raise RetryError("again", delay_s=60)
-    client, _ = _process_once(_task(id='t1', version=1, attempt=4), body,
+        raise err
+    client, _ = _process_once(_task(id='t1', version=1, attempt=attempt), body,
                               max_attempts=5, err_q_map=lambda inbox: '')
     (tc,) = client.modify_calls[0].task_changes
-    assert tc.queue == 'q'
-    assert tc.at is not None, "the retry delay was dropped"
-    assert tc.attempt == 5
+    assert tc.queue == 'q/err'
+    assert tc.at is None
 
 
 def test_worker_selector_failure_at_the_claim_limit_is_recorded():

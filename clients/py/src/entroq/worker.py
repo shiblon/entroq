@@ -746,11 +746,11 @@ class EntroQWorker:
         self._stop_event.set()
 
     def error_queue_for(self, inbox: str) -> str:
-        """Return the error queue for an inbox, using this worker's mapping.
-
-        Mirrors the Go worker's ``ErrorQueueFor``.
+        """Return the error queue for an inbox, using this worker's mapping,
+        or :func:`default_err_q_map` if the mapping gives none: a move always
+        moves. Mirrors the Go worker's ``ErrorQueueFor``.
         """
-        return self._err_q_map(inbox)
+        return self._err_q_map(inbox) or default_err_q_map(inbox)
 
     @classmethod
     def handler(
@@ -875,22 +875,10 @@ class EntroQWorker:
                                          reset_claims=True)
 
         if isinstance(exc, MoveError):
-            dest = exc.queue or self.error_queue_for(task.queue)
-            if dest:
-                change = quarantine(dest)
-            else:
-                # A custom map gave no destination. The failure is still
-                # recorded, as Go's Quarantine does with no queue: the task
-                # stays where it is, ready now, its attempt counted. It is
-                # never a no-op that leaves the task to its lease.
-                change = Modification.changing(task, at=None, attempt=attempt,
-                                               err=str(exc), reset_claims=True)
-        elif (self._max_attempts and attempt >= self._max_attempts
-              and (exc.or_move_to or self.error_queue_for(task.queue))):
+            change = quarantine(exc.queue or self.error_queue_for(task.queue))
+        elif self._max_attempts and attempt >= self._max_attempts:
             change = quarantine(exc.or_move_to or self.error_queue_for(task.queue))
         else:
-            # Below the ceiling, or at it with nowhere to go: retry with the
-            # delay, as Go's RetryOrQuarantine does without a queue.
             delay = exc.delay_s if exc.delay_s is not None else self._retry_delay_s
             if jitter:
                 delay += random.uniform(0, delay / 4)

@@ -47,8 +47,8 @@ import (
 )
 
 // ErrQMap is a function that maps from an inbox name to its "move on error"
-// error box name. If no mapping is found, a suitable default should be
-// returned.
+// error box name. An empty answer means the default, <inbox>/err
+// (DefaultErrQMap): a move always moves.
 type ErrQMap func(inbox string) string
 
 // DefaultRetryDelay is the amount by which to advance the arrival time when a
@@ -819,10 +819,17 @@ func WithMeterProvider[T any](mp metric.MeterProvider) Option[T] {
 }
 
 // ErrorQueueFor returns the error queue for the given inbox, using the worker's
-// configured mapping or the default if none is set.
+// configured mapping, or DefaultErrQMap if there is none or it gives no answer.
+//
+// It is never empty. A move or an exhausted retry with an empty destination
+// would leave the task in its own queue with its attempt counted, which is
+// neither a move nor a retry; so a map that declines falls back to the
+// default, and a move always moves.
 func (w *Worker[T]) ErrorQueueFor(inbox string) string {
 	if w.errQMap != nil {
-		return w.errQMap(inbox)
+		if q := w.errQMap(inbox); q != "" {
+			return q
+		}
 	}
 	return DefaultErrQMap(inbox)
 }
