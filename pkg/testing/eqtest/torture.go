@@ -18,8 +18,9 @@ import (
 	"github.com/shiblon/entroq/pkg/worker"
 )
 
-// TortureEnv selects the size Torture runs at: small, large, or huge. Unset,
-// Torture skips.
+// TortureEnv selects the size Torture runs at: small, large, or huge, or off
+// to skip it. Unset, it runs small, which takes seconds and is enough to catch
+// a doc set two workers both hold, unless the test runs with -short.
 const TortureEnv = "ENTROQ_TORTURE"
 
 // TortureConfig sizes a torture run.
@@ -67,21 +68,26 @@ var TortureSizes = map[string]TortureConfig{
 	"huge": {
 		Jobs: 300, Rounds: 20, FanOut: 64, Accounts: 32, Shards: 8, Workers: 16,
 		Lease: time.Second, FaultRate: 0.02, KillEvery: 20 * time.Millisecond,
-		Timeout: 2 * time.Hour,
+		Timeout: 6 * time.Hour,
 	},
 }
 
-// Torture runs TortureWith at the size TortureEnv names, and skips when it
-// names none.
+// Torture runs TortureWith at the size TortureEnv names: small when it names
+// none, and not at all when it says off, or when it names none under -short.
 func Torture(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix string) {
 	t.Helper()
 	size := os.Getenv(TortureEnv)
-	if size == "" {
-		t.Skipf("set %s=small|large|huge to run the torture test", TortureEnv)
+	switch {
+	case size == "off":
+		t.Skipf("%s=off", TortureEnv)
+	case size == "" && testing.Short():
+		t.Skipf("-short; set %s=small|large|huge to run the torture test anyway", TortureEnv)
+	case size == "":
+		size = "small"
 	}
 	cfg, ok := TortureSizes[size]
 	if !ok {
-		t.Fatalf("%s=%q: want small, large, or huge", TortureEnv, size)
+		t.Fatalf("%s=%q: want small, large, huge, or off", TortureEnv, size)
 	}
 	TortureWith(cfg)(ctx, t, client, qPrefix)
 }
