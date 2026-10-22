@@ -12,8 +12,9 @@ export interface TaskID {
  */
 export interface TaskData {
   queue: string;
-  atMs: string; // int64 -> string
-  value: any; // bytes -> JSON value
+  atMs?: string; // int64 -> string; an instant, which the work gateway refuses
+  byMs?: string; // int64 -> string; arrive this long from the server's now
+  value?: any; // google.protobuf.Value -> JSON value
   id?: string;
   attempt?: number;
   err?: string;
@@ -106,6 +107,7 @@ export interface DocData {
   secondaryKey?: string;
   content?: any;
   atMs?: string; // int64 -> string; future = claim/renew, "0" = release
+  byMs?: string; // int64 -> string; hold the set this long from the server's now
   createdMs?: string; // for journal replay only
   modifiedMs?: string; // for journal replay only
 }
@@ -293,29 +295,4 @@ export interface QueuesResponse {
  */
 export interface TimeResponse {
   timeMs: string; // int64 -> string
-}
-
-/**
- * EntroQClientInterface defines the methods required by a worker.
- */
-export interface EntroQClientInterface {
-  claim(
-    queues: string[],
-    durationMs?: number,
-    pollMs?: number
-  ): Promise<ClaimResponse>;
-  modify(
-    request: Omit<ModifyRequest, "claimantId">
-  ): Promise<ModifyResponse>;
-  claimDocs(request: ClaimDocsRequest): Promise<ClaimDocsResponse>;
-}
-
-/**
- * EntroQDocClientInterface extends EntroQClientInterface with doc operations,
- * required by a doc-aware worker.
- */
-export interface EntroQDocClientInterface extends EntroQClientInterface {
-  docs(request: DocsRequest): Promise<DocsResponse>;
-  claimDocs(request: ClaimDocsRequest): Promise<ClaimDocsResponse>;
-  namespaceStats(request?: NamespacesRequest): Promise<NamespacesResponse>;
 }

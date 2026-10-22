@@ -9,6 +9,7 @@ from datetime import datetime, timezone, timedelta
 import pytest
 
 from entroq.base import EntroQBase
+from entroq.json import EntroQJSON
 from entroq.types import (
     Task, TaskID, TaskChange,
     ClaimedDocs, Doc, DocData, DocID, DocClaim,
@@ -56,6 +57,10 @@ def _doc(namespace='ns', id='d1', version=1, key='k', secondary_key='') -> Doc:
 
 class FakeClient(EntroQBase):
     """Controllable in-process client for worker tests."""
+
+    def as_claimant(self, claimant_id):
+        # Claimants are not modeled here; a worker's scoped client is this one.
+        return self
 
     def __init__(self, tasks=(), docs=()):
         self._task_q: asyncio.Queue[Task] = asyncio.Queue()
@@ -1519,6 +1524,59 @@ def test_worker_cancels_handler_when_claim_is_lost():
     elapsed = asyncio.run(asyncio.wait_for(run(), timeout=10))
     assert reached_end == [], "handler kept running after the claim was gone"
     assert elapsed < 0.5, f"claim loss took {elapsed:.2f}s to stop the handler"
+
+
+@pytest.mark.parametrize("sentinel", [
+    lambda e: RetryError(f"read failed: {e!r}"),
+    lambda e: MoveError(f"read failed: {e!r}"),
+], ids=["retry", "move"])
+@pytest.mark.parametrize("phase", ["body", "selector"])
+def test_worker_cancellation_wins_over_sentinels(phase, sentinel):
+    """A phase that answers the worker's cancellation with a sentinel, as one
+    whose read failed with it would, commits nothing: the cancellation reaches
+    the caller, and the lease decides, as in the Go worker."""
+    task = _task(id='t1', version=1, queue='q')
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0)
+
+    async def swallow():
+        try:
+            await asyncio.sleep(5)
+        except asyncio.CancelledError as e:
+            raise sentinel(e)
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            if phase == "body":
+                await swallow()
+            return None
+
+        @process.selector
+        async def process(t):
+            if phase == "selector":
+                await swallow()
+            return []
+
+        proc = asyncio.ensure_future(worker._process(task, process))
+        await asyncio.sleep(0.05)
+        proc.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await proc
+
+    asyncio.run(asyncio.wait_for(run(), timeout=5))
+    assert client.modify_calls == [], "a canceled worker committed a disposition"
+
+
+def test_workers_sharing_a_client_are_distinct_consumers():
+    """Each worker acts as a claimant of its own on its client's connection, so
+    workers sharing a client do not hold each other's doc sets."""
+    eq = EntroQJSON("http://127.0.0.1:1")
+    a, b = EntroQWorker(eq, 'q'), EntroQWorker(eq, 'q')
+    claimants = {a._eq.claimant_id, b._eq.claimant_id}
+    assert len(claimants) == 2, "two workers on one client share a claimant"
+    assert eq.claimant_id not in claimants, "a worker acts as its client's own claimant"
+    assert a._eq.http is eq.http and b._eq.http is eq.http, "a worker opened a connection of its own"
 
 
 def test_worker_outer_cancellation_still_propagates():

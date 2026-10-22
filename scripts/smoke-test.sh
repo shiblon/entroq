@@ -2,7 +2,7 @@
 set -e
 
 # EntroQ Cross-Language Smoke Test
-# This script verifies that Go, Python, and JS clients can all interact 
+# This script verifies that Go and JS clients can both interact
 # with the same EntroQ backend (using the docker-compose sandbox).
 
 # 1. Start the sandbox
@@ -26,50 +26,43 @@ done
 echo "--- Running Go Smoke Test ---"
 go test -v -run Example_manualClaimAndRenew github.com/shiblon/entroq
 
-# 4. Python Smoke Test (using PYTHONPATH to point to local src)
-echo "--- Running Python Smoke Test ---"
-export PYTHONPATH=$PYTHONPATH:$(pwd)/clients/py/src
-python3 -c "
-import sys
-import time
-from entroq.json import EntroQJSON
-from entroq.types import TaskData
-
-client = EntroQJSON('http://localhost:9100')
-inserted, _ = client.modify(inserts=[TaskData(queue='/smoke/py', value=b'py-work')])
-task = client.claim(['/smoke/py'])
-if task.value != b'py-work':
-    print(f'Mismatched value: {task.value}')
-    sys.exit(1)
-client.modify(deletes=[task.id_version])
-print('Python claim/modify success!')
-"
-
-# 5. JS/TS Smoke Test (Node)
+# 4. JS/TS Smoke Test (Node), through an eqlink work child
 echo "--- Running JS Smoke Test ---"
 (cd clients/js && npm install --no-package-lock && npm run build > /dev/null 2>&1)
-export NODE_PATH=$(pwd)/clients/js/node_modules
-node -e "
-const { EntroQClient } = require('./clients/js/dist/client');
+EQLINK_DIR=$(mktemp -d)
+go build -o "$EQLINK_DIR/eqlink" ./cmd/eqlink
+EQLINK="$EQLINK_DIR/eqlink" node -e "
+const { Worker, M } = require('./clients/js/dist/index.js');
+const { NodeGateway } = require('./clients/js/dist/node.js');
 (async () => {
-    const client = new EntroQClient({ baseUrl: 'http://localhost:9100' });
     try {
-        await client.modify({ 
-            inserts: [{ queue: '/smoke/js', value: Buffer.from('js-work').toString('base64') }] 
+        const seeded = await fetch('http://localhost:9100/api/v0/modify', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ claimantId: 'smoke', inserts: [{ queue: '/smoke/js', value: 'js-work' }] }),
         });
-        const resp = await client.claim(['/smoke/js']);
-        if (Buffer.from(resp.task.value, 'base64').toString() !== 'js-work') {
-            throw new Error('Mismatched value: ' + resp.task.value);
+        if (!seeded.ok) {
+            throw new Error('seed: ' + seeded.status + ' ' + await seeded.text());
         }
-        await client.modify({ 
-            deletes: [{ id: resp.task.id, version: resp.task.version, queue: '/smoke/js' }] 
-        });
-        console.log('JS claim/modify success!');
+        let seen;
+        const gateway = new NodeGateway({ eqlink: process.env.EQLINK, entroq: 'localhost:37706', handleSignals: false });
+        await gateway.run(new Worker(['/smoke/js'], {
+            work: (w, ctx) => {
+                seen = w.value;
+                ctx.stop();
+                return M.of(M.deleting(w.task));
+            },
+        }));
+        if (seen !== 'js-work') {
+            throw new Error('Mismatched value: ' + JSON.stringify(seen));
+        }
+        console.log('JS gateway worker success!');
     } catch (err) {
         console.error(err);
         process.exit(1);
     }
 })();
 "
+rm -rf "$EQLINK_DIR"
 
 echo "--- ALL SMOKE TESTS PASSED ---"

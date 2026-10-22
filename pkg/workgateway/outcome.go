@@ -75,10 +75,8 @@ func (g *Gateway) disposition(outcome Outcome, te *TaskError) error {
 	case OutcomeOK:
 		return nil
 	case OutcomeRetry:
+		// The delay is the Run's base (see retryDelay), as for every retry.
 		retry := worker.RetryErrorf("client asked to retry: %s", te.message())
-		if d := g.retryDelay(); d > 0 {
-			retry = retry.After(d)
-		}
 		if q := te.queue(); q != "" {
 			// A retry that names a queue says where to go once the attempts
 			// run out, rather than where to go now.
@@ -103,7 +101,9 @@ func (g *Gateway) disposition(outcome Outcome, te *TaskError) error {
 }
 
 // retryDelay is the base delay a retried task waits before it is available
-// again, or zero to leave the worker's own default alone.
+// again, or zero to leave the worker's own default alone. It is the Run's, so
+// it governs every retry: the client's, a work timeout's, and a task whose doc
+// sets were held.
 func (g *Gateway) retryDelay() time.Duration {
 	if g.config == nil || g.config.RetryDelayS <= 0 {
 		return 0

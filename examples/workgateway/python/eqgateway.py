@@ -141,7 +141,8 @@ class Modification:
         """A task or doc with the fields named replaced: a task's queue or
         value, which by_s may delay; a doc's content or keys."""
         if _is_doc(item):
-            data = {k: item[k] for k in ("namespace", "id", "key", "secondary_key", "content") if k in item}
+            # Handed over as protojson, whose names are camelCase.
+            data = {k: item[k] for k in ("namespace", "id", "key", "secondaryKey", "content") if k in item}
             return "doc_changes", {"old_id": doc_id(item), "new_data": {**data, **fields}}
         data = {"queue": item["queue"], "value": item.get("value"), **fields}
         return "changes", {"old_id": task_id(item), "new_data": _arriving(data, by_s)}

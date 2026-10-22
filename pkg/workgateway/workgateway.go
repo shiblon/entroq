@@ -546,14 +546,18 @@ func (g *Gateway) Handle(ctx context.Context) error {
 			case <-ctx.Done():
 			}
 		}()
-		return g.finish(ctx, g.ended(g.worker.Run(ctx,
+		runOpts := []worker.RunOption{
 			worker.AsClaimant(g.claimant),
 			worker.Watching(g.config.Queues...),
 			worker.WithMaxAttempts(g.config.MaxAttempts),
 			worker.WithMaxClaims(maxClaims(g.config.MaxClaims)),
 			worker.WithLease(g.opts.lease),
 			worker.WithWorkTimeout(g.workTimeout),
-		)))
+		}
+		if d := g.retryDelay(); d > 0 {
+			runOpts = append(runOpts, worker.WithBaseRetryDelay(d))
+		}
+		return g.finish(ctx, g.ended(g.worker.Run(ctx, runOpts...)))
 	default:
 		return g.finish(ctx, worker.FatalErrorf("expected %q to begin the session, got %q", ReqReady, msg.Type))
 	}

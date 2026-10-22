@@ -26,9 +26,10 @@ digest came from a development build and is refused.
 
 ## The Go worker is the reference implementation
 
-`pkg/worker` defines EntroQ's worker semantics. The Python, JS, and gateway
-workers are ports of it, so "parity" means parity **with Go** — not with each
-other, and not with whatever a client happens to do today. When a client
+`pkg/worker` defines EntroQ's worker semantics. The Python worker is a port of
+it, and the gateway runs it for foreign workers, the JS client among them, so
+"parity" means parity **with Go** — not with each other, and not with whatever
+a client happens to do today. When a client
 diverges, the fix is to change the client.
 
 This holds even when the divergent behavior is documented in the client. A
@@ -59,10 +60,12 @@ Read these before changing any client worker:
   A `ModifyDep` carries either `id` or `doc_id`; a decoder that reads only `id`
   silently discards every doc dependency.
 
-The ports live in `clients/py/src/entroq/worker.py` and
-`clients/js/src/worker.ts`. `pkg/workgateway` hosts foreign workers on the Go
-worker directly, so it inherits these semantics rather than reimplementing them
-— but it must still pass through each run option it means to support.
+The port lives in `clients/py/src/entroq/worker.py`. `pkg/workgateway` hosts
+foreign workers on the Go worker directly, so it inherits these semantics rather
+than reimplementing them — but it must still pass through each run option it
+means to support. The JS client (`clients/js`) and the Python gateway example
+(`examples/workgateway/python`) are gateway clients: they hold no EntroQ state,
+so parity there is speaking the protocol (`docs/workgateway-protocol.md`).
 
 ## Releasing goes through the scripts, off `develop`
 

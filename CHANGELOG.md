@@ -142,6 +142,13 @@ runs, so plan a short maintenance window on large doc tables.
 
 ### Changed
 
+- **Breaking: the JS client runs workers through the work gateway.** `entroq`
+  0.13.0 drops `EntroQClient` and `EntroQWorker`, which reimplemented the Go
+  worker and shared one claimant across every worker on a client, for a client
+  of `eqlink work`: `Worker` and `Gateway` in `entroq`, which use only `fetch`,
+  and `NodeGateway` in `entroq/node`, which starts an `eqlink work --addr`
+  child for the process. The gateway owns claims, renewal, doc sets, and
+  retries, so the client holds no EntroQ state. Node 20 or later.
 - **A canceled worker applies no retry or move.** Once a worker's context
   has ended, a `RetryError` or `MoveError` its handler returns -- usually the
   cancellation itself, seen as a failed read or write -- is not committed: the
@@ -149,13 +156,17 @@ runs, so plan a short maintenance window on large doc tables.
   workers reaches the claim limit. A modify on an ended context landed on some
   backends and not others, so the outcome used to depend on the backend. To
   answer a task and stop, return the sentinel with `ThenStop` while the
-  context is live. eqmr mappers and reducers also retry transient failures
-  after 1s rather than the worker's 30s default.
+  context is live. The Python worker matches: cancelling its asyncio task
+  commits nothing, even when a handler or selector turns the cancellation
+  into a `RetryError` or `MoveError`. eqmr mappers and reducers also retry
+  transient failures after 1s rather than the worker's 30s default.
 - **Every worker `Run` is its own consumer.** A doc set excludes other
   claimants only, so `Run` claims, renews, and commits as a claimant of its
   own, a fresh random ID by default; `worker.AsClaimant` names it instead.
   Concurrent Runs, of one worker or of workers sharing a client, no longer
-  hold each other's doc sets.
+  hold each other's doc sets. The Python `EntroQWorker` does the same, a
+  claimant of its own per run on its client's connection
+  (`EntroQBase.as_claimant`).
 - **A doc claim asks for what it does.** Claiming a doc set still needs
   `CLAIM` on its namespace, and now also `READ` there when the claim returns
   the set's docs, since that discloses their contents; a set claimed
@@ -540,6 +551,10 @@ runs, so plan a short maintenance window on large doc tables.
 
 ### Fixed
 
+- **The work gateway's `retry_delay_s` governs every retry.** It reached only
+  the retries a client asked for, so a task whose doc sets someone else held
+  came back after the worker's default 30 seconds, whatever the session set.
+  It is now the session's base retry delay, as the protocol says.
 - **EQLink's sender stops cleanly and keeps its receiver informed.**
   `Sender.Close` before `Serve` no longer panics, and a `Serve` after it
   returns at once. `Serve` stops when its context ends, so `eqlink send` stops

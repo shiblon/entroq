@@ -156,7 +156,9 @@ async def test_worker_claims_and_releases_doc_sets_over_json(eqmem_url):
             return [DocClaim(ns, "cfg"), DocClaim(ns, "empty")]
 
         worker = EntroQWorker(eq, queue)
-        task = await eq.try_claim(queue)
+        # Claimed as the worker's own consumer, which is who acts on it; the
+        # client's claimant holds nothing the worker does.
+        task = await worker._eq.try_claim(queue)
         assert task is not None
 
         await asyncio.wait_for(worker._process(task, process), timeout=30)
