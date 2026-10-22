@@ -236,23 +236,18 @@ await new NodeGateway({ entroq: "localhost:37706" }).run(
 ```
 
 ### Elixir
-The Elixir client provides an HTTP/JSON client and a worker abstraction that
-renews task/doc claims while `perform/2` runs, then applies returned
-modifications after renewal stops and final versions are stable. See
-[`clients/elixir/README.md`](clients/elixir/README.md) for details.
+The Elixir client runs workers through the work gateway too, the same way, with
+no runtime dependencies. See [`clients/elixir/README.md`](clients/elixir/README.md).
 
 ```elixir
-defmodule MyWorker do
-  use EntroQ.Worker
+alias EntroQ.Modification, as: M
 
-  @impl true
-  def perform(task, _docs) do
-    {:modify, EntroQ.Modification.delete(task)}
-  end
-end
+worker = %EntroQ.Worker{
+  queues: ["/my/queue"],
+  work: fn w, _ctx -> M.of([M.deleting(w.task)]) end
+}
 
-client = EntroQ.new("http://localhost:9100")
-EntroQ.Worker.run(client, ["/my/queue"], MyWorker)
+EntroQ.Gateway.new(entroq: "localhost:37706") |> EntroQ.Gateway.run([worker])
 ```
 
 ### Any language (work gateway)
