@@ -28,10 +28,6 @@ import (
 //
 // Close is deliberately absent: a scoped client does not own the connection it
 // speaks through, and several share one. Close the *EntroQ.
-//
-// Renew, RenewFor and RenewAllFor are also absent. They name an absolute hold,
-// which predates arrivals; UpdateArrival says how much LONGER to hold and lets
-// the backend resolve that against its own clock.
 type Client interface {
 	// Everything a Reader does, which is everything that records no holder.
 	Reader

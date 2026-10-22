@@ -1080,9 +1080,11 @@ func ChangeKeepsStoredFields(ctx context.Context, t *testing.T, client *entroq.E
 		}
 	}
 
-	if task, err = client.RenewFor(ctx, task, time.Minute); err != nil {
+	renewed, err := client.UpdateArrival(ctx, entroq.ReadyIn(time.Minute).Tasks(task))
+	if err != nil {
 		t.Fatalf("Renew: %v", err)
 	}
+	task = renewed.ChangedTasks[0]
 	check("renew", task)
 
 	resp, err = client.Modify(ctx, task.Change(entroq.ValueTo("v1"), entroq.ArrivalTimeBy(time.Minute)))
