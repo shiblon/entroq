@@ -1969,7 +1969,9 @@ func (x *ModifyRequest) GetDocDepends() []*DocID {
 }
 
 // ModifyResponse returns inserted and updated tasks and docs when successful.
-// A dependency error (which is permanent) comes through as gRPC's NOT_FOUND code.
+// A dependency error comes through as gRPC's ABORTED code (HTTP 409): the
+// state the modification depended on has moved, and it may succeed if retried
+// against what is there now. Servers before 1.13 sent NOT_FOUND.
 type ModifyResponse struct {
 	state         protoimpl.MessageState
 	sizeCache     protoimpl.SizeCache
@@ -2043,7 +2045,7 @@ func (x *ModifyResponse) GetChangedDocs() []*Doc {
 	return nil
 }
 
-// ModifyDep can be returned with a gRPC NotFound status indicating which
+// ModifyDep can be returned with a gRPC Aborted status indicating which
 // dependencies failed. This is done via the gRPC error return, not directly
 // in the response proto. Either id (for task dependencies) or doc_id (for doc
 // dependencies) will be set; msg is used with type=DETAIL for a human-readable

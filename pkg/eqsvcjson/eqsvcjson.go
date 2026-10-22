@@ -102,11 +102,9 @@ func errTranslator() connect.UnaryInterceptorFunc {
 
 // translateErr converts a google.golang.org/grpc/status error into a
 // *connect.Error. gRPC and Connect codes share numeric values, so the code maps
-// directly — except a dependency error (NotFound carrying ModifyDep details),
-// which becomes Aborted (HTTP 409 Conflict): it is an optimistic-concurrency
-// failure the caller should retry with fresh versions, not a "resource missing"
-// 404, which is also cacheable. The ModifyDep/AuthzDep details are re-attached
-// so JSON clients can see which items conflicted.
+// directly: a dependency error is already Aborted (HTTP 409 Conflict), the
+// service's code for an optimistic-concurrency failure. The ModifyDep/AuthzDep
+// details are re-attached so JSON clients can see which items conflicted.
 func translateErr(err error) error {
 	stat, ok := status.FromError(err)
 	if !ok {
@@ -114,21 +112,13 @@ func translateErr(err error) error {
 	}
 	code := connect.Code(stat.Code())
 	var details []proto.Message
-	isDep := false
 	for _, d := range stat.Details() {
 		switch m := d.(type) {
 		case *pb.ModifyDep:
-			isDep = true
 			details = append(details, m)
 		case *pb.AuthzDep:
 			details = append(details, m)
 		}
-	}
-	if isDep {
-		// TODO(next-minor): emit codes.Aborted from eqsvcgrpc directly and drop
-		// this remap; the eqgrpc client already accepts both NotFound and
-		// Aborted, so the server can switch without breaking older clients.
-		code = connect.CodeAborted
 	}
 	cerr := connect.NewError(code, errors.New(stat.Message()))
 	for _, d := range details {

@@ -839,9 +839,9 @@ func (s *QSvc) Modify(ctx context.Context, req *pb.ModifyRequest) (*pb.ModifyRes
 	if err != nil {
 		if depErr, ok := entroq.AsDependency(err); ok {
 			details := depDetails(depErr)
-			stat, sErr := status.New(codes.NotFound, "modification dependency error").WithDetails(details...)
+			stat, sErr := status.New(codes.Aborted, "modification dependency error").WithDetails(details...)
 			if sErr != nil {
-				return nil, codeErrorf(codes.NotFound, "dependency failed, and failed to add details %v: %w", err, sErr)
+				return nil, codeErrorf(codes.Aborted, "dependency failed, and failed to add details %v: %w", err, sErr)
 			}
 			return nil, stat.Err()
 		}
@@ -1143,9 +1143,9 @@ func (s *QSvc) ClaimDocs(ctx context.Context, req *pb.ClaimDocsRequest) (*pb.Cla
 	if err != nil {
 		if depErr, ok := entroq.AsDependency(err); ok {
 			details := depDetails(depErr)
-			stat, sErr := status.New(codes.NotFound, "claim docs dependency error").WithDetails(details...)
+			stat, sErr := status.New(codes.Aborted, "claim docs dependency error").WithDetails(details...)
 			if sErr != nil {
-				return nil, codeErrorf(codes.NotFound, "claim docs dependency failed, unable to add details %v: %w", err, sErr)
+				return nil, codeErrorf(codes.Aborted, "claim docs dependency failed, unable to add details %v: %w", err, sErr)
 			}
 			return nil, stat.Err()
 		}

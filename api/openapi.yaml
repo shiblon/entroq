@@ -686,7 +686,9 @@ components:
                          new lock as a Doc with no id or content. A real doc always has an id.
             description: |-
                 ModifyResponse returns inserted and updated tasks and docs when successful.
-                 A dependency error (which is permanent) comes through as gRPC's NOT_FOUND code.
+                 A dependency error comes through as gRPC's ABORTED code (HTTP 409): the
+                 state the modification depended on has moved, and it may succeed if retried
+                 against what is there now. Servers before 1.13 sent NOT_FOUND.
         NamespaceStat:
             type: object
             properties:
