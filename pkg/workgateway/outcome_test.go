@@ -107,7 +107,8 @@ func TestRetryDelayComesFromConfig(t *testing.T) {
 	if got := g.retryDelay(); got != 45*time.Second {
 		t.Errorf("retryDelay = %v, want 45s", got)
 	}
-	// And it rides on the disposition rather than being applied by the client.
+	// The worker applies it, as the Run's base, to the retry a disposition
+	// asks for rather than the client applying it.
 	err := g.disposition(OutcomeRetry, &TaskError{Message: "later"})
 	if _, ok := worker.AsRetry(err); !ok {
 		t.Fatalf("disposition(retry) = %T, want a *worker.RetryError", err)

@@ -544,6 +544,10 @@ runs, so plan a short maintenance window on large doc tables.
 
 ### Fixed
 
+- **The work gateway's `retry_delay_s` governs every retry.** It reached only
+  the retries a client asked for, so a task whose doc sets someone else held
+  came back after the worker's default 30 seconds, whatever the session set.
+  It is now the session's base retry delay, as the protocol says.
 - **EQLink's sender stops cleanly and keeps its receiver informed.**
   `Sender.Close` before `Serve` no longer panics, and a `Serve` after it
   returns at once. `Serve` stops when its context ends, so `eqlink send` stops

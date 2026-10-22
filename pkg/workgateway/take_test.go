@@ -4,6 +4,9 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/shiblon/entroq"
+	pb "github.com/shiblon/entroq/api"
 )
 
 // A take reply may settle its task instead of naming docs, as a native take
@@ -74,5 +77,38 @@ func TestTakeMoveSettlesTheTask(t *testing.T) {
 	}
 	if len(dead) != 1 || dead[0].ID != take.Task.GetId() {
 		t.Errorf("dead holds %v, want task %s", dead, take.Task.GetId())
+	}
+}
+
+// TestRetryDelayGovernsDocContention: a task whose doc sets someone else holds
+// is retried after the session's retry delay, as every other retry is, not the
+// worker's default of thirty seconds.
+func TestRetryDelayGovernsDocContention(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	eq, c, done := drainFixture(ctx, t)
+	if _, err := eq.ClaimDocs(ctx, entroq.ClaimKey("ns", "held"),
+		entroq.ClaimingSetsAs("intruder"), entroq.ClaimingSetsFor(time.Minute)); err != nil {
+		t.Fatalf("hold the set: %v", err)
+	}
+
+	session, take := open(t, c, &Config{WantDocs: true, RetryDelayS: 1})
+	expectType(t, take, RespTake)
+	c.send(&Request{Type: ReqTake, Session: session, DocSetClaims: []wireClaim{{&pb.DocSetClaim{
+		Set: &pb.DocID{Namespace: "ns", Ref: &pb.DocID_Key{Key: "held"}},
+	}}}})
+
+	// The contended task goes back, and the session goes on to the other one.
+	next := c.recv()
+	expectType(t, next, RespTake)
+	c.send(&Request{Type: ReqTake, Session: session, Quit: true, Outcome: OutcomeRetry})
+	expectType(t, c.recv(), RespQuit)
+
+	contended := stopped(ctx, t, eq, done, take.Task.GetId())
+	if contended == nil {
+		t.Fatalf("task %s is gone, want it retried", take.Task.GetId())
+	}
+	if wait := time.Until(contended.At); wait > 5*time.Second {
+		t.Errorf("contended task arrives in %v, want about the session's 1s retry delay", wait.Round(time.Second))
 	}
 }
