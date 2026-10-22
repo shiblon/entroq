@@ -142,6 +142,13 @@ runs, so plan a short maintenance window on large doc tables.
 
 ### Changed
 
+- **Breaking: the JS client runs workers through the work gateway.** `entroq`
+  0.13.0 drops `EntroQClient` and `EntroQWorker`, which reimplemented the Go
+  worker and shared one claimant across every worker on a client, for a client
+  of `eqlink work`: `Worker` and `Gateway` in `entroq`, which use only `fetch`,
+  and `NodeGateway` in `entroq/node`, which starts an `eqlink work --addr`
+  child for the process. The gateway owns claims, renewal, doc sets, and
+  retries, so the client holds no EntroQ state. Node 20 or later.
 - **A canceled worker applies no retry or move.** Once a worker's context
   has ended, a `RetryError` or `MoveError` its handler returns -- usually the
   cancellation itself, seen as a failed read or write -- is not committed: the

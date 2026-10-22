@@ -204,19 +204,25 @@ asyncio.run(main())
 ```
 
 ### TypeScript (Node.js)
-The TypeScript client provides a worker abstraction for modern async/await environments. See [`clients/js/README.md`](clients/js/README.md) for installation and full API docs.
+The TypeScript client runs workers through the work gateway (`eqlink work`),
+which runs the EntroQ worker loop in Go: claim, renew, commit, retry, and doc
+set claims. It starts an `eqlink work` child and speaks its small JSON
+protocol over HTTP. See [`clients/js/README.md`](clients/js/README.md) for
+installation and the full API.
 
 ```typescript
-import { EntroQClient, EntroQWorker } from "entroq";
+import { Worker, M } from "entroq";
+import { NodeGateway } from "entroq/node";
 
-const client = new EntroQClient({ baseUrl: "http://localhost:9100" });
-const worker = new EntroQWorker(client);
-
-await worker.run(["/my/queue"], async (task) => {
-    console.log("Processing:", task.value);
-    // Return a modification to apply atomically; here we delete to finish.
-    return { deletes: [{ id: task.id, version: task.version, queue: task.queue }] };
-});
+await new NodeGateway({ entroq: "localhost:37706" }).run(
+    new Worker(["/my/queue"], {
+        work: async (w) => {
+            console.log("Processing:", w.value);
+            // Return a modification to commit atomically; here we delete to finish.
+            return M.of(M.deleting(w.task));
+        },
+    }),
+);
 ```
 
 ### Elixir

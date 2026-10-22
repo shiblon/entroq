@@ -1,0 +1,14 @@
+{
+  "//": "The core (src/index.ts) must run outside Node: it type-checks here with browser types only, so a node: import or a Node global in it fails.",
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "types": [],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "module": "ESNext",
+    "moduleResolution": "node"
+  },
+  "files": ["src/index.ts"]
+}

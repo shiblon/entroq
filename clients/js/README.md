@@ -1,9 +1,13 @@
 # EntroQ JavaScript/TypeScript Client
 
-A client for the [EntroQ](https://github.com/shiblon/entroq) task queue, for
-Node.js and other modern JavaScript runtimes. It talks to an EntroQ service over
-the HTTP/JSON API and provides both a low-level client and a worker abstraction
-that renews task leases for you.
+Workers for the [EntroQ](https://github.com/shiblon/entroq) task queue, written
+in JavaScript or TypeScript and run through the work gateway, `eqlink work`.
+
+The gateway runs the EntroQ worker loop in Go: it claims tasks, renews them,
+claims doc sets, fixes up versions at commit, and retries, moves, and backs off.
+A worker here answers its small JSON protocol over HTTP and holds no EntroQ
+state of its own, so it has nothing to get wrong about leases or claims. The
+protocol is [`docs/workgateway-protocol.md`](../../docs/workgateway-protocol.md).
 
 ## Installation
 
@@ -11,142 +15,133 @@ that renews task leases for you.
 npm install entroq
 ```
 
-The package is published as `entroq`. It has no runtime dependencies.
+It has no runtime dependencies. It needs Node.js 20 or later, and `eqlink` on
+`PATH` (or named with `eqlink`) for `entroq/node` to start.
 
 ## Quick start
 
 ```typescript
-import { EntroQClient, EntroQWorker } from "entroq";
+import { Worker, M } from "entroq";
+import { NodeGateway } from "entroq/node";
 
-const client = new EntroQClient({ baseUrl: "http://localhost:9100" });
-const worker = new EntroQWorker(client);
+const worker = new Worker(["/my/queue"], {
+  work: async (w) => {
+    console.log("Processing:", w.value);
+    // Commit atomically: here, delete the task to finish it.
+    return M.of(M.deleting(w.task));
+  },
+});
 
-await worker.run(["/my/queue"], async (task) => {
-  console.log("Processing:", task.value);
-  // Return a modification to apply atomically; here we delete to finish.
-  return { deletes: [{ id: task.id, version: task.version, queue: task.queue }] };
+await new NodeGateway({ entroq: "localhost:37706" }).run(worker);
+```
+
+`NodeGateway` starts one `eqlink work` child for the process, shared by every
+worker, and stops it when they are done. The first SIGINT or SIGTERM drains:
+every task in hand finishes and nothing more is claimed. A second hangs up at
+once, leaving tasks in hand to their leases.
+
+## Workers
+
+A `Worker` is one session with the gateway, holding at most one task at a time.
+For more at once, or for several kinds of work, run several:
+
+```typescript
+await gateway.run(
+  new Worker(["/a"], { work: workA }),
+  ...Array.from({ length: 4 }, () => new Worker(["/b"], { work: workB })),
+);
+```
+
+Each session claims as a consumer of its own, so workers never hold each
+other's doc sets.
+
+### The functions
+
+Only `work` is required.
+
+- `work(w, ctx)` settles one task. What it returns is committed: a
+  `Modification`, or nothing to commit nothing. The task in hand is not
+  deleted unless the modification says so.
+- `take(w, ctx)` names the doc sets the task needs, with `claimSet(ns, key)`.
+  They are claimed together, all or none, before `work` runs, and `w.docs`
+  holds their members. A set someone else holds sends the task back with
+  backoff.
+- `onSuccess(w, ctx)` runs after a commit lands. It is at most once, so what it
+  does must be safe to skip.
+- `onDependency(w, deps, ctx)` runs when a commit loses a dependency race.
+
+Throw instead of returning to give the task another fate:
+
+- `RetryError(message, orMoveTo?)` tries it again later, counting the attempt;
+  once the attempts run out it moves to `orMoveTo` or the error queue.
+- `MoveError(message, queue?)` moves it now, to `queue` or the error queue.
+- `FatalWorker(message)` stops every worker; the task comes back when its lease
+  lapses.
+- Anything else stops this worker, after the gateway quarantines the task if
+  this was its last allowed claim.
+
+`w` carries `task`, `value` (its JSON value), `docs`, and `sets`. `ctx` carries
+`signal`, aborted once the worker starts stopping; `stop()`, to stop once this
+task is settled; `sleep(ms)`, which wakes early when stopping; and `read(kind,
+fields)` and `time()`, reads the gateway answers mid-turn.
+
+Long work needs nothing extra: the client tells the gateway it is still working
+while a function runs.
+
+### Modifications
+
+`M.of(...)` commits its operations together, or not at all:
+
+```typescript
+M.of(
+  M.deleting(w.task),
+  M.inserting({ queue: "/next", value: { n: 1 } }),
+  M.inserting({ queue: "/later", value: 2, byMs: 60_000 }),
+  M.changing(w.docs[0], { content: { count: 3 } }),
+  M.depending(otherDoc),
+);
+```
+
+Name a task or doc as it was handed over; the gateway moves the versions of the
+task in hand and its claimed docs to wherever renewal left them.
+
+### Options
+
+```typescript
+new Worker(queues, handlers, {
+  workTimeoutS: 300, // how long one task should take; the operator caps it
+  maxAttempts: 0,    // retries before quarantine; 0 is no limit
+  maxClaims: 0,      // claims a task may fail to survive; 0 is 5, negative is none
+  retryDelayS: 0,    // base retry delay, and the wait after doc contention; 0 is 30s
+  errorQueue: "",    // where moved tasks go; "{inbox}/err" by default
 });
 ```
 
-## EntroQClient
+Durations are whole seconds.
 
-The low-level client. It handles the wire protocol, generates a claimant ID, and
-exposes the task and document operations.
+## A gateway you did not start
 
-```typescript
-const client = new EntroQClient({
-  baseUrl: "http://localhost:9100", // required
-  claimantId: "my-worker",          // optional; a random id is generated otherwise
-  headers: { Authorization: "Bearer …" }, // optional; sent on every request
-});
-```
-
-Tasks:
-
-- `time()` — server time, ms since epoch (as a string).
-- `queues(prefix?, exact?, limit?)` / `queueStats(...)` — queue listing and stats.
-- `tasks(request)` — list tasks in a queue.
-- `tryClaim(queues, durationMs?)` — claim a task if one is available now; returns
-  a `ClaimResponse` whose `task` is omitted when nothing is available.
-- `claim(queues, durationMs?, pollMs?)` — block until a task is claimed.
-- `modify(request)` — apply an atomic batch of `inserts`/`changes`/`deletes`/
-  `depends` (and the `doc*` equivalents). Returns the inserted/changed tasks.
-- `streamTasks(request)` — async iterator of tasks (NDJSON over chunked
-  transfer).
-
-Documents (shared state in the same transaction space as tasks):
-
-- `docs(request)` — list docs in a namespace.
-- `claimDocs(request)` — atomically claim all docs sharing a primary key.
-- `namespaceStats(request?)` — per-namespace doc stats.
-
-## EntroQWorker
-
-Claims tasks from one or more queues and dispatches each to a handler, renewing
-the claim (and any claimed docs) in the background while the handler runs.
+`entroq` alone uses nothing but `fetch`, `AbortSignal`, and timers, so it runs
+anywhere those do. Given the URL of an `eqlink work --addr` already serving:
 
 ```typescript
-const worker = new EntroQWorker(client, {
-  leaseMs: 30000,      // claim/renewal duration (default 30s)
-  pollMs: 5000,        // poll interval when a queue is empty (default 5s)
-  retryDelayMs: 30000, // default delay for EntroQRetryError (default 30s)
-  errQueue: "",        // default destination for EntroQMoveError
-  maxAttempts: 0,      // >0 moves over-attempted tasks to errQueue (default off)
-});
+import { Gateway, Worker } from "entroq";
+
+const gateway = new Gateway({ url: "http://127.0.0.1:43117/" });
+await gateway.run(worker);
+gateway.stop(); // drains, from elsewhere
 ```
 
-A handler is an `async (task, docs) => …` that either returns a modify request
-to apply atomically, or returns nothing (`void`) to finish via a finisher:
-
-```typescript
-// Plain function: do work, return the modification to apply.
-await worker.run(["/my/queue"], async (task) => {
-  await handle(task.value);
-  return { deletes: [{ id: task.id, version: task.version, queue: task.queue }] };
-});
-```
-
-To claim docs before work, or to finalize when the handler returns `void`, build
-a handler and chain `.selector()` / `.finisher()`:
-
-```typescript
-const handle = EntroQWorker.handler(async (task, docs) => {
-  // docs are the claimed docs, sorted by (primary key, secondary key).
-  return { deletes: [{ id: task.id, version: task.version, queue: task.queue }] };
-})
-  .selector(async (task) => [{ namespace: "config", key: `${task.queue}/settings` }])
-  .finisher(async (task, docs) => { /* runs when doWork returns void */ });
-
-await worker.run(["/my/queue"], handle);
-```
-
-Control flow from inside a handler:
-
-- `throw new EntroQStopWorker()` — stop the loop cleanly after this task.
-- `throw new EntroQRetryError(msg, delayMs?)` — re-queue this task after a delay.
-- `throw new EntroQMoveError(msg, queue?)` — move this task to an error queue.
-
-Call `worker.stop()` from elsewhere to unblock a waiting claim and exit after the
-current task finishes.
-
-## Error handling
-
-A failed modification raises an **`EntroQDependencyError`** (HTTP 409 Conflict):
-the version you pinned drifted, the task you targeted was already claimed or
-deleted, or an insert ID collided. Re-read the affected tasks and retry. The
-error groups the failed IDs by action:
-
-```typescript
-import { EntroQDependencyError } from "entroq";
-
-try {
-  await client.modify({ deletes: [{ id, version, queue }] });
-} catch (err) {
-  if (err instanceof EntroQDependencyError) {
-    console.log("conflicting deletes:", err.deletes); // also .inserts/.changes/.depends/.claims
-  }
-}
-```
+`npm run typecheck` checks that it type-checks with browser types alone. A
+browser worker would also need the gateway to serve CORS and to sit behind
+authentication, since whoever reaches it can work its queues; neither is built
+yet.
 
 ## Development
 
-### Tests
-
-Unit tests mock the network; integration tests run against a real, ephemeral
-EntroQ server.
-
 ```bash
-npm test                  # unit + integration
-npx vitest run --coverage # with coverage
+npm install
+npm run typecheck
+npm test   # the integration tests build eqlink and run eqmem with `go run`
+npm run build
 ```
-
-The integration tests require the **Go** toolchain: they start the in-memory
-server with `go run ./cmd/eqmem serve` and are skipped automatically if `go` is not on
-`PATH`.
-
-## Architecture
-
-- **`EntroQClient`** — low-level HTTP/JSON client; wire protocol, claimant IDs,
-  RESTful transcoding via Vanguard.
-- **`EntroQWorker`** — worker abstraction with background lease renewal.
-- **Streaming** — real-time task listing via HTTP chunked transfer (NDJSON).
