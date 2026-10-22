@@ -71,18 +71,28 @@ func isDevVersion(v string) bool {
 	return strings.HasSuffix(v, "-dev")
 }
 
+// initLock is the advisory lock InitSchema holds, an arbitrary number that
+// nothing else in EntroQ uses.
+const initLock = 7243057601
+
 // InitSchema applies the full idempotent EntroQ DDL to db and records
-// SchemaDigest. Safe to run on an already-initialized database.
+// SchemaDigest. Safe to run on an already-initialized database, and from
+// several processes at once, as replicas started together do.
 //
 // The schema and the digest's statement are sent as one multi-statement
 // query, which PostgreSQL runs as a single implicit transaction, so the
 // migration and both stamps commit together or not at all. The digest covers
-// schema.sql alone, not the statement recording it.
+// schema.sql alone, not the statement recording it. The query first takes a
+// transaction-scoped advisory lock, so concurrent calls apply the schema one
+// at a time: without it, two CREATE ... IF NOT EXISTS of the same object can
+// both find it absent and collide in the catalog. The lock ends with the
+// transaction, even one whose connection dies.
 func InitSchema(ctx context.Context, db *sql.DB) error {
+	lock := fmt.Sprintf("SELECT pg_advisory_xact_lock(%d);\n", initLock)
 	stamp := fmt.Sprintf(`
 INSERT INTO entroq.meta (key, value) VALUES ('schema_digest', '%s')
     ON CONFLICT (key) DO UPDATE SET value = excluded.value;`, SchemaDigest)
-	if _, err := db.ExecContext(ctx, SchemaSQL+stamp); err != nil {
+	if _, err := db.ExecContext(ctx, lock+SchemaSQL+stamp); err != nil {
 		return fmt.Errorf("init schema: %w", err)
 	}
 	return nil
