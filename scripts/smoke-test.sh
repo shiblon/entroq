@@ -9,29 +9,40 @@ set -e
 echo "--- Starting EntroQ Sandbox ---"
 docker-compose up -d --build
 
-# Cleanup on exit
-trap 'docker-compose down' EXIT
+# Local builds of the command-line tools the tests drive the sandbox with.
+BIN_DIR=$(mktemp -d)
+trap 'docker-compose down; rm -rf "$BIN_DIR"' EXIT
+go build -o "$BIN_DIR/eqc" ./cmd/eqc
+go build -o "$BIN_DIR/eqlink" ./cmd/eqlink
+EQC="$BIN_DIR/eqc --svcaddr localhost:37706"
 
-# 2. Wait for EntroQ to be ready (max 30s)
+# 2. Wait for EntroQ to answer (max 60s)
 echo "--- Waiting for EntroQ to be healthy ---"
-for i in {1..30}; do
-  if docker exec $(docker-compose ps -q entroq) /bin/eqpg schema check > /dev/null 2>&1; then
+for i in {1..60}; do
+  if $EQC time > /dev/null 2>&1; then
     echo "EntroQ is ready!"
     break
+  fi
+  if [ "$i" = 60 ]; then
+    echo "EntroQ did not answer within 60s" >&2
+    exit 1
   fi
   sleep 1
 done
 
-# 3. Go Smoke Test
+# 3. Go Smoke Test: the Go client, through eqc, inserts and claims a task
 echo "--- Running Go Smoke Test ---"
-go test -v -run Example_manualClaimAndRenew github.com/shiblon/entroq
+$EQC ins -q /smoke/go -v '"go-work"' > /dev/null
+if ! $EQC claim -q /smoke/go | grep -q 'go-work'; then
+  echo "Go claim did not return the inserted task" >&2
+  exit 1
+fi
+echo "Go insert/claim success!"
 
 # 4. JS/TS Smoke Test (Node), through an eqlink work child
 echo "--- Running JS Smoke Test ---"
 (cd clients/js && npm install --no-package-lock && npm run build > /dev/null 2>&1)
-EQLINK_DIR=$(mktemp -d)
-go build -o "$EQLINK_DIR/eqlink" ./cmd/eqlink
-EQLINK="$EQLINK_DIR/eqlink" node -e "
+EQLINK="$BIN_DIR/eqlink" node -e "
 const { Worker, M } = require('./clients/js/dist/index.js');
 const { NodeGateway } = require('./clients/js/dist/node.js');
 (async () => {
@@ -63,6 +74,5 @@ const { NodeGateway } = require('./clients/js/dist/node.js');
     }
 })();
 "
-rm -rf "$EQLINK_DIR"
 
 echo "--- ALL SMOKE TESTS PASSED ---"

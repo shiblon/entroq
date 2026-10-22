@@ -153,7 +153,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&rootFlags.authzToken, "authz_token", "", "Pass an Authorization token.")
 	rootCmd.PersistentFlags().StringVar(&rootFlags.pgURL, "pg_url", "", "PostgreSQL URL for direct backend connection.")
 	rootCmd.PersistentFlags().StringVar(&rootFlags.pgHeartbeat, "pg_heartbeat", "", "How often a direct PG connection checks for tasks that became ready through time or other clients (e.g. 5s; default 5s, 0 disables).")
-	rootCmd.PersistentFlags().StringVar(&rootFlags.claimant, "claimant", "", "Claimant ID for this process, taken exactly as given. Defaults to a generated one, which begins with the --authz-token's subject if a token is set. Also read from EQC_CLAIMANT.")
+	rootCmd.PersistentFlags().StringVar(&rootFlags.claimant, "claimant", "", "Claimant ID for this process, taken exactly as given. Defaults to a generated one, which begins with the --authz_token's subject if a token is set. Also read from EQC_CLAIMANT.")
 
 	viper.BindPFlag("svcaddr", rootCmd.PersistentFlags().Lookup("svcaddr"))
 	viper.BindPFlag("authz_token", rootCmd.PersistentFlags().Lookup("authz_token"))
