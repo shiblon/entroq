@@ -8,6 +8,11 @@ import (
 	"github.com/shiblon/entroq"
 	pb "github.com/shiblon/entroq/api"
 	"github.com/shiblon/entroq/pkg/authz"
+	"github.com/shiblon/entroq/pkg/backend/eqmem"
+	"github.com/shiblon/entroq/pkg/version"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 // actionsFor returns the actions requested for one namespace, and whether it
@@ -112,4 +117,37 @@ func TestClaimDocsAuthzAsksForWhatTheClaimDoes(t *testing.T) {
 			t.Errorf("got %+v, want no queue: the claim reads no task", req.Queues)
 		}
 	})
+}
+
+// TestClaimDocsNamesSetsByProtocol: each protocol names what to claim its own
+// way. Protocol 1 claims the set namespace and key name; protocol 2 names its
+// sets in sets, and a protocol-2 claim with none is refused rather than read
+// as protocol 1.
+func TestClaimDocsNamesSetsByProtocol(t *testing.T) {
+	ctx := context.Background()
+	svc, err := New(ctx, eqmem.Opener())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	declared := func(p string) context.Context {
+		return metadata.NewIncomingContext(ctx, metadata.Pairs(version.ProtocolHeader, p))
+	}
+
+	if _, err := svc.ClaimDocs(ctx, &pb.ClaimDocsRequest{ClaimQuery: &pb.DocClaim{
+		Claimant: "c1", Namespace: "ns", Key: "k1", DurationMs: 60_000,
+	}}); err != nil {
+		t.Errorf("protocol 1 claim by namespace and key: %v", err)
+	}
+	_, err = svc.ClaimDocs(declared("2"), &pb.ClaimDocsRequest{ClaimQuery: &pb.DocClaim{
+		Claimant: "c1", Namespace: "ns", Key: "k2", DurationMs: 60_000,
+	}})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("protocol 2 claim with no sets: got %v, want InvalidArgument", err)
+	}
+	if _, err := svc.ClaimDocs(declared("2"), &pb.ClaimDocsRequest{ClaimQuery: &pb.DocClaim{
+		Claimant: "c1", DurationMs: 60_000,
+		Sets: []*pb.DocSetClaim{{Set: &pb.DocID{Namespace: "ns", Ref: &pb.DocID_Key{Key: "k3"}}}},
+	}}); err != nil {
+		t.Errorf("protocol 2 claim by sets: %v", err)
+	}
 }

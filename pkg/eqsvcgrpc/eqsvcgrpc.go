@@ -1092,12 +1092,16 @@ func (s *QSvc) ClaimDocs(ctx context.Context, req *pb.ClaimDocsRequest) (*pb.Cla
 	}
 	cq := req.GetClaimQuery()
 	// The claimant is the request's: the service's client would otherwise fill
-	// in its own for an empty one, so check the claim as received. At protocol
-	// 2 the sets name what to claim, and the namespace and key are ignored.
+	// in its own for an empty one, so check the claim as received. Each
+	// protocol names what to claim its own way: protocol 1 by namespace and
+	// key, one set; protocol 2 in sets, and only there.
 	args := []entroq.DocClaimArg{entroq.ClaimingSetsAs(cq.GetClaimant())}
-	if sets := cq.GetSets(); len(sets) > 0 {
+	if sets := cq.GetSets(); len(sets) > 0 || protocol >= 2 {
 		if protocol < 2 {
 			return nil, codeErrorf(codes.InvalidArgument, "claim docs: sets are protocol 2, and the request declares protocol %d", protocol)
+		}
+		if len(sets) == 0 {
+			return nil, codeErrorf(codes.InvalidArgument, "claim docs: protocol 2 names the sets to claim in sets; namespace and key are protocol 1")
 		}
 		for _, sc := range sets {
 			key, ok := sc.GetSet().GetRef().(*pb.DocID_Key)

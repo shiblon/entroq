@@ -1367,7 +1367,8 @@ func (x *DocSetClaim) GetOmitMembers() bool {
 // named is claimed, or none is.
 //
 // In protocol 1, namespace and key name the one set, the docs sharing that
-// key. Protocol 2 names the sets in sets, and namespace and key are ignored.
+// key. Protocol 2 names the sets in sets, which must not be empty, and
+// namespace and key are protocol 1 only.
 type DocClaim struct {
 	state         protoimpl.MessageState
 	sizeCache     protoimpl.SizeCache
