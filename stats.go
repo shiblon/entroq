@@ -175,7 +175,7 @@ func (c *EntroQ) WaitQueuesEmpty(ctx context.Context, opts ...QueuesOpt) error {
 
 // Tasks returns a slice of all tasks in the given queue.
 func (c *EntroQ) Tasks(ctx context.Context, queue string, opts ...TasksOpt) ([]*Task, error) {
-	return c.tasks(ctx, queue, c.ClientID, opts)
+	return c.tasks(ctx, queue, c.clientID, opts)
 }
 
 // tasks lists the tasks in queue for a client whose claimant is self, which is

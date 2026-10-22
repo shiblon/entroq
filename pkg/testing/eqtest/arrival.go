@@ -83,13 +83,13 @@ func UpdateArrival(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPr
 			t.Fatalf("Renew response: want one task and one set, got %+v", resp)
 		}
 		rt, rg := resp.ChangedTasks[0], resp.ChangedSets[0]
-		if rt.Version != task.Version+1 || rt.Claimant != client.ClientID || rt.At.Before(before.Add(59*time.Minute)) {
-			t.Errorf("Renewed task: want version %d held by %s for an hour, got %+v", task.Version+1, client.ClientID, rt)
+		if rt.Version != task.Version+1 || rt.Claimant != client.ID() || rt.At.Before(before.Add(59*time.Minute)) {
+			t.Errorf("Renewed task: want version %d held by %s for an hour, got %+v", task.Version+1, client.ID(), rt)
 		}
 		if rt.Claims != task.Claims || rt.Attempt != task.Attempt || string(rt.Value) != string(task.Value) {
 			t.Errorf("Renewed task changed more than its arrival: before %+v, after %+v", task, rt)
 		}
-		if rg.Version != set.Version+1 || rg.Claimant != client.ClientID || rg.At.Before(before.Add(59*time.Minute)) || rg.NumDocs != 2 {
+		if rg.Version != set.Version+1 || rg.Claimant != client.ID() || rg.At.Before(before.Add(59*time.Minute)) || rg.NumDocs != 2 {
 			t.Errorf("Renewed set: want version %d held for an hour with 2 docs, got %+v", set.Version+1, rg)
 		}
 		// Every write moves the version, so what was read before is stale.
@@ -133,7 +133,7 @@ func UpdateArrival(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPr
 		if err != nil {
 			t.Fatalf("Update: %v", err)
 		}
-		if resp.ChangedTasks[0].Claimant != client.ClientID || resp.ChangedSets[0].Claimant != "" {
+		if resp.ChangedTasks[0].Claimant != client.ID() || resp.ChangedSets[0].Claimant != "" {
 			t.Errorf("Mixed update: want the task kept and the set released, got %+v and %+v", resp.ChangedTasks[0], resp.ChangedSets[0])
 		}
 	})
@@ -161,7 +161,7 @@ func UpdateArrival(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPr
 		if err != nil {
 			t.Fatalf("Renew empty set: %v", err)
 		}
-		if rg := resp.ChangedSets[0]; rg.Version != set.Version+1 || rg.NumDocs != 0 || rg.Claimant != client.ClientID {
+		if rg := resp.ChangedSets[0]; rg.Version != set.Version+1 || rg.NumDocs != 0 || rg.Claimant != client.ID() {
 			t.Errorf("Renewed empty set: want version %d, no docs, still held, got %+v", set.Version+1, rg)
 		}
 	})

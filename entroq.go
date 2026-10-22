@@ -462,7 +462,7 @@ func GenHex16() string {
 type EntroQ struct {
 	backend   Backend
 	opener    BackendOpener
-	ClientID  string
+	clientID  string
 	idGenRand IDGenerator
 
 	// subject is who this client acts for, set by WithSubjectFromJWT; every
@@ -499,7 +499,7 @@ func WithSubjectFromJWT(token string) Option {
 // WithSubjectFromJWT generate it.
 func WithClaimantID(id string) Option {
 	return func(eq *EntroQ) {
-		eq.ClientID = id
+		eq.clientID = id
 	}
 }
 
@@ -573,8 +573,8 @@ func New(ctx context.Context, opener BackendOpener, opts ...Option) (*EntroQ, er
 	if n := len(eq.newClaimant()); n > MaxClaimantBytes {
 		return nil, InvalidArgumentf("subject %q makes %d-byte claimants, limit is %d", eq.subject, n, MaxClaimantBytes)
 	}
-	if eq.ClientID == "" {
-		eq.ClientID = eq.newClaimant()
+	if eq.clientID == "" {
+		eq.clientID = eq.newClaimant()
 	}
 	return eq, nil
 }
@@ -597,7 +597,7 @@ func (c *EntroQ) Close() error {
 // like Modify, Claim, etc. To change the ID per call (usually not needed, and
 // can be dangerous), use the "As" calls, e.g., ModifyAs.
 func (c *EntroQ) ID() string {
-	return c.ClientID
+	return c.clientID
 }
 
 // GenID creates a new ID using the client's ID generator.
@@ -759,7 +759,7 @@ func claimQueryFromOpts(claimant string, opts ...ClaimOpt) *ClaimQuery {
 // value given in options, and an arrival time computed from the duration. The
 // default duration if none is given is DefaultClaimDuration.
 func (c *EntroQ) Claim(ctx context.Context, opts ...ClaimOpt) (*Task, error) {
-	query := claimQueryFromOpts(c.ClientID, opts...)
+	query := claimQueryFromOpts(c.clientID, opts...)
 	if err := query.Validate(); err != nil {
 		return nil, fmt.Errorf("claim: %w", err)
 	}
@@ -772,7 +772,7 @@ func (c *EntroQ) Claim(ctx context.Context, opts ...ClaimOpt) (*Task, error) {
 // dependency tasks are not present. This can be used, for example, to ensure
 // that configuration tasks haven't changed.
 func (c *EntroQ) TryClaim(ctx context.Context, opts ...ClaimOpt) (*Task, error) {
-	query := claimQueryFromOpts(c.ClientID, opts...)
+	query := claimQueryFromOpts(c.clientID, opts...)
 	if err := query.Validate(); err != nil {
 		return nil, fmt.Errorf("try claim: %w", err)
 	}
@@ -799,7 +799,7 @@ func (c *EntroQ) TryClaim(ctx context.Context, opts ...ClaimOpt) (*Task, error) 
 //   - changed: The tasks that were successfully updated.
 //   - err: A *DependencyError if any version check failed.
 func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (*ModifyResponse, error) {
-	mod := NewModification(c.ClientID, modArgs...)
+	mod := NewModification(c.clientID, modArgs...)
 	// Generate IDs for any inserts that don't have them. This is necessary
 	// because the backend does not assign IDs.
 	for _, ins := range mod.Inserts {
@@ -856,7 +856,7 @@ func (c *EntroQ) Docs(ctx context.Context, rq *DocQuery) ([]*Doc, error) {
 func (c *EntroQ) ClaimDocs(ctx context.Context, args ...DocClaimArg) ([]*DocSet, error) {
 	cq := NewDocClaim(args...)
 	if cq.Claimant == "" {
-		cq.Claimant = c.ClientID
+		cq.Claimant = c.clientID
 	}
 	if cq.Duration == 0 && cq.TaskToMatch == nil {
 		cq.Duration = DefaultClaimDuration

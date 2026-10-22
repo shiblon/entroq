@@ -640,8 +640,8 @@ func DocClaimantBehavior(ctx context.Context, t *testing.T, client *entroq.Entro
 		t.Fatalf("future-at insert: %v", err)
 	}
 	inserted := resp.InsertedDocs[0]
-	if inserted.Claimant != client.ClientID {
-		t.Errorf("after future-at insert: claimant want %q, got %q", client.ClientID, inserted.Claimant)
+	if inserted.Claimant != client.ID() {
+		t.Errorf("after future-at insert: claimant want %q, got %q", client.ID(), inserted.Claimant)
 	}
 	if time.Until(inserted.At) <= 0 {
 		t.Errorf("after future-at insert: at %v is not in the future", inserted.At)
@@ -650,7 +650,7 @@ func DocClaimantBehavior(ctx context.Context, t *testing.T, client *entroq.Entro
 	if err != nil {
 		t.Fatalf("same-client reclaim after future-at insert: %v", err)
 	}
-	if len(reclaimed) != 1 || reclaimed[0].Claimant != client.ClientID {
+	if len(reclaimed) != 1 || reclaimed[0].Claimant != client.ID() {
 		t.Fatalf("same-client reclaim after future-at insert: got %+v", reclaimed)
 	}
 
@@ -680,8 +680,8 @@ func DocClaimantBehavior(ctx context.Context, t *testing.T, client *entroq.Entro
 		t.Fatalf("change with future at: %v", err)
 	}
 	doc = resp.ChangedDocs[0]
-	if doc.Claimant != client.ClientID {
-		t.Errorf("after future-at change: claimant want %q, got %q", client.ClientID, doc.Claimant)
+	if doc.Claimant != client.ID() {
+		t.Errorf("after future-at change: claimant want %q, got %q", client.ID(), doc.Claimant)
 	}
 
 	// Change with past at (release): requested.At <= now → claimant cleared.
@@ -970,8 +970,8 @@ func DocSets(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPrefix s
 		// was already there at version 0, so it moves the version like any
 		// other. Only an insert creates a set, at version 0.
 		if set.Namespace != ns || set.Key != "empty" || set.Version != 1 ||
-			set.Claimant != client.ClientID || !set.At.After(before) {
-			t.Errorf("Claimed empty set: got %+v, want %s/empty held by %s past %v", set, ns, client.ClientID, before)
+			set.Claimant != client.ID() || !set.At.After(before) {
+			t.Errorf("Claimed empty set: got %+v, want %s/empty held by %s past %v", set, ns, client.ID(), before)
 		}
 		if _, err := client.Modify(ctx, entroq.PuttingDocInto(ns, entroq.WithKeys("empty", "x")), entroq.ModifyAs(intruder)); !entroq.IsDependency(err) {
 			t.Errorf("Intruder insert into a claimed empty set: want a claim error, got %v", err)
@@ -1208,8 +1208,8 @@ func DocClaimSets(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 			t.Errorf("Set a claimed without members: want no docs and a count of 2, got %d docs, count %d", len(sets[1].Docs), sets[1].NumDocs)
 		}
 		for _, g := range sets {
-			if g.Claimant != client.ClientID {
-				t.Errorf("Set %s: want it held by %s, got %q", g.Key, client.ClientID, g.Claimant)
+			if g.Claimant != client.ID() {
+				t.Errorf("Set %s: want it held by %s, got %q", g.Key, client.ID(), g.Claimant)
 			}
 		}
 		if _, err := client.UpdateArrival(ctx, entroq.ReadyNow().Docs(sets...)); err != nil {
