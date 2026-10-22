@@ -25,6 +25,16 @@ class EntroQBase(ABC):
     async def __aenter__(self: _EntroQ) -> _EntroQ:
         return self
 
+    def as_claimant(self: _EntroQ, claimant_id: str) -> _EntroQ:
+        """Return a client sharing this one's connection that claims, renews,
+        and commits as ``claimant_id``.
+
+        A doc set excludes other claimants only, so every consumer needs a
+        claimant of its own: :class:`EntroQWorker` takes one per run. A client
+        that cannot act as another claimant raises ``NotImplementedError``.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot act as another claimant")
+
     async def __aexit__(
         self,
         exc_type: type[BaseException] | None,

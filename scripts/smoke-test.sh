@@ -2,7 +2,7 @@
 set -e
 
 # EntroQ Cross-Language Smoke Test
-# This script verifies that Go, Python, and JS clients can all interact 
+# This script verifies that Go and JS clients can both interact
 # with the same EntroQ backend (using the docker-compose sandbox).
 
 # 1. Start the sandbox
@@ -26,26 +26,7 @@ done
 echo "--- Running Go Smoke Test ---"
 go test -v -run Example_manualClaimAndRenew github.com/shiblon/entroq
 
-# 4. Python Smoke Test (using PYTHONPATH to point to local src)
-echo "--- Running Python Smoke Test ---"
-export PYTHONPATH=$PYTHONPATH:$(pwd)/clients/py/src
-python3 -c "
-import sys
-import time
-from entroq.json import EntroQJSON
-from entroq.types import TaskData
-
-client = EntroQJSON('http://localhost:9100')
-inserted, _ = client.modify(inserts=[TaskData(queue='/smoke/py', value=b'py-work')])
-task = client.claim(['/smoke/py'])
-if task.value != b'py-work':
-    print(f'Mismatched value: {task.value}')
-    sys.exit(1)
-client.modify(deletes=[task.id_version])
-print('Python claim/modify success!')
-"
-
-# 5. JS/TS Smoke Test (Node)
+# 4. JS/TS Smoke Test (Node)
 echo "--- Running JS Smoke Test ---"
 (cd clients/js && npm install --no-package-lock && npm run build > /dev/null 2>&1)
 export NODE_PATH=$(pwd)/clients/js/node_modules

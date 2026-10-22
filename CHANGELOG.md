@@ -149,13 +149,17 @@ runs, so plan a short maintenance window on large doc tables.
   workers reaches the claim limit. A modify on an ended context landed on some
   backends and not others, so the outcome used to depend on the backend. To
   answer a task and stop, return the sentinel with `ThenStop` while the
-  context is live. eqmr mappers and reducers also retry transient failures
-  after 1s rather than the worker's 30s default.
+  context is live. The Python worker matches: cancelling its asyncio task
+  commits nothing, even when a handler or selector turns the cancellation
+  into a `RetryError` or `MoveError`. eqmr mappers and reducers also retry
+  transient failures after 1s rather than the worker's 30s default.
 - **Every worker `Run` is its own consumer.** A doc set excludes other
   claimants only, so `Run` claims, renews, and commits as a claimant of its
   own, a fresh random ID by default; `worker.AsClaimant` names it instead.
   Concurrent Runs, of one worker or of workers sharing a client, no longer
-  hold each other's doc sets.
+  hold each other's doc sets. The Python `EntroQWorker` does the same, a
+  claimant of its own per run on its client's connection
+  (`EntroQBase.as_claimant`).
 - **A doc claim asks for what it does.** Claiming a doc set still needs
   `CLAIM` on its namespace, and now also `READ` there when the claim returns
   the set's docs, since that discloses their contents; a set claimed

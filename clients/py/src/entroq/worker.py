@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import secrets
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
@@ -606,6 +607,31 @@ def _releasing(mod: Modification, sets: Sequence[Doc]) -> None:
 # EntroQWorker
 # ---------------------------------------------------------------------------
 
+async def _stop(work: asyncio.Future) -> None:
+    """Cancel work and wait for it to end, whatever it ends with."""
+    work.cancel()
+    await asyncio.gather(work, return_exceptions=True)
+
+
+async def _cancellation_wins(aw: Awaitable):
+    """Await aw so that cancelling the caller cancels the caller.
+
+    Awaited directly, a handler phase receives the caller's cancellation and
+    may answer it with a RetryError or MoveError, which the caller would then
+    see in its place: the cancellation is gone, and the worker would commit a
+    disposition while it is stopping. Python before 3.11 cannot tell that this
+    happened. Run in a task of its own behind a shield, the phase cannot catch
+    the caller's cancellation: the caller gets it, stops the phase, and
+    re-raises, so a canceled worker applies no retry or move, as in Go.
+    """
+    inner = asyncio.ensure_future(aw)
+    try:
+        return await asyncio.shield(inner)
+    except asyncio.CancelledError:
+        await _stop(inner)
+        raise
+
+
 class EntroQWorker:
     """Async worker: claims tasks from queues and dispatches to a Handler.
 
@@ -677,6 +703,10 @@ class EntroQWorker:
         if err_queue and err_q_map is not None:
             raise ValueError("err_queue and err_q_map are mutually exclusive")
         self._client = client
+        # Every run is its own consumer: a doc set excludes other claimants
+        # only, so workers sharing a client, or one claimant's two runs, would
+        # hold each other's sets. The client's own claimant is never used.
+        self._eq = client.as_claimant(secrets.token_hex(8))
         self._queues = list(queues)
         self._claim_duration_s = claim_duration_s
         if err_queue:
@@ -727,7 +757,7 @@ class EntroQWorker:
         return _FnHandler(fn)
 
     async def _claim_docs(self, task: Task, handler: Handler) -> ClaimedDocs:
-        doc_claims = await handler._select(task)
+        doc_claims = await _cancellation_wins(handler._select(task))
         if not doc_claims:
             return ClaimedDocs()
         # One all-or-nothing claim of every set. Claiming them one at a time
@@ -739,7 +769,7 @@ class EntroQWorker:
         # of their own, so they expire exactly with it, from one reading of
         # one clock. The claim fails if the task is no longer at this version,
         # which means this worker no longer holds it.
-        return await self._client.claim_doc_sets(doc_claims, task_to_match=task)
+        return await self._eq.claim_doc_sets(doc_claims, task_to_match=task)
 
     async def _failed(self, task: Task, exc: BaseException, *,
                       sets: Sequence[Doc] = ()) -> bool:
@@ -833,7 +863,7 @@ class EntroQWorker:
         ops = [change]
         for group in sets:
             ops.append(Modification.arriving(group, 0.0))
-        await self._client.modify(Modification(*ops))
+        await self._eq.modify(Modification(*ops))
 
     async def _process(self, task: Task, handler: Handler) -> bool:
         """Process one already-claimed task. Returns False if the worker should stop."""
@@ -850,7 +880,7 @@ class EntroQWorker:
             # reason is recorded, and the claim count resets, so a task that is
             # inspected and re-queued starts its budget over rather than
             # tripping the limit again on its first claim.
-            await self._client.modify(Modification(
+            await self._eq.modify(Modification(
                 Modification.changing(
                     task, queue=dest, at=None,
                     attempt=task.attempt + 1,
@@ -888,25 +918,33 @@ class EntroQWorker:
         timed_out = False
 
         since_claim_s = asyncio.get_running_loop().time() - claimed_at
-        async with _renewing(self._client, task, docs, since_claim_s) as state:
+        async with _renewing(self._eq, task, docs, since_claim_s) as state:
             work = asyncio.ensure_future(handler.do_work(task, docs))
             state.work = work
+            # The body is awaited through a shield, so a cancellation of this
+            # worker lands here rather than in the body, which could turn it
+            # into a RetryError and lose it. See _cancellation_wins.
+            guarded = asyncio.shield(work)
             try:
                 if self._work_timeout_s > 0:
-                    # wait_for cancels the body on expiry, so a body that
-                    # swallows cancellation cannot be made to stop -- the same
-                    # limit the Go worker's context has.
-                    result = await asyncio.wait_for(work, self._work_timeout_s)
+                    result = await asyncio.wait_for(guarded, self._work_timeout_s)
                 else:
-                    result = await work
+                    result = await guarded
             except asyncio.TimeoutError:
                 # Before the Exception clause: a timeout is an Exception too,
-                # and it is not the handler's failure.
+                # and it is not the handler's failure. wait_for gave up on the
+                # shield, so the body is stopped here; one that swallows
+                # cancellation cannot be made to stop, the same limit the Go
+                # worker's context has.
+                await _stop(work)
                 timed_out = True
             except asyncio.CancelledError:
-                # Only swallow a cancellation the renewer caused; anything
-                # else is the caller stopping us and must keep propagating.
-                if not state.work_cancelled:
+                # A cancellation the renewer caused ended the body itself; the
+                # lost claim is raised below. Anything else is the caller
+                # stopping this worker, and cancellation wins: the body is
+                # stopped, nothing is committed, and the lease decides.
+                if not (state.work_cancelled and work.done()):
+                    await _stop(work)
                     raise
             except Exception as e:
                 do_work_exc = e
@@ -942,7 +980,7 @@ class EntroQWorker:
         # A backend refuses a modification naming no operation, so a body that
         # claimed nothing and decided nothing writes nothing.
         if not mod.is_empty():
-            await self._client.modify(mod)
+            await self._eq.modify(mod)
 
         # on_success holds no doc claim: the transaction ended with the commit.
         #
@@ -969,6 +1007,7 @@ class EntroQWorker:
         at the next await point.
         """
         self._stop_event.clear()
+        self._eq = self._client.as_claimant(secrets.token_hex(8))
         await self._run_loop(handler)
 
     async def _run_loop(self, handler: Handler) -> None:
@@ -977,7 +1016,7 @@ class EntroQWorker:
             # Race claim() against the stop signal so stop() can unblock a
             # claim() that is waiting indefinitely for a task to appear.
             claim_task = asyncio.create_task(
-                self._client.claim(
+                self._eq.claim(
                     self._queues,
                     duration_ms=int(self._claim_duration_s * 1000),
                 )

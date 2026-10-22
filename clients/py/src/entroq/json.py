@@ -211,6 +211,11 @@ class EntroQJSON(EntroQBase):
         if self._owns_http:
             await self.http.aclose()
 
+    def as_claimant(self, claimant_id: str) -> "EntroQJSON":
+        """Return a client on this one's HTTP connection that acts as
+        ``claimant_id``. Closing it leaves the connection open."""
+        return EntroQJSON(self._base_url, claimant_id, http_client=self.http)
+
     async def _request(self, method: str, path: str, *, json=None, params=None) -> dict:
         try:
             resp = await self.http.request(
