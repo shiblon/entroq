@@ -1,6 +1,7 @@
 // Package entroq defines an atomic task lease manager as described in depth at
 // https://github.com/shiblon/entroq and associated wiki pages.
-// You can get the docker image at https://hub.docker.com/shiblon/entroq.
+// Service images are published at ghcr.io/shiblon (entroq-pg, entroq-mem,
+// entroq-redis).
 //
 // The gist: if you have a bunch of stuff that needs to get done and you don't
 // want to lose any of it to failures, and you don't want to commit any of it
@@ -49,15 +50,16 @@
 //
 // # Doc Keys and Ordering
 //
-// The primary key sets related docs together. ClaimDocs acquires an
-// exclusive lease on all docs sharing a primary key in one atomic operation,
-// making the primary key the natural unit of exclusive ownership. The
-// secondary key provides a sort dimension within that set.
+// The primary key groups related docs into a doc set: the docs sharing a
+// namespace and primary key, with one version, claimant, and arrival between
+// them, which is the unit of exclusive ownership. ClaimDocs claims one or more
+// sets in one atomic operation, all of them or none; a set may be claimed
+// while it has no docs, and while it is held only its holder writes to it. The
+// secondary key is unique within a set and orders its docs.
 //
-// Both Docs and ClaimDocs return results ordered by (primary key, secondary
-// key). This is guaranteed by both the PostgreSQL and eqmem backends. A
-// worker that claims a primary-key set receives docs in stable secondary-key
-// order, making reduce-shaped strategies simple.
+// Docs and ClaimDocs return docs ordered by (primary key, secondary key) on
+// every backend. A worker that claims a set receives its docs in stable
+// secondary-key order, making reduce-shaped strategies simple.
 //
 // # Doc Storage Considerations
 //
@@ -66,11 +68,10 @@
 // will be slower and take more memory proportional to the count. Design
 // primary keys so that the set of docs under one key is reasonable.
 //
-// The eqmem backend performs O(n) range scans over the full namespace on every
-// Docs or ClaimDocs call. It is suitable for development, testing, and
-// low-volume production use when docs play a central role for you. For
-// high-volume or latency-sensitive workloads, PostgreSQL is the recommended
-// backend.
+// The eqmem backend keeps each namespace's docs in an in-memory btree, so a
+// Docs or ClaimDocs call costs O(log n + k) for the k docs it returns, and
+// everything lives in one process's memory. For data larger than that, or for
+// several servers sharing one store, PostgreSQL is the recommended backend.
 //
 // # Task-as-Mutex Pattern
 //

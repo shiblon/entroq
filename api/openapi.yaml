@@ -886,7 +886,7 @@ components:
                     type: array
                     items:
                         $ref: '#/components/schemas/Task'
-            description: TasksReqponse contains the tasks requested.
+            description: TasksResponse contains the tasks requested.
         TimeResponse:
             type: object
             properties:

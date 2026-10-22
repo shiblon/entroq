@@ -41,9 +41,9 @@ const (
 	// pill. Tasks only.
 	ChangeMode_CHANGE_RESET_CLAIMS ChangeMode = 1
 	// Change only when the task, or the doc set old_id names by key, is ready
-	// again: renewing a lease on it, or releasing it. Only new_data.at_ms is
-	// read; anything else given must match what old_id names. Keeps a task's
-	// claim count.
+	// again: renewing a lease on it, or releasing it. Only the arrival is read,
+	// new_data.at_ms at protocol 1 and new_data.by_ms at protocol 2; anything
+	// else given must match what old_id names. Keeps a task's claim count.
 	ChangeMode_CHANGE_LEASE ChangeMode = 2
 )
 
@@ -2283,7 +2283,7 @@ func (x *TasksRequest) GetOmitValues() bool {
 	return false
 }
 
-// TasksReqponse contains the tasks requested.
+// TasksResponse contains the tasks requested.
 type TasksResponse struct {
 	state         protoimpl.MessageState
 	sizeCache     protoimpl.SizeCache

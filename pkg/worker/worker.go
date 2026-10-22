@@ -19,11 +19,11 @@
 // single function that does the work and returns a Result describing the
 // modifications to apply.
 //
-//	client, _ := entroq.New(ctx, mem.Opener()) // Open an in-memory EntroQ backend.
+//	client, _ := entroq.New(ctx, eqmem.Opener()) // Open an in-memory EntroQ backend.
 //	w := worker.New[json.RawMessage](client,
-//		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, value json.RawMessage, _ []*entroq.DocSet) (*worker.Result, error) {
-//			log.Printf("Working on task %v", task.ID)
-//			return worker.Modify(task.Delete()), nil
+//		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, work *worker.Work[json.RawMessage]) (*worker.Result, error) {
+//			log.Printf("Working on task %v", work.Task.ID)
+//			return worker.Modify(work.Task.Delete()), nil
 //		}),
 //	)
 //	if err := w.Run(ctx, worker.Watching("/my/inbox")); err != nil {
@@ -131,8 +131,8 @@ type Handler[T any] interface {
 
 	// DoWork is called by Worker.Run for each claimed task. The task and its
 	// doc sets, empty ones included, are renewed together in the background
-	// while this function runs. value holds the result of
-	// unmarshaling task.Value into T. The sets are those TakeDocs claimed, in
+	// while this function runs. work.Value holds the result of
+	// unmarshaling task.Value into T. work.Sets are those TakeDocs claimed, in
 	// the order they were claimed (by namespace, then key), each with its docs;
 	// the slice is non-nil but empty when none were claimed, and a set may have
 	// no docs.
@@ -195,8 +195,7 @@ type MakeHandler[T any] func() (Handler[T], error)
 // run once it succeeds) rather than committing them yourself in a Finish
 // function. It is not handed a client: it runs under renewal, and its output is
 // the returned Result, which the worker commits in Finish at the stable version.
-// The sets parameter carries any doc sets claimed by WithTakeDocs, and can
-// be empty.
+// Work.Sets carries any doc sets claimed by WithTakeDocs, and can be empty.
 //
 // Return the Result (built with Modify) and a nil error on success; a nil Result
 // is a valid no-op. To retry the task return a RetryError (RetryErrorf); to move
@@ -330,7 +329,7 @@ type TakeResult struct {
 // entroq.ClaimKey. The worker owns the claim's lease and claimant, as it owns
 // the versions of a Modify result: it claims the sets as itself, until the
 // task's own arrival time, and ignores any lease (entroq.ClaimingSetsFor,
-// entroq.ClaimingSetsUntil) or claimant (entroq.ClaimingSetsAs) in args.
+// entroq.MatchingLeaseOf) or claimant (entroq.ClaimingSetsAs) in args.
 func Take(args ...entroq.DocClaimArg) *TakeResult {
 	return &TakeResult{args: args}
 }
