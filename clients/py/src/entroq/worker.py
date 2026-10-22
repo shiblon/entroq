@@ -26,7 +26,17 @@ from .base import EntroQBase
 # ---------------------------------------------------------------------------
 
 class StopWorker(Exception):
-    """Raise from do_work to stop the worker loop cleanly after the current task."""
+    """Raise to stop the worker, answering the task in hand first: a drain.
+
+    Raised from do_work or a selector, the task goes back now, ready for
+    another worker, with its doc sets released and no attempt counted. Raised
+    from a finisher, after the commit, the task is already done. Either way the
+    worker then stops cleanly.
+
+    To commit a result and then stop, return the Modification with
+    ``then_stop=True``; to retry or move the task and then stop, raise
+    RetryError or MoveError with ``then_stop=True``.
+    """
 
 
 class FatalWorker(Exception):
@@ -53,22 +63,31 @@ class RetryError(Exception):
     ``delay_s`` overrides the worker's ``retry_delay_s`` for this failure.
     ``or_move_to`` overrides the queue the task is quarantined to once it
     exhausts ``max_attempts``; it has no effect on the retries themselves.
-    Mirrors the Go client's ``RetryError.After`` and ``RetryError.OrMoveTo``.
+    ``then_stop`` stops the worker once the retry has landed. Mirrors the Go
+    client's ``RetryError.After``, ``RetryError.OrMoveTo`` and
+    ``RetryError.ThenStop``.
     """
 
     def __init__(self, message: str = "", *, delay_s: float | None = None,
-                 or_move_to: str = "") -> None:
+                 or_move_to: str = "", then_stop: bool = False) -> None:
         super().__init__(message)
         self.delay_s = delay_s
         self.or_move_to = or_move_to
+        self.then_stop = then_stop
 
 
 class MoveError(Exception):
-    """Raise from do_work to move the task to an error queue."""
+    """Raise from do_work to move the task to an error queue.
 
-    def __init__(self, message: str = "", *, queue: str = "") -> None:
+    ``then_stop`` stops the worker once the move has landed, as the Go client's
+    ``MoveError.ThenStop`` does.
+    """
+
+    def __init__(self, message: str = "", *, queue: str = "",
+                 then_stop: bool = False) -> None:
         super().__init__(message)
         self.queue = queue
+        self.then_stop = then_stop
 
 
 # ---------------------------------------------------------------------------
@@ -782,10 +801,11 @@ class EntroQWorker:
         returns: ``False`` to stop the worker loop, ``True`` to go on.
         """
         if isinstance(exc, StopWorker):
-            return False  # the claim expires naturally
+            await self._release(task, sets)
+            return False
         if isinstance(exc, (RetryError, MoveError)):
             await self._dispose(task, exc, sets=sets)
-            return True
+            return not exc.then_stop
         if isinstance(exc, FatalWorker):
             raise exc
         await self._quarantine_at_limit(task, sets, exc)
@@ -817,6 +837,15 @@ class EntroQWorker:
             return False
         return True
 
+    async def _release(self, task: Task, sets: Sequence[Doc]) -> None:
+        """Give the task back now, for a worker that is stopping: ready at
+        once, its sets released, no attempt counted, and its claim count reset,
+        since this was a decision and not a failure."""
+        ops = [Modification.changing(task, at=None, reset_claims=True)]
+        for group in sets:
+            ops.append(Modification.arriving(group, 0.0))
+        await self._eq.modify(Modification(*ops))
+
     async def _dispose(self, task: Task, exc: RetryError | MoveError, *,
                        sets: Sequence[Doc] = (), jitter: bool = False) -> None:
         """Apply a sentinel's disposition to a claimed task, releasing its sets.
@@ -847,12 +876,21 @@ class EntroQWorker:
 
         if isinstance(exc, MoveError):
             dest = exc.queue or self.error_queue_for(task.queue)
-            if not dest:
-                return  # custom map declined a destination: claim expires
-            change = quarantine(dest)
-        elif self._max_attempts and attempt >= self._max_attempts:
+            if dest:
+                change = quarantine(dest)
+            else:
+                # A custom map gave no destination. The failure is still
+                # recorded, as Go's Quarantine does with no queue: the task
+                # stays where it is, ready now, its attempt counted. It is
+                # never a no-op that leaves the task to its lease.
+                change = Modification.changing(task, at=None, attempt=attempt,
+                                               err=str(exc), reset_claims=True)
+        elif (self._max_attempts and attempt >= self._max_attempts
+              and (exc.or_move_to or self.error_queue_for(task.queue))):
             change = quarantine(exc.or_move_to or self.error_queue_for(task.queue))
         else:
+            # Below the ceiling, or at it with nowhere to go: retry with the
+            # delay, as Go's RetryOrQuarantine does without a queue.
             delay = exc.delay_s if exc.delay_s is not None else self._retry_delay_s
             if jitter:
                 delay += random.uniform(0, delay / 4)
@@ -997,7 +1035,7 @@ class EntroQWorker:
             logging.warning("Finisher for task %s failed after the commit: %s",
                             state.task.id, e)
 
-        return True
+        return not mod.then_stop
 
     async def run(self, handler: Handler) -> None:
         """Run the worker loop until stopped, cancelled, or StopWorker is raised.

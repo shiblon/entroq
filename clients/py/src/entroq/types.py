@@ -334,6 +334,19 @@ class InvalidArgumentError(Exception):
         self.message = message
 
 
+class UnsupportedError(Exception):
+    """Raised when the server does not serve the protocol this client speaks.
+
+    The client speaks one protocol and never falls back: upgrading means
+    moving the server. Retrying cannot help. Mirrors the Go client's
+    UnsupportedError.
+    """
+
+    def __init__(self, message: str = "") -> None:
+        super().__init__(message)
+        self.message = message
+
+
 class TransportError(Exception):
     """Raised when a client could not complete an exchange with its backend.
 
@@ -433,9 +446,14 @@ class Modification:
             M.changing(doc, content=new_content),
             M.inserting(DocData(namespace='/state', key='counter', content=0)),
         )
+
+    ``then_stop`` matters only when a worker's handler returns this: the worker
+    commits it, runs on_success, and then stops cleanly, the way Go's
+    ``Result.ThenStop`` does. Everywhere else it is ignored.
     """
 
-    def __init__(self, *ops: _Op) -> None:
+    def __init__(self, *ops: _Op, then_stop: bool = False) -> None:
+        self.then_stop = then_stop
         self.task_inserts: List[TaskData] = []
         self.task_changes: List[TaskChange] = []
         self.task_deletes: List[TaskID] = []

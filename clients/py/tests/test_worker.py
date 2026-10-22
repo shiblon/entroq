@@ -530,7 +530,7 @@ def test_worker_stop_worker_stops_loop():
 
     asyncio.run(run())
     assert len(processed) == 1
-    assert len(client.modify_calls) == 0
+    _assert_released(client)
 
 
 def test_worker_retry_error_requeues_with_delay():
@@ -1101,7 +1101,8 @@ def test_worker_max_claims_allows_task_at_the_ceiling():
     asyncio.run(run())
 
     assert work_called == ['t1']
-    assert client.modify_calls == []
+    # Run, not moved: the only write is the stopping worker's release.
+    _assert_released(client)
 
 
 def test_worker_max_claims_zero_means_no_limit():
@@ -1381,11 +1382,90 @@ def test_worker_selector_retry_requeues_the_task():
     assert 'not yet' in tc.err
 
 
-def test_worker_selector_stop_exits_without_writing():
-    """StopWorker leaves the claim to expire, as it does from do_work."""
+def test_worker_selector_stop_releases_the_task():
+    """StopWorker from a selector drains, as it does from do_work: the task
+    goes back now, and the worker stops."""
     client, _, stop = _selector_raises(StopWorker())
     assert stop == [False]
-    assert client.modify_calls == []
+    _assert_released(client)
+
+
+def _assert_released(client):
+    """The worker's one write gave the task back, ready now in its own queue,
+    with no attempt counted and its claims reset: a drain, not a failure."""
+    assert len(client.modify_calls) == 1, client.modify_calls
+    (tc,) = client.modify_calls[0].task_changes
+    assert tc.queue == tc.from_queue
+    assert tc.at is None
+    assert tc.attempt == 0 and not tc.err
+    assert tc.reset_claims
+
+
+def _process_once(task, body, **worker_args):
+    """Run body as the handler on task once; return (client, keep_going)."""
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0, **worker_args)
+    out = []
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            return await body(t)
+
+        out.append(await worker._process(task, process))
+
+    asyncio.run(run())
+    return client, out[0]
+
+
+def test_worker_commit_then_stop():
+    """A result with then_stop commits, then stops the worker."""
+    async def body(t):
+        return Modification(Modification.deleting(t), then_stop=True)
+    client, keep_going = _process_once(_task(id='t1', version=1), body)
+    assert keep_going is False
+    assert [d.id for d in client.modify_calls[0].task_deletes] == ['t1']
+
+
+@pytest.mark.parametrize("err", [
+    RetryError("later", then_stop=True),
+    MoveError("bad", queue="dead", then_stop=True),
+], ids=["retry", "move"])
+def test_worker_disposition_then_stop(err):
+    """A retry or move with then_stop lands, then stops the worker."""
+    async def body(t):
+        raise err
+    client, keep_going = _process_once(_task(id='t1', version=1), body)
+    assert keep_going is False
+    (tc,) = client.modify_calls[0].task_changes
+    assert tc.attempt == 1
+
+
+def test_worker_move_with_no_destination_still_records_it():
+    """A move a custom map gives no queue is never a no-op: the task stays
+    put, ready now, with its attempt and error recorded, as in Go."""
+    async def body(t):
+        raise MoveError("bad")
+    client, keep_going = _process_once(_task(id='t1', version=1), body,
+                                       err_q_map=lambda inbox: '')
+    assert keep_going is True
+    (tc,) = client.modify_calls[0].task_changes
+    assert tc.queue == 'q' and tc.at is None
+    assert tc.attempt == 1 and tc.err == 'bad'
+    assert tc.reset_claims
+
+
+def test_worker_exhausted_retry_with_nowhere_to_go_retries():
+    """At the attempt ceiling with no queue to move to, the task is retried
+    after its delay, as Go's RetryOrQuarantine does, rather than made ready."""
+    async def body(t):
+        raise RetryError("again", delay_s=60)
+    client, _ = _process_once(_task(id='t1', version=1, attempt=4), body,
+                              max_attempts=5, err_q_map=lambda inbox: '')
+    (tc,) = client.modify_calls[0].task_changes
+    assert tc.queue == 'q'
+    assert tc.at is not None, "the retry delay was dropped"
+    assert tc.attempt == 5
 
 
 def test_worker_selector_failure_at_the_claim_limit_is_recorded():
