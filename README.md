@@ -290,7 +290,6 @@ so you don't have to write the claim/renew/modify loop yourself:
 
 | Package | What it does |
 |---|---|
-| `batchworker` | Aggregates tasks and processes them in configurable batches |
 | `mapworker` | Generic map: transforms a task's value and routes the result to an outbox queue |
 | `httpworker` | Executes HTTP requests described by task values; writes the response back as a task |
 | `procworker` | Runs a subprocess described by the task value; captures stdout/stderr as an output task |
