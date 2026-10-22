@@ -128,12 +128,12 @@ func checkSchemaRejects(ctx context.Context, t *testing.T, path string) {
 	}{
 		{"task id multibyte", task, []any{wide(33), ""}},
 		{"task id NUL", task, []any{nul(65), ""}},
-		{"task claimant multibyte", task, []any{"t1", wide(33)}},
+		{"task claimant multibyte", task, []any{"t1", wide(257)}},
 		{"doc namespace NUL", doc, []any{nul(1025), "d1", "k", ""}},
 		{"doc id multibyte", doc, []any{"ns", wide(33), "k", ""}},
 		{"doc key multibyte", doc, []any{"ns", "d3", wide(129), ""}},
 		{"doc secondary key NUL", doc, []any{"ns", "d4", "k", nul(257)}},
-		{"lock claimant NUL", lock, []any{"ns", "k2", nul(65)}},
+		{"lock claimant NUL", lock, []any{"ns", "k2", nul(513)}},
 	}
 	for _, test := range tests {
 		if _, err := db.ExecContext(ctx, test.query, test.args...); err == nil {

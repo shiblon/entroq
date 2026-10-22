@@ -14,10 +14,10 @@ import (
 // each other's sets and the exclusion silently stops excluding. Tasks are the
 // same -- a claimant check is what keeps one holder from writing another's
 // task. So anything running several consumers on one connection gives each its
-// own Client, with As.
+// own Client, with Scoped.
 //
-// *EntroQ is a Client, holding things as its own ID. As returns another, over
-// the same connection, holding things as a different claimant.
+// *EntroQ is a Client, holding things as its own ID. Scoped returns another,
+// over the same connection, holding things as a claimant of its own.
 //
 // KEEPING THIS SMALL IS DELIBERATE. Adding a method here breaks every fake a
 // caller wrote for its tests, which is the cost of handing an interface out
@@ -44,9 +44,29 @@ type Client interface {
 	Modify(ctx context.Context, args ...ModifyArg) (*ModifyResponse, error)
 	UpdateArrival(ctx context.Context, entries ...*ArrivalEntry) (*ModifyResponse, error)
 
-	// As returns another client over the same connection, holding what it
-	// claims as claimant.
-	As(claimant string) Client
+	// Scoped returns another client over the same connection, holding what it
+	// claims as a new claimant: one the client generates, unless an option
+	// names it.
+	Scoped(opts ...ScopeOption) Client
+}
+
+// ScopeOption configures the client Scoped returns.
+type ScopeOption func(*scopeConfig)
+
+type scopeConfig struct {
+	claimant string
+}
+
+// DangerousClaimant makes a scoped client hold things as claimant, taken
+// exactly as given, rather than one it generates. Two clients given the same
+// claimant are one holder: each can claim and write the other's tasks and doc
+// sets, and neither excludes the other. Use it for a name that must survive a
+// restart. Under mesh authz it must begin with the token's subject: build it
+// with MustClaimantFromSub.
+func DangerousClaimant(claimant string) ScopeOption {
+	return func(c *scopeConfig) {
+		c.claimant = claimant
+	}
 }
 
 // Reader is the part of a Client that records no holder: it asks questions and
@@ -80,14 +100,23 @@ var (
 	_ Reader = (*EntroQ)(nil)
 )
 
-// As returns a client over this connection that holds what it claims as
-// claimant, leaving this one's own ID untouched.
+// Scoped returns a client over this connection that holds what it claims as a
+// claimant of its own, leaving this one's ID untouched. The claimant is
+// generated the way this client's own was, after its subject if it has one
+// (see WithSubjectFromJWT), unless DangerousClaimant names it.
 //
 // Use it to give each concurrent consumer its own claimant while sharing one
 // connection: worker.New takes a Client, and a worker's Run scopes itself with
 // this.
-func (c *EntroQ) As(claimant string) Client {
-	return &scopedClient{eq: c, claimant: claimant}
+func (c *EntroQ) Scoped(opts ...ScopeOption) Client {
+	conf := scopeConfig{}
+	for _, o := range opts {
+		o(&conf)
+	}
+	if conf.claimant == "" {
+		conf.claimant = c.newClaimant()
+	}
+	return &scopedClient{eq: c, claimant: conf.claimant}
 }
 
 // scopedClient is a Client that holds everything as one claimant, over a
@@ -100,15 +129,15 @@ type scopedClient struct {
 
 var _ Client = (*scopedClient)(nil)
 
-// As returns a SIBLING over the same connection, never a client wrapping this
-// one.
+// Scoped returns a SIBLING over the same connection, never a client wrapping
+// this one, with a claimant generated as the connection's would be.
 //
 // Nesting would invert the claimant, silently and only for writes: each scoped
 // client appends its own claimant to the arguments it passes down, so a client
 // wrapping a client would leave the INNER claimant last, and last wins. Every
 // scopedClient is one hop from the connection, so that cannot arise.
-func (c *scopedClient) As(claimant string) Client {
-	return &scopedClient{eq: c.eq, claimant: claimant}
+func (c *scopedClient) Scoped(opts ...ScopeOption) Client {
+	return c.eq.Scoped(opts...)
 }
 
 // ID is the claimant, which is what this client holds things as.

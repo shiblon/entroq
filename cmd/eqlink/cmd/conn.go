@@ -23,7 +23,7 @@ import (
 // (certF/keyF/caF) and bearer-token auth (tokenFile); label names it in errors
 // and logs (e.g. "local", "from", "to"). When a token file is given, the token
 // is reloaded on rotation (SIGHUP or mtime change) by a goroutine spawned on g,
-// and the token's subject becomes the client's claimant.
+// and the token's subject begins every claimant the client makes.
 //
 // It backs both the single-instance commands (via localEQ) and "eqlink handoff",
 // which opens two instances symmetrically, so neither endpoint is privileged.
@@ -55,7 +55,9 @@ func openEntroq(ctx context.Context, g *errgroup.Group, label, addr, certF, keyF
 			return nil, err
 		}
 		opts = append(opts, eqgrpc.WithDialOpts(grpc.WithPerRPCCredentials(creds)))
-		eqOpts = append(eqOpts, entroq.WithClaimantID(creds.claimant))
+		// The token's subject, read once at startup; a rotated token is
+		// expected to name the same one.
+		eqOpts = append(eqOpts, entroq.WithSubjectFromJWT(*creds.token.Load()))
 	}
 
 	startupCtx, cancel := context.WithTimeout(ctx, entroqStartupTimeout)
@@ -100,9 +102,8 @@ func remoteTLS(label, cert, key, ca string) (*tls.Config, error) {
 // tokenFileCreds implements grpc.PerRPCCredentials with an in-memory bearer
 // token that is loaded at startup and reloaded on rotation.
 type tokenFileCreds struct {
-	path     string
-	claimant string // sub#nonce, computed once at startup
-	token    atomic.Pointer[string]
+	path  string
+	token atomic.Pointer[string]
 }
 
 // newTokenFileCreds loads the token immediately; returns an error if the file
@@ -112,7 +113,6 @@ func newTokenFileCreds(path string) (*tokenFileCreds, error) {
 	if err := c.reload(); err != nil {
 		return nil, err
 	}
-	c.claimant = entroq.MustClaimantFromSub(*c.token.Load())
 	return c, nil
 }
 

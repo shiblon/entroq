@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     attempt     INTEGER NOT NULL,
     err         TEXT NOT NULL,
     CHECK (octet_length(id) <= 64),
-    CHECK (octet_length(claimant) <= 64)
+    CHECK (octet_length(claimant) <= 512)
 );
 
 CREATE INDEX IF NOT EXISTS tasks_queue_at
@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS doc_locks (
     PRIMARY KEY (namespace, key_primary),
     CHECK (octet_length(namespace) <= 1024),
     CHECK (octet_length(key_primary) <= 256),
-    CHECK (octet_length(claimant) <= 64)
+    CHECK (octet_length(claimant) <= 512)
 );
 
 -- Held sets, for counting claimed docs without reading every doc.

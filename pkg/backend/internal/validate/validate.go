@@ -16,7 +16,7 @@ const (
 	// MaxIDBytes bounds task and doc IDs.
 	MaxIDBytes = 64
 	// MaxClaimantBytes bounds task and doc claimants.
-	MaxClaimantBytes = 64
+	MaxClaimantBytes = entroq.MaxClaimantBytes
 	// MaxNamespaceBytes bounds doc namespaces.
 	MaxNamespaceBytes = 1024
 	// MaxDocKeyBytes bounds doc primary and secondary keys.

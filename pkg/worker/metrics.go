@@ -67,10 +67,10 @@ func newWorkerMetrics(mp metric.MeterProvider) (*workerMetrics, error) {
 	// record of who handled what survives in the queue; this counter is the only
 	// place that history exists, and it is per-process.
 	//
-	// The claimant attribute is the worker's client ID. It defaults to a random
-	// value per client, which means a new time series on every restart. A
-	// deployment that wants stable per-worker series should set it to something
-	// durable, such as the pod name, with entroq.WithClaimantID.
+	// The claimant attribute is the Run's claimant. It is generated per Run,
+	// which means a new time series on every restart. A deployment that wants
+	// stable per-worker series should name it durably, such as after the pod,
+	// with AsClaimant.
 	tasks, err := meter.Int64Counter("entroq.worker.tasks_total",
 		metric.WithDescription("Tasks handled by this worker, by queue, claimant, and outcome."),
 	)

@@ -13,11 +13,13 @@ CREATE SCHEMA IF NOT EXISTS entroq;
 -- pgcrypto provides gen_random_bytes(), used for auto-generating task IDs.
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
--- Core table. Task IDs and claimant IDs are arbitrary TEXT with a CHECK
--- constraint limiting them to 64 bytes. They are NOT UUIDs: the default
--- generator emits short random strings. The 64-byte ceiling simply leaves room
--- for callers who elect to supply their own UUIDs (36 chars), ULIDs (26), or
--- similar schemes, while keeping indexes efficient.
+-- Core table. Task IDs and claimant IDs are arbitrary TEXT with CHECK
+-- constraints limiting task IDs to 64 bytes and claimants to 512. They are NOT
+-- UUIDs: the default generator emits short random strings. The 64-byte ceiling
+-- on IDs leaves room for callers who elect to supply their own UUIDs (36
+-- chars), ULIDs (26), or similar schemes, while keeping indexes efficient. A
+-- claimant may begin with an authenticated subject, such as a Kubernetes
+-- service account name, so it has more room; no index keys on it.
 -- Bucketing uses hashtext(id) & 255 -- a stable 8-bit hash value in [0,255] --
 -- with an index on (queue, at, (hashtext(id) & 255)) for efficient range scans.
 -- hashtext() is IMMUTABLE and available in all supported PostgreSQL versions.
@@ -31,7 +33,7 @@ CREATE TABLE IF NOT EXISTS entroq.tasks (
     at       TIMESTAMP WITH TIME ZONE NOT NULL,
     created  TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
     modified TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
-    claimant TEXT                     NOT NULL DEFAULT '' CHECK (octet_length(claimant) <= 64),
+    claimant TEXT                     NOT NULL DEFAULT '' CHECK (octet_length(claimant) <= 512),
     value    JSONB,
     claims   INTEGER                  NOT NULL DEFAULT 0,
     attempt  INTEGER                  NOT NULL DEFAULT 0,
@@ -61,7 +63,7 @@ CREATE TABLE IF NOT EXISTS entroq.doc_locks (
     namespace   TEXT COLLATE "C"         NOT NULL CHECK (octet_length(namespace) <= 1024),
     key_primary TEXT COLLATE "C"         NOT NULL CHECK (octet_length(key_primary) <= 256),
     version     INTEGER                  NOT NULL,
-    claimant    TEXT                     NOT NULL DEFAULT '' CHECK (octet_length(claimant) <= 64),
+    claimant    TEXT                     NOT NULL DEFAULT '' CHECK (octet_length(claimant) <= 512),
     at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
     num_docs    INTEGER                  NOT NULL DEFAULT 0,
     PRIMARY KEY (namespace, key_primary)
@@ -856,6 +858,23 @@ BEGIN
         ALTER TABLE entroq.docs ADD CONSTRAINT docs_namespace_check
             CHECK (octet_length(namespace) <= 1024);
         RAISE NOTICE 'entroq: doc namespace limit raised to 1024 bytes';
+    END IF;
+END $$;
+
+-- Raise the task claimant bound to 512 bytes (see the header), which 1.12 set
+-- at 64. Guarded like the namespace bound above, and added VALID for the same
+-- reason: loosening a bound cannot fail on existing rows.
+DO $$
+DECLARE v_def text;
+BEGIN
+    SELECT pg_get_constraintdef(oid) INTO v_def
+      FROM pg_constraint
+     WHERE conrelid = 'entroq.tasks'::regclass AND conname = 'tasks_claimant_check';
+    IF v_def IS NOT NULL AND v_def NOT LIKE '%octet_length(claimant) <= 512%' THEN
+        ALTER TABLE entroq.tasks DROP CONSTRAINT tasks_claimant_check;
+        ALTER TABLE entroq.tasks ADD CONSTRAINT tasks_claimant_check
+            CHECK (octet_length(claimant) <= 512);
+        RAISE NOTICE 'entroq: task claimant limit raised to 512 bytes';
     END IF;
 END $$;
 

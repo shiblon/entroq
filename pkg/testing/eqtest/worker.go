@@ -504,7 +504,7 @@ func WorkerMoveOnError(ctx context.Context, t *testing.T, client *entroq.EntroQ,
 			// so the connection cannot touch it. Naming the holder is what
 			// lets this clean up without waiting out a lease.
 			c.input.Version = 1
-			if _, err := client.As(dieHolder).Modify(ctx, c.input.Delete()); err != nil {
+			if _, err := client.Scoped(entroq.DangerousClaimant(dieHolder)).Modify(ctx, c.input.Delete()); err != nil {
 				t.Fatalf("Test %q tried to clean up dead task: %v", c.name, err)
 			}
 			return

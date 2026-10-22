@@ -2,6 +2,8 @@ package entroq_test
 
 import (
 	"context"
+	"encoding/base64"
+	"strings"
 	"testing"
 	"time"
 
@@ -9,12 +11,12 @@ import (
 	"github.com/shiblon/entroq/pkg/backend/eqmem"
 )
 
-// TestAsMakesSiblingsNotNests covers the one way this design can silently
+// TestScopedMakesSiblingsNotNests covers the one way this design can silently
 // invert. Each scoped client appends its own claimant to the arguments going
 // down, so a client wrapping a client would leave the INNER claimant last, and
 // last wins -- quietly, and only for writes. Every scoped client is one hop
 // from the connection, so that cannot arise.
-func TestAsMakesSiblingsNotNests(t *testing.T) {
+func TestScopedMakesSiblingsNotNests(t *testing.T) {
 	ctx := context.Background()
 	eq, err := entroq.New(ctx, eqmem.Opener(), entroq.WithClaimantID("connection"))
 	if err != nil {
@@ -22,8 +24,8 @@ func TestAsMakesSiblingsNotNests(t *testing.T) {
 	}
 	defer eq.Close()
 
-	a := eq.As("a")
-	b := a.As("b")
+	a := eq.Scoped(entroq.DangerousClaimant("a"))
+	b := a.Scoped(entroq.DangerousClaimant("b"))
 
 	if got := b.ID(); got != "b" {
 		t.Errorf("a client made from another holds as %q, want %q", got, "b")
@@ -62,7 +64,7 @@ func TestScopedClientClaimantWinsOverTheCallers(t *testing.T) {
 	defer eq.Close()
 
 	const queue = "as_override"
-	resp, err := eq.As("owner").Modify(ctx,
+	resp, err := eq.Scoped(entroq.DangerousClaimant("owner")).Modify(ctx,
 		entroq.ModifyAs("impostor"),
 		entroq.InsertingInto(queue, entroq.WithArrivalTimeIn(time.Hour)))
 	if err != nil {
@@ -88,7 +90,7 @@ func TestDistinctClaimantsExcludeEachOther(t *testing.T) {
 	defer eq.Close()
 
 	const ns = "claimant_exclusion"
-	one, two := eq.As("consumer-1"), eq.As("consumer-2")
+	one, two := eq.Scoped(entroq.DangerousClaimant("consumer-1")), eq.Scoped(entroq.DangerousClaimant("consumer-2"))
 
 	if _, err := one.Modify(ctx, entroq.PuttingDocInto(ns, entroq.WithKeys("shared", ""))); err != nil {
 		t.Fatalf("Insert doc: %v", err)
@@ -127,7 +129,7 @@ func TestDistinctClaimantsExcludeEachOther(t *testing.T) {
 	if _, err := one.Modify(ctx, entroq.PuttingDocInto(ns, entroq.WithKeys(shared, ""))); err != nil {
 		t.Fatalf("Insert second doc: %v", err)
 	}
-	same1, same2 := eq.As("one-consumer"), eq.As("one-consumer")
+	same1, same2 := eq.Scoped(entroq.DangerousClaimant("one-consumer")), eq.Scoped(entroq.DangerousClaimant("one-consumer"))
 	if _, err := same1.ClaimDocs(ctx, entroq.ClaimKey(ns, shared), entroq.ClaimingSetsFor(time.Hour)); err != nil {
 		t.Fatalf("First claim under a shared claimant: %v", err)
 	}
@@ -147,21 +149,92 @@ func TestScopedClientReadsNeedNoClaimant(t *testing.T) {
 	defer eq.Close()
 
 	const ns = "claimant_reads"
-	if _, err := eq.As("writer").Modify(ctx, entroq.PuttingDocInto(ns,
+	if _, err := eq.Scoped(entroq.DangerousClaimant("writer")).Modify(ctx, entroq.PuttingDocInto(ns,
 		entroq.WithKeys("config", ""), entroq.WithContent("v1"))); err != nil {
 		t.Fatalf("Insert doc: %v", err)
 	}
 
 	// A different consumer reads it without claiming anything, which is the
 	// case a worker body needs for a config doc.
-	docs, err := eq.As("reader").Docs(ctx, &entroq.DocQuery{Namespace: ns})
+	docs, err := eq.Scoped(entroq.DangerousClaimant("reader")).Docs(ctx, &entroq.DocQuery{Namespace: ns})
 	if err != nil {
 		t.Fatalf("Docs as reader: %v", err)
 	}
 	if len(docs) != 1 {
 		t.Fatalf("got %d docs, want 1", len(docs))
 	}
-	if _, err := eq.As("reader").Time(ctx); err != nil {
+	if _, err := eq.Scoped(entroq.DangerousClaimant("reader")).Time(ctx); err != nil {
 		t.Errorf("Time as reader: %v", err)
+	}
+}
+
+// testJWT is an unsigned token carrying sub: clients only read the subject,
+// and the server is what verifies a signature.
+func testJWT(sub string) string {
+	enc := base64.RawURLEncoding
+	return enc.EncodeToString([]byte(`{"alg":"none"}`)) + "." +
+		enc.EncodeToString([]byte(`{"sub":"`+sub+`"}`)) + ".sig"
+}
+
+// TestSubjectFromJWTBeginsEveryClaimant checks that a client given a token's
+// subject generates every claimant after it, its own and each scoped one, each
+// fresh, which is what mesh authz requires of a claimant.
+func TestSubjectFromJWTBeginsEveryClaimant(t *testing.T) {
+	ctx := context.Background()
+	const sub = "system:serviceaccount:entroq:worker"
+	eq, err := entroq.New(ctx, eqmem.Opener(), entroq.WithSubjectFromJWT(testJWT(sub)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer eq.Close()
+
+	seen := map[string]bool{}
+	for _, c := range []entroq.Client{eq, eq.Scoped(), eq.Scoped(), eq.Scoped().Scoped()} {
+		id := c.ID()
+		if !strings.HasPrefix(id, sub+entroq.ClaimantSeparator) || len(id) <= len(sub)+1 {
+			t.Errorf("claimant %q does not begin with %q and a fresh ID", id, sub+entroq.ClaimantSeparator)
+		}
+		if seen[id] {
+			t.Errorf("claimant %q generated twice", id)
+		}
+		seen[id] = true
+	}
+
+	// The override is taken as given.
+	if got := eq.Scoped(entroq.DangerousClaimant("given")).ID(); got != "given" {
+		t.Errorf("DangerousClaimant made %q, want it as given", got)
+	}
+
+	// Without a subject a claimant is a fresh ID alone.
+	plain, err := entroq.New(ctx, eqmem.Opener())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer plain.Close()
+	if id := plain.Scoped().ID(); strings.Contains(id, entroq.ClaimantSeparator) || id == plain.ID() {
+		t.Errorf("subjectless scoped claimant %q, want a fresh ID unlike %q", id, plain.ID())
+	}
+}
+
+// TestSubjectFromJWTRefusesWhatItCannotUse checks that New reports a token it
+// cannot read, or a subject too long to leave room for a generated ID, rather
+// than making claimants every request would be refused for.
+func TestSubjectFromJWTRefusesWhatItCannotUse(t *testing.T) {
+	ctx := context.Background()
+	for name, tok := range map[string]string{
+		"not a JWT":        "opaque-token",
+		"no sub":           testJWT(""),
+		"subject too long": testJWT(strings.Repeat("s", entroq.MaxClaimantBytes)),
+	} {
+		t.Run(name, func(t *testing.T) {
+			eq, err := entroq.New(ctx, eqmem.Opener(), entroq.WithSubjectFromJWT(tok))
+			if err == nil {
+				eq.Close()
+				t.Fatal("New accepted it")
+			}
+			if !entroq.IsInvalidArgument(err) {
+				t.Errorf("New: %v, want an invalid argument", err)
+			}
+		})
 	}
 }

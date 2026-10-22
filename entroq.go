@@ -443,8 +443,13 @@ type Backend interface {
 // and claimant IDs when they are not specified. By default, this is
 // GenHex16
 // NOTE: any ID generated must be <= 64 bytes long; every backend rejects
-// longer task IDs and claimants.
+// longer task IDs, and a generated claimant adds the client's subject to it.
 type IDGenerator func() string
+
+// MaxClaimantBytes bounds a claimant, in bytes, on every backend. It leaves
+// room for a long authenticated subject, such as a Kubernetes service account
+// name, ahead of the ID a client generates.
+const MaxClaimantBytes = 512
 
 // GenHex16 is an ID generator that produces 16-character random
 // hex strings. It is the default for New clients.
@@ -459,12 +464,39 @@ type EntroQ struct {
 	opener    BackendOpener
 	ClientID  string
 	idGenRand IDGenerator
+
+	// subject is who this client acts for, set by WithSubjectFromJWT; every
+	// claimant it generates begins with it. subjectErr is why it could not be
+	// read, reported by New.
+	subject    string
+	subjectErr error
 }
 
 // Option is an option that modifies how EntroQ clients are created.
 type Option func(*EntroQ)
 
-// WithClaimantID sets the default claimaint ID for this client.
+// WithSubjectFromJWT makes this client act for the subject of token, a signed
+// JWT: every claimant it creates, for itself and for each worker Run or
+// gateway session, starts with "<subject>#".
+//
+// It matters only where the server checks authorization. A server running
+// mesh authz accepts a claimant only if it starts with the subject of the
+// token sent with the request, so a client without this option is denied with
+// "claimant_id does not match authenticated user". It does not send the token:
+// the transport does that (eqgrpc.WithBearerToken).
+//
+// New fails if token is not a JWT with a "sub" claim, or if the subject is too
+// long for a claimant.
+func WithSubjectFromJWT(token string) Option {
+	return func(eq *EntroQ) {
+		eq.subject, eq.subjectErr = parseJWTSub(token)
+	}
+}
+
+// WithClaimantID sets this client's own claimant, taken exactly as given in
+// place of the one it would generate. Under mesh authz it must begin with the
+// token's subject: build it with MustClaimantFromSub, or let
+// WithSubjectFromJWT generate it.
 func WithClaimantID(id string) Option {
 	return func(eq *EntroQ) {
 		eq.ClientID = id
@@ -535,10 +567,25 @@ func New(ctx context.Context, opener BackendOpener, opts ...Option) (*EntroQ, er
 	} else {
 		return nil, fmt.Errorf("no backend or backend opener specified")
 	}
+	if eq.subjectErr != nil {
+		return nil, fmt.Errorf("subject: %w", eq.subjectErr)
+	}
+	if n := len(eq.newClaimant()); n > MaxClaimantBytes {
+		return nil, InvalidArgumentf("subject %q makes %d-byte claimants, limit is %d", eq.subject, n, MaxClaimantBytes)
+	}
 	if eq.ClientID == "" {
-		eq.ClientID = eq.idGenRand()
+		eq.ClientID = eq.newClaimant()
 	}
 	return eq, nil
+}
+
+// newClaimant returns a claimant no other holder has: a fresh ID, after the
+// client's subject if it has one, which an authorizer may require.
+func (c *EntroQ) newClaimant() string {
+	if c.subject == "" {
+		return c.idGenRand()
+	}
+	return c.subject + ClaimantSeparator + c.idGenRand()
 }
 
 // Close closes the underlying backend.
