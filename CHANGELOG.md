@@ -9,22 +9,46 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Release note: the next release must be a minor (v1.13.0 or later), not a
-patch. It adds public API (`entroq.InvalidArgumentError`), moves the SQLite
-schema to version 3, adds `eqc work --max-claims`, removes the
-`eqc mod --reset` flag, bounds every worker handler body at five minutes by
-default (see the work timeout entry, and pass `WithWorkTimeout(0)` /
-`work_timeout_s=0` for a handler that legitimately runs longer), quarantines a
-task after five claims it did not survive (see the claim limit entry, and pass
-`WithMaxClaims(0)` / `max_claims=0` / `--max-claims 0` for no limit), and changes how doc versions
-and claims work (see the doc sets entry). The PostgreSQL schema moves to 1.13.0: stop 1.12 services
-first, since the upgrade drops the doc functions they call, then run
-`eqpg schema upgrade` (or serve with `--init_schema`) before starting the new
-service. The upgrade moves data and holds a lock on the docs table while it
-runs, so plan a short maintenance window on large doc tables.
+Upgrading: this is a minor release with breaking changes, meant to be the last
+of its kind in 1.x. Most callers need only the steps here; the entries below
+say what changed and why.
+
+- **Schemas.** PostgreSQL moves to schema 1.13.0. Stop 1.12 services first,
+  since the upgrade drops the doc functions they call, then run
+  `eqpg schema upgrade` (or serve with `--init_schema`) before starting the new
+  service. The upgrade moves data and holds a lock on the docs table while it
+  runs, so plan a short maintenance window on large doc tables. SQLite moves
+  to schema version 3 on open, and Redis migrates on its first open.
+- **Clients and servers.** A 1.12 client works against a 1.13 server. A 1.13
+  Go or Python client refuses a 1.12 server, saying so, so upgrade servers
+  first.
+- **Go worker handlers** take `(ctx, entroq.Reader, *worker.Work[T])`; see the
+  handler entry. A body is bounded at five minutes and a task quarantined after
+  five claims it did not survive: pass `WithWorkTimeout(0)` /
+  `work_timeout_s=0` or `WithMaxClaims(0)` / `max_claims=0` /
+  `--max-claims 0` to turn either off.
+- **Doc sets.** Docs sharing a primary key are one unit with one version and
+  claim, and secondary keys within a set are unique; see the doc set entries.
+- **Authorization.** A client acting for a token's subject builds its
+  claimants from it with `entroq.WithSubjectFromJWT`; see the claimant entry.
+  A policy granting workers `CLAIM` on a namespace may also need `READ`.
+- **Removed APIs** are listed under Removed, each with its replacement.
+- **The JS client, the Elixir client, and the Python gateway example** run
+  workers through the work gateway, `eqlink work`, and have new APIs.
 
 ### Added
 
+- **Server flags for the claim lease bounds.** `--claim_lease_floor` and
+  `--claim_lease_ceiling` on every backend's `serve` command set the range
+  the service clamps a claim's lease into, 45s to one hour by default
+  (`eqsvcgrpc.WithClaimLeaseBounds`).
+- **`--work-timeout` on `eqprocworker` and `eqc work`.** How long one run of
+  the command may take before it is killed and the task retried, its attempt
+  counted. Five minutes by default, as for `worker.WithWorkTimeout`; 0 is no
+  limit.
+- **`then_stop` in the Python worker.** `RetryError`, `MoveError`, and
+  `Modification` take `then_stop=True`, Go's `ThenStop`: the task's fate lands,
+  and then the worker stops.
 - **`ThenStop` on `worker.RetryError` and `worker.MoveError`.** The error-path
   twin of `Result.ThenStop`: the sentinel's disposition lands -- the task
   retried with its attempt counted, or quarantined -- and only then does the
@@ -119,9 +143,9 @@ runs, so plan a short maintenance window on large doc tables.
   claim polling (SQLite, Redis, PostgreSQL) or one wakeup per queue (in-memory).
 - **`eqc work --max-claims`.** Passes the worker's claim ceiling through, as
   `eqlink work` already does: claim `N` may run, and a later claim moves the
-  task to the error queue without running the command. The default 0 means no
-  maximum, matching `worker.WithMaxClaims`. Tasks the worker moves itself now
-  honor `--error-queue` too.
+  task to the error queue without running the command. It defaults to the
+  library's five, and 0 means no maximum, as for `worker.WithMaxClaims`. Tasks
+  the worker moves itself now honor `--error-queue` too.
 - **`worker.WithDocContentionDelay`.** Sets the delay before a task is retried
   because a doc set it needs is held by someone else, which used the base
   retry delay and still does by default. Up to a quarter more is added at
@@ -142,13 +166,87 @@ runs, so plan a short maintenance window on large doc tables.
 
 ### Changed
 
+- **Breaking: claimants carry the token's subject, and scoped clients make
+  their own.** Under mesh authorization the server requires every claimant to
+  begin with the authenticated subject and `#`.
+  `entroq.WithSubjectFromJWT(token)` makes a client act for the token's
+  subject: every claimant it generates is `<sub>#<random>`, where it was a
+  random ID the server refused. It does not send the token; the transport does
+  (`eqgrpc.WithBearerToken`), and `New` fails if the token is not a JWT with a
+  `sub` claim. `eqlink` and `eqc --authz_token` use it. `Client.Scoped()`
+  returns a client over the same connection with a fresh claimant of its own,
+  which is how every worker `Run` and work gateway session claims;
+  `Scoped(entroq.DangerousClaimant(id))` names one exactly. Claimants may now
+  be 512 bytes (`entroq.MaxClaimantBytes`), from 64, so a long subject fits;
+  the PostgreSQL and SQLite schemas raise their checks to match.
+- **Breaking (Go): `ClaimedBySelf` means the client that asks.** A scoped
+  client's `Tasks(ctx, q, entroq.ClaimedBySelf())` filters by its own
+  claimant, where it would have used the connection's. `entroq.TasksOpt` is
+  now `func(*TasksQuery)`, from `func(*EntroQ, *TasksQuery)`.
+- **Breaking: dependency errors are gRPC `Aborted`.** A modification that lost
+  a race is an optimistic-concurrency conflict, which gRPC calls `ABORTED`;
+  the gRPC service sent `NOT_FOUND`, which reads as a missing resource, while
+  HTTP/JSON already answered 409. Released Go and Python clients accept
+  `Aborted`, and the Go client still reads `NotFound` from a 1.12 server as a
+  dependency error.
+- **Breaking: a move always moves.** A worker's `ErrQMap` that returns no
+  queue for an inbox now falls back to `worker.DefaultErrQMap`, `<inbox>/err`,
+  where a move to "" left the task to lapse with its lease. The Python
+  worker's `error_queue_for` does the same.
+- **Breaking: a protocol 2 doc claim names its sets.** A `ClaimDocs` that
+  declares protocol 2 and names no `sets` is an invalid argument; `namespace`
+  and `key` are protocol 1 only.
+- **Breaking: task arrivals travel as durations.** A write names a task's
+  arrival only as a duration from the backend's own clock
+  (`WithArrivalTimeIn`, `ArrivalTimeBy`; `by_ms` on the wire), so the offset
+  between a caller's clock and the backend's no longer matters. Under
+  protocol 2 a meaningful `at_ms` is an invalid argument; protocol 1 still
+  reads it. The Python client sends every arrival as `by_ms`.
+- **A 45 second default lease, bounded by the service.**
+  `entroq.DefaultClaimDuration` is 45s, and the service clamps every claim's
+  lease, for tasks and doc sets, into 45s to one hour, counting each clamp in
+  `entroq.claim.lease_clamped`. A holder renews after two thirds of its lease
+  (`entroq.RenewalDurationFor`), so the last third is the margin a renewal
+  must complete in. A longer lease costs only the sad path: a dead holder
+  keeps what it held for up to one lease.
+- **Breaking: a doc set's secondary keys are unique.** No two docs in one set
+  may share a secondary key, so a key pair names one doc; an insert that
+  collides fails as a dependency error naming the doc already there. The
+  empty secondary key counts, so a set holds at most one doc without one.
+  Duplicates stored before the upgrade stay, readable by ID, and the backends
+  enforce this, with no schema change.
+- **An empty doc set claims to version 1.** Claiming a set nothing has stored
+  gives it version 1, as a claim of a task does, so version 0 always means
+  created by an insert and not written since.
+- **Breaking: the Python client speaks protocol 2.** It declares protocol 2
+  on every request, checks once that the server serves it, and refuses a
+  server that does not, a 1.12 server included, with `UnsupportedError`.
+  Renewal follows the lease the service granted rather than the one asked for,
+  and renews doc sets by reference, so an empty set stays held.
+- **The Python `StopWorker` drains.** Raised from `do_work` or a selector, it
+  abandoned the task, held with its sets until the lease ran out and counted
+  toward the claim limit. It now releases the task now, and its sets, with no
+  attempt counted and its claims reset, and then the worker stops.
+- **Breaking: the Elixir client runs workers through the work gateway.** It
+  drops its HTTP client and its own worker loop for a client of `eqlink
+  work`, in the shape of the JS client: an `%EntroQ.Worker{}` of functions,
+  fates by raising `EntroQ.RetryError`, `EntroQ.MoveError`, or
+  `EntroQ.FatalWorker`, and `EntroQ.Modification.of/1` to commit.
+  `EntroQ.Gateway` starts one `eqlink work` child for every worker in the VM.
+  No runtime dependencies; Elixir 1.18 or later.
+- **`entroq.DocSet` has JSON field names.** It marshals as `namespace`, `key`,
+  `version`, `claimant`, `at`, `num_docs`, and `docs`, where it used the Go
+  field names.
 - **Breaking: the JS client runs workers through the work gateway.** `entroq`
   0.13.0 drops `EntroQClient` and `EntroQWorker`, which reimplemented the Go
   worker and shared one claimant across every worker on a client, for a client
   of `eqlink work`: `Worker` and `Gateway` in `entroq`, which use only `fetch`,
   and `NodeGateway` in `entroq/node`, which starts an `eqlink work --addr`
   child for the process. The gateway owns claims, renewal, doc sets, and
-  retries, so the client holds no EntroQ state. Node 20 or later.
+  retries, so the client holds no EntroQ state. A worker reads its task's
+  value as `w.task.value`, and the package exports only what a worker uses.
+  Node 20 or later. The Python gateway example in `examples/workgateway`
+  follows the same shape.
 - **A canceled worker applies no retry or move.** Once a worker's context
   has ended, a `RetryError` or `MoveError` its handler returns -- usually the
   cancellation itself, seen as a failed read or write -- is not committed: the
@@ -162,9 +260,10 @@ runs, so plan a short maintenance window on large doc tables.
   transient failures after 1s rather than the worker's 30s default.
 - **Every worker `Run` is its own consumer.** A doc set excludes other
   claimants only, so `Run` claims, renews, and commits as a claimant of its
-  own, a fresh random ID by default; `worker.AsClaimant` names it instead.
-  Concurrent Runs, of one worker or of workers sharing a client, no longer
-  hold each other's doc sets. The Python `EntroQWorker` does the same, a
+  own, from `Client.Scoped`, a fresh random ID by default (after the
+  connection's subject; see the claimant entry); `worker.AsClaimant` names it
+  instead. Concurrent Runs, of one worker or of workers sharing a client, no
+  longer hold each other's doc sets. The Python `EntroQWorker` does the same, a
   claimant of its own per run on its client's connection
   (`EntroQBase.as_claimant`).
 - **A doc claim asks for what it does.** Claiming a doc set still needs
@@ -180,14 +279,13 @@ runs, so plan a short maintenance window on large doc tables.
   `UpdateArrival` per half lease for the task and every set it holds, sets
   with no docs included, rather than a rewrite of every task and doc plus a
   claim of each empty set again. The handler's sets, and their docs, come to
-  `Finish` at the sets' final versions. Doc sets follow their task: once a
-  commit the worker makes writes the task (a `Modify` result that changes,
-  deletes, or makes the task arrive, or a retry or move), the worker releases
-  each set the commit did not write, after `OnSuccess`, so another worker can
-  claim it at once instead of waiting out its lease. The release is
-  best-effort, one call for all the sets, and a failure is logged. A failed
-  commit releases nothing, and neither does a user `Finish`, which owns its
-  own commits. The first renewal now comes half a lease after the task was
+  `Finish` at the sets' final versions. A doc claim is scoped to the handler
+  body: the commit that ends the body releases every set the worker holds, in
+  the same transaction, whatever else it does, unless the commit itself holds
+  a set into the future (a set arrival, or a member write with a future
+  arrival). Another worker can claim the sets at once, with no window between
+  the task and its sets. A failed commit releases nothing, since the task and
+  its sets lapse together. The first renewal now comes half a lease after the task was
   claimed, at once if claiming its doc sets took longer, rather than half a
   lease after the sets were claimed, when a slow `TakeDocs` could let the
   task's claim lapse first.
@@ -319,9 +417,10 @@ runs, so plan a short maintenance window on large doc tables.
 - **Breaking (Go): `ClaimDocs` claims several doc sets, all or none.**
   `eq.ClaimDocs(ctx, args...)` takes `entroq.DocClaimArg`s: each
   `entroq.ClaimKey(ns, key)` names a set (`.WithoutMembers()` returns it
-  without its docs, with its count), and one `entroq.ClaimingSetsFor(d)` or
-  `entroq.ClaimingSetsUntil(t)` sets the lease, `DefaultClaimDuration` by
-  default; `entroq.ClaimingSetsAs` claims for another claimant, as `ModifyAs`
+  without its docs, with its count), and one `entroq.ClaimingSetsFor(d)` sets
+  the lease, `DefaultClaimDuration` by default, or `entroq.MatchingLeaseOf(task)`
+  holds the sets exactly as long as a task the caller holds, read from the
+  task as stored, so no instant crosses a clock; `entroq.ClaimingSetsAs` claims for another claimant, as `ModifyAs`
   modifies. Every set is claimed, or, if anyone else holds one, none is, with
   a `DependencyError` naming each held set. It returns `[]*entroq.DocSet`,
   in the order named, each with its namespace, key, version, claimant,
@@ -444,20 +543,32 @@ runs, so plan a short maintenance window on large doc tables.
   doc index when it reads a lock; the in-memory backend keeps it on the lock and
   recounts after replaying a journal. Upgrading from 1.12 counts each set's
   docs as it gives the set its lock.
-- **Breaking (Go): worker handlers receive doc sets, and name them with
-  `worker.Take`.** `TakeDocs` returns a `*worker.TakeResult`, built with
+- **Breaking (Go): every handler phase takes a reader and the work.** Every
+  phase function, and every `Handler` method, now has the shape
+  `func(ctx context.Context, eq entroq.Reader, work *worker.Work[T])`.
+  `worker.Work` carries the claimed `Task`, its decoded `Value`, and its doc
+  `Sets`, so a phase that learns something new gains a field and breaks
+  nobody. The phases that run while the claim is renewed, `TakeDocs` and
+  `DoWork`, get an `entroq.Reader`, which cannot write the task out from under
+  its renewal; `Finish` runs after renewal stops and gets the whole
+  `entroq.Client`. Replace `func(ctx, task, value, docs)` bodies with
+  `func(ctx, eq, work)` and read `work.Task`, `work.Value`, and `work.Sets`.
+  `TakeDocs` returns a `*worker.TakeResult`, built with
   `worker.Take(entroq.ClaimKey(...), ...)` as a DoModify result is with
-  `worker.Modify`. The worker claims every set at once, as itself and until
-  the task's own arrival time, so the task and its sets expire together; it
-  ignores any lease or claimant among the arguments, as it fixes the versions
-  of a `Modify` result. A set someone else holds leaves none claimed, and the
-  task retries with backoff. `DoWork`, `DoModify`, and `Finish` handlers, and
-  the `Handler` interface, take `[]*entroq.DocSet` where they took
-  `[]*entroq.Doc`: one set per `ClaimKey`, sorted by namespace and key, each
-  with its docs and its version and claim, including a set claimed with no
-  docs. `entroq.DocsIn(sets)`
-  flattens them to the docs handlers received before. A handler that ignored
-  its docs only changes the parameter type.
+  `worker.Modify`. The worker claims every set at once, as the Run's own
+  claimant and with `MatchingLeaseOf` the task, so the task and its sets expire
+  together; it ignores any lease or claimant among the arguments, as it fixes
+  the versions of a `Modify` result. A set someone else holds leaves none
+  claimed, and the task retries with backoff. `work.Sets` holds one set per
+  `ClaimKey`, sorted by namespace and key, each with its docs, version, and
+  claim, including a set claimed with no docs; `entroq.DocsIn(sets)` flattens
+  them to docs.
+- **`worker.WithCueWork`, a phase before renewal starts.** `Handler.CueWork`
+  runs once the task's doc sets are held and before `DoWork`, with nothing
+  renewing the claim: the place to hand work to whoever will do it. A cue that
+  never completes blocks its worker and the task's lease lapses, so another
+  worker takes it, where the same wait under renewal would pin the task for as
+  long as the worker lived. The work gateway hands tasks to its clients here.
 - **Schemas carry a digest, and unreleased ones a `-dev` version.**
   `eqpg.InitSchema` records `eqpg.SchemaDigest`, the SHA-256 of the schema it
   applies, and `eqpg.Open` refuses a database at the right version whose
@@ -530,17 +641,28 @@ runs, so plan a short maintenance window on large doc tables.
   combined with `--queue_to`. `--reset` now fails with a pointer to the new
   flag.
 
+### Removed
+
+- **`EntroQ.Renew`, `RenewFor`, and `RenewAllFor`.** Use `UpdateArrival`:
+  `eq.UpdateArrival(ctx, entroq.ReadyIn(d).Tasks(tasks...).Docs(sets...))`,
+  which also renews a doc set with no docs.
+- **`EntroQ.TryClaimDocByID`.** A doc has no claim of its own. Claim its set
+  with `ClaimDocs(ctx, entroq.ClaimKey(ns, doc.Key))`.
+- **`EntroQ.ClientID`.** The connection's ID is `eq.ID()`; a scoped client's
+  `ID()` is its claimant.
+- **`entroq.WithArrivalTime` and `ArrivalTimeTo`.** Use `WithArrivalTimeIn`
+  and `ArrivalTimeBy`, converting a wall-clock time at the edge with
+  `time.Until`.
+- **`entroq.ModifyOption` and `eqpg.RunningInTx`.** The only backend-specific
+  modify option, with no callers outside its tests. Docs keep state that
+  changes atomically with tasks on every backend, through the service too.
+- **`GenID` from `entroq.Reader`.** Nothing needed it there; `*EntroQ` still
+  has it.
+- **`pkg/workers/batchworker`.** It had no users.
+- **`deploy/helm`.** The chart is `charts/entroq`.
+
 ### Deprecated
 
-- **`EntroQ.Renew`, `RenewFor`, and `RenewAllFor`.** They now make one
-  `UpdateArrival` rather than rewriting every task and doc, so a renewal no
-  longer resends values. A doc passed to `Renew` renews its whole set, and
-  comes back at the set's new version. Use `UpdateArrival`, which also renews
-  a set with no docs; these will be removed.
-- **`EntroQ.TryClaimDocByID`.** A doc has no claim of its own: it claimed the
-  doc's whole set and returned only the named doc. Claim the set with
-  `ClaimDocs(ctx, entroq.ClaimKey(ns, doc.Key))`, which also works for a set
-  with no docs.
 - **In-memory journal replay no longer checks doc versions.** Journals written
   before doc sets had locks did not record doc claims, so their doc versions
   can trail what later records name. Replay applies the recorded state anyway,
@@ -550,6 +672,26 @@ runs, so plan a short maintenance window on large doc tables.
   versions.
 
 ### Fixed
+
+- **A stopped or timed-out command worker commits no failure.** `eqprocworker`
+  and `httpworker` turned any error into a committed failure, the task deleted
+  and its output put in the error box, including a command killed because the
+  worker was stopping or its work timeout ran out. With the five-minute
+  default, every command running longer went to the error box. When the
+  handler's context has ended they now commit nothing: a stop leaves the task
+  to its lease, and a timeout retries it, counting the attempt. A request's
+  own `httpworker` timeout is still the task's failure.
+- **Replicas initializing the schema together take turns.** Two
+  `eqpg.InitSchema` calls at once on an empty database, as replicas started
+  together with `--init_schema` make, could collide in the catalog and fail
+  one replica. It now holds a transaction-scoped advisory lock.
+- **The Python gateway example backs off from a gateway that went away.** It
+  reconnected at once, in a tight loop.
+- **The Kubernetes example starts.** It ran `eqpg serve --init_schema` as an
+  init container, which serves and never exits, so the pod never left Init;
+  and it named an image nothing builds and a worker binary no image carries.
+  The server now applies the schema itself, from the published
+  `ghcr.io/shiblon/entroq-pg` image, and the worker is `eqc work`.
 
 - **The work gateway's `retry_delay_s` governs every retry.** It reached only
   the retries a client asked for, so a task whose doc sets someone else held
@@ -715,9 +857,8 @@ runs, so plan a short maintenance window on large doc tables.
 - **The Go worker keeps an empty doc set it claimed.** Renewing a set's
   docs renewed the set, but a set claimed with no docs had none to renew,
   so its claim lapsed after one lease while the handler still ran, and another
-  claimant could take it. The worker now claims such sets again each time it
-  renews. A set the handler does not write is still released only when its
-  lease runs out.
+  claimant could take it. Renewal now names each set it holds, empty ones
+  included, and keeps them all.
 - **`eqpg.Open` closes its connections when it fails.** A failed open, such as
   one refused for a schema mismatch, left its connection pool open.
 - **In-memory snapshots keep docs.** A snapshot saved only tasks, and taking
@@ -739,7 +880,7 @@ runs, so plan a short maintenance window on large doc tables.
   that failed in Go rather than in the database, such as `eqpg.RunningInTx`
   caller work returning an error, was committed anyway, and a failed commit
   was reported as success. Both now roll back or report the error.
-  `RunningInTx` is now marked experimental; docs cover what it was for.
+  `RunningInTx` itself is removed; see Removed.
 - **Duplicate IDs in one modification are rejected.** Naming a task or doc in
   more than one operation of a modification (two inserts, a change and a
   delete, a delete and a re-insert) behaved differently on every backend and
@@ -759,7 +900,7 @@ runs, so plan a short maintenance window on large doc tables.
   enforced them only through schema CHECKs, whose failures reached callers as
   an unclassified error: the service returned gRPC `Unknown`, which HTTP/JSON
   clients saw as a 500. Every backend now checks the limits in Go before
-  touching storage (task and doc IDs and claimants 64 bytes, doc namespaces
+  touching storage (task and doc IDs 64 bytes, claimants 512, doc namespaces
   1024 bytes, doc keys 256 bytes) and returns the new
   `entroq.InvalidArgumentError`, which the service reports as
   `InvalidArgument` (HTTP 400) and the gRPC backend turns back into the same
