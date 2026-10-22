@@ -301,10 +301,11 @@ func (r *Receiver) runSession(ctx context.Context, start sessionStart) error {
 	g.Go(func() error { return r.runRequestLane(gctx, state, socket, cancel) })
 	g.Go(func() error { return r.runResponseLane(gctx, start, state, socket, cancel) })
 	g.Go(func() error {
-		return state.liveness.run(gctx, func() {
-			log.Printf("receiver session %q peer liveness timeout", start.session)
+		if err := state.liveness.run(gctx); err != nil {
+			log.Printf("receiver session %q: %v", start.session, err)
 			cancel()
-		})
+		}
+		return nil
 	})
 	if err := g.Wait(); err != nil {
 		return err
@@ -329,7 +330,7 @@ type receiverSessionState struct {
 // runRequestLane claims request frames, writing each to the upstream and
 // answering it with an ACK. A lane that expires abandons the upstream socket.
 func (r *Receiver) runRequestLane(ctx context.Context, state *receiverSessionState, socket *responseSocket, complete func()) error {
-	err := runLane(ctx, r.eq, r.cfg.mp, r.claimant(), &state.requestLanes, noDocs[Envelope],
+	_, err := runLane(ctx, r.eq, r.cfg.mp, r.claimant(), &state.requestLanes, noDocs[Envelope],
 		func(turns *laneTurns) worker.DoModifyRun[Envelope] {
 			return r.requestHandler(state, socket, turns)
 		})
@@ -457,7 +458,7 @@ func (r *Receiver) runResponseLane(ctx context.Context, start sessionStart, stat
 	}
 	// r.claimant is the same consumer the bootstrap worker held the session doc
 	// as, so this lane can take it; see Receiver.claimant.
-	err := runLane(ctx, r.eq, r.cfg.mp, r.claimant(), &state.responseLanes, takeSessionDoc,
+	_, err := runLane(ctx, r.eq, r.cfg.mp, r.claimant(), &state.responseLanes, takeSessionDoc,
 		func(turns *laneTurns) worker.DoModifyRun[Response] {
 			return r.responseHandler(start, state, socket, complete, turns)
 		},

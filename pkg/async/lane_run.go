@@ -54,19 +54,19 @@ func noDocs[T any](context.Context, entroq.Reader, *worker.Work[T]) (*worker.Tak
 }
 
 // runLane claims on lanes' local queue until a turn finishes the lane's
-// direction, starting a new worker on the new queue after each rotation. It
-// returns nil once a turn is done or ctx ends, and errLaneExpired if the
-// queue reaches its GC deadline first.
+// direction, starting a new worker on the new queue after each rotation. done
+// reports that a turn finished it; once ctx ends it returns neither done nor an
+// error, and errLaneExpired if the queue reaches its GC deadline first.
 //
 // handle makes the lane's handler, which builds each result with the
 // laneTurns it is given.
 func runLane[T any](ctx context.Context, eq *entroq.EntroQ, mp metric.MeterProvider, claimant string, lanes *sessionLanes,
-	take worker.TakeRun[T], handle func(*laneTurns) worker.DoModifyRun[T], opts ...worker.RunOption) error {
+	take worker.TakeRun[T], handle func(*laneTurns) worker.DoModifyRun[T], opts ...worker.RunOption) (done bool, err error) {
 	for {
 		var turns laneTurns
 		queue := lanes.local.queue
 		wctx, stop := context.WithDeadline(ctx, lanes.local.collectAt)
-		err := worker.New(eq,
+		err = worker.New(eq,
 			worker.WithTakeDocs(take),
 			worker.WithDoModify(handle(&turns)),
 			worker.WithMeterProvider[T](mp),
@@ -75,14 +75,16 @@ func runLane[T any](ctx context.Context, eq *entroq.EntroQ, mp metric.MeterProvi
 		stop()
 		switch {
 		case err != nil:
-			return err
+			return false, err
 		case turns.last == turnRotated:
 			continue
-		case turns.last == turnDone, ctx.Err() != nil:
-			return nil
+		case turns.last == turnDone:
+			return true, nil
+		case ctx.Err() != nil:
+			return false, nil
 		case expired:
-			return errLaneExpired
+			return false, errLaneExpired
 		}
-		return fmt.Errorf("lane worker on %q stopped without a reason", queue)
+		return false, fmt.Errorf("lane worker on %q stopped without a reason", queue)
 	}
 }

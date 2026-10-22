@@ -33,9 +33,6 @@ type senderSession struct {
 	responseLanes sessionLanes
 	startedAt     time.Time
 	liveness      *peerLiveness
-	cancel        context.CancelCauseFunc
-
-	responseCompleted bool
 
 	responseStarted bool
 	responseStatus  int
@@ -85,37 +82,43 @@ func releaseBody(w http.ResponseWriter, body io.Closer) func() {
 	}
 }
 
-func (s *senderSession) run(parent context.Context) error {
-	ctx, cancel := context.WithCancelCause(parent)
-	defer cancel(nil)
-	s.cancel = cancel
+// sessionEnd is a session ending on its own terms: the terminal response
+// committed, or writing it to the caller failed and the peer was told. err is
+// the remote error that arrived after the response had started, if one did.
+type sessionEnd struct {
+	err error
+}
 
-	g, gctx := errgroup.WithContext(ctx)
+func (e *sessionEnd) Error() string { return "eqlink session ended" }
+
+// run carries the exchange until a worker ends it, each returning what ended
+// it: the response lane a *sessionEnd, liveness errPeerSilent, a lane its
+// failure. With none of those, the caller's context ended it. The peer is told
+// unless the response finished or the peer itself has gone quiet.
+func (s *senderSession) run(parent context.Context) error {
+	g, gctx := errgroup.WithContext(parent)
 	g.Go(func() error { return s.source.run(gctx) })
 	g.Go(func() error { return s.runRequestLane(gctx) })
 	g.Go(func() error { return s.runResponseLane(gctx) })
-	g.Go(func() error {
-		return s.liveness.run(gctx, func() { cancel(errSenderPeerTimeout) })
-	})
+	g.Go(func() error { return s.liveness.run(gctx) })
 
 	err := g.Wait()
 	s.deleteBootstrapTask(parent)
-	if s.responseCompleted {
-		return s.responseErr
+	if err == nil {
+		// No worker decided the end, so the caller's context did.
+		err = context.Cause(parent)
 	}
-	if err != nil {
-		if parent.Err() != nil {
-			s.notifyPeerCanceled(parent, err)
-		}
-		return err
+	var end *sessionEnd
+	switch {
+	case errors.As(err, &end):
+		return end.err
+	case errors.Is(err, errPeerSilent):
+		return errSenderPeerTimeout
+	case err == nil:
+		return fmt.Errorf("session workers exited before terminal response committed")
 	}
-	if cause := context.Cause(ctx); cause != nil {
-		if parent.Err() != nil {
-			s.notifyPeerCanceled(parent, cause)
-		}
-		return cause
-	}
-	return fmt.Errorf("session workers exited before terminal response committed")
+	s.notifyPeerCanceled(parent, err)
+	return err
 }
 
 // deleteBootstrapTask removes unaccepted demand after a local cancellation or
@@ -158,7 +161,7 @@ func (s *senderSession) notifyPeerCanceled(parent context.Context, cause error) 
 // runRequestLane claims request ACKs, answering each with the next frame of
 // the request body.
 func (s *senderSession) runRequestLane(ctx context.Context) error {
-	err := runLane(ctx, s.sender.eq, s.sender.mp, s.claimant(), &s.requestLanes, noDocs[Envelope],
+	_, err := runLane(ctx, s.sender.eq, s.sender.mp, s.claimant(), &s.requestLanes, noDocs[Envelope],
 		func(turns *laneTurns) worker.DoModifyRun[Envelope] {
 			return func(ctx context.Context, _ entroq.Reader, work *worker.Work[Envelope]) (*worker.Result, error) {
 				return s.handleRequestAck(ctx, turns, work)
@@ -270,9 +273,10 @@ func (s *senderSession) handleRequestAck(ctx context.Context, turns *laneTurns, 
 }
 
 // runResponseLane claims response frames, writing each to the caller and
-// answering it with an ACK.
+// answering it with an ACK. It returns a *sessionEnd once the response is
+// done, which ends the session.
 func (s *senderSession) runResponseLane(ctx context.Context) error {
-	err := runLane(ctx, s.sender.eq, s.sender.mp, s.claimant(), &s.responseLanes, noDocs[Response],
+	done, err := runLane(ctx, s.sender.eq, s.sender.mp, s.claimant(), &s.responseLanes, noDocs[Response],
 		func(turns *laneTurns) worker.DoModifyRun[Response] {
 			return func(ctx context.Context, _ entroq.Reader, work *worker.Work[Response]) (*worker.Result, error) {
 				return s.handleResponse(ctx, turns, work)
@@ -283,6 +287,9 @@ func (s *senderSession) runResponseLane(ctx context.Context) error {
 	}
 	if err != nil {
 		return fmt.Errorf("response data worker: %w", err)
+	}
+	if done {
+		return &sessionEnd{err: s.responseErr}
 	}
 	return nil
 }
@@ -343,11 +350,7 @@ func (s *senderSession) handleResponse(ctx context.Context, turns *laneTurns, wo
 			result := worker.Modify(mods...).OnDependency(func(_ context.Context, depErr *entroq.DependencyError) error {
 				return worker.FatalErrorf("session %q response failure commit lost dependency: %v", s.session, depErr)
 			})
-			return turns.end(result, turnDone, func(context.Context) error {
-				s.responseCompleted = true
-				s.cancel(err)
-				return nil
-			}), nil
+			return turns.end(result, turnDone, nil), nil
 		}
 	}
 	if resp.Final {
@@ -393,7 +396,6 @@ func (s *senderSession) handleResponse(ctx context.Context, turns *laneTurns, wo
 		return turns.end(result, next, nil), nil
 	}
 	return turns.end(result, turnDone, func(context.Context) error {
-		s.responseCompleted = true
 		if s.sender.auditLog != nil {
 			s.sender.auditLog.LogAttrs(ctx, slog.LevelInfo, "response_received",
 				slog.String("response_queue", s.responseLanes.local.queue),
@@ -401,7 +403,6 @@ func (s *senderSession) handleResponse(ctx context.Context, turns *laneTurns, wo
 				slog.Float64("duration_s", time.Since(s.startedAt).Seconds()),
 			)
 		}
-		s.cancel(s.responseErr)
 		return nil
 	}), nil
 }
