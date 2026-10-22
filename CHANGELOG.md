@@ -142,6 +142,11 @@ runs, so plan a short maintenance window on large doc tables.
 
 ### Changed
 
+- **Every worker `Run` is its own consumer.** A doc set excludes other
+  claimants only, so `Run` claims, renews, and commits as a claimant of its
+  own, a fresh random ID by default; `worker.AsClaimant` names it instead.
+  Concurrent Runs, of one worker or of workers sharing a client, no longer
+  hold each other's doc sets.
 - **A doc claim asks for what it does.** Claiming a doc set still needs
   `CLAIM` on its namespace, and now also `READ` there when the claim returns
   the set's docs, since that discloses their contents; a set claimed

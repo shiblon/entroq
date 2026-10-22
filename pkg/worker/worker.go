@@ -720,8 +720,6 @@ type Worker[T any] struct {
 	closed bool
 	runs   map[*activeRun]struct{}
 	wg     sync.WaitGroup
-	// runSeq names consumers apart within this worker, under mu.
-	runSeq int
 }
 
 // activeRun holds what Shutdown needs to stop one Run, and the consumer that
@@ -1410,7 +1408,7 @@ func WithMaxAttempts(m int32) RunOption {
 }
 
 // AsClaimant names the consumer this Run holds everything as, instead of the
-// "<connection ID>/<n>" it would pick.
+// random ID it would pick.
 //
 // Every Run is its own consumer either way; this only chooses the name. Use it
 // for a name that survives a restart, so metrics series and anything reading
@@ -1550,9 +1548,9 @@ func isSentinelError(err error) bool {
 // connection -- hold doc sets without claiming each other's. Nothing has to be
 // arranged for that; AsClaimant only renames it.
 //
-// The claimant is "<connection ID>/<n>" by default, which is stable for the
-// Run's life and visibly its connection's. A deployment wanting durable names
-// across restarts, for metrics series that survive one, passes AsClaimant.
+// The claimant is a fresh random ID by default, stable for the Run's life. A
+// deployment wanting durable names across restarts, for metrics series that
+// survive one, passes AsClaimant.
 func (w *Worker[T]) Run(ctx context.Context, opts ...RunOption) error {
 	ro := &runOpt{
 		lease:          entroq.DefaultClaimDuration,
@@ -1595,12 +1593,14 @@ func (w *Worker[T]) Run(ctx context.Context, opts ...RunOption) error {
 // newClient returns a view on the "real" EntroQ client that operates with a
 // new claimant ID so it's safe to use in a Run function without colliding with
 // other Runs on the same worker.
+//
+// The claimant is random rather than derived from the connection: workers
+// sharing a connection share its ID, so a name built from it needs a counter
+// whose scope is easy to get wrong, and two Runs with one name exclude each
+// other from no doc set.
 func (w *Worker[T]) newClient(claimant string) entroq.Client {
 	if claimant == "" {
-		w.mu.Lock()
-		w.runSeq++
-		claimant = fmt.Sprintf("%s/%d", w.eqc.ID(), w.runSeq)
-		w.mu.Unlock()
+		claimant = entroq.GenHex16()
 	}
 	return w.eqc.As(claimant)
 }

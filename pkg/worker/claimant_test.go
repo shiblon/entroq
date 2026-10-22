@@ -2,7 +2,6 @@ package worker
 
 import (
 	"context"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -115,9 +114,12 @@ func TestConcurrentRunsHoldSetsApart(t *testing.T) {
 	}
 }
 
-// TestRunClaimantDefaultsToItsConnectionAndSequence pins the default name,
-// which is what anything reading claimants off stored tasks or metrics sees.
-func TestRunClaimantDefaultsToItsConnectionAndSequence(t *testing.T) {
+// TestWorkersSharingAConnectionAreDistinctConsumers runs two workers on one
+// client and checks that their Runs claim as different consumers, neither of
+// them the connection itself. A default name derived from the connection and
+// a count kept per worker gave both first Runs one claimant, so their doc sets
+// excluded neither from the other.
+func TestWorkersSharingAConnectionAreDistinctConsumers(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -128,33 +130,57 @@ func TestRunClaimantDefaultsToItsConnectionAndSequence(t *testing.T) {
 	defer client.Close()
 
 	const queue = "default_claimant"
-	if _, err := client.Modify(ctx, entroq.InsertingInto(queue)); err != nil {
+	if _, err := client.Modify(ctx, entroq.InsertingInto(queue), entroq.InsertingInto(queue)); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
 
-	seen := make(chan string, 1)
-	w := New[string](client, WithDoModify[string](
-		func(ctx context.Context, _ entroq.Reader, work *Work[string]) (*Result, error) {
-			task := work.Task
-			seen <- task.Claimant
-			return Modify(task.Delete()), nil
-		}))
+	// Each worker holds its task until both have one, so they claim at once.
+	seen := make(chan string, 2)
+	both := make(chan struct{})
+	var once sync.Once
+	var mu sync.Mutex
+	claimed := 0
+	newWorker := func() *Worker[string] {
+		return New[string](client, WithDoModify[string](
+			func(ctx context.Context, _ entroq.Reader, work *Work[string]) (*Result, error) {
+				task := work.Task
+				seen <- task.Claimant
+				mu.Lock()
+				if claimed++; claimed == 2 {
+					once.Do(func() { close(both) })
+				}
+				mu.Unlock()
+				select {
+				case <-both:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+				return Modify(task.Delete()), nil
+			}))
+	}
 
 	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
-	go func() { _ = w.Run(runCtx, Watching(queue), WithLease(10*time.Second)) }()
+	for range 2 {
+		w := newWorker()
+		go func() { _ = w.Run(runCtx, Watching(queue), WithLease(10*time.Second)) }()
+	}
 
-	select {
-	case got := <-seen:
-		// Derived from the connection rather than random, so it reads as what
-		// it is: one consumer of a known connection.
-		if !strings.HasPrefix(got, "conn/") {
-			t.Errorf("task claimed by %q, want it derived from the connection's %q", got, "conn")
+	var got []string
+	for range 2 {
+		select {
+		case c := <-seen:
+			got = append(got, c)
+		case <-ctx.Done():
+			t.Fatalf("claimed %v before timing out, want two tasks claimed", got)
 		}
-		if got == "conn" {
-			t.Error("the Run claimed as the connection itself, which is the sharing this prevents")
+	}
+	if got[0] == got[1] {
+		t.Errorf("both workers claimed as %q, want a consumer each", got[0])
+	}
+	for _, c := range got {
+		if c == "conn" {
+			t.Errorf("a Run claimed as the connection itself, %q", c)
 		}
-	case <-ctx.Done():
-		t.Fatal("no task was claimed")
 	}
 }
