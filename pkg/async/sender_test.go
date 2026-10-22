@@ -4,8 +4,12 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/backend/eqmem"
 )
 
 // serveSender runs s.Serve on a fresh listener and returns the listener's
@@ -77,4 +81,50 @@ func TestSenderServeStopsWithItsContext(t *testing.T) {
 	stop()
 	served(t, done)
 	expectRefused(t, addr)
+}
+
+// TestSenderTerminalRequestAckReleasesTheBody is the receiver reporting that
+// the request side failed while the session lives on: the request lane ends,
+// and a body read blocked on the client is released then, not only when the
+// session ends.
+func TestSenderTerminalRequestAckReleasesTheBody(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	eq, err := entroq.New(ctx, eqmem.Opener())
+	if err != nil {
+		t.Fatalf("new EntroQ: %v", err)
+	}
+	defer eq.Close()
+
+	const sessionID = "terminal-ack"
+	body := newBlockingReadCloser()
+	request := httptest.NewRequest(http.MethodPost, "http://service/upload", nil)
+	request.Body = body
+	requestAck := newReceiveLane("/service", sessionID, "request-ack", time.Now(), defaultLaneTiming)
+	responseData := newReceiveLane("/service", sessionID, "response-data", time.Now(), defaultLaneTiming)
+	session := newSenderSession(NewSender(eq, ""), httptest.NewRecorder(), request, sessionID, requestAck, responseData, nil, time.Now())
+
+	go session.source.run(ctx)
+	select {
+	case <-body.readStarted:
+	case <-ctx.Done():
+		t.Fatal("the body was never read")
+	}
+
+	if _, err := eq.Modify(ctx, entroq.InsertingInto(requestAck.queue, entroq.WithValue(Envelope{
+		FrameControl: FrameControl{Session: sessionID, Final: true, Error: "upstream request failed"},
+	}))); err != nil {
+		t.Fatalf("insert terminal ACK: %v", err)
+	}
+	if err := session.runRequestLane(ctx); err != nil {
+		t.Fatalf("request lane = %v, want nil", err)
+	}
+	select {
+	case <-body.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the terminal ACK did not release the blocked body read")
+	}
+	if ctx.Err() != nil {
+		t.Fatal("the context ended; the release must not depend on it")
+	}
 }

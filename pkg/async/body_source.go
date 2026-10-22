@@ -22,28 +22,30 @@ type bodyEvent struct {
 
 // bodySource owns one local request body. Its single buffered event and the
 // event held by a blocked send bound read-ahead while keeping socket reads out
-// of worker handlers. The body is closed on cancellation so a blocked Read is
-// released; channels are never closed, and every operation selects on ctx.
+// of worker handlers. release ends a blocked Read, and is called on
+// cancellation; channels are never closed, and every operation selects on ctx.
 type bodySource struct {
-	body     io.ReadCloser
+	body     io.Reader
 	trailers http.Header
+	release  func()
 	events   chan bodyEvent
 }
 
-func newBodySource(body io.ReadCloser, trailers http.Header) *bodySource {
+func newBodySource(body io.Reader, trailers http.Header, release func()) *bodySource {
 	return &bodySource{
 		body:     body,
 		trailers: trailers,
+		release:  release,
 		events:   make(chan bodyEvent, 1),
 	}
 }
 
 // run is the sole reader of the local request body. It publishes bounded body
-// events until EOF or a read failure; canceling ctx closes the body to release
-// a blocked Read, while normal completion stops that cancellation callback.
+// events until EOF or a read failure; canceling ctx releases a blocked Read,
+// while normal completion stops that cancellation callback.
 func (s *bodySource) run(ctx context.Context) error {
-	stopClose := context.AfterFunc(ctx, func() { s.body.Close() })
-	defer stopClose()
+	stopRelease := context.AfterFunc(ctx, s.release)
+	defer stopRelease()
 
 	buffer := make([]byte, streamReadBufferSize)
 	emptyReads := 0

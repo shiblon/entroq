@@ -39,7 +39,7 @@ func TestBodySourceCancellationClosesBlockedBody(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(testCtx)
 	body := newBlockingReadCloser()
-	source := newBodySource(body, nil)
+	source := newBodySource(body, nil, func() { body.Close() })
 	done := make(chan error, 1)
 	go func() { done <- source.run(ctx) }()
 

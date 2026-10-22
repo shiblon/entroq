@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"net/http"
@@ -55,11 +56,32 @@ func newSenderSession(sender *Sender, writer http.ResponseWriter, request *http.
 		writer:        writer,
 		session:       session,
 		bootstrapTask: bootstrapTask,
-		source:        newBodySource(request.Body, request.Trailer),
+		source:        newBodySource(request.Body, request.Trailer, releaseBody(writer, request.Body)),
 		requestLanes:  sessionLanes{local: requestAck},
 		responseLanes: sessionLanes{local: responseData},
 		startedAt:     startedAt,
 		liveness:      newPeerLiveness(sender.heartbeat),
+	}
+}
+
+// releaseBody returns a func that ends a Read of the request body that is
+// waiting on the client. Closing the body cannot do it alone: an HTTP/1 server
+// body's Close waits for a Read in progress. A read deadline on the connection
+// ends the Read; a writer without deadlines, such as a test recorder, gets the
+// Close.
+func releaseBody(w http.ResponseWriter, body io.Closer) func() {
+	rc := http.NewResponseController(w)
+	return func() {
+		err := rc.SetReadDeadline(time.Now())
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, http.ErrNotSupported) {
+			log.Printf("release request body: %v", err)
+		}
+		if err := body.Close(); err != nil {
+			log.Printf("close request body: %v", err)
+		}
 	}
 }
 
@@ -165,7 +187,7 @@ func (s *senderSession) handleRequestAck(ctx context.Context, turns *laneTurns, 
 			return nil, worker.FatalErrorf("session %q received invalid terminal request ACK", s.session)
 		}
 		return turns.end(worker.Modify(task.Delete()), turnDone, func(context.Context) error {
-			s.source.body.Close()
+			s.source.release()
 			return nil
 		}), nil
 	}
