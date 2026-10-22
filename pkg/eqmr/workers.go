@@ -324,7 +324,8 @@ func (c *Controller) ReducerWorker(reduceFn Reducer) *worker.Worker[reduceTask] 
 			// Not claiming the pointers lets a duplicate task race this one.
 			docs, err := c.client.Docs(ctx, &entroq.DocQuery{
 				Namespace: c.DocNS(),
-				KeyExact:  mapOutDocKey(rt.Partition),
+				KeyStart:  mapOutPartition(rt.Partition),
+				KeyEnd:    prefixEnd(mapOutPartition(rt.Partition)),
 			})
 			if err != nil {
 				return nil, retryIfUnavailable(fmt.Errorf("read map outputs for partition %d: %w", rt.Partition, err))

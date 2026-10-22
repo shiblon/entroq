@@ -312,7 +312,7 @@ func (c *Controller) mapDoneWorker() *worker.Worker[mapDone] {
 					return nil, worker.MoveErrorf("split %q produced a run for partition %d of %d", md.SplitKey, run.Partition, st.ReduceParts)
 				}
 				mods = append(mods, entroq.PuttingDocInto(c.DocNS(),
-					entroq.WithKeys(mapOutDocKey(run.Partition), mapOutSecondaryKey(md.SplitKey, i)),
+					entroq.WithKeys(mapOutDocKey(run.Partition, md.SplitKey), mapOutRunKey(i)),
 					entroq.WithContent(run),
 				))
 			}
@@ -364,17 +364,33 @@ func (c *Controller) reduceDoneWorker() *worker.Worker[reduceDone] {
 	return worker.New[reduceDone](c.client,
 		worker.WithTakeDocs(func(_ context.Context, _ entroq.Reader, work *worker.Work[reduceDone]) (*worker.TakeResult, error) {
 			rd := work.Value
-			return worker.Take(entroq.ClaimKey(c.DocNS(), mapOutDocKey(rd.Partition))), nil
+			// The claim is on the set the marker goes in, not on the
+			// pointers: it only keeps two acceptances of the partition from
+			// committing to the sink at once, and it stays one set however
+			// many splits fed the partition.
+			return worker.Take(entroq.ClaimKey(c.DocNS(), resultDocKey(rd.Partition))), nil
 		}),
 		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, work *worker.Work[reduceDone]) (*worker.Result, error) {
-			task, rd, docs := work.Task, work.Value, entroq.DocsIn(work.Sets)
+			task, rd := work.Task, work.Value
 			st, err := c.readState(ctx)
 			if err != nil {
 				return nil, retryIfUnavailable(err)
 			}
 			discard := append([]entroq.ModifyArg{task.Delete()}, c.collecting(rd.Runs)...)
-			if st.terminal() || len(docs) == 0 {
-				// The run has ended, or the partition was already accepted.
+			if st.terminal() || len(entroq.DocsIn(work.Sets)) > 0 {
+				// The run has ended, or the partition has its marker.
+				return worker.Modify(discard...), nil
+			}
+			docs, err := c.client.Docs(ctx, &entroq.DocQuery{
+				Namespace: c.DocNS(),
+				KeyStart:  mapOutPartition(rd.Partition),
+				KeyEnd:    prefixEnd(mapOutPartition(rd.Partition)),
+			})
+			if err != nil {
+				return nil, retryIfUnavailable(fmt.Errorf("read pointers for partition %d: %w", rd.Partition, err))
+			}
+			if len(docs) == 0 {
+				// Consumed by an acceptance whose marker went with them.
 				return worker.Modify(discard...), nil
 			}
 			// The pointer set is fixed once mapping ends; a reducer that read a
@@ -393,6 +409,8 @@ func (c *Controller) reduceDoneWorker() *worker.Worker[reduceDone] {
 				return nil, moveOrRetry(ctx, err, "commit output for partition %d", rd.Partition)
 			}
 
+			// The deletes are pinned to the versions read, so a pointer that
+			// changed since fails the commit.
 			mods := []entroq.ModifyArg{task.Delete(), checking(c.ReduceCheckQ())}
 			for _, d := range docs {
 				mods = append(mods, d.Delete())
@@ -490,7 +508,8 @@ func (c *Controller) anyDocs(ctx context.Context, prefix string) (bool, error) {
 }
 
 // keyPartitions lists, in order and without repeats, the partitions named by
-// the keys of docs under prefix, whose keys end in a partition number.
+// the keys of docs under prefix, whose keys continue with a partition number,
+// up to the next '/' if there is one.
 func (c *Controller) keyPartitions(ctx context.Context, prefix string) ([]int, error) {
 	docs, err := c.client.Docs(ctx, &entroq.DocQuery{
 		Namespace:  c.DocNS(),
@@ -503,7 +522,8 @@ func (c *Controller) keyPartitions(ctx context.Context, prefix string) ([]int, e
 	}
 	var parts []int
 	for _, d := range docs {
-		p, err := strconv.Atoi(strings.TrimPrefix(d.Key, prefix))
+		num, _, _ := strings.Cut(strings.TrimPrefix(d.Key, prefix), "/")
+		p, err := strconv.Atoi(num)
 		if err != nil {
 			return nil, fmt.Errorf("doc key %q names no partition: %w", d.Key, err)
 		}
