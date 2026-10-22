@@ -27,22 +27,16 @@ spec:
       labels:
         app: entroq
     spec:
-      initContainers:
-        - name: init-schema
-          image: shiblon/entroq:latest
-          command: ["/bin/eqpg", "serve", "--init_schema", "--dbaddr=postgres:5432", "--dbuser=entroq", "--dbname=entroq"]
-          env:
-            - name: PGPASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: postgres-secret
-                  key: postgres-password
       containers:
         - name: entroq
-          image: shiblon/entroq:latest
+          image: ghcr.io/shiblon/entroq-pg:latest
           command:
             - "/bin/eqpg"
             - "serve"
+            # Applies or upgrades the schema, then serves. Idempotent, so it is
+            # safe on every start; the chart does the same. (An init container
+            # cannot run serve: it never exits.)
+            - "--init_schema"
             - "--dbaddr=postgres:5432"
             - "--dbuser=entroq"
             - "--dbname=entroq"

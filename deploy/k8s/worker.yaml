@@ -14,11 +14,17 @@ spec:
     spec:
       containers:
         - name: worker
-          image: shiblon/entroq:latest
+          # The service images carry eqc. This one copies each task's value
+          # from /work/inbox to /work/done; replace cat with your command.
+          image: ghcr.io/shiblon/entroq-pg:latest
           command:
-            - "/bin/eqprocworker"
-            - "--eqaddr=entroq:37706"
-            - "--inbox=/subprocworker/inbox"
+            - "/bin/eqc"
+            - "--svcaddr=entroq:37706"
+            - "work"
+            - "--queue=/work/inbox"
+            - "--out-queue=/work/done"
+            - "--"
+            - "/busybox/cat"
           resources:
             requests:
               cpu: 10m
