@@ -19,11 +19,11 @@
 // single function that does the work and returns a Result describing the
 // modifications to apply.
 //
-//	client, _ := entroq.New(ctx, mem.Opener()) // Open an in-memory EntroQ backend.
+//	client, _ := entroq.New(ctx, eqmem.Opener()) // Open an in-memory EntroQ backend.
 //	w := worker.New[json.RawMessage](client,
-//		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, value json.RawMessage, _ []*entroq.DocSet) (*worker.Result, error) {
-//			log.Printf("Working on task %v", task.ID)
-//			return worker.Modify(task.Delete()), nil
+//		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, work *worker.Work[json.RawMessage]) (*worker.Result, error) {
+//			log.Printf("Working on task %v", work.Task.ID)
+//			return worker.Modify(work.Task.Delete()), nil
 //		}),
 //	)
 //	if err := w.Run(ctx, worker.Watching("/my/inbox")); err != nil {
@@ -47,8 +47,8 @@ import (
 )
 
 // ErrQMap is a function that maps from an inbox name to its "move on error"
-// error box name. If no mapping is found, a suitable default should be
-// returned.
+// error box name. An empty answer means the default, <inbox>/err
+// (DefaultErrQMap): a move always moves.
 type ErrQMap func(inbox string) string
 
 // DefaultRetryDelay is the amount by which to advance the arrival time when a
@@ -131,8 +131,8 @@ type Handler[T any] interface {
 
 	// DoWork is called by Worker.Run for each claimed task. The task and its
 	// doc sets, empty ones included, are renewed together in the background
-	// while this function runs. value holds the result of
-	// unmarshaling task.Value into T. The sets are those TakeDocs claimed, in
+	// while this function runs. work.Value holds the result of
+	// unmarshaling task.Value into T. work.Sets are those TakeDocs claimed, in
 	// the order they were claimed (by namespace, then key), each with its docs;
 	// the slice is non-nil but empty when none were claimed, and a set may have
 	// no docs.
@@ -195,8 +195,7 @@ type MakeHandler[T any] func() (Handler[T], error)
 // run once it succeeds) rather than committing them yourself in a Finish
 // function. It is not handed a client: it runs under renewal, and its output is
 // the returned Result, which the worker commits in Finish at the stable version.
-// The sets parameter carries any doc sets claimed by WithTakeDocs, and can
-// be empty.
+// Work.Sets carries any doc sets claimed by WithTakeDocs, and can be empty.
 //
 // Return the Result (built with Modify) and a nil error on success; a nil Result
 // is a valid no-op. To retry the task return a RetryError (RetryErrorf); to move
@@ -330,7 +329,7 @@ type TakeResult struct {
 // entroq.ClaimKey. The worker owns the claim's lease and claimant, as it owns
 // the versions of a Modify result: it claims the sets as itself, until the
 // task's own arrival time, and ignores any lease (entroq.ClaimingSetsFor,
-// entroq.ClaimingSetsUntil) or claimant (entroq.ClaimingSetsAs) in args.
+// entroq.MatchingLeaseOf) or claimant (entroq.ClaimingSetsAs) in args.
 func Take(args ...entroq.DocClaimArg) *TakeResult {
 	return &TakeResult{args: args}
 }
@@ -819,10 +818,17 @@ func WithMeterProvider[T any](mp metric.MeterProvider) Option[T] {
 }
 
 // ErrorQueueFor returns the error queue for the given inbox, using the worker's
-// configured mapping or the default if none is set.
+// configured mapping, or DefaultErrQMap if there is none or it gives no answer.
+//
+// It is never empty. A move or an exhausted retry with an empty destination
+// would leave the task in its own queue with its attempt counted, which is
+// neither a move nor a retry; so a map that declines falls back to the
+// default, and a move always moves.
 func (w *Worker[T]) ErrorQueueFor(inbox string) string {
 	if w.errQMap != nil {
-		return w.errQMap(inbox)
+		if q := w.errQMap(inbox); q != "" {
+			return q
+		}
 	}
 	return DefaultErrQMap(inbox)
 }
@@ -1425,8 +1431,8 @@ func WithMaxAttempts(m int32) RunOption {
 	}
 }
 
-// AsClaimant names the consumer this Run holds everything as, instead of the
-// random ID it would pick.
+// AsClaimant names the consumer this Run holds everything as, taken exactly as
+// given (entroq.DangerousClaimant), instead of the claimant it would generate.
 //
 // Every Run is its own consumer either way; this only chooses the name. Use it
 // for a name that survives a restart, so metrics series and anything reading
@@ -1608,19 +1614,14 @@ func (w *Worker[T]) Run(ctx context.Context, opts ...RunOption) error {
 	}
 }
 
-// newClient returns a view on the "real" EntroQ client that operates with a
-// new claimant ID so it's safe to use in a Run function without colliding with
-// other Runs on the same worker.
-//
-// The claimant is random rather than derived from the connection: workers
-// sharing a connection share its ID, so a name built from it needs a counter
-// whose scope is easy to get wrong, and two Runs with one name exclude each
-// other from no doc set.
+// newClient returns the client a Run holds everything as: one scoped to a
+// claimant of its own, generated by the connection so that it carries the
+// connection's subject (entroq.WithSubjectFromJWT), unless AsClaimant names it.
 func (w *Worker[T]) newClient(claimant string) entroq.Client {
 	if claimant == "" {
-		claimant = entroq.GenHex16()
+		return w.eqc.Scoped()
 	}
-	return w.eqc.As(claimant)
+	return w.eqc.Scoped(entroq.DangerousClaimant(claimant))
 }
 
 // join registers run for Shutdown, or refuses once Shutdown has been called.

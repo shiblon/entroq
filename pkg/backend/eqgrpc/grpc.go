@@ -495,9 +495,9 @@ func authzErrFromStat(stat *status.Status) error {
 }
 
 func depErrorFromStat(stat *status.Status) error {
-	// Dependency errors currently arrive as NotFound; a future server minor
-	// version may switch to Aborted (a better fit for an optimistic-concurrency
-	// conflict). Accept both now so that switch needs no client change.
+	// Dependency errors arrive as Aborted, the code for an optimistic-
+	// concurrency conflict. Servers before 1.13 sent NotFound, which is still
+	// accepted so a new client works against an old server.
 	if c := stat.Code(); c != codes.NotFound && c != codes.Aborted {
 		return fmt.Errorf("expected NotFound or Aborted, got something else: %w", stat.Err())
 	}

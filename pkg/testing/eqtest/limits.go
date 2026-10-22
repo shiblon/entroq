@@ -40,8 +40,8 @@ func LengthLimits(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 		{"doc secondary key over limit", entroq.PuttingDocInto(ns, entroq.WithIDKeys("", "k", wide(129))), "", false},
 		{"doc namespace at limit", entroq.PuttingDocInto(nsOf(1024), entroq.WithIDKeys("", "k", "")), "", true},
 		{"doc namespace over limit", entroq.PuttingDocInto(nsOf(1023)+"é", entroq.WithIDKeys("", "k", "")), "", false},
-		{"insert claimant at limit", entroq.InsertingInto(queue), strings.Repeat("c", 64), true},
-		{"insert claimant over limit", entroq.InsertingInto(queue), wide(33), false},
+		{"insert claimant at limit", entroq.InsertingInto(queue), strings.Repeat("c", entroq.MaxClaimantBytes), true},
+		{"insert claimant over limit", entroq.InsertingInto(queue), wide(entroq.MaxClaimantBytes/2 + 1), false},
 	}
 	for _, w := range writes {
 		t.Run(w.name, func(t *testing.T) {
@@ -59,12 +59,15 @@ func LengthLimits(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 		})
 	}
 
+	// A claimant one byte past the limit, in two-byte characters.
+	overClaimant := wide(entroq.MaxClaimantBytes/2 + 1)
+
 	t.Run("task claimant over limit", func(t *testing.T) {
 		q := path.Join(queue, "claim")
 		if _, err := client.Modify(ctx, entroq.InsertingInto(q)); err != nil {
 			t.Fatal(err)
 		}
-		if task, err := client.TryClaim(ctx, entroq.From(q), entroq.ClaimFor(time.Minute), entroq.WithClaimant(wide(33))); err == nil {
+		if task, err := client.TryClaim(ctx, entroq.From(q), entroq.ClaimFor(time.Minute), entroq.WithClaimant(overClaimant)); err == nil {
 			t.Fatalf("claimed with an over-limit claimant: %v", task)
 		}
 	})
@@ -75,7 +78,7 @@ func LengthLimits(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := client.Modify(ctx, resp.InsertedTasks[0].Change(entroq.ArrivalTimeBy(time.Minute)), entroq.ModifyAs(wide(33))); err == nil {
+		if _, err := client.Modify(ctx, resp.InsertedTasks[0].Change(entroq.ArrivalTimeBy(time.Minute)), entroq.ModifyAs(overClaimant)); err == nil {
 			t.Fatal("changed a task with an over-limit claimant")
 		}
 	})
@@ -85,7 +88,7 @@ func LengthLimits(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 		if _, err := client.Modify(ctx, entroq.PuttingDocInto(dns, entroq.WithIDKeys("", "k", ""))); err != nil {
 			t.Fatal(err)
 		}
-		if docs, err := docsOf(client.ClaimDocs(ctx, entroq.ClaimKey(dns, "k"), entroq.ClaimingSetsFor(time.Minute), entroq.ClaimingSetsAs(wide(33)))); err == nil {
+		if docs, err := docsOf(client.ClaimDocs(ctx, entroq.ClaimKey(dns, "k"), entroq.ClaimingSetsFor(time.Minute), entroq.ClaimingSetsAs(overClaimant))); err == nil {
 			t.Fatalf("claimed docs with an over-limit claimant: %v", docs)
 		}
 	})
@@ -97,7 +100,7 @@ func LengthLimits(ctx context.Context, t *testing.T, client *entroq.EntroQ, qPre
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := client.Modify(ctx, resp.InsertedTasks[0].Delete(), entroq.ModifyAs(wide(33))); err != nil {
+		if _, err := client.Modify(ctx, resp.InsertedTasks[0].Delete(), entroq.ModifyAs(overClaimant)); err != nil {
 			t.Fatalf("delete with a long claimant: %v", err)
 		}
 	})

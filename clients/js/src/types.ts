@@ -1,298 +1,69 @@
 /**
- * TaskID contains the ID and version of a task.
+ * The EntroQ objects a worker sees: the protojson of the api/entroq.proto
+ * messages of the same names, written out by hand with only the fields a
+ * worker uses. int64 fields arrive as strings, and either strings or numbers
+ * are accepted.
  */
-export interface TaskID {
-  id: string;
-  version: number;
-  queue: string;
-}
 
-/**
- * TaskData contains only the data portion of a task.
- */
-export interface TaskData {
-  queue: string;
-  atMs?: string; // int64 -> string; an instant, which the work gateway refuses
-  byMs?: string; // int64 -> string; arrive this long from the server's now
-  value?: any; // google.protobuf.Value -> JSON value
-  id?: string;
-  attempt?: number;
-  err?: string;
-}
-
-/**
- * TaskChange identifies a task by ID and specifies new data.
- */
-/**
- * ChangeMode says how a change treats what is stored. Modes other than
- * CHANGE_DEFAULT are protocol 2: the request must declare it in its
- * entroq-protocol header, or the server refuses them.
- */
-export type ChangeMode = "CHANGE_DEFAULT" | "CHANGE_RESET_CLAIMS" | "CHANGE_LEASE";
-
-export interface TaskChange {
-  oldId: TaskID;
-  newData: TaskData;
-  mode?: ChangeMode;
-}
-
-/**
- * Task is a complete task object.
- */
+/** A task, as the gateway hands it over. */
 export interface Task {
   queue: string;
   id: string;
   version: number;
-  atMs: string; // int64 -> string
+  atMs: string;
   claimantId: string;
-  value: any; // bytes -> JSON value
-  createdMs: string; // int64 -> string
-  modifiedMs: string; // int64 -> string
+  value: any;
+  createdMs: string;
+  modifiedMs: string;
   claims: number;
   attempt: number;
   err: string;
 }
 
-/**
- * QueueStats contains statistics about a queue.
- */
-export interface QueueStats {
-  name: string;
-  numTasks: number;
-  numClaimed: number;
-  numAvailable: number;
-  maxClaims: number;
-}
-
-/**
- * ClaimRequest to attempt a claim on one or more queues.
- */
-export interface ClaimRequest {
-  claimantId: string;
-  queues: string[];
-  durationMs: string; // int64 -> string
-  pollMs: string; // int64 -> string
-}
-
-/**
- * ClaimResponse from a claim attempt.
- */
-export interface ClaimResponse {
-  task?: Task;
-}
-
-/**
- * DocID identifies a specific version of a doc.
- */
-export interface DocID {
-  namespace: string;
-  // Exactly one of id and key. A key alone names a doc set; key with
-  // secondaryKey names a doc (protocol 2).
-  id?: string;
-  key?: string;
-  secondaryKey?: string;
+/** A task named at a version. */
+export interface TaskID {
+  queue: string;
+  id: string;
   version: number;
 }
 
-/**
- * DocData holds the data portion of a doc, used for insertions.
- * atMs controls claim behavior on inserts and changes: "0" (or omitted)
- * leaves/releases the claim; a future ms timestamp sets the caller as claimant
- * until then.
- */
-export interface DocData {
-  namespace: string;
-  id?: string;
-  key: string;
-  secondaryKey?: string;
-  content?: any;
-  atMs?: string; // int64 -> string; future = claim/renew, "0" = release
-  byMs?: string; // int64 -> string; hold the set this long from the server's now
-  createdMs?: string; // for journal replay only
-  modifiedMs?: string; // for journal replay only
-}
-
-/**
- * DocChange identifies a doc by DocID and provides updated data.
- */
-export interface DocChange {
-  oldId: DocID;
-  newData: DocData;
-  mode?: ChangeMode; // CHANGE_LEASE names a doc set by key; no claims reset
-}
-
-/**
- * Doc is a complete doc object.
- */
+/** A doc, or a doc set: a set has no id or content, and len counts its docs. */
 export interface Doc {
   namespace: string;
   id: string;
   version: number;
   claimant: string;
-  atMs: string; // int64 -> string
+  atMs: string;
   key: string;
   secondaryKey: string;
   content?: any;
-  createdMs: string; // int64 -> string
-  modifiedMs: string; // int64 -> string
-  len?: number;       // for a Doc standing for a doc set: its doc count
+  createdMs: string;
+  modifiedMs: string;
+  len?: number;
 }
 
-/**
- * DocQuery describes a listing request for docs in a namespace.
- * If ids is non-empty, key range and limit are ignored.
- */
-export interface DocQuery {
+/** A doc named at a version, by id; or a doc set, by key. */
+export interface DocID {
   namespace: string;
-  keyStart?: string;
-  keyEnd?: string;
-  limit?: number;
-  omitValues?: boolean;
-  ids?: string[];
+  id?: string;
+  key?: string;
+  version: number;
 }
 
-/**
- * DocClaim describes an atomic all-or-nothing claim of docs sharing a key.
- */
-/**
- * DocSetClaim names one doc set of a claim, by key (protocol 2).
- */
+/** A doc set to claim, by key, for `take`. */
 export interface DocSetClaim {
   set: DocID;
-  omitMembers?: boolean; // return the set alone, without its docs
+  omitMembers?: boolean;
 }
 
-/**
- * DocClaim claims doc sets, all of them or none.
- */
-export interface DocClaim {
-  sets?: DocSetClaim[];   // protocol 2: the doc sets to claim
-  namespace?: string;  // protocol 1
-  key?: string;        // protocol 1
-  durationMs?: string; // int64 -> string; defaults to DefaultClaimDuration
-  atMs?: string;       // protocol 2: hold until this time instead; future only
-  claimant?: string;   // normally auto-set by the client
-}
-
-/**
- * DocsRequest asks for a listing of docs matching a query.
- */
-export interface DocsRequest {
-  query: DocQuery;
-}
-
-/**
- * DocsResponse contains the listed docs.
- */
-export interface DocsResponse {
-  docs: Doc[];
-}
-
-/**
- * ClaimDocsRequest asks to atomically claim a set of docs.
- */
-export interface ClaimDocsRequest {
-  claimQuery: DocClaim;
-}
-
-/**
- * ClaimDocsResponse contains the members of every set not claimed with
- * omitMembers, and every claimed doc set, in the order named, as a Doc with no
- * id or content, present even when the set has no docs. Servers at protocol 1
- * omit the sets.
- */
-export interface ClaimDocsResponse {
-  docs: Doc[];
-  sets?: Doc[];
-}
-
-/**
- * NamespaceStat contains statistics for a single doc namespace.
- */
-export interface NamespaceStat {
-  name: string;
-  numDocs: number;
-  numClaimed: number;
-}
-
-/**
- * NamespacesRequest asks for a listing of doc namespaces.
- */
-export interface NamespacesRequest {
-  matchPrefix?: string[];
-  matchExact?: string[];
-  limit?: number;
-}
-
-/**
- * NamespacesResponse contains the requested namespace statistics.
- */
-export interface NamespacesResponse {
-  namespaces: NamespaceStat[];
-}
-
-/**
- * ModifyRequest to atomically update, insert, or delete tasks and docs.
- */
+/** The operations of one commit, by the ModifyRequest field each goes in. */
 export interface ModifyRequest {
-  claimantId: string;
-  inserts?: TaskData[];
-  changes?: TaskChange[];
+  inserts?: any[];
+  changes?: any[];
   deletes?: TaskID[];
   depends?: TaskID[];
-  docInserts?: DocData[];
-  docChanges?: DocChange[];
+  docInserts?: any[];
+  docChanges?: any[];
   docDeletes?: DocID[];
   docDepends?: DocID[];
-}
-
-/**
- * ModifyResponse with results of a transaction.
- */
-export interface ModifyResponse {
-  inserted?: Task[];
-  changed?: Task[];
-  insertedDocs?: Doc[];
-  changedDocs?: Doc[];
-}
-
-/**
- * TasksRequest to list tasks in a queue.
- */
-export interface TasksRequest {
-  claimantId?: string;
-  queue: string;
-  limit?: number;
-  taskId?: string[];
-  omitValues?: boolean;
-}
-
-/**
- * TasksResponse with listed tasks.
- */
-export interface TasksResponse {
-  tasks: Task[];
-}
-
-/**
- * QueuesRequest to list known queues.
- */
-export interface QueuesRequest {
-  matchPrefix?: string[];
-  matchExact?: string[];
-  limit?: number;
-}
-
-/**
- * QueuesResponse with listed queue stats.
- */
-export interface QueuesResponse {
-  queues: QueueStats[];
-}
-
-/**
- * TimeResponse with server's current time.
- */
-export interface TimeResponse {
-  timeMs: string; // int64 -> string
 }

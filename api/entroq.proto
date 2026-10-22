@@ -77,9 +77,9 @@ enum ChangeMode {
   CHANGE_RESET_CLAIMS = 1;
 
   // Change only when the task, or the doc set old_id names by key, is ready
-  // again: renewing a lease on it, or releasing it. Only new_data.at_ms is
-  // read; anything else given must match what old_id names. Keeps a task's
-  // claim count.
+  // again: renewing a lease on it, or releasing it. Only the arrival is read,
+  // new_data.at_ms at protocol 1 and new_data.by_ms at protocol 2; anything
+  // else given must match what old_id names. Keeps a task's claim count.
   CHANGE_LEASE = 2;
 }
 
@@ -272,7 +272,8 @@ message DocSetClaim {
 // named is claimed, or none is.
 //
 // In protocol 1, namespace and key name the one set, the docs sharing that
-// key. Protocol 2 names the sets in sets, and namespace and key are ignored.
+// key. Protocol 2 names the sets in sets, which must not be empty, and
+// namespace and key are protocol 1 only.
 message DocClaim {
   // Protocol 2.
   repeated DocSetClaim sets = 5;
@@ -367,7 +368,9 @@ message ModifyRequest {
 }
 
 // ModifyResponse returns inserted and updated tasks and docs when successful.
-// A dependency error (which is permanent) comes through as gRPC's NOT_FOUND code.
+// A dependency error comes through as gRPC's ABORTED code (HTTP 409): the
+// state the modification depended on has moved, and it may succeed if retried
+// against what is there now. Servers before 1.13 sent NOT_FOUND.
 message ModifyResponse {
   repeated Task inserted = 1;
   repeated Task changed = 2;
@@ -388,7 +391,7 @@ enum ActionType {
   READ = 6;
 }
 
-// ModifyDep can be returned with a gRPC NotFound status indicating which
+// ModifyDep can be returned with a gRPC Aborted status indicating which
 // dependencies failed. This is done via the gRPC error return, not directly
 // in the response proto. Either id (for task dependencies) or doc_id (for doc
 // dependencies) will be set; msg is used with type=DETAIL for a human-readable
@@ -431,7 +434,7 @@ message TasksRequest {
   bool omit_values = 5;
 }
 
-// TasksReqponse contains the tasks requested.
+// TasksResponse contains the tasks requested.
 message TasksResponse {
   repeated Task tasks = 1;
 }

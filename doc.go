@@ -347,13 +347,13 @@ func (q *DocQuery) Validate() error {
 // does. ClaimDocs returns the set it claimed, which may have no docs yet;
 // each member carries the set's version and claim.
 type DocSet struct {
-	Namespace string
-	Key       string
-	Version   int32
-	Claimant  string
-	At        time.Time
-	NumDocs   int    // how many docs the set has
-	Docs      []*Doc // its docs
+	Namespace string    `json:"namespace"`
+	Key       string    `json:"key"`
+	Version   int32     `json:"version"`
+	Claimant  string    `json:"claimant"`
+	At        time.Time `json:"at"`
+	NumDocs   int       `json:"num_docs"` // how many docs the set has
+	Docs      []*Doc    `json:"docs"`     // its docs
 }
 
 // DocsIn returns the docs of sets, in order: every member of the first

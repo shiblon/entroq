@@ -205,9 +205,9 @@ A `Mapper` or `Reducer` that returns an error kills its worker, the MapReduce
 contract: a run in which some calls failed cannot vouch for its output. The task
 is reclaimed when its lease expires. `MaxClaims` (default `DefaultMaxClaims`,
 10; negative for unlimited) bounds how often: past it the task is quarantined
-to its queue's error queue, `{prefix}/map/err` for example. (`pkg/worker`
-defaults to unlimited, since a claim count cannot tell crashes from ordinary
-churn. A batch run has an end and can afford to fail.)
+to its queue's error queue, `{prefix}/map/err` for example. The limit is higher
+than `pkg/worker`'s default of five because a batch's units run longer and see
+more worker churn; a run has an end and can afford to fail.
 
 The controller's error worker judges every quarantined task: a duplicate whose
 unit is already done is retired, and anything else fails the run with the

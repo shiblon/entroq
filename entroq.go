@@ -1,6 +1,7 @@
 // Package entroq defines an atomic task lease manager as described in depth at
 // https://github.com/shiblon/entroq and associated wiki pages.
-// You can get the docker image at https://hub.docker.com/shiblon/entroq.
+// Service images are published at ghcr.io/shiblon (entroq-pg, entroq-mem,
+// entroq-redis).
 //
 // The gist: if you have a bunch of stuff that needs to get done and you don't
 // want to lose any of it to failures, and you don't want to commit any of it
@@ -49,15 +50,16 @@
 //
 // # Doc Keys and Ordering
 //
-// The primary key sets related docs together. ClaimDocs acquires an
-// exclusive lease on all docs sharing a primary key in one atomic operation,
-// making the primary key the natural unit of exclusive ownership. The
-// secondary key provides a sort dimension within that set.
+// The primary key groups related docs into a doc set: the docs sharing a
+// namespace and primary key, with one version, claimant, and arrival between
+// them, which is the unit of exclusive ownership. ClaimDocs claims one or more
+// sets in one atomic operation, all of them or none; a set may be claimed
+// while it has no docs, and while it is held only its holder writes to it. The
+// secondary key is unique within a set and orders its docs.
 //
-// Both Docs and ClaimDocs return results ordered by (primary key, secondary
-// key). This is guaranteed by both the PostgreSQL and eqmem backends. A
-// worker that claims a primary-key set receives docs in stable secondary-key
-// order, making reduce-shaped strategies simple.
+// Docs and ClaimDocs return docs ordered by (primary key, secondary key) on
+// every backend. A worker that claims a set receives its docs in stable
+// secondary-key order, making reduce-shaped strategies simple.
 //
 // # Doc Storage Considerations
 //
@@ -66,11 +68,10 @@
 // will be slower and take more memory proportional to the count. Design
 // primary keys so that the set of docs under one key is reasonable.
 //
-// The eqmem backend performs O(n) range scans over the full namespace on every
-// Docs or ClaimDocs call. It is suitable for development, testing, and
-// low-volume production use when docs play a central role for you. For
-// high-volume or latency-sensitive workloads, PostgreSQL is the recommended
-// backend.
+// The eqmem backend keeps each namespace's docs in an in-memory btree, so a
+// Docs or ClaimDocs call costs O(log n + k) for the k docs it returns, and
+// everything lives in one process's memory. For data larger than that, or for
+// several servers sharing one store, PostgreSQL is the recommended backend.
 //
 // # Task-as-Mutex Pattern
 //
@@ -443,8 +444,13 @@ type Backend interface {
 // and claimant IDs when they are not specified. By default, this is
 // GenHex16
 // NOTE: any ID generated must be <= 64 bytes long; every backend rejects
-// longer task IDs and claimants.
+// longer task IDs, and a generated claimant adds the client's subject to it.
 type IDGenerator func() string
+
+// MaxClaimantBytes bounds a claimant, in bytes, on every backend. It leaves
+// room for a long authenticated subject, such as a Kubernetes service account
+// name, ahead of the ID a client generates.
+const MaxClaimantBytes = 512
 
 // GenHex16 is an ID generator that produces 16-character random
 // hex strings. It is the default for New clients.
@@ -457,17 +463,44 @@ func GenHex16() string {
 type EntroQ struct {
 	backend   Backend
 	opener    BackendOpener
-	ClientID  string
+	clientID  string
 	idGenRand IDGenerator
+
+	// subject is who this client acts for, set by WithSubjectFromJWT; every
+	// claimant it generates begins with it. subjectErr is why it could not be
+	// read, reported by New.
+	subject    string
+	subjectErr error
 }
 
 // Option is an option that modifies how EntroQ clients are created.
 type Option func(*EntroQ)
 
-// WithClaimantID sets the default claimaint ID for this client.
+// WithSubjectFromJWT makes this client act for the subject of token, a signed
+// JWT: every claimant it creates, for itself and for each worker Run or
+// gateway session, starts with "<subject>#".
+//
+// It matters only where the server checks authorization. A server running
+// mesh authz accepts a claimant only if it starts with the subject of the
+// token sent with the request, so a client without this option is denied with
+// "claimant_id does not match authenticated user". It does not send the token:
+// the transport does that (eqgrpc.WithBearerToken).
+//
+// New fails if token is not a JWT with a "sub" claim, or if the subject is too
+// long for a claimant.
+func WithSubjectFromJWT(token string) Option {
+	return func(eq *EntroQ) {
+		eq.subject, eq.subjectErr = parseJWTSub(token)
+	}
+}
+
+// WithClaimantID sets this client's own claimant, taken exactly as given in
+// place of the one it would generate. Under mesh authz it must begin with the
+// token's subject: build it with MustClaimantFromSub, or let
+// WithSubjectFromJWT generate it.
 func WithClaimantID(id string) Option {
 	return func(eq *EntroQ) {
-		eq.ClientID = id
+		eq.clientID = id
 	}
 }
 
@@ -535,10 +568,25 @@ func New(ctx context.Context, opener BackendOpener, opts ...Option) (*EntroQ, er
 	} else {
 		return nil, fmt.Errorf("no backend or backend opener specified")
 	}
-	if eq.ClientID == "" {
-		eq.ClientID = eq.idGenRand()
+	if eq.subjectErr != nil {
+		return nil, fmt.Errorf("subject: %w", eq.subjectErr)
+	}
+	if n := len(eq.newClaimant()); n > MaxClaimantBytes {
+		return nil, InvalidArgumentf("subject %q makes %d-byte claimants, limit is %d", eq.subject, n, MaxClaimantBytes)
+	}
+	if eq.clientID == "" {
+		eq.clientID = eq.newClaimant()
 	}
 	return eq, nil
+}
+
+// newClaimant returns a claimant no other holder has: a fresh ID, after the
+// client's subject if it has one, which an authorizer may require.
+func (c *EntroQ) newClaimant() string {
+	if c.subject == "" {
+		return c.idGenRand()
+	}
+	return c.subject + ClaimantSeparator + c.idGenRand()
 }
 
 // Close closes the underlying backend.
@@ -550,7 +598,7 @@ func (c *EntroQ) Close() error {
 // like Modify, Claim, etc. To change the ID per call (usually not needed, and
 // can be dangerous), use the "As" calls, e.g., ModifyAs.
 func (c *EntroQ) ID() string {
-	return c.ClientID
+	return c.clientID
 }
 
 // GenID creates a new ID using the client's ID generator.
@@ -712,7 +760,7 @@ func claimQueryFromOpts(claimant string, opts ...ClaimOpt) *ClaimQuery {
 // value given in options, and an arrival time computed from the duration. The
 // default duration if none is given is DefaultClaimDuration.
 func (c *EntroQ) Claim(ctx context.Context, opts ...ClaimOpt) (*Task, error) {
-	query := claimQueryFromOpts(c.ClientID, opts...)
+	query := claimQueryFromOpts(c.clientID, opts...)
 	if err := query.Validate(); err != nil {
 		return nil, fmt.Errorf("claim: %w", err)
 	}
@@ -725,171 +773,11 @@ func (c *EntroQ) Claim(ctx context.Context, opts ...ClaimOpt) (*Task, error) {
 // dependency tasks are not present. This can be used, for example, to ensure
 // that configuration tasks haven't changed.
 func (c *EntroQ) TryClaim(ctx context.Context, opts ...ClaimOpt) (*Task, error) {
-	query := claimQueryFromOpts(c.ClientID, opts...)
+	query := claimQueryFromOpts(c.clientID, opts...)
 	if err := query.Validate(); err != nil {
 		return nil, fmt.Errorf("try claim: %w", err)
 	}
 	return c.backend.TryClaim(ctx, query)
-}
-
-// RenewConfig holds all options for renewal.
-type RenewConfig struct {
-	Interval time.Duration
-	Tasks    []*Task
-	Docs     []*Doc
-}
-
-// NewRenewConfig creates a RenewConfig from the given options.
-func NewRenewConfig(opts ...RenewOption) *RenewConfig {
-	c := &RenewConfig{
-		Interval: DefaultClaimDuration,
-	}
-	for _, o := range opts {
-		o(c)
-	}
-	return c
-}
-
-// IsEmpty signals whether there are no tasks or documents in this RenewConfig.
-func (rc *RenewConfig) IsEmpty() bool {
-	return len(rc.Tasks) == 0 && len(rc.Docs) == 0
-}
-
-// RenewOption lets you specify what to do during a renewal
-type RenewOption func(*RenewConfig)
-
-// RenewingTasks specifies tasks to refresh in Renew.
-func RenewingTasks(ts []*Task) RenewOption {
-	return func(rc *RenewConfig) {
-		rc.Tasks = ts
-	}
-}
-
-// RenewingTask specifies one task to renew. Calling this is an append
-// operation - you may call it multiple times to renew multiple tasks.
-func RenewingTask(t *Task) RenewOption {
-	return func(rc *RenewConfig) {
-		rc.Tasks = append(rc.Tasks, t)
-	}
-}
-
-// RenewingDocs specifies docs to refresh in Renew.
-func RenewingDocs(ds []*Doc) RenewOption {
-	return func(rc *RenewConfig) {
-		rc.Docs = ds
-	}
-}
-
-// RenewingDoc specifies a single doc to refresh. Appends to the config.
-func RenewingDoc(d *Doc) RenewOption {
-	return func(rc *RenewConfig) {
-		rc.Docs = append(rc.Docs, d)
-	}
-}
-
-// WithRenewInterval sets the lease time for renewed tasks.
-func WithRenewInterval(dt time.Duration) RenewOption {
-	return func(rc *RenewConfig) {
-		rc.Interval = dt
-	}
-}
-
-// RenewResponse stores tasks and docs that were updated.
-type RenewResponse struct {
-	Tasks []*Task
-	Docs  []*Doc
-}
-
-// Renew makes the tasks and docs it names ready again after the renewal
-// interval, keeping their claims. A doc renews its whole doc set, as every
-// member of a set shares its lease: the docs come back at their set's new
-// version, and a set is renewed once however many of its docs are named.
-//
-// Deprecated: use UpdateArrival, which renews doc sets directly, including
-// sets with no docs.
-func (c *EntroQ) Renew(ctx context.Context, opts ...RenewOption) (*RenewResponse, error) {
-	conf := NewRenewConfig(opts...)
-	if conf.IsEmpty() {
-		return nil, InvalidArgumentf("renew: no docs or tasks specified")
-	}
-	type setKey struct{ ns, key string }
-	var sets []*DocSet
-	seen := make(map[setKey]bool)
-	for _, d := range conf.Docs {
-		k := setKey{d.Namespace, d.Key}
-		if seen[k] {
-			continue
-		}
-		seen[k] = true
-		sets = append(sets, &DocSet{Namespace: d.Namespace, Key: d.Key, Version: d.Version})
-	}
-	resp, err := c.UpdateArrival(ctx, ReadyIn(conf.Interval).Tasks(conf.Tasks...).Docs(sets...))
-	if err != nil {
-		return nil, fmt.Errorf("renew: %w", err)
-	}
-	tasks, err := inOrder(conf.Tasks, resp.ChangedTasks)
-	if err != nil {
-		return nil, fmt.Errorf("renew: %w", err)
-	}
-	locks := make(map[setKey]*DocSet, len(resp.ChangedSets))
-	for _, g := range resp.ChangedSets {
-		locks[setKey{g.Namespace, g.Key}] = g
-	}
-	docs := make([]*Doc, 0, len(conf.Docs))
-	for _, d := range conf.Docs {
-		g, ok := locks[setKey{d.Namespace, d.Key}]
-		if !ok {
-			return nil, fmt.Errorf("renew: doc set %q in %q was not renewed", d.Key, d.Namespace)
-		}
-		nd := *d
-		nd.Version, nd.Claimant, nd.At = g.Version, g.Claimant, g.At
-		docs = append(docs, &nd)
-	}
-	return &RenewResponse{Tasks: tasks, Docs: docs}, nil
-}
-
-// RenewFor makes a task ready again after duration, keeping its claim, and
-// returns it at its new version.
-//
-// Deprecated: use UpdateArrival.
-func (c *EntroQ) RenewFor(ctx context.Context, task *Task, duration time.Duration) (*Task, error) {
-	changed, err := c.RenewAllFor(ctx, []*Task{task}, duration)
-	if err != nil {
-		return nil, fmt.Errorf("renew task: %w", err)
-	}
-	return changed[0], nil
-}
-
-// RenewAllFor makes tasks ready again after duration, keeping their claims,
-// and returns them at their new versions, in the order given.
-//
-// Deprecated: use UpdateArrival.
-func (c *EntroQ) RenewAllFor(ctx context.Context, tasks []*Task, duration time.Duration) ([]*Task, error) {
-	if len(tasks) == 0 {
-		return nil, nil
-	}
-	resp, err := c.UpdateArrival(ctx, ReadyIn(duration).Tasks(tasks...))
-	if err != nil {
-		return nil, fmt.Errorf("renew tasks: %w", err)
-	}
-	return inOrder(tasks, resp.ChangedTasks)
-}
-
-// inOrder returns changed in the order of the tasks they are new versions of.
-func inOrder(tasks, changed []*Task) ([]*Task, error) {
-	byID := make(map[string]*Task, len(changed))
-	for _, t := range changed {
-		byID[t.ID] = t
-	}
-	out := make([]*Task, 0, len(tasks))
-	for _, t := range tasks {
-		nt, ok := byID[t.ID]
-		if !ok {
-			return nil, fmt.Errorf("task %s was not renewed", t.ID)
-		}
-		out = append(out, nt)
-	}
-	return out, nil
 }
 
 // Modify allows a batch of mutations to be applied atomically to the task store.
@@ -912,7 +800,7 @@ func inOrder(tasks, changed []*Task) ([]*Task, error) {
 //   - changed: The tasks that were successfully updated.
 //   - err: A *DependencyError if any version check failed.
 func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (*ModifyResponse, error) {
-	mod := NewModification(c.ClientID, modArgs...)
+	mod := NewModification(c.clientID, modArgs...)
 	// Generate IDs for any inserts that don't have them. This is necessary
 	// because the backend does not assign IDs.
 	for _, ins := range mod.Inserts {
@@ -945,33 +833,6 @@ func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (*ModifyRespo
 	return resp, nil
 }
 
-// TryClaimDocByID attempts to claim the doc identified by ns and id by
-// pushing its arrival time to now+duration. This is an optimistic operation:
-// it reads the doc first, then changes it. If the doc was modified between the
-// read and the change, the backend returns a DependencyError and the caller
-// may retry. If the doc is currently claimed by another claimant, a
-// DependencyError with DocClaims set is returned.
-//
-// A doc has no claim of its own: this claims the doc's whole set, the docs
-// sharing its primary key, and returns only the named doc.
-//
-// Deprecated: claim the set with ClaimDocs(ctx, ClaimKey(ns, doc.Key)),
-// which also works for a set with no docs.
-func (c *EntroQ) TryClaimDocByID(ctx context.Context, ns, id string, duration time.Duration) (*Doc, error) {
-	docs, err := c.Docs(ctx, &DocQuery{Namespace: ns, IDs: []string{id}})
-	if err != nil {
-		return nil, fmt.Errorf("try claim doc by id: get doc: %w", err)
-	}
-	if len(docs) == 0 {
-		return nil, fmt.Errorf("try claim doc by id: doc %s/%s not found", ns, id)
-	}
-	resp, err := c.Modify(ctx, docs[0].Change(WithDocArrivalTimeBy(duration)))
-	if err != nil {
-		return nil, fmt.Errorf("try claim doc by id: %w", err)
-	}
-	return resp.ChangedDocs[0], nil
-}
-
 // Docs returns a list of docs matching the given query.
 func (c *EntroQ) Docs(ctx context.Context, rq *DocQuery) ([]*Doc, error) {
 	if err := rq.Validate(); err != nil {
@@ -996,7 +857,7 @@ func (c *EntroQ) Docs(ctx context.Context, rq *DocQuery) ([]*Doc, error) {
 func (c *EntroQ) ClaimDocs(ctx context.Context, args ...DocClaimArg) ([]*DocSet, error) {
 	cq := NewDocClaim(args...)
 	if cq.Claimant == "" {
-		cq.Claimant = c.ClientID
+		cq.Claimant = c.clientID
 	}
 	if cq.Duration == 0 && cq.TaskToMatch == nil {
 		cq.Duration = DefaultClaimDuration

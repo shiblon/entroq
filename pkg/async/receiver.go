@@ -276,11 +276,19 @@ func (r *Receiver) runSession(ctx context.Context, start sessionStart) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	if _, err := r.eq.TryClaimDocByID(ctx, start.receiverDocNS, start.session, r.cfg.heartbeat.timeout); err != nil {
+	// The session doc's id is its key (see the bootstrap's insert), so its set
+	// is named by the session. A set claims even with no docs in it, so a
+	// missing doc is checked for, as it would have failed a claim by id.
+	sets, err := r.eq.ClaimDocs(ctx, entroq.ClaimKey(start.receiverDocNS, start.session),
+		entroq.ClaimingSetsFor(r.cfg.heartbeat.timeout))
+	if err != nil {
 		if ctx.Err() != nil {
 			return nil
 		}
 		return fmt.Errorf("claim receiver session doc: %w", err)
+	}
+	if len(entroq.DocsIn(sets)) == 0 {
+		return fmt.Errorf("claim receiver session doc: %q is missing from %q", start.session, start.receiverDocNS)
 	}
 
 	socket := newResponseSocket()

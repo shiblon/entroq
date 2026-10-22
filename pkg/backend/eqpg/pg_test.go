@@ -233,6 +233,16 @@ func TestUpgradeFrom1_11(t *testing.T) {
 		}
 	}
 
+	// A claimant may now carry a long authenticated subject: 1.11 and 1.12
+	// stopped it at 64 bytes.
+	long := strings.Repeat("c", entroq.MaxClaimantBytes)
+	if _, err := db.ExecContext(ctx, `INSERT INTO entroq.tasks (id, queue, at, claimant) VALUES ('long-claimant', 'q', now(), $1)`, long); err != nil {
+		t.Errorf("Insert a %d-byte claimant after upgrade: %v", len(long), err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO entroq.tasks (id, queue, at, claimant) VALUES ('too-long-claimant', 'q', now(), $1)`, long+"c"); err == nil {
+		t.Errorf("Inserted a %d-byte claimant after upgrade", len(long)+1)
+	}
+
 	var dropped int
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM pg_attribute
 		WHERE attrelid = 'entroq.docs'::regclass AND attname IN ('version', 'claimant', 'at') AND NOT attisdropped`).Scan(&dropped); err != nil {

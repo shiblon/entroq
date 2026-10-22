@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -12,6 +13,27 @@ from entroq.types import (
 )
 
 
+
+def _mock_http(handler) -> httpx.AsyncClient:
+    """An HTTP client on handler, speaking as a current server: it answers the
+    client's first request, its protocol check, itself, and says it serves
+    protocols 1 and 2 on every answer."""
+    checked = False
+
+    async def serve(request: httpx.Request) -> httpx.Response:
+        nonlocal checked
+        if not checked and request.method == "GET" and request.url.path == "/api/v0/time":
+            checked = True
+            resp = httpx.Response(200, json={"timeMs": "0"})
+        else:
+            resp = handler(request)
+            if inspect.isawaitable(resp):
+                resp = await resp
+        resp.headers.setdefault("entroq-protocol", "1,2")
+        return resp
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(serve))
+
 async def _docs_query(**kwargs) -> httpx.QueryParams:
     """Return the query parameters docs(**kwargs) puts on the wire."""
     seen: list[httpx.Request] = []
@@ -20,7 +42,7 @@ async def _docs_query(**kwargs) -> httpx.QueryParams:
         seen.append(request)
         return httpx.Response(200, json={"docs": []})
 
-    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    http = _mock_http((handler))
     try:
         eq = EntroQJSON("http://entroq.example", http_client=http)
         await eq.docs(**kwargs)
@@ -83,7 +105,7 @@ async def test_async_context_manager_closes_http_client():
 
 
 async def test_injected_http_client_is_public_and_caller_owned():
-    http = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(204)))
+    http = _mock_http((lambda _: httpx.Response(204)))
 
     async with EntroQJSON("http://localhost", http_client=http) as eq:
         assert eq.http is http
@@ -101,7 +123,7 @@ async def test_claim_uses_go_poll_default():
             "task": {"id": "t", "queue": "q", "atMs": "0", "createdMs": "0", "modifiedMs": "0"},
         })
 
-    http = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    http = _mock_http((handle))
     try:
         eq = EntroQJSON("http://localhost", http_client=http)
         task = await eq.claim("q")
@@ -121,7 +143,7 @@ async def test_claim_can_be_canceled_by_caller():
         await blocked.wait()
         raise AssertionError("canceled request continued")
 
-    http = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    http = _mock_http((handle))
     try:
         eq = EntroQJSON("http://localhost", http_client=http)
         claim = asyncio.create_task(eq.claim("q"))
@@ -137,7 +159,7 @@ async def test_claim_optional_timeout_cancels_wait():
     async def handle(_):
         await asyncio.Event().wait()
 
-    http = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    http = _mock_http((handle))
     try:
         eq = EntroQJSON("http://localhost", http_client=http)
         with pytest.raises(TimeoutError, match="after 0.01s"):
@@ -157,7 +179,7 @@ async def test_transport_errors_preserve_retry_safety(error_type, safe_to_retry)
     async def handle(request):
         raise error_type("broken", request=request)
 
-    http = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    http = _mock_http((handle))
     try:
         eq = EntroQJSON("http://localhost", http_client=http)
         with pytest.raises(TransportError) as raised:
@@ -175,7 +197,7 @@ async def _modify_dep_error(details: list[dict]) -> DependencyError:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(409, json={"message": "dependency", "details": details})
 
-    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    http = _mock_http((handler))
     try:
         eq = EntroQJSON("http://entroq.example", http_client=http)
         with pytest.raises(DependencyError) as raised:
@@ -288,7 +310,7 @@ async def _refused(**response) -> InvalidArgumentError:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(400, **response)
 
-    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    http = _mock_http((handler))
     try:
         eq = EntroQJSON("http://entroq.example", http_client=http)
         with pytest.raises(InvalidArgumentError) as raised:
@@ -312,3 +334,24 @@ async def test_a_refused_request_without_a_reason_falls_back_to_the_status():
     """A body that carries no message still has to produce a usable error."""
     err = await _refused(text="not json at all")
     assert "400" in str(err)
+
+
+@pytest.mark.parametrize("served", ["1", None], ids=["protocol 1", "no header"])
+async def test_refuses_a_server_that_does_not_serve_protocol_2(served):
+    """A server too old for protocol 2 is refused before anything reaches it,
+    since it might drop the fields it does not know instead of refusing them.
+    A server that names no protocol predates the header: protocol 1 alone."""
+    from entroq.types import UnsupportedError
+    paths = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        headers = {"entroq-protocol": served} if served else {}
+        return httpx.Response(200, json={"timeMs": "0", "docs": []}, headers=headers)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    client = EntroQJSON("http://entroq.test", http_client=http)
+    with pytest.raises(UnsupportedError, match="upgrade the server"):
+        await client.docs("ns")
+    assert paths == ["/api/v0/time"], "a request went past the protocol check"
+    await http.aclose()

@@ -10,12 +10,13 @@
  * gateway passes it on, and it exits on its own when this process does.
  */
 import { spawn, type ChildProcess } from "node:child_process";
+import { constants } from "node:os";
 import { createInterface } from "node:readline";
 
 import { failure, Gateway, GatewayError, HTTPTransport, SessionGone, type Transport, type Worker } from "./gateway";
 
 /** What a gateway's exit code says, when it exited without a word. */
-export function exitError(code: number | null): Error {
+function exitError(code: number | null): Error {
   if (code === 0) {
     return new SessionGone("gateway exited");
   }
@@ -24,7 +25,7 @@ export function exitError(code: number | null): Error {
 }
 
 /** One `eqlink work --addr` child, shared by every session in this process. */
-export class HTTPChild {
+class HTTPChild {
   private proc?: ChildProcess;
   private url?: string;
   private starting?: Promise<string>;
@@ -125,7 +126,7 @@ export interface NodeGatewayOptions {
  * and stops them together.
  */
 export class NodeGateway extends Gateway {
-  readonly child: HTTPChild;
+  private readonly child: HTTPChild;
   private readonly handleSignals: boolean;
 
   constructor(opts: NodeGatewayOptions = {}) {
@@ -148,9 +149,10 @@ export class NodeGateway extends Gateway {
   async run(...workers: Worker[]): Promise<void> {
     const onSignal = (sig: NodeJS.Signals) => {
       if (this.stopping.signal.aborted) {
-        // A second signal: the gateway hangs up, leaving tasks to their leases.
+        // A second signal: the gateway hangs up, leaving tasks to their leases,
+        // and this process exits as the signal would have made it.
         this.child.signal(sig);
-        process.exit(130);
+        process.exit(128 + constants.signals[sig]);
       }
       this.log(`[worker] ${sig}: draining`);
       this.stop(sig);

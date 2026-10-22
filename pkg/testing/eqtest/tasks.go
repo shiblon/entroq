@@ -763,8 +763,8 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	if claimed.Claims != 1 {
 		t.Fatalf("Expected claim to increment task claims to %d, got %d", 1, claimed.Claims)
 	}
-	if claimed.Claimant != client.ClientID {
-		t.Fatalf("Claimed task's claimant is %q, want the claiming client %q", claimed.Claimant, client.ClientID)
+	if claimed.Claimant != client.ID() {
+		t.Fatalf("Claimed task's claimant is %q, want the claiming client %q", claimed.Claimant, client.ID())
 	}
 
 	// TryClaim not ready task.
@@ -1080,9 +1080,11 @@ func ChangeKeepsStoredFields(ctx context.Context, t *testing.T, client *entroq.E
 		}
 	}
 
-	if task, err = client.RenewFor(ctx, task, time.Minute); err != nil {
+	renewed, err := client.UpdateArrival(ctx, entroq.ReadyIn(time.Minute).Tasks(task))
+	if err != nil {
 		t.Fatalf("Renew: %v", err)
 	}
+	task = renewed.ChangedTasks[0]
 	check("renew", task)
 
 	resp, err = client.Modify(ctx, task.Change(entroq.ValueTo("v1"), entroq.ArrivalTimeBy(time.Minute)))

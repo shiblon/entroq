@@ -128,7 +128,7 @@ describe.skipIf(!goAvailable())("NodeGateway against eqmem", () => {
           return M.of(M.deleting(w.task), M.changing(count, { content: Number(count.content) + 1 }));
         },
         onSuccess: (w) => {
-          values.push(Number(w.value));
+          values.push(Number(w.task.value));
           if (values.length === n) {
             gateway.stop();
           }

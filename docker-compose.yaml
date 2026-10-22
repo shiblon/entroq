@@ -41,7 +41,7 @@ services:
     ports:
       - "9090:9090"
     volumes:
-      - ./contrib/prometheus.yaml:/etc/prometheus/prometheus.yml
+      - ./deploy/prometheus.yaml:/etc/prometheus/prometheus.yml
     depends_on:
       - entroq
 

@@ -154,3 +154,38 @@ func waitForTasks(ctx context.Context, t *testing.T, client *entroq.EntroQ, queu
 		}
 	}
 }
+
+// TestMoveWithNoMappedQueueStillMoves: a custom map that gives an inbox no
+// error queue falls back to <inbox>/err, so a MoveError moves the task rather
+// than leaving it in place with its attempt counted.
+func TestMoveWithNoMappedQueueStillMoves(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client, err := entroq.New(ctx, eqmem.Opener())
+	if err != nil {
+		t.Fatalf("New client: %v", err)
+	}
+	defer client.Close()
+
+	const inbox = "declined"
+	if _, err := client.Modify(ctx, entroq.InsertingInto(inbox, entroq.WithValue("x"))); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+	done := make(chan error, 1)
+	go func() {
+		w := New(client,
+			WithErrQMap[string](func(string) string { return "" }),
+			WithDoWork(func(context.Context, entroq.Reader, *Work[string]) error {
+				return MoveErrorf("bad input")
+			}))
+		done <- w.Run(runCtx, Watching(inbox))
+	}()
+
+	waitForTasks(ctx, t, client, DefaultErrQMap(inbox), 1)
+	runCancel()
+	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+		t.Errorf("worker run: %v", err)
+	}
+}

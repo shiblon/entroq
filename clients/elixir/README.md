@@ -1,11 +1,13 @@
 # EntroQ Elixir Client
 
-Elixir client for the [EntroQ](https://github.com/shiblon/entroq) task queue.
+Workers for the [EntroQ](https://github.com/shiblon/entroq) task queue, written
+in Elixir and run through the work gateway, `eqlink work`.
 
-This package talks to EntroQ over the HTTP/JSON RPC API. The worker API follows
-the same safety model as the Go `DoModify` path: handler code returns intent,
-and the worker owns renewal, final version capture, version fix-up, and the
-final atomic `Modify`.
+The gateway runs the EntroQ worker loop in Go: it claims tasks, renews them,
+claims doc sets, fixes up versions at commit, and retries, moves, and backs off.
+A worker here answers its small JSON protocol over HTTP and holds no EntroQ
+state of its own, so it has nothing to get wrong about leases or claims. The
+protocol is [`docs/workgateway-protocol.md`](../../docs/workgateway-protocol.md).
 
 ## Installation
 
@@ -19,217 +21,122 @@ def deps do
 end
 ```
 
-## Client
+It has no runtime dependencies. It needs Elixir 1.18 or later, and `eqlink` on
+`PATH` (or named with `:eqlink`).
+
+## Quick start
 
 ```elixir
-client = EntroQ.new("http://localhost:9100")
-```
+alias EntroQ.Modification, as: M
 
-Client functions return `{:ok, value}` or `{:error, reason}`. Dependency
-conflicts are returned as `%EntroQ.DependencyError{}`.
-
-### Time
-
-```elixir
-{:ok, time_ms} = EntroQ.Client.time(client)
-```
-
-### Queue Stats
-
-```elixir
-{:ok, queues} = EntroQ.Client.queues(client, prefix: "/jobs")
-
-Enum.each(queues, fn q ->
-  IO.inspect({q.name, q.num_available, q.num_claimed, q.num_tasks})
-end)
-```
-
-### Reading Tasks
-
-```elixir
-{:ok, tasks} =
-  EntroQ.Client.tasks(client,
-    queue: "/jobs/email",
-    limit: 100,
-    omit_values: false
-  )
-```
-
-### Raw Claim
-
-`try_claim/3` returns immediately with a task or `nil`.
-
-```elixir
-case EntroQ.Client.try_claim(client, ["/jobs/email", "/jobs/sms"]) do
-  {:ok, nil} ->
-    :empty
-
-  {:ok, task} ->
-    IO.inspect(task.value)
-
-  {:error, reason} ->
-    raise inspect(reason)
-end
-```
-
-`claim/3` uses the server-side wait endpoint.
-
-```elixir
-{:ok, task} =
-  EntroQ.Client.claim(client, "/jobs/email",
-    duration_ms: 30_000,
-    poll_ms: 5_000
-  )
-```
-
-### Raw Modify
-
-`Modify` is the atomic commit primitive. You can insert, change, delete, or
-depend on tasks and docs in one request.
-
-```elixir
-mod =
-  EntroQ.Modification.new()
-  |> EntroQ.Modification.insert(%EntroQ.TaskData{
-    queue: "/jobs/email",
-    value: %{"to" => "chris@example.com", "template" => "welcome"}
-  })
-
-{:ok, result} = EntroQ.Client.modify(client, mod)
-```
-
-Finish a claimed task by deleting the exact version you claimed:
-
-```elixir
-{:ok, task} = EntroQ.Client.try_claim(client, "/jobs/email")
-
-mod =
-  EntroQ.Modification.new()
-  |> EntroQ.Modification.delete(task)
-
-{:ok, _result} = EntroQ.Client.modify(client, mod)
-```
-
-Move a task and update its error metadata atomically:
-
-```elixir
-mod =
-  EntroQ.Modification.change(task,
-    queue: "/jobs/email/err",
-    at_ms: 0,
-    attempt: task.attempt + 1,
-    err: "invalid recipient"
-  )
-
-{:ok, _result} = EntroQ.Client.modify(client, mod)
-```
-
-### Reading Docs
-
-Docs are durable shared state in the same transaction space as tasks.
-
-```elixir
-{:ok, docs} =
-  EntroQ.Client.docs(client,
-    namespace: "/config",
-    key_start: "/jobs/",
-    limit: 100
-  )
-```
-
-Read exact doc IDs when you already know them:
-
-```elixir
-{:ok, docs} =
-  EntroQ.Client.docs(client,
-    namespace: "/config",
-    ids: ["doc-id-1", "doc-id-2"]
-  )
-```
-
-### Claiming Docs
-
-`claim_docs/2` atomically claims all docs sharing a namespace and primary key.
-
-```elixir
-{:ok, docs} =
-  EntroQ.Client.claim_docs(client,
-    namespace: "/config",
-    key: "/jobs/email",
-    duration_ms: 30_000
-  )
-```
-
-### Doc Namespace Stats
-
-```elixir
-{:ok, namespaces} = EntroQ.Client.namespace_stats(client, prefix: "/config")
-
-Enum.each(namespaces, fn ns ->
-  IO.inspect({ns.name, ns.num_docs, ns.num_claimed})
-end)
-```
-
-## Worker
-
-```elixir
-defmodule MyWorker do
-  use EntroQ.Worker
-
-  @impl true
-  def take_docs(task) do
-    [
-      EntroQ.DocClaim.new("/config", task.queue <> "/settings")
-    ]
+worker = %EntroQ.Worker{
+  queues: ["/my/queue"],
+  work: fn w, _ctx ->
+    IO.inspect(w.task["value"], label: "Processing")
+    # Commit atomically: here, delete the task to finish it.
+    M.of([M.deleting(w.task)])
   end
+}
 
-  @impl true
-  def perform(task, docs) do
-    {:modify,
-     EntroQ.Modification.new()
-     |> EntroQ.Modification.delete(task)
-     |> EntroQ.Modification.change(List.first(docs), content: %{"seen" => true})}
-  end
-end
-
-client = EntroQ.new("http://localhost:9100")
-EntroQ.Worker.run(client, ["/my/queue"], MyWorker)
+:ok = EntroQ.Gateway.new(entroq: "localhost:37706") |> EntroQ.Gateway.run([worker])
 ```
 
-For small applications, use the function form:
+The gateway starts one `eqlink work` child, shared by every worker, and stops it
+when they are done. `EntroQ.Gateway.stop/1` drains: every task in hand
+finishes and nothing more is claimed. The child exits on its own if the VM does.
+
+## Workers
+
+A `%EntroQ.Worker{}` is one session with the gateway, holding at most one task
+at a time. For more at once, or for several kinds of work, run several:
 
 ```elixir
-EntroQ.Worker.run(client, ["/my/queue"],
-  perform: fn task, _docs ->
-    {:modify, EntroQ.Modification.delete(task)}
-  end
-)
+EntroQ.Gateway.run(gateway, [worker_a | List.duplicate(worker_b, 4)])
 ```
 
-`perform/2` receives the originally claimed task/docs. While it runs, the worker
-renews the task and claimed docs together in one atomic `Modify`. When
-`perform/2` returns, renewal stops and any in-flight renewal finishes before the
-worker commits the result.
+Each session claims as a consumer of its own, so workers never hold each
+other's doc sets.
 
-Supported `perform/2` results:
+### The functions
 
-- `{:modify, modification}`: stop renewal, fix versions, apply the modification.
-- `{:finish, payload}`: stop renewal, then call `finish(final_task, final_docs, payload)`.
-- `:ok`: work succeeded; no default modification is applied.
-- `{:retry, reason}` or `{:retry, reason, opts}`: requeue with attempt increment.
-- `{:move, reason}` or `{:move, reason, opts}`: move to the error queue.
-- `:stop`: stop the worker loop.
-- `{:error, reason}`: stop with an error.
+Only `work` is required.
 
-`finish/3` receives stable final versions after renewal has stopped. It may
-return the same result shapes as `perform/2`.
+- `work: fn w, ctx -> ... end` settles one task. What it returns is committed:
+  an `EntroQ.Modification`, or nil to commit nothing. The task in hand is not
+  deleted unless the modification says so.
+- `take: fn w, ctx -> ... end` names the doc sets the task needs, with
+  `EntroQ.claim_set(ns, key)`. They are claimed together, all or none, before
+  `work` runs, and `w.docs` holds their members. A set someone else holds sends
+  the task back with backoff.
+- `on_success: fn w, ctx -> ... end` runs after a commit lands. It is at most
+  once, so what it does must be safe to skip.
+- `on_dependency: fn w, deps, ctx -> ... end` runs when a commit loses a
+  dependency race.
+
+Raise instead of returning to give the task another fate:
+
+- `raise EntroQ.RetryError, message: "...", or_move_to: "..."` tries it again
+  later, counting the attempt; once the attempts run out it moves to
+  `or_move_to` or the error queue.
+- `raise EntroQ.MoveError, message: "...", queue: "..."` moves it now, to
+  `queue` or the error queue.
+- `raise EntroQ.FatalWorker, message: "..."` stops every worker; the task comes
+  back when its lease lapses.
+- Anything else stops this worker, after the gateway quarantines the task if
+  this was its last allowed claim.
+
+`w` carries `task`, `docs`, and `sets`, the protojson the gateway sent, with
+string keys: `w.task["value"]`, `doc["content"]`. `ctx` works with
+`EntroQ.Context`: `stopping?/1`, true once the worker starts stopping;
+`stop/1`, to stop once this task is settled; `sleep/2`, which wakes early when
+stopping; and `read/3` and `time/1`, reads the gateway answers mid-turn.
+
+Long work needs nothing extra: the client tells the gateway it is still working
+while a function runs.
+
+### Modifications
+
+`M.of([...])` commits its operations together, or not at all:
+
+```elixir
+M.of([
+  M.deleting(w.task),
+  M.inserting(queue: "/next", value: %{n: 1}),
+  M.inserting(queue: "/later", value: 2, by_ms: 60_000),
+  M.changing(doc, content: %{count: 3}),
+  M.depending(other_doc)
+])
+```
+
+Name a task or doc as it was handed over; the gateway moves the versions of the
+task in hand and its claimed docs to wherever renewal left them.
+
+### Options
+
+```elixir
+%EntroQ.Worker{
+  queues: queues,
+  work: work,
+  work_timeout_s: 300, # how long one task should take; the operator caps it
+  max_attempts: 0,     # retries before quarantine; 0 is no limit
+  max_claims: 0,       # claims a task may fail to survive; 0 is 5, negative is none
+  retry_delay_s: 0,    # base retry delay, and the wait after doc contention; 0 is 30s
+  error_queue: ""      # where moved tasks go; "{inbox}/err" by default
+}
+```
+
+Durations are whole seconds.
+
+## A gateway you did not start
+
+Given the URL of an `eqlink work --addr` already serving:
+
+```elixir
+gateway = EntroQ.Gateway.new(url: "http://127.0.0.1:43117/")
+```
 
 ## Development
 
-Use the Elixir container from the repository root:
-
 ```bash
-docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
-  -v "$PWD:/repo" -w /repo/clients/elixir \
-  elixir:1.17 sh -lc 'mix local.hex --force && mix test'
+mix test   # the integration tests build eqlink and eqmem with Go, if it is installed
 ```

@@ -24,10 +24,12 @@ serialized through a single-connection `database/sql` write pool and committed
 with `BEGIN IMMEDIATE`. Separate
 backend instances and processes are still coordinated by SQLite's file locks.
 
-Blocking claims use in-process `subq` notifications plus EntroQ's normal poll
-interval. Notifications do not cross process boundaries and there is no
-dedicated clock-trigger scanner: a future task becomes visible on the next poll
-unless a modification through the same backend instance wakes the claimant first.
+Blocking claims are woken in-process by a modification through the same
+backend instance, and otherwise by a readiness loop (`WithReadinessInterval`,
+`--readiness_interval`, default 5s) that checks the queues claims are waiting
+on, so a task inserted by another process, or one whose arrival time comes due,
+is found within one interval. An idle backend, with no claim waiting, queries
+nothing.
 Empty blocking-claim polls use a read-only readiness probe and enter the write
 pool only when a claim appears promising.
 

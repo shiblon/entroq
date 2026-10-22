@@ -26,7 +26,7 @@ import { NodeGateway } from "entroq/node";
 
 const worker = new Worker(["/my/queue"], {
   work: async (w) => {
-    console.log("Processing:", w.value);
+    console.log("Processing:", w.task.value);
     // Commit atomically: here, delete the task to finish it.
     return M.of(M.deleting(w.task));
   },
@@ -80,7 +80,7 @@ Throw instead of returning to give the task another fate:
 - Anything else stops this worker, after the gateway quarantines the task if
   this was its last allowed claim.
 
-`w` carries `task`, `value` (its JSON value), `docs`, and `sets`. `ctx` carries
+`w` carries `task`, `docs`, and `sets`. `ctx` carries
 `signal`, aborted once the worker starts stopping; `stop()`, to stop once this
 task is settled; `sleep(ms)`, which wakes early when stopping; and `read(kind,
 fields)` and `time()`, reads the gateway answers mid-turn.

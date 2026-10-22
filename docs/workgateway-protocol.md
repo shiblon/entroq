@@ -53,12 +53,17 @@ unchanged (see [Transports](#transports)).
 
 ## The payloads are the EntroQ protobufs, as protojson
 
-A worker hand-models nothing. Every domain object on the wire (task, doc, doc
-set, modification, dependency, and the read requests and answers) is the
-canonical protojson of the message of that name in `api/entroq.proto`. A
-foreign worker generates those types from the same proto the rest of EntroQ
-uses. Only the envelope around them, a `type` and the fields this document
-names, belongs to the gateway.
+Every domain object on the wire (task, doc, doc set, modification,
+dependency, and the read requests and answers) is the canonical protojson of
+the message of that name in `api/entroq.proto`. Only the envelope around them,
+a `type` and the fields this document names, belongs to the gateway.
+
+A worker needs nothing from the proto to read or write them: they are plain
+JSON, and naming only the fields a worker uses is enough. Generating types
+from the proto works too, but is never required; the examples write theirs by
+hand. Field names are lowerCamelCase (`claimantId`, `byMs`), though the
+gateway also accepts the proto's own snake_case. int64 fields arrive as
+strings, and the gateway accepts strings or numbers.
 
 Three rules for a modification, all enforced:
 
@@ -93,7 +98,7 @@ the session:
 | `max_attempts` | Retries before a task is quarantined. Zero is no limit. |
 | `max_claims` | Claims a task may fail to survive before it is quarantined. Zero takes the worker's default of five; a negative value is no limit. |
 | `retry_delay_s` | Base delay, in whole seconds, before a retried task is available again, including a task whose doc sets someone else holds. Zero takes the worker's default of 30. |
-| `work_timeout_s` | How long this client expects one task to take. The operator caps it. |
+| `work_timeout_s` | How long this client expects one task to take, in whole seconds. The operator caps it. Zero takes the operator's cap, `--max-work-timeout` (default 5m). |
 | `dangerous_claimant_override` | Replace the gateway's claimant. Only if you supply your own ownership guarantees. |
 
 The gateway answers with `ready`, which carries what the session settled on:

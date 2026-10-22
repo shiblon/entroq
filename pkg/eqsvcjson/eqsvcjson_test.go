@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"connectrpc.com/connect"
+	"github.com/shiblon/entroq"
 	pb "github.com/shiblon/entroq/api"
 	"github.com/shiblon/entroq/api/apiconnect"
 	"github.com/shiblon/entroq/pkg/backend/eqmem"
@@ -121,18 +122,19 @@ func TestOverLimitValuesAre400(t *testing.T) {
 	defer cleanup()
 
 	long := strings.Repeat("c", 65)
+	longClaimant := strings.Repeat("c", entroq.MaxClaimantBytes+1)
 	tests := []struct {
 		name string
 		path string
 		body map[string]any
 	}{
 		{"claim claimant", "/api/v0/claim", map[string]any{
-			"claimantId": long,
+			"claimantId": longClaimant,
 			"queues":     []string{"/q"},
 			"durationMs": 1000,
 		}},
 		{"modify claimant", "/api/v0/modify", map[string]any{
-			"claimantId": long,
+			"claimantId": longClaimant,
 			"inserts":    []map[string]any{{"queue": "/q"}},
 		}},
 		{"task id", "/api/v0/modify", map[string]any{

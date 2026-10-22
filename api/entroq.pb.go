@@ -41,9 +41,9 @@ const (
 	// pill. Tasks only.
 	ChangeMode_CHANGE_RESET_CLAIMS ChangeMode = 1
 	// Change only when the task, or the doc set old_id names by key, is ready
-	// again: renewing a lease on it, or releasing it. Only new_data.at_ms is
-	// read; anything else given must match what old_id names. Keeps a task's
-	// claim count.
+	// again: renewing a lease on it, or releasing it. Only the arrival is read,
+	// new_data.at_ms at protocol 1 and new_data.by_ms at protocol 2; anything
+	// else given must match what old_id names. Keeps a task's claim count.
 	ChangeMode_CHANGE_LEASE ChangeMode = 2
 )
 
@@ -1367,7 +1367,8 @@ func (x *DocSetClaim) GetOmitMembers() bool {
 // named is claimed, or none is.
 //
 // In protocol 1, namespace and key name the one set, the docs sharing that
-// key. Protocol 2 names the sets in sets, and namespace and key are ignored.
+// key. Protocol 2 names the sets in sets, which must not be empty, and
+// namespace and key are protocol 1 only.
 type DocClaim struct {
 	state         protoimpl.MessageState
 	sizeCache     protoimpl.SizeCache
@@ -1968,7 +1969,9 @@ func (x *ModifyRequest) GetDocDepends() []*DocID {
 }
 
 // ModifyResponse returns inserted and updated tasks and docs when successful.
-// A dependency error (which is permanent) comes through as gRPC's NOT_FOUND code.
+// A dependency error comes through as gRPC's ABORTED code (HTTP 409): the
+// state the modification depended on has moved, and it may succeed if retried
+// against what is there now. Servers before 1.13 sent NOT_FOUND.
 type ModifyResponse struct {
 	state         protoimpl.MessageState
 	sizeCache     protoimpl.SizeCache
@@ -2042,7 +2045,7 @@ func (x *ModifyResponse) GetChangedDocs() []*Doc {
 	return nil
 }
 
-// ModifyDep can be returned with a gRPC NotFound status indicating which
+// ModifyDep can be returned with a gRPC Aborted status indicating which
 // dependencies failed. This is done via the gRPC error return, not directly
 // in the response proto. Either id (for task dependencies) or doc_id (for doc
 // dependencies) will be set; msg is used with type=DETAIL for a human-readable
@@ -2280,7 +2283,7 @@ func (x *TasksRequest) GetOmitValues() bool {
 	return false
 }
 
-// TasksReqponse contains the tasks requested.
+// TasksResponse contains the tasks requested.
 type TasksResponse struct {
 	state         protoimpl.MessageState
 	sizeCache     protoimpl.SizeCache

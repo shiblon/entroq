@@ -11,7 +11,7 @@ from .types import (
     Task, TaskData, TaskChange, TaskID, TaskArrival,
     Doc, DocData, DocChange, DocID, DocArrival, DocClaim, ClaimedDocs,
     DependencyError, InvalidArgumentError, Modification, ModifyResult,
-    TransportError,
+    TransportError, UnsupportedError,
 )
 from .base import EntroQBase
 
@@ -22,7 +22,18 @@ from .base import EntroQBase
 # branching would cost more than it bought, and a protocol 1 CLIENT still
 # works against a protocol 2 server, which is the compatibility that matters.
 PROTOCOL = 2
-_PROTOCOL_HEADERS = {"entroq-protocol": str(PROTOCOL)}
+_PROTOCOL_HEADER = "entroq-protocol"
+_PROTOCOL_HEADERS = {_PROTOCOL_HEADER: str(PROTOCOL)}
+
+
+def _served(resp: httpx.Response) -> list[int]:
+    """The protocols a server says it serves. A server that says nothing
+    predates the header, which means protocol 1 alone."""
+    raw = resp.headers.get(_PROTOCOL_HEADER, "")
+    try:
+        return [int(p) for p in raw.split(",") if p.strip()] or [1]
+    except ValueError:
+        return [1]
 
 
 def _service_message(resp: httpx.Response) -> str:
@@ -193,6 +204,8 @@ class EntroQJSON(EntroQBase):
         """
         self._base_url = base_url.rstrip("/")
         self.claimant_id = claimant_id or secrets.token_hex(8)
+        # Whether the server has said it serves PROTOCOL; see _check_server.
+        self._server_ok = False
         self._owns_http = http_client is None
         self.http = http_client or httpx.AsyncClient(
             timeout=None,
@@ -214,9 +227,35 @@ class EntroQJSON(EntroQBase):
     def as_claimant(self, claimant_id: str) -> "EntroQJSON":
         """Return a client on this one's HTTP connection that acts as
         ``claimant_id``. Closing it leaves the connection open."""
-        return EntroQJSON(self._base_url, claimant_id, http_client=self.http)
+        scoped = EntroQJSON(self._base_url, claimant_id, http_client=self.http)
+        scoped._server_ok = self._server_ok
+        return scoped
+
+    async def _check_server(self) -> None:
+        """Refuse a server that does not serve PROTOCOL, asking it once, with a
+        time request, before anything else is sent.
+
+        A server too old to serve it may also be too old to refuse the fields
+        it does not know, and would drop them instead: a doc claim tied to a
+        task's lease would lose the tie. So the question comes first, as the Go
+        client's does, rather than being read off the first real answer.
+        """
+        if self._server_ok:
+            return
+        try:
+            resp = await self.http.get(f"{self._base_url}/api/v0/time", headers=_PROTOCOL_HEADERS)
+        except httpx.TransportError as e:
+            # Nothing has been sent yet, so the caller may simply try again.
+            raise TransportError(f"GET /api/v0/time: {e}", cause=e, safe_to_retry=True) from e
+        served = _served(resp)
+        if PROTOCOL not in served:
+            raise UnsupportedError(
+                f"the server serves protocol {', '.join(map(str, served))}, and this client "
+                f"speaks {PROTOCOL}: upgrade the server to EntroQ 1.13 or later")
+        self._server_ok = True
 
     async def _request(self, method: str, path: str, *, json=None, params=None) -> dict:
+        await self._check_server()
         try:
             resp = await self.http.request(
                 method, f"{self._base_url}{path}",

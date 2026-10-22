@@ -765,7 +765,7 @@ func TestLostClaimGoesOn(t *testing.T) {
 			// now, so the connection's own claimant is a different one and is
 			// excluded from a held task -- which is the point of that, and
 			// means this has to name the holder to move the task at all.
-			if _, err := client.As(holder).Modify(ctx, task.Change(entroq.ValueTo("taken"), entroq.ArrivalTimeBy(time.Hour))); err != nil {
+			if _, err := client.Scoped(entroq.DangerousClaimant(holder)).Modify(ctx, task.Change(entroq.ValueTo("taken"), entroq.ArrivalTimeBy(time.Hour))); err != nil {
 				t.Fatalf("Change underneath: %v", err)
 			}
 			if _, err := client.Modify(ctx, entroq.InsertingInto("q", entroq.WithValue("next"))); err != nil {
@@ -824,7 +824,7 @@ func TestLostClaimFatalStops(t *testing.T) {
 	task := <-working
 	// As the holder: a Run is its own consumer, so the connection cannot
 	// touch a task the Run holds.
-	if _, err := client.As(holder).Modify(ctx, task.Change(entroq.ArrivalTimeBy(time.Hour))); err != nil {
+	if _, err := client.Scoped(entroq.DangerousClaimant(holder)).Modify(ctx, task.Change(entroq.ArrivalTimeBy(time.Hour))); err != nil {
 		t.Fatalf("Change underneath: %v", err)
 	}
 	if _, ok := AsFatal(<-errCh); !ok {

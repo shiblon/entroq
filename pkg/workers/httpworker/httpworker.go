@@ -119,6 +119,13 @@ func (hw *Worker) Run(ctx context.Context, eq *entroq.EntroQ, opts ...Option) er
 		elapsed := time.Since(start)
 
 		if err != nil {
+			// The worker stopping, or its work timeout, is no answer from the
+			// server: commit nothing, so the worker lets the claim lapse or
+			// retries it. The request's own Timeout is an answer, and goes to
+			// the error box below.
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("request: %w", ctx.Err())
+			}
 			resp = &Response{
 				Error:   err.Error(),
 				Elapsed: elapsed,

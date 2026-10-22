@@ -95,12 +95,10 @@ export function failure(msg: Message): Error {
 }
 
 /**
- * A task in hand: the task, its value, the docs claimed for it, and the sets
- * they were claimed as. `docs` and `sets` are empty in `take`, which decides
- * them.
+ * A task in hand: the task, the docs claimed for it, and the sets they were
+ * claimed as. `docs` and `sets` are empty in `take`, which decides them.
  */
 export class Work {
-  readonly value: any;
   readonly sets: Doc[];
   readonly docs: Doc[];
 
@@ -108,34 +106,28 @@ export class Work {
     readonly task: Task,
     docSets: { set: Doc; docs?: Doc[] }[] = [],
   ) {
-    this.value = task.value;
     this.sets = docSets.map((s) => s.set);
     this.docs = docSets.flatMap((s) => s.docs ?? []);
   }
 }
 
 /** A doc set for `take` to claim. */
-export function claimSet(namespace: string, key: string, omitMembers = false): DocSetClaim {
-  return omitMembers ? { set: { namespace, key, version: 0 }, omitMembers } : { set: { namespace, key, version: 0 } };
+export function claimSet(namespace: string, key: string, omitMembers?: boolean): DocSetClaim {
+  return { set: { namespace, key, version: 0 }, omitMembers };
 }
 
-type Field = keyof Omit<ModifyRequest, "claimantId">;
-type Op = [Field, any];
+type Op = [keyof ModifyRequest, any];
 
 function isDoc(item: Task | Doc): item is Doc {
   return "namespace" in item;
 }
 
 function taskId(t: Task | TaskID): TaskID {
-  return { queue: t.queue, id: t.id, version: t.version ?? 0 };
+  return { queue: t.queue, id: t.id, version: t.version };
 }
 
 function docId(d: Doc | DocID): DocID {
-  return { namespace: d.namespace, id: d.id, version: d.version ?? 0 };
-}
-
-function arriving<T extends object>(data: T, byMs?: number): T {
-  return byMs ? { ...data, byMs: String(Math.round(byMs)) } : data;
+  return { namespace: d.namespace, id: d.id, version: d.version };
 }
 
 /**
@@ -144,10 +136,11 @@ function arriving<T extends object>(data: T, byMs?: number): T {
  *     M.of(M.deleting(w.task), M.inserting({ queue: "next", value: v }))
  *
  * Name a task or doc as it was handed over. The gateway moves the versions of
- * the task in hand and its claimed docs to wherever renewal left them.
+ * the task in hand and its claimed docs to wherever renewal left them. Fields
+ * pass through as given, and the gateway refuses what it cannot commit.
  */
 export class Modification {
-  readonly request: Omit<ModifyRequest, "claimantId"> = {};
+  readonly request: ModifyRequest = {};
 
   constructor(...ops: Op[]) {
     for (const [field, item] of ops) {
@@ -163,30 +156,20 @@ export class Modification {
    * A task, given queue and value, and byMs to delay it; or a doc, given
    * namespace and key, and optionally secondaryKey and content.
    */
-  static inserting(
-    item:
-      | { queue: string; value?: any; byMs?: number }
-      | { namespace: string; key: string; secondaryKey?: string; content?: any; id?: string },
-  ): Op {
-    if ("queue" in item) {
-      const { byMs, ...data } = item;
-      return ["inserts", arriving(data, byMs)];
-    }
-    return ["docInserts", item];
+  static inserting(item: Record<string, any>): Op {
+    return ["queue" in item ? "inserts" : "docInserts", item];
   }
 
   /**
    * A task or doc with the fields named replaced: a task's queue or value,
-   * which byMs may delay; a doc's content or keys.
+   * or byMs to delay it; a doc's content or keys.
    */
-  static changing(item: Task | Doc, fields: { byMs?: number; [field: string]: any } = {}): Op {
-    const { byMs, ...rest } = fields;
+  static changing(item: Task | Doc, fields: Record<string, any> = {}): Op {
     if (isDoc(item)) {
       const { namespace, id, key, secondaryKey, content } = item;
-      return ["docChanges", { oldId: docId(item), newData: { namespace, id, key, secondaryKey, content, ...rest } }];
+      return ["docChanges", { oldId: docId(item), newData: { namespace, id, key, secondaryKey, content, ...fields } }];
     }
-    const data = { queue: item.queue, value: item.value, ...rest };
-    return ["changes", { oldId: taskId(item), newData: arriving(data, byMs) }];
+    return ["changes", { oldId: taskId(item), newData: { queue: item.queue, value: item.value, ...fields } }];
   }
 
   static deleting(item: Task | Doc): Op {
@@ -510,7 +493,7 @@ export class Gateway {
   protected readonly stopping = new AbortController();
   private readonly sessions = new Set<Session>();
   private failure?: Error;
-  private readonly connectFn: () => Promise<Transport>;
+  private readonly connect: () => Promise<Transport>;
   protected readonly log: (line: string) => void;
 
   constructor(opts: GatewayOptions = {}) {
@@ -518,13 +501,8 @@ export class Gateway {
     if (!connect && !url) {
       throw new Error("Gateway needs a url or a connect function");
     }
-    this.connectFn = connect ?? (async () => new HTTPTransport(url!));
+    this.connect = connect ?? (async () => new HTTPTransport(url!));
     this.log = opts.log ?? ((line) => console.error(line));
-  }
-
-  /** Open one session's transport. */
-  protected connect(): Promise<Transport> {
-    return this.connectFn();
   }
 
   /**
@@ -549,65 +527,48 @@ export class Gateway {
     }
   }
 
-  /** Run one worker's sessions one after another until it stops. */
+  /**
+   * Run one worker's sessions, one after another, until it stops. A session
+   * that is gone is replaced at once. A transient error, or a gateway that
+   * went away or never answered, is retried with backoff. Anything else stops
+   * every worker, and run throws it.
+   */
   private async serve(worker: Worker): Promise<void> {
-    let backoffMs = 200;
-    const wait = async () => {
-      await sleep(backoffMs, this.stopping.signal);
-      backoffMs = Math.min(backoffMs * 2, 5000);
-    };
+    let backoffMs = 0;
     while (!this.stopping.signal.aborted) {
-      let xchg: Transport;
+      let xchg: Transport | undefined;
+      let session: Session | undefined;
       try {
         xchg = await this.connect();
-      } catch (e) {
-        if (!this.recoverable(e)) {
-          return;
+        session = new Session(worker, xchg);
+        this.sessions.add(session);
+        if (this.stopping.signal.aborted) {
+          session.stopping.abort();
         }
-        await wait();
-        continue;
-      }
-      const session = new Session(worker, xchg);
-      this.sessions.add(session);
-      if (this.stopping.signal.aborted) {
-        session.stopping.abort();
-      }
-      try {
         await session.run();
-        backoffMs = 200;
+        backoffMs = 0;
       } catch (e) {
         if (e instanceof SessionGone) {
-          // Start a new session at once.
-        } else if (e instanceof GatewayError) {
-          if (!this.recoverable(e)) {
-            return;
-          }
-          if (!session.stopping.signal.aborted) {
-            await wait();
-          }
+          backoffMs = 0;
+        } else if (e instanceof GatewayError && e.cls !== "transient") {
+          this.log(`[worker] ${e.message}; stopping`);
+          this.failure ??= e;
+          this.stop();
+          return;
         } else {
-          // A gateway that went away, or never answered: try again, in time.
-          this.log(`[worker] gateway unreachable (${e instanceof Error ? e.message : e}); reconnecting`);
-          await wait();
+          this.log(`[worker] ${e instanceof Error ? e.message : e}; reconnecting`);
+          backoffMs = Math.min(Math.max(backoffMs * 2, 200), 5000);
         }
       } finally {
-        this.sessions.delete(session);
-        xchg.close();
+        if (session) {
+          this.sessions.delete(session);
+        }
+        xchg?.close();
       }
-      if (session.stopping.signal.aborted) {
+      if (session?.stopping.signal.aborted) {
         return;
       }
+      await sleep(backoffMs, this.stopping.signal);
     }
-  }
-
-  private recoverable(e: unknown): boolean {
-    if (e instanceof GatewayError && e.cls === "transient") {
-      this.log(`[worker] ${e.message}; reconnecting`);
-      return true;
-    }
-    this.log(`[worker] ${e instanceof Error ? e.message : e}; stopping`);
-    this.failure ??= e instanceof Error ? e : new Error(String(e));
-    this.stop();
-    return false;
   }
 }

@@ -804,7 +804,7 @@ func TestEQMemJournalDocClaim(t *testing.T) {
 		t.Fatalf("Claim: %v, %v", err, sets)
 	}
 	held := sets[0].Docs
-	holder := eq.ClientID
+	holder := eq.ID()
 	if err := eq.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -1073,7 +1073,7 @@ func TestEQMemJournalUpdateArrival(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Renew: %v", err)
 	}
-	holder := eq.ClientID
+	holder := eq.ID()
 	if err := eq.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}

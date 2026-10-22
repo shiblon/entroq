@@ -18,13 +18,13 @@ from eqgateway import Gateway, Worker, M
 def work(w, ctx):
     """Process one task and say what becomes of it.
 
-    w.task is the protojson of an api.Task, and w.value its JSON value.
+    w.task is the protojson of an api.Task, with its JSON value in "value".
     Return a Modification to commit (M(M.deleting(w.task)) once it is
     consumed), or None to commit nothing; raise RetryError or MoveError to give
     up on it. Long work can watch ctx.stopping, or use ctx.sleep, to finish
     early when the worker drains.
     """
-    print(f"[worker] task {w.task['id']}: value={w.value!r}", file=sys.stderr)
+    print(f"[worker] task {w.task['id']}: value={w.task['value']!r}", file=sys.stderr)
     return M(M.deleting(w.task))
 
 
