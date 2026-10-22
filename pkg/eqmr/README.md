@@ -26,7 +26,7 @@ goes to a `Sink`.
               |     (one per run)     |   /reduce-check, /gc, and
               +-----------------------+   every {queue}/err
                          |
-   docs:  state, split/NNNNNN, mapout/NNNNNN, result/NNNNNN
+   docs:  state, split/NNNNNN, mapout/PPPPPP/NNNNNN, result/PPPPPP
           (document store and sink: run/..., output/...)
 ```
 
@@ -51,8 +51,9 @@ resumes the run. Run one launcher at a time: one that stages splits while
 another's run is accepting them brings accepted splits back.
 
 **Acceptance.** The controller accepts the first finish for each unit while
-claiming only that unit's input, the split doc or the partition's pointer docs,
-and deletes the input in the `Modify` that records the acceptance. Acceptances
+claiming one doc set: the split doc for a split, and for a partition the set
+its result marker goes in. It deletes the input in the `Modify` that records
+the acceptance, pinned to the versions it read. Acceptances
 of different units never wait on one another; a later finish for the same unit
 finds its input gone.
 
@@ -119,9 +120,11 @@ src, err := eqmr.NewFileSource("corpus")                           // mapper pod
 Mappers assign each key to a partition by `ShardForKey`, buffer up to
 `DefaultIntermediateRunBytes` (`WithIntermediateRunBytes`), sort records by
 primary key, secondary key, and value, and write immutable runs. The
-controller publishes one pointer doc per run, keyed `mapout/<partition>` with
-the split and run as its secondary key (`split/000003/0001`), so a split's
-absence means its output is durable and reachable. Reducers heap-merge a
+controller publishes one pointer doc per run, keyed `mapout/<partition>/<split>`
+with the run as its secondary key (`0001`), so a split's absence means its
+output is durable and reachable. Each split's pointers for a partition are a
+doc set of their own: every write to a set moves its version, so acceptances
+sharing one set per partition would take turns on it. Reducers heap-merge a
 partition's runs and feed one key at a time through `ReducerInput`, so reduce
 work scales with partitions.
 
@@ -267,7 +270,7 @@ markers, its document-sink output if any, and its quarantined tasks if it
 failed; intermediates are collected as it goes. Once the sink has finished,
 nothing in EntroQ is needed to read the output.
 
-A namespace under EntroQ's `/gc=` convention expires its unclaimed doc groups
+A namespace under EntroQ's `/gc=` convention expires its unclaimed doc sets
 at a time fixed when they are inserted: right for output with a bounded reading
 window, wrong for intermediates.
 

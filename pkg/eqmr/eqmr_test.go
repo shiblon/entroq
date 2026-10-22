@@ -826,8 +826,9 @@ func TestSetupIsRetryable(t *testing.T) {
 
 // TestDocKeysAreUnique pins that no two docs in a run share both a primary and
 // a secondary key, which backends may enforce. Map-output pointers are the
-// case that matters: one partition collects many runs from many splits under
-// one primary key, so its pointers must differ in their secondary keys.
+// case that matters: a split that writes several runs for a partition puts
+// them under one primary key, so its pointers must differ in their secondary
+// keys.
 func TestDocKeysAreUnique(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

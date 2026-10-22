@@ -11,12 +11,15 @@ import pytest
 from entroq.base import EntroQBase
 from entroq.types import (
     Task, TaskID, TaskChange,
-    Doc, DocID,
+    ClaimedDocs, Doc, DocData, DocID, DocClaim,
     DependencyError, Modification, ModifyResult, TransportError,
 )
 from entroq.worker import (
-    StopWorker, RetryError, MoveError,
+    next_renewal_retry_s, renewal_margin_s, renewal_interval_s,
+    granted_lease_s,
+    StopWorker, FatalWorker, RetryError, MoveError,
     DocClaim, Handler, EntroQWorker, default_err_q_map,
+    DEFAULT_WORK_TIMEOUT_S, DEFAULT_MAX_CLAIMS,
     _fix_versions, _renewing,
 )
 
@@ -25,10 +28,18 @@ from entroq.worker import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _task(id='t1', version=1, queue='q', attempt=0, claims=0, err='') -> Task:
+def _task(id='t1', version=1, queue='q', attempt=0, claims=0, err='',
+          lease_s=None) -> Task:
+    """Build a task. lease_s is the lease it was granted: at minus modified.
+
+    Leaving it None leaves modified unset, which is what a task built by hand
+    looks like; the worker then falls back to its default claim duration.
+    """
+    now = datetime.now(tz=timezone.utc)
     return Task(
         id=id, version=version, queue=queue,
-        at=datetime.now(tz=timezone.utc),
+        at=now if lease_s is None else now + timedelta(seconds=lease_s),
+        modified=None if lease_s is None else now,
         claimant='claimant', value=None,
         attempt=attempt, claims=claims, err=err,
     )
@@ -51,8 +62,26 @@ class FakeClient(EntroQBase):
         self._docs = list(docs)
         self.modify_calls: list[Modification] = []
         self.modify_raises: Exception | None = None
+        # A set is a map from secondary key to doc, so a fixture that seeds two
+        # docs at one place describes a set the service would refuse. Caught
+        # here so a unit test cannot pass on state that cannot exist.
+        places = [(d.namespace, d.key, d.secondary_key) for d in self._docs]
+        if len(set(places)) != len(places):
+            raise ValueError(f"seeded docs share a place in their set: {places}")
+        # A doc set holds its own lock, versioned apart from its members.
+        self._set_versions: dict[tuple[str, str], int] = {}
+        self.claim_set_calls: list[tuple[list[DocClaim], Task | None]] = []
         for t in tasks:
             self._task_q.put_nowait(t)
+
+    def _set_ref(self, namespace, key) -> Doc:
+        """Return a set's lock as the service reports it: a doc with no id."""
+        now = datetime.now(tz=timezone.utc)
+        return Doc(
+            namespace=namespace, id='', version=self._set_versions.setdefault(
+                (namespace, key), 1),
+            key=key, secondary_key='', content=None, claimant='claimant',
+            at=now, modified=now)
 
     async def time(self) -> datetime:
         return datetime.now(tz=timezone.utc)
@@ -76,53 +105,174 @@ class FakeClient(EntroQBase):
         if self.modify_raises is not None:
             raise self.modify_raises
         self.modify_calls.append(modification)
+        now = datetime.now(tz=timezone.utc)
         tasks_changed = [
             Task(id=tc.id, version=tc.version + 1, queue=tc.queue,
-                 at=tc.at or datetime.now(tz=timezone.utc),
+                 at=tc.at or now,
                  claimant='claimant', value=tc.value,
                  attempt=tc.attempt, err=tc.err or '')
             for tc in modification.task_changes
         ]
+        # An arrival moves its item one version and sets only when the item is
+        # ready again, resolved here against this client's clock as a backend
+        # resolves it against its own.
+        tasks_changed.extend(
+            Task(id=a.id, version=a.version + 1, queue=a.queue,
+                 at=now + timedelta(seconds=a.by_s), modified=now,
+                 claimant='claimant', value=None)
+            for a in modification.task_arrivals
+        )
         docs_changed = [
             Doc(namespace=dc.namespace, id=dc.id, version=dc.version + 1,
                 key=dc.key, secondary_key=dc.secondary_key,
                 content=dc.content, claimant='claimant',
-                at=dc.at or datetime.now(tz=timezone.utc))
+                at=dc.at or now)
             for dc in modification.doc_changes
         ]
+        for a in modification.doc_arrivals:
+            version = self._set_versions.get((a.namespace, a.key), a.version) + 1
+            self._set_versions[(a.namespace, a.key)] = version
+            docs_changed.append(Doc(
+                namespace=a.namespace, id='', version=version, key=a.key,
+                secondary_key='', content=None, claimant='claimant',
+                at=now + timedelta(seconds=a.by_s), modified=now))
         return ModifyResult(tasks_changed=tasks_changed, docs_changed=docs_changed)
 
     async def docs(self, namespace='', key_start='', key_end='', limit=0, omit_values=False):
         return list(self._docs)
 
     async def claim_docs(self, namespace, key, duration_ms=30000):
-        return [d for d in self._docs if d.namespace == namespace and d.key == key]
+        return await self.claim_doc_sets(
+            [DocClaim(namespace, key)], duration_ms=duration_ms)
+
+    async def claim_doc_sets(self, sets, *, duration_ms=30000, task_to_match=None):
+        sets = list(sets)
+        self.claim_set_calls.append((sets, task_to_match))
+        members, refs = [], []
+        for c in sets:
+            members.extend(d for d in self._docs
+                           if d.namespace == c.namespace and d.key == c.key)
+            refs.append(self._set_ref(c.namespace, c.key))
+        return ClaimedDocs(members, refs)
 
 
 class DocFailClient(FakeClient):
-    """Fails claim_docs with a prescribed DependencyError."""
+    """Fails a doc claim with a prescribed DependencyError."""
 
     def __init__(self, tasks=(), error=None):
         super().__init__(tasks=tasks)
         self._doc_error = error
 
-    async def claim_docs(self, namespace, key, duration_ms=30000):
+    async def claim_doc_sets(self, sets, *, duration_ms=30000, task_to_match=None):
         raise self._doc_error
 
 
+class ParkedRenewClient(FakeClient):
+    """Applies a renewal, then takes time to answer.
+
+    A server that has already committed while its reply is still on the wire.
+    renewal_applied fires the moment the write lands, so a caller waiting on it
+    is guaranteed to be inside the reply's flight.
+    """
+
+    IN_FLIGHT_S = 0.05
+
+    def __init__(self, tasks=(), docs=()):
+        super().__init__(tasks=tasks, docs=docs)
+        self.renewal_applied = asyncio.Event()
+        self.renewed: ModifyResult | None = None
+
+    async def modify(self, modification, *, unsafe_claimant_id=None):
+        if not modification.task_arrivals:
+            return await super().modify(modification)
+        result = await super().modify(modification)
+        self.renewed = result
+        self.renewal_applied.set()
+        await asyncio.sleep(self.IN_FLIGHT_S)
+        return result
+
+
+class SilentRenewClient(FakeClient):
+    """Answers a renewal without reporting what it changed.
+
+    Whatever it did, the caller cannot know the versions it now holds.
+    """
+
+    def __init__(self, tasks=(), docs=(), omit='task'):
+        super().__init__(tasks=tasks, docs=docs)
+        self._omit = omit
+        self.renewals = 0
+
+    async def modify(self, modification, *, unsafe_claimant_id=None):
+        if not modification.task_arrivals:
+            return await super().modify(modification)
+        self.renewals += 1
+        result = await super().modify(modification)
+        if self._omit == 'task':
+            return ModifyResult(tasks_changed=[], docs_changed=result.docs_changed)
+        return ModifyResult(tasks_changed=result.tasks_changed, docs_changed=[])
+
+
+class SlowClaimClient(FakeClient):
+    """Takes time to claim doc sets, as a contended claim does.
+
+    claim_elapsed_s is how long the claim took, which is lease time already
+    spent when the handler body finally starts.
+    """
+
+    def __init__(self, tasks=(), docs=(), claim_delay_s=0.0):
+        super().__init__(tasks=tasks, docs=docs)
+        self._claim_delay_s = claim_delay_s
+        self.renewed_at: list[float] = []
+        self._body_start: float | None = None
+
+    async def claim_doc_sets(self, sets, *, duration_ms=30000, task_to_match=None):
+        await asyncio.sleep(self._claim_delay_s)
+        result = await super().claim_doc_sets(
+            sets, duration_ms=duration_ms, task_to_match=task_to_match)
+        self._body_start = asyncio.get_running_loop().time()
+        return result
+
+    async def modify(self, modification, *, unsafe_claimant_id=None):
+        if modification.task_arrivals and self._body_start is not None:
+            self.renewed_at.append(
+                asyncio.get_running_loop().time() - self._body_start)
+        return await super().modify(modification)
+
+
+class FlakyRenewClient(FakeClient):
+    """Fails the first `failures` renewals transiently, recording when each
+    attempt was made. Everything else passes through."""
+
+    def __init__(self, tasks=(), docs=(), failures=1):
+        super().__init__(tasks=tasks, docs=docs)
+        self._failures = failures
+        self.attempts: list[float] = []
+
+    async def modify(self, modification, *, unsafe_claimant_id=None):
+        if not modification.task_arrivals:
+            return await super().modify(modification)
+        self.attempts.append(asyncio.get_running_loop().time())
+        if self._failures > 0:
+            self._failures -= 1
+            # Not a DependencyError: a lost claim stops the work, and this is
+            # the transient kind that must be retried instead.
+            raise RuntimeError("renewal is having a bad day")
+        return await super().modify(modification)
+
+    def gaps(self) -> list[float]:
+        return [b - a for a, b in zip(self.attempts, self.attempts[1:])]
+
+
 class RenewFailClient(FakeClient):
-    """Fails only renewal modifies (those that just push `at` forward)."""
+    """Fails only renewal modifies: those carrying a task arrival."""
 
     def __init__(self, tasks=(), error=None):
         super().__init__(tasks=tasks)
         self._renew_error = error
 
     async def modify(self, modification, *, unsafe_claimant_id=None):
-        changes = modification.task_changes
-        is_renewal = bool(changes) and all(
-            c.at is not None and c.queue == c.from_queue for c in changes
-        )
-        if is_renewal and self._renew_error is not None:
+        if modification.task_arrivals and self._renew_error is not None:
             raise self._renew_error
         return await super().modify(modification)
 
@@ -150,39 +300,98 @@ def test_fix_versions_task_change():
     tc = TaskChange(id='t1', version=1, queue='q', at=task.at)
     mod = Modification()
     mod.task_changes.append(tc)
-    _fix_versions(mod, task, [])
+    _fix_versions(mod, task, [], [])
     assert mod.task_changes[0].version == 5
 
 
 def test_fix_versions_task_delete():
     task = _task(id='t1', version=5)
     mod = Modification(Modification.deleting(TaskID(id='t1', version=1, queue='q')))
-    _fix_versions(mod, task, [])
+    _fix_versions(mod, task, [], [])
     assert mod.task_deletes[0].version == 5
 
 
 def test_fix_versions_task_depend():
     task = _task(id='t1', version=5)
     mod = Modification(Modification.depending(TaskID(id='t1', version=1, queue='q')))
-    _fix_versions(mod, task, [])
+    _fix_versions(mod, task, [], [])
     assert mod.task_depends[0].version == 5
 
 
-def test_fix_versions_doc_change():
-    doc = _doc(namespace='ns', id='d1', version=7)
+def test_fix_versions_claimed_member_with_no_set_is_a_bug():
+    """A claimed member whose set is not held has no version we can name.
+
+    The only candidates are the set's version and a wrong one -- the
+    claim-time version being exactly what a renewal moves past -- so this is
+    the worker library disagreeing with itself, not a case to guess at.
+    """
+    doc = _doc(namespace='ns', id='d1', key='k', version=7)
     mod = Modification()
     dc = doc.as_change()
     dc.version = 2
     mod.doc_changes.append(dc)
-    _fix_versions(mod, _task(), [doc])
-    assert mod.doc_changes[0].version == 7
+    with pytest.raises(FatalWorker, match="no lock for that set"):
+        _fix_versions(mod, _task(), [doc], [])
 
 
-def test_fix_versions_doc_delete():
-    doc = _doc(namespace='ns', id='d1', version=7)
+def test_fix_versions_doc_delete_takes_its_sets_version():
+    doc = _doc(namespace='ns', id='d1', key='k', version=7)
+    group = _doc(namespace='ns', id='', key='k', version=9)
     mod = Modification(Modification.deleting(DocID(namespace='ns', id='d1', version=2)))
-    _fix_versions(mod, _task(), [doc])
-    assert mod.doc_deletes[0].version == 7
+    _fix_versions(mod, _task(), [doc], [group])
+    assert mod.doc_deletes[0].version == 9
+
+
+def test_fix_versions_leaves_an_unclaimed_doc_alone():
+    """A doc this worker did not claim keeps the version its caller chose.
+
+    Its version is not ours to decide: we hold no lock on it and know nothing
+    about what it is at.
+    """
+    mod = Modification(Modification.deleting(DocID(namespace='ns', id='other', version=4)))
+    _fix_versions(mod, _task(), [], [])
+    assert mod.doc_deletes[0].version == 4
+
+
+def test_fix_versions_imposes_the_sets_version_on_its_members():
+    """A member named by ID takes its set's current version, not its own.
+
+    A doc carries its set's version and no other, so a renewal that moved the
+    set's lock has moved every member with it. The members are left as they
+    were claimed and the set is the one authority, applied here.
+    """
+    doc = _doc(namespace='ns', id='d1', key='k', version=7)
+    group = _doc(namespace='ns', id='', key='k', version=9)  # renewed twice
+    mod = Modification(
+        Modification.deleting(DocID(namespace='ns', id='d1', version=7)),
+        Modification.depending(DocID(namespace='ns', id='d1', version=7)),
+    )
+    change = doc.as_change()
+    change.version = 7
+    mod.doc_changes.append(change)
+
+    _fix_versions(mod, _task(), [doc], [group])
+
+    assert mod.doc_deletes[0].version == 9, "delete takes the set's version"
+    assert mod.doc_depends[0].version == 9, "so does a depend"
+    assert mod.doc_changes[0].version == 9, "and a change"
+
+
+def test_fix_versions_leaves_docs_of_unclaimed_sets_alone():
+    """A doc whose set was not claimed here keeps what the caller named.
+
+    The leasehold decides what may be corrected; a set this worker never held
+    could have moved for any reason, and guessing at its version would turn a
+    dependency check into a blind write.
+    """
+    mine = _doc(namespace='ns', id='d1', key='k', version=7)
+    group = _doc(namespace='ns', id='', key='k', version=9)
+    mod = Modification(
+        Modification.deleting(DocID(namespace='ns', id='elsewhere', version=3)))
+
+    _fix_versions(mod, _task(), [mine], [group])
+
+    assert mod.doc_deletes[0].version == 3, "untouched: not a member of a claimed set"
 
 
 def test_fix_versions_skips_unknown_ids():
@@ -190,7 +399,7 @@ def test_fix_versions_skips_unknown_ids():
     tc = TaskChange(id='t-other', version=3, queue='q', at=task.at)
     mod = Modification()
     mod.task_changes.append(tc)
-    _fix_versions(mod, task, [])
+    _fix_versions(mod, task, [], [])
     assert mod.task_changes[0].version == 3  # unchanged
 
 
@@ -239,7 +448,7 @@ def test_handler_finisher_chaining():
     async def process(task, docs):
         finished.append(task.id)
 
-    asyncio.run(process._do_finish(_task(), []))
+    asyncio.run(process._on_success(_task(), []))
     assert finished == ['t1']
 
 
@@ -629,6 +838,61 @@ def test_worker_rejects_invalid_transport_backoff():
         )
 
 
+def test_either_post_commit_hook_name_works():
+    """on_success is the name; finish is what it used to be called.
+
+    Code written against finish must keep working on an upgrade with no
+    edits, so on_success calls it by default and either override is enough.
+    """
+    task = _task(id='t1', version=1)
+
+    for hook in ('on_success', 'finish'):
+        client = FakeClient(tasks=[task])
+        worker = EntroQWorker(client, 'q', claim_duration_s=60.0)
+        ran = []
+
+        async def run():
+            async def hook_fn(self, t, docs):
+                ran.append(t.id)
+
+            handler = type('H', (Handler,), {
+                'do_work': lambda self, t, docs: _returns(None),
+                hook: hook_fn,
+            })()
+            await worker._process(task, handler)
+
+        asyncio.run(run())
+        assert ran == ['t1'], f"overriding {hook} did not run it"
+
+
+def test_overriding_both_hooks_runs_only_on_success():
+    """on_success is the one the worker calls, so it decides."""
+    task = _task(id='t1', version=1)
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0)
+    ran = []
+
+    async def run():
+        class MyHandler(Handler):
+            async def do_work(self, t, docs):
+                return None
+
+            async def on_success(self, t, docs):
+                ran.append('on_success')
+
+            async def finish(self, t, docs):
+                ran.append('finish')
+
+        await worker._process(task, MyHandler())
+
+    asyncio.run(run())
+    assert ran == ['on_success'], ran
+
+
+async def _returns(value):
+    return value
+
+
 def test_worker_finisher_called_when_do_work_returns_none():
     task = _task(id='t1', version=1)
     client = FakeClient(tasks=[task])
@@ -741,6 +1005,37 @@ def test_worker_move_error_increments_attempt():
     assert tc.attempt == 2
 
 
+def test_worker_max_claims_defaults_to_five():
+    """Parity with Go, whose worker.DefaultMaxClaims is five.
+
+    The count only climbs when a worker said nothing at all, so a task that
+    reaches the limit is a poison pill rather than one that is merely busy.
+    """
+    assert DEFAULT_MAX_CLAIMS == 5, "five, as Go bounds it"
+
+    task = _task(id='t1', version=1, claims=DEFAULT_MAX_CLAIMS + 1)
+    client = FakeClient(tasks=[task])
+    # No max_claims: the default is what is under test.
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0, err_queue='err')
+
+    work_called = []
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            work_called.append(t.id)
+            raise StopWorker
+
+        await worker._process(task, process)
+
+    asyncio.run(run())
+
+    assert work_called == [], "the handler must not run for a task over the limit"
+    tc = client.modify_calls[0].task_changes[0]
+    assert tc.queue == 'err'
+    assert 'maximum claims' in tc.err
+
+
 def test_worker_max_claims_moves_task_without_running_handler():
     task = _task(id='t1', version=1, claims=4)
     client = FakeClient(tasks=[task])
@@ -807,7 +1102,8 @@ def test_worker_max_claims_allows_task_at_the_ceiling():
 def test_worker_max_claims_zero_means_no_limit():
     task = _task(id='t1', version=1, claims=1000)
     client = FakeClient(tasks=[task])
-    worker = EntroQWorker(client, 'q', claim_duration_s=60.0, err_queue='err')
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0, max_claims=0,
+                          err_queue='err')
 
     work_called = []
 
@@ -852,6 +1148,152 @@ def _doc_dispose(error):
     return client.modify_calls[0].task_changes[0]
 
 
+def _retry_delays(*, jitter: bool, n: int = 20, delay_s: float = 10.0) -> list[float]:
+    """Dispose of n retries and return how long each asked to wait."""
+    out = []
+    for _ in range(n):
+        task = _task(id='t1', version=1, queue='q')
+        client = FakeClient(tasks=[task])
+        worker = EntroQWorker(client, 'q', claim_duration_s=60.0,
+                              retry_delay_s=delay_s)
+
+        async def run():
+            await worker._dispose(task, RetryError("lost a race"), jitter=jitter)
+
+        asyncio.run(run())
+        tc = client.modify_calls[0].task_changes[0]
+        out.append((tc.at - datetime.now(tz=timezone.utc)).total_seconds())
+    return out
+
+
+def test_a_contention_retry_spreads_the_workers_that_lost():
+    """Every worker that loses one race fails at the same instant.
+
+    An unjittered delay brings them all back together to lose again, so a
+    contention retry waits up to a quarter longer at random. Go's
+    contentionDelay does the same.
+    """
+    delays = _retry_delays(jitter=True)
+    assert len({round(d, 3) for d in delays}) > 1, (
+        f"every retry waited the same: {delays}")
+    assert all(9.0 <= d <= 13.0 for d in delays), (
+        f"a spread retry must stay within a quarter of the delay: {delays}")
+
+
+def test_an_ordinary_retry_is_not_spread():
+    """Only a failure shared by every loser of a race needs spreading; a
+    handler asking for a retry is asking for the delay it named."""
+    delays = _retry_delays(jitter=False, n=5)
+    assert all(abs(d - 10.0) < 0.5 for d in delays), delays
+
+
+def _work_timeout_change(*, work_timeout_s, body, max_attempts=0, attempt=0):
+    """Run one task through a worker with work_timeout_s and return the
+    TaskChange it emitted, or None if it emitted none."""
+    task = _task(id='t1', version=1, queue='q', attempt=attempt, lease_s=60.0)
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0,
+                          work_timeout_s=work_timeout_s,
+                          max_attempts=max_attempts, err_queue='err')
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            return await body(t, docs)
+
+        await worker._process(task, process)
+
+    asyncio.run(run())
+    changes = [tc for m in client.modify_calls for tc in m.task_changes]
+    return changes[-1] if changes else None
+
+
+def test_work_timeout_retries_the_task():
+    """A body that runs too long costs the task once, not the worker.
+
+    A hang that was bad luck comes back and succeeds, so the disposition is a
+    retry with the attempt counted -- not a quarantine.
+    """
+    entered = []
+
+    async def slow(t, docs):
+        entered.append(t.id)
+        await asyncio.sleep(5.0)  # cancelled well before this
+        return None
+
+    tc = _work_timeout_change(work_timeout_s=0.05, body=slow)
+    assert entered == ['t1'], "the body must have been entered"
+    assert tc is not None, "a timed-out body must leave a disposition"
+    assert tc.queue == 'q', "retried, not quarantined"
+    assert tc.at is not None, "a retry defers the task"
+    assert 'did not finish within' in tc.err
+    assert tc.attempt == 1, "a timeout counts against max_attempts"
+
+
+def test_work_timeout_quarantines_once_attempts_run_out():
+    """A task that hangs every time is for a person to look at."""
+    async def slow(t, docs):
+        await asyncio.sleep(5.0)
+        return None
+
+    tc = _work_timeout_change(work_timeout_s=0.05, body=slow,
+                              max_attempts=2, attempt=1)
+    assert tc is not None
+    assert tc.queue == 'err', "the last attempt quarantines"
+    assert 'did not finish within' in tc.err
+
+
+def test_work_timeout_zero_means_never():
+    """Zero opts out, for a body that may idle on purpose."""
+    finished = []
+
+    async def idle_then_finish(t, docs):
+        await asyncio.sleep(0.1)
+        finished.append(t.id)
+        return None
+
+    tc = _work_timeout_change(work_timeout_s=0.0, body=idle_then_finish)
+    assert finished == ['t1'], "a body with no timeout must run to completion"
+    assert tc is None, "nothing to dispose of: the body succeeded"
+
+
+def test_work_timeout_defaults_to_five_minutes():
+    """Parity with Go, whose worker.DefaultWorkTimeout is five minutes.
+
+    A body that wedges otherwise holds its task under renewal for as long as
+    the worker lives, and no other worker can ever have it, so the default
+    that costs nothing when work is quick is the one that catches that.
+    """
+    worker = EntroQWorker(FakeClient(tasks=[]), 'q')
+    assert worker._work_timeout_s == DEFAULT_WORK_TIMEOUT_S
+    assert DEFAULT_WORK_TIMEOUT_S == 300.0, "five minutes, as Go bounds it"
+
+
+def test_work_timeout_leaves_a_body_that_finished_in_time_alone():
+    """The deadline only decides why a body that failed did so."""
+    finished = []
+
+    async def quick(t, docs):
+        finished.append(t.id)
+        return None
+
+    tc = _work_timeout_change(work_timeout_s=5.0, body=quick)
+    assert finished == ['t1']
+    assert tc is None
+
+
+def test_work_timeout_does_not_override_a_sentinel():
+    """A body that says what it wants on its way out is taken at its word."""
+    async def moves(t, docs):
+        raise MoveError("I know where this goes")
+
+    tc = _work_timeout_change(work_timeout_s=5.0, body=moves)
+    assert tc is not None
+    assert tc.queue == 'err'
+    assert 'I know where this goes' in tc.err
+    assert 'did not finish within' not in tc.err
+
+
 def test_worker_missing_doc_is_a_poison_pill():
     """A required doc that no longer exists can never be claimed: quarantine."""
     tc = _doc_dispose(DependencyError(
@@ -869,6 +1311,168 @@ def test_worker_contended_doc_retries_with_backoff():
     assert tc.at is not None
     assert 'doc contention' in tc.err
     assert tc.attempt == 1
+
+
+def test_worker_lapsed_task_lease_retries_and_says_so():
+    """The sets are held until the task arrives, so a worker that ran past its
+    own lease fails the claim on the task rather than on any doc. Transient
+    like contention, and recorded apart from it: nothing was contended."""
+    tc = _doc_dispose(DependencyError(
+        "lapsed", depends=[TaskID(id='t1', version=1, queue='q')]))
+    assert tc.queue == 'q'
+    assert tc.at is not None
+    assert 'task lease lapsed' in tc.err
+    assert 'doc contention' not in tc.err
+    assert tc.attempt == 1
+
+
+def _selector_raises(error, *, claims=0, max_claims=0):
+    """Fail the selector with `error` and return (client, task, work_called)."""
+    task = _task(id='t1', version=1, queue='q', claims=claims)
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0,
+                          max_claims=max_claims, err_queue='err')
+    work_called = []
+    stop = []
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            work_called.append(t.id)
+            return None
+
+        @process.selector
+        async def process(t):
+            raise error
+
+        stop.append(await worker._process(task, process))
+
+    asyncio.run(run())
+    assert work_called == [], "the handler must not run when the selector failed"
+    return client, task, stop
+
+
+def test_worker_selector_move_quarantines_the_task():
+    """A sentinel from the selector acts on the task, as one from do_work does.
+
+    The Go worker routes a TakeDocs sentinel through the same machinery; this
+    raised out of the worker loop instead, stopping the worker over a task the
+    selector had already decided what to do with."""
+    client, _, stop = _selector_raises(MoveError("no docs for this one"))
+    assert stop == [True], "the worker keeps running"
+    tc = client.modify_calls[0].task_changes[0]
+    assert tc.queue == 'err'
+    assert 'no docs for this one' in tc.err
+    assert tc.attempt == 1
+    assert tc.reset_claims
+
+
+def test_worker_selector_retry_requeues_the_task():
+    client, _, stop = _selector_raises(RetryError("not yet"))
+    assert stop == [True]
+    tc = client.modify_calls[0].task_changes[0]
+    assert tc.queue == 'q'
+    assert tc.at is not None
+    assert 'not yet' in tc.err
+
+
+def test_worker_selector_stop_exits_without_writing():
+    """StopWorker leaves the claim to expire, as it does from do_work."""
+    client, _, stop = _selector_raises(StopWorker())
+    assert stop == [False]
+    assert client.modify_calls == []
+
+
+def test_worker_selector_failure_at_the_claim_limit_is_recorded():
+    """A non-sentinel failure on the last allowed claim is written down.
+
+    The next claim would move the task anyway without saying why, so the
+    reason is recorded while it is still known. The worker still stops."""
+    task = _task(id='t1', version=1, queue='q', claims=3)
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0, max_claims=3, err_queue='err')
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            return None
+
+        @process.selector
+        async def process(t):
+            raise RuntimeError("selector blew up")
+
+        await worker._process(task, process)
+
+    with pytest.raises(RuntimeError, match="selector blew up"):
+        asyncio.run(run())
+
+    tc = client.modify_calls[0].task_changes[0]
+    assert tc.queue == 'err'
+    assert 'claim limit' in tc.err
+    assert 'selector blew up' in tc.err
+    assert tc.attempt == 1
+    assert tc.reset_claims
+
+
+def test_worker_handler_failure_at_the_claim_limit_is_recorded():
+    """The same for the work phase, which is where Go's second check lives."""
+    task = _task(id='t1', version=1, queue='q', claims=3)
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0, max_claims=3, err_queue='err')
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            raise RuntimeError("handler blew up")
+
+        await worker._process(task, process)
+
+    with pytest.raises(RuntimeError, match="handler blew up"):
+        asyncio.run(run())
+
+    tc = client.modify_calls[0].task_changes[0]
+    assert tc.queue == 'err'
+    assert 'claim limit' in tc.err
+    assert 'handler blew up' in tc.err
+
+
+def test_worker_handler_failure_below_the_claim_limit_records_nothing():
+    """A record is a modification, and a modification resets the claim count,
+    so recording below the limit would keep the task from ever reaching it."""
+    task = _task(id='t1', version=1, queue='q', claims=1)
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0, max_claims=3, err_queue='err')
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            raise RuntimeError("handler blew up")
+
+        await worker._process(task, process)
+
+    with pytest.raises(RuntimeError, match="handler blew up"):
+        asyncio.run(run())
+
+    assert client.modify_calls == [], "the task waits out its lease"
+
+
+def test_worker_handler_failure_without_a_claim_limit_records_nothing():
+    task = _task(id='t1', version=1, queue='q', claims=1000)
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0, max_claims=0,
+                          err_queue='err')
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            raise RuntimeError("handler blew up")
+
+        await worker._process(task, process)
+
+    with pytest.raises(RuntimeError, match="handler blew up"):
+        asyncio.run(run())
+
+    assert client.modify_calls == []
 
 
 def test_worker_missing_doc_wins_over_contention():
@@ -891,7 +1495,10 @@ def test_worker_cancels_handler_when_claim_is_lost():
     timeout, so `reached_end` staying empty means the work was genuinely
     cancelled rather than merely outlived by the test.
     """
-    task = _task(id='t1', version=1, queue='q')
+    # The lease the claim granted sets the renewal cadence, so a short one is
+    # what brings the failing renewal forward; the worker's requested duration
+    # has no say in it.
+    task = _task(id='t1', version=1, queue='q', lease_s=0.02)
     client = RenewFailClient(tasks=[task], error=DependencyError("claim lost"))
     worker = EntroQWorker(client, 'q', claim_duration_s=0.02)
 
@@ -964,22 +1571,18 @@ def test_worker_claims_docs_for_task():
     assert received_docs[0].id == 'd1'
 
 
-def test_worker_doc_claims_sorted_by_namespace_key():
-    """Docs must be claimed in (namespace, key) order to avoid livelock."""
+def test_worker_claims_every_set_in_one_call():
+    """Every named set is claimed together, or none is.
+
+    Claiming them one at a time lets two workers each hold part of what both
+    need, which an ordering can only mitigate. One all-or-nothing claim leaves
+    nothing to order.
+    """
     task = _task(id='t1', version=1)
     doc_a = _doc(namespace='ns', id='da', version=1, key='aaa')
     doc_b = _doc(namespace='ns', id='db', version=1, key='bbb')
     client = FakeClient(tasks=[task], docs=[doc_a, doc_b])
     worker = EntroQWorker(client, 'q', claim_duration_s=60.0)
-
-    claim_order = []
-    original_claim_docs = client.claim_docs
-
-    async def tracking_claim_docs(namespace, key, duration_ms=30000):
-        claim_order.append((namespace, key))
-        return await original_claim_docs(namespace, key, duration_ms)
-
-    client.claim_docs = tracking_claim_docs
 
     async def run():
         @EntroQWorker.handler
@@ -988,12 +1591,16 @@ def test_worker_doc_claims_sorted_by_namespace_key():
 
         @process.selector
         async def process(task):
-            return [DocClaim('ns', 'bbb'), DocClaim('ns', 'aaa')]  # reversed
+            return [DocClaim('ns', 'bbb'), DocClaim('ns', 'aaa')]
 
         await worker._process(task, process)
 
     asyncio.run(run())
-    assert claim_order == [('ns', 'aaa'), ('ns', 'bbb')]
+    assert len(client.claim_set_calls) == 1, client.claim_set_calls
+    sets, matched = client.claim_set_calls[0]
+    assert [(c.namespace, c.key) for c in sets] == [('ns', 'bbb'), ('ns', 'aaa')]
+    assert matched is task, (
+        "the sets must be held until the task arrives, so they expire with it")
 
 
 # ---------------------------------------------------------------------------
@@ -1001,11 +1608,12 @@ def test_worker_doc_claims_sorted_by_namespace_key():
 # ---------------------------------------------------------------------------
 
 def test_renewing_updates_state_task():
-    task = _task(id='t1', version=1)
+    # A 0.15s lease renews every 0.1s, so 0.25s covers two renewals.
+    task = _task(id='t1', version=1, lease_s=0.15)
     client = FakeClient()
 
     async def run():
-        async with _renewing(client, task, [], duration_s=0.1) as state:
+        async with _renewing(client, task, ClaimedDocs()) as state:
             await asyncio.sleep(0.25)
         return state.task.version
 
@@ -1013,13 +1621,567 @@ def test_renewing_updates_state_task():
 
 
 def test_renewing_dep_error_sets_state_error():
-    task = _task(id='t1', version=1)
+    task = _task(id='t1', version=1, lease_s=0.15)
     client = FakeClient()
     client.modify_raises = DependencyError("lease lost")
 
     async def run():
-        async with _renewing(client, task, [], duration_s=0.1) as state:
+        async with _renewing(client, task, ClaimedDocs()) as state:
             await asyncio.sleep(0.2)
         return state.error
 
     assert isinstance(asyncio.run(run()), DependencyError)
+
+
+def test_renewing_renews_the_lease_it_was_granted():
+    """A renewal asks for at - modified, never for what the claim requested.
+
+    The granted lease is the only number both sides agree on: a service may
+    clamp a requested one, and renewing for the request would leave the task
+    free between renewals.
+    """
+    task = _task(id='t1', version=1, lease_s=0.15)
+    client = FakeClient()
+
+    async def run():
+        async with _renewing(client, task, ClaimedDocs()):
+            await asyncio.sleep(0.15)
+
+    asyncio.run(run())
+    arrivals = [a for m in client.modify_calls for a in m.task_arrivals]
+    assert arrivals, "the renewer must send an arrival, not a change"
+    assert all(abs(a.by_s - 0.15) < 1e-9 for a in arrivals), arrivals
+    assert not any(m.task_changes for m in client.modify_calls), (
+        "a renewal must carry no value, queue, or attempt")
+
+
+def test_renewing_renews_an_empty_doc_set():
+    """A set with no docs still holds a lock, and still has to be renewed.
+
+    The arrival names the set, so there is nothing to iterate and come up
+    empty: this is the case a per-doc renewal silently dropped.
+    """
+    task = _task(id='t1', version=1, lease_s=0.15)
+    client = FakeClient()  # no docs at all
+
+    async def run():
+        docs = await client.claim_doc_sets([DocClaim('ns', 'empty')],
+                                           task_to_match=task)
+        assert list(docs) == [], "the set has no members"
+        async with _renewing(client, task, docs):
+            await asyncio.sleep(0.15)
+
+    asyncio.run(run())
+    arrivals = [a for m in client.modify_calls for a in m.doc_arrivals]
+    assert arrivals, "an empty set must still be renewed"
+    assert all((a.namespace, a.key) == ('ns', 'empty') for a in arrivals)
+
+
+def test_renewal_reaches_the_commit_through_the_set():
+    """What a renewal moves has to reach the committed modification.
+
+    A doc carries its set's version, so renewing the set invalidates every
+    version the handler is holding. The members are deliberately left as they
+    were claimed -- keeping two copies in step is what went wrong before --
+    and _fix_versions imposes the set's current version at commit, which is
+    the only place that correction lives.
+    """
+    task = _task(id='t1', version=1, lease_s=0.15)
+    doc = _doc(namespace='ns', id='d1', key='k')
+    client = FakeClient(docs=[doc])
+
+    async def run():
+        docs = await client.claim_doc_sets([DocClaim('ns', 'k')], task_to_match=task)
+        claimed_at = docs[0].version
+        async with _renewing(client, task, docs) as state:
+            await asyncio.sleep(0.25)  # two renewals at a 0.1s cadence
+        mod = Modification(Modification.deleting(state.docs[0]))
+        _fix_versions(mod, state.task, state.docs, state.sets)
+        return claimed_at, state.sets[0].version, mod.doc_deletes[0].version
+
+    claimed_at, set_version, deleted_at = asyncio.run(run())
+    assert set_version > claimed_at, "the renewals moved the set"
+    assert deleted_at == set_version, (
+        f"commit named v{deleted_at}, set is at v{set_version}")
+
+
+def test_a_renewal_already_committed_is_not_abandoned():
+    """A renewal the server applied must reach the commit that follows it.
+
+    The body ends while the reply is in flight. Dropping it there loses the
+    only record of the version the server now holds, and the commit is then
+    built on the version before it -- which the server rejects, discarding
+    work that succeeded. The window is one reply per renewal, so the chance of
+    hitting it grows with how long the handler runs.
+    """
+    task = _task(id='t1', version=1, queue='q', lease_s=0.12)
+    client = ParkedRenewClient(tasks=[task])
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            # Inside the reply's flight, by construction.
+            await client.renewal_applied.wait()
+            return Modification(Modification.changing(t, value={'done': True}))
+
+        worker = EntroQWorker(client, 'q', claim_duration_s=60.0)
+        await worker._process(task, process)
+
+    asyncio.run(run())
+
+    assert client.renewed is not None, "the renewal never landed"
+    granted = client.renewed.tasks_changed[0]
+    commits = [m for m in client.modify_calls if m.task_changes]
+    assert commits, "the body's commit was never sent"
+    assert commits[-1].task_changes[0].version == granted.version, (
+        "the commit names the version from before the renewal the server "
+        "already applied")
+
+
+def test_a_renewal_that_does_not_report_the_task_stops_the_work():
+    """If a renewal does not come back with what we hold, we do not hold it.
+
+    A reply naming no task leaves the caller unable to name its version again,
+    so there is nothing to go on with: the same lost claim a failed renewal
+    raises, and dropped the same way, rather than carried on into a commit
+    that would be refused.
+    """
+    task = _task(id='t1', version=1, queue='q', lease_s=0.12)
+    client = SilentRenewClient(tasks=[task], omit='task')
+    committed = []
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            await asyncio.sleep(0.3)
+            committed.append(t.id)
+            return Modification(Modification.changing(t, value={'done': True}))
+
+        worker = EntroQWorker(client, 'q', claim_duration_s=60.0)
+        await worker._process(task, process)
+
+    # A lost claim: the run loop logs it and takes the next task.
+    with pytest.raises(DependencyError):
+        asyncio.run(run())
+    assert client.renewals >= 1
+    assert committed == [], "the handler must not run to completion"
+
+
+def test_a_renewal_that_does_not_report_a_set_stops_the_work():
+    """The same for a set: a doc carries its set's version and nothing else."""
+    doc = _doc(namespace='ns', id='d1', key='k')
+    task = _task(id='t1', version=1, queue='q', lease_s=0.12)
+    client = SilentRenewClient(tasks=[task], docs=[doc], omit='sets')
+    committed = []
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            await asyncio.sleep(0.3)
+            committed.append(t.id)
+            return None
+
+        @process.selector
+        async def process(t):
+            return [DocClaim('ns', 'k')]
+
+        worker = EntroQWorker(client, 'q', claim_duration_s=60.0)
+        await worker._process(task, process)
+
+    with pytest.raises(DependencyError):
+        asyncio.run(run())
+    assert committed == [], "the handler must not run to completion"
+
+
+def test_the_first_renewal_counts_time_already_spent():
+    """The lease starts at the claim, not at the body.
+
+    Claiming doc sets is an all-or-nothing claim against other workers, so it
+    can take a real part of the lease. Waiting a full interval after it means
+    the first renewal can arrive after the task has already come free. Go
+    passes time.Since(claimed) in for exactly this.
+    """
+    doc = _doc(namespace='ns', id='d1', key='k')
+    task = _task(id='t1', version=1, queue='q', lease_s=0.3)  # interval 0.2
+    client = SlowClaimClient(tasks=[task], docs=[doc], claim_delay_s=0.25)
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            await asyncio.sleep(0.1)
+            return None
+
+        @process.selector
+        async def process(t):
+            return [DocClaim('ns', 'k')]
+
+        worker = EntroQWorker(client, 'q', claim_duration_s=60.0)
+        await worker._process(task, process)
+
+    asyncio.run(run())
+
+    assert client.renewed_at, "the lease was never renewed"
+    # The claim spent 0.25s of a 0.2s interval, so the renewal was already due
+    # when the body started and must not wait another interval for it.
+    assert client.renewed_at[0] < 0.1, (
+        f"first renewal {client.renewed_at[0]:.3f}s into a body that began "
+        "with the interval already spent")
+
+
+def test_next_renewal_retry_fits_inside_the_margin():
+    """The margin is the whole budget for recovering from a failed renewal.
+
+    Waiting the ordinary interval spends it on one attempt, so one dropped
+    packet costs the claim. Mirrors Go's TestNextRenewalRetryFitsInsideTheMargin.
+    """
+    task = _task(id='t1', version=1, lease_s=60.0)
+    interval = renewal_interval_s(task)
+    margin = renewal_margin_s(task)
+    assert (interval, margin) == (40.0, 20.0), (interval, margin)
+
+    delays, last = [], 0.0
+    for _ in range(6):
+        last = next_renewal_retry_s(last, margin, interval)
+        delays.append(last)
+    assert delays == [2.5, 5.0, 10.0, 20.0, 40.0, 40.0], delays
+
+    # Three attempts land inside the margin, which is the point.
+    elapsed, inside = 0.0, 0
+    for d in delays:
+        elapsed += d
+        if elapsed < margin:
+            inside += 1
+    assert inside == 3, (inside, delays)
+
+    # A success returns to the ordinary cadence.
+    assert next_renewal_retry_s(0.0, margin, interval) == margin / 8
+
+
+def test_next_renewal_retry_with_no_margin():
+    """A lease leaving nothing to retry inside has only the ordinary cadence,
+    and in particular the wait is never zero, which would spin."""
+    for margin, interval in ((0.0, 40.0), (-1.0, 40.0), (0.0, 0.0)):
+        assert next_renewal_retry_s(0.0, margin, interval) == interval
+
+
+def test_renewal_margin_is_what_the_cadence_leaves():
+    task = _task(id='t1', version=1, lease_s=90.0)
+    assert (renewal_margin_s(task) + renewal_interval_s(task)
+            == pytest.approx(granted_lease_s(task)))
+    assert renewal_margin_s(task) > 0
+
+
+def test_a_transient_renewal_failure_retries_inside_the_margin():
+    """The loop has to USE the policy, which is the part that was wrong: a
+    transient failure waited the full interval and spent the whole margin."""
+    task = _task(id='t1', version=1, lease_s=0.3)  # interval 0.2, margin 0.1
+    client = FlakyRenewClient(tasks=[task], failures=1)
+
+    async def run():
+        async with _renewing(client, task, ClaimedDocs()):
+            # Long enough for the first renewal, its failure, and the retry.
+            await asyncio.sleep(0.35)
+
+    asyncio.run(run())
+
+    gaps = client.gaps()
+    assert gaps, f"only {len(client.attempts)} renewal attempts; the retry never happened"
+    assert len(client.attempts) >= 2, client.attempts
+    # The first retry is due at margin/8 = 12.5ms, jitter adding a quarter.
+    # The full interval would be 200ms.
+    assert gaps[0] < 0.1, f"retry came {gaps[0]:.3f}s later, a cadence not a retry: {gaps}"
+
+
+def test_renewing_advances_set_versions():
+    """Each renewal names the set at the version the last one returned."""
+    task = _task(id='t1', version=1, lease_s=0.15)
+    client = FakeClient(docs=[_doc(namespace='ns', id='d1', key='k')])
+
+    async def run():
+        docs = await client.claim_doc_sets([DocClaim('ns', 'k')],
+                                           task_to_match=task)
+        async with _renewing(client, task, docs) as state:
+            await asyncio.sleep(0.25)
+        return [g.version for g in state.sets]
+
+    final = asyncio.run(run())
+    versions = [a.version for m in client.modify_calls for a in m.doc_arrivals]
+    assert versions == sorted(set(versions)), (
+        "a renewal must not reuse a version the last one moved: %r" % versions)
+    assert final == [max(versions) + 1]
+
+
+# ---------------------------------------------------------------------------
+# Releasing claimed sets
+# ---------------------------------------------------------------------------
+
+def _released(client) -> list[tuple[str, str]]:
+    """Return the sets released (arrival of zero) across every modify made."""
+    return [(a.namespace, a.key)
+            for m in client.modify_calls for a in m.doc_arrivals if a.by_s <= 0]
+
+
+def _run_with_sets(client, task, claims, body):
+    """Process task with a handler claiming claims and returning body(task, docs)."""
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0)
+
+    @EntroQWorker.handler
+    async def process(t, docs):
+        return body(t, docs)
+
+    @process.selector
+    async def process(t):
+        return claims
+
+    asyncio.run(worker._process(task, process))
+    return worker
+
+
+def test_commit_releases_the_sets_it_did_not_hold():
+    """Claimed sets go back in the committing modification, not afterwards."""
+    task = _task(id='t1', version=1, queue='q')
+    client = FakeClient(docs=[_doc(namespace='ns', id='d1', key='watched')])
+
+    _run_with_sets(client, task,
+                   [DocClaim('ns', 'watched'), DocClaim('ns', 'empty')],
+                   lambda t, docs: Modification(Modification.deleting(t)))
+
+    assert sorted(_released(client)) == [('ns', 'empty'), ('ns', 'watched')]
+    # One modification, not two: the releases ride with the commit so no window
+    # opens where the task is gone and its docs are still held.
+    committed = [m for m in client.modify_calls if m.task_deletes]
+    assert len(committed) == 1
+    assert len(client.modify_calls) == 1, "a second modify means a separate release"
+
+
+def test_a_body_that_commits_nothing_still_releases():
+    """Returning None ends the body, so the sets still go back."""
+    task = _task(id='t1', version=1, queue='q')
+    client = FakeClient(docs=[_doc(namespace='ns', id='d1', key='held')])
+
+    _run_with_sets(client, task, [DocClaim('ns', 'held')], lambda t, docs: None)
+
+    assert _released(client) == [('ns', 'held')]
+    assert not client.modify_calls[0].task_changes, "the task was left alone"
+    assert not client.modify_calls[0].task_deletes
+
+
+def test_a_body_that_leaves_the_task_alone_still_releases():
+    """The sets belong to the body, not to the task."""
+    task = _task(id='t1', version=1, queue='q')
+    doc = _doc(namespace='ns', id='d1', key='written')
+    client = FakeClient(docs=[doc])
+
+    _run_with_sets(client, task, [DocClaim('ns', 'written')],
+                   lambda t, docs: Modification(
+                       Modification.changing(docs[0], content='done')))
+
+    assert _released(client) == [('ns', 'written')]
+
+
+def test_a_set_held_into_the_future_is_kept():
+    """A body naming an arrival of its own decided, so nothing overrides it."""
+    task = _task(id='t1', version=1, queue='q')
+    doc = _doc(namespace='ns', id='d1', key='kept')
+    client = FakeClient(docs=[doc, _doc(namespace='ns', id='d2', key='freed')])
+    later = datetime.now(tz=timezone.utc) + timedelta(minutes=1)
+
+    _run_with_sets(client, task, [DocClaim('ns', 'kept'), DocClaim('ns', 'freed')],
+                   lambda t, docs: Modification(
+                       Modification.deleting(t),
+                       Modification.changing(
+                           [d for d in docs if d.key == 'kept'][0], at=later)))
+
+    assert _released(client) == [('ns', 'freed')], (
+        "the set written with a future arrival must keep it")
+
+
+def test_releasing_never_names_an_unclaimed_set():
+    """The leasehold bounds the release, whatever the modification mentions."""
+    task = _task(id='t1', version=1, queue='q')
+    client = FakeClient(docs=[_doc(namespace='ns', id='d1', key='held')])
+
+    _run_with_sets(client, task, [DocClaim('ns', 'held')],
+                   lambda t, docs: Modification(
+                       Modification.deleting(t),
+                       # Names a set this worker never claimed.
+                       Modification.inserting(DocData(
+                           namespace='ns', key='elsewhere', content=1))))
+
+    assert _released(client) == [('ns', 'held')], (
+        "releasing moves a version, so it may only name what was claimed here")
+
+
+# ---------------------------------------------------------------------------
+# FatalWorker
+# ---------------------------------------------------------------------------
+
+def test_fatal_worker_stops_the_worker_and_leaves_the_task():
+    """A fatal handler error stops the loop and disposes of nothing.
+
+    The task is neither retried nor quarantined, so it comes back when its lease
+    lapses -- for a worker that may do better. Mirrors Go's FatalError.
+    """
+    task = _task(id='t1', version=1, queue='q')
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0)
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            raise FatalWorker("configuration is unreadable")
+
+        with pytest.raises(FatalWorker, match="unreadable"):
+            await worker._process(task, process)
+
+    asyncio.run(run())
+    assert client.modify_calls == [], (
+        "a fatal error must not retry, quarantine, or otherwise write")
+
+
+def test_fatal_worker_is_an_ordinary_exception():
+    """It derives from Exception, so broad handlers can still catch it.
+
+    Stopping the worker is a decision about the program, not an interruption of
+    it, which is why this is not a BaseException like KeyboardInterrupt.
+    """
+    assert issubclass(FatalWorker, Exception)
+    try:
+        raise FatalWorker("x")
+    except Exception:
+        pass
+    else:
+        raise AssertionError("FatalWorker escaped 'except Exception'")
+
+
+def test_a_finisher_failure_is_logged_not_fatal():
+    """The commit already landed, so a finisher error must not discard it.
+
+    Matches the Go worker, where OnSuccess is optimistic: its error is logged and
+    the task stays handled. Python used to let any finisher error kill the worker,
+    which was stricter than the reference.
+    """
+    task = _task(id='t1', version=1, queue='q')
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0)
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            return Modification(Modification.deleting(t))
+
+        @process.finisher
+        async def process(t, docs):
+            raise RuntimeError("the webhook is down")
+
+        return await worker._process(task, process)
+
+    assert asyncio.run(run()) is True, "the worker keeps going"
+    assert client.modify_calls[0].task_deletes, "the commit still happened"
+
+
+def test_a_fatal_finisher_does_stop_the_worker():
+    """The one finisher error that is not swallowed."""
+    task = _task(id='t1', version=1, queue='q')
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0)
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            return Modification(Modification.deleting(t))
+
+        @process.finisher
+        async def process(t, docs):
+            raise FatalWorker("unrecoverable after commit")
+
+        with pytest.raises(FatalWorker):
+            await worker._process(task, process)
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Dispositions reset the claim count, as Go's RetryOrQuarantine does
+# ---------------------------------------------------------------------------
+
+def _disposed(exc, **worker_kwargs):
+    """Return the task change a disposition of exc produces."""
+    task = _task(id='t1', version=1, queue='q')
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0, **worker_kwargs)
+    asyncio.run(worker._dispose(task, exc))
+    return client.modify_calls[0].task_changes[0]
+
+
+def test_a_retry_resets_the_claim_count():
+    """A handled failure must not leave its claims counting toward the limit.
+
+    Go's RetryOrQuarantine always resets: the claims before a handled failure do
+    not point at a poison pill. Without this, a worker with both max_claims and
+    max_attempts set accumulates a claim per retry and is quarantined as
+    "maximum claims exceeded" long before it exhausts its attempts.
+    """
+    change = _disposed(RetryError("transient"))
+    assert change.reset_claims is True
+    assert change.attempt == 1
+    assert change.queue == 'q', "a retry stays in its own queue"
+
+
+def test_a_quarantine_resets_the_claim_count():
+    change = _disposed(MoveError("poison"), err_queue='err')
+    assert change.reset_claims is True
+    assert change.queue == 'err'
+    assert change.at is None, "a quarantined task is for inspection, available now"
+
+
+def test_the_claim_limit_move_records_an_attempt_and_resets():
+    """The claim-limit move is a disposition too, so it looks like one.
+
+    Go routes this through the same Quarantine path, which counts the attempt,
+    records the reason, and resets the claims -- so an inspected task re-queued
+    by hand starts its budget over instead of tripping the limit immediately.
+    """
+    task = _task(id='t1', version=1, queue='q', claims=9)
+    client = FakeClient(tasks=[task])
+    worker = EntroQWorker(client, 'q', claim_duration_s=60.0, max_claims=3,
+                          err_queue='err')
+
+    async def run():
+        @EntroQWorker.handler
+        async def process(t, docs):
+            raise AssertionError("the handler must not run past the claim limit")
+
+        return await worker._process(task, process)
+
+    assert asyncio.run(run()) is True
+    change = client.modify_calls[0].task_changes[0]
+    assert change.queue == 'err'
+    assert change.reset_claims is True
+    assert change.attempt == 1
+    assert 'maximum claims exceeded' in change.err
+
+
+def test_fix_versions_corrects_arrivals():
+    """An arrival names a version too, so renewal has to reach it.
+
+    A handler may defer its task or hold a set past the body with an arrival --
+    the documented way to do the latter. Left uncorrected, both are pinned at
+    the version they were claimed at, so the first renewal makes the whole
+    commit fail and the completed work is thrown away.
+    """
+    task = _task(id='t1', version=9)
+    group = _doc(namespace='ns', id='', key='k', version=4)
+    doc = _doc(namespace='ns', id='d1', key='k', version=1)
+    mod = Modification(
+        Modification.arriving(task, 30.0),
+        Modification.arriving(group, 30.0),
+    )
+    # As a handler would have them: stale, from claim time.
+    mod.task_arrivals[0].version = 1
+    mod.doc_arrivals[0].version = 1
+
+    _fix_versions(mod, task, [doc], [group])
+
+    assert mod.task_arrivals[0].version == 9, "the task arrival takes the renewed version"
+    assert mod.doc_arrivals[0].version == 4, "the set arrival takes the set's version"

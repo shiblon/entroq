@@ -7,12 +7,17 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
+	"connectrpc.com/connect"
+	pb "github.com/shiblon/entroq/api"
+	"github.com/shiblon/entroq/api/apiconnect"
 	"github.com/shiblon/entroq/pkg/backend/eqmem"
 	"github.com/shiblon/entroq/pkg/eqsvcgrpc"
 	"github.com/shiblon/entroq/pkg/eqsvcjson"
+	"github.com/shiblon/entroq/pkg/version"
 )
 
 // newTestServer stands up an in-memory EntroQ backend behind the JSON/Connect
@@ -142,5 +147,143 @@ func TestOverLimitValuesAre400(t *testing.T) {
 				t.Fatalf("status = %d, want 400; body=%v", code, out)
 			}
 		})
+	}
+}
+
+// TestResponsesCarryProtocol checks that JSON responses, successful or not,
+// carry the server's protocol, as gRPC responses do.
+func TestResponsesCarryProtocol(t *testing.T) {
+	ts, cleanup := newTestServer(t)
+	defer cleanup()
+	for name, body := range map[string]string{
+		"success": `{"claimantId": "test", "inserts": [{"queue": "/q", "value": "x"}]}`,
+		"error":   `{"claimantId": "test", "deletes": [{"id": "none", "version": 1, "queue": "/q"}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			resp, err := http.Post(ts.URL+"/api/v0/modify", "application/json", strings.NewReader(body))
+			if err != nil {
+				t.Fatalf("post: %v", err)
+			}
+			resp.Body.Close()
+			if got, want := resp.Header.Get(version.ProtocolHeader), version.FormatProtocols(version.ServedProtocols); got != want {
+				t.Errorf("status %d: protocol header %q, want %q", resp.StatusCode, got, want)
+			}
+		})
+	}
+}
+
+// TestRequestsDeclareProtocol checks that a JSON request is read under the
+// protocol its header declares: none is protocol 1, which has no change
+// modes, and one the server does not serve is refused.
+func TestRequestsDeclareProtocol(t *testing.T) {
+	ts, cleanup := newTestServer(t)
+	defer cleanup()
+	lease := `{"claimantId": "test", "changes": [{"oldId": {"id": "t", "version": 1, "queue": "/q"}, "newData": {"atMs": "1"}, "mode": "CHANGE_LEASE"}]}`
+	for _, tc := range []struct {
+		name, protocol string
+		want           int
+	}{
+		{"a lease with no protocol", "", http.StatusBadRequest},
+		{"a lease at protocol 1", "1", http.StatusBadRequest},
+		{"an unserved protocol", strconv.Itoa(version.Protocol + 1), http.StatusNotImplemented},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v0/modify", strings.NewReader(lease))
+			if err != nil {
+				t.Fatalf("request: %v", err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			if tc.protocol != "" {
+				req.Header.Set(version.ProtocolHeader, tc.protocol)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("post: %v", err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != tc.want {
+				t.Errorf("status %d, want %d", resp.StatusCode, tc.want)
+			}
+		})
+	}
+}
+
+// TestUnknownJSONFieldsRefused checks that a JSON request with a field the
+// server does not know is refused on both routes, the REST one and the
+// connect one, and nothing is done.
+func TestUnknownJSONFieldsRefused(t *testing.T) {
+	ts, cleanup := newTestServer(t)
+	defer cleanup()
+	for _, tc := range []struct{ name, path, body string }{
+		{"REST, nested", "/api/v0/modify", `{"claimantId": "test", "inserts": [{"queue": "/strict", "bogus": 1}]}`},
+		{"REST, top level", "/api/v0/modify", `{"claimantId": "test", "inserts": [{"queue": "/strict"}], "bogus": true}`},
+		{"connect, nested", "/api.EntroQ/Modify", `{"claimantId": "test", "inserts": [{"queue": "/strict", "bogus": 1}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := http.Post(ts.URL+tc.path, "application/json", strings.NewReader(tc.body))
+			if err != nil {
+				t.Fatalf("post: %v", err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "bogus") {
+				t.Errorf("Unknown field: want 400 naming it, got %d %s", resp.StatusCode, body)
+			}
+		})
+	}
+	resp, err := http.Get(ts.URL + "/api/v0/tasks?queue=/strict")
+	if err != nil {
+		t.Fatalf("tasks: %v", err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if strings.Contains(string(b), `"queue":"/strict"`) {
+		t.Errorf("After the refused requests: want nothing inserted, got %s", b)
+	}
+}
+
+// TestStreamTasksOverConnect covers the streaming route, which nothing else does.
+//
+// streamAdapter satisfies the gRPC service's stream interface by EMBEDDING it and
+// leaving it nil, so every method the service calls that the adapter does not
+// define itself is a nil dereference. QSvc.StreamTasks opens by setting the
+// protocol header on the stream, which is such a method -- so this route panicked
+// on its first statement and dropped the connection. The gRPC-side test fake was
+// given that method; the production adapter was not, and nothing covered it.
+func TestStreamTasksOverConnect(t *testing.T) {
+	ts, cleanup := newTestServer(t)
+	defer cleanup()
+
+	if code, _ := postJSON(t, ts.URL+"/api/v0/modify", map[string]any{
+		"claimantId": "test",
+		"inserts":    []any{map[string]any{"queue": "/stream/q", "value": "x"}},
+	}); code != http.StatusOK {
+		t.Fatalf("seed insert: status %d", code)
+	}
+
+	client := apiconnect.NewEntroQClient(http.DefaultClient, ts.URL)
+	stream, err := client.StreamTasks(context.Background(),
+		connect.NewRequest(&pb.TasksRequest{Queue: "/stream/q"}))
+	if err != nil {
+		t.Fatalf("StreamTasks: %v", err)
+	}
+	defer stream.Close()
+
+	var queues []string
+	for stream.Receive() {
+		for _, task := range stream.Msg().GetTasks() {
+			queues = append(queues, task.GetQueue())
+		}
+	}
+	if err := stream.Err(); err != nil {
+		t.Fatalf("receiving: %v", err)
+	}
+	if len(queues) == 0 {
+		t.Fatal("stream delivered no tasks")
+	}
+	for _, q := range queues {
+		if q != "/stream/q" {
+			t.Errorf("streamed a task from %q, want /stream/q", q)
+		}
 	}
 }

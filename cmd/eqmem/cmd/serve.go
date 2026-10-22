@@ -116,7 +116,7 @@ func init() {
 	f.DurationVar(&serve.readinessInterval, "readiness_interval", eqmem.DefaultReadinessInterval,
 		"Interval for notifying claims when tasks become ready through time; non-positive disables.")
 	f.BoolVar(&serve.createJournalDir, "mkdir", false, "Create the journal directory if it does not exist.")
-	f.BoolVar(&serve.snapshotAndQuit, "snapshot_and_quit", false, "Read the journal, write a snapshot, then exit. Requires --journal.")
+	f.BoolVar(&serve.snapshotAndQuit, "snapshot_and_quit", false, "Read the journal, write a snapshot of every journal file except the live one, then exit. The live file stays and is replayed after the snapshot. Requires --journal.")
 	f.StringVar(&serve.periodicSnapshot, "periodic_snapshot", "", "Snapshot interval (e.g. 1h). Minimum 1m. Requires --journal.")
 	f.BoolVar(&serve.cleanup, "journal_cleanup", false, "Remove compacted journal files after snapshotting. Requires --journal.")
 	f.IntVar(&serve.journalMaxItems, "journal_max_items", 0, "Rotate journal after this many items (0 uses the built-in default).")

@@ -312,6 +312,17 @@ func (r *holdRef) committing() { r.set(committing) }
 // landed marks the docs released for good.
 func (r *holdRef) landed() { r.set(released) }
 
+// leaving marks the docs released if err is a retry or a move: the worker
+// releases a task's doc sets in the modify that requeues or moves the task.
+// Any other error leaves the task claimed, and its sets with it.
+func (r *holdRef) leaving(err error) {
+	if _, ok := worker.AsRetry(err); ok {
+		r.set(released)
+	} else if _, ok := worker.AsMove(err); ok {
+		r.set(released)
+	}
+}
+
 // failed puts the docs back in hand, since a failed commit releases nothing,
 // and reports a violation for any doc another worker took meanwhile.
 func (r *holdRef) failed() {
@@ -350,8 +361,8 @@ func (tt *torture) quarantine(format string, args ...any) error {
 // take wraps a doc request with the take phase's fault: a crash after the task
 // is claimed and before its docs are. The take phase runs again on every doc
 // contention retry, so it crashes at a tenth of the fault rate.
-func take[T any](tt *torture, claims func(T) []*entroq.DocClaim) worker.TakeRun[T] {
-	return func(_ context.Context, _ *entroq.Task, v T) ([]*entroq.DocClaim, error) {
+func take[T any](tt *torture, claims func(T) []entroq.DocClaimArg) worker.TakeRun[T] {
+	return func(_ context.Context, _ entroq.Reader, work *worker.Work[T]) (*worker.TakeResult, error) {
 		if tt.chance(tt.cfg.FaultRate / 10) {
 			tt.counts.takeCrash.Add(1)
 			return nil, errors.New("torture: injected crash in take")
@@ -359,7 +370,7 @@ func take[T any](tt *torture, claims func(T) []*entroq.DocClaim) worker.TakeRun[
 		if claims == nil {
 			return nil, nil
 		}
-		return claims(v), nil
+		return worker.Take(claims(work.Value)...), nil
 	}
 }
 
@@ -419,6 +430,8 @@ func (tt *torture) commit(task *entroq.Task, held *holdRef, args ...entroq.Modif
 				return nil
 			}
 			if tt.chance(0.5) {
+				// The retry releases the docs with the task.
+				held.landed()
 				return worker.RetryErrorf("torture: injected conflict").After(time.Millisecond)
 			}
 			return nil
@@ -451,7 +464,8 @@ func docIn(docs []*entroq.Doc, ns string) []*entroq.Doc {
 func (tt *torture) splitWorker() *worker.Worker[tortureRound] {
 	return worker.New(tt.eq,
 		worker.WithTakeDocs(take[tortureRound](tt, nil)),
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, v tortureRound, _ []*entroq.Doc) (*worker.Result, error) {
+		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, work *worker.Work[tortureRound]) (*worker.Result, error) {
+			task, v := work.Task, work.Value
 			if err := tt.work(ctx); err != nil {
 				return nil, err
 			}
@@ -472,14 +486,16 @@ func (tt *torture) splitWorker() *worker.Worker[tortureRound] {
 
 func (tt *torture) pieceWorker(owner int64) *worker.Worker[torturePiece] {
 	return worker.New(tt.eq,
-		worker.WithTakeDocs(take(tt, func(v torturePiece) []*entroq.DocClaim {
-			return []*entroq.DocClaim{
+		worker.WithTakeDocs(take(tt, func(v torturePiece) []entroq.DocClaimArg {
+			return []entroq.DocClaimArg{
 				entroq.ClaimKey(tt.joinNS, tt.joinKey(v.Job, v.Round)),
 				entroq.ClaimKey(tt.acctNS, tt.acctKey(tt.intN(tt.cfg.Accounts))),
 			}
 		})),
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, v torturePiece, docs []*entroq.Doc) (*worker.Result, error) {
+		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, work *worker.Work[torturePiece]) (_ *worker.Result, err error) {
+			task, v, docs := work.Task, work.Value, entroq.DocsIn(work.Sets)
 			held := tt.hold(owner, docs)
+			defer func() { held.leaving(err) }()
 			joins, accts := docIn(docs, tt.joinNS), docIn(docs, tt.acctNS)
 			if len(joins) != 1 || len(accts) != 1 {
 				return nil, tt.quarantine("piece %v took %d join and %d account docs, want 1 each", v, len(joins), len(accts))
@@ -520,11 +536,13 @@ func (tt *torture) pieceWorker(owner int64) *worker.Worker[torturePiece] {
 
 func (tt *torture) mergeWorker(owner int64) *worker.Worker[tortureRound] {
 	return worker.New(tt.eq,
-		worker.WithTakeDocs(take(tt, func(v tortureRound) []*entroq.DocClaim {
-			return []*entroq.DocClaim{entroq.ClaimKey(tt.joinNS, tt.joinKey(v.Job, v.Round))}
+		worker.WithTakeDocs(take(tt, func(v tortureRound) []entroq.DocClaimArg {
+			return []entroq.DocClaimArg{entroq.ClaimKey(tt.joinNS, tt.joinKey(v.Job, v.Round))}
 		})),
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, v tortureRound, docs []*entroq.Doc) (*worker.Result, error) {
+		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, work *worker.Work[tortureRound]) (_ *worker.Result, err error) {
+			task, v, docs := work.Task, work.Value, entroq.DocsIn(work.Sets)
 			held := tt.hold(owner, docs)
+			defer func() { held.leaving(err) }()
 			if len(docs) != 1 {
 				return nil, tt.quarantine("merge %v took %d join docs, want 1", v, len(docs))
 			}
@@ -589,7 +607,8 @@ func (tt *torture) mergeWorker(owner int64) *worker.Worker[tortureRound] {
 // went wrong.
 func (tt *torture) medicWorker() *worker.Worker[struct{}] {
 	return worker.New(tt.eq,
-		worker.WithDoModify(func(_ context.Context, task *entroq.Task, _ struct{}, _ []*entroq.Doc) (*worker.Result, error) {
+		worker.WithDoModify(func(_ context.Context, _ entroq.Reader, work *worker.Work[struct{}]) (*worker.Result, error) {
+			task := work.Task
 			if strings.Contains(task.Err, "required doc missing") {
 				return nil, tt.quarantine("task %s in %s lost a doc it required", task.ID, task.Queue)
 			}
@@ -610,11 +629,13 @@ func (tt *torture) hogs() int { return max(2, tt.cfg.Accounts/4) }
 // docs claimed by another worker.
 func (tt *torture) hogWorker(owner int64) *worker.Worker[struct{}] {
 	return worker.New(tt.eq,
-		worker.WithTakeDocs(func(context.Context, *entroq.Task, struct{}) ([]*entroq.DocClaim, error) {
-			return []*entroq.DocClaim{entroq.ClaimKey(tt.acctNS, tt.acctKey(tt.intN(tt.cfg.Accounts)))}, nil
+		worker.WithTakeDocs(func(context.Context, entroq.Reader, *worker.Work[struct{}]) (*worker.TakeResult, error) {
+			return worker.Take(entroq.ClaimKey(tt.acctNS, tt.acctKey(tt.intN(tt.cfg.Accounts)))), nil
 		}),
-		worker.WithDoModify(func(ctx context.Context, task *entroq.Task, _ struct{}, docs []*entroq.Doc) (*worker.Result, error) {
+		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, work *worker.Work[struct{}]) (_ *worker.Result, err error) {
+			task, docs := work.Task, entroq.DocsIn(work.Sets)
 			held := tt.hold(owner, docs)
+			defer func() { held.leaving(err) }()
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()

@@ -392,10 +392,19 @@ components:
                     type: array
                     items:
                         $ref: '#/components/schemas/Doc'
+                    description: |-
+                        The members of every claimed set not claimed with omit_members, with
+                         content.
+                sets:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/Doc'
+                    description: |-
+                        Every claimed set, as a Doc with no id or content, in the order named.
+                         Not present for servers on protocol 1.
             description: |-
-                ClaimDocsResponse contains the docs claimed by a ClaimDocs call.
-                 A dependency error (missing or already-claimed docs) comes through as
-                 gRPC's NOT_FOUND code with ModifyDep details carrying doc_id fields.
+                ClaimDocsResponse contains the docs claimed by a ClaimDocs call, and the
+                 sets they belong to. All sets are present, but not all sets have docs.
         ClaimRequest:
             type: object
             properties:
@@ -454,7 +463,14 @@ components:
                     type: string
                 modifiedMs:
                     type: string
-            description: Doc is a complete doc object with identity, data, and metadata.
+                len:
+                    type: integer
+                    description: Number of docs under a doc set, if applicable.
+                    format: int32
+            description: |-
+                Doc is a complete doc object with identity, data, and metadata.
+                 Note that when representing a set, it will not contain id, secondary_key, or
+                 content.
         DocChange:
             type: object
             properties:
@@ -462,23 +478,50 @@ components:
                     $ref: '#/components/schemas/DocID'
                 newData:
                     $ref: '#/components/schemas/DocData'
+                mode:
+                    type: integer
+                    format: enum
             description: |-
                 DocChange identifies a doc by DocID and provides updated data. Only content
                  from new_data is applied; keys are immutable after creation.
         DocClaim:
             type: object
             properties:
-                namespace:
-                    type: string
-                claimant:
-                    type: string
-                key:
-                    type: string
+                sets:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/DocSetClaim'
+                    description: Protocol 2.
                 durationMs:
                     type: string
+                taskToMatch:
+                    allOf:
+                        - $ref: '#/components/schemas/TaskID'
+                    description: |-
+                        Protocol 2: hold the sets until this task arrives, instead of for
+                         duration_ms, so they expire in step with it.
+
+                         The task is NAMED rather than its arrival time being sent. The server
+                         reads it, so the hold and the task's own expiry come from one clock
+                         reading and are exactly simultaneous; an instant would instead be wrong
+                         by however much the clocks between the holder and the store disagree.
+
+                         The claim fails if the task is not present at this version, which means
+                         the caller no longer holds it. The queue is required: a backend needs it
+                         to find the task.
+                claimant:
+                    type: string
+                namespace:
+                    type: string
+                    description: Protocol 1.
+                key:
+                    type: string
             description: |-
-                DocClaim describes an atomic all-or-nothing claim of docs in a namespace.
-                 All docs sharing the given key are claimed together.
+                DocClaim describes an atomic all-or-nothing claim of doc sets: every set
+                 named is claimed, or none is.
+
+                 In protocol 1, namespace and key name the one set, the docs sharing that
+                 key. Protocol 2 names the sets in sets, and namespace and key are ignored.
         DocData:
             type: object
             properties:
@@ -499,8 +542,27 @@ components:
                 atMs:
                     type: string
                     description: |-
-                        at_ms is the requested arrival/claim-expiry time for doc inserts and changes.
-                         Zero means "use the backend's current time and release any claim."
+                        at_ms is the requested arrival/claim-expiry time for doc inserts and
+                         changes. Zero means "use the backend's current time and release any
+                         claim." Only a protocol 1 client still sends it; see by_ms.
+                byMs:
+                    type: string
+                    description: |-
+                        by_ms is how long from the backend's own now the doc's set arrives, in
+                         millis. Nonzero wins over at_ms, and may be negative. Positive holds the
+                         set, claimed by the caller; zero or less releases it.
+
+                         Prefer it to at_ms always, and for a renewal it is the only safe choice.
+                         An at_ms is an instant on the caller's clock, so it is wrong by whatever
+                         the two clocks disagree by, AND it can go stale in flight: an at_ms that
+                         is no longer in the future when the backend evaluates it is
+                         indistinguishable from a deliberate release, so a renewal merely delayed
+                         releases the set instead of holding it. A by_ms is resolved entirely on
+                         the backend's clock, where a delay can postpone an arrival but cannot
+                         invert its meaning.
+
+                         Zero means the same as absent, because an absent arrival already means
+                         "release now", so nothing is lost by conflating them.
             description: |-
                 DocData holds the data portion of a doc, used for insertions. The created_ms
                  and modified_ms fields are used only for journal replay; leave them zero for
@@ -512,10 +574,30 @@ components:
                     type: string
                 id:
                     type: string
+                key:
+                    type: string
+                    description: Used for servers at protocol 2.
+                secondaryKey:
+                    type: string
+                    description: Only meaningful if key is present.
                 version:
                     type: integer
                     format: int32
             description: DocID identifies a specific version of a doc.
+        DocSetClaim:
+            type: object
+            properties:
+                set:
+                    $ref: '#/components/schemas/DocID'
+                omitMembers:
+                    type: boolean
+                    description: |-
+                        Return the set alone, with its lock and len, and none of its docs. The
+                         holder can read them later, or insert one it knows is new, without
+                         racing anyone.
+            description: |-
+                DocSetClaim names one doc set of a claim, by key (DocID.key, with no id),
+                 and whether its members come back.
         DocsResponse:
             type: object
             properties:
@@ -598,6 +680,9 @@ components:
                     type: array
                     items:
                         $ref: '#/components/schemas/Doc'
+                    description: |-
+                        Changed docs, and the doc sets a CHANGE_LEASE change named, each at its
+                         new lock as a Doc with no id or content. A real doc always has an id.
             description: |-
                 ModifyResponse returns inserted and updated tasks and docs when successful.
                  A dependency error (which is permanent) comes through as gRPC's NOT_FOUND code.
@@ -717,6 +802,9 @@ components:
                     $ref: '#/components/schemas/TaskID'
                 newData:
                     $ref: '#/components/schemas/TaskData'
+                mode:
+                    type: integer
+                    format: enum
             description: |-
                 TaskChange identifies a task by ID and specifies the new data it should contain.
                  All fields should be filled in. Empty fields result in deleting data from that field.
@@ -729,6 +817,22 @@ components:
                 atMs:
                     type: string
                     description: The epoch time in millis when this task becomes available.
+                byMs:
+                    type: string
+                    description: |-
+                        Protocol 2: how long from the SERVER's now until this task becomes
+                         available, in millis. Nonzero wins over at_ms, and may be negative.
+
+                         Prefer it to at_ms whenever the arrival is meant to be relative, as a
+                         release ("now") or a delay ("in an hour") is. An at_ms is an instant on
+                         the caller's clock that the server then compares against its own, so the
+                         two disagree by whatever the clocks do; a by_ms is resolved entirely on
+                         the server's clock and cannot. It also lets a store be driven directly,
+                         through psql and stored procedures, with no client clock involved at all.
+
+                         Zero means the same as absent, because an absent at_ms already means the
+                         server's now. So no presence flag is needed: a caller that omits this and
+                         a caller that sends zero both get now.
                 value:
                     allOf:
                         - $ref: '#/components/schemas/GoogleProtobufValue'

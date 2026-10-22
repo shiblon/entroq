@@ -14,6 +14,16 @@ schema through the Go service rather than executing it directly.
 
 `TestSchemaVersion` in `pkg/backend/eqpg` enforces this invariant.
 
+Between releases the version carries a `-dev` suffix (`1.13.0-dev`), and a
+`-dev` database is never current: `eqpg schema upgrade` always re-applies it.
+The version alone cannot tell two builds' schemas apart, so `InitSchema` also
+records `SchemaDigest`, the SHA-256 of `schema.sql`, and `Open` refuses a
+database whose digest differs or is missing. Any edit to `schema.sql` changes
+the digest; that is the point. The release drops the suffix, and
+`scripts/tag-release.sh` refuses to tag while it is present. The SQLite backend
+records a digest the same way; a file at the current version with another
+digest came from a development build and is refused.
+
 ## The Go worker is the reference implementation
 
 `pkg/worker` defines EntroQ's worker semantics. The Python, JS, and gateway
@@ -40,9 +50,9 @@ Read these before changing any client worker:
 - `worker.DefaultErrQMap` — the default error queue is `<inbox>/err`, and
   `WithErrQMap` computes it per inbox. A move with no destination falls back to
   it; it never becomes a no-op.
-- `acquireDocs` — a missing doc is a poison pill (move); a doc claimed by
-  someone else is transient (retry with backoff). Both are recorded on the task,
-  not just logged.
+- `acquireDocs` — a doc set held by someone else is transient (retry with
+  backoff), recorded on the task, not just logged. A set with no docs claims
+  normally and returns none; the handler decides what an empty set means.
 - `DependencyError` (`entroq.go`) — task and doc failures are separate fields.
   A `ModifyDep` carries either `id` or `doc_id`; a decoder that reads only `id`
   silently discards every doc dependency.

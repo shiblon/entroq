@@ -2,6 +2,7 @@ package eqredis
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -43,6 +44,58 @@ func migrateDocKeys(ctx context.Context, client *redis.Client) error {
 				return fmt.Errorf("move doc %q in %q: %w", id, ns, err)
 			}
 		}
+	}
+	return nil
+}
+
+// claimsIndexMigratedKey marks a database whose queues all have a qsclaims
+// index and whose qsclaimed sets hold only tasks that were claimed.
+const claimsIndexMigratedKey = keyPrefix + "migrated:claimsindex"
+
+// migrateClaimsIndex builds each queue's qsclaims index from its tasks' claim
+// counts, and drops from qsclaimed the tasks that were never claimed, which
+// an earlier version added when a change moved them into the future. It runs
+// once per database.
+func migrateClaimsIndex(ctx context.Context, client *redis.Client) error {
+	done, err := client.Exists(ctx, claimsIndexMigratedKey).Result()
+	if err != nil {
+		return fmt.Errorf("check claims index migration: %w", err)
+	}
+	if done == 1 {
+		return nil
+	}
+	queues, err := client.SMembers(ctx, queuesKey).Result()
+	if err != nil {
+		return fmt.Errorf("list queues: %w", err)
+	}
+	for _, q := range queues {
+		ids, err := client.ZRange(ctx, queueKey(q), 0, -1).Result()
+		if err != nil {
+			return fmt.Errorf("list tasks in %q: %w", q, err)
+		}
+		read := client.Pipeline()
+		claims := make([]*redis.StringCmd, len(ids))
+		for i, id := range ids {
+			claims[i] = read.HGet(ctx, taskKey(id), "claims")
+		}
+		if _, err := read.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+			return fmt.Errorf("read claims in %q: %w", q, err)
+		}
+		write := client.Pipeline()
+		for i, id := range ids {
+			n, err := claims[i].Int()
+			if err != nil || n == 0 {
+				write.ZRem(ctx, qsclaimedKey(q), id)
+				continue
+			}
+			write.ZAdd(ctx, qsclaimsKey(q), redis.Z{Score: float64(n), Member: id})
+		}
+		if _, err := write.Exec(ctx); err != nil {
+			return fmt.Errorf("index claims in %q: %w", q, err)
+		}
+	}
+	if err := client.Set(ctx, claimsIndexMigratedKey, "1", 0).Err(); err != nil {
+		return fmt.Errorf("mark claims index migration: %w", err)
 	}
 	return nil
 }

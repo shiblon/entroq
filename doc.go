@@ -13,12 +13,11 @@ import (
 type DocOpt func(*docOpts)
 
 type docOpts struct {
-	id              string
-	key             string
-	secondaryKey    string
-	content         json.RawMessage
-	at              time.Time
-	skipCollidingID bool
+	id           string
+	key          string
+	secondaryKey string
+	content      json.RawMessage
+	by           time.Duration
 }
 
 // WithKeys sets the primary and secondary keys for doc creation. The ID is
@@ -65,48 +64,57 @@ func WithContent(v any) DocOpt {
 	return WithRawContent(b)
 }
 
-// WithDocArrivalTime sets the arrival time on a doc insertion or change. When
-// non-zero and in the future, the backend also records the caller as the
-// claimant so the doc can be renewed or released.
-func WithDocArrivalTime(t time.Time) DocOpt {
-	return func(o *docOpts) {
-		o.at = t
-	}
-}
-
-// WithDocArrivalTimeBy sets the doc arrival time to now plus d. Use this to
-// insert a claimed doc, or to claim or renew an existing doc, by pushing its At
-// into the future.
+// WithDocArrivalTimeBy sets how long from the backend's own now a doc arrives:
+// a positive d holds its set until then, claimed by the caller so it can be
+// renewed or released, and zero or less releases it. Use it to insert a
+// claimed doc, or to claim or renew an existing one.
+//
+// The arrival belongs to the doc's set, not the doc: setting it claims or
+// renews the whole set. When one modification gives docs of one set different
+// positive durations the longest wins, and if none is positive the
+// modification releases the set.
+//
+// A duration, not an instant, and resolved by the backend rather than here: an
+// instant computed in this process can go stale on the way, and a stale
+// arrival is indistinguishable from a deliberate release, so a renewal delayed
+// in flight would hand the set away instead of holding it.
 func WithDocArrivalTimeBy(d time.Duration) DocOpt {
 	return func(o *docOpts) {
-		o.at = time.Now().Add(d)
+		o.by = d
 	}
 }
 
-// WithSkipCollidingDoc marks a doc insert as skippable when its explicit ID
-// already exists. When the caller specifies an ID and that doc is already
-// present, the Modify call removes this insert and retries rather than
-// returning an error. Analogous to WithSkipColliding for task inserts.
-func WithSkipCollidingDoc(skip bool) DocOpt {
-	return func(o *docOpts) {
-		o.skipCollidingID = skip
-	}
-}
-
-// DocID contains the identifying parts of a storage doc.
+// DocID contains the identifying parts of a storage doc. It names a doc by
+// ID, or, with no ID, a whole doc set by its key: a set is a doc with only a
+// namespace and a primary key. Either way, Version is the set's.
 type DocID struct {
 	Namespace string `json:"namespace"`
-	ID        string `json:"id"`
+	ID        string `json:"id,omitempty"`
+	Key       string `json:"key,omitempty"`
 	Version   int32  `json:"version"`
 }
 
 // NewDocID creates a DocID for the given namespace, id, and version. The
 // namespace is part of the doc's modify key, the way a queue is for a task.
 func NewDocID(ns string, id string, version int32) *DocID {
-	return &DocID{ns, id, version}
+	return &DocID{Namespace: ns, ID: id, Version: version}
+}
+
+// NewDocSetRef creates a DocID naming the doc set with the given namespace
+// and key, at version.
+func NewDocSetRef(ns, key string, version int32) *DocID {
+	return &DocID{Namespace: ns, Key: key, Version: version}
+}
+
+// IsSetRef reports whether r names a whole doc set rather than one doc.
+func (r DocID) IsSetRef() bool {
+	return r.ID == "" && r.Key != ""
 }
 
 func (r DocID) String() string {
+	if r.IsSetRef() {
+		return fmt.Sprintf("%s/[%s]:v%d", r.Namespace, r.Key, r.Version)
+	}
 	return fmt.Sprintf("%s/%s:v%d", r.Namespace, r.ID, r.Version)
 }
 
@@ -128,27 +136,38 @@ func (r DocID) Depend() ModifyArg {
 // insertions and journal replay. Created and Modified are populated when
 // journaling to preserve original timestamps on replay.
 type DocData struct {
-	Namespace    string          `json:"namespace"`
-	ID           string          `json:"id"`
+	Namespace string `json:"namespace"`
+	ID        string `json:"id"`
+
+	// by is how long from the backend's own now the doc arrives, and is the
+	// only way a write names an arrival. Unexported and not serialized,
+	// because it is an instruction rather than stored state: only
+	// WithDocArrivalTimeBy sets it, and By reads it. At, below, carries an
+	// arrival only back out of a journal, where it is an instant the backend
+	// already decided.
+	by time.Duration
+
 	At           time.Time       `json:"at"`
 	Key          string          `json:"key"`
 	SecondaryKey string          `json:"secondary_key"`
 	Content      json.RawMessage `json:"content"`
 	Created      time.Time       `json:"created"`
 	Modified     time.Time       `json:"modified"`
-
-	// skipCollidingID indicates that a collision on insertion is not fatal.
-	// When the explicit ID already exists, Modify removes this insert and
-	// retries rather than returning an error. Analogous to TaskData's field.
-	skipCollidingID bool
 }
 
 // Doc represents a durable state record in EntroQ.
 type Doc struct {
-	Namespace    string          `json:"namespace"`
-	ID           string          `json:"id"`
-	Version      int32           `json:"version"`
-	Claimant     string          `json:"claimant"`
+	Namespace string `json:"namespace"`
+	ID        string `json:"id"`
+	Version   int32  `json:"version"`
+	Claimant  string `json:"claimant"`
+
+	// by is the arrival a change asks for, as a duration from the backend's
+	// own now; see DocData.by. At is the stored arrival the backend decided,
+	// which is an observation: compare it against other server times, not
+	// against a local clock.
+	by time.Duration
+
 	At           time.Time       `json:"at"`
 	Key          string          `json:"key"`
 	SecondaryKey string          `json:"secondary_key"`
@@ -156,12 +175,22 @@ type Doc struct {
 	Created      time.Time       `json:"created"`
 	Modified     time.Time       `json:"modified"`
 }
+
+// By returns how long from the backend's own now this doc's set is asked to
+// arrive, zero for a write that releases it. Only a backend's Modify reads it.
+func (d *DocData) By() time.Duration { return d.by }
+
+// By returns how long from the backend's own now a change asks this doc's set
+// to arrive, zero for a change that releases it. Only a backend's Modify reads
+// it; a stored doc carries none.
+func (r *Doc) By() time.Duration { return r.by }
 
 // Data returns a DocData from this Doc, preserving timestamps for journaling.
 func (r *Doc) Data() *DocData {
 	rd := &DocData{
 		Namespace:    r.Namespace,
 		ID:           r.ID,
+		by:           r.by,
 		At:           r.At,
 		Key:          r.Key,
 		SecondaryKey: r.SecondaryKey,
@@ -215,14 +244,14 @@ func (r *Doc) Copy() *Doc {
 	return &cp
 }
 
-// Change returns a ModifyArg that changes this doc. Accepts WithContent,
-// WithDocArrivalTime, and WithDocArrivalTimeBy. WithIDKeys is ignored (keys are immutable).
+// Change returns a ModifyArg that changes this doc. Accepts WithContent and
+// WithDocArrivalTimeBy. WithIDKeys is ignored (keys are immutable).
 //
-// Much like Task.Change, a change releases by default: the arrival time is
-// reset (so the backend substitutes now(), see Backend.Modify) unless an
-// explicit WithDocArrivalTime / WithDocArrivalTimeBy pushes it into the future
-// to keep the doc claimed. Callers therefore do not silently keep a claim just
-// by omitting the arrival time.
+// Much like Task.Change, a change releases by default: it asks for an arrival
+// of zero unless WithDocArrivalTimeBy names a positive duration to keep the
+// doc's set claimed. Callers therefore do not silently keep a claim just by
+// omitting the arrival. The stored instant is dropped along with it, so
+// nothing downstream can read it as the arrival this change asks for.
 func (r *Doc) Change(opts ...DocOpt) ModifyArg {
 	return func(m *Modification) {
 		o := &docOpts{}
@@ -230,12 +259,9 @@ func (r *Doc) Change(opts ...DocOpt) ModifyArg {
 			opt(o)
 		}
 		nr := r.Copy()
-		nr.At = time.Time{}
+		nr.At, nr.by = time.Time{}, o.by
 		if len(o.content) > 0 {
 			nr.Content = o.content
-		}
-		if !o.at.IsZero() {
-			nr.At = o.at
 		}
 		m.DocChanges = append(m.DocChanges, nr)
 	}
@@ -270,9 +296,8 @@ func PuttingDoc(rd *DocData) ModifyArg {
 
 // PuttingDocInto returns a ModifyArg that creates a doc in the given namespace.
 // Use WithKeys to set the primary and secondary keys, WithContent/WithRawContent
-// to set the payload, and WithDocArrivalTime/WithDocArrivalTimeBy to insert the
-// doc with a claim. Use WithIDKeys only when explicit ID control is required.
-// Use WithSkipCollidingDoc to allow the insert to be silently dropped on ID collision.
+// to set the payload, and WithDocArrivalTimeBy to insert the doc with a claim.
+// Use WithIDKeys only when explicit ID control is required.
 func PuttingDocInto(ns string, opts ...DocOpt) ModifyArg {
 	return func(m *Modification) {
 		o := &docOpts{}
@@ -280,13 +305,12 @@ func PuttingDocInto(ns string, opts ...DocOpt) ModifyArg {
 			opt(o)
 		}
 		rd := &DocData{
-			Namespace:       ns,
-			ID:              o.id,
-			At:              o.at,
-			Key:             o.key,
-			SecondaryKey:    o.secondaryKey,
-			Content:         o.content,
-			skipCollidingID: o.skipCollidingID,
+			Namespace:    ns,
+			ID:           o.id,
+			by:           o.by,
+			Key:          o.key,
+			SecondaryKey: o.secondaryKey,
+			Content:      o.content,
 		}
 		m.DocInserts = append(m.DocInserts, rd)
 	}
@@ -309,59 +333,190 @@ type DocQuery struct {
 	OmitValues bool     `json:"omit_values"`
 }
 
-// DocClaim is used to claim all docs that share a primary key in a namespace.
-//
-// Construct with ClaimKey for a fluent interface:
-//
-//	eq.ClaimDocs(ctx, entroq.ClaimKey("state", "counter"))
-//	eq.ClaimDocs(ctx, entroq.ClaimKey("state", "counter").For(5*time.Second))
-type DocClaim struct {
-	Namespace string        `json:"namespace"`
-	Claimant  string        `json:"claimant"`
-	Key       string        `json:"key"`
-	Duration  time.Duration `json:"duration"`
-}
-
-// ClaimKey returns a DocClaim for the given namespace and primary key, using
-// DefaultClaimDuration. Call For to override the duration.
-func ClaimKey(ns, key string) *DocClaim {
-	return &DocClaim{
-		Namespace: ns,
-		Key:       key,
-		Duration:  DefaultClaimDuration,
-	}
-}
-
-// For sets the claim duration, overriding the DefaultClaimDuration set by ClaimKey.
-func (c *DocClaim) For(d time.Duration) *DocClaim {
-	c.Duration = d
-	return c
-}
-
-// Validate checks that the claim query specifies exactly one valid strategy.
-func (q *DocClaim) Validate() error {
-	if q.Key == "" {
-		return fmt.Errorf("can't claim on a blank key")
+// Validate checks that the query names a namespace. Doc IDs are unique only
+// within a namespace, unlike task IDs, so even a lookup by ID needs one.
+func (q *DocQuery) Validate() error {
+	if q.Namespace == "" {
+		return InvalidArgumentf("docs query must name a namespace")
 	}
 	return nil
 }
 
-// DocClaimOpt specifies document claim functionality.
-type DocClaimOpt func(*DocClaim)
-
-// LockingFor specifies the duration of a successful claim before it becomes
-// available for other claimants..
-func LockingFor(dt time.Duration) DocClaimOpt {
-	return func(dc *DocClaim) {
-		dc.Duration = dt
-	}
+// DocSet is a doc set: the docs sharing a primary key in a namespace,
+// which have one version, claimant, and arrival time between them, as a task
+// does. ClaimDocs returns the set it claimed, which may have no docs yet;
+// each member carries the set's version and claim.
+type DocSet struct {
+	Namespace string
+	Key       string
+	Version   int32
+	Claimant  string
+	At        time.Time
+	NumDocs   int    // how many docs the set has
+	Docs      []*Doc // its docs
 }
 
-// WithDocClaimant specifies the claimant ID for this document. Only needed
-// in very specific circmunstances, such as developing a server that proxies
-// through to an EntroQ backend. Otherwise don't use it - it's set for you.
-func WithDocClaimant(id string) DocClaimOpt {
-	return func(dc *DocClaim) {
-		dc.Claimant = id
+// DocsIn returns the docs of sets, in order: every member of the first
+// set, then of the next.
+func DocsIn(sets []*DocSet) []*Doc {
+	var docs []*Doc
+	for _, g := range sets {
+		docs = append(docs, g.Docs...)
 	}
+	return docs
+}
+
+// DocSetClaim names one doc set of a claim: the docs sharing a primary key in a
+// namespace, which may be none. Build one with ClaimKey.
+type DocSetClaim struct {
+	Namespace string `json:"namespace"`
+	Key       string `json:"key"`
+	// OmitMembers returns the set alone, with its lock and count, and none
+	// of its docs. Its holder can read them later, or insert one it knows is
+	// new, without racing anyone.
+	OmitMembers bool `json:"omit_members,omitempty"`
+}
+
+// ClaimKey names the doc set with the given namespace and primary key, for
+// ClaimDocs.
+func ClaimKey(ns, key string) *DocSetClaim {
+	return &DocSetClaim{Namespace: ns, Key: key}
+}
+
+// WithoutMembers makes the claim of this set return the set alone, without
+// its docs (see DocSetClaim.OmitMembers).
+func (s *DocSetClaim) WithoutMembers() *DocSetClaim {
+	s.OmitMembers = true
+	return s
+}
+
+// DocClaim claims doc sets, all of them or none, for one claimant until one
+// time. Build one with ClaimDocs's arguments:
+//
+//	eq.ClaimDocs(ctx,
+//		entroq.ClaimKey("orders", "cust-17").WithoutMembers(),
+//		entroq.ClaimKey("stock", "sku-9"),
+//		entroq.ClaimingSetsFor(time.Minute),
+//	)
+type DocClaim struct {
+	Sets     []*DocSetClaim `json:"sets"`
+	Claimant string         `json:"claimant"`
+	Duration time.Duration  `json:"duration"`
+
+	// TaskToMatch, if set, holds the sets until the named task arrives instead
+	// of for Duration, so they expire in step with it. The claim depends on
+	// that task at that version, and fails if it is missing: its lease is then
+	// no longer one to depend on. See MatchingLeaseOf.
+	//
+	// The queue is part of the reference because a backend needs it to find
+	// the task: eqmem keeps tasks under their queue's lock.
+	TaskToMatch *TaskID `json:"task_to_match,omitempty"`
+
+	leases int // lease arguments given, of which there may be one
+}
+
+// DocClaimArg is an argument to ClaimDocs: a set to claim (ClaimKey), or an
+// option of the whole claim.
+type DocClaimArg interface {
+	applyDocClaim(*DocClaim)
+}
+
+func (s *DocSetClaim) applyDocClaim(c *DocClaim) {
+	c.Sets = append(c.Sets, s)
+}
+
+type docClaimOption func(*DocClaim)
+
+func (o docClaimOption) applyDocClaim(c *DocClaim) {
+	o(c)
+}
+
+// ClaimingSetsFor holds a claim's sets for d from when it is made. Without a
+// lease argument a claim lasts DefaultClaimDuration.
+func ClaimingSetsFor(d time.Duration) DocClaimArg {
+	return docClaimOption(func(c *DocClaim) {
+		c.Duration, c.TaskToMatch = d, nil
+		c.leases++
+	})
+}
+
+// MatchingLeaseOf holds a claim's sets until the given task arrives, so they
+// expire in step with it: a worker that dies lets go of its task and its sets
+// at the same moment.
+//
+// It names the task rather than its arrival time, and the backend reads that
+// arrival, so the two come from one clock reading and are exactly rather than
+// approximately simultaneous.
+//
+// The claim fails if the task is not present at this version, which means the
+// implied dependency no longer holds; the task's lease is no longer reliable.
+func MatchingLeaseOf(task *Task) DocClaimArg {
+	return docClaimOption(func(c *DocClaim) {
+		c.Duration, c.TaskToMatch = 0, task.IDVersion()
+		c.leases++
+	})
+}
+
+// ClaimingSetsAs makes the claim for claimant instead of the client's own ID,
+// as ModifyAs does for a modification. A service claiming on a caller's
+// behalf needs it; a client otherwise does not.
+func ClaimingSetsAs(claimant string) DocClaimArg {
+	return docClaimOption(func(c *DocClaim) {
+		c.Claimant = claimant
+	})
+}
+
+// NewDocClaim builds the claim that args describe, filling in nothing.
+func NewDocClaim(args ...DocClaimArg) *DocClaim {
+	c := new(DocClaim)
+	for _, a := range args {
+		a.applyDocClaim(c)
+	}
+	return c
+}
+
+// Validate checks that the claim names at least one set, each once by
+// namespace and key, a claimant, and at most one lease, and that its duration
+// is neither negative nor longer than MaxClaimDuration. A zero duration and no
+// time means the default, which ClaimDocs fills in. Whether At is in the
+// future, or too far into it, is the backend's to check, by its own clock.
+func (q *DocClaim) Validate() error {
+	if len(q.Sets) == 0 {
+		return InvalidArgumentf("doc claim must name a doc set")
+	}
+	seen := make(map[[2]string]bool, len(q.Sets))
+	for _, s := range q.Sets {
+		if s == nil || s.Namespace == "" {
+			return InvalidArgumentf("doc claim must name a namespace for each set")
+		}
+		if s.Key == "" {
+			return InvalidArgumentf("doc claim must name a key for each set")
+		}
+		k := [2]string{s.Namespace, s.Key}
+		if seen[k] {
+			return InvalidArgumentf("doc claim names set %q in %q more than once", s.Key, s.Namespace)
+		}
+		seen[k] = true
+	}
+	if q.Claimant == "" {
+		return InvalidArgumentf("doc claim must name a claimant")
+	}
+	if q.leases > 1 {
+		return InvalidArgumentf("doc claim gives more than one lease")
+	}
+	if q.Duration < 0 {
+		return InvalidArgumentf("doc claim duration must not be negative, got %v", q.Duration)
+	}
+	if q.Duration > MaxClaimDuration {
+		return InvalidArgumentf("doc claim duration is %v, limit is %v (a unit error?)", q.Duration, MaxClaimDuration)
+	}
+	if q.Duration > 0 && q.TaskToMatch != nil {
+		return InvalidArgumentf("doc claim gives both a duration and a task to match")
+	}
+	if q.TaskToMatch != nil {
+		if q.TaskToMatch.ID == "" || q.TaskToMatch.Queue == "" {
+			return InvalidArgumentf("doc claim matches a task with no ID or no queue: %v", q.TaskToMatch)
+		}
+	}
+	return nil
 }

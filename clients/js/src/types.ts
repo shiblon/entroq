@@ -22,9 +22,17 @@ export interface TaskData {
 /**
  * TaskChange identifies a task by ID and specifies new data.
  */
+/**
+ * ChangeMode says how a change treats what is stored. Modes other than
+ * CHANGE_DEFAULT are protocol 2: the request must declare it in its
+ * entroq-protocol header, or the server refuses them.
+ */
+export type ChangeMode = "CHANGE_DEFAULT" | "CHANGE_RESET_CLAIMS" | "CHANGE_LEASE";
+
 export interface TaskChange {
   oldId: TaskID;
   newData: TaskData;
+  mode?: ChangeMode;
 }
 
 /**
@@ -77,7 +85,11 @@ export interface ClaimResponse {
  */
 export interface DocID {
   namespace: string;
-  id: string;
+  // Exactly one of id and key. A key alone names a doc set; key with
+  // secondaryKey names a doc (protocol 2).
+  id?: string;
+  key?: string;
+  secondaryKey?: string;
   version: number;
 }
 
@@ -104,6 +116,7 @@ export interface DocData {
 export interface DocChange {
   oldId: DocID;
   newData: DocData;
+  mode?: ChangeMode; // CHANGE_LEASE names a doc set by key; no claims reset
 }
 
 /**
@@ -120,6 +133,7 @@ export interface Doc {
   content?: any;
   createdMs: string; // int64 -> string
   modifiedMs: string; // int64 -> string
+  len?: number;       // for a Doc standing for a doc set: its doc count
 }
 
 /**
@@ -138,10 +152,23 @@ export interface DocQuery {
 /**
  * DocClaim describes an atomic all-or-nothing claim of docs sharing a key.
  */
+/**
+ * DocSetClaim names one doc set of a claim, by key (protocol 2).
+ */
+export interface DocSetClaim {
+  set: DocID;
+  omitMembers?: boolean; // return the set alone, without its docs
+}
+
+/**
+ * DocClaim claims doc sets, all of them or none.
+ */
 export interface DocClaim {
-  namespace: string;
-  key: string;
+  sets?: DocSetClaim[];   // protocol 2: the doc sets to claim
+  namespace?: string;  // protocol 1
+  key?: string;        // protocol 1
   durationMs?: string; // int64 -> string; defaults to DefaultClaimDuration
+  atMs?: string;       // protocol 2: hold until this time instead; future only
   claimant?: string;   // normally auto-set by the client
 }
 
@@ -167,10 +194,14 @@ export interface ClaimDocsRequest {
 }
 
 /**
- * ClaimDocsResponse contains the claimed docs.
+ * ClaimDocsResponse contains the members of every set not claimed with
+ * omitMembers, and every claimed doc set, in the order named, as a Doc with no
+ * id or content, present even when the set has no docs. Servers at protocol 1
+ * omit the sets.
  */
 export interface ClaimDocsResponse {
   docs: Doc[];
+  sets?: Doc[];
 }
 
 /**

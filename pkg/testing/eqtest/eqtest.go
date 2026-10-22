@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/shiblon/entroq"
@@ -69,13 +70,22 @@ func ClientService(ctx context.Context, opener entroq.BackendOpener) (client *en
 // backend's readiness/GC loops are rooted at context.Background(), so a service
 // left unclosed leaks a heartbeat ticker that keeps mutating shared state (e.g.
 // eqpg's notification watermark) and can perturb later tests.
+//
+// The service's claim lease bounds are opened up to a millisecond floor. The
+// contract tests claim with sub-second leases on purpose, to watch a lease
+// expire and the next claimant take over, and the production floor of thirty
+// seconds would turn those into thirty-second waits that no longer test
+// expiry at all. This widens a policy knob; it does not weaken an assertion,
+// and every test keeps asserting exactly what it did before.
 func StartService(ctx context.Context, opener entroq.BackendOpener) (stop func(), dial Dialer, err error) {
 	lis := bufconn.Listen(bufSize)
-	svc, err := eqsvcgrpc.New(ctx, opener)
+	svc, err := eqsvcgrpc.New(ctx, opener,
+		eqsvcgrpc.WithClaimLeaseBounds(time.Millisecond, entroq.MaxClaimDuration),
+	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("start service: %w", err)
 	}
-	s := grpc.NewServer()
+	s := grpc.NewServer(eqgrpc.ServerKeepalive())
 	hpb.RegisterHealthServer(s, health.NewServer())
 	pb.RegisterEntroQServer(s, svc)
 	go s.Serve(lis)
@@ -97,28 +107,28 @@ func newTaskQueueVersionValue(t *entroq.Task) *taskQueueVersionValue {
 	}
 }
 
+// taskIDQueueVersionValue is what a comparison of a task before and after an
+// operation checks. The claimant is left out: it names the task's holder, which
+// claiming and releasing change by design (see TaskClaimantIsHolder).
 type taskIDQueueVersionValue struct {
-	Queue    string
-	ID       string
-	Version  int32
-	Value    json.RawMessage
-	Claimant string
+	Queue   string
+	ID      string
+	Version int32
+	Value   json.RawMessage
 }
 
 func newTaskIDQueueVersionValue(t *entroq.Task) *taskIDQueueVersionValue {
 	return &taskIDQueueVersionValue{
-		ID:       t.ID,
-		Queue:    t.Queue,
-		Version:  t.Version,
-		Claimant: t.Claimant,
-		Value:    append(json.RawMessage(nil), t.Value...),
+		ID:      t.ID,
+		Queue:   t.Queue,
+		Version: t.Version,
+		Value:   append(json.RawMessage(nil), t.Value...),
 	}
 }
 
 type cmpOpts struct {
 	versionIncr int
 	valueEmpty  bool
-	claimant    string
 }
 
 type cmpOpt func(*cmpOpts)
@@ -129,14 +139,6 @@ func expectVersionIncr(by int) cmpOpt {
 	}
 	return func(o *cmpOpts) {
 		o.versionIncr = by
-	}
-}
-
-// expectClaimant expects every task in got to be held by claimant, as a task
-// claimed by a worker running under that claimant is.
-func expectClaimant(claimant string) cmpOpt {
-	return func(o *cmpOpts) {
-		o.claimant = claimant
 	}
 }
 
@@ -162,9 +164,6 @@ func EqualAllTasksUnorderedSkipTimesAndCounters(want, got []*entroq.Task, opts .
 		}
 		if options.valueEmpty {
 			ws[i].Value = nil
-		}
-		if options.claimant != "" {
-			ws[i].Claimant = options.claimant
 		}
 	}
 	gs := make([]*taskIDQueueVersionValue, len(got))
@@ -241,4 +240,24 @@ func uniqueTaskID(base string) string {
 // uniqueTaskIDOfLen returns a random task ID exactly n bytes long, n >= 16.
 func uniqueTaskIDOfLen(n int) string {
 	return strings.Repeat("a", n-16) + entroq.GenHex16()
+}
+
+// docsOf returns the members of the claimed doc sets, or the claim's error.
+func docsOf(sets []*entroq.DocSet, err error) ([]*entroq.Doc, error) {
+	if err != nil {
+		return nil, err
+	}
+	return entroq.DocsIn(sets), nil
+}
+
+// oneSet returns the one doc set a claim of one set returns, or the claim's
+// error.
+func oneSet(sets []*entroq.DocSet, err error) (*entroq.DocSet, error) {
+	if err != nil {
+		return nil, err
+	}
+	if len(sets) != 1 {
+		return nil, fmt.Errorf("claim of one doc set returned %d", len(sets))
+	}
+	return sets[0], nil
 }

@@ -30,6 +30,21 @@ message TaskData {
   // The epoch time in millis when this task becomes available.
   int64 at_ms = 2;
 
+  // Protocol 2: how long from the SERVER's now until this task becomes
+  // available, in millis. Nonzero wins over at_ms, and may be negative.
+  //
+  // Prefer it to at_ms whenever the arrival is meant to be relative, as a
+  // release ("now") or a delay ("in an hour") is. An at_ms is an instant on
+  // the caller's clock that the server then compares against its own, so the
+  // two disagree by whatever the clocks do; a by_ms is resolved entirely on
+  // the server's clock and cannot. It also lets a store be driven directly,
+  // through psql and stored procedures, with no client clock involved at all.
+  //
+  // Zero means the same as absent, because an absent at_ms already means the
+  // server's now. So no presence flag is needed: a caller that omits this and
+  // a caller that sends zero both get now.
+  int64 by_ms = 7;
+
   // The task's JSON payload.
   google.protobuf.Value value = 3;
 
@@ -48,11 +63,32 @@ message TaskData {
   string err = 6;
 }
 
+// ChangeMode says how a TaskChange or DocChange treats what is already
+// stored. Modes other than CHANGE_DEFAULT are protocol 2: a request that
+// declares protocol 1 (or no protocol) may not use them.
+enum ChangeMode {
+  // Apply new_data as the new contents, keeping a task's claim count. The
+  // only mode of protocol 1.
+  CHANGE_DEFAULT = 0;
+
+  // As CHANGE_DEFAULT, and reset the task's claim count to zero: the task was
+  // modified on purpose, so its earlier claims no longer point at a poison
+  // pill. Tasks only.
+  CHANGE_RESET_CLAIMS = 1;
+
+  // Change only when the task, or the doc set old_id names by key, is ready
+  // again: renewing a lease on it, or releasing it. Only new_data.at_ms is
+  // read; anything else given must match what old_id names. Keeps a task's
+  // claim count.
+  CHANGE_LEASE = 2;
+}
+
 // TaskChange identifies a task by ID and specifies the new data it should contain.
 // All fields should be filled in. Empty fields result in deleting data from that field.
 message TaskChange {
   TaskID old_id = 1;
   TaskData new_data = 2;
+  ChangeMode mode = 3;
 }
 
 // Task is a complete task object, containing IDs, data, and metadata.
@@ -133,7 +169,15 @@ message ClaimResponse {
 // DocID identifies a specific version of a doc.
 message DocID {
   string namespace = 1;
-  string id = 2;
+  oneof ref {
+    string id = 2;
+
+    // Used for servers at protocol 2.
+    string key = 4;
+  }
+  // Only meaningful if key is present.
+  string secondary_key = 5;
+
   int32 version = 3;
 }
 
@@ -148,9 +192,26 @@ message DocData {
   google.protobuf.Value content = 5;
   int64 created_ms = 6;
   int64 modified_ms = 7;
-  // at_ms is the requested arrival/claim-expiry time for doc inserts and changes.
-  // Zero means "use the backend's current time and release any claim."
+  // at_ms is the requested arrival/claim-expiry time for doc inserts and
+  // changes. Zero means "use the backend's current time and release any
+  // claim." Only a protocol 1 client still sends it; see by_ms.
   int64 at_ms = 8;
+  // by_ms is how long from the backend's own now the doc's set arrives, in
+  // millis. Nonzero wins over at_ms, and may be negative. Positive holds the
+  // set, claimed by the caller; zero or less releases it.
+  //
+  // Prefer it to at_ms always, and for a renewal it is the only safe choice.
+  // An at_ms is an instant on the caller's clock, so it is wrong by whatever
+  // the two clocks disagree by, AND it can go stale in flight: an at_ms that
+  // is no longer in the future when the backend evaluates it is
+  // indistinguishable from a deliberate release, so a renewal merely delayed
+  // releases the set instead of holding it. A by_ms is resolved entirely on
+  // the backend's clock, where a delay can postpone an arrival but cannot
+  // invert its meaning.
+  //
+  // Zero means the same as absent, because an absent arrival already means
+  // "release now", so nothing is lost by conflating them.
+  int64 by_ms = 9;
 }
 
 // DocChange identifies a doc by DocID and provides updated data. Only content
@@ -158,9 +219,12 @@ message DocData {
 message DocChange {
   DocID old_id = 1;
   DocData new_data = 2;
+  ChangeMode mode = 3;
 }
 
 // Doc is a complete doc object with identity, data, and metadata.
+// Note that when representing a set, it will not contain id, secondary_key, or
+// content.
 message Doc {
   string namespace = 1;
   string id = 2;
@@ -172,6 +236,9 @@ message Doc {
   google.protobuf.Value content = 8;
   int64 created_ms = 9;
   int64 modified_ms = 10;
+
+  // Number of docs under a doc set, if applicable.
+  int32 len = 11;
 }
 
 // DocQuery describes a listing request for docs in a namespace. Exactly one
@@ -190,13 +257,46 @@ message DocQuery {
   string key_exact = 7;
 }
 
-// DocClaim describes an atomic all-or-nothing claim of docs in a namespace.
-// All docs sharing the given key are claimed together.
+// DocSetClaim names one doc set of a claim, by key (DocID.key, with no id),
+// and whether its members come back.
+message DocSetClaim {
+  DocID set = 1;
+
+  // Return the set alone, with its lock and len, and none of its docs. The
+  // holder can read them later, or insert one it knows is new, without
+  // racing anyone.
+  bool omit_members = 2;
+}
+
+// DocClaim describes an atomic all-or-nothing claim of doc sets: every set
+// named is claimed, or none is.
+//
+// In protocol 1, namespace and key name the one set, the docs sharing that
+// key. Protocol 2 names the sets in sets, and namespace and key are ignored.
 message DocClaim {
-  string namespace = 1;
-  string claimant = 2;
-  string key = 3;
+  // Protocol 2.
+  repeated DocSetClaim sets = 5;
+
   int64 duration_ms = 4;
+
+  // Protocol 2: hold the sets until this task arrives, instead of for
+  // duration_ms, so they expire in step with it.
+  //
+  // The task is NAMED rather than its arrival time being sent. The server
+  // reads it, so the hold and the task's own expiry come from one clock
+  // reading and are exactly simultaneous; an instant would instead be wrong
+  // by however much the clocks between the holder and the store disagree.
+  //
+  // The claim fails if the task is not present at this version, which means
+  // the caller no longer holds it. The queue is required: a backend needs it
+  // to find the task.
+  TaskID task_to_match = 6;
+
+  string claimant = 2;
+
+  // Protocol 1.
+  string namespace = 1;
+  string key = 3;
 }
 
 // DocsRequest asks for a listing of docs matching a query.
@@ -214,11 +314,16 @@ message ClaimDocsRequest {
   DocClaim claim_query = 1;
 }
 
-// ClaimDocsResponse contains the docs claimed by a ClaimDocs call.
-// A dependency error (missing or already-claimed docs) comes through as
-// gRPC's NOT_FOUND code with ModifyDep details carrying doc_id fields.
+// ClaimDocsResponse contains the docs claimed by a ClaimDocs call, and the
+// sets they belong to. All sets are present, but not all sets have docs.
 message ClaimDocsResponse {
+  // The members of every claimed set not claimed with omit_members, with
+  // content.
   repeated Doc docs = 1;
+
+  // Every claimed set, as a Doc with no id or content, in the order named.
+  // Not present for servers on protocol 1.
+  repeated Doc sets = 2;
 }
 
 // NamespaceStat contains statistics for a single doc namespace.
@@ -267,6 +372,8 @@ message ModifyResponse {
   repeated Task inserted = 1;
   repeated Task changed = 2;
   repeated Doc inserted_docs = 3;
+  // Changed docs, and the doc sets a CHANGE_LEASE change named, each at its
+  // new lock as a Doc with no id or content. A real doc always has an id.
   repeated Doc changed_docs = 4;
 }
 
@@ -372,6 +479,7 @@ service EntroQ {
       body: "*"
     };
   }
+
   rpc Tasks(TasksRequest) returns (TasksResponse) {
     option (google.api.http) = {
       get: "/api/v0/tasks"

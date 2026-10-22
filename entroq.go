@@ -49,14 +49,14 @@
 //
 // # Doc Keys and Ordering
 //
-// The primary key groups related docs together. ClaimDocs acquires an
+// The primary key sets related docs together. ClaimDocs acquires an
 // exclusive lease on all docs sharing a primary key in one atomic operation,
 // making the primary key the natural unit of exclusive ownership. The
-// secondary key provides a sort dimension within that group.
+// secondary key provides a sort dimension within that set.
 //
 // Both Docs and ClaimDocs return results ordered by (primary key, secondary
 // key). This is guaranteed by both the PostgreSQL and eqmem backends. A
-// worker that claims a primary-key group receives docs in stable secondary-key
+// worker that claims a primary-key set receives docs in stable secondary-key
 // order, making reduce-shaped strategies simple.
 //
 // # Doc Storage Considerations
@@ -102,6 +102,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand"
 	"slices"
 	"strings"
@@ -110,8 +111,42 @@ import (
 
 const (
 	DefaultClaimPollTime = 30 * time.Second
-	DefaultClaimDuration = 30 * time.Second
+
+	// DefaultClaimDuration is how long a claim holds a task or doc set when
+	// nothing says otherwise. A holder renews after RenewalDurationFor of it,
+	// so what is left over is the margin: for the renewal to complete in, and
+	// for claiming doc sets before they stop expiring in step with their task.
+	//
+	// Lengthening it costs only the sad path, where a dead holder keeps what it
+	// held for up to a lease. That is multiplied by the failure rate; anything
+	// on the happy path is multiplied by throughput.
+	DefaultClaimDuration = 45 * time.Second
 )
+
+// RenewalDurationFor returns how far into lease its holder renews, leaving the
+// rest as margin.
+//
+// A service also applies it to its lease floor, to decide how far below that
+// floor a claim may name an arrival: that far down is one renewal's worth of a
+// lease, which is as low as a holder can be given and still renew in time. The
+// two uses are not forced to match, but equal is always safe where drifting
+// apart would need an argument, so one fraction serves both.
+func RenewalDurationFor(lease time.Duration) time.Duration {
+	return lease * 2 / 3
+}
+
+// MaxClaimDuration bounds how long any claim may hold a task or doc set. It is
+// a sanity bound, not a policy one: a service sets policy, and its limits are
+// far tighter, measured in minutes. This one only refuses a lease nobody could
+// have meant, so that a backend never stores an arrival no one can wait out.
+//
+// It sits below the most common way to get one by accident. A time.Duration
+// counts nanoseconds, so an int64(30*time.Second) passed where milliseconds
+// were expected asks for thirty billion milliseconds, or about 347 days; a
+// bound of a year would let that through, and thirty days does not. Nothing
+// legitimate wants a claim this long, because a lease is held by a live worker
+// that renews it, not by one that asks for a month up front.
+const MaxClaimDuration = 30 * 24 * time.Hour
 
 // ClaimQuery contains information necessary to attempt to make a claim on a task in a specific queue.
 type ClaimQuery struct {
@@ -119,6 +154,25 @@ type ClaimQuery struct {
 	Claimant string        // The ID of the process trying to make the claim.
 	Duration time.Duration // How long the task should be claimed for if successful.
 	PollTime time.Duration // Length of time between (possibly interruptible) sleep and polling.
+}
+
+// Validate checks that the claim names at least one queue, a claimant, and a
+// duration that is positive and no longer than MaxClaimDuration, returning an
+// InvalidArgumentError otherwise.
+func (q *ClaimQuery) Validate() error {
+	if len(q.Queues) == 0 {
+		return InvalidArgumentf("claim must name at least one queue")
+	}
+	if q.Claimant == "" {
+		return InvalidArgumentf("claim must name a claimant")
+	}
+	if q.Duration <= 0 {
+		return InvalidArgumentf("claim duration must be positive, got %v", q.Duration)
+	}
+	if q.Duration > MaxClaimDuration {
+		return InvalidArgumentf("claim duration is %v, limit is %v (a unit error?)", q.Duration, MaxClaimDuration)
+	}
+	return nil
 }
 
 // BackendClaimFunc is a function that can make claims based on a ClaimQuery.
@@ -197,17 +251,20 @@ type ListenerCounter interface {
 	Listeners() map[string]int
 }
 
-// NotifyModified takes inserted and changed tasks and notifies once per unique queue/ID pair.
+// NotifyModified takes inserted and changed tasks and notifies once per unique
+// queue/ID pair, for those that are available rather than held.
+//
+// Availability is read as At at or before Modified, both of which are set in
+// reference to the backend clock.
 func NotifyModified(n Notifier, inserted, changed []*Task) {
-	now := time.Now()
 	qs := make(map[string]string)
 	for _, t := range inserted {
-		if !now.Before(t.At) {
+		if !t.At.After(t.Modified) {
 			qs[t.ID] = t.Queue
 		}
 	}
 	for _, t := range changed {
-		if !now.Before(t.At) {
+		if !t.At.After(t.Modified) {
 			qs[t.ID] = t.Queue
 		}
 	}
@@ -273,11 +330,11 @@ func NormalizeArrival(at, now time.Time) time.Time {
 // convention for garbage-collected task queues and doc namespaces. Each
 // backend starts its own GC loop that pays attention to any queue or namespace
 // whose /gc=<ts> activation has fired (ts <= now). It deletes available tasks
-// (At <= now), and atomically deletes complete primary-key groups from opted-in
-// namespaces only when every member of that group is available.
+// (At <= now), and atomically deletes complete primary-key sets from opted-in
+// namespaces only when every member of that set is available.
 //
 // Backends MAY implement GC loops more efficiently so long as the behavior is
-// equivalent to those task and doc-group semantics.
+// equivalent to those task and doc-set semantics.
 //
 // See pkg/queues for details on how /gc= parameter sections are parsed.
 //
@@ -353,8 +410,9 @@ type Backend interface {
 	// across all classes -- insert/doc-insert collisions, missing or
 	// version-mismatched changes/deletes/depends, claimed targets, and
 	// queue/namespace mismatches -- not merely the first class encountered. A
-	// caller acts on the full set: skip-colliding inserts in particular depend on
-	// collisions always being reported, even alongside other failures.
+	// caller acts on the full set: OnlyCollisions in particular is true only
+	// when collisions are the whole story, so every other failure beside them
+	// must be reported too.
 	// (*DependencyError).Merge helps a backend that discovers failures in more
 	// than one pass fold them into a single such error.
 	Modify(ctx context.Context, mod *Modification) (*ModifyResponse, error)
@@ -362,9 +420,13 @@ type Backend interface {
 	// Docs returns a list of docs matching the given query.
 	Docs(ctx context.Context, rq *DocQuery) ([]*Doc, error)
 
-	// ClaimDocs attempts to claim a set of docs for modification (including
-	// deletion).
-	ClaimDocs(ctx context.Context, cq *DocClaim) ([]*Doc, error)
+	// ClaimDocs claims every doc set cq names, atomically: all of them, or,
+	// if anyone else holds one, none, with a DependencyError naming the held
+	// sets. It returns them in the order named, each at its new lock with its
+	// members, unless claimed with OmitMembers. The claim holds the sets until
+	// cq.Until(now), by the backend's clock; a time not in the future is an
+	// invalid argument.
+	ClaimDocs(ctx context.Context, cq *DocClaim) ([]*DocSet, error)
 
 	// NamespaceStats returns statistics for doc namespaces matching the query.
 	NamespaceStats(ctx context.Context, qq *MatchQuery) (map[string]*NamespaceStat, error)
@@ -599,7 +661,36 @@ func IsInvalidArgument(err error) bool {
 	return errors.As(err, &e)
 }
 
-// claimQueryFromOpts processes ClaimOpt values and produces a claim query.
+// UnsupportedError indicates a request the backend does not understand, such
+// as one needing a newer wire protocol than its server speaks. Retrying it
+// cannot succeed until the server is upgraded. The service reports it as
+// codes.Unimplemented, and the gRPC backend translates that code back to it.
+type UnsupportedError struct{ msg string }
+
+// Error implements the error interface.
+func (e *UnsupportedError) Error() string { return e.msg }
+
+// Unsupportedf builds an UnsupportedError with a formatted message.
+func Unsupportedf(format string, args ...any) *UnsupportedError {
+	return &UnsupportedError{msg: fmt.Sprintf(format, args...)}
+}
+
+// IsUnsupported reports whether err indicates a request the backend does not
+// understand (see UnsupportedError).
+func IsUnsupported(err error) bool {
+	var e *UnsupportedError
+	return errors.As(err, &e)
+}
+
+// NewClaimQuery builds the claim query that Claim and TryClaim would send for
+// opts, with no default claimant. The service uses it to check a claim's shape
+// before authorizing it.
+func NewClaimQuery(opts ...ClaimOpt) *ClaimQuery {
+	return claimQueryFromOpts("", opts...)
+}
+
+// claimQueryFromOpts processes ClaimOpt values and produces a claim query. A
+// zero duration, as from ClaimFor(0), means the default.
 func claimQueryFromOpts(claimant string, opts ...ClaimOpt) *ClaimQuery {
 	query := &ClaimQuery{
 		Claimant: claimant,
@@ -608,6 +699,9 @@ func claimQueryFromOpts(claimant string, opts ...ClaimOpt) *ClaimQuery {
 	}
 	for _, opt := range opts {
 		opt(query)
+	}
+	if query.Duration == 0 {
+		query.Duration = DefaultClaimDuration
 	}
 	return query
 }
@@ -619,8 +713,8 @@ func claimQueryFromOpts(claimant string, opts ...ClaimOpt) *ClaimQuery {
 // default duration if none is given is DefaultClaimDuration.
 func (c *EntroQ) Claim(ctx context.Context, opts ...ClaimOpt) (*Task, error) {
 	query := claimQueryFromOpts(c.ClientID, opts...)
-	if len(query.Queues) == 0 {
-		return nil, fmt.Errorf("no queues specified for claim")
+	if err := query.Validate(); err != nil {
+		return nil, fmt.Errorf("claim: %w", err)
 	}
 	return c.backend.Claim(ctx, query)
 }
@@ -632,8 +726,8 @@ func (c *EntroQ) Claim(ctx context.Context, opts ...ClaimOpt) (*Task, error) {
 // that configuration tasks haven't changed.
 func (c *EntroQ) TryClaim(ctx context.Context, opts ...ClaimOpt) (*Task, error) {
 	query := claimQueryFromOpts(c.ClientID, opts...)
-	if len(query.Queues) == 0 {
-		return nil, fmt.Errorf("no queues specified for try claim")
+	if err := query.Validate(); err != nil {
+		return nil, fmt.Errorf("try claim: %w", err)
 	}
 	return c.backend.TryClaim(ctx, query)
 }
@@ -643,9 +737,6 @@ type RenewConfig struct {
 	Interval time.Duration
 	Tasks    []*Task
 	Docs     []*Doc
-	// Claimant renews as this claimant instead of the client's own. It must
-	// be the claimant that holds the tasks and docs.
-	Claimant string
 }
 
 // NewRenewConfig creates a RenewConfig from the given options.
@@ -696,14 +787,6 @@ func RenewingDoc(d *Doc) RenewOption {
 	}
 }
 
-// RenewingAs renews as the given claimant rather than the client's own. Empty
-// means the client's claimant.
-func RenewingAs(claimant string) RenewOption {
-	return func(rc *RenewConfig) {
-		rc.Claimant = claimant
-	}
-}
-
 // WithRenewInterval sets the lease time for renewed tasks.
 func WithRenewInterval(dt time.Duration) RenewOption {
 	return func(rc *RenewConfig) {
@@ -717,42 +800,58 @@ type RenewResponse struct {
 	Docs  []*Doc
 }
 
-// RenewEverything updates the At time of all specified tasks and docs.
+// Renew makes the tasks and docs it names ready again after the renewal
+// interval, keeping their claims. A doc renews its whole doc set, as every
+// member of a set shares its lease: the docs come back at their set's new
+// version, and a set is renewed once however many of its docs are named.
+//
+// Deprecated: use UpdateArrival, which renews doc sets directly, including
+// sets with no docs.
 func (c *EntroQ) Renew(ctx context.Context, opts ...RenewOption) (*RenewResponse, error) {
 	conf := NewRenewConfig(opts...)
-	if len(conf.Tasks) == 0 && len(conf.Docs) == 0 {
-		return nil, fmt.Errorf("renew: no docs or tasks specified")
+	if conf.IsEmpty() {
+		return nil, InvalidArgumentf("renew: no docs or tasks specified")
 	}
-	// The client's claimant is used unless RenewingAs names another, as a
-	// worker running under its own claimant must.
-	var modArgs []ModifyArg
-	if conf.Claimant != "" {
-		modArgs = append(modArgs, ModifyAs(conf.Claimant))
-	}
-	var taskIDs []string
-	var docIDs []string
-	for _, t := range conf.Tasks {
-		modArgs = append(modArgs, t.Change(ArrivalTimeBy(conf.Interval)))
-		taskIDs = append(taskIDs, t.IDVersion().String())
-	}
+	type setKey struct{ ns, key string }
+	var sets []*DocSet
+	seen := make(map[setKey]bool)
 	for _, d := range conf.Docs {
-		modArgs = append(modArgs, d.Change(WithDocArrivalTimeBy(conf.Interval)))
-		docIDs = append(docIDs, d.IDVersion().String())
+		k := setKey{d.Namespace, d.Key}
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		sets = append(sets, &DocSet{Namespace: d.Namespace, Key: d.Key, Version: d.Version})
 	}
-	resp, err := c.Modify(ctx, modArgs...)
+	resp, err := c.UpdateArrival(ctx, ReadyIn(conf.Interval).Tasks(conf.Tasks...).Docs(sets...))
 	if err != nil {
-		return nil, fmt.Errorf("renewal failed for tasks/docs %q/%q: %w", taskIDs, docIDs, err)
+		return nil, fmt.Errorf("renew: %w", err)
 	}
-	changed := resp.ChangedTasks
-	changedDocs := resp.ChangedDocs
-	if len(changed) != len(conf.Tasks) || len(changedDocs) != len(conf.Docs) {
-		return nil, fmt.Errorf("renewal expected updates of %d tasks / %d docs, got %d / %d", len(conf.Tasks), len(conf.Docs), len(changed), len(changedDocs))
+	tasks, err := inOrder(conf.Tasks, resp.ChangedTasks)
+	if err != nil {
+		return nil, fmt.Errorf("renew: %w", err)
 	}
-	return &RenewResponse{Tasks: changed, Docs: changedDocs}, nil
+	locks := make(map[setKey]*DocSet, len(resp.ChangedSets))
+	for _, g := range resp.ChangedSets {
+		locks[setKey{g.Namespace, g.Key}] = g
+	}
+	docs := make([]*Doc, 0, len(conf.Docs))
+	for _, d := range conf.Docs {
+		g, ok := locks[setKey{d.Namespace, d.Key}]
+		if !ok {
+			return nil, fmt.Errorf("renew: doc set %q in %q was not renewed", d.Key, d.Namespace)
+		}
+		nd := *d
+		nd.Version, nd.Claimant, nd.At = g.Version, g.Claimant, g.At
+		docs = append(docs, &nd)
+	}
+	return &RenewResponse{Tasks: tasks, Docs: docs}, nil
 }
 
-// RenewFor attempts to renew the given task's lease (update arrival time) for
-// the given duration. Returns the new task.
+// RenewFor makes a task ready again after duration, keeping its claim, and
+// returns it at its new version.
+//
+// Deprecated: use UpdateArrival.
 func (c *EntroQ) RenewFor(ctx context.Context, task *Task, duration time.Duration) (*Task, error) {
 	changed, err := c.RenewAllFor(ctx, []*Task{task}, duration)
 	if err != nil {
@@ -761,32 +860,36 @@ func (c *EntroQ) RenewFor(ctx context.Context, task *Task, duration time.Duratio
 	return changed[0], nil
 }
 
-// RenewAllFor attempts to renew all given tasks' leases (update arrival times)
-// for the given duration. Returns the new tasks.
-func (c *EntroQ) RenewAllFor(ctx context.Context, tasks []*Task, duration time.Duration) (result []*Task, err error) {
+// RenewAllFor makes tasks ready again after duration, keeping their claims,
+// and returns them at their new versions, in the order given.
+//
+// Deprecated: use UpdateArrival.
+func (c *EntroQ) RenewAllFor(ctx context.Context, tasks []*Task, duration time.Duration) ([]*Task, error) {
 	if len(tasks) == 0 {
 		return nil, nil
 	}
-	// Note that we use the default claimant always in this situation. These
-	// functions are high-level user-friendly things and don't allow some of
-	// the other hocus pocus that might happen in a grpc proxy situation (where
-	// claimant IDs need to come from the request, not the client it uses to
-	// perform its work).
-	var modArgs []ModifyArg
-	var taskIDs []string
-	for _, t := range tasks {
-		modArgs = append(modArgs, t.Change(ArrivalTimeBy(duration)))
-		taskIDs = append(taskIDs, t.IDVersion().String())
-	}
-	resp, err := c.Modify(ctx, modArgs...)
+	resp, err := c.UpdateArrival(ctx, ReadyIn(duration).Tasks(tasks...))
 	if err != nil {
-		return nil, fmt.Errorf("renewal failed for tasks %q: %w", taskIDs, err)
+		return nil, fmt.Errorf("renew tasks: %w", err)
 	}
-	changed := resp.ChangedTasks
-	if len(changed) != len(tasks) {
-		return nil, fmt.Errorf("renewal expected %d updated tasks, got %d", len(tasks), len(changed))
+	return inOrder(tasks, resp.ChangedTasks)
+}
+
+// inOrder returns changed in the order of the tasks they are new versions of.
+func inOrder(tasks, changed []*Task) ([]*Task, error) {
+	byID := make(map[string]*Task, len(changed))
+	for _, t := range changed {
+		byID[t.ID] = t
 	}
-	return changed, nil
+	out := make([]*Task, 0, len(tasks))
+	for _, t := range tasks {
+		nt, ok := byID[t.ID]
+		if !ok {
+			return nil, fmt.Errorf("task %s was not renewed", t.ID)
+		}
+		out = append(out, nt)
+	}
+	return out, nil
 }
 
 // Modify allows a batch of mutations to be applied atomically to the task store.
@@ -822,11 +925,6 @@ func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (*ModifyRespo
 			ins.ID = c.GenID()
 		}
 	}
-	for _, opt := range mod.Options() {
-		if err := opt.IsModifyBackend(c.backend); err != nil {
-			return nil, fmt.Errorf("modify option incompatible with backend %T: %w", c.backend, err)
-		}
-	}
 	for _, ins := range mod.Inserts {
 		if ins.Value != nil && !json.Valid(ins.Value) {
 			return nil, fmt.Errorf("modify insert %q: value is not valid JSON", ins.Queue)
@@ -837,65 +935,14 @@ func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (*ModifyRespo
 			return nil, fmt.Errorf("modify change %s: value is not valid JSON", chg.ID)
 		}
 	}
-	for {
-		resp, err := c.backend.Modify(ctx, mod)
-		if err == nil {
-			return resp, nil
+	resp, err := c.backend.Modify(ctx, mod)
+	if err != nil {
+		if depErr, ok := AsDependency(err); ok {
+			depErr.nameArrivals(mod)
 		}
-		depErr, ok := AsDependency(err)
-		// If not a dependency error, pass it on out.
-		if !ok {
-			return nil, fmt.Errorf("modify: %w", err)
-		}
-		// If anything is missing or there's a claim problem, bail.
-		if depErr.HasMissing() || depErr.HasClaims() {
-			return nil, fmt.Errorf("modify non-ins deps: %w", err)
-		}
-		// No collisions? Not sure what's going on.
-		if !depErr.HasCollisions() {
-			return nil, fmt.Errorf("non-collision errors: %w", err)
-		}
-
-		// If we get this far, the only errors we have are insertion collisions.
-		// If any of them cannot be skipped, we bail out.
-		// Otherwise we remove them and try again.
-
-		// Now check all collisions. If we can remove all of them safely, do so
-		// and try again.
-		collidingIDs := make(map[string]bool)
-		for _, ins := range depErr.Inserts {
-			collidingIDs[ins.ID] = true
-		}
-		var newInserts []*TaskData
-		for _, td := range mod.Inserts {
-			if collidingIDs[td.ID] {
-				if td.skipCollidingID {
-					// Skippable, so skip.
-					continue
-				}
-				// Can't skip this one. Bail.
-				return nil, fmt.Errorf("unskippable collision: %w", err)
-			}
-			newInserts = append(newInserts, td)
-		}
-		mod.Inserts = newInserts
-
-		collidingDocKeys := make(map[string]bool)
-		for _, ins := range depErr.DocInserts {
-			collidingDocKeys[DocKey(ins.Namespace, ins.ID)] = true
-		}
-		var newDocInserts []*DocData
-		for _, dd := range mod.DocInserts {
-			if collidingDocKeys[DocKey(dd.Namespace, dd.ID)] {
-				if dd.skipCollidingID {
-					continue
-				}
-				return nil, fmt.Errorf("unskippable doc collision: %w", err)
-			}
-			newDocInserts = append(newDocInserts, dd)
-		}
-		mod.DocInserts = newDocInserts
+		return nil, fmt.Errorf("modify: %w", err)
 	}
+	return resp, nil
 }
 
 // TryClaimDocByID attempts to claim the doc identified by ns and id by
@@ -904,6 +951,12 @@ func (c *EntroQ) Modify(ctx context.Context, modArgs ...ModifyArg) (*ModifyRespo
 // read and the change, the backend returns a DependencyError and the caller
 // may retry. If the doc is currently claimed by another claimant, a
 // DependencyError with DocClaims set is returned.
+//
+// A doc has no claim of its own: this claims the doc's whole set, the docs
+// sharing its primary key, and returns only the named doc.
+//
+// Deprecated: claim the set with ClaimDocs(ctx, ClaimKey(ns, doc.Key)),
+// which also works for a set with no docs.
 func (c *EntroQ) TryClaimDocByID(ctx context.Context, ns, id string, duration time.Duration) (*Doc, error) {
 	docs, err := c.Docs(ctx, &DocQuery{Namespace: ns, IDs: []string{id}})
 	if err != nil {
@@ -921,13 +974,35 @@ func (c *EntroQ) TryClaimDocByID(ctx context.Context, ns, id string, duration ti
 
 // Docs returns a list of docs matching the given query.
 func (c *EntroQ) Docs(ctx context.Context, rq *DocQuery) ([]*Doc, error) {
+	if err := rq.Validate(); err != nil {
+		return nil, fmt.Errorf("docs: %w", err)
+	}
 	return c.backend.Docs(ctx, rq)
 }
 
-// ClaimDocs attempts to claim a set of docs.
-func (c *EntroQ) ClaimDocs(ctx context.Context, cq *DocClaim) ([]*Doc, error) {
+// ClaimDocs claims the doc sets args name, all of them or none, and returns
+// them in the order named, each with its members, which may be none, unless
+// it was claimed WithoutMembers. A set someone else holds fails the whole
+// claim with a DependencyError naming it, and nothing is claimed.
+//
+//	sets, err := eq.ClaimDocs(ctx,
+//		entroq.ClaimKey("orders", "cust-17"),
+//		entroq.ClaimKey("stock", "sku-9").WithoutMembers(),
+//		entroq.ClaimingSetsFor(time.Minute),
+//	)
+//
+// The claim lasts DefaultClaimDuration unless ClaimingSetsFor says otherwise,
+// or MatchingLeaseOf ties it to a task's own arrival.
+func (c *EntroQ) ClaimDocs(ctx context.Context, args ...DocClaimArg) ([]*DocSet, error) {
+	cq := NewDocClaim(args...)
 	if cq.Claimant == "" {
 		cq.Claimant = c.ClientID
+	}
+	if cq.Duration == 0 && cq.TaskToMatch == nil {
+		cq.Duration = DefaultClaimDuration
+	}
+	if err := cq.Validate(); err != nil {
+		return nil, fmt.Errorf("claim docs: %w", err)
 	}
 	return c.backend.ClaimDocs(ctx, cq)
 }
@@ -938,6 +1013,10 @@ type ModifyResponse struct {
 	ChangedTasks  []*Task
 	InsertedDocs  []*Doc
 	ChangedDocs   []*Doc
+
+	// ChangedSets holds each doc set named in DocArrives at its new lock
+	// and doc count, without its docs: they are at the set's new version.
+	ChangedSets []*DocSet
 }
 
 // ModifyArg is an argument to the Modify function, which does batch modifications to the task store.
@@ -952,25 +1031,6 @@ func ModifyAs(id string) ModifyArg {
 	}
 }
 
-// ModifyOption is an option that can be passed through to a backend's Modify
-// implementation. Backend-specific options use IsModifyBackend to validate that
-// the correct backend is in use; generic options return nil unconditionally.
-type ModifyOption interface {
-	// IsModifyBackend returns nil if the given backend supports this option, or a
-	// descriptive error if not. Returning non-nil causes Modify to fail before
-	// the backend is called. Generic options always return nil.
-	IsModifyBackend(Backend) error
-}
-
-// WithModifyOption allows an option the backend understands to be added.
-// These are accessible in the backend if additional modification settings
-// are needed (example: modifying inside an SQL transaction).
-func WithModifyOption(opt ModifyOption) ModifyArg {
-	return func(m *Modification) {
-		m.options = append(m.options, opt)
-	}
-}
-
 // WithModification returns a ModifyArg that merges the given Modification with whatever it is so far.
 // Ignores Claimant field, and simply appends to all others.
 func WithModification(src *Modification) ModifyArg {
@@ -979,29 +1039,40 @@ func WithModification(src *Modification) ModifyArg {
 		dest.Changes = append(dest.Changes, src.Changes...)
 		dest.Deletes = append(dest.Deletes, src.Deletes...)
 		dest.Depends = append(dest.Depends, src.Depends...)
+		dest.Arrives = append(dest.Arrives, src.Arrives...)
 		dest.DocInserts = append(dest.DocInserts, src.DocInserts...)
 		dest.DocChanges = append(dest.DocChanges, src.DocChanges...)
 		dest.DocDeletes = append(dest.DocDeletes, src.DocDeletes...)
 		dest.DocDepends = append(dest.DocDepends, src.DocDepends...)
+		dest.DocArrives = append(dest.DocArrives, src.DocArrives...)
+		for id := range src.resetClaims {
+			if dest.resetClaims == nil {
+				dest.resetClaims = make(map[string]bool)
+			}
+			dest.resetClaims[id] = true
+		}
 	}
 }
 
 // Modification contains all of the information for a single batch modification in the task store.
 type Modification struct {
-	now     time.Time
-	options []ModifyOption
+	// resetClaims holds the IDs of changed tasks whose claim count the change
+	// resets (see ResettingClaims).
+	resetClaims map[string]bool
 
 	Claimant string `json:"claimant"`
 
-	Inserts []*TaskData `json:"inserts"`
-	Changes []*Task     `json:"changes"`
-	Deletes []*TaskID   `json:"deletes"`
-	Depends []*TaskID   `json:"depends"`
+	Inserts []*TaskData    `json:"inserts"`
+	Changes []*Task        `json:"changes"`
+	Deletes []*TaskID      `json:"deletes"`
+	Depends []*TaskID      `json:"depends"`
+	Arrives []*TaskArrival `json:"arrives,omitempty"`
 
-	DocInserts []*DocData `json:"doc_inserts"`
-	DocChanges []*Doc     `json:"doc_changes"`
-	DocDeletes []*DocID   `json:"doc_deletes"`
-	DocDepends []*DocID   `json:"doc_depends"`
+	DocInserts []*DocData    `json:"doc_inserts"`
+	DocChanges []*Doc        `json:"doc_changes"`
+	DocDeletes []*DocID      `json:"doc_deletes"`
+	DocDepends []*DocID      `json:"doc_depends"`
+	DocArrives []*DocArrival `json:"doc_arrives,omitempty"`
 }
 
 // String produces a friendly version of this modification.
@@ -1019,6 +1090,9 @@ func (m *Modification) String() string {
 	if len(m.Depends) != 0 {
 		out = append(out, fmt.Sprintf("dep: %v", m.Depends))
 	}
+	if len(m.Arrives) != 0 {
+		out = append(out, fmt.Sprintf("arr: %v", m.Arrives))
+	}
 	if len(m.DocInserts) != 0 {
 		out = append(out, fmt.Sprintf("doc-ins: %v", m.DocInserts))
 	}
@@ -1031,6 +1105,12 @@ func (m *Modification) String() string {
 	if len(m.DocDepends) != 0 {
 		out = append(out, fmt.Sprintf("doc-dep: %v", m.DocDepends))
 	}
+	if len(m.DocArrives) != 0 {
+		out = append(out, fmt.Sprintf("doc-arr: %v", m.DocArrives))
+	}
+	if len(m.resetClaims) != 0 {
+		out = append(out, fmt.Sprintf("reset-claims: %v", slices.Sorted(maps.Keys(m.resetClaims))))
+	}
 	return "mod:\n\t" + strings.Join(out, "\n\t")
 }
 
@@ -1038,20 +1118,36 @@ func (m *Modification) String() string {
 // and dependencies all together. When creating this for the purpose of passing
 // to WithModification, set the claimant to empty (it is ignored in that case).
 func NewModification(claimant string, modArgs ...ModifyArg) *Modification {
-	m := &Modification{
-		Claimant: claimant,
-		now:      time.Now(),
-	}
+	m := &Modification{Claimant: claimant}
 	for _, arg := range modArgs {
 		arg(m)
 	}
 	return m
 }
 
-// Options returns a slice of ModifyOption, which backends can use to
-// change how an individual call to Modify operates.
-func (m *Modification) Options() []ModifyOption {
-	return m.options
+// ResetClaims makes m's change of the task with the given ID reset its claim
+// count to zero, as a change made with ResettingClaims does. It is for adding
+// the reset to a modification already built.
+func (m *Modification) ResetClaims(id string) {
+	if m.resetClaims == nil {
+		m.resetClaims = make(map[string]bool)
+	}
+	m.resetClaims[id] = true
+}
+
+// ResetsClaims reports whether m's change of the task with the given ID
+// resets its claim count to zero (see ResettingClaims). Otherwise a change leaves
+// the count as it is stored.
+func (m *Modification) ResetsClaims(id string) bool {
+	return m.resetClaims[id]
+}
+
+// IsEmpty reports whether m names no operation at all. Modify refuses such a
+// modification: one that does nothing is a mistake, most often a list its
+// builder forgot to carry.
+func (m *Modification) IsEmpty() bool {
+	return len(m.Inserts)+len(m.Changes)+len(m.Deletes)+len(m.Depends)+len(m.Arrives)+
+		len(m.DocInserts)+len(m.DocChanges)+len(m.DocDeletes)+len(m.DocDepends)+len(m.DocArrives) == 0
 }
 
 // EnsureModifyKeys rejects a modification that would write to an empty queue or
@@ -1071,20 +1167,42 @@ func (m *Modification) Options() []ModifyOption {
 // start of Modify. Because direct-to-backend clients are not a supported path,
 // enforcing in the Go backend is sufficient: every supported write reaches one.
 func (m *Modification) EnsureModifyKeys() error {
+	if m.IsEmpty() {
+		return InvalidArgumentf("modify: nothing to do")
+	}
 	for _, ins := range m.Inserts {
 		if ins.Queue == "" {
-			return fmt.Errorf("modify: insert of task %q must name a queue", ins.ID)
+			return InvalidArgumentf("modify: insert of task %q must name a queue", ins.ID)
 		}
 	}
 	for _, c := range m.Changes {
 		if c.Queue == "" {
-			return fmt.Errorf("modify: change of task %q must name a destination queue", c.ID)
+			return InvalidArgumentf("modify: change of task %q must name a destination queue", c.ID)
+		}
+	}
+	for _, a := range m.Arrives {
+		if a.Queue == "" {
+			return InvalidArgumentf("modify: arrival of task %q must name its queue", a.ID)
 		}
 	}
 	for _, ins := range m.DocInserts {
 		if ins.Namespace == "" {
-			return fmt.Errorf("modify: doc insert %q must name a namespace", ins.ID)
+			return InvalidArgumentf("modify: doc insert %q must name a namespace", ins.ID)
 		}
+	}
+	sets := make(map[[2]string]bool, len(m.DocArrives))
+	for _, a := range m.DocArrives {
+		if !a.IsSetRef() {
+			return InvalidArgumentf("modify: doc arrival %v must name a doc set by key, not a doc", a.DocID)
+		}
+		if a.Namespace == "" {
+			return InvalidArgumentf("modify: arrival of doc set %q must name a namespace", a.Key)
+		}
+		k := [2]string{a.Namespace, a.Key}
+		if sets[k] {
+			return InvalidArgumentf("modify: doc set %q in %q arrives more than once", a.Key, a.Namespace)
+		}
+		sets[k] = true
 	}
 	return nil
 }
@@ -1094,39 +1212,61 @@ func (m *Modification) EnsureModifyKeys() error {
 func (m *Modification) modDependencies() (tasks map[string]int32, docs map[string]int32, err error) {
 	tasks = make(map[string]int32)
 	for _, t := range m.Changes {
-		if _, ok := tasks[t.ID]; ok {
-			return nil, nil, fmt.Errorf("duplicates found in task dependencies")
+		if err := addTaskDep(tasks, t.ID, t.Version); err != nil {
+			return nil, nil, fmt.Errorf("modify task: %w", err)
 		}
-		tasks[t.ID] = t.Version
 	}
 	for _, t := range m.Deletes {
-		if _, ok := tasks[t.ID]; ok {
-			return nil, nil, fmt.Errorf("duplicates found in task dependencies")
+		if err := addTaskDep(tasks, t.ID, t.Version); err != nil {
+			return nil, nil, fmt.Errorf("modify task: %w", err)
 		}
-		tasks[t.ID] = t.Version
+	}
+	for _, t := range m.Arrives {
+		if err := addTaskDep(tasks, t.ID, t.Version); err != nil {
+			return nil, nil, fmt.Errorf("modify task: %w", err)
+		}
 	}
 	docs = make(map[string]int32)
 	for _, d := range m.DocChanges {
-		k := DocKey(d.Namespace, d.ID)
-		if _, ok := docs[k]; ok {
-			return nil, nil, fmt.Errorf("duplicates found in doc dependencies")
+		if err := addDocDep(docs, d.Namespace, d.ID, d.Version); err != nil {
+			return nil, nil, fmt.Errorf("modify doc: %w", err)
 		}
-		docs[k] = d.Version
 	}
 	for _, d := range m.DocDeletes {
-		k := DocKey(d.Namespace, d.ID)
-		if _, ok := docs[k]; ok {
-			return nil, nil, fmt.Errorf("duplicates found in doc dependencies")
+		if err := addDocDep(docs, d.Namespace, d.ID, d.Version); err != nil {
+			return nil, nil, fmt.Errorf("modify doc: %w", err)
 		}
-		docs[k] = d.Version
 	}
 	return tasks, docs, nil
 }
 
+// addTaskDep records a task ID's version, rejecting an ID already present:
+// one modification may name a task in only one operation.
+func addTaskDep(deps map[string]int32, id string, version int32) error {
+	if _, ok := deps[id]; ok {
+		return InvalidArgumentf("task %q appears in more than one operation of the modification", id)
+	}
+	deps[id] = version
+	return nil
+}
+
+// addDocDep is addTaskDep for docs, which are unique within a namespace.
+func addDocDep(deps map[string]int32, ns, id string, version int32) error {
+	k := DocKey(ns, id)
+	if _, ok := deps[k]; ok {
+		return InvalidArgumentf("doc %q in namespace %q appears in more than one operation of the modification", id, ns)
+	}
+	deps[k] = version
+	return nil
+}
+
 // AllDependencies returns dependency maps from ID to version for tasks and docs
-// that must exist and match version numbers. It returns an error if there are
-// duplicates. Changes, Deletions, Dependencies, and Insertions with IDs must be
-// disjoint sets within their respective types.
+// that must exist and match version numbers. It returns an InvalidArgumentError
+// if an ID appears in more than one operation: changes, deletions, depends,
+// and inserts with explicit IDs must be disjoint sets within their respective
+// types. That also rules out deleting and re-inserting an ID in one
+// modification, which would restart its version and let a stale holder of the
+// old one match the new one.
 //
 // When using this to query backend storage for presence, it is safe to ignore
 // the version if you use the DependencyError method to determine whether a
@@ -1135,45 +1275,46 @@ func (m *Modification) modDependencies() (tasks map[string]int32, docs map[strin
 func (m *Modification) AllDependencies() (tasks map[string]int32, docs map[string]int32, err error) {
 	tasks, docs, err = m.modDependencies()
 	if err != nil {
-		return nil, nil, fmt.Errorf("get dependencies: %w", err)
+		return nil, nil, fmt.Errorf("all dependencies: %w", err)
 	}
 	for _, t := range m.Depends {
-		if _, ok := tasks[t.ID]; ok {
-			return nil, nil, fmt.Errorf("duplicates found in task dependencies")
+		if err := addTaskDep(tasks, t.ID, t.Version); err != nil {
+			return nil, nil, fmt.Errorf("all dependencies: %w", err)
 		}
-		tasks[t.ID] = t.Version
 	}
 	for _, t := range m.Inserts {
 		if t.ID == "" {
 			continue
 		}
-		if _, ok := tasks[t.ID]; ok {
-			return nil, nil, fmt.Errorf("duplicates found in task dependencies")
+		if err := addTaskDep(tasks, t.ID, -1); err != nil {
+			return nil, nil, fmt.Errorf("all dependencies: %w", err)
 		}
-		tasks[t.ID] = -1
 	}
 	for _, d := range m.DocDepends {
-		k := DocKey(d.Namespace, d.ID)
-		if _, ok := docs[k]; ok {
-			return nil, nil, fmt.Errorf("duplicates found in doc dependencies")
+		if err := addDocDep(docs, d.Namespace, d.ID, d.Version); err != nil {
+			return nil, nil, fmt.Errorf("all dependencies: %w", err)
 		}
-		docs[k] = d.Version
 	}
 	for _, d := range m.DocInserts {
 		if d.ID == "" {
 			continue
 		}
-		k := DocKey(d.Namespace, d.ID)
-		if _, ok := docs[k]; ok {
-			return nil, nil, fmt.Errorf("duplicates found in doc dependencies")
+		if err := addDocDep(docs, d.Namespace, d.ID, -1); err != nil {
+			return nil, nil, fmt.Errorf("all dependencies: %w", err)
 		}
-		docs[k] = -1
 	}
 	return tasks, docs, nil
 }
 
-func (m *Modification) otherwiseClaimed(task *Task) bool {
-	return task.At.After(m.now) && task.Claimant != "" && task.Claimant != m.Claimant
+// otherwiseClaimed reports whether task is held by someone other than this
+// modification's claimant, at now.
+//
+// now is the BACKEND's reading of its own clock, taken while it holds the
+// task: a stored task carries no field that can answer "is it held right
+// now", so unlike NotifyModified this genuinely needs a clock, and it must be
+// the one that stamped the arrival being compared.
+func (m *Modification) otherwiseClaimed(task *Task, now time.Time) bool {
+	return task.At.After(now) && task.Claimant != "" && task.Claimant != m.Claimant
 }
 
 func (m *Modification) badInserts(foundDeps map[string]*Task) []*TaskID {
@@ -1186,7 +1327,7 @@ func (m *Modification) badInserts(foundDeps map[string]*Task) []*TaskID {
 	return present
 }
 
-func (m *Modification) badChanges(foundDeps map[string]*Task) (missing []*TaskID, claimed []*TaskID) {
+func (m *Modification) badChanges(foundDeps map[string]*Task, now time.Time) (missing []*TaskID, claimed []*TaskID) {
 	for _, t := range m.Changes {
 		found := foundDeps[t.ID]
 		if found == nil || found.Version != t.Version {
@@ -1196,7 +1337,7 @@ func (m *Modification) badChanges(foundDeps map[string]*Task) (missing []*TaskID
 			})
 			continue
 		}
-		if m.otherwiseClaimed(found) {
+		if m.otherwiseClaimed(found, now) {
 			claimed = append(claimed, &TaskID{
 				ID:      t.ID,
 				Version: t.Version,
@@ -1207,14 +1348,14 @@ func (m *Modification) badChanges(foundDeps map[string]*Task) (missing []*TaskID
 	return missing, claimed
 }
 
-func (m *Modification) badDeletes(foundDeps map[string]*Task) (missing []*TaskID, claimed []*TaskID) {
+func (m *Modification) badDeletes(foundDeps map[string]*Task, now time.Time) (missing []*TaskID, claimed []*TaskID) {
 	for _, t := range m.Deletes {
 		found := foundDeps[t.ID]
 		if found == nil || found.Version != t.Version {
 			missing = append(missing, t)
 			continue
 		}
-		if m.otherwiseClaimed(found) {
+		if m.otherwiseClaimed(found, now) {
 			claimed = append(claimed, t)
 			continue
 		}
@@ -1236,15 +1377,15 @@ func (m *Modification) missingDepends(foundDeps map[string]*Task) []*TaskID {
 // dependencies found in the backend, or nil if everything is fine. Problems
 // include missing or claimed dependencies, both of which will block a
 // modification.
-func (m *Modification) DependencyError(found map[string]*Task, foundDocs map[string]*Doc) error {
+func (m *Modification) DependencyError(found map[string]*Task, foundDocs map[string]*Doc, now time.Time) error {
 	presentInserts := m.badInserts(found)
-	missingChanges, claimedChanges := m.badChanges(found)
-	missingDeletes, claimedDeletes := m.badDeletes(found)
+	missingChanges, claimedChanges := m.badChanges(found, now)
+	missingDeletes, claimedDeletes := m.badDeletes(found, now)
 	missingDepends := m.missingDepends(found)
 
 	presentDocIns := m.badDocInserts(foundDocs)
-	missingDocChg, claimedDocChg := m.badDocChanges(foundDocs)
-	missingDocDel, claimedDocDel := m.badDocDeletes(foundDocs)
+	missingDocChg, claimedDocChg := m.badDocChanges(foundDocs, now)
+	missingDocDel, claimedDocDel := m.badDocDeletes(foundDocs, now)
 	missingDocDep := m.missingDocDepends(foundDocs)
 
 	if len(presentInserts) > 0 || len(missingChanges) > 0 || len(claimedChanges) > 0 || len(missingDeletes) > 0 || len(claimedDeletes) > 0 || len(missingDepends) > 0 ||
@@ -1284,28 +1425,28 @@ func (m *Modification) badDocInserts(found map[string]*Doc) []*DocID {
 	return bad
 }
 
-func (m *Modification) badDocChanges(found map[string]*Doc) (missing, claimed []*DocID) {
+func (m *Modification) badDocChanges(found map[string]*Doc, now time.Time) (missing, claimed []*DocID) {
 	for _, chg := range m.DocChanges {
 		r, ok := found[DocKey(chg.Namespace, chg.ID)]
 		if !ok || r.Version != chg.Version {
 			missing = append(missing, &DocID{Namespace: chg.Namespace, ID: chg.ID, Version: chg.Version})
 			continue
 		}
-		if r.Claimant != "" && r.Claimant != m.Claimant && time.Now().Before(r.At) {
+		if r.Claimant != "" && r.Claimant != m.Claimant && now.Before(r.At) {
 			claimed = append(claimed, &DocID{Namespace: chg.Namespace, ID: chg.ID, Version: chg.Version})
 		}
 	}
 	return missing, claimed
 }
 
-func (m *Modification) badDocDeletes(found map[string]*Doc) (missing, claimed []*DocID) {
+func (m *Modification) badDocDeletes(found map[string]*Doc, now time.Time) (missing, claimed []*DocID) {
 	for _, del := range m.DocDeletes {
 		r, ok := found[DocKey(del.Namespace, del.ID)]
 		if !ok || r.Version != del.Version {
 			missing = append(missing, del)
 			continue
 		}
-		if r.Claimant != "" && r.Claimant != m.Claimant && time.Now().Before(r.At) {
+		if r.Claimant != "" && r.Claimant != m.Claimant && now.Before(r.At) {
 			claimed = append(claimed, del)
 		}
 	}
@@ -1332,12 +1473,24 @@ type DependencyError struct {
 
 	Claims []*TaskID
 
+	// Task arrivals whose task was missing, or not at the version or in the
+	// queue named. One held by someone else is in Claims.
+	Arrives []*TaskID
+
 	DocInserts []*DocID
 	DocDepends []*DocID
 	DocDeletes []*DocID
 	DocChanges []*DocID
 
+	// Docs held by someone else. A doc set held by someone else appears as
+	// a set reference (see DocID.IsSetRef) at its current version, whatever
+	// the operation, followed by its members.
 	DocClaims []*DocID
+
+	// Doc set arrivals whose set was missing or not at the version named,
+	// each a set reference at the set's current version. One held by
+	// someone else is in DocClaims.
+	DocArrives []*DocID
 
 	Message string
 }
@@ -1362,6 +1515,8 @@ func (m *DependencyError) Copy() *DependencyError {
 		DocClaims:  make([]*DocID, len(m.DocClaims)),
 		Message:    m.Message,
 	}
+	e.Arrives = append(e.Arrives, m.Arrives...)
+	e.DocArrives = append(e.DocArrives, m.DocArrives...)
 	copy(e.Inserts, m.Inserts)
 	copy(e.Depends, m.Depends)
 	copy(e.Deletes, m.Deletes)
@@ -1377,18 +1532,17 @@ func (m *DependencyError) Copy() *DependencyError {
 
 // HasMissing indicates whether there was anything missing in this error.
 func (m *DependencyError) HasMissing() bool {
-	return len(m.Depends) > 0 || len(m.Deletes) > 0 || len(m.Changes) > 0
+	return len(m.Depends) > 0 || len(m.Deletes) > 0 || len(m.Changes) > 0 || len(m.Arrives) > 0
 }
 
-// HasMissingDocs indicates whether any docs were missing (not claimed
-// by another, but actually absent). Used by workers to detect poison-pill tasks
-// whose required docs no longer exist.
+// HasMissingDocs indicates whether any docs or doc sets the operation named
+// were absent or not at their set's version.
 func (m *DependencyError) HasMissingDocs() bool {
-	return len(m.DocDepends) > 0 || len(m.DocDeletes) > 0 || len(m.DocChanges) > 0
+	return len(m.DocDepends) > 0 || len(m.DocDeletes) > 0 || len(m.DocChanges) > 0 || len(m.DocArrives) > 0
 }
 
-// HasClaimedDocs indicates whether any docs were blocked by another
-// claimant. This is transient contention -- retry with backoff.
+// HasClaimedDocs indicates whether any docs or doc sets were blocked by
+// another claimant. This is transient contention -- retry with backoff.
 func (m *DependencyError) HasClaimedDocs() bool {
 	return len(m.DocClaims) > 0
 }
@@ -1406,6 +1560,16 @@ func (m *DependencyError) HasCollisions() bool {
 // HasAny reports whether any dependency fields are populated.
 func (m *DependencyError) HasAny() bool {
 	return m.HasMissing() || m.HasCollisions() || m.HasClaims() || m.HasMissingDocs() || m.HasClaimedDocs()
+}
+
+// OnlyCollisions reports whether the only failures were inserts, of tasks or
+// docs, whose explicit IDs already exist. For an inserter that may be run
+// again, that means its modification was committed before: insert a batch
+// in one modification with a marker doc of explicit ID, and a collision on
+// the marker says the batch is in. (Finished tasks are deleted, so the
+// tasks' own IDs cannot say that.)
+func (m *DependencyError) OnlyCollisions() bool {
+	return m.HasCollisions() && !m.HasMissing() && !m.HasClaims() && !m.HasMissingDocs() && !m.HasClaimedDocs()
 }
 
 // OnlyClaims indicates that the error was only related to claimants (tasks or
@@ -1429,6 +1593,7 @@ func (m *DependencyError) Implicates(id string) bool {
 		slices.ContainsFunc(m.Depends, match) ||
 		slices.ContainsFunc(m.Deletes, match) ||
 		slices.ContainsFunc(m.Changes, match) ||
+		slices.ContainsFunc(m.Arrives, match) ||
 		slices.ContainsFunc(m.Claims, match)
 }
 
@@ -1457,11 +1622,13 @@ func (m *DependencyError) Merge(other *DependencyError) *DependencyError {
 		Deletes:    dedupTaskIDs(cat(m.Deletes, other.Deletes)),
 		Changes:    dedupTaskIDs(cat(m.Changes, other.Changes)),
 		Claims:     dedupTaskIDs(cat(m.Claims, other.Claims)),
+		Arrives:    dedupTaskIDs(cat(m.Arrives, other.Arrives)),
 		DocInserts: dedupDocIDs(catDoc(m.DocInserts, other.DocInserts)),
 		DocDepends: dedupDocIDs(catDoc(m.DocDepends, other.DocDepends)),
 		DocDeletes: dedupDocIDs(catDoc(m.DocDeletes, other.DocDeletes)),
 		DocChanges: dedupDocIDs(catDoc(m.DocChanges, other.DocChanges)),
 		DocClaims:  dedupDocIDs(catDoc(m.DocClaims, other.DocClaims)),
+		DocArrives: dedupDocIDs(catDoc(m.DocArrives, other.DocArrives)),
 		Message:    m.Message,
 	}
 	if merged.Message == "" {
@@ -1487,15 +1654,15 @@ func dedupTaskIDs(ids []*TaskID) []*TaskID {
 	return out
 }
 
-// dedupDocIDs keeps the first DocID seen for each namespaced doc ID.
+// dedupDocIDs keeps the first DocID seen for each doc or doc set it names.
 func dedupDocIDs(ids []*DocID) []*DocID {
-	seen := make(map[string]bool, len(ids))
+	seen := make(map[[3]string]bool, len(ids))
 	var out []*DocID
 	for _, id := range ids {
 		if id == nil {
 			continue
 		}
-		k := DocKey(id.Namespace, id.ID)
+		k := [3]string{id.Namespace, id.ID, id.Key}
 		if seen[k] {
 			continue
 		}
@@ -1503,6 +1670,27 @@ func dedupDocIDs(ids []*DocID) []*DocID {
 		out = append(out, id)
 	}
 	return out
+}
+
+// nameArrivals reports as arrivals the task arrivals of mod that failed as
+// changes: backends check an arrival as the change of arrival time it is.
+func (m *DependencyError) nameArrivals(mod *Modification) {
+	if len(mod.Arrives) == 0 {
+		return
+	}
+	arriving := make(map[string]bool, len(mod.Arrives))
+	for _, a := range mod.Arrives {
+		arriving[a.ID] = true
+	}
+	var changes []*TaskID
+	for _, c := range m.Changes {
+		if arriving[c.ID] {
+			m.Arrives = append(m.Arrives, c)
+		} else {
+			changes = append(changes, c)
+		}
+	}
+	m.Changes = changes
 }
 
 // Error produces a helpful error string indicating what was missing.
@@ -1540,6 +1728,12 @@ func (m *DependencyError) Error() string {
 			lines = append(lines, fmt.Sprintf("\t\t%s", tid))
 		}
 	}
+	if len(m.Arrives) > 0 {
+		lines = append(lines, "\tmissing task arrivals:")
+		for _, tid := range m.Arrives {
+			lines = append(lines, fmt.Sprintf("\t\t%s", tid))
+		}
+	}
 	if len(m.DocInserts) > 0 {
 		lines = append(lines, "\tcolliding doc inserts:")
 		for _, did := range m.DocInserts {
@@ -1565,8 +1759,14 @@ func (m *DependencyError) Error() string {
 		}
 	}
 	if len(m.DocClaims) > 0 {
-		lines = append(lines, "\tclaimed modified docs:")
+		lines = append(lines, "\tdocs and doc sets held by another claimant:")
 		for _, did := range m.DocClaims {
+			lines = append(lines, fmt.Sprintf("\t\t%s", did))
+		}
+	}
+	if len(m.DocArrives) > 0 {
+		lines = append(lines, "\tmissing doc set arrivals:")
+		for _, did := range m.DocArrives {
 			lines = append(lines, fmt.Sprintf("\t\t%s", did))
 		}
 	}

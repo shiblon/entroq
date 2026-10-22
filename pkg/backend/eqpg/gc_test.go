@@ -24,6 +24,13 @@ var retiredSQLProcedures = []string{
 	"entroq.gc_activation(text)",
 	"entroq._path_param_values(text,text)",
 	"entroq.gc_due(text)",
+	// Arrivals arrive as durations now; the timestamptz overload must be gone,
+	// or a stale caller could still resolve to it.
+	"entroq._modify_arrays(text," +
+		"text[],integer[],text[]," +
+		"text[],integer[],text[]," +
+		"text[],text[],timestamptz[],text[],integer[],text[]," +
+		"text[],integer[],text[],text[],timestamptz[],text[],integer[],text[],boolean[])",
 }
 
 var retiredSQLTypes = []string{
@@ -111,7 +118,7 @@ func TestGCLoopCollects(t *testing.T) {
 	eqtest.GCCollectsInLoop(ctx, t, client, "/test/gcloop")
 }
 
-func TestGCDocGroups(t *testing.T) {
+func TestGCDocSets(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	b, err := Open(ctx, pgHostPort,
@@ -121,7 +128,7 @@ func TestGCDocGroups(t *testing.T) {
 		t.Fatalf("open backend: %v", err)
 	}
 	defer b.Close()
-	eqtest.GCDocGroups(ctx, t, b, b.collectDocsOnce, "/pgtest/"+entroq.GenHex16())
+	eqtest.GCDocSets(ctx, t, b, b.collectDocsOnce, "/pgtest/"+entroq.GenHex16())
 }
 
 // TestGCCollectOnce drives the shared claim/delete collector directly: due gc=
@@ -145,13 +152,14 @@ func TestGCCollectOnce(t *testing.T) {
 	defer b.Close()
 
 	p := "/test/collectonce/" + entroq.GenHex16()
-	past := time.Now().Add(-time.Hour)
-	future := time.Now().Add(time.Hour)
-	futureGC := fmt.Sprintf("%s/c/gc=%d", p, future.Unix())
+	// An arrival is requested as a duration from the backend's now. A gc=
+	// activation is part of a queue NAME, so it stays an absolute instant.
+	const past, future = -time.Hour, time.Hour
+	futureGC := fmt.Sprintf("%s/c/gc=%d", p, time.Now().Add(future).Unix())
 
 	cases := []struct {
 		id, queue string
-		at        time.Time
+		at        time.Duration
 		collected bool
 	}{
 		{"co_due0", p + "/a/gc=0", past, true},       // always-active, arrived => collected
@@ -166,7 +174,7 @@ func TestGCCollectOnce(t *testing.T) {
 	}
 	for _, c := range cases {
 		if _, err := client.Modify(ctx, entroq.InsertingInto(c.queue,
-			entroq.WithID(c.id), entroq.WithArrivalTime(c.at), entroq.WithRawValue([]byte("{}")))); err != nil {
+			entroq.WithID(c.id), entroq.WithArrivalTimeIn(c.at), entroq.WithRawValue([]byte("{}")))); err != nil {
 			t.Fatalf("insert %s: %v", c.id, err)
 		}
 	}
@@ -197,5 +205,73 @@ func TestGCCollectOnce(t *testing.T) {
 		if !c.collected && !present {
 			t.Errorf("%s should have survived but was collected", c.id)
 		}
+	}
+}
+
+// TestCollectLocksSkipsGroupBeingInserted holds an insert into an empty,
+// unheld set open while lock collection runs. The insert's lock on the row
+// keeps collection from deleting the lock of a set that is about to have a
+// member.
+func TestCollectLocksSkipsGroupBeingInserted(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	b, err := Open(ctx, pgHostPort,
+		WithDB("postgres"), WithUsername("postgres"), WithPassword("password"),
+		WithConnectAttempts(10), withGCInterval(time.Hour))
+	if err != nil {
+		t.Fatalf("open backend: %v", err)
+	}
+	defer b.Close()
+
+	ns := "/pgtest/" + entroq.GenHex16()
+	lockExists := func() bool {
+		t.Helper()
+		var n int
+		if err := b.DB.QueryRowContext(ctx, `SELECT count(*) FROM entroq.doc_locks WHERE namespace = $1 AND key_primary = 'k'`, ns).Scan(&n); err != nil {
+			t.Fatalf("Read lock: %v", err)
+		}
+		return n == 1
+	}
+
+	// An empty set whose claim has lapsed: idle, so collectable.
+	if _, err := b.ClaimDocs(ctx, entroq.NewDocClaim(entroq.ClaimKey(ns, "k"), entroq.ClaimingSetsAs("me"), entroq.ClaimingSetsFor(time.Millisecond))); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+
+	tx, err := b.DB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+	mod := entroq.NewModification("me", entroq.PuttingDocInto(ns, entroq.WithKeys("k", "a")))
+	if err := modifyDocs(ctx, tx, mod, new(entroq.ModifyResponse)); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	// Collection may wait for the insert, as a one-statement delete does, so
+	// run it alongside and commit the insert while it is going. A delete that
+	// waits then rechecks only the lock row, which the insert did not change,
+	// and removes the lock of a set that now has a member.
+	collected := make(chan error, 1)
+	go func() {
+		_, err := b.collectLocksOnce(ctx, 1000)
+		collected <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit insert: %v", err)
+	}
+	if err := <-collected; err != nil {
+		t.Fatalf("Collect during insert: %v", err)
+	}
+	if !lockExists() {
+		t.Fatal("Collection deleted the lock of a set with an insert in progress")
+	}
+	if _, err := b.collectLocksOnce(ctx, 1000); err != nil {
+		t.Fatalf("Collect after insert: %v", err)
+	}
+	if !lockExists() {
+		t.Error("Collection deleted the lock of a set with a member")
 	}
 }

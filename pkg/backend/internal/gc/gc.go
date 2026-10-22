@@ -126,23 +126,23 @@ func CollectDocsOnce(ctx context.Context, backend entroq.Backend, batch int, rep
 		if collected >= batch {
 			break
 		}
-		docs, err := backend.ClaimDocs(ctx, &entroq.DocClaim{
-			Namespace: candidate.namespace,
-			Key:       candidate.key,
-			Claimant:  claimant,
-			Duration:  entroq.DefaultClaimDuration,
-		})
+		sets, err := backend.ClaimDocs(ctx, entroq.NewDocClaim(
+			entroq.ClaimKey(candidate.namespace, candidate.key),
+			entroq.ClaimingSetsAs(claimant),
+			entroq.ClaimingSetsFor(entroq.DefaultClaimDuration),
+		))
 		if err != nil {
 			if _, ok := entroq.AsDependency(err); ok {
 				continue
 			}
 			return collected, fmt.Errorf("doc gc claim %q/%q: %w", candidate.namespace, candidate.key, err)
 		}
-		if len(docs) == 0 {
+		group := sets[0]
+		if len(group.Docs) == 0 {
 			continue
 		}
-		deletes := make([]entroq.ModifyArg, 0, len(docs))
-		for _, doc := range docs {
+		deletes := make([]entroq.ModifyArg, 0, len(group.Docs))
+		for _, doc := range group.Docs {
 			deletes = append(deletes, doc.Delete())
 		}
 		if _, err := backend.Modify(ctx, entroq.NewModification(claimant, deletes...)); err != nil {
@@ -152,7 +152,7 @@ func CollectDocsOnce(ctx context.Context, backend entroq.Backend, batch int, rep
 			return collected, fmt.Errorf("doc gc delete %q/%q: %w", candidate.namespace, candidate.key, err)
 		}
 		collected++
-		reporter.Deleted(ctx, candidate.namespace, len(docs))
+		reporter.Deleted(ctx, candidate.namespace, len(group.Docs))
 	}
 	return collected, nil
 }

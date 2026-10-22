@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"testing"
-	"time"
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/testing/benchmark"
@@ -13,12 +12,11 @@ import (
 // BatchPopulate fills the backend with n tasks spread evenly across multiple queues.
 func BatchPopulate(ctx context.Context, c *entroq.EntroQ, n int, queues []string) error {
 	const batchSize = 1000
-	now := time.Now()
 	for i := 0; i < n; i += batchSize {
 		var ins []entroq.ModifyArg
 		for j := i; j < i+batchSize && j < n; j++ {
 			q := queues[(i+j)%len(queues)]
-			ins = append(ins, entroq.InsertingInto(q, entroq.WithArrivalTime(now), entroq.WithValue("bench-value")))
+			ins = append(ins, entroq.InsertingInto(q, entroq.WithArrivalTimeIn(0), entroq.WithValue("bench-value")))
 		}
 		if _, err := c.Modify(ctx, ins...); err != nil {
 			return fmt.Errorf("populate batch: %w", err)

@@ -5,11 +5,14 @@
 //	{eq}:q:{name}           -- ZSET: member=taskID, score=atUnixMilli (task index per queue)
 //	{eq}:t:{id}             -- Hash: task fields (id, queue, value, at, created, modified, claimant, version, claims, attempt, err)
 //	{eq}:qs                 -- Set: active queue names (maintained lazily; GC removes empties)
-//	{eq}:qsclaimed:{name}   -- ZSET: claimed task IDs, score=atUnixMilli; ZCOUNT >now gives exact claimed count
-//	{eq}:d:{ns}/{id}        -- Hash: doc fields (namespace, id, version, claimant, at, key_primary, key_secondary, content, created, modified)
+//	{eq}:qsclaimed:{name}   -- ZSET: task IDs claimed at least once, score=atUnixMilli; ZCOUNT >now counts claimed tasks
+//	{eq}:qsclaims:{name}    -- ZSET: task IDs claimed at least once, score=claims; the top score is MaxClaims
+//	{eq}:d:{ns}/{id}        -- Hash: doc fields (namespace, id, key_primary, key_secondary, content, created, modified)
 //	{eq}:dnsidx:{ns}        -- ZSET: doc namespace index, member=keyPrimary\x00keySecondary\x00id, score=0
+//	{eq}:dl:{ns}/{key}      -- Hash: doc set lock (version, claimant, at)
+//	{eq}:dlidx:{ns}         -- Set: primary keys in a namespace that have a lock
+//	{eq}:dlheld:{ns}        -- ZSET: held primary keys, score=atUnixMilli
 //	{eq}:ns                 -- Set: active namespace names (maintained lazily; GC removes empties)
-//	{eq}:nsclaimed:{ns}     -- ZSET: claimed doc IDs, score=atUnixMilli; ZCOUNT >now gives exact claimed count
 //
 // Key hash tags:
 //
@@ -47,6 +50,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/backend/internal/gcmetrics"
+	"github.com/shiblon/entroq/pkg/internal/latency"
 	"github.com/shiblon/entroq/pkg/subq"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
@@ -77,6 +81,14 @@ func qsclaimedKey(name string) string {
 	return keyPrefix + "qsclaimed:" + name
 }
 
+// qsclaimsKey is the ZSET of a queue's tasks that have been claimed, scored by
+// their claim count, so the most-claimed task still in the queue is its top.
+func qsclaimsKey(name string) string {
+	return keyPrefix + "qsclaims:" + name
+}
+
+// nsclaimedKey is the per-doc claim set from before doc sets had locks. Only
+// migrateDocLocks uses it, to remove it.
 func nsclaimedKey(ns string) string {
 	return keyPrefix + "nsclaimed:" + ns
 }
@@ -106,6 +118,9 @@ type EQRedis struct {
 	stopGC    context.CancelFunc
 	gcDone    chan struct{}
 	gcMetrics *gcmetrics.Metrics
+
+	claimDuration  metric.Float64Histogram
+	modifyDuration metric.Float64Histogram
 
 	stopReadiness context.CancelFunc
 	readinessDone chan struct{}
@@ -154,8 +169,9 @@ func WithNotifyWaiter(nw entroq.NotifyWaiter) RedisOpt {
 	}
 }
 
-// WithMeterProvider sets the OTel MeterProvider used for GC telemetry (metrics
-// are reported under the "entroq.redis" meter). Defaults to a noop provider.
+// WithMeterProvider sets the OTel MeterProvider used for claim, modify, and GC
+// telemetry (metrics are reported under the "entroq.redis" meter). Defaults to
+// a noop provider.
 func WithMeterProvider(mp metric.MeterProvider) RedisOpt {
 	return func(o *redisOptions) {
 		o.mp = mp
@@ -196,6 +212,18 @@ func Open(ctx context.Context, opts ...RedisOpt) (*EQRedis, error) {
 		client.Close()
 		return nil, fmt.Errorf("eqredis open: migrate doc keys: %w", err)
 	}
+	if err := migrateDocLocks(ctx, client); err != nil {
+		client.Close()
+		return nil, fmt.Errorf("eqredis open: migrate doc locks: %w", err)
+	}
+	if err := migrateDocFields(ctx, client); err != nil {
+		client.Close()
+		return nil, fmt.Errorf("eqredis open: migrate doc fields: %w", err)
+	}
+	if err := migrateClaimsIndex(ctx, client); err != nil {
+		client.Close()
+		return nil, fmt.Errorf("eqredis open: migrate claims index: %w", err)
+	}
 
 	nw := o.nw
 	if nw == nil {
@@ -206,10 +234,29 @@ func Open(ctx context.Context, opts ...RedisOpt) (*EQRedis, error) {
 	if mp == nil {
 		mp = noop.NewMeterProvider()
 	}
-	gcMetrics, err := gcmetrics.New(mp.Meter("entroq.redis"))
+	meter := mp.Meter("entroq.redis")
+	gcMetrics, err := gcmetrics.New(meter)
 	if err != nil {
 		client.Close()
 		return nil, fmt.Errorf("eqredis open: gc metrics: %w", err)
+	}
+	claimDuration, err := meter.Float64Histogram("entroq.claim.duration",
+		metric.WithDescription("Duration of TryClaim calls against Redis."),
+		metric.WithUnit("s"),
+		latency.Buckets(),
+	)
+	if err != nil {
+		client.Close()
+		return nil, fmt.Errorf("eqredis open: claim metrics: %w", err)
+	}
+	modifyDuration, err := meter.Float64Histogram("entroq.modify.duration",
+		metric.WithDescription("Duration of Modify calls against Redis."),
+		metric.WithUnit("s"),
+		latency.Buckets(),
+	)
+	if err != nil {
+		client.Close()
+		return nil, fmt.Errorf("eqredis open: modify metrics: %w", err)
 	}
 
 	// GC's context is rooted at context.Background(), NOT the constructor's ctx:
@@ -224,6 +271,9 @@ func Open(ctx context.Context, opts ...RedisOpt) (*EQRedis, error) {
 		stopGC:    gcCancel,
 		gcDone:    make(chan struct{}),
 		gcMetrics: gcMetrics,
+
+		claimDuration:  claimDuration,
+		modifyDuration: modifyDuration,
 	}
 	// GC is a first-class, always-on backend behavior.
 	go func() {
@@ -257,9 +307,21 @@ func (e *EQRedis) Close() error {
 	return e.client.Close()
 }
 
-// Time returns the current time in UTC.
+// Time returns the current time in UTC, at the millisecond precision this
+// backend stores. Reporting finer precision than it can store would make the
+// reported time disagree with every stamp derived from it.
 func (e *EQRedis) Time(_ context.Context) (time.Time, error) {
-	return time.Now().UTC(), nil
+	return nowUTC(), nil
+}
+
+// nowUTC is this backend's clock, truncated to the millisecond precision Redis
+// stores, so that every instant derived from one reading agrees with every
+// other. Without it, a time kept as a Go value (a doc set's lock arrival, say)
+// carries microseconds that the same reading loses when it is written as
+// milliseconds, and At minus Modified comes out slightly longer than the
+// duration that was asked for. eqsqlite truncates for the same reason.
+func nowUTC() time.Time {
+	return time.UnixMilli(time.Now().UTC().UnixMilli()).UTC()
 }
 
 // taskFields is the canonical set of Hash fields for a task.

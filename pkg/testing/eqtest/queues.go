@@ -192,7 +192,7 @@ func QueueStatsAccuracy(ctx context.Context, t *testing.T, client *entroq.EntroQ
 		entroq.InsertingInto(partial),
 		entroq.InsertingInto(partial),
 		entroq.InsertingInto(partial),
-		entroq.InsertingInto(future, entroq.WithArrivalTime(time.Now().Add(time.Hour))),
+		entroq.InsertingInto(future, entroq.WithArrivalTimeIn(time.Hour)),
 	); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
@@ -259,12 +259,7 @@ func NamespaceStats(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	}
 
 	// Claim one doc in ns2.
-	claimed, err := client.ClaimDocs(ctx, &entroq.DocClaim{
-		Namespace: ns2,
-		Claimant:  client.ClientID,
-		Key:       key,
-		Duration:  30 * time.Second,
-	})
+	claimed, err := docsOf(client.ClaimDocs(ctx, entroq.ClaimKey(ns2, key), entroq.ClaimingSetsAs(client.ClientID), entroq.ClaimingSetsFor(30*time.Second)))
 	if err != nil {
 		t.Fatalf("claim docs: %v", err)
 	}
@@ -295,11 +290,14 @@ func NamespaceStats(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 		}
 	}
 
-	// Release the claim: change each claimed doc with a past at.
+	// Release the claim: one commit changing the claimed docs with a past at
+	// releases their group.
+	var release []entroq.ModifyArg
 	for _, d := range claimed {
-		if _, err := client.Modify(ctx, d.Change(entroq.WithDocArrivalTimeBy(-time.Second))); err != nil {
-			t.Fatalf("release doc: %v", err)
-		}
+		release = append(release, d.Change(entroq.WithDocArrivalTimeBy(-time.Second)))
+	}
+	if _, err := client.Modify(ctx, release...); err != nil {
+		t.Fatalf("release docs: %v", err)
 	}
 
 	// After release, ns2 claimed should be 0.

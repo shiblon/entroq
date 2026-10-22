@@ -66,7 +66,7 @@ func TestRetryError_OrMoveTo(t *testing.T) {
 	defer runCancel()
 	done := make(chan error, 1)
 	go func() {
-		w := New(client, WithDoWork(func(context.Context, *entroq.Task, string, []*entroq.Doc) error {
+		w := New(client, WithDoWork(func(context.Context, entroq.Reader, *Work[string]) error {
 			return RetryErrorf("always fails").OrMoveTo(customErr)
 		}))
 		// maxAttempts=1: the first failure (attempt 0) exhausts and quarantines.
@@ -100,7 +100,7 @@ func TestRetryError_After(t *testing.T) {
 	defer runCancel()
 	done := make(chan error, 1)
 	go func() {
-		w := New(client, WithDoWork(func(context.Context, *entroq.Task, string, []*entroq.Doc) error {
+		w := New(client, WithDoWork(func(context.Context, entroq.Reader, *Work[string]) error {
 			return RetryErrorf("transient").After(time.Hour)
 		}))
 		// maxAttempts 0 => never quarantines; base delay left at its 30s default,
@@ -112,7 +112,7 @@ func TestRetryError_After(t *testing.T) {
 	// far-future arrival and the worker blocks claiming it. Wait for that retry.
 	deadline := time.After(5 * time.Second)
 	var retried *entroq.Task
-	for retried == nil {
+	for {
 		tasks, err := client.Tasks(ctx, q)
 		if err != nil {
 			t.Fatalf("tasks: %v", err)

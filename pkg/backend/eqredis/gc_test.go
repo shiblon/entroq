@@ -33,7 +33,7 @@ func TestGCLoopCollects(t *testing.T) {
 	eqtest.GCCollectsInLoop(ctx, t, client, fmt.Sprintf("/redistest/gcloop/%s", client.GenID()))
 }
 
-func TestGCDocGroups(t *testing.T) {
+func TestGCDocSets(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	b, err := Open(ctx, WithAddr(redisAddr), withGCInterval(time.Hour))
@@ -41,7 +41,7 @@ func TestGCDocGroups(t *testing.T) {
 		t.Fatalf("open backend: %v", err)
 	}
 	defer b.Close()
-	eqtest.GCDocGroups(ctx, t, b, b.collectDocsOnce, "/redistest/"+entroq.GenHex16())
+	eqtest.GCDocSets(ctx, t, b, b.collectDocsOnce, "/redistest/"+entroq.GenHex16())
 }
 
 // TestGCRemovesEmptyQueues covers the pre-existing empty-queue bookkeeping
@@ -114,13 +114,14 @@ func TestGCCollectOnce(t *testing.T) {
 	defer b.Close()
 
 	p := "/redistest/collectonce/" + client.GenID()
-	past := time.Now().Add(-time.Hour)
-	future := time.Now().Add(time.Hour)
-	futureGC := fmt.Sprintf("%s/c/gc=%d", p, future.Unix())
+	// An arrival is requested as a duration from the backend's now. A gc=
+	// activation is part of a queue NAME, so it stays an absolute instant.
+	const past, future = -time.Hour, time.Hour
+	futureGC := fmt.Sprintf("%s/c/gc=%d", p, time.Now().Add(future).Unix())
 
 	cases := []struct {
 		id, queue string
-		at        time.Time
+		at        time.Duration
 		collected bool
 	}{
 		{"co_due0", p + "/a/gc=0", past, true},       // always-active, arrived => collected
@@ -135,7 +136,7 @@ func TestGCCollectOnce(t *testing.T) {
 	}
 	for _, c := range cases {
 		if _, err := client.Modify(ctx, entroq.InsertingInto(c.queue,
-			entroq.WithID(c.id), entroq.WithArrivalTime(c.at), entroq.WithRawValue([]byte("{}")))); err != nil {
+			entroq.WithID(c.id), entroq.WithArrivalTimeIn(c.at), entroq.WithRawValue([]byte("{}")))); err != nil {
 			t.Fatalf("insert %s: %v", c.id, err)
 		}
 	}

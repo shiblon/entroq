@@ -3,10 +3,13 @@ package eqredis
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"testing"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 	"github.com/shiblon/entroq"
+	"github.com/shiblon/entroq/pkg/backend/internal/docset"
 )
 
 func docContent(ctx context.Context, t *testing.T, client *entroq.EntroQ, ns, id string) string {
@@ -108,5 +111,172 @@ func TestMigrateDocKeys(t *testing.T) {
 	}
 	if got := docContent(ctx, t, reopened, kept, "d"); got != "kept" {
 		t.Errorf("doc in %q = %q, want %q", kept, got, "kept")
+	}
+}
+
+// TestMigrateDocLocks checks that opening a database written before doc sets
+// had locks gives each set a lock one version past its highest member, with
+// any claim released.
+func TestMigrateDocLocks(t *testing.T) {
+	ctx := context.Background()
+	client, err := redisClient(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
+	defer rdb.Close()
+
+	ns := "migrate-locks-" + entroq.GenHex16()
+	if _, err := client.Modify(ctx,
+		entroq.PuttingDocInto(ns, entroq.WithIDKeys("a", "k", "1")),
+		entroq.PuttingDocInto(ns, entroq.WithIDKeys("b", "k", "2")),
+		entroq.PuttingDocInto(ns, entroq.WithIDKeys("c", "other", "")),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// Put the namespace back the way an older server left it: per-doc versions
+	// and claims, and no locks.
+	future := strconv.FormatInt(time.Now().Add(time.Hour).UnixMilli(), 10)
+	for _, cmd := range []redis.Cmder{
+		rdb.HSet(ctx, docKey(ns, "a"), "version", "2"),
+		rdb.HSet(ctx, docKey(ns, "b"), "version", "7", "claimant", "holder", "at", future),
+		rdb.HSet(ctx, docKey(ns, "c"), "version", "0"),
+		rdb.Del(ctx, lockKey(docset.Set{Namespace: ns, Key: "k"}), lockKey(docset.Set{Namespace: ns, Key: "other"}),
+			lockIndexKey(ns), heldGroupsKey(ns), docLocksMigratedKey, docFieldsMigratedKey),
+	} {
+		if err := cmd.Err(); err != nil {
+			t.Fatalf("simulate legacy state: %v", err)
+		}
+	}
+
+	reopened, err := redisClient(ctx)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+
+	docs, err := reopened.Docs(ctx, &entroq.DocQuery{Namespace: ns})
+	if err != nil || len(docs) != 3 {
+		t.Fatalf("docs after migration: %v, %v", docs, err)
+	}
+	want := map[string]int32{"a": 8, "b": 8, "c": 1}
+	for _, d := range docs {
+		if d.Version != want[d.ID] || d.Claimant != "" {
+			t.Errorf("migrated doc %q: want version %d and no claimant, got version %d, claimant %q", d.ID, want[d.ID], d.Version, d.Claimant)
+		}
+	}
+	if _, err := reopened.Modify(ctx, docs[0].Change(entroq.WithContent("after"))); err != nil {
+		t.Errorf("change after migration: %v", err)
+	}
+	checkNoDocFields(ctx, t, rdb, ns, "a", "b", "c")
+}
+
+// checkNoDocFields fails for each doc in ns whose hash still holds its own
+// version, claimant, or arrival time.
+func checkNoDocFields(ctx context.Context, t *testing.T, rdb *redis.Client, ns string, ids ...string) {
+	t.Helper()
+	for _, id := range ids {
+		for _, field := range []string{"version", "claimant", "at"} {
+			if ok, err := rdb.HExists(ctx, docKey(ns, id), field).Result(); err != nil || ok {
+				t.Errorf("doc %q still has field %q (err %v)", id, field, err)
+			}
+		}
+	}
+}
+
+// TestMigrateDocFieldsAfterLocks covers a database a development build left
+// with set locks, and the lock migration marked done, but with doc hashes
+// still holding their own versions and claims. The fields go; the locks stay.
+func TestMigrateDocFieldsAfterLocks(t *testing.T) {
+	ctx := context.Background()
+	client, err := redisClient(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
+	defer rdb.Close()
+
+	ns := "migrate-fields-" + entroq.GenHex16()
+	resp, err := client.Modify(ctx, entroq.PuttingDocInto(ns, entroq.WithIDKeys("a", "k", "")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	version := resp.InsertedDocs[0].Version
+	for _, cmd := range []redis.Cmder{
+		rdb.HSet(ctx, docKey(ns, "a"), "version", "99", "claimant", "", "at", "0"),
+		rdb.Del(ctx, docFieldsMigratedKey),
+	} {
+		if err := cmd.Err(); err != nil {
+			t.Fatalf("simulate development state: %v", err)
+		}
+	}
+
+	reopened, err := redisClient(ctx)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	checkNoDocFields(ctx, t, rdb, ns, "a")
+	docs, err := reopened.Docs(ctx, &entroq.DocQuery{Namespace: ns})
+	if err != nil || len(docs) != 1 || docs[0].Version != version {
+		t.Errorf("doc after field migration: want version %d from its lock, got %v, %v", version, docs, err)
+	}
+}
+
+// TestMigrateClaimsIndex puts a queue back the way an earlier version left it,
+// with no claims index and a never-claimed task in the claimed set, and checks
+// that opening builds the index and corrects the counts.
+func TestMigrateClaimsIndex(t *testing.T) {
+	ctx := context.Background()
+	client, err := redisClient(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
+	defer rdb.Close()
+
+	queue := "migrate-claims-" + entroq.GenHex16()
+	resp, err := client.Modify(ctx, entroq.InsertingInto(queue), entroq.InsertingInto(queue))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := client.TryClaim(ctx, entroq.From(queue), entroq.ClaimFor(time.Hour))
+	if err != nil || claimed == nil {
+		t.Fatalf("claim: %v, %v", claimed, err)
+	}
+	var never *entroq.Task
+	for _, task := range resp.InsertedTasks {
+		if task.ID != claimed.ID {
+			never = task
+		}
+	}
+	later := strconv.FormatInt(time.Now().Add(time.Hour).UnixMilli(), 10)
+	for _, cmd := range []redis.Cmder{
+		rdb.HSet(ctx, taskKey(never.ID), "at", later),
+		rdb.ZAdd(ctx, queueKey(queue), redis.Z{Score: float64(time.Now().Add(time.Hour).UnixMilli()), Member: never.ID}),
+		rdb.ZAdd(ctx, qsclaimedKey(queue), redis.Z{Score: float64(time.Now().Add(time.Hour).UnixMilli()), Member: never.ID}),
+		rdb.Del(ctx, qsclaimsKey(queue), claimsIndexMigratedKey),
+	} {
+		if err := cmd.Err(); err != nil {
+			t.Fatalf("simulate legacy state: %v", err)
+		}
+	}
+
+	reopened, err := redisClient(ctx)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	stats, err := reopened.QueueStats(ctx, entroq.MatchExact(queue))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := stats[queue]
+	if s == nil || s.Claimed != 1 || s.Future != 1 || s.MaxClaims != 1 {
+		t.Errorf("stats after migration: want 1 claimed, 1 future, max claims 1; got %+v", s)
 	}
 }

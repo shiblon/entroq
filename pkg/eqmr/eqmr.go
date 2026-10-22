@@ -65,7 +65,7 @@
 // Keys and values are strings, and must be valid UTF-8 with no NUL, which
 // PostgreSQL JSONB and JSON strings require. ValidateText is the rule; Setup,
 // every emit and combine, and the document sink apply it. Document keys are
-// readable: "state", "split/000007", "mapout/000003", "result/000003", and,
+// readable: "state", "split/000007", "mapout/000003/000007", "result/000003", and,
 // for the document store and sink, "run/..." and "output/...".
 package eqmr
 
@@ -379,15 +379,22 @@ func splitDocKey(n int) string { return fmt.Sprintf("%s%06d", splitPrefix, n) }
 // splitDocID is a deterministic split doc id, so a retried Setup recognizes
 // staged splits.
 func splitDocID(n int) string   { return fmt.Sprintf("split-%06d", n) }
-func mapOutDocKey(p int) string { return fmt.Sprintf("%s%06d", mapOutPrefix, p) }
 func resultDocKey(p int) string { return fmt.Sprintf("%s%06d", resultPrefix, p) }
 
-// mapOutSecondaryKey names run i of the split keyed splitKey. A partition's
-// pointers share a primary key, so that claiming it takes the partition; this
-// keeps each (key, secondary) pair unique.
-func mapOutSecondaryKey(splitKey string, i int) string {
-	return fmt.Sprintf("%s/%04d", splitKey, i)
+// mapOutPartition is the key prefix of partition p's pointer docs.
+func mapOutPartition(p int) string { return fmt.Sprintf("%s%06d/", mapOutPrefix, p) }
+
+// mapOutDocKey is the primary key of the pointers to the runs that the split
+// keyed splitKey produced for partition p. Every split's pointers have a key,
+// and so a doc set, of their own: every write to a set moves its version, so
+// splits sharing one set per partition would take turns on it.
+func mapOutDocKey(p int, splitKey string) string {
+	return mapOutPartition(p) + strings.TrimPrefix(splitKey, splitPrefix)
 }
+
+// mapOutRunKey is the secondary key of run i of a split, which keeps the
+// pointers in one set apart.
+func mapOutRunKey(i int) string { return fmt.Sprintf("%04d", i) }
 
 // resultDocID is the id of the marker that a partition's output is committed.
 // Being explicit, it makes a second marker for the partition an error.
@@ -422,7 +429,7 @@ type docRef struct {
 	Store Descriptor `json:"store,omitzero"`
 }
 
-// asQuery reads the doc group by primary key, without claiming it.
+// asQuery reads the doc set by primary key, without claiming it.
 func (r docRef) asQuery() *entroq.DocQuery {
 	return &entroq.DocQuery{Namespace: r.NS, KeyExact: r.Key}
 }

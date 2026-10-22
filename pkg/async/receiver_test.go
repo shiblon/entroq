@@ -110,6 +110,10 @@ func testSessionQueueRotation(t *testing.T, timing laneTiming, force bool) {
 	responseData := newReceiveLane("/service", sessionID, "response-data", time.Now(), timing)
 	forceAt := responseData.forceAt()
 	piggybackAt := responseData.collectAt.Add(-timing.piggybackBefore)
+	// The rotated-away queue's GC deadline: a lane that moves to its new queue
+	// at once delivers well before it, and one that lingers on the old queue
+	// until its deadline delivers after it.
+	firstCollectAt := responseData.collectAt
 	sender := NewSender(eq, "", WithSenderRequestTimeout(10*time.Second))
 	sender.laneTiming = timing
 	w := &notifyingResponseWriter{ResponseRecorder: httptest.NewRecorder(), flushed: make(chan struct{}, 8)}
@@ -159,6 +163,9 @@ func testSessionQueueRotation(t *testing.T, timing laneTiming, force bool) {
 		t.Fatalf("write second body: %v", err)
 	}
 	waitForFlush(t, ctx, w.flushed, "second body through replacement workers")
+	if late := time.Since(firstCollectAt); late >= 0 {
+		t.Errorf("second body arrived %v after the first response queue's GC deadline; a lane did not move to its new queue at once", late)
+	}
 	if err := responseWriter.Close(); err != nil {
 		t.Fatalf("close response body: %v", err)
 	}
@@ -438,7 +445,8 @@ func TestSenderCancellationNotifiesLastRequestDataQueue(t *testing.T) {
 
 	workerCtx, stopWorker := context.WithCancel(ctx)
 	var got Envelope
-	w := worker.New(eq, worker.WithDoModify(func(_ context.Context, task *entroq.Task, env Envelope, _ []*entroq.Doc) (*worker.Result, error) {
+	w := worker.New(eq, worker.WithDoModify(func(_ context.Context, _ entroq.Reader, work *worker.Work[Envelope]) (*worker.Result, error) {
+		task, env := work.Task, work.Value
 		got = env
 		return worker.Modify(task.Delete()).OnSuccess(func(context.Context) error {
 			stopWorker()

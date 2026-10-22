@@ -8,7 +8,9 @@ import (
 	"time"
 
 	"github.com/shiblon/entroq"
-	"github.com/shiblon/entroq/pkg/backend/internal/limits"
+	"github.com/shiblon/entroq/pkg/backend/internal/arrival"
+	"github.com/shiblon/entroq/pkg/backend/internal/docset"
+	"github.com/shiblon/entroq/pkg/backend/internal/validate"
 )
 
 // Modify atomically applies a modification to the task and document store.
@@ -18,13 +20,7 @@ func (b *EQSQLite) Modify(ctx context.Context, mod *entroq.Modification) (*entro
 	if mod == nil {
 		return nil, fmt.Errorf("eqsqlite modify: nil modification")
 	}
-	if err := mod.EnsureModifyKeys(); err != nil {
-		return nil, fmt.Errorf("eqsqlite modify: %w", err)
-	}
-	if err := limits.Modification(mod); err != nil {
-		return nil, fmt.Errorf("eqsqlite modify: %w", err)
-	}
-	if _, _, err := mod.AllDependencies(); err != nil {
+	if err := validate.Modification(mod); err != nil {
 		return nil, fmt.Errorf("eqsqlite modify: %w", err)
 	}
 	value, err := b.write(ctx, func(ctx context.Context, tx *sql.Tx) (any, error) {
@@ -44,8 +40,34 @@ func modifyTx(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (*entro
 	if err != nil {
 		return nil, err
 	}
-	if depErr := checkDependencies(mod, foundTasks, foundDocs, now); depErr.HasAny() {
+	// Task arrivals are changes of the stored tasks' arrival times alone.
+	mod = arrival.Changes(mod, func(id string) *entroq.Task { return foundTasks[id] })
+	member := func(ns, id string) *entroq.Doc { return foundDocs[entroq.DocKey(ns, id)] }
+	locks, err := loadDocLocks(ctx, tx, docset.Sets(mod, member))
+	if err != nil {
+		return nil, err
+	}
+	occupants, err := loadDocOccupants(ctx, tx, mod)
+	if err != nil {
+		return nil, err
+	}
+	docPlan := docset.Evaluate(mod, now, member,
+		func(g docset.Set, secondary string) *entroq.Doc {
+			return occupants[occupantKey(g.Namespace, g.Key, secondary)]
+		},
+		func(g docset.Set) docset.Lock { return lockOf(locks, g) },
+	)
+	if depErr := checkDependencies(mod, foundTasks, now).Merge(docPlan.Err); depErr != nil {
 		return nil, depErr
+	}
+	// Each written member carries its set's new lock, the only version and
+	// claim a member has.
+	withLock := func(d *entroq.Doc) {
+		l, ok := docPlan.Locks[docset.Set{Namespace: d.Namespace, Key: d.Key}]
+		if !ok {
+			l = lockOf(locks, docset.Set{Namespace: d.Namespace, Key: d.Key})
+		}
+		d.Version, d.Claimant, d.At = l.Version, l.Claimant, l.At
 	}
 
 	resp := &entroq.ModifyResponse{}
@@ -54,14 +76,19 @@ func modifyTx(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (*entro
 	}
 	for _, change := range mod.Changes {
 		old := foundTasks[change.ID]
-		at := entroq.NormalizeArrival(change.At, now)
+		at := storedAt(change.By(), now)
 		claimant := ""
 		if at.After(now) {
 			claimant = mod.Claimant
 		}
+		// A change keeps the claim count unless it resets it.
+		claims := old.Claims
+		if mod.ResetsClaims(change.ID) {
+			claims = 0
+		}
 		updated := &entroq.Task{
 			ID: change.ID, Version: old.Version + 1, Queue: change.Queue,
-			At: at, Claimant: claimant, Claims: old.Claims, Value: change.Value,
+			At: at, Claimant: claimant, Claims: claims, Value: change.Value,
 			Created: old.Created, Modified: now, Attempt: change.Attempt, Err: change.Err,
 		}
 		resp.ChangedTasks = append(resp.ChangedTasks, updated)
@@ -74,12 +101,17 @@ func modifyTx(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (*entro
 		if id == "" {
 			id = entroq.GenHex16()
 		}
-		at := entroq.NormalizeArrival(insert.At, now)
+		at := storedAt(insert.By(), now)
 		created := time.UnixMilli(storedTime(insert.Created, now)).UTC()
 		modified := time.UnixMilli(storedTime(insert.Modified, now)).UTC()
+		// As for a change, the writer holds a task that is not yet available.
+		claimant := ""
+		if at.After(now) {
+			claimant = mod.Claimant
+		}
 		task := &entroq.Task{
 			ID: id, Queue: insert.Queue, Version: 0, At: at,
-			Claimant: mod.Claimant, Value: insert.Value, Created: created,
+			Claimant: claimant, Value: insert.Value, Created: created,
 			Modified: modified, Attempt: insert.Attempt, Err: insert.Err,
 		}
 		resp.InsertedTasks = append(resp.InsertedTasks, task)
@@ -98,39 +130,35 @@ func modifyTx(ctx context.Context, tx *sql.Tx, mod *entroq.Modification) (*entro
 		}
 		created := time.UnixMilli(storedTime(insert.Created, now)).UTC()
 		modified := time.UnixMilli(storedTime(insert.Modified, now)).UTC()
-		at := entroq.NormalizeArrival(insert.At, now)
-		claimant := ""
-		if at.After(now) {
-			claimant = mod.Claimant
-		}
 		doc := &entroq.Doc{
-			Namespace: insert.Namespace, ID: id, Version: 0,
-			Claimant: claimant, At: at,
+			Namespace: insert.Namespace, ID: id,
 			Key: insert.Key, SecondaryKey: insert.SecondaryKey, Content: insert.Content,
 			Created: created, Modified: modified,
 		}
+		withLock(doc)
 		resp.InsertedDocs = append(resp.InsertedDocs, doc)
 	}
 	if err := insertDocs(ctx, tx, resp.InsertedDocs); err != nil {
 		return nil, err
 	}
 	for _, change := range mod.DocChanges {
+		// Keys and Created belong to the stored doc: a change replaces content.
 		old := foundDocs[entroq.DocKey(change.Namespace, change.ID)]
-		at := entroq.NormalizeArrival(change.At, now)
-		claimant := ""
-		if at.After(now) {
-			claimant = mod.Claimant
-		}
 		doc := &entroq.Doc{
-			Namespace: change.Namespace, ID: change.ID, Version: old.Version + 1,
-			Claimant: claimant, At: at, Key: change.Key, SecondaryKey: change.SecondaryKey,
+			Namespace: change.Namespace, ID: change.ID,
+			Key: old.Key, SecondaryKey: old.SecondaryKey,
 			Content: change.Content, Created: old.Created, Modified: now,
 		}
+		withLock(doc)
 		resp.ChangedDocs = append(resp.ChangedDocs, doc)
 	}
 	if err := changeDocs(ctx, tx, resp.ChangedDocs); err != nil {
 		return nil, err
 	}
+	if err := saveDocLocks(ctx, tx, docPlan.Locks); err != nil {
+		return nil, err
+	}
+	resp.ChangedSets = docPlan.Arrived
 	return resp, nil
 }
 
@@ -172,21 +200,22 @@ func deleteTasks(ctx context.Context, tx *sql.Tx, deletes []*entroq.TaskID) erro
 }
 
 func changeTasks(ctx context.Context, tx *sql.Tx, tasks []*entroq.Task) error {
-	const columns = 9
+	const columns = 10
 	return batchRanges(len(tasks), columns, func(start, end int) error {
 		args := make([]any, 0, columns*(end-start))
 		for _, task := range tasks[start:end] {
 			args = append(args, task.ID, task.Version, task.Queue, task.At.UnixMilli(),
-				task.Claimant, jsonValue(task.Value), task.Modified.UnixMilli(), task.Attempt, task.Err)
+				task.Claimant, task.Claims, jsonValue(task.Value), task.Modified.UnixMilli(), task.Attempt, task.Err)
 		}
 		query := `WITH changes(id, new_version, new_queue, new_at_ms, new_claimant,
-			new_value, new_modified_ms, new_attempt, new_err) AS (VALUES ` +
+			new_claims, new_value, new_modified_ms, new_attempt, new_err) AS (VALUES ` +
 			rowPlaceholders(end-start, columns) + `)
 			UPDATE tasks SET
 				version = changes.new_version,
 				queue = changes.new_queue,
 				at_ms = changes.new_at_ms,
 				claimant = changes.new_claimant,
+				claims = changes.new_claims,
 				value = changes.new_value,
 				modified_ms = changes.new_modified_ms,
 				attempt = changes.new_attempt,
@@ -234,19 +263,19 @@ func deleteDocs(ctx context.Context, tx *sql.Tx, deletes []*entroq.DocID) error 
 	})
 }
 
+// insertDocs writes new docs. A doc's version and claim are its set's,
+// written to doc_locks.
 func insertDocs(ctx context.Context, tx *sql.Tx, docs []*entroq.Doc) error {
-	const columns = 10
+	const columns = 7
 	return batchRanges(len(docs), columns, func(start, end int) error {
 		args := make([]any, 0, columns*(end-start))
 		for _, doc := range docs[start:end] {
-			args = append(args, doc.Namespace, doc.ID, doc.Version, doc.Claimant, doc.At.UnixMilli(), doc.Key, doc.SecondaryKey,
+			args = append(args, doc.Namespace, doc.ID, doc.Key, doc.SecondaryKey,
 				jsonValue(doc.Content), doc.Created.UnixMilli(), doc.Modified.UnixMilli())
 		}
 		query := `INSERT INTO docs
-			(namespace, id, version, claimant, at_ms, key_primary, key_secondary, content, created_ms, modified_ms)
-			VALUES `
-		row := "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?),"
-		query += strings.TrimSuffix(strings.Repeat(row, end-start), ",")
+			(namespace, id, key_primary, key_secondary, content, created_ms, modified_ms)
+			VALUES ` + rowPlaceholders(end-start, columns)
 		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 			return fmt.Errorf("insert docs: %w", err)
 		}
@@ -254,23 +283,18 @@ func insertDocs(ctx context.Context, tx *sql.Tx, docs []*entroq.Doc) error {
 	})
 }
 
+// changeDocs replaces docs' content; keys belong to the stored doc, and the
+// version and claim to its set's lock.
 func changeDocs(ctx context.Context, tx *sql.Tx, docs []*entroq.Doc) error {
-	const columns = 9
+	const columns = 4
 	return batchRanges(len(docs), columns, func(start, end int) error {
 		args := make([]any, 0, columns*(end-start))
 		for _, doc := range docs[start:end] {
-			args = append(args, doc.Namespace, doc.ID, doc.Version, doc.Claimant, doc.At.UnixMilli(),
-				doc.Key, doc.SecondaryKey, jsonValue(doc.Content), doc.Modified.UnixMilli())
+			args = append(args, doc.Namespace, doc.ID, jsonValue(doc.Content), doc.Modified.UnixMilli())
 		}
-		query := `WITH changes(namespace, id, new_version, new_claimant, new_at_ms,
-			new_key_primary, new_key_secondary, new_content, new_modified_ms) AS (VALUES ` +
+		query := `WITH changes(namespace, id, new_content, new_modified_ms) AS (VALUES ` +
 			rowPlaceholders(end-start, columns) + `)
 			UPDATE docs SET
-				version = changes.new_version,
-				claimant = changes.new_claimant,
-				at_ms = changes.new_at_ms,
-				key_primary = changes.new_key_primary,
-				key_secondary = changes.new_key_secondary,
 				content = changes.new_content,
 				modified_ms = changes.new_modified_ms
 			FROM changes
@@ -344,7 +368,7 @@ func loadDependencies(ctx context.Context, tx *sql.Tx, mod *entroq.Modification)
 		for _, doc := range docIDs[start:end] {
 			args = append(args, doc.namespace, doc.id)
 		}
-		query := "SELECT " + docColumns + " FROM docs WHERE (namespace, id) IN (VALUES " +
+		query := "SELECT " + docColumns + " FROM " + docsWithLocks + " WHERE (d.namespace, d.id) IN (VALUES " +
 			rowPlaceholders(end-start, 2) + ")"
 		rows, err := tx.QueryContext(ctx, query, args...)
 		if err != nil {
@@ -367,7 +391,9 @@ func loadDependencies(ctx context.Context, tx *sql.Tx, mod *entroq.Modification)
 	return tasks, docs, nil
 }
 
-func checkDependencies(mod *entroq.Modification, tasks map[string]*entroq.Task, docs map[string]*entroq.Doc, now time.Time) *entroq.DependencyError {
+// checkDependencies checks mod's task operations against the stored tasks;
+// docset checks its doc operations.
+func checkDependencies(mod *entroq.Modification, tasks map[string]*entroq.Task, now time.Time) *entroq.DependencyError {
 	depErr := &entroq.DependencyError{}
 	for _, dep := range mod.Depends {
 		found := tasks[dep.ID]
@@ -396,34 +422,6 @@ func checkDependencies(mod *entroq.Modification, tasks map[string]*entroq.Task, 
 			depErr.Inserts = append(depErr.Inserts, found.IDVersion())
 		}
 	}
-	for _, dep := range mod.DocDepends {
-		found := docs[entroq.DocKey(dep.Namespace, dep.ID)]
-		if found == nil || found.Version != dep.Version {
-			depErr.DocDepends = append(depErr.DocDepends, dep)
-		}
-	}
-	for _, del := range mod.DocDeletes {
-		found := docs[entroq.DocKey(del.Namespace, del.ID)]
-		if found == nil || found.Version != del.Version {
-			depErr.DocDeletes = append(depErr.DocDeletes, del)
-		} else if heldDoc(found, mod.Claimant, now) {
-			depErr.DocClaims = append(depErr.DocClaims, del)
-		}
-	}
-	for _, change := range mod.DocChanges {
-		found := docs[entroq.DocKey(change.Namespace, change.ID)]
-		id := &entroq.DocID{Namespace: change.Namespace, ID: change.ID, Version: change.Version}
-		if found == nil || found.Version != change.Version {
-			depErr.DocChanges = append(depErr.DocChanges, id)
-		} else if heldDoc(found, mod.Claimant, now) {
-			depErr.DocClaims = append(depErr.DocClaims, id)
-		}
-	}
-	for _, insert := range mod.DocInserts {
-		if found := docs[entroq.DocKey(insert.Namespace, insert.ID)]; insert.ID != "" && found != nil {
-			depErr.DocInserts = append(depErr.DocInserts, found.IDVersion())
-		}
-	}
 	return depErr
 }
 
@@ -431,6 +429,119 @@ func heldTask(task *entroq.Task, claimant string, now time.Time) bool {
 	return task.Claimant != "" && task.Claimant != claimant && task.At.After(now)
 }
 
-func heldDoc(doc *entroq.Doc, claimant string, now time.Time) bool {
-	return doc.Claimant != "" && doc.Claimant != claimant && doc.At.After(now)
+// loadDocLocks reads the locks of sets; a set with none is absent from the
+// result.
+func loadDocLocks(ctx context.Context, q queryer, sets []docset.Set) (map[docset.Set]docset.Lock, error) {
+	locks := make(map[docset.Set]docset.Lock, len(sets))
+	const columns = 2
+	err := batchRanges(len(sets), columns, func(start, end int) error {
+		args := make([]any, 0, columns*(end-start))
+		for _, g := range sets[start:end] {
+			args = append(args, g.Namespace, g.Key)
+		}
+		rows, err := q.QueryContext(ctx, `SELECT namespace, key_primary, version, claimant, at_ms, num_docs FROM doc_locks
+			WHERE (namespace, key_primary) IN (VALUES `+rowPlaceholders(end-start, columns)+")", args...)
+		if err != nil {
+			return fmt.Errorf("load doc locks: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var g docset.Set
+			var l docset.Lock
+			var at int64
+			if err := rows.Scan(&g.Namespace, &g.Key, &l.Version, &l.Claimant, &at, &l.NumDocs); err != nil {
+				return fmt.Errorf("scan doc lock: %w", err)
+			}
+			l.At, l.Stored = time.UnixMilli(at).UTC(), true
+			locks[g] = l
+		}
+		return rows.Err()
+	})
+	return locks, err
+}
+
+// occupantKey indexes a doc by the place it holds in its set.
+func occupantKey(ns, key, secondary string) string {
+	return ns + "\x00" + key + "\x00" + secondary
+}
+
+// loadDocOccupants reads the docs already holding the secondary keys mod's
+// inserts want, batched the way loadDependencies reads the docs mod names by ID.
+// A set is a map from secondary key to doc, so an insert onto an occupied
+// secondary key is a collision; see docset.Evaluate.
+//
+// Only inserts need this: keys are immutable after creation, so nothing else can
+// move a doc onto an occupied key. Writers to one set are serialized by the
+// set's own lock, so a check here cannot be overtaken.
+func loadDocOccupants(ctx context.Context, q queryer, mod *entroq.Modification) (map[string]*entroq.Doc, error) {
+	occupants := make(map[string]*entroq.Doc, len(mod.DocInserts))
+	if len(mod.DocInserts) == 0 {
+		return occupants, nil
+	}
+	inserts := mod.DocInserts
+	err := batchRanges(len(inserts), 3, func(start, end int) error {
+		args := make([]any, 0, 3*(end-start))
+		for _, ins := range inserts[start:end] {
+			args = append(args, ins.Namespace, ins.Key, ins.SecondaryKey)
+		}
+		query := "SELECT " + docColumns + " FROM " + docsWithLocks +
+			" WHERE (d.namespace, d.key_primary, d.key_secondary) IN (VALUES " +
+			rowPlaceholders(end-start, 3) + ")"
+		rows, err := q.QueryContext(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("load doc occupants: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			doc, err := scanDoc(rows)
+			if err != nil {
+				return fmt.Errorf("scan doc occupant: %w", err)
+			}
+			occupants[occupantKey(doc.Namespace, doc.Key, doc.SecondaryKey)] = doc
+		}
+		return rows.Err()
+	})
+	return occupants, err
+}
+
+// lockOf returns g's lock from locks, or docset.Absent.
+func lockOf(locks map[docset.Set]docset.Lock, g docset.Set) docset.Lock {
+	if l, ok := locks[g]; ok {
+		return l
+	}
+	return docset.Absent
+}
+
+// saveDocLocks writes locks, creating or replacing each set's.
+func saveDocLocks(ctx context.Context, tx *sql.Tx, locks map[docset.Set]docset.Lock) error {
+	sets := make([]docset.Set, 0, len(locks))
+	for g := range locks {
+		sets = append(sets, g)
+	}
+	const columns = 6
+	return batchRanges(len(sets), columns, func(start, end int) error {
+		args := make([]any, 0, columns*(end-start))
+		for _, g := range sets[start:end] {
+			l := locks[g]
+			args = append(args, g.Namespace, g.Key, l.Version, l.Claimant, l.At.UnixMilli(), l.NumDocs)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO doc_locks (namespace, key_primary, version, claimant, at_ms, num_docs)
+			VALUES `+rowPlaceholders(end-start, columns)+`
+			ON CONFLICT (namespace, key_primary) DO UPDATE SET
+				version = excluded.version, claimant = excluded.claimant, at_ms = excluded.at_ms,
+				num_docs = excluded.num_docs`, args...); err != nil {
+			return fmt.Errorf("save doc locks: %w", err)
+		}
+		return nil
+	})
+}
+
+// storedAt is the arrival time a write stores. A write names its arrival only
+// as a duration from this backend's own now (backend Modify contract); the cap
+// keeps a negative one from ordering the task ahead of everything already
+// waiting. The result is cut to the millisecond the database keeps, so
+// comparing it with now, which is kept the same way, gives the answer a later
+// read will, and the response carries what was stored.
+func storedAt(by time.Duration, now time.Time) time.Time {
+	return time.UnixMilli(entroq.NormalizeArrival(now.Add(by), now).UnixMilli()).UTC()
 }

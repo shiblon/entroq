@@ -3,6 +3,7 @@ package eqsqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -26,6 +27,18 @@ func TestBackendContract(t *testing.T) {
 		{"SimpleChange", eqtest.SimpleChange},
 		{"ChangeKeepsStoredFields", eqtest.ChangeKeepsStoredFields},
 		{"InsertKeepsAttemptAndErr", eqtest.InsertKeepsAttemptAndErr},
+		{"ModifyRejectsDuplicateIDs", eqtest.ModifyRejectsDuplicateIDs},
+		{"ModifyRespectsTaskClaims", eqtest.ModifyRespectsTaskClaims},
+		{"TasksWithIDStaysInQueue", eqtest.TasksWithIDStaysInQueue},
+		{"DocSets", eqtest.DocSets},
+		{"DocSetDepends", eqtest.DocSetDepends},
+		{"DocAndTaskDependenciesFailTogether", eqtest.DocAndTaskDependenciesFailTogether},
+		{"DocSecondaryKeysAreUnique", eqtest.DocSecondaryKeysAreUnique},
+		{"DocMemberVersionFromSet", eqtest.DocMemberVersionFromSet},
+		{"DocSecondaryKeyRaceHasOneWinner", eqtest.DocSecondaryKeyRaceHasOneWinner},
+		{"UpdateArrival", eqtest.UpdateArrival},
+		{"ClaimStampsLease", eqtest.ClaimStampsLease},
+		{"ArrivalResolvesOnBackendClock", eqtest.ArrivalResolvesOnBackendClock},
 		{"TaskChangeFutureArrival", eqtest.TaskChangeFutureArrival},
 		{"TaskChangeFarPastArrivalNormalized", eqtest.TaskChangeFarPastArrivalNormalized},
 		{"ModifyRejectsWrongQueue", eqtest.ModifyRejectsWrongQueue},
@@ -48,6 +61,16 @@ func TestBackendContract(t *testing.T) {
 		{"MapReduce", eqtest.MapReduce},
 		{"WorkerCompactDependencyHandler", eqtest.WorkerCompactDependencyHandler},
 		{"WorkerDependencyMove", eqtest.WorkerDependencyMove},
+		{"WorkerHoldsEmptyGroup", eqtest.WorkerHoldsEmptyGroup},
+		{"WorkerReleasesSets", eqtest.WorkerReleasesSets},
+		{"ClaimsReset", eqtest.ClaimsReset},
+		{"DocClaimSets", eqtest.DocClaimSets},
+		{"InvalidRequests", eqtest.InvalidRequests},
+		{"TasksClaimantFilter", eqtest.TasksClaimantFilter},
+		{"QueueStatsCounts", eqtest.QueueStatsCounts},
+		{"QueueStatsMatching", eqtest.QueueStatsMatching},
+		{"DocsOrderAndLimits", eqtest.DocsOrderAndLimits},
+		{"TaskClaimantIsHolder", eqtest.TaskClaimantIsHolder},
 		{"InitialVersions", eqtest.InitialVersions},
 		{"SimpleDocLifecycle", eqtest.SimpleDocLifecycle},
 		{"DocMultiOp", eqtest.DocMultiOp},
@@ -342,7 +365,7 @@ func TestGCLoopCollects(t *testing.T) {
 	eqtest.GCCollectsInLoop(ctx, t, client, "sqlitetest")
 }
 
-func TestGCDocGroups(t *testing.T) {
+func TestGCDocSets(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	b, err := Open(ctx, filepath.Join(t.TempDir(), "entroq.sqlite"))
@@ -350,7 +373,48 @@ func TestGCDocGroups(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer b.Close()
-	eqtest.GCDocGroups(ctx, t, b, b.collectDocsOnce, "sqlitetest")
+	eqtest.GCDocSets(ctx, t, b, b.collectDocsOnce, "sqlitetest")
+}
+
+func TestBackendRejectsInvalidRequests(t *testing.T) {
+	ctx := context.Background()
+	b, err := Open(ctx, filepath.Join(t.TempDir(), "entroq.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	eqtest.BackendRejectsInvalidRequests(ctx, t, b, "sqlitetest")
+	eqtest.StorageRejectsZeroDurations(ctx, t, b, "sqlitetest")
+}
+
+// TestWriteEndedByContextIsCanceled checks that a write whose context ends
+// mid-transaction reports the cancellation. database/sql rolls such a
+// transaction back itself, and Commit then says only that it is done, which a
+// worker would take for a failure rather than a clean stop.
+func TestWriteEndedByContextIsCanceled(t *testing.T) {
+	b, err := Open(context.Background(), filepath.Join(t.TempDir(), "entroq.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	_, err = b.write(ctx, func(_ context.Context, tx *sql.Tx) (any, error) {
+		cancel()
+		// Wait for database/sql to roll the transaction back.
+		for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+			var one int
+			if err := tx.QueryRowContext(context.Background(), "SELECT 1").Scan(&one); errors.Is(err, sql.ErrTxDone) {
+				return nil, nil
+			}
+			if time.Now().After(deadline) {
+				return nil, fmt.Errorf("transaction not rolled back after cancel")
+			}
+		}
+	})
+	if !entroq.IsCanceled(err) {
+		t.Errorf("Write ended by its context: want a cancellation, got %v", err)
+	}
 }
 
 func TestTorture(t *testing.T) {
