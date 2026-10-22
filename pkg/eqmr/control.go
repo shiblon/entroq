@@ -2,387 +2,716 @@ package eqmr
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
+	"slices"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/worker"
+	"golang.org/x/sync/errgroup"
 )
 
-// ControlWorker returns the worker that drives phase transitions.
+// mapDone is a mapper's finish task. Its runs are written but unpublished until
+// the controller accepts it.
+type mapDone struct {
+	// SplitKey is the split doc's key, for claiming; Split identifies the doc
+	// the mapper read.
+	SplitKey string            `json:"split_key"`
+	Split    entroq.DocID      `json:"split"`
+	Runs     []intermediateRun `json:"runs"`
+}
+
+// reduceDone is a reducer's finish task: a reference to its staged output, and
+// the pointers and runs it consumed.
+type reduceDone struct {
+	Partition int               `json:"partition"`
+	Pointers  []entroq.DocID    `json:"pointers"`
+	Runs      []intermediateRun `json:"runs"`
+	Sink      Descriptor        `json:"sink"`
+	Staged    json.RawMessage   `json:"staged"`
+}
+
+// barrierCheck is the value of a check task, which asks whether a phase is
+// complete.
+type barrierCheck struct{}
+
+// gcTask asks the collector to delete Runs, which were retired inside one
+// EntroQ commit, and to sweep an ended run's Stores and Sinks of everything
+// nothing committed.
+type gcTask struct {
+	Runs   []intermediateRun `json:"runs,omitempty"`
+	Stores []Descriptor      `json:"stores,omitempty"`
+	Sinks  []Descriptor      `json:"sinks,omitempty"`
+}
+
+// RunController runs this run's controller workers until ctx ends or one exits.
+// Run one per run, and restart it to recover: its work waits in EntroQ.
 //
-// It watches ControlQ, which holds exactly one task for the life of a run. That
-// task carries the phase state: each tick claims it, checks the current phase
-// barrier, and commits the next state, plus anything that state change fans
-// out, in a single atomic Modify. EntroQ's claim semantics mean only one
-// controller can act at a time no matter how many run, and a controller that
-// dies mid-tick simply loses its claim, so another picks the task up once the
-// claim is released.
-//
-// Run as many control pods as you like; exactly one will be doing anything.
-func (c *Controller) ControlWorker() *worker.Worker[controlState] {
-	return worker.New[controlState](c.client,
-		worker.WithErrQMap[controlState](c.errQMap),
-		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, work *worker.Work[controlState]) (*worker.Result, error) {
-			task, state := work.Task, work.Value
-			// Check the barrier FIRST, and pace only when it did not move.
-			// Sleeping before looking would add a full ControlInterval to every
-			// phase, since a phase that is already complete would still wait out
-			// an interval before anyone noticed.
-			next, extra, err := c.step(ctx, state)
-			if err != nil {
+// It first fails an unfinished run that names a store or sink this process
+// cannot reach, and returns an error.
+func (c *Controller) RunController(ctx context.Context) error {
+	if err := c.checkGrants(ctx); err != nil {
+		return err
+	}
+	g, gctx := errgroup.WithContext(ctx)
+	for _, run := range c.controllerRoles() {
+		g.Go(func() error { return run(gctx) })
+	}
+	return g.Wait()
+}
+
+// controllerRoles binds each controller worker to its queues, for RunController
+// and Run.
+func (c *Controller) controllerRoles() []func(context.Context) error {
+	return []func(context.Context) error{
+		func(ctx context.Context) error {
+			return c.mapDoneWorker().Run(ctx, c.controlRunOptions(c.MapDoneQ())...)
+		},
+		func(ctx context.Context) error {
+			return c.mapCheckWorker().Run(ctx, c.controlRunOptions(c.MapCheckQ())...)
+		},
+		func(ctx context.Context) error {
+			return c.reduceDoneWorker().Run(ctx, c.controlRunOptions(c.ReduceDoneQ())...)
+		},
+		func(ctx context.Context) error {
+			return c.reduceCheckWorker().Run(ctx, c.controlRunOptions(c.ReduceCheckQ())...)
+		},
+		func(ctx context.Context) error {
+			return c.gcWorker().Run(ctx, c.gcRunOptions()...)
+		},
+		func(ctx context.Context) error {
+			return c.errWorker().Run(ctx, c.controlRunOptions(c.errQueues()...)...)
+		},
+	}
+}
+
+// controlRunOptions configures a controller worker. Each run has its own
+// claimant, the worker default, so doc claims exclude the other controller
+// workers on this client. A doc found held is about to be released, so its
+// task is retried at once and has no claim ceiling.
+func (c *Controller) controlRunOptions(queues ...string) []worker.RunOption {
+	return []worker.RunOption{
+		worker.Watching(queues...),
+		worker.WithLease(c.cfg.Lease),
+		worker.WithBaseRetryDelay(0),
+	}
+}
+
+// Collection retries. An exhausted collection task is quarantined, which does
+// not fail the run.
+const (
+	gcMaxAttempts = 10
+	gcRetryDelay  = time.Second
+)
+
+// gcRunOptions configures the collector.
+func (c *Controller) gcRunOptions() []worker.RunOption {
+	opts := []worker.RunOption{
+		worker.Watching(c.GCQ()),
+		worker.WithLease(c.cfg.Lease),
+		worker.WithMaxAttempts(gcMaxAttempts),
+		worker.WithBaseRetryDelay(gcRetryDelay),
+	}
+	// The claim ceiling catches a handler that crashes.
+	if c.cfg.MaxClaims > 0 {
+		opts = append(opts, worker.WithMaxClaims(c.cfg.MaxClaims))
+	}
+	return opts
+}
+
+// unavailableRetryDelay spaces out retries while the backend is unreachable.
+const unavailableRetryDelay = time.Second
+
+// retryIfUnavailable turns an error from a temporarily unavailable backend into
+// a retry, and returns any other error unchanged.
+func retryIfUnavailable(err error) error {
+	if err == nil || !entroq.IsUnavailable(err) {
+		return err
+	}
+	return worker.RetryErrorf("%v", err).After(unavailableRetryDelay)
+}
+
+// stateDoc reads the run's state doc, which is nil if the run does not exist.
+func (c *Controller) stateDoc(ctx context.Context) (*entroq.Doc, runState, error) {
+	docs, err := c.client.Docs(ctx, &entroq.DocQuery{Namespace: c.DocNS(), KeyExact: stateDocKey})
+	if err != nil {
+		return nil, runState{}, fmt.Errorf("read run state: %w", err)
+	}
+	if len(docs) == 0 {
+		return nil, runState{}, nil
+	}
+	st, err := entroq.GetContent[runState](docs[0])
+	if err != nil {
+		return nil, runState{}, fmt.Errorf("parse run state: %w", err)
+	}
+	return docs[0], st, nil
+}
+
+// readState reads the run state without a claim. A run with no state doc
+// quarantines the task.
+func (c *Controller) readState(ctx context.Context) (runState, error) {
+	doc, st, err := c.stateDoc(ctx)
+	if err != nil {
+		return st, err
+	}
+	if doc == nil {
+		return st, worker.MoveErrorf("run %q has no state doc", c.prefix)
+	}
+	return st, nil
+}
+
+// stateDecision decides a controller task's commit from the claimed run state:
+// the task's own modifications, and the next state, or nil to keep it.
+type stateDecision[T any] func(ctx context.Context, task *entroq.Task, value T, st runState) ([]entroq.ModifyArg, *runState, error)
+
+// stateWorker builds a controller worker that claims the state doc, decides,
+// and commits the decision with the state doc's change and release.
+func stateWorker[T any](c *Controller, decide stateDecision[T], opts ...worker.Option[T]) *worker.Worker[T] {
+	always := func(context.Context) (bool, error) { return true, nil }
+	return barrierWorker(c, always, decide, opts...)
+}
+
+// barrierWorker builds a controller worker for check tasks. reached looks
+// without a claim, and the task retires if it is false, as it is for every
+// check after the one that ends the phase. Otherwise the state doc is claimed
+// and decide is called; decide must check again under the claim.
+func barrierWorker[T any](c *Controller, reached func(context.Context) (bool, error), decide stateDecision[T], opts ...worker.Option[T]) *worker.Worker[T] {
+	opts = append(opts,
+		worker.WithTakeDocs(func(ctx context.Context, _ entroq.Reader, work *worker.Work[T]) (*worker.TakeResult, error) {
+			ok, err := reached(ctx)
+			if err != nil && !entroq.IsUnavailable(err) {
 				return nil, err
 			}
-
-			// Terminal states park far out so a finished run stops costing
-			// claims while staying inspectable. A phase that just advanced
-			// commits immediately and is re-examined without waiting, because
-			// the next barrier is a different question and may already be
-			// answered. Only a phase that is still waiting on the same barrier
-			// pauses, and it does so here, under renewal.
-			//
-			// Pacing with a sleep rather than a near-future arrival time is
-			// deliberate: an arrival time expresses "not before this moment",
-			// not "wake me again shortly". Holding the claim across the sleep
-			// costs nothing and leaves the single-actor guarantee unchanged.
-			delay := time.Duration(0)
-			switch {
-			case next.Phase == PhaseDone || next.Phase == PhaseFailed:
-				delay = terminalRearm
-			case next.Phase == state.Phase:
-				select {
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				case <-time.After(c.cfg.ControlInterval):
-				}
+			// A check that could not tell must not retire: it claims, and
+			// decide's read can be retried.
+			if err == nil && !ok {
+				return nil, nil
 			}
-			// The phase change and whatever it fans out commit together, so a
-			// controller that dies between them is not a possible state.
-			modArgs := append([]entroq.ModifyArg{task.Change(
-				entroq.ValueTo(next),
-				entroq.ArrivalTimeBy(delay),
-			)}, extra...)
-			return worker.Modify(modArgs...), nil
+			return worker.Take(entroq.ClaimKey(c.DocNS(), stateDocKey)), nil
+		}),
+		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, work *worker.Work[T]) (*worker.Result, error) {
+			task, value, docs := work.Task, work.Value, entroq.DocsIn(work.Sets)
+			if len(docs) == 0 {
+				// Not reached.
+				return worker.Modify(task.Delete()), nil
+			}
+			if len(docs) != 1 {
+				return nil, worker.MoveErrorf("run %q has %d state docs, want 1", c.prefix, len(docs))
+			}
+			stateDoc := docs[0]
+			st, err := entroq.GetContent[runState](stateDoc)
+			if err != nil {
+				return nil, worker.MoveErrorf("parse run state: %v", err)
+			}
+			mods, next, err := decide(ctx, task, value, st)
+			if err != nil {
+				return nil, retryIfUnavailable(err)
+			}
+			// A change releases the claim; one without content keeps the state.
+			release := stateDoc.Change()
+			if next != nil {
+				release = stateDoc.Change(entroq.WithContent(*next))
+			}
+			return worker.Modify(append(mods, release)...), nil
+		}),
+	)
+	return worker.New[T](c.client, opts...)
+}
+
+// collecting returns the insert of a gc task for runs, or nothing for no runs.
+func (c *Controller) collecting(runs []intermediateRun) []entroq.ModifyArg {
+	if len(runs) == 0 {
+		return nil
+	}
+	return []entroq.ModifyArg{entroq.InsertingInto(c.GCQ(), entroq.WithValue(gcTask{Runs: runs}))}
+}
+
+// checking inserts a check task into queue. It belongs in the commit it
+// follows, so the check is handled after that commit is visible, and the last
+// commit of a phase queues a check that finds the phase complete.
+func checking(queue string) entroq.ModifyArg {
+	return entroq.InsertingInto(queue, entroq.WithValue(barrierCheck{}))
+}
+
+// ending is what every commit that ends a run carries: a sweep of its store
+// and sink.
+func (c *Controller) ending(st runState) []entroq.ModifyArg {
+	gc := gcTask{}
+	if st.Store != (Descriptor{}) {
+		gc.Stores = []Descriptor{st.Store}
+	}
+	if st.Sink != (Descriptor{}) {
+		gc.Sinks = []Descriptor{st.Sink}
+	}
+	if len(gc.Stores) == 0 && len(gc.Sinks) == 0 {
+		return nil
+	}
+	return []entroq.ModifyArg{entroq.InsertingInto(c.GCQ(), entroq.WithValue(gc))}
+}
+
+// failing fails the run with reason and moves task to the quarantine queue,
+// for a dependency the run cannot do without.
+func (c *Controller) failing(task *entroq.Task, st runState, reason string) ([]entroq.ModifyArg, *runState) {
+	mods := []entroq.ModifyArg{task.Change(entroq.QueueTo(c.QuarantineQ()), entroq.AppendingErr(reason))}
+	if st.terminal() {
+		return mods, nil
+	}
+	next := st.failed(reason)
+	return append(mods, c.ending(next)...), &next
+}
+
+// finishing calls the sink's Finish, under the state claim, and returns the
+// commit that marks the run done, so a done run's output is ready to read.
+func (c *Controller) finishing(ctx context.Context, task *entroq.Task, st runState, empty []int) ([]entroq.ModifyArg, *runState, error) {
+	sink, err := c.sinks.resolve(st.Sink)
+	if err != nil {
+		mods, failed := c.failing(task, st, err.Error())
+		return mods, failed, nil
+	}
+	if err := sink.Finish(ctx, c.prefix, st.ReduceParts, empty); err != nil {
+		if _, ok := worker.AsMove(err); ok {
+			mods, failed := c.failing(task, st, fmt.Sprintf("finish output: %v", err))
+			return mods, failed, nil
+		}
+		return nil, nil, worker.RetryErrorf("finish output: %v", err)
+	}
+	next := st
+	next.Phase = PhaseDone
+	return append([]entroq.ModifyArg{task.Delete()}, c.ending(next)...), &next, nil
+}
+
+// mapDoneWorker accepts the first finish for each split. Holding only the
+// split doc, it deletes it, publishes the runs as pointer docs, and queues a
+// map check, in one Modify. A later finish finds the split gone, and its runs
+// are collected.
+func (c *Controller) mapDoneWorker() *worker.Worker[mapDone] {
+	return worker.New[mapDone](c.client,
+		worker.WithTakeDocs(func(_ context.Context, _ entroq.Reader, work *worker.Work[mapDone]) (*worker.TakeResult, error) {
+			md := work.Value
+			return worker.Take(entroq.ClaimKey(c.DocNS(), md.SplitKey)), nil
+		}),
+		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, work *worker.Work[mapDone]) (*worker.Result, error) {
+			task, md, docs := work.Task, work.Value, entroq.DocsIn(work.Sets)
+			st, err := c.readState(ctx)
+			if err != nil {
+				return nil, retryIfUnavailable(err)
+			}
+			discard := append([]entroq.ModifyArg{task.Delete()}, c.collecting(md.Runs)...)
+			if st.terminal() || len(docs) == 0 || docs[0].ID != md.Split.ID {
+				// The run has ended, or the split was already accepted.
+				return worker.Modify(discard...), nil
+			}
+			mods := []entroq.ModifyArg{task.Delete(), docs[0].Delete(), checking(c.MapCheckQ())}
+			for i, run := range md.Runs {
+				if run.Partition < 0 || run.Partition >= st.ReduceParts {
+					return nil, worker.MoveErrorf("split %q produced a run for partition %d of %d", md.SplitKey, run.Partition, st.ReduceParts)
+				}
+				mods = append(mods, entroq.PuttingDocInto(c.DocNS(),
+					entroq.WithKeys(mapOutDocKey(run.Partition, md.SplitKey), mapOutRunKey(i)),
+					entroq.WithContent(run),
+				))
+			}
+			return worker.Modify(mods...), nil
 		}),
 	)
 }
 
-// step computes the next control state, plus any modifications that must land
-// atomically with it. It performs no mutation itself: everything it decides is
-// committed by the caller in a single Modify alongside the control task.
-func (c *Controller) step(ctx context.Context, state controlState) (controlState, []entroq.ModifyArg, error) {
-	// Terminal states re-arm without doing work, so the outcome stays readable
-	// with ordinary task tooling until Cleanup runs.
-	if state.Phase == PhaseDone || state.Phase == PhaseFailed {
-		return state, nil, nil
+// mapCheckWorker ends the map phase once no split docs remain: it fans out a
+// reduce task for each partition with pointer docs, or finishes the run if
+// there are none.
+func (c *Controller) mapCheckWorker() *worker.Worker[barrierCheck] {
+	reached := func(ctx context.Context) (bool, error) {
+		return c.consumed(ctx, PhaseMap, splitPrefix)
 	}
-
-	// A quarantined task fails the run: a MapReduce that lost part of its input
-	// cannot support a claim about the correctness of its output.
-	stats, err := c.client.QueueStats(ctx, entroq.MatchExact(c.ErrQ()))
-	if err != nil {
-		return state, nil, fmt.Errorf("eqmr control: quarantine check: %w", err)
-	}
-	if n := queueDepth(stats, c.ErrQ()); n > 0 {
-		return failed(state, c.quarantineReason(ctx, n)), nil, nil
-	}
-
-	switch state.Phase {
-	case PhaseMap:
-		// Split docs are deleted in the same Modify that writes their map outputs,
-		// so their absence means every map-output doc exists.
-		remaining, err := c.countDocs(ctx, splitPrefix)
+	return barrierWorker(c, reached, func(ctx context.Context, task *entroq.Task, _ barrierCheck, st runState) ([]entroq.ModifyArg, *runState, error) {
+		if st.Phase != PhaseMap {
+			return []entroq.ModifyArg{task.Delete()}, nil, nil
+		}
+		if left, err := c.anyDocs(ctx, splitPrefix); err != nil || left {
+			return []entroq.ModifyArg{task.Delete()}, nil, err
+		}
+		parts, err := c.keyPartitions(ctx, mapOutPrefix)
 		if err != nil {
-			return state, nil, fmt.Errorf("eqmr control: %w", err)
+			return nil, nil, err
 		}
-		if remaining == 0 {
-			next := controlState{
-				Phase:        PhaseReduce,
-				MapSplits:    state.MapSplits,
-				ReduceParts:  state.ReduceParts,
-				LastProgress: time.Now(),
-			}
-			return next, c.pendingReduceTasks(state.ReduceParts), nil
+		if len(parts) == 0 {
+			return c.finishing(ctx, task, st, allPartitions(st.ReduceParts))
 		}
-		return c.progress(state, remaining)
+		next := st
+		next.Phase = PhaseReduce
+		mods := []entroq.ModifyArg{task.Delete()}
+		for _, p := range parts {
+			mods = append(mods, entroq.InsertingInto(c.ReduceQ(), entroq.WithValue(reduceTask{Partition: p, Partitions: st.ReduceParts, Sink: st.Sink})))
+		}
+		return mods, &next, nil
+	})
+}
 
-	case PhaseReduce:
-		// Every partition writes a result doc, empty ones included, and each is
-		// committed atomically with that partition's map output deletions. So the
-		// count of result docs is a complete and purely doc-based statement of
-		// how much of the reduce phase is finished. No queue is consulted.
-		done, err := c.countDocs(ctx, resultPrefix)
+// reduceDoneWorker accepts the first finish for each partition. Holding only
+// the partition's pointer docs, it commits the staged output to the sink, then
+// in one Modify deletes the pointers, writes the result marker, collects the
+// consumed runs, and queues a reduce check. A later finish finds the pointers
+// gone, and its runs are collected.
+//
+// A loser's staged output is left for the sink's sweep: a crash between the
+// sink commit and the Modify can make the committed attempt look like a loser.
+func (c *Controller) reduceDoneWorker() *worker.Worker[reduceDone] {
+	return worker.New[reduceDone](c.client,
+		worker.WithTakeDocs(func(_ context.Context, _ entroq.Reader, work *worker.Work[reduceDone]) (*worker.TakeResult, error) {
+			rd := work.Value
+			// The claim is on the set the marker goes in, not on the
+			// pointers: it only keeps two acceptances of the partition from
+			// committing to the sink at once, and it stays one set however
+			// many splits fed the partition.
+			return worker.Take(entroq.ClaimKey(c.DocNS(), resultDocKey(rd.Partition))), nil
+		}),
+		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, work *worker.Work[reduceDone]) (*worker.Result, error) {
+			task, rd := work.Task, work.Value
+			st, err := c.readState(ctx)
+			if err != nil {
+				return nil, retryIfUnavailable(err)
+			}
+			discard := append([]entroq.ModifyArg{task.Delete()}, c.collecting(rd.Runs)...)
+			if st.terminal() || len(entroq.DocsIn(work.Sets)) > 0 {
+				// The run has ended, or the partition has its marker.
+				return worker.Modify(discard...), nil
+			}
+			docs, err := c.client.Docs(ctx, &entroq.DocQuery{
+				Namespace: c.DocNS(),
+				KeyStart:  mapOutPartition(rd.Partition),
+				KeyEnd:    prefixEnd(mapOutPartition(rd.Partition)),
+			})
+			if err != nil {
+				return nil, retryIfUnavailable(fmt.Errorf("read pointers for partition %d: %w", rd.Partition, err))
+			}
+			if len(docs) == 0 {
+				// Consumed by an acceptance whose marker went with them.
+				return worker.Modify(discard...), nil
+			}
+			// The pointer set is fixed once mapping ends; a reducer that read a
+			// different set missed part of the partition.
+			if !samePointers(docs, rd.Pointers) {
+				return nil, worker.MoveErrorf("reducer for partition %d consumed %d map outputs, but %d are published", rd.Partition, len(rd.Pointers), len(docs))
+			}
+
+			// A sink this process cannot reach fails the run.
+			sink, err := c.sinks.resolve(rd.Sink)
+			if err != nil {
+				return nil, worker.MoveErrorf("partition %d: %v", rd.Partition, err)
+			}
+			// Committing again after a crash is a no-op.
+			if err := sink.Commit(ctx, c.prefix, rd.Partition, rd.Staged); err != nil {
+				return nil, moveOrRetry(err, "commit output for partition %d", rd.Partition)
+			}
+
+			// The deletes are pinned to the versions read, so a pointer that
+			// changed since fails the commit.
+			mods := []entroq.ModifyArg{task.Delete(), checking(c.ReduceCheckQ())}
+			for _, d := range docs {
+				mods = append(mods, d.Delete())
+			}
+			// The marker records the partition as committed; output lives in
+			// the sink.
+			mods = append(mods, entroq.PuttingDocInto(c.DocNS(),
+				entroq.WithIDKeys(resultDocID(rd.Partition), resultDocKey(rd.Partition), ""),
+			))
+			return worker.Modify(append(mods, c.collecting(rd.Runs)...)...), nil
+		}),
+	)
+}
+
+// reduceCheckWorker ends the reduce phase once no pointer docs remain: it
+// finishes the sink, naming the partitions with no data, and marks the run
+// done.
+func (c *Controller) reduceCheckWorker() *worker.Worker[barrierCheck] {
+	reached := func(ctx context.Context) (bool, error) {
+		return c.consumed(ctx, PhaseReduce, mapOutPrefix)
+	}
+	return barrierWorker(c, reached, func(ctx context.Context, task *entroq.Task, _ barrierCheck, st runState) ([]entroq.ModifyArg, *runState, error) {
+		if st.Phase != PhaseReduce {
+			return []entroq.ModifyArg{task.Delete()}, nil, nil
+		}
+		if left, err := c.anyDocs(ctx, mapOutPrefix); err != nil || left {
+			return []entroq.ModifyArg{task.Delete()}, nil, err
+		}
+		done, err := c.keyPartitions(ctx, resultPrefix)
 		if err != nil {
-			return state, nil, fmt.Errorf("eqmr control: %w", err)
+			return nil, nil, err
 		}
-		if done >= state.ReduceParts {
-			next := controlState{
-				Phase:        PhaseDone,
-				MapSplits:    state.MapSplits,
-				ReduceParts:  state.ReduceParts,
-				LastProgress: time.Now(),
+		var empty []int
+		for _, p := range allPartitions(st.ReduceParts) {
+			if _, ok := slices.BinarySearch(done, p); !ok {
+				empty = append(empty, p)
 			}
-			return next, nil, nil
 		}
-		return c.progress(state, state.ReduceParts-done)
-
-	default:
-		return failed(state, fmt.Sprintf("unknown phase %q", state.Phase)), nil, nil
-	}
+		return c.finishing(ctx, task, st, empty)
+	})
 }
 
-// pendingReduceTasks is the modification that fans a run out to its reduce
-// partitions. It is applied by the same Modify that advances the control task,
-// so the fan-out and the phase change cannot diverge.
-func (c *Controller) pendingReduceTasks(parts int) []entroq.ModifyArg {
-	args := make([]entroq.ModifyArg, 0, parts)
-	for p := range parts {
-		args = append(args, entroq.InsertingInto(c.ReduceQ(), entroq.WithValue(reduceClaim{
-			Doc:       docRef{NS: c.DocNS(), Key: mapOutPartition(p)},
-			Partition: p,
-		})))
+// allPartitions lists partitions 0 through n-1.
+func allPartitions(n int) []int {
+	parts := make([]int, n)
+	for i := range parts {
+		parts[i] = i
 	}
-	return args
+	return parts
 }
 
-// progress folds a stall check into the next state. A phase whose outstanding
-// unit count has not moved for StallTimeout has stopped making progress, which
-// otherwise presents as a run that hangs forever with no diagnostic.
-//
-// Claimed work counts as progress so that a single slow mapper is never mistaken
-// for a stall: its unit is claimed and renewed the whole time it runs, and the
-// remaining count does not move until it commits. A worker that hangs while
-// still renewing its claim is out of scope here, as it must be: that is a
-// process liveness problem for the orchestrator, not something the queue can
-// distinguish from slow work.
-func (c *Controller) progress(state controlState, remaining int) (controlState, []entroq.ModifyArg, error) {
-	now := time.Now()
-	next := state
-	next.LastRemaining = remaining
-
-	if remaining != state.LastRemaining || state.LastProgress.IsZero() {
-		next.LastProgress = now
-		return next, nil, nil
+// samePointers reports whether published and consumed name the same pointer
+// docs. Claiming changes their versions, so ids identify them.
+func samePointers(published []*entroq.Doc, consumed []entroq.DocID) bool {
+	if len(published) != len(consumed) {
+		return false
 	}
-	if c.cfg.StallTimeout > 0 && now.Sub(state.LastProgress) > c.cfg.StallTimeout {
-		claimed, err := c.claimedTasks(context.Background())
-		if err == nil && claimed > 0 {
-			// Something is actively held and being renewed: slow, not stalled.
-			next.LastProgress = now
-			return next, nil, nil
+	ids := make(map[string]bool, len(published))
+	for _, d := range published {
+		ids[d.ID] = true
+	}
+	for _, p := range consumed {
+		if !ids[p.ID] {
+			return false
 		}
-		return failed(state, fmt.Sprintf("phase %q made no progress for %v (%d unit(s) outstanding)",
-			state.Phase, now.Sub(state.LastProgress).Round(time.Second), remaining)), nil, nil
 	}
-	return next, nil, nil
+	return true
 }
 
-// quarantineReason describes a quarantine failure, including why the first
-// quarantined task got there.
-//
-// A bare count says a run failed without saying what to change, and the reason
-// is right there: the worker records it on the task when it quarantines. Only
-// reached on the terminal failure path, so one extra listing costs nothing.
-func (c *Controller) quarantineReason(ctx context.Context, n int) string {
-	base := fmt.Sprintf("%d task(s) quarantined in %s", n, c.ErrQ())
-	tasks, err := c.client.Tasks(ctx, c.ErrQ(), entroq.LimitTasks(1))
-	if err != nil || len(tasks) == 0 || tasks[0].Err == "" {
-		return base
+// consumed reports, without a claim, whether the run is in phase and no doc has
+// a key under prefix: whether a check may end the phase.
+func (c *Controller) consumed(ctx context.Context, phase, prefix string) (bool, error) {
+	st, err := c.readState(ctx)
+	if err != nil || st.Phase != phase {
+		return false, err
 	}
-	return fmt.Sprintf("%s; first: %s", base, tasks[0].Err)
+	left, err := c.anyDocs(ctx, prefix)
+	return !left, err
 }
 
-func failed(state controlState, reason string) controlState {
-	state.Phase = PhaseFailed
-	state.Reason = reason
-	return state
-}
-
-func queueDepth(stats map[string]*entroq.QueueStat, q string) int {
-	s, ok := stats[q]
-	if !ok {
-		return 0
-	}
-	return s.Size
-}
-
-func queueClaimed(stats map[string]*entroq.QueueStat, q string) int {
-	s, ok := stats[q]
-	if !ok {
-		return 0
-	}
-	return s.Claimed
-}
-
-// Status reports the run's current phase, and the failure reason when the run
-// has failed. It reads the control task, so it works from any process.
-func (c *Controller) Status(ctx context.Context) (phase, reason string, err error) {
-	tasks, err := c.client.Tasks(ctx, c.ControlQ())
+// anyDocs reports whether any doc has a key under prefix. It takes no claim, so
+// its answer can be stale.
+func (c *Controller) anyDocs(ctx context.Context, prefix string) (bool, error) {
+	docs, err := c.client.Docs(ctx, &entroq.DocQuery{
+		Namespace:  c.DocNS(),
+		KeyStart:   prefix,
+		KeyEnd:     prefixEnd(prefix),
+		OmitValues: true,
+		Limit:      1,
+	})
 	if err != nil {
-		return "", "", fmt.Errorf("eqmr status: %w", err)
+		return false, fmt.Errorf("check %q docs: %w", prefix, err)
 	}
-	if len(tasks) == 0 {
-		return "", "", fmt.Errorf("eqmr status: no control task in %s (run not set up, or already cleaned up)", c.ControlQ())
-	}
-	state, err := entroq.GetValue[controlState](tasks[0])
-	if err != nil {
-		return "", "", fmt.Errorf("eqmr status: parse control task: %w", err)
-	}
-	return state.Phase, state.Reason, nil
+	return len(docs) > 0, nil
 }
 
-// maxWaitInterval caps how long Wait sleeps between checks. Wait is a
-// client-side observer of a durable state machine, so its latency is a separate
-// question from the controller's cadence: polling on ControlInterval would make
-// a finished run take up to a full interval longer to be noticed, purely as
-// observation lag. Status is one cheap query against a single-task queue, so a
-// brisk fixed cap costs little.
-const maxWaitInterval = 100 * time.Millisecond
+// keyPartitions lists, in order and without repeats, the partitions named by
+// the keys of docs under prefix, whose keys continue with a partition number,
+// up to the next '/' if there is one.
+func (c *Controller) keyPartitions(ctx context.Context, prefix string) ([]int, error) {
+	docs, err := c.client.Docs(ctx, &entroq.DocQuery{
+		Namespace:  c.DocNS(),
+		KeyStart:   prefix,
+		KeyEnd:     prefixEnd(prefix),
+		OmitValues: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list %q docs: %w", prefix, err)
+	}
+	var parts []int
+	for _, d := range docs {
+		num, _, _ := strings.Cut(strings.TrimPrefix(d.Key, prefix), "/")
+		p, err := strconv.Atoi(num)
+		if err != nil {
+			return nil, fmt.Errorf("doc key %q names no partition: %w", d.Key, err)
+		}
+		if i, found := slices.BinarySearch(parts, p); !found {
+			parts = slices.Insert(parts, i, p)
+		}
+	}
+	return parts, nil
+}
 
-// Wait blocks until the run reaches a terminal phase, returning an error if it
-// failed. Call it after Setup.
-//
-// It polls, because a run's progress lives in EntroQ rather than in this
-// process. It is a convenience for in-process runs; a long-lived deployment
-// should call Status on whatever schedule suits it rather than blocking here.
-func (c *Controller) Wait(ctx context.Context) error {
-	interval := min(c.cfg.ControlInterval, maxWaitInterval)
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+// gcWorker deletes retired runs and sweeps ended runs. Deletes are idempotent,
+// so a retry deletes what is left. Collection never touches run state.
+func (c *Controller) gcWorker() *worker.Worker[gcTask] {
+	return worker.New[gcTask](c.client,
+		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, work *worker.Work[gcTask]) (*worker.Result, error) {
+			task, gc := work.Task, work.Value
+			for i, run := range gc.Runs {
+				store, err := c.stores.resolve(run.Store)
+				if err != nil {
+					return nil, worker.MoveErrorf("collect run %d: %v", i, err)
+				}
+				if err := store.delete(ctx, run.Ref); err != nil {
+					return nil, worker.RetryErrorf("collect run %d: %v", i, err)
+				}
+			}
+			// Sweeps are best effort: what one misses is garbage.
+			for _, d := range gc.Stores {
+				store, err := c.stores.resolve(d)
+				if err == nil {
+					err = store.sweep(ctx, c.prefix)
+				}
+				logSweepFailure("intermediate store", d, c.prefix, err)
+			}
+			for _, d := range gc.Sinks {
+				sink, err := c.sinks.resolve(d)
+				if err == nil {
+					err = sink.Sweep(ctx, c.prefix)
+				}
+				logSweepFailure("sink", d, c.prefix, err)
+			}
+			return worker.Modify(task.Delete()), nil
+		}),
+	)
+}
+
+// logSweepFailure logs a failed sweep, which is not retried.
+func logSweepFailure(what string, d Descriptor, run string, err error) {
+	if err == nil {
+		return
+	}
+	log.Printf("eqmr: sweep %s %s for %q: %v", what, d, run, err)
+}
+
+// checkGrants fails an unfinished run that names a store or sink this process
+// cannot reach. A run with no state doc yet is left alone.
+func (c *Controller) checkGrants(ctx context.Context) error {
+	_, st, err := c.stateDoc(ctx)
+	if err != nil {
+		return fmt.Errorf("eqmr controller: %w", err)
+	}
+	if st.Phase == "" || st.terminal() {
+		return nil
+	}
+	var missing []error
+	if _, err := c.stores.resolve(st.Store); err != nil {
+		missing = append(missing, err)
+	}
+	if _, err := c.sinks.resolve(st.Sink); err != nil {
+		missing = append(missing, err)
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	reason := fmt.Sprintf("controller cannot run: %v", errors.Join(missing...))
+	if err := c.failNow(ctx, reason); err != nil {
+		return fmt.Errorf("eqmr controller: %s; failing the run: %w", reason, err)
+	}
+	return fmt.Errorf("eqmr controller: %s", reason)
+}
+
+// failNow fails the run from outside any worker, unless it has already ended.
+func (c *Controller) failNow(ctx context.Context, reason string) error {
+	return c.updateState(ctx, func(st runState) (*runState, []entroq.ModifyArg) {
+		if st.terminal() {
+			return nil, nil
+		}
+		next := st.failed(reason)
+		return &next, c.ending(next)
+	})
+}
+
+// updateState changes the run state from outside a worker. It claims the state
+// doc under its own claimant, waiting for any holder, and commits what change
+// returns, the next state or nil and any other modifications, with the
+// release.
+func (c *Controller) updateState(ctx context.Context, change func(runState) (*runState, []entroq.ModifyArg)) error {
+	claimant := entroq.GenHex16()
 	for {
-		phase, reason, err := c.Status(ctx)
+		sets, err := c.client.ClaimDocs(ctx,
+			entroq.ClaimKey(c.DocNS(), stateDocKey),
+			entroq.ClaimingSetsAs(claimant),
+			entroq.ClaimingSetsFor(c.cfg.Lease),
+		)
+		if _, ok := entroq.AsDependency(err); ok {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(maxWaitInterval):
+			}
+			continue
+		}
 		if err != nil {
 			return err
 		}
-		switch phase {
-		case PhaseDone:
-			return nil
-		case PhaseFailed:
-			return fmt.Errorf("eqmr run %q failed: %s", c.prefix, reason)
+		docs := entroq.DocsIn(sets)
+		if len(docs) != 1 {
+			return fmt.Errorf("run %q has %d state docs, want 1", c.prefix, len(docs))
 		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("eqmr wait: %w", ctx.Err())
-		case <-ticker.C:
+		st, err := entroq.GetContent[runState](docs[0])
+		if err != nil {
+			return fmt.Errorf("parse run state: %w", err)
 		}
+		next, mods := change(st)
+		release := docs[0].Change()
+		if next != nil {
+			release = docs[0].Change(entroq.WithContent(*next))
+		}
+		_, err = c.client.Modify(ctx, append(mods, release, entroq.ModifyAs(claimant))...)
+		return err
 	}
 }
 
-// CellState is the state of one unit of work: one input split in the map phase,
-// or one partition in the reduce phase.
-type CellState uint8
+// errWorker judges quarantined tasks. A duplicate whose unit is already
+// complete is retired. Anything else moves to QuarantineQ and fails the run with
+// the task's error, except a collection failure, which is only kept.
+func (c *Controller) errWorker() *worker.Worker[json.RawMessage] {
+	return stateWorker(c, func(ctx context.Context, task *entroq.Task, raw json.RawMessage, st runState) ([]entroq.ModifyArg, *runState, error) {
+		origin := strings.TrimSuffix(task.Queue, errQSuffix)
+		loser, err := c.isLoser(ctx, origin, raw)
+		if err != nil {
+			return nil, nil, err
+		}
+		if loser {
+			return []entroq.ModifyArg{task.Delete()}, nil, nil
+		}
 
-const (
-	// CellPending means the unit exists and nobody is working on it.
-	CellPending CellState = iota
-	// CellRunning means a worker holds it right now.
-	CellRunning
-	// CellDone means it committed its output.
-	CellDone
-)
+		mods := []entroq.ModifyArg{task.Change(entroq.QueueTo(c.QuarantineQ()))}
+		if origin == c.GCQ() || st.terminal() {
+			return mods, nil, nil
+		}
+		next := st.failed(fmt.Sprintf("task quarantined from %s: %s", origin, task.Err))
+		return append(mods, c.ending(next)...), &next, nil
+	}, worker.WithErrQMap[json.RawMessage](func(string) string { return c.QuarantineQ() }))
+}
 
-// String renders a cell state for logs and simple text rendering.
-func (s CellState) String() string {
-	switch s {
-	case CellRunning:
-		return "running"
-	case CellDone:
-		return "done"
+// isLoser reports whether a quarantined task from origin duplicates a unit that
+// is already complete.
+func (c *Controller) isLoser(ctx context.Context, origin string, raw json.RawMessage) (bool, error) {
+	// A value that does not parse cannot be shown to be a loser, so it counts
+	// as a failure.
+	switch origin {
+	case c.MapQ():
+		var ref docRef
+		if err := json.Unmarshal(raw, &ref); err != nil {
+			return false, nil
+		}
+		found, err := c.client.Docs(ctx, ref.asQuery())
+		if err != nil {
+			return false, fmt.Errorf("check split %q: %w", ref.Key, err)
+		}
+		return len(found) == 0, nil
+
+	case c.ReduceQ():
+		var rt reduceTask
+		if err := json.Unmarshal(raw, &rt); err != nil {
+			return false, nil
+		}
+		found, err := c.client.Docs(ctx, &entroq.DocQuery{
+			Namespace:  c.DocNS(),
+			KeyExact:   resultDocKey(rt.Partition),
+			OmitValues: true,
+		})
+		if err != nil {
+			return false, fmt.Errorf("check result %d: %w", rt.Partition, err)
+		}
+		return len(found) > 0, nil
+
 	default:
-		return "pending"
+		return false, nil
 	}
-}
-
-// PhaseProgress counts the units of one phase. Total is fixed for the life of
-// the run; the three states below always sum to it.
-type PhaseProgress struct {
-	Total   int `json:"total"`
-	Done    int `json:"done"`
-	Running int `json:"running"`
-	Pending int `json:"pending"`
-}
-
-// Progress is a snapshot of a run, sufficient to draw it.
-//
-// Counts are per phase, not per worker. A unit is claimed by whichever worker
-// is free, so no worker owns a knowable share of the run. For per-worker
-// throughput and idleness use the worker metrics, entroq.worker.tasks_total and
-// entroq.worker.slots.
-//
-// Map resolution follows the split count: a mapper commits once, at the end of
-// its split, so finer progress comes from smaller splits.
-type Progress struct {
-	Phase  string        `json:"phase"`
-	Reason string        `json:"reason,omitempty"`
-	Map    PhaseProgress `json:"map"`
-	Reduce PhaseProgress `json:"reduce"`
-	// Quarantined is the number of tasks that exhausted their retries. Any
-	// value above zero means the run is failing or has failed.
-	Quarantined int `json:"quarantined"`
-}
-
-// Progress reports a snapshot of the run. It is safe to call from any process
-// and at any time, including after completion and before Cleanup.
-//
-// Completion is read purely from documents: a split doc disappears when its
-// mapper commits, and a result doc appears when a partition commits, empty
-// partitions included. Neither answer consults a queue, so a shared or
-// long-lived queue would not change these numbers.
-func (c *Controller) Progress(ctx context.Context) (*Progress, error) {
-	tasks, err := c.client.Tasks(ctx, c.ControlQ())
-	if err != nil {
-		return nil, fmt.Errorf("eqmr progress: %w", err)
-	}
-	if len(tasks) == 0 {
-		return nil, fmt.Errorf("eqmr progress: no control task in %s (run not set up, or already cleaned up)", c.ControlQ())
-	}
-	state, err := entroq.GetValue[controlState](tasks[0])
-	if err != nil {
-		return nil, fmt.Errorf("eqmr progress: parse control task: %w", err)
-	}
-
-	p := &Progress{Phase: state.Phase, Reason: state.Reason}
-
-	// One stats call covers both work queues and the quarantine queue.
-	//
-	// "Running" is a count of claimed TASKS, not claimed documents. Workers no
-	// longer claim their input, so that a duplicate task can race a straggler
-	// rather than block on it; the task claim is what remains observable. A
-	// consequence is that duplicates inflate the raw claimed count, since two
-	// workers may hold two tasks for one unit of work, so it is capped by the
-	// number of units actually outstanding.
-	stats, err := c.client.QueueStats(ctx, entroq.MatchExact(c.MapQ(), c.ReduceQ(), c.ErrQ()))
-	if err != nil {
-		return nil, fmt.Errorf("eqmr progress: queue stats: %w", err)
-	}
-
-	// Map: outstanding splits are the ones whose docs are still present.
-	remaining, err := c.countDocs(ctx, splitPrefix)
-	if err != nil {
-		return nil, fmt.Errorf("eqmr progress: %w", err)
-	}
-	mapRunning := min(queueClaimed(stats, c.MapQ()), remaining)
-	p.Map = PhaseProgress{
-		Total:   state.MapSplits,
-		Done:    max(state.MapSplits-remaining, 0),
-		Running: mapRunning,
-		Pending: max(remaining-mapRunning, 0),
-	}
-
-	// Reduce: a partition is done once its result doc exists.
-	done, err := c.countDocs(ctx, resultPrefix)
-	if err != nil {
-		return nil, fmt.Errorf("eqmr progress: %w", err)
-	}
-	outstanding := max(state.ReduceParts-done, 0)
-	reduceRunning := min(queueClaimed(stats, c.ReduceQ()), outstanding)
-	p.Reduce = PhaseProgress{
-		Total:   state.ReduceParts,
-		Done:    min(done, state.ReduceParts),
-		Running: reduceRunning,
-		Pending: max(outstanding-reduceRunning, 0),
-	}
-
-	p.Quarantined = queueDepth(stats, c.ErrQ())
-	return p, nil
 }

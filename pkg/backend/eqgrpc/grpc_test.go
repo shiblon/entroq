@@ -365,3 +365,7 @@ func TestGRPCTasksClaimantLimit(t *testing.T) {
 // GCCollectsInLoop is not run over gRPC: garbage collection belongs to the
 // storage backend behind the service, and each storage backend runs it with
 // its own test-only GC interval.
+
+func TestGRPCTorture(t *testing.T) {
+	RunQTest(t, eqtest.Torture)
+}

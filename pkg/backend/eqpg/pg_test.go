@@ -798,3 +798,74 @@ func TestMixedAtomicStress(t *testing.T) {
 	t.Parallel()
 	RunQTest(t, eqtest.MixedAtomicStress)
 }
+
+func TestTorture(t *testing.T) {
+	RunQTest(t, eqtest.Torture)
+}
+
+// TestTortureOverGRPC runs the torture test through the gRPC service, where a
+// worker killed mid-commit can leave the server holding a commit the client
+// never saw land.
+func TestTortureOverGRPC(t *testing.T) {
+	ctx := context.Background()
+	client, stop, err := eqtest.ClientService(ctx, Opener(pgHostPort,
+		WithDB("postgres"),
+		WithUsername("postgres"),
+		WithPassword("password"),
+		WithConnectAttempts(10),
+	))
+	if err != nil {
+		t.Fatalf("start gRPC service over postgres: %v", err)
+	}
+	defer stop()
+	eqtest.Torture(ctx, t, client, "pgtest/"+client.GenID())
+}
+
+// TestModifyReportsFailedCommit checks that a modification whose transaction
+// fails at COMMIT is reported as failed. A deferred constraint trigger makes
+// COMMIT the statement that fails, which is also where a canceled context
+// lands when a worker is killed mid-commit. It runs in a database of its own,
+// since the trigger fails every task insert.
+func TestModifyReportsFailedCommit(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	const name = "entroq_failed_commit"
+	db := freshDB(ctx, t, name)
+	if err := InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	for _, stmt := range []string{
+		`CREATE FUNCTION entroq.break_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			RAISE EXCEPTION 'commit broken on purpose';
+		END $$`,
+		`CREATE CONSTRAINT TRIGGER break_commit AFTER INSERT ON entroq.tasks
+		DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION entroq.break_commit()`,
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("install commit breaker: %v", err)
+		}
+	}
+
+	client, err := entroq.New(ctx, Opener(pgHostPort,
+		WithDB(name),
+		WithUsername("postgres"),
+		WithPassword("password"),
+		WithConnectAttempts(10)))
+	if err != nil {
+		t.Fatalf("Get client: %v", err)
+	}
+	defer client.Close()
+
+	const queue = "/commit"
+	if _, err := client.Modify(ctx, entroq.InsertingInto(queue)); err == nil {
+		t.Error("Modify reported success for a transaction that failed at COMMIT")
+	}
+	tasks, err := client.Tasks(ctx, queue)
+	if err != nil {
+		t.Fatalf("Tasks: %v", err)
+	}
+	if len(tasks) != 0 {
+		t.Errorf("failed commit left %d tasks in %s", len(tasks), queue)
+	}
+}

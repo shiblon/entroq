@@ -1107,3 +1107,17 @@ func TestEQMemJournalRestoresArrivals(t *testing.T) {
 		return entroq.New(ctx, Opener(WithJournal(journalDir)))
 	}, "/journal/arrivals")
 }
+
+func TestEQMemTorture(t *testing.T) {
+	ctx := context.Background()
+	client, err := entroq.New(ctx, Opener())
+	if err != nil {
+		t.Fatalf("Get client: %v", err)
+	}
+	defer client.Close()
+	eqtest.Torture(ctx, t, client, "")
+}
+
+func TestEQMemJournalTorture(t *testing.T) {
+	RunQTest(t, eqtest.Torture)
+}

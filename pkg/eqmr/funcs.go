@@ -75,31 +75,6 @@ type ReducerInput interface {
 	Next() bool
 }
 
-// sliceInput is a ReducerInput over an in-memory value slice.
-type sliceInput struct {
-	key    string
-	values []string
-	idx    int
-}
-
-func (s *sliceInput) Key() string { return s.key }
-func (s *sliceInput) Err() error  { return nil }
-
-func (s *sliceInput) Value() string {
-	if s.idx == 0 || s.idx > len(s.values) {
-		return ""
-	}
-	return s.values[s.idx-1]
-}
-
-func (s *sliceInput) Next() bool {
-	if s.idx >= len(s.values) {
-		return false
-	}
-	s.idx++
-	return true
-}
-
 // Fingerprint64 produces a 64-bit unsigned integer from a string.
 func Fingerprint64(key string) uint64 {
 	h := fnv.New64()

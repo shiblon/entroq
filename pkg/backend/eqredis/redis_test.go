@@ -411,3 +411,7 @@ func TestLatencyMetrics(t *testing.T) {
 		}
 	}
 }
+
+func TestTorture(t *testing.T) {
+	RunQTest(t, eqtest.Torture)
+}

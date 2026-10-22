@@ -91,6 +91,19 @@ runs, so plan a short maintenance window on large doc tables.
   showed, keeps the grpc-go default, refuses pings more often than every five
   minutes, and closes the connection on the third, failing any claim that
   waits more than about a minute and a half. The examples now use it.
+- **Streaming HTTP object-store foundation for eqmr.** Defines the
+  language-neutral child-process protocol and implements its internal client,
+  canonical framed-run codec, and object-backed intermediate-store adapter.
+  Idempotent put, open, and delete stream over locally selected HTTP transport
+  such as stdin/stdout or a Unix socket. Runs are written in chained,
+  xxHash64-checksummed blocks closed by a counted footer, so a reader verifies
+  each block before using any of its records; a corrupt run fails its run at
+  once instead of being retried. Map tasks and run pointers record a credential-free store
+  descriptor (logical name, versioned driver, store identity), and a worker
+  refuses to read or write a run through a different store that shares its
+  name. Put names the run an object belongs to, and `POST /v1/sweep` tells a
+  driver a run has ended. Launching driver processes and a public constructor
+  for HTTP stores remain follow-up work.
 - **Readiness loops for SQLite and Redis.** Both backends now wake claims for
   tasks that become available with time, every `WithReadinessInterval`
   (default 5s; `--readiness_interval` on `eqsqlite serve` and `eqredis serve`),
@@ -129,6 +142,20 @@ runs, so plan a short maintenance window on large doc tables.
 
 ### Changed
 
+- **A canceled worker applies no retry or move.** Once a worker's context
+  has ended, a `RetryError` or `MoveError` its handler returns -- usually the
+  cancellation itself, seen as a failed read or write -- is not committed: the
+  task and its doc sets lapse with the lease, and a task that keeps ending its
+  workers reaches the claim limit. A modify on an ended context landed on some
+  backends and not others, so the outcome used to depend on the backend. To
+  answer a task and stop, return the sentinel with `ThenStop` while the
+  context is live. eqmr mappers and reducers also retry transient failures
+  after 1s rather than the worker's 30s default.
+- **Every worker `Run` is its own consumer.** A doc set excludes other
+  claimants only, so `Run` claims, renews, and commits as a claimant of its
+  own, a fresh random ID by default; `worker.AsClaimant` names it instead.
+  Concurrent Runs, of one worker or of workers sharing a client, no longer
+  hold each other's doc sets.
 - **A doc claim asks for what it does.** Claiming a doc set still needs
   `CLAIM` on its namespace, and now also `READ` there when the claim returns
   the set's docs, since that discloses their contents; a set claimed
@@ -430,6 +457,46 @@ runs, so plan a short maintenance window on large doc tables.
   `eqpg` has no digest, so run `eqpg schema upgrade` once to record it. SQLite
   records a digest too, and refuses a file that a development build created
   with a different layout.
+- **Breaking (experimental): eqmr's controller reacts to finish tasks.** The
+  polling control loop is replaced by controller workers, and only they write
+  run state.
+  - Mappers and reducers commit a finish task atomically with deleting their
+    own task. The controller accepts the first finish for each unit while
+    claiming only that unit's input, and each acceptance commits a check task
+    that alone decides whether its phase is over, so the run's state doc is
+    claimed only at phase boundaries and acceptances never contend.
+  - `Setup` stages its splits and then creates the run and every map task in
+    one commit, so it can be retried with the same input; empty input is an
+    error. Reduce tasks are created only for partitions that received data,
+    and a run whose input maps to nothing goes straight to done.
+  - Output goes to a `Sink` (`WithSink`), which owns its format and readiness.
+    Reducers stream results into a staged attempt and their finish task
+    carries only a reference to it; the controller commits the first attempt
+    per partition and calls `Sink.Finish`, naming the partitions that received
+    no data, before the run is done. The default document sink keeps output in
+    the run's namespace for small jobs, `Results` reads it, and it refuses a
+    result that is not valid NUL-free UTF-8, which nothing checked before.
+    `Descriptor` is now exported, since sinks are user-provided.
+  - `NewFileStore` keeps intermediate runs as files, one directory per run,
+    each written once under a unique name and synced before it is referenced,
+    chosen with `WithIntermediateStore`; the document store remains the
+    default.
+  - Collection: a losing map finish's runs and a reduced partition's consumed
+    runs are deleted by a `gc` worker as soon as they are retired. Staged
+    output is never deleted that way; when a run ends, done or failed, its
+    store and sink are swept of everything nothing committed, which also
+    collects what crashed workers wrote and never reported.
+  - Failure: each worker quarantines to its own `<queue>/err`, and an error
+    worker retires quarantined duplicates whose unit is already complete,
+    failing the run with the task's reason otherwise and keeping the task in
+    `<prefix>/quarantine`. A corrupt intermediate run, a sink error marked
+    with a `worker.MoveError`, and a store or sink a process cannot reach all
+    fail the run at once with a reason; only a backend known to be
+    unavailable is retried.
+  - Removed: stall detection, with `WithControlInterval` and
+    `WithStallTimeout`; `ControlWorker`, `ControlQ`, `ErrQ`, and `Cleanup`.
+    `Progress` is derived from the run's docs, and `Run` returns only after the
+    run's intermediates are collected.
 - **Breaking: PostgreSQL no longer uses LISTEN/NOTIFY.** The service is the
   database's only client, so the backend now runs the same readiness loop as
   the other backends: a batched, read-only count of available tasks on the
@@ -818,11 +885,14 @@ changes.
 - **Experimental MapReduce package (`pkg/eqmr`).** A MapReduce that runs
   entirely on EntroQ tasks and documents, promoted from the `examples/mr`
   sketch. It adds a real shuffle step: mappers partition intermediate keys into
-  a configured number of reduce shards and write per-partition map-output documents,
-  so reduce work is proportional to the partition count rather than to the
-  number of distinct keys. It adds combiners, which differ from reducers in
-  being closed over their own output and so may run at more than one stage. The
-  controller is now a single self-requeueing control task rather than in-process
+  a configured number of reduce shards, cut bounded sorted immutable runs, and
+  atomically publish per-partition pointer documents. Document-backed runs use
+  ordered chunks so reducers heap-merge one current chunk per run instead of
+  materializing whole partitions. Reduce work is proportional to the partition
+  count rather than to the number of distinct keys. It adds combiners, which
+  differ from reducers in being closed over their own output and so may run at
+  more than one stage. The controller is now a single self-requeueing control
+  task rather than in-process
   goroutines, so it can run in its own pod, in as many replicas as desired, with
   the claim providing the single-actor guarantee and lease expiry providing
   failover. Both shard counts must be configured explicitly. Also included:
@@ -830,15 +900,17 @@ changes.
   driving a status view, and validation of namespaces and document keys as
   NUL-free UTF-8 within the backend length limits. Map keys and values are text
   rather than bytes, validated on input and on every emit, which drops base64
-  from every intermediate document: measured, map-output documents are 22% smaller
-  and readable in psql. A job with genuinely binary keys encodes them itself. Phase completion is judged
+  from every intermediate document and keeps them readable in psql. A job with
+  genuinely binary keys encodes them itself. Phase completion is judged
   purely from documents: every partition writes a result document, empty ones
   included, so finishing is a recorded fact rather than an absence and no queue
   is consulted to decide it. Workers read their input document rather than
   claiming it, taking exclusion at commit time through a version-pinned delete,
   which makes backup tasks (speculative execution against stragglers) possible:
-  a duplicate task races the original instead of blocking on its claim, and the
-  loser's work is rejected atomically. No straggler policy ships with it. The
+  a duplicate task races the original instead of blocking on its claim; only the
+  winner publishes pointers, and the loser removes its unpublished runs. Result
+  readers reject incomplete or failed runs rather than returning partial output.
+  No straggler policy ships with it. The
   Configuration is by functional option, `New(eq, prefix, opts...)`, and shard
   counts are required only by `Setup`: a mapper or reducer pod builds a
   controller from a run prefix alone, because the partition count a mapper must

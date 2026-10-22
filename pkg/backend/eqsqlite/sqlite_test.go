@@ -416,3 +416,13 @@ func TestWriteEndedByContextIsCanceled(t *testing.T) {
 		t.Errorf("Write ended by its context: want a cancellation, got %v", err)
 	}
 }
+
+func TestTorture(t *testing.T) {
+	ctx := context.Background()
+	client, err := entroq.New(ctx, Opener(filepath.Join(t.TempDir(), "entroq.sqlite")))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer client.Close()
+	eqtest.Torture(ctx, t, client, "sqlitetest")
+}

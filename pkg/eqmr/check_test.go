@@ -15,19 +15,18 @@ import (
 	"github.com/shiblon/entroq/pkg/eqmr/eqmrtest"
 )
 
-// checkConfig is the shared shape for these runs: intervals tightened so the
-// suite is not paced by a production-sized control loop.
+// checkConfig is the shared shape for these runs: intervals tightened to the
+// test's timescale.
 func checkConfig(unique, wordsPerDoc, docs, mapShards, reduceShards, mappers, reducers int) eqmrtest.Config {
 	return eqmrtest.Config{
-		UniqueWords:     unique,
-		WordsPerDoc:     wordsPerDoc,
-		NumDocs:         docs,
-		MapShards:       mapShards,
-		ReduceShards:    reduceShards,
-		Mappers:         mappers,
-		Reducers:        reducers,
-		Lease:           5 * time.Second,
-		ControlInterval: 20 * time.Millisecond,
+		UniqueWords:  unique,
+		WordsPerDoc:  wordsPerDoc,
+		NumDocs:      docs,
+		MapShards:    mapShards,
+		ReduceShards: reduceShards,
+		Mappers:      mappers,
+		Reducers:     reducers,
+		Lease:        5 * time.Second,
 	}
 }
 

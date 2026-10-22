@@ -747,11 +747,12 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 
 	// Claim ready task.
 	claimCtx, claimCancel := context.WithTimeout(ctx, 5*time.Second)
+	began := time.Now()
 	claimed, err := client.Claim(claimCtx, entroq.From(queue), entroq.ClaimFor(10*time.Second))
 	claimCancel()
 
 	if err != nil {
-		t.Fatalf("Got unexpected error for claiming from a queue with one ready task: %+v", err)
+		failClaim(ctx, t, client, queue, "claim of the ready task", began, err)
 	}
 	if claimed == nil {
 		t.Fatalf("Unexpected nil result from blocking Claim")
@@ -778,12 +779,13 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	// Make sure the next claim will work.
 	claimCtx, cancel := context.WithTimeout(ctx, 2*futureTaskDuration)
 	defer cancel()
+	began = time.Now()
 	claimed, err = client.Claim(claimCtx,
 		entroq.From(queue),
 		entroq.ClaimFor(5*time.Second),
 		entroq.ClaimPollTime(time.Second))
 	if err != nil {
-		t.Fatalf("Got unexpected error for claiming from a queue with one ready task: %v", err)
+		failClaim(ctx, t, client, queue, "claim of the future task", began, err)
 	}
 	if diff := EqualTasksVersionIncr(inserted[1], claimed, 1); diff != "" {
 		t.Fatalf("Claim got unexpected task, ignoring ID and time fields (-want +got):\n%v", diff)
@@ -795,6 +797,28 @@ func SimpleSequence(ctx context.Context, t *testing.T, client *entroq.EntroQ, qP
 	if claimed.Claims != 1 {
 		t.Fatalf("Expected claim to increment task claims to %d, got %d", 1, claimed.Claims)
 	}
+}
+
+// failClaim fails a test whose blocking claim did not return a task, with what
+// is needed to tell why. The error says which way the claim failed: a
+// "condition" error means a claim attempt itself failed or stalled past the
+// deadline, while a plain wait error means every attempt found nothing and no
+// wakeup arrived in time. The queue as it stands afterwards says whether the
+// task was there, available, and unclaimed all along.
+func failClaim(ctx context.Context, t *testing.T, client *entroq.EntroQ, queue, what string, began time.Time, err error) {
+	t.Helper()
+	failed := time.Now()
+	report := fmt.Sprintf("%s failed after %v: %v\nprocess time at failure: %v",
+		what, failed.Sub(began).Round(time.Millisecond), err, failed.UTC().Format(time.RFC3339Nano))
+	tasks, terr := client.Tasks(context.WithoutCancel(ctx), queue)
+	if terr != nil {
+		report += fmt.Sprintf("\nlisting %s afterwards also failed: %v", queue, terr)
+	}
+	for _, task := range tasks {
+		report += fmt.Sprintf("\n  task %s: at=%v claimant=%q version=%d claims=%d",
+			task.ID, task.At.UTC().Format(time.RFC3339Nano), task.Claimant, task.Version, task.Claims)
+	}
+	t.Fatal(report)
 }
 
 // DeleteMissingTask verifies that deleting a task that is not present fails with

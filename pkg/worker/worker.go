@@ -720,8 +720,6 @@ type Worker[T any] struct {
 	closed bool
 	runs   map[*activeRun]struct{}
 	wg     sync.WaitGroup
-	// runSeq names consumers apart within this worker, under mu.
-	runSeq int
 }
 
 // activeRun holds what Shutdown needs to stop one Run, and the consumer that
@@ -962,7 +960,22 @@ func WithErrQMap[T any](f ErrQMap) Option[T] {
 // This applies to both handler paths. A sentinel skips Finish entirely, so the
 // worker is the one writing this modification whichever handler asked for it,
 // and nothing here second-guesses a hand-written Finish.
+//
+// Cancellation wins. A worker whose context has ended commits no retry or move:
+// the task and its sets lapse with the lease, and a task that keeps ending its
+// workers reaches the claim limit. A sentinel returned then is usually the
+// cancellation itself seen as a failure, and whether a modify on an ended
+// context lands differs by backend. A handler that must answer its task and
+// stop returns a sentinel with ThenStop while its context is still live.
 func (w *Worker[T]) handleSentinelErrors(ctx context.Context, eqc entroq.Client, sentinel error, task *entroq.Task, sets []*entroq.DocSet, errQ string, opts *runOpt) (isSentinel bool, err error) {
+	if cerr := ctx.Err(); cerr != nil {
+		if _, ok := AsRetry(sentinel); ok {
+			return true, fmt.Errorf("retry not applied, worker stopping: %w", cerr)
+		}
+		if _, ok := AsMove(sentinel); ok {
+			return true, fmt.Errorf("move not applied, worker stopping: %w", cerr)
+		}
+	}
 	if re, ok := AsRetry(sentinel); ok {
 		delay := opts.baseRetryDelay
 		if re.hasAfter {
@@ -1338,14 +1351,17 @@ const atLimitTimeout = 5 * time.Second
 // record is a modification and would reset the claim count; the task waits
 // out its lease, as before.
 //
-// The attempt is best-effort, with its own short timeout, apart from a
-// shutdown in progress, and the worker stops afterward exactly as it would
-// have without it: nothing is swallowed. It reports whether the task moved.
+// The attempt is best-effort, with its own short timeout, and the worker stops
+// afterward exactly as it would have without it: nothing is swallowed. A worker
+// whose context has ended does not attempt it, since cancellation wins (see
+// handleSentinelErrors): its handler's error is then most likely the
+// cancellation, and the next claim moves the task anyway. It reports whether
+// the task moved.
 func (w *Worker[T]) quarantineAtLimit(ctx context.Context, eqc entroq.Client, task *entroq.Task, sets []*entroq.DocSet, err error, opts *runOpt) bool {
-	if opts.maxClaims <= 0 || task == nil || task.Claims < opts.maxClaims {
+	if opts.maxClaims <= 0 || task == nil || task.Claims < opts.maxClaims || ctx.Err() != nil {
 		return false
 	}
-	qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), atLimitTimeout)
+	qctx, cancel := context.WithTimeout(ctx, atLimitTimeout)
 	defer cancel()
 	move := MoveErrorf("handler failed at the claim limit (%d claims, limit %d): %v", task.Claims, opts.maxClaims, err)
 	if _, qerr := w.handleSentinelErrors(qctx, eqc, move, task, sets, w.ErrorQueueFor(task.Queue), opts); qerr != nil {
@@ -1410,7 +1426,7 @@ func WithMaxAttempts(m int32) RunOption {
 }
 
 // AsClaimant names the consumer this Run holds everything as, instead of the
-// "<connection ID>/<n>" it would pick.
+// random ID it would pick.
 //
 // Every Run is its own consumer either way; this only chooses the name. Use it
 // for a name that survives a restart, so metrics series and anything reading
@@ -1550,9 +1566,9 @@ func isSentinelError(err error) bool {
 // connection -- hold doc sets without claiming each other's. Nothing has to be
 // arranged for that; AsClaimant only renames it.
 //
-// The claimant is "<connection ID>/<n>" by default, which is stable for the
-// Run's life and visibly its connection's. A deployment wanting durable names
-// across restarts, for metrics series that survive one, passes AsClaimant.
+// The claimant is a fresh random ID by default, stable for the Run's life. A
+// deployment wanting durable names across restarts, for metrics series that
+// survive one, passes AsClaimant.
 func (w *Worker[T]) Run(ctx context.Context, opts ...RunOption) error {
 	ro := &runOpt{
 		lease:          entroq.DefaultClaimDuration,
@@ -1595,12 +1611,14 @@ func (w *Worker[T]) Run(ctx context.Context, opts ...RunOption) error {
 // newClient returns a view on the "real" EntroQ client that operates with a
 // new claimant ID so it's safe to use in a Run function without colliding with
 // other Runs on the same worker.
+//
+// The claimant is random rather than derived from the connection: workers
+// sharing a connection share its ID, so a name built from it needs a counter
+// whose scope is easy to get wrong, and two Runs with one name exclude each
+// other from no doc set.
 func (w *Worker[T]) newClient(claimant string) entroq.Client {
 	if claimant == "" {
-		w.mu.Lock()
-		w.runSeq++
-		claimant = fmt.Sprintf("%s/%d", w.eqc.ID(), w.runSeq)
-		w.mu.Unlock()
+		claimant = entroq.GenHex16()
 	}
 	return w.eqc.As(claimant)
 }

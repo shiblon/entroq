@@ -3,192 +3,196 @@ package eqmr
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"sort"
-	"strings"
-	"time"
+	"io"
+	"log"
 
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/worker"
 )
 
-// keyValues is one intermediate key with all of its values from a single map
-// split. A map-output doc holds a slice of these, sorted by key, which is what makes
-// the reducer's merge a linear k-way merge rather than a full sort.
-type keyValues struct {
-	Key    string   `json:"key"`
-	Values []string `json:"values"`
+// reduceTask is the value of a reduce task: one partition of the shuffle.
+type reduceTask struct {
+	Partition int `json:"partition"`
+	// Partitions is the run's partition count.
+	Partitions int `json:"partitions"`
+	// Sink is the run's sink, stamped from the run state.
+	Sink Descriptor `json:"sink"`
 }
 
-// reduceClaim is the value of a reduce task: one partition of the shuffle. Its
-// Doc names the key prefix the partition's map outputs are under.
-type reduceClaim struct {
-	Doc       docRef `json:"doc"`
-	Partition int    `json:"partition"`
-}
-
-// Run phases, carried in the control task's value.
-const (
-	PhaseMap    = "map"
-	PhaseReduce = "reduce"
-	PhaseDone   = "done"
-	PhaseFailed = "failed"
-)
-
-// terminalRearm is how far into the future a finished or failed control task is
-// pushed. It is kept rather than deleted so the outcome stays inspectable with
-// ordinary task tooling until Cleanup runs.
-const terminalRearm = 24 * time.Hour
-
-// controlState is the value of the single control task. The task is both the
-// phase state and the timer, so the state advances atomically with the requeue.
-type controlState struct {
-	Phase string `json:"phase"`
-	// MapSplits is the number of split docs Setup actually wrote. Empty splits
-	// are skipped, so this can be less than Config.MapShards, and only Setup
-	// knows the true figure.
-	MapSplits int `json:"map_splits"`
-	// ReduceParts is the partition count the run was created with, stamped so
-	// progress reporting does not depend on a caller's live config matching.
-	ReduceParts int `json:"reduce_parts"`
-	// LastProgress is when the run last looked different from the check before.
-	LastProgress time.Time `json:"last_progress"`
-	// LastRemaining is the count of outstanding units at the previous check.
-	LastRemaining int `json:"last_remaining"`
-	// Reason explains a PhaseFailed outcome.
-	Reason string `json:"reason,omitempty"`
-}
-
-// Setup writes the input splits and starts the run. It divides input into
-// Config.MapShards contiguous splits, writes one split doc and one map task per
-// non-empty split, and creates the single control task that drives the phases.
-//
-// Setup is not idempotent: a second call against the same Prefix collides on
-// the split doc keys. Use a fresh Prefix per run.
+// Setup divides input into Config.MapShards contiguous splits and creates the
+// run from them; see SetupFrom. Empty input is an error.
 func (c *Controller) Setup(ctx context.Context, input []*KV) error {
+	if c.cfg.MapShards <= 0 {
+		return fmt.Errorf("eqmr setup: MapShards must be set with WithMapShards; it fixes how input is divided")
+	}
+	// Validate every record first, so an error names the record.
+	for i, kv := range input {
+		if err := ValidateText(fmt.Sprintf("input key at index %d", i), kv.Key); err != nil {
+			return fmt.Errorf("eqmr setup: %w", err)
+		}
+		if err := ValidateText(fmt.Sprintf("input value at index %d", i), kv.Value); err != nil {
+			return fmt.Errorf("eqmr setup: %w", err)
+		}
+	}
+	return c.setup(ctx, c.inlineSource(input, c.cfg.MapShards))
+}
+
+// SetupFrom creates the run with one split doc and one map task per split of
+// the source set by WithSource. MapShards does not apply, and must be unset.
+//
+// It stages the split docs under deterministic ids, then creates the state doc
+// and every map task in one Modify, so a run is never half set up. On a Prefix
+// that already holds the run it does nothing, so a retry or a restarted
+// launcher resumes the run; run one launcher at a time, since one that stages
+// while another's run is accepting splits brings them back. A Prefix that
+// holds a different run is an error, and so is a source with no splits.
+func (c *Controller) SetupFrom(ctx context.Context) error {
+	if c.cfg.Source == nil {
+		return fmt.Errorf("eqmr setup: no source; configure one with WithSource")
+	}
+	if c.cfg.MapShards != 0 {
+		return fmt.Errorf("eqmr setup: MapShards applies only to Setup; a source's splits are its own")
+	}
+	return c.setup(ctx, c.cfg.Source)
+}
+
+func (c *Controller) setup(ctx context.Context, src Source) error {
 	const batchSize = 250
 
-	if err := c.cfg.validateForSetup(); err != nil {
+	if c.cfg.ReduceShards <= 0 {
+		return fmt.Errorf("eqmr setup: ReduceShards must be set with WithReduceShards; it fixes the document layout when the map phase writes its output")
+	}
+	source := src.Descriptor()
+	if err := source.validate(); err != nil {
+		return fmt.Errorf("eqmr setup source: %w", err)
+	}
+	store := c.defaultStore()
+	if err := store.validate(); err != nil {
+		return fmt.Errorf("eqmr setup: %w", err)
+	}
+	sink := c.sink.Descriptor()
+	if err := sink.validate(); err != nil {
+		return fmt.Errorf("eqmr setup sink: %w", err)
+	}
+	// A run that exists is resumed, not staged again: staging would bring back
+	// the splits it has already accepted.
+	want := runState{MapShards: c.cfg.MapShards, ReduceParts: c.cfg.ReduceShards, Source: source, Store: store, Sink: sink}
+	if found, err := c.alreadySetUp(ctx, want); found || err != nil {
 		return err
 	}
-	splits := splitInput(input, c.cfg.MapShards)
-
-	// Empty splits are never written, so the number of map units is not
-	// necessarily MapShards. Progress reporting needs the real total, and it is
-	// only knowable here, so it is stamped into the control task rather than
-	// inferred later from a config value that may overstate it.
-	created := 0
-	for _, split := range splits {
-		if len(split) > 0 {
-			created++
-		}
+	splits, err := src.Splits(ctx)
+	if err != nil {
+		return fmt.Errorf("eqmr setup: list splits: %w", err)
+	}
+	if len(splits) == 0 {
+		return fmt.Errorf("eqmr setup: no input")
 	}
 
-	var args []entroq.ModifyArg
+	// Deterministic ids and batches let a retry skip splits already staged: a
+	// batch commits whole or not at all, so one that fails only on colliding
+	// ids landed before.
+	var staged []entroq.ModifyArg
 	flush := func() error {
-		if len(args) == 0 {
+		if len(staged) == 0 {
 			return nil
 		}
-		if _, err := c.client.Modify(ctx, args...); err != nil {
-			return fmt.Errorf("eqmr setup: %w", err)
+		if _, err := c.client.Modify(ctx, staged...); err != nil {
+			if de, ok := entroq.AsDependency(err); !ok || !de.OnlyCollisions() {
+				return fmt.Errorf("eqmr setup: stage splits: %w", err)
+			}
 		}
-		args = args[:0]
+		staged = staged[:0]
 		return nil
 	}
-
+	st := want
+	st.Phase, st.MapSplits = PhaseMap, len(splits)
+	start := []entroq.ModifyArg{entroq.PuttingDocInto(c.DocNS(),
+		entroq.WithIDKeys(stateDocID, stateDocKey, ""),
+		entroq.WithContent(st),
+	)}
 	for i, split := range splits {
-		if len(split) == 0 {
-			continue
-		}
-		// Validate the input here rather than letting a bad record surface as a
-		// marshaling failure inside a mapper, where it would be reported against
-		// a split rather than against the record that is actually wrong.
-		for j, kv := range split {
-			if err := ValidateText(fmt.Sprintf("input key at index %d", j), kv.Key); err != nil {
-				return fmt.Errorf("eqmr setup: %w", err)
-			}
-			if err := ValidateText(fmt.Sprintf("input value at index %d", j), kv.Value); err != nil {
-				return fmt.Errorf("eqmr setup: %w", err)
-			}
-		}
 		key := splitDocKey(i)
-		if err := ValidText("split doc key", key, MaxDocKeyBytes); err != nil {
-			return fmt.Errorf("eqmr setup: %w", err)
-		}
-		args = append(args,
-			entroq.PuttingDocInto(c.DocNS(), entroq.WithKeys(key, ""), entroq.WithContent(split)),
-			entroq.InsertingInto(c.MapQ(), entroq.WithValue(docRef{
-				NS:           c.DocNS(),
-				Key:          key,
-				ReduceShards: c.cfg.ReduceShards,
-			})),
-		)
-		if len(args) >= batchSize {
+		staged = append(staged, entroq.PuttingDocInto(c.DocNS(),
+			entroq.WithIDKeys(splitDocID(i), key, ""),
+			entroq.WithContent(splitDoc{Split: split}),
+		))
+		if len(staged) >= batchSize {
 			if err := flush(); err != nil {
 				return err
 			}
 		}
+		start = append(start, entroq.InsertingInto(c.MapQ(), entroq.WithValue(docRef{
+			NS:           c.DocNS(),
+			Key:          key,
+			ReduceShards: c.cfg.ReduceShards,
+			Source:       source,
+			Store:        store,
+		})))
 	}
 	if err := flush(); err != nil {
 		return err
 	}
 
-	// The control task is created last, so a failed Setup never leaves a
-	// controller polling a run whose inputs were never fully written.
-	if _, err := c.client.Modify(ctx, entroq.InsertingInto(c.ControlQ(),
-		entroq.WithValue(controlState{
-			Phase:        PhaseMap,
-			MapSplits:    created,
-			ReduceParts:  c.cfg.ReduceShards,
-			LastProgress: time.Now(),
-		}),
-	)); err != nil {
-		return fmt.Errorf("eqmr setup control task: %w", err)
+	// The run and all of its map tasks appear together.
+	_, err = c.client.Modify(ctx, start...)
+	if de, ok := entroq.AsDependency(err); ok && de.HasCollisions() {
+		// A retry whose first commit landed.
+		if found, err := c.alreadySetUp(ctx, want); found || err != nil {
+			return err
+		}
+		return fmt.Errorf("eqmr setup: start run: %w", de)
+	}
+	if err != nil {
+		return fmt.Errorf("eqmr setup: start run: %w", err)
 	}
 	return nil
 }
 
-// splitInput divides input into n contiguous groups whose sizes differ by at
-// most one. Groups may be empty when len(input) < n.
-func splitInput(input []*KV, n int) [][]*KV {
-	splits := make([][]*KV, n)
-	if len(input) == 0 {
-		return splits
+// alreadySetUp reports whether Prefix holds a run, and errors if it is not the
+// one want describes. A run is recognized by its shard counts and descriptors,
+// not its splits, so resuming it does not list the input again.
+func (c *Controller) alreadySetUp(ctx context.Context, want runState) (bool, error) {
+	doc, st, err := c.stateDoc(ctx)
+	if err != nil {
+		return false, fmt.Errorf("eqmr setup: %w", err)
 	}
-	per, extra := len(input)/n, len(input)%n
-	start := 0
-	for i := range n {
-		size := per
-		if i < extra {
-			size++
-		}
-		splits[i] = input[start : start+size]
-		start += size
+	if doc == nil {
+		return false, nil
 	}
-	return splits
+	if st.MapShards != want.MapShards || st.ReduceParts != want.ReduceParts ||
+		st.Source != want.Source || st.Store != want.Store || st.Sink != want.Sink {
+		return true, fmt.Errorf("eqmr setup: prefix %q already holds a different run", c.prefix)
+	}
+	return true, nil
 }
 
 // MapperOption configures a mapper worker.
 type MapperOption func(*mapperOpts)
 
 type mapperOpts struct {
-	combiner Combiner
+	combiner             Combiner
+	intermediateRunBytes int
 }
 
-// WithCombiner applies a Combiner to each key's values before they are written
-// to map-output docs. This is the cheapest place to combine and usually the most
-// effective, because it shrinks the data before it is ever stored. See Combiner
-// for the contract it must satisfy.
+// WithCombiner applies cb to each sorted run before it is stored. A split may
+// produce several runs, so cb may apply more than once; see Combiner.
 func WithCombiner(cb Combiner) MapperOption {
 	return func(o *mapperOpts) { o.combiner = cb }
 }
 
-// MapperWorker returns a worker that consumes input splits. Run it with
-// RunOptions, or use the Run helper for the standard configuration.
-//
-// The worker claims its split doc before working, and commits the split doc's
-// deletion in the same Modify that writes its map-output docs. That single atomic
-// step is what makes "no split docs remain" a sound completion barrier.
+// WithIntermediateRunBytes bounds the mapper memory used to sort one batch of
+// intermediate records before writing an immutable run. Non-positive values
+// use DefaultIntermediateRunBytes. A single record may exceed the bound.
+func WithIntermediateRunBytes(n int) MapperOption {
+	return func(o *mapperOpts) { o.intermediateRunBytes = n }
+}
+
+// MapperWorker returns a worker for map tasks. It reads its split without
+// claiming it, writes runs, and commits a finish task naming the split it read
+// and the runs it wrote, in the Modify that deletes its task. RunMapper runs it
+// with the run's options.
 func (c *Controller) MapperWorker(mapFn Mapper, opts ...MapperOption) *worker.Worker[docRef] {
 	o := new(mapperOpts)
 	for _, opt := range opts {
@@ -196,127 +200,86 @@ func (c *Controller) MapperWorker(mapFn Mapper, opts ...MapperOption) *worker.Wo
 	}
 
 	return worker.New[docRef](c.client,
-		worker.WithErrQMap[docRef](c.errQMap),
 		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, work *worker.Work[docRef]) (*worker.Result, error) {
 			task, ref := work.Task, work.Value
-			// Read the split WITHOUT claiming it. Claiming would be mutual
-			// exclusion at start time, which is exactly what makes a duplicate
-			// task pointless: a second worker would block on the claim instead
-			// of racing. Exclusion happens at commit time instead, through the
-			// version-pinned delete below, so two workers may process the same
-			// split and the first to commit wins.
+			// Not claiming the split lets a duplicate task race this one.
 			found, err := c.client.Docs(ctx, ref.asQuery())
 			if err != nil {
-				return nil, fmt.Errorf("read split %q: %w", ref.Key, err)
+				return nil, retryIfUnavailable(fmt.Errorf("read split %q: %w", ref.Key, err))
 			}
 			if len(found) == 0 {
-				// The split is gone, so someone else already committed it. This
-				// task is the loser of a race, or a straggler whose work was
-				// taken over. Either way there is nothing left to do.
+				// The split was already accepted.
 				return worker.Modify(task.Delete()), nil
 			}
 			doc := found[0]
 
-			var split []*KV
+			var split splitDoc
 			if err := json.Unmarshal(doc.Content, &split); err != nil {
-				// A malformed split is a data error, not a transient one:
-				// retrying cannot help, and silently skipping it would produce
-				// a wrong answer. Quarantine it so the controller fails the run.
+				// A malformed split cannot succeed on a retry.
 				return nil, worker.MoveErrorf("parse split doc %q: %v", ref.Key, err)
 			}
 
-			grouped, order, err := runMapper(ctx, mapFn, split)
-			if err != nil {
-				return nil, err
-			}
-			if o.combiner != nil {
-				for _, k := range order {
-					combined, err := o.combiner(ctx, k, grouped[k])
-					if err != nil {
-						return nil, fmt.Errorf("combine %q: %w", k, err)
-					}
-					grouped[k] = combined
-				}
-			}
-
-			// The partition count comes from the task, not from this process's
-			// configuration, so a mapper deployment cannot disagree with the
-			// run it is serving.
+			// The partition count, source, and store come from the task, so a
+			// mapper cannot disagree with its run. A source or store that is
+			// missing, malformed, or unreachable fails the run.
 			if ref.ReduceShards <= 0 {
 				return nil, worker.MoveErrorf("map task for %q carries no partition count", ref.Key)
 			}
-			buckets := partition(grouped, order, ref.ReduceShards)
-
-			// doc.Delete() is pinned to the version read above, so this whole
-			// modification is rejected if another worker committed the same
-			// split first. Rejection is atomic: the losing worker's map-output docs
-			// are never written, so a race costs duplicated compute and nothing
-			// else.
-			modArgs := []entroq.ModifyArg{task.Delete(), doc.Delete()}
-			for p, entries := range buckets {
-				if len(entries) == 0 {
-					continue
+			for _, d := range []Descriptor{ref.Source, ref.Store} {
+				if err := d.validate(); err != nil {
+					return nil, worker.MoveErrorf("map task for %q: %v", ref.Key, err)
 				}
-				modArgs = append(modArgs, entroq.PuttingDocInto(c.DocNS(),
-					// No secondary key. The doc is alone in its set, the
-					// merge is order-independent, and the reducer sorts values
-					// itself, so nothing here needs the ordering a secondary
-					// key provides.
-					entroq.WithKeys(mapOutDocKey(p, ref.Key), ""),
-					entroq.WithContent(entries),
-				))
 			}
-			return worker.Modify(modArgs...).OnDependency(lostRace), nil
+			src, err := c.sources.resolve(ref.Source)
+			if err != nil {
+				return nil, worker.MoveErrorf("map task for %q: %v", ref.Key, err)
+			}
+			store, err := c.resolveStore(ref.Store)
+			if err != nil {
+				return nil, worker.MoveErrorf("map task for %q: %v", ref.Key, err)
+			}
+			records, err := src.Open(ctx, split.Split)
+			if err != nil {
+				return nil, moveOrRetry(err, "open split %q", ref.Key)
+			}
+			defer records.Close()
+			out := newIntermediateWriter(store, c.prefix, ref.ReduceShards, o.intermediateRunBytes, o.combiner)
+			if err := runMapper(ctx, mapFn, records, out); err != nil {
+				abortIntermediate(ctx, out, ref.Key)
+				return nil, err
+			}
+			runs, err := out.finish(ctx)
+			if err != nil {
+				abortIntermediate(ctx, out, ref.Key)
+				return nil, err
+			}
+
+			// The runs are unpublished until the controller accepts this finish.
+			// If this commit fails, the task is someone else's, and the runs are
+			// this worker's to remove.
+			return worker.Modify(task.Delete(), entroq.InsertingInto(c.MapDoneQ(), entroq.WithValue(mapDone{
+				SplitKey: ref.Key,
+				Split:    *doc.IDVersion(),
+				Runs:     runs,
+			}))).OnDependency(func(ctx context.Context, _ *entroq.DependencyError) error {
+				abortIntermediate(ctx, out, ref.Key)
+				return nil
+			}), nil
 		}),
 	)
 }
 
-// lostRace is the disposition for a commit that failed on a dependency.
-//
-// A nil return leaves the task alone. It is reclaimed on lease expiry, re-reads
-// its input, finds the work already done and retires. Never a RetryError: that
-// increments the attempt count, and a worker that lost a race must not be
-// quarantined, since quarantining anything fails the run.
-//
-// Unclassified failures stop the worker, per the OnDependency contract.
-func lostRace(_ context.Context, de *entroq.DependencyError) error {
-	switch {
-	case de.HasMissingDocs():
-		// The input document is gone: another worker committed this unit first.
-		// This is the ordinary way to lose a speculative race.
-		return nil
-
-	case de.HasCollisions():
-		// An explicit-id insert collided, meaning another worker already
-		// recorded this partition's result. It is how an empty partition loses,
-		// having no input document to lose instead.
-		return nil
-
-	case de.HasMissing() || de.HasClaims():
-		// Our own task was deleted or reclaimed while we worked, so it belongs
-		// to someone else now. Ordinary lease behavior, nothing to dispose of.
-		return nil
-
-	default:
-		// Nothing in this package claims documents, so document contention here
-		// means an assumption no longer holds. Stop and let the orchestrator
-		// restart rather than continue from an unexplained failure.
-		return fmt.Errorf("eqmr: unexpected dependency failure: %w", de)
+func abortIntermediate(ctx context.Context, out *intermediateWriter, split string) {
+	if err := out.abort(ctx); err != nil {
+		log.Printf("eqmr: clean up unpublished runs for split %q: %v", split, err)
 	}
 }
 
-// runMapper runs mapFn over every KV in a split, collecting emitted pairs
-// grouped by key and remembering first-emit order for deterministic bucketing.
-func runMapper(ctx context.Context, mapFn Mapper, split []*KV) (map[string][]string, []string, error) {
-	grouped := make(map[string][]string)
-	var order []string
-
-	// Validate at the point of emission, so a bad pair names the mapper call
-	// that produced it.
-	//
-	// A MoveError, because text that is not valid UTF-8 stays invalid on a
-	// retry: the task is quarantined on the first attempt and the controller
-	// fails the run with the reason.
+// runMapper calls mapFn on every record and streams what it emits into out,
+// which cuts sorted runs as its buffer fills.
+func runMapper(ctx context.Context, mapFn Mapper, records Records, out *intermediateWriter) error {
+	// Text is checked where it is emitted, so an error names the mapper call.
+	// Invalid text cannot succeed on a retry.
 	emit := func(_ context.Context, k, v string) error {
 		if err := ValidateText("emitted key", k); err != nil {
 			return worker.MoveErrorf("%v", err)
@@ -324,175 +287,153 @@ func runMapper(ctx context.Context, mapFn Mapper, split []*KV) (map[string][]str
 		if err := ValidateText(fmt.Sprintf("value emitted for key %q", k), v); err != nil {
 			return worker.MoveErrorf("%v", err)
 		}
-		if _, seen := grouped[k]; !seen {
-			order = append(order, k)
-		}
-		grouped[k] = append(grouped[k], v)
-		return nil
+		return out.write(ctx, k, "", v)
 	}
 
-	for _, kv := range split {
+	for {
+		kv, err := records.Next(ctx)
+		if err == io.EOF {
+			return out.err
+		}
+		if err != nil {
+			return moveOrRetry(err, "read input")
+		}
+		if err := ValidateText("input key", kv.Key); err != nil {
+			return worker.MoveErrorf("%v", err)
+		}
+		if err := ValidateText(fmt.Sprintf("input value for key %q", kv.Key), kv.Value); err != nil {
+			return worker.MoveErrorf("%v", err)
+		}
 		if err := mapFn(ctx, kv.Key, kv.Value, emit); err != nil {
-			return nil, nil, fmt.Errorf("map %s: %w", kv, err)
+			return fmt.Errorf("map %s: %w", kv, err)
 		}
 	}
-	return grouped, order, nil
 }
 
-// partition assigns each key to a reduce shard and returns per-shard entries
-// sorted by key, which is the precondition for the reducer's merge.
-func partition(grouped map[string][]string, order []string, shards int) [][]*keyValues {
-	buckets := make([][]*keyValues, shards)
-	for _, key := range order {
-		p := ShardForKey(key, shards)
-		vals := grouped[key]
-		sortValues(vals)
-		buckets[p] = append(buckets[p], &keyValues{Key: key, Values: vals})
-	}
-	for _, entries := range buckets {
-		sort.Slice(entries, func(i, j int) bool { return entries[i].Key < entries[j].Key })
-	}
-	return buckets
-}
-
-func sortValues(vals []string) { sort.Strings(vals) }
-
-// ReducerWorker returns a worker that consumes one reduce partition per task.
+// ReducerWorker returns a worker for reduce tasks. It merges the runs named by
+// its partition's pointers, calls reduceFn once per key, streams the results
+// into a staged attempt at the run's sink, and commits a finish task naming
+// the attempt and what it consumed, in the Modify that deletes its task.
 //
-// It reads every map-output doc under the partition's key prefix, merges those
-// sorted runs, runs reduceFn once per distinct key, and
-// commits the map output deletions together with the partition's result doc. As in
-// the map phase, that atomicity is what makes "no map-output docs remain" a sound
-// barrier.
-func (c *Controller) ReducerWorker(reduceFn Reducer) *worker.Worker[reduceClaim] {
-	return worker.New[reduceClaim](c.client,
-		worker.WithErrQMap[reduceClaim](c.errQMap),
-		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, work *worker.Work[reduceClaim]) (*worker.Result, error) {
-			task, rc := work.Task, work.Value
-			// Read the partition's map outputs WITHOUT claiming them, for the same
-			// reason the mapper does: a claim would block a duplicate worker
-			// rather than race it. Exclusion is at commit time.
-			if !strings.HasSuffix(rc.Doc.Key, "/") {
-				// A run started by an older eqmr keyed a partition's outputs
-				// exactly; reading them as a range would find none and record
-				// an empty result. Fail the run instead.
-				return nil, worker.MoveErrorf("reduce task names %q, not a partition prefix: finish runs before upgrading eqmr", rc.Doc.Key)
-			}
+// A run that cannot be read is retried: a loser whose inputs were collected
+// finds no pointers on the retry and retires.
+func (c *Controller) ReducerWorker(reduceFn Reducer) *worker.Worker[reduceTask] {
+	return worker.New[reduceTask](c.client,
+		worker.WithDoModify(func(ctx context.Context, _ entroq.Reader, work *worker.Work[reduceTask]) (*worker.Result, error) {
+			task, rt := work.Task, work.Value
+			// Not claiming the pointers lets a duplicate task race this one.
 			docs, err := c.client.Docs(ctx, &entroq.DocQuery{
-				Namespace: rc.Doc.NS,
-				KeyStart:  rc.Doc.Key,
-				KeyEnd:    prefixEnd(rc.Doc.Key),
+				Namespace: c.DocNS(),
+				KeyStart:  mapOutPartition(rt.Partition),
+				KeyEnd:    prefixEnd(mapOutPartition(rt.Partition)),
 			})
 			if err != nil {
-				return nil, fmt.Errorf("read map outputs %q: %w", rc.Doc.Key, err)
+				return nil, retryIfUnavailable(fmt.Errorf("read map outputs for partition %d: %w", rt.Partition, err))
 			}
-
 			if len(docs) == 0 {
-				// Either nothing was ever emitted to this partition, or another
-				// worker already reduced it. Those look identical from here, so
-				// ask whether the output exists.
-				done, err := c.client.Docs(ctx, &entroq.DocQuery{
-					Namespace:  c.DocNS(),
-					KeyExact:   resultDocKey(rc.Partition),
-					OmitValues: true,
-				})
-				if err != nil {
-					return nil, fmt.Errorf("check result %d: %w", rc.Partition, err)
-				}
-				if len(done) > 0 {
-					return worker.Modify(task.Delete()), nil
-				}
-				// Genuinely empty. Write an empty result anyway, so that "this
-				// partition is finished" is a recorded fact rather than an
-				// absence: completion is judged purely from documents, and a
-				// silent partition would be indistinguishable from one that
-				// never ran. The explicit document id makes a simultaneous
-				// duplicate collide rather than write a second result.
-				return worker.Modify(task.Delete(), c.resultInsert(rc.Partition, []*KV{})).
-					OnDependency(lostRace), nil
+				// Already reduced: reduce tasks exist only for partitions with
+				// data.
+				return worker.Modify(task.Delete()), nil
 			}
 
-			runs := make([][]*keyValues, 0, len(docs))
-			for _, d := range docs {
-				var entries []*keyValues
-				if err := json.Unmarshal(d.Content, &entries); err != nil {
-					return nil, worker.MoveErrorf("parse map-output doc %q: %v", d.ID, err)
-				}
-				runs = append(runs, entries)
-			}
-
-			var out []*KV
-			err = mergeRuns(runs, func(key string, values []string) error {
-				// Values arrive as the concatenation of per-split runs, each
-				// internally sorted. Sorting again makes a key's reduce input
-				// independent of split count and combine order, so results are
-				// reproducible across differently sharded runs of the same input.
-				sortValues(values)
-				result, err := reduceFn(ctx, &sliceInput{key: key, values: values})
-				if err != nil {
-					return fmt.Errorf("reduce %q: %w", key, err)
-				}
-				out = append(out, NewKV(key, result))
-				return nil
-			})
+			// A sink or store this process cannot reach fails the run.
+			sink, err := c.sinks.resolve(rt.Sink)
 			if err != nil {
+				return nil, worker.MoveErrorf("partition %d: %v", rt.Partition, err)
+			}
+			stores := c.stores
+			pointers := make([]entroq.DocID, 0, len(docs))
+			runs := make([]intermediateRun, 0, len(docs))
+			for _, d := range docs {
+				run, err := entroq.GetContent[intermediateRun](d)
+				if err != nil {
+					return nil, worker.MoveErrorf("parse map-output pointer %q: %v", d.ID, err)
+				}
+				if run.Partition != rt.Partition {
+					return nil, worker.MoveErrorf("map-output pointer %q names partition %d, want %d", d.ID, run.Partition, rt.Partition)
+				}
+				if _, err := stores.resolve(run.Store); err != nil {
+					return nil, worker.MoveErrorf("partition %d: %v", rt.Partition, err)
+				}
+				pointers = append(pointers, *d.IDVersion())
+				runs = append(runs, run)
+			}
+
+			merged, err := openMergedIntermediate(ctx, stores, runs)
+			if err != nil {
+				return nil, runReadFailure(err, "open partition %d", rt.Partition)
+			}
+			writer, err := sink.Stage(ctx, c.prefix, rt.Partition, rt.Partitions)
+			if err != nil {
+				return nil, errors.Join(moveOrRetry(err, "stage partition %d", rt.Partition), merged.Close())
+			}
+			reduceErr := reduceIntermediate(ctx, merged, reduceFn, writer)
+			mergeErr := merged.Close()
+			staged, stageErr := writer.Close(ctx)
+			if err := errors.Join(reduceErr, mergeErr); err != nil {
 				return nil, err
 			}
-
-			// Every map output delete is version-pinned, so a worker that lost this
-			// partition to another has its whole modification rejected and
-			// writes no result.
-			modArgs := []entroq.ModifyArg{task.Delete()}
-			for _, d := range docs {
-				modArgs = append(modArgs, d.Delete())
+			if stageErr != nil {
+				return nil, moveOrRetry(stageErr, "stage partition %d", rt.Partition)
 			}
-			modArgs = append(modArgs, c.resultInsert(rc.Partition, out))
-			return worker.Modify(modArgs...).OnDependency(lostRace), nil
+
+			// The controller decides which attempt is committed. One that no
+			// finish names is swept with the sink.
+			return worker.Modify(task.Delete(), entroq.InsertingInto(c.ReduceDoneQ(), entroq.WithValue(reduceDone{
+				Partition: rt.Partition,
+				Pointers:  pointers,
+				Runs:      runs,
+				Sink:      rt.Sink,
+				Staged:    staged,
+			}))), nil
 		}),
 	)
 }
 
-// resultInsert builds the insert for one partition's output. The explicit
-// document id is what stops two racing workers from both recording a result.
-func (c *Controller) resultInsert(partition int, out []*KV) entroq.ModifyArg {
-	return entroq.PuttingDocInto(c.DocNS(),
-		entroq.WithIDKeys(resultDocID(partition), resultDocKey(partition), ""),
-		entroq.WithContent(out),
-	)
+// moveOrRetry quarantines the task on a worker.MoveError from a source or sink,
+// which fails the run, and retries anything else. A worker whose context has
+// ended applies neither, so a cancellation seen as a failure here lets the
+// task's claim lapse with its lease.
+func moveOrRetry(err error, format string, args ...any) error {
+	what := fmt.Sprintf(format, args...)
+	if _, ok := worker.AsMove(err); ok {
+		return worker.MoveErrorf("%s: %v", what, err)
+	}
+	return worker.RetryErrorf("%s: %v", what, err)
 }
 
-// mergeRuns performs a k-way merge over runs that are each sorted by key,
-// calling visit once per distinct key with every value for it, in key order.
-//
-// Cursor-per-run with a linear minimum scan is O(k) per key. With k equal to
-// the number of map splits that is comfortably cheaper than the reduce work
-// itself; swapping in a heap becomes worthwhile only once map outputs are read
-// lazily rather than unmarshaled up front.
-func mergeRuns(runs [][]*keyValues, visit func(key string, values []string) error) error {
-	cursors := make([]int, len(runs))
+// runReadFailure quarantines the task on a corrupt run, which reads the same
+// every time, and retries anything else: a missing run may have been collected
+// after another worker reduced the partition.
+func runReadFailure(err error, format string, args ...any) error {
+	what := fmt.Sprintf(format, args...)
+	if errors.Is(err, errCorruptRun) {
+		return worker.MoveErrorf("%s: %v", what, err)
+	}
+	return worker.RetryErrorf("%s: %v", what, err)
+}
+
+// reduceIntermediate runs reduceFn once per key of merged, in key order, and
+// writes each result to out as it is produced.
+func reduceIntermediate(ctx context.Context, merged *mergedIntermediate, reduceFn Reducer, out SinkWriter) error {
+	stream := newGroupedIntermediate(ctx, merged)
 	for {
-		minKey, have := "", false
-		for i, run := range runs {
-			if cursors[i] >= len(run) {
-				continue
+		input, ok := stream.nextGroup()
+		if !ok {
+			if stream.err != nil {
+				return runReadFailure(stream.err, "read intermediate records")
 			}
-			if k := run[cursors[i]].Key; !have || k < minKey {
-				minKey, have = k, true
-			}
-		}
-		if !have {
 			return nil
 		}
-
-		var values []string
-		for i, run := range runs {
-			for cursors[i] < len(run) && run[cursors[i]].Key == minKey {
-				values = append(values, run[cursors[i]].Values...)
-				cursors[i]++
-			}
+		result, err := reduceFn(ctx, input)
+		if err != nil {
+			return fmt.Errorf("reduce %q: %w", input.Key(), err)
 		}
-		if err := visit(minKey, values); err != nil {
-			return err
+		if err := input.drain(); err != nil {
+			return runReadFailure(err, "drain reduce input %q", input.Key())
+		}
+		if err := out.Write(ctx, input.Key(), result); err != nil {
+			return moveOrRetry(err, "write output for %q", input.Key())
 		}
 	}
 }

@@ -8,11 +8,10 @@ import (
 	"github.com/shiblon/entroq"
 	"github.com/shiblon/entroq/pkg/backend/eqmem"
 	"github.com/shiblon/entroq/pkg/eqmr"
-	"github.com/shiblon/entroq/pkg/worker"
 )
 
-// mapOutBytes runs only the map phase and reports the total size of the map output
-// docs it produced: the intermediate data the reduce phase has to move.
+// mapOutBytes runs only the map phase and reports the total size of its durable
+// run payloads: the intermediate data the reduce phase has to move.
 func mapOutBytes(t *testing.T, input []*eqmr.KV, combiner eqmr.Combiner, mapShards int) int {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -36,38 +35,10 @@ func mapOutBytes(t *testing.T, input []*eqmr.KV, combiner eqmr.Combiner, mapShar
 	if combiner != nil {
 		opts = append(opts, eqmr.WithCombiner(combiner))
 	}
-	mapCtx, stopMappers := context.WithCancel(ctx)
-	defer stopMappers()
-	for range 4 {
-		go func() {
-			_ = ctrl.MapperWorker(eqmr.WordCountMapper, opts...).Run(mapCtx,
-				worker.Watching(ctrl.MapQ()), worker.WithLease(5*time.Second))
-		}()
-	}
-
-	// The map phase barrier: split docs are deleted in the same Modify that
-	// writes the map outputs, so their absence means every map output is durable.
-	for {
-		splits, err := eq.Docs(ctx, &entroq.DocQuery{
-			Namespace: ctrl.DocNS(), KeyStart: "split/", KeyEnd: "split0",
-			OmitValues: true, Limit: 1,
-		})
-		if err != nil {
-			t.Fatalf("check splits: %v", err)
-		}
-		if len(splits) == 0 {
-			break
-		}
-		select {
-		case <-ctx.Done():
-			t.Fatal("timed out waiting for the map phase")
-		case <-time.After(10 * time.Millisecond):
-		}
-	}
-	stopMappers()
+	mapOnly(ctx, t, eq, ctrl, opts...)
 
 	outs, err := eq.Docs(ctx, &entroq.DocQuery{
-		Namespace: ctrl.DocNS(), KeyStart: "mapout/", KeyEnd: "mapout0",
+		Namespace: ctrl.DocNS(), KeyStart: "run/", KeyEnd: "run0",
 	})
 	if err != nil {
 		t.Fatalf("read map outputs: %v", err)
