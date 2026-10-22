@@ -242,8 +242,8 @@ EntroQ.Worker.run(client, ["/my/queue"], MyWorker)
 ### Any language (work gateway)
 A worker can be written in **any** language without importing EntroQ or gRPC:
 `eqlink work` runs the hard part of the worker loop (claim, renew, commit) on its
-behalf and speaks a small newline-delimited JSON protocol over a stdio pipe or a
-WebSocket. See the wire contract and the client recipes in
+behalf, and the worker drives it with a small JSON protocol over plain HTTP or
+a stdio pipe. See the wire contract and the client recipes in
 [`docs/workgateway-protocol.md`](docs/workgateway-protocol.md), and a minimal
 Python example in [`examples/workgateway/`](examples/workgateway/).
 
