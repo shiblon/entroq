@@ -22,6 +22,10 @@ const DefaultMaxFrameBytes = 10 << 20
 // would mark the next frame is somewhere in the bytes nobody is reading.
 var ErrFrameTooLarge = errors.New("frame too large")
 
+// ErrMalformedFrame is a frame that does not decode as a request. Like a frame
+// over the limit, it ends the session, and the peer is told why.
+var ErrMalformedFrame = errors.New("malformed frame")
+
 // StreamConn carries a gateway session over one byte stream: a unix socket, a
 // TCP conn, anything that reads and writes. Two one-way streams, which is what
 // a spawned child gets for its stdin and stdout, become one with Joining.
@@ -174,6 +178,12 @@ func pumpRead(ctx context.Context, r io.Reader, out chan<- requestFrame, gone ch
 	br := bufio.NewReader(r)
 	for {
 		line, err := readFrame(br, max)
+		if errors.Is(err, ErrFrameTooLarge) {
+			// The peer is still there and reading, so only the read side ends:
+			// the gateway can still answer, and tell it why.
+			end(err)
+			return nil
+		}
 		if err != nil {
 			// A broken read leaves a fragment, not a frame, and the read error
 			// is why the session is ending -- not whatever the fragment fails
@@ -190,7 +200,9 @@ func pumpRead(ctx context.Context, r io.Reader, out chan<- requestFrame, gone ch
 		}
 		req := new(Request)
 		if uerr := json.Unmarshal(line, req); uerr != nil {
-			return end(fmt.Errorf("decode frame: %w", uerr))
+			// As for a frame over the limit, only the read side ends.
+			end(fmt.Errorf("%w: %v", ErrMalformedFrame, uerr))
+			return nil
 		}
 		if derr := deliver(ctx, out, requestFrame{req: req}); derr != nil {
 			return derr

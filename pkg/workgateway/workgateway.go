@@ -520,7 +520,7 @@ func (g *Gateway) Handle(ctx context.Context) error {
 
 	msg, err := g.conn.Recv(ctx)
 	if err != nil {
-		return g.exit(fmt.Errorf("handle recv: %w", err))
+		return g.finish(ctx, recvFault(fmt.Errorf("handle recv: %w", err)))
 	}
 	switch msg.Type {
 	case ReqReady:
@@ -655,7 +655,7 @@ func (g *Gateway) recv(ctx context.Context, expect RequestType) (*Request, error
 			continue
 		}
 		if msg.Type != expect {
-			return nil, fmt.Errorf("gateway recv expected %v, got %v", expect, msg.Type)
+			return nil, worker.FatalErrorf("gateway recv expected %v, got %v", expect, msg.Type)
 		}
 		// The task's answer ends what the client owed for it, so the next
 		// task starts unheld.
@@ -681,7 +681,7 @@ func (g *Gateway) recvWithin(ctx context.Context) (*Request, error) {
 	if !g.armed {
 		msg, err := g.conn.Recv(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("gateway recv: %w", err)
+			return nil, recvFault(fmt.Errorf("gateway recv: %w", err))
 		}
 		return msg, nil
 	}
@@ -692,9 +692,20 @@ func (g *Gateway) recvWithin(ctx context.Context) (*Request, error) {
 		if ctx.Err() == nil && errors.Is(context.Cause(sctx), errSilent) {
 			return nil, fmt.Errorf("gateway recv: %w (%v)", errSilent, g.silenceTimeout())
 		}
-		return nil, fmt.Errorf("gateway recv: %w", err)
+		return nil, recvFault(fmt.Errorf("gateway recv: %w", err))
 	}
 	return msg, nil
+}
+
+// recvFault makes a failed Recv the client caused, a frame over the limit or
+// one that does not decode, a fatal: the session ends as the caller's fault,
+// and the task in hand keeps its claim rather than counting against the
+// handler. Any other failure is left as it is.
+func recvFault(err error) error {
+	if errors.Is(err, ErrFrameTooLarge) || errors.Is(err, ErrMalformedFrame) {
+		return worker.FatalErrorf("%v", err)
+	}
+	return err
 }
 
 // silenced is what a silent client gets, the same as a fired work timeout: the

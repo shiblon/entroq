@@ -133,7 +133,7 @@ func (k *keptConn) idleTurn() (*Request, error) {
 		if k.ctx.Err() == nil && errors.Is(context.Cause(ctx), errIdleSilent) {
 			return nil, fmt.Errorf("%w within %v", errIdleSilent, k.within)
 		}
-		return nil, fmt.Errorf("idle recv: %w", err)
+		return nil, recvFault(fmt.Errorf("idle recv: %w", err))
 	}
 	if msg.Type != ReqReady {
 		return nil, worker.FatalErrorf("idle recv expected %v, got %v", ReqReady, msg.Type)
