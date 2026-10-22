@@ -77,8 +77,11 @@ type Config struct {
 	// Unlimited when set to its zero value.
 	MaxAttempts int32 `json:"max_attempts"`
 
-	// MaxClaims sets maximum claims without modification before quarantine.
-	// Unlimited when set to its zero value.
+	// MaxClaims sets how many claims a task may fail to survive before it is
+	// quarantined. Zero takes the worker's default (worker.DefaultMaxClaims), as
+	// zero does elsewhere in a config, and a negative value is no limit. That
+	// differs from worker.WithMaxClaims, where zero is no limit, so that a
+	// client that says nothing gets what a native worker gets.
 	MaxClaims int32 `json:"max_claims"`
 
 	// RespDocs indicates that the client takes documents.
@@ -547,7 +550,7 @@ func (g *Gateway) Handle(ctx context.Context) error {
 			worker.AsClaimant(g.claimant),
 			worker.Watching(g.config.Queues...),
 			worker.WithMaxAttempts(g.config.MaxAttempts),
-			worker.WithMaxClaims(g.config.MaxClaims),
+			worker.WithMaxClaims(maxClaims(g.config.MaxClaims)),
 			worker.WithLease(g.opts.lease),
 			worker.WithWorkTimeout(g.workTimeout),
 		)))
@@ -759,6 +762,18 @@ func (g *Gateway) makeDoModify() worker.DoModifyRun[json.RawMessage] {
 		}
 		return res, nil
 	}
+}
+
+// maxClaims is the claim limit a client's max_claims asks for: the worker's
+// default for zero, none for a negative value.
+func maxClaims(asked int32) int32 {
+	switch {
+	case asked == 0:
+		return worker.DefaultMaxClaims
+	case asked < 0:
+		return 0
+	}
+	return asked
 }
 
 // quit records that the client asked to drain. Nothing stops here: the task in

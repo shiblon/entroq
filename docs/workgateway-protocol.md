@@ -91,7 +91,7 @@ the session:
 | `want_success`, `want_dependency` | Run the post-commit turns. |
 | `error_queue` | Where a quarantined or moved task goes. `{inbox}` stands for the task's own queue; the default is `{inbox}/err`. |
 | `max_attempts` | Retries before a task is quarantined. Zero is no limit. |
-| `max_claims` | Claims a task may fail to survive before it is quarantined. Zero is no limit. |
+| `max_claims` | Claims a task may fail to survive before it is quarantined. Zero takes the worker's default of five; a negative value is no limit. |
 | `retry_delay_s` | Base delay before a retried task is available again. Zero takes the worker's default. |
 | `work_timeout_s` | How long this client expects one task to take. The operator caps it. |
 | `dangerous_claimant_override` | Replace the gateway's claimant. Only if you supply your own ownership guarantees. |
