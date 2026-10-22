@@ -93,7 +93,7 @@ the session:
 | `max_attempts` | Retries before a task is quarantined. Zero is no limit. |
 | `max_claims` | Claims a task may fail to survive before it is quarantined. Zero takes the worker's default of five; a negative value is no limit. |
 | `retry_delay_s` | Base delay, in whole seconds, before a retried task is available again, including a task whose doc sets someone else holds. Zero takes the worker's default of 30. |
-| `work_timeout_s` | How long this client expects one task to take. The operator caps it. |
+| `work_timeout_s` | How long this client expects one task to take, in whole seconds. The operator caps it. Zero takes the operator's cap, `--max-work-timeout` (default 5m). |
 | `dangerous_claimant_override` | Replace the gateway's claimant. Only if you supply your own ownership guarantees. |
 
 The gateway answers with `ready`, which carries what the session settled on:

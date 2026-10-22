@@ -661,7 +661,7 @@ class EntroQWorker:
             return Modification(Modification.deleting(task))
 
         async def main():
-            async with EntroQJSON('http://localhost:8080') as eq:
+            async with EntroQJSON('http://localhost:9100') as eq:
                 worker = EntroQWorker(eq, 'my-queue')
                 await worker.run(process)
 

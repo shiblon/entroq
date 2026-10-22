@@ -259,8 +259,8 @@ Key values — override with `--set key=value` or `-f my-values.yaml`:
 
 | Value | Default | Description |
 |---|---|---|
-| `entroq.storage.enabled` | `false` | `true` = StatefulSet + PVC (journaled); `false` = Deployment (memory-only) |
-| `entroq.storage.size` | `1Gi` | PVC size when storage is enabled |
+| `entroq.backend.type` | `memory` | `memory` (Deployment, nothing persisted), `journal` (StatefulSet + PVC), `postgres`, or `redis` |
+| `entroq.storage.size` | `1Gi` | PVC size when `backend.type` is `journal` |
 | `entroq.storage.storageClass` | `""` | StorageClass for PVC; blank = cluster default |
 | `entroq.authorization.strategy` | `mesh` | `mesh` uses native label policy; `opahttp` runs the OPA sidecar; `none` is unsecured |
 | `entroq.authorization.opaUrl` | `http://localhost:8181` | OPA endpoint used by EntroQ when the strategy is `opahttp` |

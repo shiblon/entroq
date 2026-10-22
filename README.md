@@ -44,9 +44,11 @@ worker while others continue making progress on "good" work. This design allows
 you to scale your processing power simply by adding more workers. Once a task
 is in a queue, no further communication between nodes is required.
 
-Workers can set configuration options that automatically quarantine tasks if
-they have failed too many times, where they can be inspected manually, fixed,
-and reintroduced to their work queue as needed.
+By default a worker quarantines a task that has been claimed five times without
+being handled (a crash or a hang each time), recording why, so a poison pill
+stops costing workers. A worker can also cap failed attempts. Quarantined tasks
+wait in an error queue, `<inbox>/err` by default, to be inspected, fixed, and
+reintroduced to their work queue as needed.
 
 ## Getting Started
 
@@ -147,6 +149,14 @@ Important details:
 - On command failure, the current task is modified in place: `attempt` and
   `err` are updated, and `At` is moved by `--retry-in`. The default
   `--max-attempts 0` means unlimited retries.
+- `--work-timeout` (default 5m) bounds one run of the command: one that runs
+  longer is killed and the task retried, its attempt counted. Use 0 for a
+  command that legitimately runs longer.
+- `--max-claims` (default 5) moves a task to the error queue once it has been
+  claimed that many times without being handled, such as a command that
+  crashes the worker. Use 0 for no limit.
+- `--lease` is the claim lease, which the worker renews two thirds of the way
+  through for as long as the command runs.
 - Invalid JSONL output, too much stdout, or exhausted attempts move the input
   task to `--error-queue`, defaulting to `<input>/err`.
 - `--recur-in` is the cron-like mode: after a successful run, the claimed task
@@ -270,18 +280,25 @@ to read or coordinate around.
 
 Doc namespaces can opt into the same built-in garbage collection as task queues
 by placing `/gc=<timestamp>` in the namespace. Once active, GC removes each
-primary-key set atomically, and only while every member of that set is
-unclaimed. A claimed set does not prevent collection of other sets in the
+primary-key set atomically, and only while the set is unclaimed. A claimed set does not prevent collection of other sets in the
 same namespace. Malformed `gc=` values are reported and never collected.
 
 Docs and tasks share the same `Modify` call, so you can atomically insert a
 task and its initial doc state, or delete a task and update a doc, in one round
 trip with no possibility of partial failure.
 
-`ClaimDocs` acquires an exclusive lease on all docs sharing a primary key in
-one atomic operation, making the primary key the natural unit of coordinated
-ownership. Results are returned ordered by `(primary key, secondary key)`,
-which makes reduce-shaped strategies straightforward.
+The docs sharing a namespace and primary key are a doc set, with one version,
+claimant, and arrival time between them. `ClaimDocs` claims one or more sets in
+one atomic operation, all of them or none, and a set can be claimed even while
+it has no docs. While a set is held, only its holder can write to it. Secondary
+keys are unique within a set, and docs come back ordered by
+`(primary key, secondary key)`, which makes reduce-shaped strategies
+straightforward.
+
+Tasks give exclusivity and docs follow them: a worker that holds a task and
+the doc sets that task needs works without interference. Workers that all
+contend for the same doc sets, rather than for tasks, are a sign the work
+should be partitioned by task instead.
 
 ## Reusable Workers
 
@@ -291,6 +308,7 @@ so you don't have to write the claim/renew/modify loop yourself:
 | Package | What it does |
 |---|---|
 | `mapworker` | Generic map: transforms a task's value and routes the result to an outbox queue |
+| `handoffworker` | Hands tasks from a queue on one EntroQ instance to a queue on another, exactly once in effect |
 | `httpworker` | Executes HTTP requests described by task values; writes the response back as a task |
 | `procworker` | Runs a subprocess described by the task value; captures stdout/stderr as an output task |
 | `fileworker` | Writes task values to files |
