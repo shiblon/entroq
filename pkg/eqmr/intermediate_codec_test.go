@@ -97,7 +97,7 @@ func TestIntermediateRunCodecRejectsInvalidStreams(t *testing.T) {
 			if got := errors.Is(err, errCorruptRun); got != tc.corrupt {
 				t.Errorf("corrupt = %v, want %v for %v", got, tc.corrupt, err)
 			}
-			_, moved := worker.AsMove(runReadFailure(context.Background(), err, "read"))
+			_, moved := worker.AsMove(runReadFailure(err, "read"))
 			if moved != tc.corrupt {
 				t.Errorf("quarantined = %v, want %v: only corruption skips retries", moved, tc.corrupt)
 			}
@@ -137,30 +137,8 @@ func TestIntermediateRunBrokenSourceIsRetried(t *testing.T) {
 	if err == nil || errors.Is(err, errCorruptRun) {
 		t.Fatalf("read of a broken source: got %v, want a retryable error", err)
 	}
-	if _, retried := worker.AsRetry(runReadFailure(context.Background(), err, "read")); !retried {
+	if _, retried := worker.AsRetry(runReadFailure(err, "read")); !retried {
 		t.Errorf("a broken source was not retried")
-	}
-}
-
-// TestCancelledWorkerIsNoVerdict fails reads and writes under a cancelled
-// context. The task is neither retried nor moved: its claim expires with the
-// lease, where a retry would hold it back for the full retry delay.
-func TestCancelledWorkerIsNoVerdict(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	for name, err := range map[string]error{
-		"read":  runReadFailure(ctx, ctx.Err(), "read"),
-		"write": moveOrRetry(ctx, fmt.Errorf("write: %w", ctx.Err()), "write"),
-	} {
-		_, retried := worker.AsRetry(err)
-		_, moved := worker.AsMove(err)
-		if retried || moved || !errors.Is(err, context.Canceled) {
-			t.Errorf("%s under a cancelled context: got %v (retry %v, move %v), want a plain cancellation", name, err, retried, moved)
-		}
-	}
-	// A move is still a verdict: the data is bad however the worker ends.
-	if _, moved := worker.AsMove(moveOrRetry(ctx, worker.MoveErrorf("bad line"), "read")); !moved {
-		t.Error("a MoveError under a cancelled context was not moved")
 	}
 }
 

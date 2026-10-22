@@ -240,7 +240,7 @@ func (c *Controller) MapperWorker(mapFn Mapper, opts ...MapperOption) *worker.Wo
 			}
 			records, err := src.Open(ctx, split.Split)
 			if err != nil {
-				return nil, moveOrRetry(ctx, err, "open split %q", ref.Key)
+				return nil, moveOrRetry(err, "open split %q", ref.Key)
 			}
 			defer records.Close()
 			out := newIntermediateWriter(store, c.prefix, ref.ReduceShards, o.intermediateRunBytes, o.combiner)
@@ -296,7 +296,7 @@ func runMapper(ctx context.Context, mapFn Mapper, records Records, out *intermed
 			return out.err
 		}
 		if err != nil {
-			return moveOrRetry(ctx, err, "read input")
+			return moveOrRetry(err, "read input")
 		}
 		if err := ValidateText("input key", kv.Key); err != nil {
 			return worker.MoveErrorf("%v", err)
@@ -361,11 +361,11 @@ func (c *Controller) ReducerWorker(reduceFn Reducer) *worker.Worker[reduceTask] 
 
 			merged, err := openMergedIntermediate(ctx, stores, runs)
 			if err != nil {
-				return nil, runReadFailure(ctx, err, "open partition %d", rt.Partition)
+				return nil, runReadFailure(err, "open partition %d", rt.Partition)
 			}
 			writer, err := sink.Stage(ctx, c.prefix, rt.Partition, rt.Partitions)
 			if err != nil {
-				return nil, errors.Join(moveOrRetry(ctx, err, "stage partition %d", rt.Partition), merged.Close())
+				return nil, errors.Join(moveOrRetry(err, "stage partition %d", rt.Partition), merged.Close())
 			}
 			reduceErr := reduceIntermediate(ctx, merged, reduceFn, writer)
 			mergeErr := merged.Close()
@@ -374,7 +374,7 @@ func (c *Controller) ReducerWorker(reduceFn Reducer) *worker.Worker[reduceTask] 
 				return nil, err
 			}
 			if stageErr != nil {
-				return nil, moveOrRetry(ctx, stageErr, "stage partition %d", rt.Partition)
+				return nil, moveOrRetry(stageErr, "stage partition %d", rt.Partition)
 			}
 
 			// The controller decides which attempt is committed. One that no
@@ -391,37 +391,26 @@ func (c *Controller) ReducerWorker(reduceFn Reducer) *worker.Worker[reduceTask] 
 }
 
 // moveOrRetry quarantines the task on a worker.MoveError from a source or sink,
-// which fails the run, and retries anything else. See unsentineled.
-func moveOrRetry(ctx context.Context, err error, format string, args ...any) error {
+// which fails the run, and retries anything else. A worker whose context has
+// ended applies neither, so a cancellation seen as a failure here lets the
+// task's claim lapse with its lease.
+func moveOrRetry(err error, format string, args ...any) error {
 	what := fmt.Sprintf(format, args...)
 	if _, ok := worker.AsMove(err); ok {
 		return worker.MoveErrorf("%s: %v", what, err)
-	}
-	if ctx.Err() != nil {
-		return unsentineled(what, err)
 	}
 	return worker.RetryErrorf("%s: %v", what, err)
 }
 
 // runReadFailure quarantines the task on a corrupt run, which reads the same
 // every time, and retries anything else: a missing run may have been collected
-// after another worker reduced the partition. See unsentineled.
-func runReadFailure(ctx context.Context, err error, format string, args ...any) error {
+// after another worker reduced the partition.
+func runReadFailure(err error, format string, args ...any) error {
 	what := fmt.Sprintf(format, args...)
 	if errors.Is(err, errCorruptRun) {
 		return worker.MoveErrorf("%s: %v", what, err)
 	}
-	if ctx.Err() != nil {
-		return unsentineled(what, err)
-	}
 	return worker.RetryErrorf("%s: %v", what, err)
-}
-
-// unsentineled returns the error of a worker whose context has ended, which
-// is no verdict on the task: the worker stops, and the task's claim expires
-// with its lease. A retry would hold it back for the full retry delay.
-func unsentineled(what string, err error) error {
-	return fmt.Errorf("%s: %w", what, err)
 }
 
 // reduceIntermediate runs reduceFn once per key of merged, in key order, and
@@ -432,7 +421,7 @@ func reduceIntermediate(ctx context.Context, merged *mergedIntermediate, reduceF
 		input, ok := stream.nextGroup()
 		if !ok {
 			if stream.err != nil {
-				return runReadFailure(ctx, stream.err, "read intermediate records")
+				return runReadFailure(stream.err, "read intermediate records")
 			}
 			return nil
 		}
@@ -441,10 +430,10 @@ func reduceIntermediate(ctx context.Context, merged *mergedIntermediate, reduceF
 			return fmt.Errorf("reduce %q: %w", input.Key(), err)
 		}
 		if err := input.drain(); err != nil {
-			return runReadFailure(ctx, err, "drain reduce input %q", input.Key())
+			return runReadFailure(err, "drain reduce input %q", input.Key())
 		}
 		if err := out.Write(ctx, input.Key(), result); err != nil {
-			return moveOrRetry(ctx, err, "write output for %q", input.Key())
+			return moveOrRetry(err, "write output for %q", input.Key())
 		}
 	}
 }

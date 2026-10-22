@@ -447,11 +447,18 @@ func (c *Controller) RunReducer(ctx context.Context, reduceFn Reducer) error {
 	return c.ReducerWorker(reduceFn).Run(ctx, c.workerRunOptions(c.ReduceQ())...)
 }
 
+// workRetryDelay is the base delay before a mapper or reducer retries a task
+// after a transient failure, such as a store read. The worker's default suits
+// a queue where a retry means something is wrong; here one usually means a
+// blip, and the phase waits on the unit. It still backs off per attempt.
+const workRetryDelay = time.Second
+
 // workerRunOptions configures mappers and reducers.
 func (c *Controller) workerRunOptions(queue string) []worker.RunOption {
 	opts := []worker.RunOption{
 		worker.Watching(queue),
 		worker.WithLease(c.cfg.Lease),
+		worker.WithBaseRetryDelay(workRetryDelay),
 	}
 	if c.cfg.MaxClaims > 0 {
 		opts = append(opts, worker.WithMaxClaims(c.cfg.MaxClaims))
