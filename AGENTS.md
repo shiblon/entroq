@@ -40,7 +40,9 @@ destination, and that was a task-losing bug in both Python and JS for a year.
 Read these before changing any client worker:
 
 - `pkg/worker/worker.go` — the run loop, the phase order, and the error ladder
-  (sentinel → dependency → cancellation → exit).
+  (sentinel → dependency → cancellation → exit), and the one rule above
+  it: a worker whose context has ended applies no retry or move, and the
+  lease decides.
 - `Task.RetryOrQuarantine` (`task.go`) — retry and quarantine are **one**
   decision, taken at the moment of failure. A client that re-queues and then
   checks the attempt ceiling on the *next* claim has a bug: an exhausted task

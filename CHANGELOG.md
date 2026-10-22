@@ -142,6 +142,14 @@ runs, so plan a short maintenance window on large doc tables.
 
 ### Changed
 
+- **A canceled worker applies no retry or move.** Once a worker's context
+  has ended, a `RetryError` or `MoveError` its handler returns -- usually the
+  cancellation itself, seen as a failed read or write -- is not committed: the
+  task and its doc sets lapse with the lease, and a task that keeps ending its
+  workers reaches the claim limit. A modify on an ended context landed on some
+  backends and not others, so the outcome used to depend on the backend. To
+  answer a task and stop, return the sentinel with `ThenStop` while the
+  context is live.
 - **Every worker `Run` is its own consumer.** A doc set excludes other
   claimants only, so `Run` claims, renews, and commits as a claimant of its
   own, a fresh random ID by default; `worker.AsClaimant` names it instead.

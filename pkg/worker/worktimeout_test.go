@@ -69,6 +69,16 @@ func TestWorkTimeoutRetriesTheTask(t *testing.T) {
 		}
 	}
 
+	// A third start shows the second retry landed. Stop only then: a worker
+	// whose context has ended commits no retry, so cancelling sooner would
+	// race the second one.
+	select {
+	case <-started:
+	case err := <-errCh:
+		t.Fatalf("Run stopped instead of retrying the task a second time: %v", err)
+	case <-ctx.Done():
+		t.Fatal("Body was not entered for attempt 3")
+	}
 	runCancel()
 	if err := <-errCh; err != nil && !errors.Is(err, context.Canceled) {
 		t.Errorf("Run: %v", err)

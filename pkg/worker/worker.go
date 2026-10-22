@@ -960,7 +960,22 @@ func WithErrQMap[T any](f ErrQMap) Option[T] {
 // This applies to both handler paths. A sentinel skips Finish entirely, so the
 // worker is the one writing this modification whichever handler asked for it,
 // and nothing here second-guesses a hand-written Finish.
+//
+// Cancellation wins. A worker whose context has ended commits no retry or move:
+// the task and its sets lapse with the lease, and a task that keeps ending its
+// workers reaches the claim limit. A sentinel returned then is usually the
+// cancellation itself seen as a failure, and whether a modify on an ended
+// context lands differs by backend. A handler that must answer its task and
+// stop returns a sentinel with ThenStop while its context is still live.
 func (w *Worker[T]) handleSentinelErrors(ctx context.Context, eqc entroq.Client, sentinel error, task *entroq.Task, sets []*entroq.DocSet, errQ string, opts *runOpt) (isSentinel bool, err error) {
+	if cerr := ctx.Err(); cerr != nil {
+		if _, ok := AsRetry(sentinel); ok {
+			return true, fmt.Errorf("retry not applied, worker stopping: %w", cerr)
+		}
+		if _, ok := AsMove(sentinel); ok {
+			return true, fmt.Errorf("move not applied, worker stopping: %w", cerr)
+		}
+	}
 	if re, ok := AsRetry(sentinel); ok {
 		delay := opts.baseRetryDelay
 		if re.hasAfter {
@@ -1336,14 +1351,17 @@ const atLimitTimeout = 5 * time.Second
 // record is a modification and would reset the claim count; the task waits
 // out its lease, as before.
 //
-// The attempt is best-effort, with its own short timeout, apart from a
-// shutdown in progress, and the worker stops afterward exactly as it would
-// have without it: nothing is swallowed. It reports whether the task moved.
+// The attempt is best-effort, with its own short timeout, and the worker stops
+// afterward exactly as it would have without it: nothing is swallowed. A worker
+// whose context has ended does not attempt it, since cancellation wins (see
+// handleSentinelErrors): its handler's error is then most likely the
+// cancellation, and the next claim moves the task anyway. It reports whether
+// the task moved.
 func (w *Worker[T]) quarantineAtLimit(ctx context.Context, eqc entroq.Client, task *entroq.Task, sets []*entroq.DocSet, err error, opts *runOpt) bool {
-	if opts.maxClaims <= 0 || task == nil || task.Claims < opts.maxClaims {
+	if opts.maxClaims <= 0 || task == nil || task.Claims < opts.maxClaims || ctx.Err() != nil {
 		return false
 	}
-	qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), atLimitTimeout)
+	qctx, cancel := context.WithTimeout(ctx, atLimitTimeout)
 	defer cancel()
 	move := MoveErrorf("handler failed at the claim limit (%d claims, limit %d): %v", task.Claims, opts.maxClaims, err)
 	if _, qerr := w.handleSentinelErrors(qctx, eqc, move, task, sets, w.ErrorQueueFor(task.Queue), opts); qerr != nil {
