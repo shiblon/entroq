@@ -44,9 +44,12 @@ sed -i.bak "s/\"version\": \"[^\"]*\"/\"version\": \"${VERSION}\"/" "${PKGJSON}"
 rm -f "${PKGJSON}.bak"
 echo "Set version ${VERSION} in ${PKGJSON}"
 
+# The token goes in the container's own ~/.npmrc, not the mounted clients/js,
+# so it is gone with the container whether or not the publish succeeds. The
+# container expands NPM_TOKEN itself, keeping it off this host's command lines.
 docker run --rm \
     -v "${REPO_ROOT}/clients/js:/work" \
     -w /work \
-    -e NPM_TOKEN="${NPM_TOKEN}" \
+    -e NPM_TOKEN \
     node:20-alpine \
-    sh -c "npm install && npm run build && echo '//registry.npmjs.org/:_authToken=${NPM_TOKEN}' > .npmrc && npm publish && rm .npmrc"
+    sh -c 'npm install && npm run build && echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc && npm publish'
