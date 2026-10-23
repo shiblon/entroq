@@ -7,11 +7,11 @@ set -e
 
 # 1. Start the sandbox
 echo "--- Starting EntroQ Sandbox ---"
-docker-compose up -d --build
+docker compose up -d --build
 
 # Local builds of the command-line tools the tests drive the sandbox with.
 BIN_DIR=$(mktemp -d)
-trap 'docker-compose down; rm -rf "$BIN_DIR"' EXIT
+trap 'docker compose down; rm -rf "$BIN_DIR"' EXIT
 go build -o "$BIN_DIR/eqc" ./cmd/eqc
 go build -o "$BIN_DIR/eqlink" ./cmd/eqlink
 EQC="$BIN_DIR/eqc --svcaddr localhost:37706"

@@ -687,6 +687,10 @@ say what changed and why.
   one replica. It now holds a transaction-scoped advisory lock.
 - **The Python gateway example backs off from a gateway that went away.** It
   reconnected at once, in a tight loop.
+- **The docker-compose sandbox starts.** It loaded `schema.sql` through
+  PostgreSQL's init scripts, which records no schema digest, so the server
+  refused the database. The server now applies the schema itself with
+  `--init_schema`.
 - **The Kubernetes example starts.** It ran `eqpg serve --init_schema` as an
   init container, which serves and never exits, so the pod never left Init;
   and it named an image nothing builds and a worker binary no image carries.
