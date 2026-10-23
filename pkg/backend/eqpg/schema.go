@@ -53,7 +53,7 @@ var SchemaSQL string
 //     schema.sql, since the schema may have changed between development builds.
 //     The release drops the suffix (scripts/tag-release.sh refuses to tag
 //     while it is present).
-const SchemaVersion = "1.13.0-dev"
+const SchemaVersion = "1.13.0"
 
 // SchemaDigest identifies the exact schema this build applies: the hex
 // SHA-256 of SchemaSQL. InitSchema records it beside the version, and a

@@ -946,5 +946,5 @@ CREATE TABLE IF NOT EXISTS entroq.meta (
     value TEXT NOT NULL
 );
 
-INSERT INTO entroq.meta (key, value) VALUES ('schema_version', '1.13.0-dev')
-    ON CONFLICT (key) DO UPDATE SET value = '1.13.0-dev' WHERE entroq.meta.key = 'schema_version';
+INSERT INTO entroq.meta (key, value) VALUES ('schema_version', '1.13.0')
+    ON CONFLICT (key) DO UPDATE SET value = '1.13.0' WHERE entroq.meta.key = 'schema_version';

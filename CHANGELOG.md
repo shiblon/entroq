@@ -7,7 +7,7 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [Unreleased]
+## [1.13.0] - 2026-10-22
 
 Upgrading: this is a minor release with breaking changes, meant to be the last
 of its kind in 1.x. Most callers need only the steps here; the entries below
